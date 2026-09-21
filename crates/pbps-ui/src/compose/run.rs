@@ -136,12 +136,8 @@ impl Publications {
     }
 
     fn refused(&self, description: Description, problem: Problem) -> Outcome {
-        let mut result = recover::classify(
-            &Record::new(description),
-            RefEvidence::Absent,
-            None,
-            Some(problem),
-        );
+        let local = refs::observe(&self.git, &description.output_ref);
+        let mut result = recover::classify(&Record::new(description), local, None, Some(problem));
         result.status = Status::Refused;
         result.cleanup_pending = false;
         result

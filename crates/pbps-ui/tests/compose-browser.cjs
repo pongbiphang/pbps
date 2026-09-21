@@ -20,7 +20,7 @@ class Element {
   }
 }
 const preview = id => ({candidate_id: id, operation_id: `operation-${id}`, output_ref: `refs/heads/${id}`,
-  base: "base", tree: `tree-${id}`, diff: `diff-${id}`, destination: {host: "host.test"}, signing: {required: false}});
+  base: "base", tree: `tree-${id}`, diff: `diff-${id}`, destination: {host: "host.test", repository_identity: {common_inode: 12345}}, signing: {required: false}});
 function setup() {
   const doc = {createElement: tag => new Element(tag, doc)};
   const root = new Element("section", doc);
@@ -46,6 +46,7 @@ async function exercise() {
   a.calls[2].resolve(preview("new")); await second;
   a.calls[1].resolve(preview("stale")); await first;
   assert.equal(a.confirm.disabled, false);
+  assert(!a.root.find(e => e.textContent.includes("common_inode")));
   assert(a.root.find(e => e.textContent === "diff-new"));
   const confirming = a.confirm.fire("click");
   await a.confirm.fire("click");
@@ -84,10 +85,11 @@ async function outcomes() {
   const receipt = {status: "recovery_required", operation_id: "operation-one", local: "present",
     remote: "unknown", cleanup_pending: true, problem: "persistence_uncertain",
     details: {commit: "a".repeat(40), output_ref: "refs/heads/pbps-compose/" + "b".repeat(64), base: "base", tree: "tree",
-      destination: {host: "reviewed.test"}, source_project: "/source/project", project_suffix: "project", delivery_generation: "nonce-one"}};
+      destination: {host: "reviewed.test", repository_identity: {common_inode: 12345}}, source_project: "/source/project", project_suffix: "project", delivery_generation: "nonce-one"}};
   p = a.confirm.fire("click"); a.calls[1].resolve(receipt); await p;
   assert(visible("Commit: " + "a".repeat(40)));
   assert(visible("Remote publication is uncertain"));
+  assert(!visible("common_inode"));
   assert(visible("Private cleanup remains pending"));
   assert(visible("git worktree add NEW_DIRECTORY"));
   assert(!button("retry"));

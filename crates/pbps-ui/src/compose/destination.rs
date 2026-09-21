@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::{Error, Result, git::Git};
+use super::{Error, Result, git::Git, record::RepositoryIdentity};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -14,6 +14,7 @@ pub struct Destination {
     port: Option<u16>,
     principal: Option<String>,
     repository: String,
+    repository_identity: Option<RepositoryIdentity>,
 }
 
 fn simple(value: &str) -> bool {
@@ -43,6 +44,7 @@ impl Destination {
                 port: None,
                 principal: None,
                 repository,
+                repository_identity: None,
             });
         }
         let (transport, authority, repository) =
@@ -90,6 +92,7 @@ impl Destination {
             port,
             principal,
             repository,
+            repository_identity: None,
         })
     }
 }
@@ -120,6 +123,13 @@ pub(super) fn validate(destination: &Destination) -> Result<()> {
             && destination.host.is_none()
             && destination.port.is_none()
             && destination.principal.is_none()
+            && destination
+                .repository_identity
+                .as_ref()
+                .is_some_and(|identity| {
+                    identity.source == Path::new(&destination.repository)
+                        && identity.common.is_absolute()
+                })
             && !destination.repository.chars().any(char::is_control)
         {
             Ok(())
@@ -158,7 +168,18 @@ pub(super) fn resolve(git: &Git, remote: &str) -> Result<Destination> {
     if value.lines().count() != 1 {
         return Err(Error::new("Compose requires exactly one push destination"));
     }
-    Destination::parse(&value)
+    let mut destination = Destination::parse(&value)?;
+    if destination.transport == "file" {
+        // A path can be reused for another repository with the same base tip.
+        // Bind both its directory and effective Git common directory; a normal
+        // checkout can keep its inode while its .git directory is replaced.
+        destination.repository_identity = Some(RepositoryIdentity::capture(&Git {
+            root: destination.repository.clone().into(),
+            hooks: git.hooks.clone(),
+            deadline: git.deadline,
+        })?);
+    }
+    Ok(destination)
 }
 
 #[cfg(test)]

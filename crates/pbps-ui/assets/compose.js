@@ -67,6 +67,10 @@ globalThis.PbpsCompose = Object.freeze({
     let confirming = false;
     let operation = null;
     const receipts = new Map();
+    const destinationText = destination => {
+      const {transport, host, port, principal, repository} = destination;
+      return JSON.stringify({transport, host, port, principal, repository});
+    };
     const quote = value => "'" + value.replaceAll("'", "'\"'\"'") + "'";
     const statusText = {
       refused: "Publication refused before an attempt.",
@@ -101,7 +105,7 @@ globalThis.PbpsCompose = Object.freeze({
         if (receipt.cleanup_pending) card.append(make("p", "Private cleanup remains pending; keep this receipt."));
         const d = receipt.details;
         if (d) {
-          card.append(make("pre", `Commit: ${d.commit || "not yet recorded"}\nOutput branch: ${d.output_ref}\nParent: ${d.base}\nTree: ${d.tree}\nDestination: ${JSON.stringify(d.destination)}\nSource project: ${d.source_project}`));
+          card.append(make("pre", `Commit: ${d.commit || "not yet recorded"}\nOutput branch: ${d.output_ref}\nParent: ${d.base}\nTree: ${d.tree}\nDestination: ${destinationText(d.destination)}\nSource project: ${d.source_project}`));
           if (receipt.local === "present" && /^[a-f0-9]{40}([a-f0-9]{24})?$/.test(d.commit) && /^refs\/heads\/pbps-compose\/[a-f0-9]{64}$/.test(d.output_ref)) {
             card.append(make("p", "Continue from this result in a separate checkout. Run from the source repository, replacing NEW_DIRECTORY with an unused path; then open its project directory shown below."));
             card.append(make("pre", `git worktree add NEW_DIRECTORY ${quote(d.output_ref.slice("refs/heads/".length))}\npbps --project ${quote("NEW_DIRECTORY" + (d.project_suffix ? "/" + d.project_suffix : ""))} ui`));
@@ -199,7 +203,7 @@ globalThis.PbpsCompose = Object.freeze({
         if (mine !== generation || confirming) return;
         candidate = preview.candidate_id;
         operation = preview.operation_id;
-        details.textContent = `Output branch: ${preview.output_ref}\nParent: ${preview.base}\nTree: ${preview.tree}\nDestination: ${JSON.stringify(preview.destination)}\nSigning: ${JSON.stringify(preview.signing)}\nMessage: ${request.message}`;
+        details.textContent = `Output branch: ${preview.output_ref}\nParent: ${preview.base}\nTree: ${preview.tree}\nDestination: ${destinationText(preview.destination)}\nSigning: ${JSON.stringify(preview.signing)}\nMessage: ${request.message}`;
         diff.textContent = preview.diff;
         activity.textContent = "Review this frozen candidate. Later file edits require Refresh.";
         confirm.disabled = false;

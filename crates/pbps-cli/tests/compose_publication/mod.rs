@@ -724,3 +724,126 @@ fn late_dangling_symbolic_collision_is_rejected_under_the_prepared_ref_lock() {
     assert_eq!(f.remote_ref(&preview.output_ref), None);
     f.source_unchanged(&before);
 }
+
+#[test]
+fn a_local_remote_replaced_at_the_same_path_is_not_the_reviewed_repository() {
+    for git_directory_only in [false, true] {
+        for after_local_publication in [false, true] {
+            let f = Fixture::new(&format!(
+                "local-identity-{git_directory_only}-{after_local_publication}"
+            ));
+            if git_directory_only {
+                fs::remove_dir_all(&f.remote).unwrap();
+                git(
+                    &f.repo.root,
+                    &[
+                        "clone",
+                        "--no-checkout",
+                        "-q",
+                        ".",
+                        f.remote.to_str().unwrap(),
+                    ],
+                );
+            }
+            let (_store, preview, candidate) = f.ready();
+            let before = f.repo.preserved();
+            let mut publisher = f.publisher();
+            let initial = after_local_publication.then(|| {
+                publisher.confirm_observed(&candidate, &|at| {
+                    at != Boundary::AfterPersist(DurableStage::LocalPublished)
+                })
+            });
+            let target = if git_directory_only {
+                f.remote.join(".git")
+            } else {
+                f.remote.clone()
+            };
+            let old = f.remote.with_extension("identity-original");
+            fs::rename(&target, &old).unwrap();
+            git(
+                &f.repo.root,
+                &[
+                    "clone",
+                    "--bare",
+                    "--single-branch",
+                    "--branch",
+                    "master",
+                    "-q",
+                    ".",
+                    target.to_str().unwrap(),
+                ],
+            );
+            assert_eq!(
+                git(&f.remote, &["rev-parse", "HEAD"]),
+                format!("{}\n", preview.base).as_bytes()
+            );
+            drop(publisher);
+            let mut publisher = f.publisher();
+            let result = if after_local_publication {
+                publisher.retry(&preview.operation_id)
+            } else {
+                publisher.confirm(&candidate)
+            };
+            assert_eq!(
+                result.problem,
+                Some(Problem::DestinationChanged),
+                "{result:?}"
+            );
+            assert_eq!(f.remote_ref(&preview.output_ref), None);
+            if let Some(initial) = initial {
+                assert_eq!(result.local, LocalState::Present);
+                assert_eq!(
+                    result.details.as_ref().unwrap().commit,
+                    initial.details.unwrap().commit
+                );
+            } else {
+                assert_eq!(result.status, Status::Refused);
+                assert_eq!(result.details.as_ref().unwrap().commit, None);
+            }
+            // Bringing the original repository back restores the same identity.
+            fs::remove_dir_all(&target).unwrap();
+            fs::rename(&old, &target).unwrap();
+            let completed = if after_local_publication {
+                publisher.retry(&preview.operation_id)
+            } else {
+                publisher.confirm(&candidate)
+            };
+            assert_eq!(completed.status, Status::Delivered, "{completed:?}");
+            f.source_unchanged(&before);
+        }
+    }
+}
+
+#[test]
+fn a_refused_collision_reports_its_actual_direct_symbolic_or_unreadable_evidence() {
+    use pbps_ui::compose::RefEvidence;
+    for kind in ["direct", "symbolic", "unreadable"] {
+        let f = Fixture::new(&format!("refusal-evidence-{kind}"));
+        let (_store, preview, candidate) = f.ready();
+        let reference = f.repo.root.join(".git").join(&preview.output_ref);
+        fs::create_dir_all(reference.parent().unwrap()).unwrap();
+        let expected = match kind {
+            "direct" => {
+                fs::write(&reference, format!("{}\n", preview.base)).unwrap();
+                RefEvidence::Direct(preview.base.clone())
+            }
+            "symbolic" => {
+                fs::write(&reference, "ref: refs/heads/foreign-missing\n").unwrap();
+                RefEvidence::Symbolic
+            }
+            "unreadable" => {
+                fs::write(&reference, "invalid object id\n").unwrap();
+                RefEvidence::Unreadable
+            }
+            _ => unreachable!(),
+        };
+        let bytes = fs::read(&reference).unwrap();
+        let result = f.publisher().confirm(&candidate);
+        assert_eq!(result.status, Status::Refused);
+        assert_eq!(result.problem, Some(Problem::RefCollision));
+        assert_eq!(result.local_evidence, expected);
+        assert_eq!(result.details.unwrap().commit, None);
+        assert_eq!(fs::read(&reference).unwrap(), bytes);
+        assert_eq!(f.remote_ref(&preview.output_ref), None);
+    }
+}
