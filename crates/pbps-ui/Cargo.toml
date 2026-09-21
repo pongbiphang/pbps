@@ -11,6 +11,11 @@ repository.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tiny_http.workspace = true
+sha2.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# No-follow capture and bounded subprocess groups; no schema/model dependency.
+rustix = { workspace = true, features = ["fs", "process", "rand"] }
 
 [lints]
 workspace = true

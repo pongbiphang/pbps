@@ -180,6 +180,10 @@ usage and the read-only boundary.
 
 ## Development
 
+The browser behavior tests require Node.js 24 on `PATH`, or a Node executable
+selected with `PBPS_TEST_NODE`. Node is a test dependency only; the shipped
+binary serves embedded assets and does not invoke it.
+
 Linux is the primary development and release target; Windows coverage comes from
 the CI matrix.
 

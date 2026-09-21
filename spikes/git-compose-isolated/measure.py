@@ -122,7 +122,19 @@ class IsolatedCompose(unittest.TestCase):
             self.git("update-index", "--add", "--cacheinfo", "100644," + blob + "," + path,
                      extra_env=index_env)
         self.tree = self.oid("write-tree", extra_env=index_env)
-        self.diff = self.git("diff", "--no-ext-diff", "--no-textconv", self.base, self.tree).stdout
+        force_text = [] if OPTIONS.revert_forced_text else ["--text"]
+        self.diff = self.git("diff", "--no-ext-diff", "--no-textconv", *force_text, self.base, self.tree).stdout
+
+    def test_binary_attributes_still_show_the_reviewed_lines(self):
+        (self.repo / ".gitattributes").write_text("schema/*.yml -diff\nschema.ids.json -diff\n")
+        # Commit the attributes only; preserve the pending rename and staged
+        # unrelated work from the fixture.
+        self.git("add", ".gitattributes")
+        self.git("commit", "-qm", "binary diff attributes", "--only", ".gitattributes")
+        self.base = self.oid("rev-parse", "HEAD")
+        self.capture()
+        self.assertIn(b"+  full_name:", self.diff)
+        self.assertNotIn(b"Binary files", self.diff)
 
     def make_commit(self):
         return self.oid("commit-tree", self.tree, "-p", self.base, "-m", "rename customer_name full_name")
@@ -285,9 +297,11 @@ if __name__ == "__main__":
     parser.add_argument("--pbps", required=True, type=lambda p: str(Path(p).resolve()))
     parser.add_argument("--revert-ref-type-guard", action="store_true")
     parser.add_argument("--revert-candidate-freeze", action="store_true")
+    parser.add_argument("--revert-forced-text", action="store_true")
     OPTIONS = parser.parse_args()
     print(json.dumps({"git": subprocess.check_output(["git", "--version"], text=True).strip(),
                       "pbps": subprocess.check_output([OPTIONS.pbps, "--version"], text=True).strip(),
                       "revert_ref_type_guard": OPTIONS.revert_ref_type_guard,
-                      "revert_candidate_freeze": OPTIONS.revert_candidate_freeze}), flush=True)
+                      "revert_candidate_freeze": OPTIONS.revert_candidate_freeze,
+                      "revert_forced_text": OPTIONS.revert_forced_text}), flush=True)
     unittest.main(argv=[__file__], verbosity=2)

@@ -3,6 +3,10 @@
 pub mod client;
 pub mod contract;
 
+// The backend is qualified before the viewer exposes compose endpoints (#748).
+#[cfg(target_os = "linux")]
+pub mod compose;
+
 use std::collections::BTreeMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
@@ -14,6 +18,7 @@ use client::{Client, View};
 const TOKEN_HEADER: &str = "X-Pbps-Token";
 const HTML: &str = include_str!("../assets/index.html");
 const JS: &str = include_str!("../assets/app.js");
+const COMPOSE_JS: &str = include_str!("../assets/compose.js");
 const CSS: &str = include_str!("../assets/style.css");
 
 /// The CLI supplies randomness and the docs stylesheet hash; this crate needs
@@ -108,6 +113,11 @@ impl Viewer {
                 "text/javascript; charset=utf-8",
                 JS.as_bytes().to_vec(),
             ),
+            "/compose.js" => (
+                200,
+                "text/javascript; charset=utf-8",
+                COMPOSE_JS.as_bytes().to_vec(),
+            ),
             "/style.css" => (200, "text/css; charset=utf-8", CSS.as_bytes().to_vec()),
             url => match route(url) {
                 Ok(view) => match self.client.read(&view) {
@@ -171,7 +181,7 @@ fn authorized(
         Ok(None) if matches!(method, "GET" | "HEAD") => {}
         _ => return false,
     }
-    if matches!(url, "/" | "/app.js" | "/style.css") {
+    if matches!(url, "/" | "/app.js" | "/compose.js" | "/style.css") {
         return true;
     }
     one(TOKEN_HEADER) == Ok(Some(token))
@@ -244,7 +254,7 @@ mod tests {
     #[test]
     fn only_the_immutable_shell_can_be_read_without_the_token() {
         let peer = Some("127.0.0.1:1234".parse().unwrap());
-        for path in ["/", "/app.js", "/style.css"] {
+        for path in ["/", "/app.js", "/compose.js", "/style.css"] {
             assert!(authorized(
                 peer,
                 "GET",
@@ -365,14 +375,23 @@ mod tests {
             .next()
             .unwrap();
         assert!(!dependencies.contains("pbps-"));
-        for line in dependencies.lines().filter(|line| line.contains('=')) {
+        for line in dependencies
+            .lines()
+            .filter(|line| line.contains('=') && !line.starts_with('[') && !line.starts_with('#'))
+        {
             assert!(matches!(
                 line.split('=').next().unwrap().trim(),
-                "serde.workspace" | "serde_json.workspace" | "tiny_http.workspace"
+                "serde.workspace"
+                    | "serde_json.workspace"
+                    | "tiny_http.workspace"
+                    | "sha2.workspace"
+                    | "rustix"
             ));
         }
         assert!(!HTML.contains("<script>"));
         assert!(!JS.contains("innerHTML"));
+        assert!(!COMPOSE_JS.contains("innerHTML"));
+        assert!(!COMPOSE_JS.contains("localStorage") && !COMPOSE_JS.contains("sessionStorage"));
         assert!(!JS.contains("localStorage") && !JS.contains("sessionStorage"));
         assert!(
             !HTML.contains("https://") && !CSS.contains("https://") && !JS.contains("https://")

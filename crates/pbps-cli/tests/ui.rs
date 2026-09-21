@@ -95,7 +95,7 @@ impl Drop for Viewer {
 #[test]
 fn shell_reads_are_public_but_project_reads_require_the_launch_token() {
     let viewer = Viewer::start("shell");
-    for path in ["/", "/app.js", "/style.css"] {
+    for path in ["/", "/app.js", "/compose.js", "/style.css"] {
         let (status, headers, body) = viewer.request("GET", path, &[]);
         assert_eq!(status, 200, "{path}: {body}");
         assert!(headers.to_lowercase().contains("cache-control: no-store"));

@@ -132,6 +132,10 @@ enum Command {
         #[arg(long)]
         dev: Option<String>,
 
+        /// Skip configured dev rehearsal while still resolving and recording ids
+        #[arg(long)]
+        no_dev: bool,
+
         /// Select a named resolver profile for target planning. Selection only:
         /// resolver acquisition and binding qualification are not implemented yet
         #[arg(long, value_name = "PROFILE")]
@@ -181,6 +185,10 @@ enum Command {
         /// human (default) or json
         #[arg(long, default_value = "human")]
         format: OutputFormat,
+
+        /// Resolve project input paths without loading declarations or contacting environments
+        #[arg(long, conflicts_with_all = ["db", "env"])]
+        paths_only: bool,
     },
 
     /// Explain a saved plan to whoever has to approve it
@@ -672,6 +680,7 @@ fn run() -> anyhow::Result<()> {
             sql,
             staged,
             dev,
+            no_dev,
             resolve_with,
             format,
         } => {
@@ -693,10 +702,18 @@ fn run() -> anyhow::Result<()> {
                     Err(anyhow::anyhow!("{message}")),
                 )
             };
+            if no_dev && dev.is_some() {
+                refuse("--no-dev skips rehearsal and cannot be combined with --dev")?;
+            }
             // Two commands under one name, because to a user they are one
             // question asked in two places (SPEC §7.3): the MR wants a preview,
             // the deployment wants the plan for that environment.
             if target.db.is_some() || target.env.is_some() {
+                if no_dev {
+                    refuse(
+                        "--no-dev controls offline preview rehearsal; it cannot take --db or --env",
+                    )?;
+                }
                 if check {
                     refuse(
                         "--check is the CI file check; it never connects, so it cannot take --db",
@@ -805,6 +822,7 @@ fn run() -> anyhow::Result<()> {
                     out: out.as_deref(),
                     sql: sql.as_deref(),
                     dev: dev.as_deref(),
+                    no_dev,
                     // `--check` is the CI file check and changes nothing, so it
                     // must not be able to ask a question either: a prompt there
                     // would hang a pipeline on a run that was supposed to be
@@ -835,7 +853,14 @@ fn run() -> anyhow::Result<()> {
                 },
             )
         }
-        Command::Doctor { target, format } => {
+        Command::Doctor {
+            target,
+            format,
+            paths_only,
+        } => {
+            if paths_only {
+                return doctor::input_paths(&project, format == OutputFormat::Json);
+            }
             // The only connected command whose target is optional: with none it
             // surveys every configured environment, which is what makes it
             // worth running before a deployment.
@@ -2347,6 +2372,7 @@ struct PlanOptions<'a> {
     out: Option<&'a std::path::Path>,
     sql: Option<&'a std::path::Path>,
     dev: Option<&'a str>,
+    no_dev: bool,
     /// False when there is no terminal, when `--no-input` was given, and always
     /// under `--check` — the read-only CI check must not be able to ask a
     /// question, or a pipeline hangs on one nobody can see.
@@ -2364,6 +2390,7 @@ fn cmd_plan(
         out,
         sql,
         dev,
+        no_dev,
         may_prompt,
         format,
     } = opts;
@@ -2719,7 +2746,7 @@ fn cmd_plan(
     // does not answer — is unanswerable, distinct from one that ran and found
     // the plan does not converge (a finding, below). Confusing the two would
     // tell CI the plan is wrong when the rehearsal never happened.
-    let dev_spec = if check {
+    let dev_spec = if check || no_dev {
         None
     } else {
         output::or_unanswerable(

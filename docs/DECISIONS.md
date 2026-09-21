@@ -14250,3 +14250,44 @@ SPEC is in sync with all of these.
      waiter. Exact policy attestation, provenance and source-handling follow-ups
      remain independent gates. No model, driver boundary, public schema or
      deployment authorization changes here.
+
+530. **A compose preview owns its input bytes and output tree before it owns
+     confirmation (issue #745).** Decision 527's isolated architecture replaces
+     the former preview/place/undo/re-read cycle: a server-owned candidate binds
+     the complete input membership, absence, modes, attributes, base, intent,
+     message, destination and preallocated operation/output-ref name. The diff
+     comes from the resulting tree, with forced text rendering even under
+     `-diff`. Confirmation accepts only its opaque handle; later source edits
+     cannot enter that tree. Refresh replaces the handle even when capture
+     fails, and unconfirmed handles expire after 24 hours.
+
+     Paths are obtained from `doctor --paths-only` before the CLI loads any
+     declarations. This is a separate tagged report, not a successful diagnosis
+     with fabricated zero counts. The UI can then refuse escaping paths without
+     parsing YAML. Ordinary intent commands and `validate` retain schema
+     ownership. Declaration-only changes use `plan --no-dev` to resolve ids
+     without a configured rehearsal; a final `plan --check` reconciles the
+     result against the captured base. `--no-dev` still writes the ordinary ids,
+     skips only rehearsal and refuses explicit `--dev` or target planning.
+
+     Git resolves line-ending policy through a private index and an empty
+     worktree, with attributes sourced from the reviewed base. This preserves
+     legacy `crlf` semantics and attribute precedence without reproducing Git's
+     parser or executing filters. Relevant attribute files must match the base
+     byte-for-byte and enter the manifest: `check-attr` text alone cannot
+     distinguish an unset attribute from a string value literally named
+     `unset`. Contained parent path components are resolved, while escapes
+     beyond the project remain refusals.
+     When captured bytes contain CRLF, a sterile private Git probe compares
+     raw and converted object identities using only that closed text policy.
+     Bare CR and `text=auto` binary heuristics are Git's decisions, not a second
+     normalization implementation. The probe loads no source configuration or
+     helper and performs no checkout.
+
+     Real Git/CLI scheduling tests pin source preservation and frozen output;
+     browser tests execute the shipped form rather than search its source for
+     variable names. Node.js is required only to run those development tests
+     (`PBPS_TEST_NODE` may select the executable). The viewer remains read-only
+     until publication, durable retirement and restart qualification (#746–#748)
+     are complete. This entry does not choose the endpoint-admission policy
+     whose separate decision record is tracked by #757.
