@@ -14,6 +14,15 @@ use super::{Error, Result, digest};
 pub(super) const MAX_BYTES: usize = 64 * 1024 * 1024;
 pub(super) const MAX_FILES: usize = 4096;
 
+pub(super) fn declaration_path(name: &str) -> bool {
+    // Match the CLI loader's case-sensitive suffix vocabulary. Other files
+    // beneath schema_dir are not declarations and must stay outside the diff.
+    matches!(
+        Path::new(name).extension().and_then(|s| s.to_str()),
+        Some("yml" | "yaml")
+    )
+}
+
 pub(super) fn path(name: &str) -> Result<&str> {
     if name.is_empty()
         || name.contains(['\0', '\\', '\n', '\r'])
@@ -112,7 +121,9 @@ impl Root {
         }
         Ok(Some(FileBytes {
             bytes,
-            mode: if before.st_mode & 0o111 == 0 {
+            // Git's executable mode follows the owner's execute bit; group
+            // or other execute permissions alone do not make a 100755 entry.
+            mode: if before.st_mode & 0o100 == 0 {
                 0o100644
             } else {
                 0o100755
@@ -192,8 +203,7 @@ impl Root {
                     Self::walk(&child, &full, names, depth + 1, count)?;
                 }
                 FileType::RegularFile => {
-                    let lower = name.to_ascii_lowercase();
-                    if lower.ends_with(".yml") || lower.ends_with(".yaml") {
+                    if declaration_path(name) {
                         names.push(full);
                     }
                 }

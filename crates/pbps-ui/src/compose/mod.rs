@@ -128,6 +128,7 @@ impl Candidate {
 /// Minimal deterministic scheduling boundaries used by the real capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureBoundary {
+    PathsResolved,
     InputsRead,
     IntentRecorded,
     TreeBuilt,

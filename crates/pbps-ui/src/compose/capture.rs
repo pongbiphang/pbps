@@ -285,7 +285,7 @@ fn manifest(
     let mut attr = BTreeMap::new();
     let mut bytes = BTreeMap::new();
     let mut total = 0;
-    let crlf = git.config("core.autocrlf")?.unwrap_or_default();
+    let crlf = git.converts_line_endings()?;
     for name in names {
         let file = root.read(name)?;
         let working = attributes(git, name, None)?;
@@ -300,8 +300,7 @@ fn manifest(
                 return Err(Error::new("Compose inputs exceed the total size limit"));
             }
             if file.bytes.contains(&b'\r')
-                && (crlf == "true"
-                    || crlf == "input"
+                && (crlf
                     || working
                         .iter()
                         .any(|(k, v)| matches!(k.as_str(), "text" | "eol") && v != "unset"))
@@ -447,15 +446,13 @@ pub(super) fn capture(
     };
     let snapshot_project = snapshot.join(&project);
     let (declarations, ids) = inputs(&snapshot_project, cli.paths(&snapshot_project)?)?;
+    observer(CaptureBoundary::PathsResolved);
     let declarations = join(&project, &declarations);
     let ids = join(&project, &ids);
     let live = root.declarations(&declarations)?;
     let is_input = |path: &str| {
         path == ids
-            || (path.starts_with(&format!("{declarations}/")) && {
-                let lower = path.to_ascii_lowercase();
-                lower.ends_with(".yml") || lower.ends_with(".yaml")
-            })
+            || (path.starts_with(&format!("{declarations}/")) && files::declaration_path(path))
     };
     let mut names: BTreeSet<String> = recorded.keys().filter(|p| is_input(p)).cloned().collect();
     names.extend(live.keys().cloned());
@@ -464,6 +461,14 @@ pub(super) fn capture(
         return Err(Error::new("Compose has too many input paths"));
     }
     let (evidence, captured) = manifest(&git, &root, &names, &base)?;
+    // Path admission was based on the base's configuration. The configuration
+    // actually overlaid below must be those same bytes; checking the live file
+    // before discovery alone leaves a config-change window before this capture.
+    if captured.get(&project_file).and_then(Option::as_ref) != Some(recorded_config) {
+        return Err(Error::new(
+            "Project configuration changed during capture; refresh the preview",
+        ));
+    }
     if live
         .iter()
         .any(|(name, file)| captured.get(name) != Some(&Some(file.clone())))

@@ -243,6 +243,38 @@ fn edits_during_capture_are_refused_and_never_become_post_diff_evidence() {
 }
 
 #[test]
+fn configuration_cannot_redirect_intent_writes_after_path_admission() {
+    let repo = Repository::new("config-admission-race", "");
+    repo.table(RENAMED);
+    let ids = fs::read(repo.project.join("schema.ids.json")).unwrap();
+    let index = fs::read(repo.root.join(".git/index")).unwrap();
+    let result = repo
+        .store()
+        .preview_observed(request(), SystemTime::now(), &|at| {
+            if at == CaptureBoundary::PathsResolved {
+                // If this later configuration were overlaid into the snapshot,
+                // ordinary `rename` would write the source's identity file before
+                // the final capture recheck ever had a chance to refuse it.
+                fs::write(
+                    repo.project.join("pbps.yml"),
+                    format!(
+                        "dialect: mssql\nids_file: {}\n",
+                        repo.project.join("schema.ids.json").display()
+                    ),
+                )
+                .unwrap();
+            }
+        });
+    assert!(result.is_err());
+    assert_eq!(
+        fs::read(repo.project.join("schema.ids.json")).unwrap(),
+        ids,
+        "path admission must protect the actual configuration used by the intent CLI"
+    );
+    assert_eq!(fs::read(repo.root.join(".git/index")).unwrap(), index);
+}
+
+#[test]
 fn refresh_replaces_the_handle_and_expiry_requires_another_preview() {
     let repo = Repository::new("refresh", "");
     repo.table(RENAMED);
@@ -318,6 +350,37 @@ fn new_deleted_recreated_paths_and_modes_are_part_of_the_candidate() {
 }
 
 #[test]
+fn captured_executable_modes_match_real_git_including_group_only_execute() {
+    for mode in [0o654, 0o740] {
+        let repo = Repository::new(&format!("git-mode-{mode:o}"), "");
+        repo.table(RENAMED);
+        fs::set_permissions(
+            repo.project.join("schema/t.yml"),
+            fs::Permissions::from_mode(mode),
+        )
+        .unwrap();
+        git(&repo.root, &["add", "schema/t.yml"]);
+        let entry = String::from_utf8(git(
+            &repo.root,
+            &["ls-files", "--stage", "--", "schema/t.yml"],
+        ))
+        .unwrap();
+        let expected = u32::from_str_radix(entry.split_whitespace().next().unwrap(), 8).unwrap();
+        let mut store = repo.store();
+        let now = SystemTime::now();
+        let preview = store.preview(request(), now).unwrap();
+        let candidate = store.confirm(&preview.candidate_id, now).unwrap();
+        assert_eq!(
+            candidate.manifest().inputs["schema/t.yml"]
+                .as_ref()
+                .unwrap()
+                .mode,
+            expected
+        );
+    }
+}
+
+#[test]
 fn a_new_path_or_mode_change_at_the_capture_barrier_is_not_omitted() {
     for mode_only in [true, false] {
         let repo = Repository::new(&format!("membership-race-{mode_only}"), "");
@@ -360,6 +423,70 @@ fn binary_attributes_cannot_hide_reviewed_declaration_or_identity_bytes() {
     assert!(preview.diff.contains("+  ident:"), "{}", preview.diff);
     assert!(preview.diff.contains("schema.ids.json"));
     assert!(!preview.diff.contains("Binary files"));
+}
+
+#[test]
+fn uppercase_suffixes_are_not_declarations_and_do_not_enter_candidate_changes() {
+    let repo = Repository::new("suffixes", "");
+    fs::write(
+        repo.project.join("schema/notes.YML"),
+        "base non-declaration",
+    )
+    .unwrap();
+    repo.commit();
+    repo.table(RENAMED);
+    fs::write(
+        repo.project.join("schema/notes.YML"),
+        "unreviewed non-declaration",
+    )
+    .unwrap();
+    fs::write(repo.project.join("schema/new.YAML"), "not a declaration").unwrap();
+    let mut store = repo.store();
+    let now = SystemTime::now();
+    let preview = store.preview(request(), now).unwrap();
+    assert!(!preview.diff.contains("notes.YML") && !preview.diff.contains("new.YAML"));
+    let candidate = store.confirm(&preview.candidate_id, now).unwrap();
+    assert!(!candidate.manifest().inputs.contains_key("schema/notes.YML"));
+    assert!(!candidate.manifest().inputs.contains_key("schema/new.YAML"));
+    assert_eq!(
+        git(
+            &candidate.snapshot_repository(),
+            &["show", &format!("{}:schema/notes.YML", preview.tree)]
+        ),
+        b"base non-declaration"
+    );
+    let listing = String::from_utf8(git(
+        &candidate.snapshot_repository(),
+        &["ls-tree", "-r", &preview.tree],
+    ))
+    .unwrap();
+    assert!(!listing.contains("new.YAML"));
+}
+
+#[test]
+fn git_boolean_aliases_cannot_admit_conversion_dependent_carriage_returns() {
+    for value in [
+        "TRUE", "yes", "on", "1", "input", "INPUT", "false", "off", "0",
+    ] {
+        let repo = Repository::new(&format!("autocrlf-{value}"), "");
+        git(&repo.root, &["config", "core.autocrlf", value]);
+        repo.table(&RENAMED.replace('\n', "\r\n"));
+        let raw = git(&repo.root, &["hash-object", "--no-filters", "schema/t.yml"]);
+        let ordinary = git(
+            &repo.root,
+            &["hash-object", "--path=schema/t.yml", "schema/t.yml"],
+        );
+        let result = repo.store().preview(request(), SystemTime::now());
+        if raw != ordinary {
+            assert!(result.is_err(), "accepted conversion under {value}");
+        } else {
+            assert!(
+                result.is_ok(),
+                "refused raw-byte policy {value}: {}",
+                result.err().unwrap()
+            );
+        }
+    }
 }
 
 #[test]

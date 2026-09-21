@@ -96,6 +96,27 @@ impl Git {
         }
     }
 
+    pub fn converts_line_endings(&self) -> Result<bool> {
+        let Some(value) = self.config("core.autocrlf")? else {
+            return Ok(false);
+        };
+        if value.eq_ignore_ascii_case("input") {
+            return Ok(true);
+        }
+        // Git owns boolean spelling, including bare config keys and aliases.
+        // `input` is the only non-boolean value admitted by core.autocrlf.
+        match self
+            .line(&["config", "--type=bool", "--get", "core.autocrlf"])?
+            .as_str()
+        {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(Error::new(
+                "Could not read Git's line-ending conversion policy",
+            )),
+        }
+    }
+
     pub fn store(&self, bytes: &[u8]) -> Result<String> {
         text(self.bytes(
             &["hash-object", "-w", "--no-filters", "--stdin"],
