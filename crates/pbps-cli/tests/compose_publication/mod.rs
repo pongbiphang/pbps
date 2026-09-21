@@ -1006,3 +1006,63 @@ fn unreadable_source_and_signing_evidence_do_not_claim_a_known_change() {
         f.source_unchanged(&before);
     }
 }
+
+#[test]
+fn a_dangling_symbolic_local_destination_never_redirects_publication() {
+    for late in [false, true] {
+        let f = Fixture::new(&format!("remote-symbolic-{late}"));
+        let (_store, preview, candidate) = f.ready();
+        let before = f.repo.preserved();
+        let foreign = "refs/heads/foreign-never-created";
+        if !late {
+            git(&f.remote, &["symbolic-ref", &preview.output_ref, foreign]);
+        }
+        let mut publisher = f.publisher();
+        let result = publisher.confirm_observed(&candidate, &|at| {
+            if late && at == Boundary::BeforePush {
+                git(&f.remote, &["symbolic-ref", &preview.output_ref, foreign]);
+            }
+            true
+        });
+        assert_eq!(
+            f.remote_ref(foreign),
+            None,
+            "a push must not dereference the reviewed output ref"
+        );
+        assert_eq!(
+            git(&f.remote, &["symbolic-ref", &preview.output_ref]),
+            format!("{foreign}\n").as_bytes()
+        );
+        assert_eq!(result.local, LocalState::Present);
+        assert_ne!(result.remote, DeliveryState::Delivered);
+        let known = commit(&result).to_owned();
+        drop(publisher);
+        let mut publisher = f.publisher();
+        let retry = publisher.retry(&preview.operation_id);
+        assert_eq!(commit(&retry), known);
+        assert_eq!(f.remote_ref(foreign), None);
+        let reconciled = publisher.recover(&preview.operation_id);
+        assert_eq!(commit(&reconciled), known);
+        assert_ne!(reconciled.remote, DeliveryState::Delivered);
+        if late {
+            let explicit = publisher.republish(&preview.operation_id, &generation(&retry));
+            assert_eq!(commit(&explicit), known);
+            assert_eq!(explicit.problem, Some(Problem::RefCollision));
+            assert_eq!(f.remote_ref(foreign), None);
+        }
+        git(
+            &f.remote,
+            &["symbolic-ref", "--delete", &preview.output_ref],
+        );
+        let completed = if late {
+            let result = publisher.recover(&preview.operation_id);
+            publisher.republish(&preview.operation_id, &generation(&result))
+        } else {
+            publisher.retry(&preview.operation_id)
+        };
+        assert_eq!(completed.status, Status::Delivered, "{completed:?}");
+        assert_eq!(commit(&completed), known);
+        assert_eq!(f.remote_ref(foreign), None);
+        f.source_unchanged(&before);
+    }
+}

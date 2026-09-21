@@ -5,7 +5,7 @@ use super::{
     git::Git,
     process, random_id,
     record::{Description, oid},
-    refs::RefEvidence,
+    refs::{self, RefEvidence},
 };
 
 fn command(git: &Git, description: &Description) -> Result<(std::process::Command, String)> {
@@ -38,9 +38,28 @@ fn command(git: &Git, description: &Description) -> Result<(std::process::Comman
     Ok((command, alias))
 }
 
+fn local_evidence(git: &Git, description: &Description, reference: &str) -> Option<RefEvidence> {
+    description.destination.local_repository().map(|root| {
+        refs::observe(
+            &Git {
+                root: root.to_path_buf(),
+                hooks: git.hooks.clone(),
+                deadline: git.deadline,
+            },
+            reference,
+        )
+    })
+}
+
 pub(super) fn observe(git: &Git, description: &Description, reference: &str) -> RefEvidence {
     let read = || -> Result<RefEvidence> {
         let (mut command, alias) = command(git, description)?;
+        // Git's advertisement omits dangling symrefs. A zero-value lease can
+        // dereference one, so local destinations also require direct evidence.
+        let local = local_evidence(git, description, reference);
+        if matches!(local, Some(RefEvidence::Symbolic | RefEvidence::Unreadable)) {
+            return Ok(local.unwrap());
+        }
         command.args(["ls-remote", "--symref", "--refs", &alias, reference]);
         let output = process::run(command, &[], git.deadline)?;
         if !output.status.success() {
@@ -64,13 +83,24 @@ pub(super) fn observe(git: &Git, description: &Description, reference: &str) -> 
             }
             found = Some(RefEvidence::Direct(value.into()));
         }
-        Ok(found.unwrap_or(RefEvidence::Absent))
+        let advertised = found.unwrap_or(RefEvidence::Absent);
+        if local.is_some_and(|local| local != advertised) {
+            return Ok(RefEvidence::Unreadable);
+        }
+        Ok(advertised)
     };
     read().unwrap_or(RefEvidence::Unreadable)
 }
 
 pub(super) fn push(git: &Git, description: &Description, commit: &str) -> Result<()> {
     let (mut command, alias) = command(git, description)?;
+    if local_evidence(git, description, &description.output_ref)
+        .is_some_and(|evidence| evidence != RefEvidence::Absent)
+    {
+        return Err(Error::new(
+            "The local destination ref is not directly absent",
+        ));
+    }
     command
         .args([
             "push",

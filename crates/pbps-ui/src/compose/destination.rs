@@ -98,6 +98,10 @@ impl Destination {
 }
 
 impl Destination {
+    pub(super) fn local_repository(&self) -> Option<&Path> {
+        (self.transport == "file").then(|| Path::new(&self.repository))
+    }
+
     pub(super) fn endpoint(&self) -> Result<String> {
         let host = self.host.as_deref().unwrap_or_default();
         let port = self.port.map(|p| format!(":{p}")).unwrap_or_default();
