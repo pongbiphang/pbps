@@ -620,3 +620,243 @@ fn own_start_time() -> String {
     let after_name = &stat[stat.rfind(')').unwrap() + 1..];
     after_name.split_whitespace().nth(19).unwrap().to_owned()
 }
+
+// ---------------------------------------------------------------------------
+// Round one of review: seven defects, seven tests.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_refusal_after_the_locks_are_taken_leaves_no_lock_behind() {
+    // `.git/index.lock` and `HEAD.lock` stop *every* `git` command in the
+    // checkout, not just this UI's, and the record is removed on the way out —
+    // so a refusal that dropped the locks without releasing them would leave
+    // the repository unusable with nothing on disk to explain it.
+    let checkout = Checkout::new("lock-leak");
+    edited(&checkout);
+    // A `filter` attribute is refused, and it is refused inside `install` —
+    // after step 0 has taken both locks.
+    // Scoped to the declarations: a `*.yml` rule would catch `pbps.yml` too,
+    // and the compose would then be refused a step earlier, before the locks
+    // this test is about are ever taken.
+    checkout.write(".gitattributes", "schema/*.yml filter=up\n");
+    checkout.git(&["config", "filter.up.clean", "tr a-z A-Z"]);
+    checkout.git(&["add", "-A"]);
+    checkout.git(&["commit", "-q", "-m", "an attribute the compose refuses"]);
+    let tip = checkout.git(&["rev-parse", "HEAD"]);
+    edited(&checkout);
+    let git = checkout.runner();
+    let cli = checkout.cli();
+    let file = project_file();
+
+    let refusal = compose(&checkout, &git, &cli, &file)
+        .run(&rename_request())
+        .expect_err("a filter attribute is refused");
+    assert!(refusal.to_string().contains("filter"), "{refusal}");
+
+    assert!(
+        !checkout.path(".git/index.lock").exists(),
+        "index.lock would block every git command in this checkout"
+    );
+    assert!(!checkout.path(".git/HEAD.lock").exists());
+    assert_eq!(checkout.git(&["rev-parse", "HEAD"]), tip);
+    // And `git` itself agrees the checkout is usable.
+    checkout.git(&["status", "--porcelain"]);
+}
+
+#[test]
+fn a_branch_behind_its_remote_is_refused_before_a_file_is_placed() {
+    // A refusal that arrived after the branch had moved would be one the user
+    // cannot act on, so every deterministic question about the destination is
+    // asked first.
+    let checkout = Checkout::new("unpushed");
+    let tip = checkout.git(&["rev-parse", "HEAD"]);
+    let bare = checkout.path("..").join("remote.git");
+    Command::new("git")
+        .args(["init", "-q", "--bare", "-b", "main"])
+        .arg(&bare)
+        .output()
+        .unwrap();
+    checkout.git(&["remote", "add", "origin", bare.to_str().unwrap()]);
+    checkout.git(&["push", "-q", "origin", "main"]);
+    // The local branch moves on; the remote stays where it was.
+    checkout.write("unrelated.txt", "one\n");
+    checkout.git(&["add", "-A"]);
+    checkout.git(&["commit", "-q", "-m", "unrelated"]);
+    let ahead = checkout.git(&["rev-parse", "HEAD"]);
+    edited(&checkout);
+    let before = checkout.read("schema/customer.yml");
+    let git = checkout.runner();
+    let cli = checkout.cli();
+    let file = project_file();
+
+    let mut asked = rename_request();
+    asked.remote = "origin".to_owned();
+    let refusal = compose(&checkout, &git, &cli, &file)
+        .run(&asked)
+        .expect_err("a branch ahead of its remote is refused");
+
+    assert!(
+        refusal.to_string().contains("push what you already have"),
+        "{refusal}"
+    );
+    assert_eq!(checkout.git(&["rev-parse", "HEAD"]), ahead);
+    assert_eq!(checkout.read("schema/customer.yml"), before);
+    assert!(!checkout.path(".git/index.lock").exists());
+    let _ = tip;
+}
+
+#[test]
+fn a_save_between_the_preview_and_the_commit_is_refused_rather_than_overwritten() {
+    // The blob ids the preview read are sent back with the confirmation, and
+    // step 1 compares them against the files as they are *then*. Without them
+    // the guard has nothing to compare with and never fires.
+    let checkout = Checkout::new("shown");
+    edited(&checkout);
+    let git = checkout.runner();
+    let cli = checkout.cli();
+    let file = project_file();
+
+    let preview = compose(&checkout, &git, &cli, &file)
+        .preview(&rename_request())
+        .expect("the preview finishes");
+    assert!(
+        preview.shown.contains_key("schema.ids.json"),
+        "the preview reports what it read: {:?}",
+        preview.shown
+    );
+
+    // An editor saves the ids file while the diff is being read.
+    let theirs = format!("{}\n", checkout.read("schema.ids.json").trim_end());
+    checkout.write("schema.ids.json", &format!("{theirs}\n"));
+
+    let mut confirmed = rename_request();
+    confirmed.shown = preview.shown.clone();
+    let refusal = compose(&checkout, &git, &cli, &file)
+        .run(&confirmed)
+        .expect_err("the newer work is not overwritten");
+    assert!(
+        refusal.to_string().contains("changed since it was read"),
+        "{refusal}"
+    );
+
+    // The control that shows the field is doing the work: with an empty map
+    // the same request goes through and the editor's save is exchanged away.
+    let composed = compose(&checkout, &git, &cli, &file)
+        .run(&rename_request())
+        .expect("an empty `shown` has nothing to compare with");
+    assert!(!composed.commit.is_empty());
+}
+
+#[test]
+fn a_record_this_version_cannot_read_stops_composing_rather_than_being_ignored() {
+    // Absent, empty and unreadable are three different things. An unreadable
+    // record may be a live compose's, and its locks and placed files are then
+    // in use this instant.
+    let checkout = Checkout::new("unreadable-record");
+    edited(&checkout);
+    let composing = checkout.path(".git/pbps-ui/composing");
+    std::fs::create_dir_all(&composing).unwrap();
+    std::fs::write(composing.join("truncated.json"), b"{\"id\":\"half of a").unwrap();
+    let git = checkout.runner();
+    let cli = checkout.cli();
+    let file = project_file();
+
+    let recovered = pbps_ui::compose::recover::at_launch(&git, &checkout.path(".git"));
+    assert!(
+        matches!(
+            recovered.first(),
+            Some(pbps_ui::compose::recover::Recovered::Undecided { .. })
+        ),
+        "{recovered:?}"
+    );
+    assert_eq!(
+        records_of(&checkout).len(),
+        1,
+        "and it is kept, not quietly removed"
+    );
+
+    let refusal = compose(&checkout, &git, &cli, &file)
+        .run(&rename_request())
+        .expect_err("composing is refused while it stands");
+    assert!(
+        matches!(refusal, Refusal::AlreadyComposing),
+        "got {refusal}"
+    );
+}
+
+#[test]
+fn an_execute_bit_changed_in_the_working_tree_is_what_the_commit_records() {
+    // `git add` records the bit and the tip's entry does not know about it, so
+    // committing at the tip's mode leaves `git status` reporting the path
+    // modified after a compose that was supposed to leave it clean. A
+    // mode-only change is a change for the same reason.
+    let checkout = Checkout::new("exec-bit");
+    edited(&checkout);
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(
+        checkout.path("schema/customer.yml"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let git = checkout.runner();
+    let cli = checkout.cli();
+    let file = project_file();
+
+    let composed = compose(&checkout, &git, &cli, &file)
+        .run(&rename_request())
+        .expect("the compose finishes");
+
+    assert_eq!(
+        checkout
+            .git(&["ls-tree", &composed.commit, "--", "schema/customer.yml"])
+            .split_whitespace()
+            .next()
+            .unwrap(),
+        "100755",
+        "the commit records the bit the working tree carries"
+    );
+    assert_eq!(
+        checkout.git(&["status", "--porcelain"]),
+        "",
+        "and the checkout is clean"
+    );
+}
+
+#[test]
+fn a_run_leaves_no_snapshot_of_the_project_behind_it() {
+    // Each run writes the project's subtree twice — once for the intent
+    // command, once for `validate` — under a fresh random name. Three previews
+    // before a commit would otherwise leave six copies, and nothing would ever
+    // remove them.
+    let checkout = Checkout::new("sweep");
+    edited(&checkout);
+    let git = checkout.runner();
+    let cli = checkout.cli();
+    let file = project_file();
+
+    for _ in 0..3 {
+        compose(&checkout, &git, &cli, &file)
+            .preview(&rename_request())
+            .expect("the preview finishes");
+    }
+    assert_eq!(left_under(&checkout, "intent"), 0);
+    assert_eq!(left_under(&checkout, "validate"), 0);
+
+    compose(&checkout, &git, &cli, &file)
+        .run(&rename_request())
+        .expect("the compose finishes");
+    assert_eq!(left_under(&checkout, "intent"), 0);
+    assert_eq!(left_under(&checkout, "validate"), 0);
+    let indexes = std::fs::read_dir(checkout.path(".git/pbps-ui"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".index"))
+        .count();
+    assert_eq!(indexes, 0, "nor a private index");
+}
+
+fn left_under(checkout: &Checkout, what: &str) -> usize {
+    std::fs::read_dir(checkout.path(".git/pbps-ui").join(what))
+        .map(|entries| entries.filter_map(Result::ok).count())
+        .unwrap_or(0)
+}

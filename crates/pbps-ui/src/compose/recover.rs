@@ -55,9 +55,36 @@ pub fn at_launch(git: &Git, git_dir: &Path) -> Vec<Recovered> {
     };
     names
         .into_iter()
-        .filter_map(|name| records.read(&name).ok())
-        .map(|record| one(git, git_dir, &records, record))
+        .map(|name| match records.read(&name) {
+            Ok(record) => one(git, git_dir, &records, record),
+            // Absent, empty and unreadable are three different things, and
+            // only one of them is good news (AGENTS.md). A truncated record, a
+            // permission denied, or one written by a later version is evidence
+            // that *something* was interrupted; dropping it would let this UI
+            // advertise composing while an unaccounted compose still owns
+            // locks or placed files.
+            Err(e) => Recovered::Undecided {
+                record: name.to_string_lossy().into_owned(),
+                why: format!("this record could not be read ({e}), so nothing was touched"),
+            },
+        })
         .collect()
+}
+
+/// True where any record on disk is either a live compose's or one this UI
+/// could not read. Both mean the same thing for the question being asked:
+/// something may still own the locks and the placed files.
+pub fn something_else_owns_this_checkout(git_dir: &Path) -> bool {
+    let Ok(records) = Records::open(git_dir) else {
+        return false;
+    };
+    let Ok(names) = records.list() else {
+        return false;
+    };
+    names.into_iter().any(|name| match records.read(&name) {
+        Ok(record) => record.process.alive(),
+        Err(_) => true,
+    })
 }
 
 fn one(git: &Git, git_dir: &Path, records: &Records, mut record: Record) -> Recovered {

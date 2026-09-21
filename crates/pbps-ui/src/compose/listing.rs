@@ -31,6 +31,14 @@ pub struct Input {
     pub state: State,
     /// The tip's entry, where it has one.
     pub recorded: Option<(u32, String)>,
+    /// The execute bit the working tree's file carries now.
+    ///
+    /// Carried because `git add` records it and the tip's entry does not know
+    /// about it: a declaration whose bit was changed — with the content or
+    /// instead of it — committed at the tip's mode leaves `git status`
+    /// reporting the path modified after a compose that was supposed to leave
+    /// it clean.
+    pub executable: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -116,7 +124,7 @@ pub fn inputs(
     git: &Git,
     tip: &str,
     inputs: &Inputs<'_>,
-    mut hash_of: impl FnMut(&RepoPath) -> Option<String>,
+    mut look_at: impl FnMut(&RepoPath) -> Option<(String, bool)>,
 ) -> Result<Vec<Input>, ListingRefusal> {
     let mut found: BTreeMap<RepoPath, Input> = BTreeMap::new();
 
@@ -134,9 +142,17 @@ pub fn inputs(
                 tag,
             });
         }
-        let state = match hash_of(&entry.path) {
+        let found_now = look_at(&entry.path);
+        // A mode-only change is a change. Comparing the blob alone reads a
+        // declaration whose execute bit was flipped as unchanged, leaves it
+        // out of the commit, and leaves the checkout dirty afterwards.
+        let state = match &found_now {
             None => State::Deleted,
-            Some(blob) if blob == entry.blob => State::Unchanged,
+            Some((blob, executable))
+                if *blob == entry.blob && *executable == (entry.mode == 0o100755) =>
+            {
+                State::Unchanged
+            }
             Some(_) => State::Edited,
         };
         found.insert(
@@ -145,6 +161,7 @@ pub fn inputs(
                 path: entry.path,
                 state,
                 recorded: Some((entry.mode, entry.blob)),
+                executable: found_now.map(|(_, executable)| executable),
             },
         );
     }
@@ -159,10 +176,12 @@ pub fn inputs(
                 path: path.to_string(),
             });
         }
+        let executable = look_at(&path).map(|(_, executable)| executable);
         found.entry(path.clone()).or_insert(Input {
             path,
             state: State::New,
             recorded: None,
+            executable,
         });
     }
 
@@ -310,13 +329,17 @@ mod tests {
         RepoPath::new(text.as_bytes()).unwrap()
     }
 
-    fn read_hashes(scratch: &Scratch) -> impl FnMut(&RepoPath) -> Option<String> + '_ {
+    fn read_hashes(scratch: &Scratch) -> impl FnMut(&RepoPath) -> Option<(String, bool)> + '_ {
         move |wanted: &RepoPath| {
+            use std::os::unix::fs::PermissionsExt as _;
             let file = scratch.path(wanted.to_text().unwrap());
-            std::fs::read(&file).ok().map(|bytes| {
-                let git = scratch.runner();
-                super::super::attributes::hash(&git, &bytes).unwrap()
-            })
+            let bytes = std::fs::read(&file).ok()?;
+            let executable = std::fs::metadata(&file).ok()?.permissions().mode() & 0o111 != 0;
+            let git = scratch.runner();
+            Some((
+                super::super::attributes::hash(&git, &bytes).unwrap(),
+                executable,
+            ))
         }
     }
 

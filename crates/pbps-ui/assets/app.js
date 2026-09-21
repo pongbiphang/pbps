@@ -126,7 +126,10 @@
       intent,
       message: byId("compose-message").value,
       remote: byId("compose-remote").value,
-      shown: {}
+      // What the preview read, sent back so the confirmation is checked
+      // against the files as they are *now*: an editor that saved while you
+      // were reading the diff is refused rather than overwritten.
+      shown: previewed ? previewed.shown : {}
     };
   }
   function describeIntent() {
@@ -267,12 +270,19 @@
       commit: composed.commit,
       branch: composed.branch,
       signature: composed.signature || "not signed",
-      pushed_to: composed.destination || "not pushed",
+      pushed_to: composed.destination || (composed.push_refused ? "push failed" : "not pushed"),
       hooks_did_not_run: composed.hooks_did_not_run
     }));
     const list = node("ul");
     for (const path of composed.paths) list.append(node("li", path));
     box.append(node("h3", "Files in the commit"), list);
+    if (composed.push_refused) {
+      const warn = node("article", undefined, "finding error");
+      warn.append(node("strong", "The commit is on your branch; the push did not happen"),
+                  node("p", composed.push_refused),
+                  node("p", "Push it yourself when the remote is reachable.", "muted"));
+      findings.append(warn);
+    }
     for (const kept of composed.retained) box.append(node("p", kept, "muted"));
     content.append(box);
     activity.textContent = `${composed.commit} on ${composed.branch}`;

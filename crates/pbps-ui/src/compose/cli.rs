@@ -241,27 +241,51 @@ impl Cli {
         let mut child = command
             .spawn()
             .map_err(|e| CliRefusal::Unstartable(e.to_string()))?;
+        // Drained on threads, like the `git` runner's. A `doctor` or
+        // `validate` envelope for a real schema is far larger than a pipe,
+        // and a child blocked in a write while this loop waits for its exit
+        // is a deadlock that ends at the deadline and is then reported as if
+        // the command had never started.
+        let mut out = child.stdout.take().expect("stdout was piped");
+        let mut err = child.stderr.take().expect("stderr was piped");
+        let reading = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut out, &mut bytes);
+            bytes
+        });
+        let erring = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut err, &mut bytes);
+            bytes
+        });
         let started = std::time::Instant::now();
-        loop {
+        let status = loop {
             match child.try_wait() {
-                Ok(Some(_)) => break,
+                Ok(Some(status)) => break Some(status),
                 Ok(None) => {}
                 Err(e) => return Err(CliRefusal::Unstartable(e.to_string())),
             }
             if started.elapsed() >= self.deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(CliRefusal::Unstartable(format!(
-                    "`pbps {}` did not finish within {}s",
-                    arguments.join(" "),
-                    self.deadline.as_secs()
-                )));
+                break None;
             }
             std::thread::sleep(Duration::from_millis(5));
+        };
+        let stdout = reading.join().unwrap_or_default();
+        let stderr = erring.join().unwrap_or_default();
+        match status {
+            Some(status) => Ok(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            }),
+            None => Err(CliRefusal::Unstartable(format!(
+                "`pbps {}` did not finish within {}s",
+                arguments.join(" "),
+                self.deadline.as_secs()
+            ))),
         }
-        child
-            .wait_with_output()
-            .map_err(|e| CliRefusal::Unstartable(e.to_string()))
     }
 }
 
@@ -355,6 +379,62 @@ mod tests {
         assert!(
             serde_json::from_str::<Intent>(r#"{"kind":"rename","from":"a.b.c","to":"d"}"#).is_ok()
         );
+    }
+
+    #[test]
+    fn an_answer_larger_than_a_pipe_is_read_rather_than_waited_on() {
+        // The child's stdout and stderr are pipes, and a pipe holds 64 KiB.
+        // A runner that waited for the exit before reading would block the
+        // child in a write; the compose would then end at its deadline and be
+        // reported as if the command had never started. Both streams are
+        // oversized here, because draining one and not the other deadlocks
+        // just as thoroughly.
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = std::env::temp_dir().join(format!(
+            "pbps-cli-pipe-{}-{}",
+            std::process::id(),
+            crate::compose::record::random_name().unwrap()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let envelope = serde_json::json!({
+            "schema_version": 9,
+            "tool_version": "0.0.0",
+            "command": "doctor",
+            "result": "ok",
+            "findings": [],
+            "data": {
+                "declarations": "./schema",
+                "identity_file": "./schema.ids.json",
+                // A megabyte of payload, which is what a real estate's
+                // `doctor` carries and what no pipe will hold.
+                "padding": "x".repeat(1024 * 1024),
+            },
+        });
+        let script = directory.join("pbps-with-a-lot-to-say");
+        let mut file = std::fs::File::create(&script).unwrap();
+        write!(
+            file,
+            "#!/bin/sh\nhead -c 200000 /dev/zero | tr '\\0' 'e' >&2\ncat <<'ENVELOPE'\n{}\nENVELOPE\n",
+            serde_json::to_string(&envelope).unwrap()
+        )
+        .unwrap();
+        drop(file);
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let cli = Cli {
+            executable: script,
+            deadline: Duration::from_secs(20),
+        };
+        let started = std::time::Instant::now();
+        let found = cli.where_are_the_inputs(&directory).expect("it answers");
+
+        assert_eq!(found.declarations, "./schema");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "it answered at the deadline, which is what a blocked pipe looks like"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

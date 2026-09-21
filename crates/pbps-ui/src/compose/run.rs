@@ -62,6 +62,14 @@ pub struct Preview {
     pub paths: Vec<String>,
     /// Prefilled from the intent, spelled the way the CLI spells it.
     pub message: String,
+    /// The blob the UI read for each path it would touch, by path.
+    ///
+    /// Sent back with the confirmation, where step 1 compares it against the
+    /// file as it is *then*. Without it the editor-race guard has nothing to
+    /// compare with and never fires: a save between the diff and the
+    /// confirmation would be exchanged away for bytes derived from the
+    /// earlier read, which is the one thing that guard exists to prevent.
+    pub shown: BTreeMap<String, String>,
 }
 
 /// Either answer.
@@ -81,6 +89,14 @@ pub struct Composed {
     /// user's configuration applied it, not a guarantee this UI adds.
     pub signature: String,
     pub destination: Option<String>,
+    /// A push that failed *after* the commit was made.
+    ///
+    /// A late transport failure is not "nothing happened": the branch has
+    /// moved, the index is installed, and the working tree matches the
+    /// commit. Reporting it as a refusal would tell the user their checkout
+    /// was untouched while a commit sat on their branch, and the next thing
+    /// they would do is make it again.
+    pub push_refused: Option<String>,
     /// What a compose left beside a path, named so the user can find it. The
     /// UI never deletes one of these: a descriptor can outlive any number of
     /// composes.
@@ -231,6 +247,14 @@ impl Compose<'_> {
         }
     }
 
+    /// The scratch a single run needs and nothing keeps.
+    fn sweep(&self, id: &str) {
+        let under = self.git_dir.join("pbps-ui");
+        let _ = std::fs::remove_dir_all(under.join("intent").join(id));
+        let _ = std::fs::remove_dir_all(under.join("validate").join(id));
+        let _ = std::fs::remove_file(under.join(format!("{id}.index")));
+    }
+
     fn reached(&self, phase: Phase) {
         if let Some(watching) = self.watching {
             watching(phase);
@@ -277,6 +301,13 @@ impl Compose<'_> {
             // record goes last, as it does on the success path.
             let _ = records.remove(&record);
         }
+        // Whatever the outcome. Each run writes the project's subtree twice —
+        // once for the intent command, once for `validate` — under a fresh
+        // random name, so a user reading three previews before committing
+        // would otherwise leave six copies behind, and nothing would ever
+        // remove them. The record is the only thing under `pbps-ui` that
+        // outlives its run, and only while it has something to say.
+        self.sweep(&record.id);
         outcome
     }
 
@@ -287,10 +318,13 @@ impl Compose<'_> {
     /// compose's, in use this instant.
     fn someone_else_is_composing(&self, records: &Records) -> Result<bool, Refusal> {
         for name in records.list().map_err(|e| Refusal::Io(e.to_string()))? {
-            if let Ok(found) = records.read(&name)
-                && found.process.alive()
-            {
-                return Ok(true);
+            match records.read(&name) {
+                Ok(found) if found.process.alive() => return Ok(true),
+                Ok(_) => {}
+                // A record this UI cannot read is not a record that is not
+                // there. It may be a live compose's, and its locks and placed
+                // files are then in use this instant.
+                Err(_) => return Ok(true),
             }
         }
         Ok(false)
@@ -333,8 +367,14 @@ impl Compose<'_> {
                 declarations: &declarations,
                 ids_file: &ids_file,
             },
-            |path| self.hash_of(&root, path),
+            |path| self.look_at(&root, path),
         )?;
+
+        // Every deterministic question about the destination is asked here,
+        // before a file is placed: ADR-0015 decision 5 reads the remote's tip
+        // "before composing", and a refusal that arrives after the branch has
+        // moved is one the user cannot act on.
+        let (destination, remote_has_branch) = self.destination_for(request, &lease)?;
 
         // The overlay, and then the command.
         self.overlay(&root, &intent_directory, &listed)?;
@@ -395,6 +435,8 @@ impl Compose<'_> {
             &index_lock,
             held,
             &mut placement,
+            destination,
+            remote_has_branch,
         );
         if result.is_err() {
             // Every undo publishes `rolling-back` first; the record's per-path
@@ -424,6 +466,8 @@ impl Compose<'_> {
         index_lock: &Path,
         mut held: Guard,
         placement: &mut Placement,
+        destination: Option<push::Destination>,
+        remote_has_branch: bool,
     ) -> Result<Done, Refusal> {
         // Everything the compose will commit: the listed files, which already
         // hold their bytes in the working tree, and every file the command
@@ -444,9 +488,20 @@ impl Compose<'_> {
             .filter(|input| input.state != State::Unchanged)
             .collect();
 
-        // Step 1's per-path checks, for everything that will be committed.
-        for input in listed {
-            self.index_entry_is_the_tips(&input.path, &lease.tip)?;
+        // Step 1's per-path checks, for everything that will be committed —
+        // the listed files *and* the ones the command produced. Sweeping the
+        // same shape the attribute check was found missing on: a path this
+        // compose is about to edit can be one the listing never named, and its
+        // staged entry matters just as much.
+        let mut checked = BTreeSet::new();
+        for path in listed
+            .iter()
+            .map(|input| &input.path)
+            .chain(to_place.iter().map(|wanted| &wanted.path))
+        {
+            if checked.insert(path.clone()) {
+                self.index_entry_is_the_tips(path, &lease.tip)?;
+            }
         }
 
         // The `placing` phase, with both identities of every path, before the
@@ -520,6 +575,25 @@ impl Compose<'_> {
                     path: input.path.to_string(),
                 })
             })?;
+            // The attribute check belongs to every path the commit holds, not
+            // only to the ones step 2 placed. A listed file keeps the bytes
+            // the user gave it and the UI never writes it — but it does store
+            // a blob for it, and a `filter` or an `ident` rule would leave
+            // that blob disagreeing with the file, so `git status` reports the
+            // path modified the moment it is committed. Found by a test
+            // written for something else: the compose it was supposed to
+            // refuse succeeded, because the only filtered path was one that
+            // nothing placed.
+            super::attributes::refuse_transformations(
+                self.git,
+                input.path.to_text().ok_or_else(|| {
+                    Refusal::Io("a listed path is not text git can be given".to_owned())
+                })?,
+                &lease.tip,
+                &bytes,
+                &bytes,
+            )
+            .map_err(|e| Refusal::Place(PlaceRefusal::Attribute(e)))?;
             let blob = super::attributes::store(self.git, &bytes)
                 .map_err(|e| Refusal::Place(PlaceRefusal::Attribute(e)))?;
             entries.push(CacheEntry {
@@ -570,6 +644,16 @@ impl Compose<'_> {
                     .chain(removals.iter().map(RepoPath::to_string))
                     .collect(),
                 message: request.intent.message(),
+                shown: record
+                    .paths
+                    .iter()
+                    .filter_map(|placed| {
+                        placed
+                            .original
+                            .as_ref()
+                            .map(|original| (placed.path.clone(), original.blob.clone()))
+                    })
+                    .collect(),
             }));
         }
 
@@ -653,14 +737,33 @@ impl Compose<'_> {
         let _ = records.remove(record);
         let _ = std::fs::remove_dir_all(intent_directory);
 
-        // The push, last, and only once the checkout is the commit's.
-        let destination = self.publish(request, lease, &commit)?;
+        // The push, last, and only once the checkout is the commit's. Every
+        // *deterministic* question about the destination — how many URLs it
+        // has, whether a rewrite rule would move it, whether the branch is
+        // behind the remote — was asked before anything was placed, so what is
+        // left here is the transport, and a transport failure is reported
+        // beside the commit rather than instead of it.
+        let published = match &destination {
+            None => Ok(None),
+            Some(destination) => {
+                let created = if remote_has_branch {
+                    Ok(())
+                } else {
+                    push::publish_branch(self.git, destination, &lease.reference, &lease.tip)
+                };
+                created.and_then(|()| {
+                    push::push(self.git, destination, &lease.reference, &lease.tip, &commit)
+                        .map(Some)
+                })
+            }
+        };
 
         Ok(Done::Composed(Composed {
             commit: commit.clone(),
             branch: lease.reference.clone(),
             signature: tree::signature_state(self.git, &commit),
-            destination,
+            destination: published.as_ref().ok().and_then(Clone::clone),
+            push_refused: published.err().map(|refusal| refusal.to_string()),
             retained,
             paths: entries
                 .iter()
@@ -671,21 +774,23 @@ impl Compose<'_> {
         }))
     }
 
-    fn publish(
+    /// The destination, and whether the remote already has the branch.
+    ///
+    /// Answered before anything is placed. The branch is *not* created here
+    /// even when the remote lacks it: publishing a branch is a visible act the
+    /// user confirms, and a preview must leave the remote as it found it.
+    fn destination_for(
         &self,
         request: &Request,
         lease: &Lease,
-        commit: &str,
-    ) -> Result<Option<String>, Refusal> {
+    ) -> Result<(Option<push::Destination>, bool), Refusal> {
         if request.remote.is_empty() {
-            return Ok(None);
+            return Ok((None, true));
         }
         let destination = push::destination(self.git, &request.remote, self.remote_name.clone())?;
-        match push::remote_tip(self.git, &destination, &lease.reference)? {
-            None => {
-                push::publish_branch(self.git, &destination, &lease.reference, &lease.tip)?;
-            }
-            Some(there) if there == lease.tip => {}
+        let has_branch = match push::remote_tip(self.git, &destination, &lease.reference)? {
+            None => false,
+            Some(there) if there == lease.tip => true,
             Some(there) => {
                 return Err(Refusal::Push(PushRefusal::Unpushed {
                     branch: lease.reference.clone(),
@@ -693,29 +798,27 @@ impl Compose<'_> {
                     remote: there,
                 }));
             }
-        }
-        Ok(Some(push::push(
-            self.git,
-            &destination,
-            &lease.reference,
-            &lease.tip,
-            commit,
-        )?))
+        };
+        Ok((Some(destination), has_branch))
     }
 
     fn mode_for(&self, listed: &[listing::Input], path: &RepoPath, placement: &Placement) -> u32 {
-        // For a path step 2 placed, the tip's mode, since the exchange refuses
-        // a working-tree mode that differs from it. For a listed file, which
-        // keeps the bytes and the mode the user gave it, the mode `git add`
-        // would record — the user may have changed that bit along with the
-        // content, or instead of it, and the tip's mode would leave the path
-        // modified after a compose that was supposed to leave `git status`
-        // clean.
-        listed
-            .iter()
-            .find(|input| input.path == *path)
-            .and_then(|input| input.recorded.as_ref().map(|(mode, _)| *mode))
-            .unwrap_or_else(|| placement.mode_for_new(path, self.file_mode_honoured()))
+        // For a listed file, which keeps the bytes and the mode the user gave
+        // it, the mode `git add` would record: the user may have changed that
+        // bit along with the content, or instead of it, and the tip's mode
+        // would leave the path modified after a compose that was supposed to
+        // leave `git status` clean. Under `core.fileMode=false` `git` does not
+        // read the bit at all, so the tip's mode is what it would record.
+        let honoured = self.file_mode_honoured();
+        match listed.iter().find(|input| input.path == *path) {
+            Some(input) => match (honoured, input.executable, input.recorded.as_ref()) {
+                (true, Some(true), _) => 0o100755,
+                (true, Some(false), _) => 0o100644,
+                (_, _, Some((mode, _))) => *mode,
+                (_, _, None) => 0o100644,
+            },
+            None => placement.mode_for_new(path, honoured),
+        }
     }
 
     fn file_mode_honoured(&self) -> bool {
@@ -845,9 +948,21 @@ impl Compose<'_> {
         Ok((declarations, ids_file))
     }
 
+    /// What the working tree holds for one input: the blob `git` would store
+    /// for its bytes, and the execute bit `git add` would record.
+    fn look_at(&self, root: &Dir, path: &RepoPath) -> Option<(String, bool)> {
+        let (parent, leaf) = root.walk_to_parent(path).ok()?;
+        let look = parent.look(&leaf).ok()??;
+        if look.is_link || !look.is_regular {
+            return None;
+        }
+        let bytes = parent.open_file(&leaf).ok()?.read().ok()?;
+        let blob = super::attributes::hash(self.git, &bytes).ok()?;
+        Some((blob, look.mode & 0o111 != 0))
+    }
+
     fn hash_of(&self, root: &Dir, path: &RepoPath) -> Option<String> {
-        let bytes = self.read_through_handle(root, path)?;
-        super::attributes::hash(self.git, &bytes).ok()
+        self.look_at(root, path).map(|(blob, _)| blob)
     }
 
     /// Every hash the UI takes of a working-tree file is taken over bytes read
@@ -982,6 +1097,18 @@ impl Compose<'_> {
 }
 
 /// The locks a compose holds, released together whatever the outcome.
+///
+/// The release is in `Drop` and not only in a call, because "whatever the
+/// outcome" has to include the outcomes nobody enumerated. A refusal anywhere
+/// between step 0 and step 6 — an attribute check, `validate`, a `write-tree`
+/// — leaves `.git/index.lock` and `HEAD.lock` on disk, and those two files
+/// stop *every* `git` command in the checkout, not just this UI's. With the
+/// record removed on the way out there would then be nothing on disk from
+/// which recovery could clear them, so a single refused compose would leave
+/// the repository unusable until someone found the files by hand.
+///
+/// `release` stays as the explicit call on the paths that have something to
+/// say afterwards; `Drop` is what makes forgetting it unrepresentable.
 struct Guard {
     index_lock: PathBuf,
     head: Option<Held>,
@@ -989,7 +1116,10 @@ struct Guard {
 }
 
 impl Guard {
-    fn release(mut self) {
+    /// Idempotent: each lock is taken out of its `Option`, and removing a
+    /// file that is already gone — which is what step 6's rename leaves —
+    /// is not an error.
+    fn release(&mut self) {
         if let Some(head) = self.head.take() {
             let _ = head.release();
         }
@@ -997,6 +1127,12 @@ impl Guard {
             let _ = branch.release();
         }
         let _ = std::fs::remove_file(&self.index_lock);
+    }
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
