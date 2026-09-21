@@ -3,7 +3,8 @@
 //! containment, target separation and the relevant engine compatibility.
 
 use super::{
-    File, ProcessLease, UnqualifiedProcess, for_each_namespace_task, proc_base, socket_owners,
+    File, ProcessLease, UnqualifiedProcess, for_each_namespace_task, observed_socket_holders,
+    proc_base,
 };
 use pbps_db::resolver::{BackendProcess, InstanceObservation};
 use pbps_db::transport::ConnectionId;
@@ -79,12 +80,12 @@ impl PrivateChannelLease {
         guard(&control, FORWARDER_PRIVILEGES.capabilities)?;
         private_network(&workload)?;
         let sockets = sockets(&workload, profile.port)?;
-        let mut backends = socket_owners(&workload, sockets.server)?;
+        let mut backends = observed_socket_holders(&workload, sockets.server)?;
         if backends.len() != 1 {
             return Err(UnqualifiedProcess);
         }
         let backend = backends.remove(0);
-        let forwarders = socket_owners(&control, sockets.client)?;
+        let forwarders = observed_socket_holders(&control, sockets.client)?;
         let lease = Self {
             connection,
             workload,
@@ -127,11 +128,11 @@ impl PrivateChannelLease {
         if current != self.sockets {
             return Err(UnqualifiedProcess);
         }
-        let backends = socket_owners(&self.workload, current.server)?;
+        let backends = observed_socket_holders(&self.workload, current.server)?;
         if backends.len() != 1 || !backends[0].same_process(&self.backend)? {
             return Err(UnqualifiedProcess);
         }
-        let forwarders = socket_owners(&self.control, current.client)?;
+        let forwarders = observed_socket_holders(&self.control, current.client)?;
         if forwarders.len() != 3 || forwarders.len() != self.forwarders.len() {
             return Err(UnqualifiedProcess);
         }

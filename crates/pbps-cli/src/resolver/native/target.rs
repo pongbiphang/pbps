@@ -120,9 +120,10 @@ impl NativeTarget {
             .map(|state| state.lease.service())
             .ok_or(UnqualifiedProcess)
     }
-    /// A configured service PID scopes read-only process inspection; the
-    /// actual connected socket must belong to that live engine's process tree.
-    /// A PID label alone cannot authorize a proxy or a different backend.
+    /// A configured PID selects the live service and its procfs view. The
+    /// observed connected holder must have a positive parent relation to that
+    /// service; a namespace peer or PID label alone cannot qualify a backend.
+    /// Trusted provisioning excludes hostile socket sharing (DECISIONS 533).
     pub async fn establish(
         mut connection: PeerVerifiedConn,
         service_pid: u32,

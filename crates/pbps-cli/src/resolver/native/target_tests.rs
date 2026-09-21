@@ -24,18 +24,38 @@ async fn native_aliases_share_one_instance_and_backend_children_cannot_claim_ano
         .expect("alternate database and credential connection");
     let first = PeerVerifiedConn::connect(driver, &primary).await.unwrap();
     let upstream = first.tcp_endpoints().peer();
+    let started = std::time::Instant::now();
     let mut first = NativeTarget::establish(first, main_pid).await.unwrap();
+    eprintln!(
+        "native fixture driver={driver:?} establish_ms={}",
+        started.elapsed().as_millis()
+    );
     let witness = first.witness().unwrap();
     witness.check().unwrap();
     let second = PeerVerifiedConn::connect(driver, &alias).await.unwrap();
+    assert!(
+        first
+            .current
+            .as_ref()
+            .unwrap()
+            .lease
+            .check(&second)
+            .is_err(),
+        "a separate connection cannot reuse the previous target lease"
+    );
     let mut second = NativeTarget::establish(second, main_pid).await.unwrap();
+    let started = std::time::Instant::now();
     assert!(
         first.same_instance(&mut second).await.unwrap(),
         "database, credential and address spelling do not establish separation"
     );
+    eprintln!(
+        "native fixture driver={driver:?} two_binding_checks_ms={}",
+        started.elapsed().as_millis()
+    );
     let connection = PeerVerifiedConn::connect(driver, &primary).await.unwrap();
     let observed = SocketOwnerLease::capture(&connection, main_pid).unwrap();
-    let backend = observed.owner().observer_pid().unwrap();
+    let backend = fixture_observer_pid(observed.owner());
     assert_ne!(
         backend, main_pid,
         "this measured fixture must exercise its real backend child"
@@ -47,14 +67,7 @@ async fn native_aliases_share_one_instance_and_backend_children_cannot_claim_ano
 
     // The supervisor owns this fixture and explicitly permits its process to
     // be suspended. No production target is accepted by this ignored test.
-    let backend = first
-        .current
-        .as_ref()
-        .unwrap()
-        .lease
-        .owner()
-        .observer_pid()
-        .unwrap();
+    let backend = fixture_observer_pid(first.current.as_ref().unwrap().lease.owner());
     let suspend = std::process::Command::new("/bin/kill")
         .args(["-STOP", &backend.to_string()])
         .status()
@@ -132,4 +145,16 @@ async fn native_aliases_share_one_instance_and_backend_children_cannot_claim_ano
 
     proxy::unprotected_backend_cannot_inherit_frontend_tls(driver, &primary, upstream, main_pid)
         .await;
+}
+
+// The production owner lease uses the selected procfs view. Only this owned
+// fixture needs an observer PID to suspend its backend; explicitly compare
+// held identities instead of passing a namespace-local number to host kill.
+fn fixture_observer_pid(owner: &super::super::ProcessLease) -> u32 {
+    let namespace = std::fs::File::open("/proc/self/ns/pid").unwrap();
+    assert!(owner.owns_namespace("pid", &namespace).unwrap());
+    let pid = owner.namespace_pid();
+    let candidate = super::super::ProcessLease::capture(pid).unwrap();
+    assert!(candidate.same_process(owner).unwrap());
+    pid
 }

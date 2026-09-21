@@ -87,9 +87,10 @@ def fixture(args, binary, root, owned):
     # Record the exact generated name before create so interrupted replies
     # cannot lose its cleanup scope. No shared test container is modified.
     owned.append(name)
+    pid_scope = ["--pid=host"] if args.native_host else []
     target = run("docker", "create", "--name", name, "--pull", "never", "--network",
                  "host" if args.native_host else "none", "--user", "0", "--memory", "3g",
-                 "--cpus", "2", "--pids-limit", "512", *environment,
+                 "--cpus", "2", "--pids-limit", "512", *pid_scope, *environment,
                  "--entrypoint", "/bin/bash", IMAGES[engine], "-ec", boot,
                  stdout=subprocess.PIPE).stdout.strip()
     for leaf in ("peer.key", "peer.pem"):

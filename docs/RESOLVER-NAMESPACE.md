@@ -3,8 +3,9 @@
 Issue #740 provides the observation primitive for the runtime redesign tracked
 by #737 and #740–#743. Issue #741 uses it for whole-container privilege checks,
 supplied-server engine discovery and pre-engine membership. Issue #742 enforces
-the separately documented launch/workload privilege boundary. Target and socket
-holder qualification retain their existing paths until #743.
+the separately documented launch/workload privilege boundary. Issue #743 uses
+the view for socket-holder observations, separately qualifying the native
+service/backend relation and the verified connection.
 
 ## Contract
 
@@ -140,13 +141,24 @@ that also prepared the password and data directory. No repeated census was
 removed: inheritance bounds dropped descendants, not arbitrary administrator
 runtime-exec entrants. See [the launch contract](RESOLVER-RUNTIME.md#startup-and-continuity).
 
-For #743, a target in a shared host PID namespace cannot acquire a private
-container's small process scope by assumption. The flat namespace source can
-avoid reparenting omissions, but that target's view may still be host-wide.
-The final contract must qualify the selected service, live backend and actual
-connection, preserve ambiguity refusal, and address late creation and
-descriptor transfer explicitly. The primitive does not freeze or reconfigure
-the production target and does not claim to have completed that integration.
+For #743, the native target uses its selected service's procfs view, which
+can be host-wide. Matching socket holders are grouped by TGID after inspecting
+each task's descriptor table. Incidental non-holders need no executable lease,
+so an unrelated user program or kernel thread is not qualified as an engine.
+Required unreadable descriptor tables still refuse. Native connection binding
+then requires a positive relation between the observed backend and selected
+service, rather than accepting another service in the same namespace.
+
+The complete preimplementation report on #743 demonstrates a stable PID list
+and held identities with two holders at every instant, yet an observed count
+of one. Four repeated scans can all produce that count. The approved contract
+therefore trusts environment provisioning against deliberate FD handoff; it
+preserves observation of stable/reparented extra holders and all independent
+identity and containment checks, without promising exhaustive membership.
+An empty result gets only one fresh pass for late visibility, never retries of
+ambiguity or unreadable evidence. See [the target contract](RESOLVER-RUNTIME.md#target-identity-and-socket-observation-743)
+and DECISIONS 533. The acknowledged kernel fixtures run via
+`scripts/live-resolver-sockets.py` in addition to the observer fixture below.
 
 ## Repeatable fixture
 

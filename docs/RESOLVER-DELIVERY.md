@@ -82,8 +82,8 @@ reached through a run-owned forwarder the way the Docker profile reaches its
 own containers. Instance separation is decided from the actual processes
 before the containment measurement and before any database, DDL or
 declaration, so an alias of the target refuses as the target. Exclusivity is
-the kernel's complete census of the engine's namespace plus a cumulative engine
-session counter that only this run may have moved, so a session that opened
+the observed socket rows and holders in the engine's namespace plus a cumulative
+engine session counter that only this run may have moved, so a session that opened
 and closed between two checks still ends the run. Run-owned resources are one
 uniquely named database and login, removed on every exit path, with
 unconfirmed removals reporting exactly those names.
@@ -92,7 +92,9 @@ This is the lifecycle and exclusivity portion of ADR cases 6, 11, 13, 14 and
 19–21 for supplied servers. It is not engine build or deployment-context
 qualification (#610/#611), source handling (#617) or binding evidence: no
 declaration is transferred and no SQL surface is exposed. See
-[the runtime boundary](RESOLVER-RUNTIME.md) for the measured premises.
+[the runtime boundary](RESOLVER-RUNTIME.md) for the measured premises, including
+#743's explicit trusted-provisioning assumption and non-exhaustive holder
+observations (DECISIONS 533).
 
 ## Ordered implementation issues
 

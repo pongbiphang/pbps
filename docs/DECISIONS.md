@@ -14291,3 +14291,40 @@ SPEC is in sync with all of these.
      until publication, durable retirement and restart qualification (#746–#748)
      are complete. This entry does not choose the endpoint-admission policy
      whose separate decision record is tracked by #757.
+
+533. **A socket holder is observed; target identity is positively bound under
+     trusted provisioning, not proved by an exhaustive census (#743).** Real
+     acknowledged FD handoffs kept at least two holders alive throughout a
+     flat scan while it observed one, including four repeated passes with
+     unchanged process identities and socket cookies. The user approved
+     withdrawing the universal uniqueness promise. Kernel/administrator and
+     selected engine provisioning are trusted against deliberate endpoint
+     sharing; native target observation does not freeze or change production.
+
+     Enumerate the selected service's pinned procfs view and read every visible
+     task's descriptor table. Capture executable/process leases for matching
+     thread groups only: unrelated host programs need not have root-installed
+     executables, and shared SQL Server thread tables must not count as many
+     engine processes. A worker's unshared table remains observable. Stable
+     siblings and reparented holders remain visible without descendant walks.
+     Required unreadable evidence refuses; retaining more than three holder
+     leases is unnecessary because the most permissive caller, the fixed
+     forwarder, permits three. An empty observation gets one fresh pass for
+     late backend visibility, not repeated scans as a completeness proof.
+
+     Native binding separately follows the held holder's parent relation to
+     the selected service. Sharing an executable or namespace does not make
+     it that service's backend. Retain the actual TLS connection identity,
+     endpoint/socket pair, held service/backend identities and engine-owned
+     identity query; invalidate replacement, reconnect, canceled checks and
+     discarded witnesses. Known alias/proxy and instance-separation negatives
+     remain required; they do not prove absence of every cooperating proxy.
+
+     All private-channel and supplied-server holder consumers use the same
+     explicitly limited observation. Launch restrictions, cgroup limits,
+     foreign namespace accounting, scratch/target separation and engine session
+     evidence retain their independent roles. The synchronized two-holder
+     omission is documented and tested as a limit of observation, while stable
+     extra holders, reparenting, shared/unshared thread tables and a backend
+     appearing behind the scan have real-kernel regressions. No saved-plan,
+     dialect, driver or deployment authorization boundary changes here.
