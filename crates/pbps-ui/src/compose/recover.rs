@@ -45,8 +45,10 @@ pub enum DeliveryState {
 pub enum Problem {
     ReceiptUnavailable,
     RepositoryChanged,
+    RepositoryUnavailable,
     DestinationChanged,
     SigningChanged,
+    SigningUnavailable,
     RemoteBaseChanged,
     ObjectImportFailed,
     CommitUnavailable,
@@ -158,6 +160,7 @@ pub(super) fn classify(
             Problem::PersistenceUncertain
                 | Problem::ReceiptUnavailable
                 | Problem::RepositoryChanged
+                | Problem::RepositoryUnavailable
         )
     ) {
         status = Status::RecoveryRequired;

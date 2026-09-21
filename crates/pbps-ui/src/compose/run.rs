@@ -94,18 +94,32 @@ impl Publications {
         })
     }
 
-    fn binding(&self, description: &Description) -> std::result::Result<(), Problem> {
-        if description.repository != self.repository
-            || RepositoryIdentity::capture(&self.git).ok().as_ref() != Some(&self.repository)
-        {
+    fn source_binding(&self, description: &Description) -> std::result::Result<(), Problem> {
+        if description.repository != self.repository {
             return Err(Problem::RepositoryChanged);
         }
-        if destination::resolve(&self.git, &description.remote)
-            .ok()
-            .as_ref()
-            != Some(&description.destination)
-        {
+        let current =
+            RepositoryIdentity::capture(&self.git).map_err(|_| Problem::RepositoryUnavailable)?;
+        if current != self.repository {
+            return Err(Problem::RepositoryChanged);
+        }
+        Ok(())
+    }
+
+    fn binding(&self, description: &Description) -> std::result::Result<(), Problem> {
+        self.source_binding(description)?;
+        let current = destination::resolve(&self.git, &description.remote)
+            .map_err(|_| Problem::RemoteUnavailable)?;
+        if current != description.destination {
             return Err(Problem::DestinationChanged);
+        }
+        Ok(())
+    }
+
+    fn signing(&self, description: &Description) -> std::result::Result<(), Problem> {
+        let current = capture::signing(&self.git).map_err(|_| Problem::SigningUnavailable)?;
+        if current != description.signing {
+            return Err(Problem::SigningChanged);
         }
         Ok(())
     }
@@ -159,9 +173,7 @@ impl Publications {
         }
         let admission = (|| {
             self.remote_base(&description)?;
-            if capture::signing(&self.git).ok().as_ref() != Some(&description.signing) {
-                return Err(Problem::SigningChanged);
-            }
+            self.signing(&description)?;
             if refs::observe(&self.git, &description.output_ref) != RefEvidence::Absent {
                 return Err(Problem::RefCollision);
             }
@@ -179,9 +191,7 @@ impl Publications {
             }
             let d = &record.description;
             self.binding(d)?;
-            if capture::signing(&self.git).ok().as_ref() != Some(&d.signing) {
-                return Err(Problem::SigningChanged);
-            }
+            self.signing(d)?;
             let mut args = vec!["commit-tree", d.tree.as_str(), "-p", d.base.as_str()];
             args.push(if d.signing.required {
                 "-S"
@@ -377,15 +387,8 @@ impl Publications {
                 Some(Problem::Interrupted),
             );
         }
-        if record.description.repository != self.repository
-            || RepositoryIdentity::capture(&self.git).ok().as_ref() != Some(&self.repository)
-        {
-            return recover::classify(
-                &record,
-                RefEvidence::Unreadable,
-                None,
-                Some(Problem::RepositoryChanged),
-            );
+        if let Err(error) = self.source_binding(&record.description) {
+            return recover::classify(&record, RefEvidence::Unreadable, None, Some(error));
         }
         let local = refs::observe(&self.git, &record.description.output_ref);
         if let Phase::LocalAttempt { commit } = &record.state
@@ -404,8 +407,8 @@ impl Publications {
             ..
         } = &record.state
         {
-            if self.binding(&record.description).is_err() {
-                problem = Some(Problem::DestinationChanged);
+            if let Err(error) = self.binding(&record.description) {
+                problem = Some(error);
                 Some(RefEvidence::Unreadable)
             } else {
                 Some(transport::observe(

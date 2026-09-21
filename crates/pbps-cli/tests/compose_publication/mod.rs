@@ -894,3 +894,115 @@ fn an_unreadable_prepared_ref_remains_unavailable_and_never_claims_a_known_chang
     fs::remove_file(reference).unwrap();
     f.source_unchanged(&before);
 }
+
+#[test]
+fn an_offline_destination_is_unavailable_and_restoration_reuses_the_known_commit() {
+    for stage in [
+        None,
+        Some(DurableStage::LocalPublished),
+        Some(DurableStage::RemoteAttempt),
+        Some(DurableStage::RemoteDelivered),
+    ] {
+        let f = Fixture::new(&format!("offline-{stage:?}"));
+        let (_store, preview, candidate) = f.ready();
+        let before = f.repo.preserved();
+        let mut publisher = f.publisher();
+        let initial = stage.map(|stage| {
+            publisher.confirm_observed(&candidate, &|at| at != Boundary::AfterPersist(stage))
+        });
+        drop(publisher);
+        let offline = f.remote.with_extension("offline");
+        fs::rename(&f.remote, &offline).unwrap();
+        let mut publisher = f.publisher();
+        let result = if initial.is_some() {
+            publisher.retry(&preview.operation_id)
+        } else {
+            publisher.confirm(&candidate)
+        };
+        assert_eq!(
+            result.problem,
+            Some(Problem::RemoteUnavailable),
+            "{stage:?}: {result:?}"
+        );
+        if let Some(initial) = initial {
+            assert_eq!(result.local, LocalState::Present);
+            assert_eq!(
+                result.details.as_ref().unwrap().commit,
+                initial.details.unwrap().commit
+            );
+            if stage != Some(DurableStage::LocalPublished) {
+                assert_eq!(result.remote, DeliveryState::Unavailable);
+                assert_eq!(publisher.recover(&preview.operation_id), result);
+            }
+        } else {
+            assert_eq!(result.status, Status::Refused);
+            assert!(!f.record(&preview.operation_id).exists());
+        }
+        fs::rename(&offline, &f.remote).unwrap();
+        let completed = if stage == Some(DurableStage::RemoteAttempt) {
+            // Absence after an attempt remains unknown even when transport returns.
+            let recovered = publisher.retry(&preview.operation_id);
+            assert_eq!(recovered.remote, DeliveryState::Unknown);
+            assert_eq!(f.remote_ref(&preview.output_ref), None);
+            publisher.republish(&preview.operation_id, &generation(&recovered))
+        } else if stage.is_some() {
+            publisher.retry(&preview.operation_id)
+        } else {
+            publisher.confirm(&candidate)
+        };
+        assert_eq!(completed.status, Status::Delivered, "{completed:?}");
+        if result.details.as_ref().unwrap().commit.is_some() {
+            assert_eq!(
+                completed.details.as_ref().unwrap().commit,
+                result.details.unwrap().commit
+            );
+        }
+        f.source_unchanged(&before);
+    }
+}
+
+#[test]
+fn unreadable_source_and_signing_evidence_do_not_claim_a_known_change() {
+    let f = Fixture::new("unavailable-source");
+    let (_store, preview, candidate) = f.ready();
+    let mut publisher = f.publisher();
+    let initial = publisher.confirm(&candidate);
+    assert_eq!(initial.status, Status::Delivered);
+    let config_path = f.repo.root.join(".git/config");
+    let config = fs::read(&config_path).unwrap();
+    let receipt = fs::read(f.record(&preview.operation_id)).unwrap();
+    fs::write(&config_path, b"[invalid\n").unwrap();
+    let unreadable = publisher.recover(&preview.operation_id);
+    assert_eq!(unreadable.problem, Some(Problem::RepositoryUnavailable));
+    assert_eq!(unreadable.local, LocalState::Unavailable);
+    assert_eq!(unreadable.details, initial.details);
+    assert_eq!(fs::read(f.record(&preview.operation_id)).unwrap(), receipt);
+    fs::write(config_path, config).unwrap();
+    assert_eq!(publisher.recover(&preview.operation_id), initial);
+
+    for before_commit in [false, true] {
+        let f = Fixture::new(&format!("unavailable-signing-{before_commit}"));
+        let (_store, preview, candidate) = f.ready();
+        let before = f.repo.preserved();
+        if !before_commit {
+            git(
+                &f.repo.root,
+                &["config", "commit.gpgSign", "invalid-boolean"],
+            );
+        }
+        let result = f.publisher().confirm_observed(&candidate, &|at| {
+            if before_commit && at == Boundary::BeforeCommit {
+                git(
+                    &f.repo.root,
+                    &["config", "commit.gpgSign", "invalid-boolean"],
+                );
+            }
+            true
+        });
+        assert_eq!(result.problem, Some(Problem::SigningUnavailable));
+        assert_eq!(result.details.unwrap().commit, None);
+        assert_eq!(f.remote_ref(&preview.output_ref), None);
+        git(&f.repo.root, &["config", "--unset", "commit.gpgSign"]);
+        f.source_unchanged(&before);
+    }
+}
