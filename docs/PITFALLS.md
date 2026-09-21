@@ -2469,3 +2469,44 @@ A `tokio::time::timeout` measures the wall clock, not the work: anything that
 stops the runtime's thread spends every other task's budget for it. On a
 current-thread runtime, a synchronous loop over input whose size the engine
 decides is that.
+
+## A fixture in the one shape the rule exempts
+
+`fchown` clears a setuid or setgid bit even when it sets the owner the file
+already has, which is why the compose's metadata copy sets the owner *before*
+the permission bits. The test written for that ordering used a `02600`
+fixture, passed, and proved nothing: swapping the two calls left it green.
+
+**Measured** on Linux 6.6, `chown` to a file's own owner:
+
+| mode before | mode after |
+|---|---|
+| `02600` | `02600` |
+| `02710` | `0710` |
+| `04600` | `0600` |
+| `04700` | `0700` |
+
+Setgid without group-execute is the mandatory-locking combination the kernel
+exempts, and `02600` is the one shape where the ordering cannot matter. With
+`04710` the test fails the moment the calls are swapped.
+
+The shape, not the bug: **a test of a rule needs a fixture the rule actually
+applies to.** Before keeping a test that passes, ask which of its inputs the
+behaviour under test would have rejected — and if none, the fixture is in an
+exempt case and the test is measuring nothing. Reverting the fix and watching
+the test fail is what catches this, and it is why AGENTS.md asks for it every
+time rather than when the fix looks risky.
+
+## A fallback that never runs because the first call succeeded emptily
+
+The compose's listing was first written as `entries(…).or_else(|_|
+tracked_entries(…))`. The first call was given a pathspec it could not use,
+answered **zero entries** rather than failing, and the fallback never ran — so
+the listing was silently empty and every tracked declaration went unlisted. A
+compose would have resolved the intent against a schema with nothing in it.
+
+This is shape 1 again — an emptiness read as good news — wearing a fallback's
+clothes. `or_else` only fires on `Err`, so it converts "asked the wrong
+question" into "there is nothing there". **Where a query can answer nothing,
+a fallback behind `or_else` is not a fallback.** Either the first call has to
+fail loudly on a question it cannot answer, or there must be one way to ask.

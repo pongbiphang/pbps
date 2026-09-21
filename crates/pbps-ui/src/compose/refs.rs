@@ -203,7 +203,7 @@ pub struct Prepared {
 pub fn prepare(git: &Git, lease: &Lease, new: &str) -> Result<Prepared, RefRefusal> {
     let mut session = git.interactive(&["update-ref", "--stdin"])?;
     // Each transaction command is acknowledged on its own line, `start`
-    // included, so the answers are read one at a time rather than the last one
+    // included (DECISIONS 526), so the answers are read one at a time rather than the last one
     // being read as the first. A protocol that read `start: ok` as the
     // preparation's answer would commit an unprepared transaction.
     session.send("start\n")?;

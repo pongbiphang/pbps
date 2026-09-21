@@ -1,5 +1,5 @@
 //! A compose that stops where it is told, so recovery can be measured rather
-//! than reasoned about.
+//! than reasoned about (DECISIONS 525).
 //!
 //! ADR-0015's Limits section requires step 4 to interrupt a compose at each
 //! durable point and assert what recovery does with what it finds. An

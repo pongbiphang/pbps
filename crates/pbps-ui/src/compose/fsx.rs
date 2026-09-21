@@ -17,7 +17,8 @@
 //!    was there, and so that what came out can be inspected before it is let
 //!    go.
 //!
-//! This module is Linux-only. macOS needs `renamex_np` and `acl_get_fd_np`
+//! This module is Linux-only (DECISIONS 523). macOS needs `renamex_np` and
+//! `acl_get_fd_np`
 //! and Windows the relative `NtCreateFile` walk, neither of which this
 //! workspace can call while it forbids `unsafe`, and decision 5's own rule
 //! for a platform without these calls is to refuse to compose rather than

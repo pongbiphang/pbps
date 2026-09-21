@@ -1511,11 +1511,24 @@ What this ADR reasons about and has not measured, in the order the steps of
   process, so decision 5 detects the move after each exchange or `link()`
   and refuses,
   and a move after that detection leaves a path `git status` reports
-  missing beside a retained copy. Step 4 measures how narrow that window
-  is and whether resolving the exchange's own paths with `openat2`'s
-  `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` (Linux 5.6+) closes it.
-- **The case decision 5's step 1 refuses.** The read-only viewer exists,
-  but compose and its UI recovery harness remain #494 / step 4 of #64.
+  missing beside a retained copy. **Step 4 has measured this, and
+  `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` does not close it.** Those flags
+  decide what a *lookup* may traverse; they say nothing about an ancestor
+  being renamed out from under a handle that is already open, and the
+  compose acts through the handle precisely so that it does not look the
+  path up again. `pbps-ui`'s `fsx` tests hold both halves: with the handle
+  open, the directory renamed away and another created at its path, an
+  operation through the handle still succeeds and puts the file in the
+  moved directory, and it is the *identity comparison* — `fstat` of the
+  handle against a fresh no-link lookup — that catches it. The window is
+  therefore between that comparison and the next operation, and it is
+  closed by nothing available on these platforms. The protocol is
+  unchanged; what is now known is that no flag removes the need for the
+  comparison.
+- **The case decision 5's step 1 refuses.** Compose and its UI recovery
+  harness landed in #494; the paragraph below records what that harness
+  must contain, and what of it is measured today is named at the end of
+  this section.
   That harness must start with `HEAD -> a -> b` and assert refusal before
   placement. Restoring step 1's former recursive HEAD read must demonstrate
   that it records `b` and reaches the placement checkpoint; the new step-5
@@ -1526,8 +1539,8 @@ What this ADR reasons about and has not measured, in the order the steps of
   `a` after that check and before index installation. It must not weaken
   the current guards just to make the earlier counterexample reachable.
 - **A crash during step 5's per-path undo (#152).** The compose and its
-  recovery harness do not exist yet; this amendment specifies the
-  protocol, not an implemented or measured recovery. Step 4 of #64 must
+  recovery harness landed in #494; what of the list below is measured
+  today is named at the end of this section. Step 4 of #64 must
   place two paths, redirect `HEAD` in step 5's gap to a direct branch
   whose tip requires both placements undone, and stop after rollback
   restores the first path. With the compose process gone, point `HEAD`
@@ -1567,3 +1580,36 @@ What this ADR reasons about and has not measured, in the order the steps of
   cross-origin `POST`, the rebinding `Host`, the foreign peer and a request to
   any route but the shell without the header, and watch each refused, which is
   the test ADR-0006's "structurally rather than by discipline" asks for.
+
+## What step 4 measured, and what it did not
+
+#494 implemented decision 5 and the recovery protocol on Linux, and the
+distinction between the two halves of this section matters more than either:
+
+**Measured, with a control that fails when the guard is reverted.** Step 1's
+refusal of `HEAD -> a -> b`, before anything is placed, with the recursive
+read shown recording the end of the chain instead. The prepared transaction's
+type check refusing a same-tip symbolic rewrite and preserving the symbolic
+spelling byte for byte. The three-part post-write check refusing a `HEAD` hop
+inserted after the commit. Plumbing running none of `pre-commit`, `commit-msg`,
+`post-commit`, `reference-transaction` or `post-index-change`. An interruption
+after `placing` rolling back and installing no index, and the same recovery run
+twice changing nothing. An interruption inside the gap steps 5 and 6 span being
+*finished* rather than cleaned up, leaving `git status` clean. A record in
+`rolling-back` resuming the rollback with the branch set to the composed commit
+— the #152 counterexample — and the dispatch rule reverted to show recovery
+installing the prepared index instead. A record whose process is still alive
+being left entirely alone.
+
+**Specified and implemented, not yet driven end to end.** The interruption
+points *within* the rollback — after the record's publication, after each undo
+operation, after its flush, after each progress update and during retention
+cleanup — are implemented and are exercised only at their two ends. The
+conflicting third-party path is refused by the per-path evidence check and is
+covered by a unit test of that check rather than by an interrupted compose.
+The two-path `HEAD`-redirected-in-the-gap case of #152 is implemented and is
+tested through its recovery rather than by stopping a compose mid-undo.
+
+**Not measured at all.** Every Windows and macOS claim in decision 5. Composing
+is Linux-only (DECISIONS 523), and those platforms refuse; #471's interrupted
+restoration remains a prerequisite for enabling Windows and not for this step.

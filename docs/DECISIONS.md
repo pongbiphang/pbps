@@ -14123,3 +14123,99 @@ SPEC is in sync with all of these.
      `06` mean the engine closed first. The first draft of this said the opposite, and a
      refusal that names the wrong end sends the next investigation to the
      wrong process — worse than naming none.
+
+## Phase 6 — composing intent through git (ADR-0015 decision 5, #64 step 4)
+
+523. **Composing is Linux-only, and every other platform gets decision 5's own
+     answer for a platform whose calls it has not had measured (issue #494).**
+     Step 2's placement is a filesystem protocol before it is anything else:
+     a no-follow walk from the worktree root, an atomic exchange, a metadata
+     copy that carries what `git`'s `100644`/`100755` does not, and an
+     identity comparison after every placement. On Linux `rustix` reaches
+     every one of those with a safe signature — `openat2` with
+     `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, `renameat2(RENAME_EXCHANGE)`,
+     `linkat`, `renameat`, `fchown`, `fchmod`, the `f*xattr` family (which on
+     Linux carries the POSIX ACL as `system.posix_acl_access`), `fstat` and
+     `fsync` — so the workspace's `forbid(unsafe_code)` stands unchanged.
+
+     macOS needs `renamex_np(RENAME_SWAP)` and `acl_get_fd_np`, and Windows
+     the per-component `NtCreateFile` walk with `FILE_FLAG_OPEN_REPARSE_POINT`
+     that decision 5 describes; neither is reachable from a safe wrapper in
+     this tree. Decision 5 already answers this case — "a platform with none
+     of these refuses to compose rather than overwrite a file it cannot prove
+     is the one the page saw" — so `pbps ui` on those platforms says so and
+     shows the commands to run by hand, which is what a machine without `git`
+     gets. That is also why #471, the Windows interrupted-restoration
+     residual, is not a prerequisite here: Windows compose stays refused.
+
+     `rustix` is a new *edge* for `pbps-ui` and not a new node: it is already
+     in this tree at this version for the resolver's socket diagnostics, so
+     `cargo deny` sees nothing it has not already audited — the same move as
+     DECISIONS 434. The crate's boundary test keeps its allowlist explicit,
+     and `pbps-` is still refused outright, so ADR-0015 decision 6's "sees no
+     model" boundary is unchanged.
+
+524. **The preview is a compose that stops once the tree exists and then
+     undoes itself (issue #494).** ADR-0015 decision 5 says the page shows
+     the diff *before* the commit, and the protocol holds the index lock —
+     and with it every `git` in the checkout — from step 0 through step 6. A
+     pause between the diff and the commit would therefore hold that lock for
+     as long as a person takes to read a diff, in a UI whose whole premise is
+     that the person is reading carefully.
+
+     So the preview runs steps 0 to 3, computes `git diff <tip> <tree>`,
+     publishes `rolling-back`, undoes step 2 and releases every lock — the
+     same path a refusal at that point takes, which is what makes it correct
+     rather than a second protocol. It costs the placement twice. What it
+     buys is a human looking at the exact tree that would be committed while
+     nothing is held, and a record that is a rollback rather than a success
+     if the process stops in the middle of it.
+
+     A two-request flow also means the page's "Commit" runs the protocol
+     again from step 0, so every check is taken against the working tree as
+     it is *then*: an editor that saved between the diff and the confirmation
+     is caught by step 1's hash comparison rather than silently overwritten.
+
+525. **An interruption test is a real process that stops, not a record a test
+     wrote (issue #494).** ADR-0015's Limits section requires step 4 to
+     interrupt a compose at each durable point and assert what recovery does.
+     A test that constructed the record it imagined a crashed compose would
+     have left would measure the test's idea of that state, and the states
+     that matter here are exactly the ones nobody imagined correctly the
+     first time.
+
+     `crates/pbps-cli/examples/compose-interrupted.rs` therefore runs the
+     ordinary compose through its ordinary public API and calls
+     `std::process::abort` from the phase watcher — no unwinding, leaving
+     exactly what was on disk when the phase was published. It re-implements
+     none of the protocol and ships nowhere: an example is built by `cargo
+     test --all-targets` and by nothing that produces `pbps`.
+
+     The watcher it uses is not test-only scaffolding. A compose spends most
+     of its time in subprocesses, and a browser waiting on a request with
+     nothing to show is a compose the user cannot tell from a hung one, so
+     the page has the same phases to report.
+
+     The controls the Limits section asks for are tests rather than claims.
+     Reverting the dispatch rule so a `rolling-back` record falls into the
+     success arm makes recovery answer `Finished` with the prepared index
+     installed and a path left unrestored — the #152 counterexample, exactly.
+     Reverting step 1's `symbolic-ref --no-recurse HEAD` to the bare form
+     makes three ref tests fail. Both were run in this branch.
+
+526. **`update-ref --stdin` acknowledges every command on its own line, and a
+     refused preparation does not answer at all (issue #494).** The
+     transaction protocol was first written to send `start`, `option
+     no-deref`, the `update` and `prepare` together and read one line. That
+     line is `start: ok`: **measured** on git 2.43, each transaction command
+     is acknowledged separately, so a protocol that read the last answer as
+     the first would have sent `commit` to a transaction it had never
+     confirmed was prepared. The answers are read one at a time.
+
+     The second measurement is the opposite shape. When the compare-and-swap
+     refuses — a stale tip, or a ref another `git` holds — `git` prints why on
+     `stderr` and *exits*, so the read ends with the stream closed rather than
+     with a line. That is an answer, not a broken protocol, and it is
+     reported with `git`'s own words. A deadline is the one thing in that
+     read which is not an answer, and it is the one case that does not become
+     a refusal.

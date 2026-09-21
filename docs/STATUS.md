@@ -47,8 +47,23 @@ Phase 6 step 3: `pbps ui` serves local read views for environments, drift,
 saved plans, the ledger timeline and schema documentation/ERD. Open the complete
 printed URL, including its fragment. The viewer requires a per-launch token,
 exact bound Host and matching Origin, and calls the same binary for every read.
-Its page works offline. Compose and deployment actions remain later steps of
-#64; this viewer accepts no writes. See [UI.md](UI.md).
+Its page works offline. See [UI.md](UI.md).
+
+Phase 6 step 4: the same UI composes reviewed intent. The page sends one of the
+six intent commands and its arguments — never a file and never a command name —
+and the UI runs that command in a snapshot of the recorded tip with the working
+tree's declarations laid over it, shows the diff of the tree it built, and on
+confirmation commits those paths through `git` plumbing and pushes that one
+commit to one destination. The user's hooks do not run for either, and the page
+says so beside the commit. Every `git` runs with an empty `core.hooksPath`, a
+refusing askpass and a deadline; the commit is built under the index lock and
+the branch moves only through a prepared `update-ref` transaction that is asked
+whether the branch is still direct before it is told to commit. An interrupted
+compose leaves a record under `<git-dir>/pbps-ui/composing/`, and the UI reads
+it at launch and either finishes or rolls it back before offering to compose
+again. Composing is Linux-only for now (DECISIONS 523): elsewhere the page says
+so and shows the commands to run by hand. Deployment actions remain step 5 of
+#64; this UI still writes to no database.
 
 ## Live tests
 

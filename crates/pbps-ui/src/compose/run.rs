@@ -35,7 +35,7 @@ pub struct Request {
     pub shown: BTreeMap<String, String>,
 }
 
-/// How far a run goes.
+/// How far a run goes (DECISIONS 524).
 ///
 /// The page shows the diff *before* the commit, so the preview is a compose
 /// that stops once the tree exists and then undoes itself under the ordinary
