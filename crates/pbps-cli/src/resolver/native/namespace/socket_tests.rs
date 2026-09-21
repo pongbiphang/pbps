@@ -134,3 +134,39 @@ fn a_singleton_observation_does_not_claim_exhaustive_socket_ownership() {
         assert_eq!(observed_socket_holders(&service, inode).unwrap().len(), 2);
     }
 }
+
+#[test]
+#[ignore = "requires the disposable PID/mount namespace socket fixture"]
+fn an_intermediate_exit_cannot_preserve_a_stale_service_relation() {
+    let mut fixture = Fixture::start("ancestry");
+    let service = ProcessLease::capture(fixture.pid("a")).unwrap();
+    let holders = observed_socket_holders(&service, fixture.inode()).unwrap();
+    assert_eq!(holders.len(), 1);
+    let owner = &holders[0];
+    assert_eq!(owner.namespace_pid(), fixture.pid("orphan"));
+    assert!(belongs_to_service(owner, &service).unwrap());
+    let unrelated = ProcessLease::capture(fixture.pid("b")).unwrap();
+    assert!(!matches!(belongs_to_service(owner, &unrelated), Ok(true)));
+
+    let mut acknowledged = false;
+    let result = relation_with(owner, &service, |parent| {
+        if parent == service.namespace_pid() {
+            // The intermediate-to-service link has been checked. Its exit
+            // reparents the still-live holder outside the selected service.
+            fixture.command("exit-parent");
+            acknowledged = true;
+        }
+    });
+    assert!(acknowledged, "the parent exit must precede acceptance");
+    assert!(
+        result.is_err(),
+        "an exited intermediate invalidates the chain"
+    );
+    owner
+        .check()
+        .expect("the socket holder itself remains alive");
+    service.check().expect("the selected service remains alive");
+    let reaper = ProcessLease::capture(fixture.pid("anchor")).unwrap();
+    assert!(belongs_to_service(owner, &reaper).unwrap());
+    assert!(!matches!(belongs_to_service(owner, &service), Ok(true)));
+}

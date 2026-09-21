@@ -14,6 +14,7 @@ def worker():
     held = socket.socket(fileno=int(sys.argv[4])) if len(sys.argv) > 4 else None
     stop = threading.Event()
     threads = []
+    chain = None
     control.send(b'ready')
     while True:
         command = control.recv(64).decode()
@@ -47,14 +48,15 @@ def worker():
             # The worker retains its own table and socket reference.
             held.close()
             held = None
-        elif command == 'orphan':
+        elif command in ('orphan', 'chain'):
             read_end, write_end = os.pipe()
             intermediate = os.fork()
             if intermediate == 0:
                 os.close(read_end)
                 grandchild = os.fork()
                 if grandchild == 0:
-                    os.write(write_end, str(os.getpid()).encode())
+                    if command == 'orphan':
+                        os.write(write_end, str(os.getpid()).encode())
                     os.close(write_end)
                     control.close()
                     transfer.close()
@@ -62,13 +64,33 @@ def worker():
                     # reaps this holder before shutting down the namespace.
                     threading.Event().wait()
                     os._exit(0)
+                if command == 'chain':
+                    held.close()
+                    # Announce the child only after this parent has closed
+                    # its copy, so the initial holder count is synchronized.
+                    os.write(write_end, str(grandchild).encode())
+                    os.close(write_end)
+                    control.close()
+                    transfer.close()
+                    threading.Event().wait()
+                os.close(write_end)
                 os._exit(0)
             os.close(write_end)
             orphan = int(os.read(read_end, 64))
             os.close(read_end)
-            os.waitpid(intermediate, 0)
-            control.send(json.dumps(orphan).encode())
+            if command == 'chain':
+                chain = intermediate
+                held.close()
+                held = None
+                reply = [chain, orphan]
+            else:
+                os.waitpid(intermediate, 0)
+                reply = orphan
+            control.send(json.dumps(reply).encode())
             continue
+        elif command == 'reap-chain':
+            os.waitpid(chain, 0)
+            chain = None
         elif command == 'stop':
             stop.set()
             for thread in threads:
@@ -123,6 +145,7 @@ def supervisor(case):
     right.close()
     accepted.close()
     orphan = None
+    chain = None
 
     def move(source, destination, close=True):
         destination.control.send(b'receive')
@@ -139,10 +162,25 @@ def supervisor(case):
         a.ask('worker-only')
     elif case == 'orphan':
         orphan = a.ask('orphan')
+    elif case == 'ancestry':
+        chain, orphan = a.ask('chain')
+
+    def exit_parent():
+        nonlocal chain
+        os.kill(chain, 9)
+        a.ask('reap-chain')
+        chain = None
+        # The selected service A is not a subreaper. Acknowledging this
+        # adopted parent before resuming Rust makes the schedule deterministic.
+        with open(f'/proc/{orphan}/stat') as stat:
+            parent = int(stat.read().rsplit(')', 1)[1].split()[1])
+        assert parent == os.getpid(), parent
+
     print(json.dumps(dict(anchor=os.getpid(), a=a.process.pid, b=b.process.pid,
                           c=c.process.pid if c else None, inode=inode,
                           local='%s:%d' % client.getsockname(),
-                          peer='%s:%d' % client.getpeername(), orphan=orphan)), flush=True)
+                          peer='%s:%d' % client.getpeername(), orphan=orphan,
+                          parent=chain)), flush=True)
     try:
         for command in sys.stdin:
             command = command.strip()
@@ -150,12 +188,16 @@ def supervisor(case):
                 move(c or a, b)
             elif command == 'reset':
                 move(b, c)
+            elif command == 'exit-parent':
+                exit_parent()
             elif command == 'stop':
                 return
             else:
                 raise AssertionError(command)
             print('ok', flush=True)
     finally:
+        if chain:
+            exit_parent()
         if orphan:
             os.kill(orphan, 9)
             os.waitpid(orphan, 0)
