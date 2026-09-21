@@ -191,6 +191,26 @@ fn roll_back(git: &Git, git_dir: &Path, records: &Records, record: &mut Record) 
             let _ = std::fs::remove_file(&lock.lock_file);
         }
     }
+    // Every restored exchange leaves the replacement beside its path, and a
+    // recovered `link()` leaves two names. They are moved under `previous/`
+    // and kept — never deleted, since an editor may hold one open — and this
+    // happens *before* the record goes, because the record is the only thing
+    // that names them.
+    let previous_directory = git_dir.join("pbps-ui").join("previous");
+    let _ = std::fs::create_dir_all(&previous_directory);
+    match Dir::open_root(&previous_directory) {
+        Ok(previous) => {
+            for placed in &record.paths {
+                if !placed.undone {
+                    continue;
+                }
+                if let Err(detail) = retain_leftovers(&root, placed, &previous, &record.id) {
+                    reported.push(format!("{}: {detail}", placed.path));
+                }
+            }
+        }
+        Err(e) => reported.push(format!("the displaced files could not be kept: {e}")),
+    }
     let _ = std::fs::remove_dir_all(git_dir.join("pbps-ui").join("intent").join(&record.id));
     if reported.is_empty() {
         let _ = records.remove(record);
@@ -200,6 +220,34 @@ fn roll_back(git: &Git, git_dir: &Path, records: &Records, record: &mut Record) 
         restored,
         reported,
     }
+}
+
+/// Move whatever an undo left beside a path out of the working tree.
+fn retain_leftovers(root: &Dir, placed: &Placed, previous: &Dir, id: &str) -> Result<(), String> {
+    let path = RepoPath::new(placed.path.as_bytes()).map_err(|e| e.to_string())?;
+    let (parent, _) = root.walk_to_parent(&path).map_err(|e| e.to_string())?;
+    for name in [
+        OsString::from(placed.temporary.clone()),
+        OsString::from(format!("{}.rolled-back", placed.temporary)),
+    ] {
+        let file = match parent.open_file(&name) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.to_string()),
+        };
+        let bytes = file.read().map_err(|e| e.to_string())?;
+        let kept_as = OsString::from(format!("{}-{id}", name.to_string_lossy()));
+        match previous.create_new(&kept_as, 0o600) {
+            Ok(kept) => {
+                kept.write_all(&bytes).map_err(|e| e.to_string())?;
+                kept.flush().map_err(|e| e.to_string())?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        parent.unlink(&name).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 enum Undo {
@@ -222,24 +270,40 @@ fn undo(git: &Git, root: &Dir, placed: &Placed) -> Undo {
         return Undo::Refused("the directory holding it is no longer reachable".to_owned());
     };
     let temporary = OsString::from(&placed.temporary);
-    let at = |name: &OsString| -> Option<(String, u64, u64)> {
-        let look = parent.look(name).ok()??;
-        if look.is_link || !look.is_regular {
-            return None;
+    // Three answers, not two. A name holding a symbolic link, a directory or
+    // a file that cannot be read is *not* an absent name, and collapsing them
+    // would let recovery read somebody else's object as a completed
+    // restoration — or, worse, take it away.
+    #[derive(PartialEq, Eq)]
+    enum There {
+        File(String, u64, u64),
+        Nothing,
+        Unusable,
+    }
+    let at = |name: &OsString| -> There {
+        match parent.look(name) {
+            Ok(None) => There::Nothing,
+            Ok(Some(look)) if look.is_link || !look.is_regular => There::Unusable,
+            Ok(Some(_)) => {
+                match parent
+                    .open_file(name)
+                    .and_then(|file| Ok((file.read()?, file.identity()?)))
+                {
+                    Ok((bytes, identity)) => match attributes::hash(git, &bytes) {
+                        Ok(blob) => There::File(blob, identity.device, identity.inode),
+                        Err(_) => There::Unusable,
+                    },
+                    Err(_) => There::Unusable,
+                }
+            }
+            Err(_) => There::Unusable,
         }
-        let file = parent.open_file(name).ok()?;
-        let bytes = file.read().ok()?;
-        let identity = file.identity().ok()?;
-        Some((
-            attributes::hash(git, &bytes).ok()?,
-            identity.device,
-            identity.inode,
-        ))
     };
-    let matches = |found: &Option<(String, u64, u64)>, wanted: &super::record::Identity| {
-        found.as_ref().is_some_and(|(blob, device, inode)| {
+    let matches = |found: &There, wanted: &super::record::Identity| match found {
+        There::File(blob, device, inode) => {
             *blob == wanted.blob && *device == wanted.device && *inode == wanted.inode
-        })
+        }
+        There::Nothing | There::Unusable => false,
     };
     let here = at(&leaf);
     let beside = at(&temporary);
@@ -250,6 +314,8 @@ fn undo(git: &Git, root: &Dir, placed: &Placed) -> Undo {
             if matches(&here, original) {
                 // Already undone, or never done.
                 Undo::AlreadyDone
+            } else if here == There::Unusable || beside == There::Unusable {
+                Undo::Refused("one of the two names holds something this UI cannot read".to_owned())
             } else if matches(&here, &placed.replacement) && matches(&beside, original) {
                 match parent.exchange(&leaf, &temporary) {
                     Ok(()) => Undo::Done,
@@ -266,9 +332,16 @@ fn undo(git: &Git, root: &Dir, placed: &Placed) -> Undo {
         // A `link()`. The path did not exist before, so restoring it means
         // taking the name away — by rename, never by unlink.
         None => {
-            if here.is_none() {
+            if here == There::Nothing {
                 Undo::AlreadyDone
-            } else if matches(&here, &placed.replacement) || beside.is_some() {
+            } else if here == There::Unusable {
+                Undo::Refused("the path holds something this UI cannot read".to_owned())
+            } else if matches(&here, &placed.replacement) {
+                // Only where the *whole* recorded identity matches. The
+                // temporary a `link()` was made from normally still exists,
+                // so testing for *it* instead would authorise taking away
+                // whatever is at the path — including the file an editor
+                // wrote there after the crash.
                 let away = OsString::from(format!("{}.rolled-back", placed.temporary));
                 match parent.rename(&leaf, &away) {
                     Ok(()) => Undo::Done,
@@ -420,4 +493,98 @@ fn ours_by_hash(path: &Path, record: &Record) -> bool {
         return false;
     };
     super::run::hash_file(path).is_ok_and(|found| found == *wanted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compose::record::Identity;
+    use crate::compose::scratch_repo::Scratch;
+
+    /// The `link()` half of the undo, which a rename cannot reach: an intent
+    /// command that rewrites the ids file exchanges it, and a project whose
+    /// ids file is absent has no identities for the intent to resolve. The
+    /// *record* is this function's input, so building one is building the
+    /// input — the files beside it are real, and they are what decides.
+    fn a_created_path(blob: &str, device: u64, inode: u64) -> Placed {
+        Placed {
+            path: "schema/new.yml".to_owned(),
+            temporary: "new.yml.pbps-ui-test".to_owned(),
+            original: None,
+            replacement: Identity {
+                blob: blob.to_owned(),
+                device,
+                inode,
+            },
+            entry_mode: Some(0o100644),
+            entry_blob: Some(blob.to_owned()),
+            keep: None,
+            retained_as: None,
+            undone: false,
+        }
+    }
+
+    fn identity_of(scratch: &Scratch, relative: &str) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt as _;
+        let found = std::fs::metadata(scratch.path(relative)).unwrap();
+        (found.dev(), found.ino())
+    }
+
+    #[test]
+    fn a_created_path_is_taken_away_only_where_its_whole_identity_matches() {
+        let scratch = Scratch::new("undo-created");
+        scratch.write("schema/keep.yml", b"table: keep\n");
+        scratch.commit("one");
+        let git = scratch.runner();
+        let root = Dir::open_root(&scratch.root).unwrap();
+
+        // What the compose placed, and the source its `link()` was made from,
+        // which is why testing for *that* name instead is not enough.
+        scratch.write("schema/new.yml", b"table: new\n");
+        scratch.write("schema/new.yml.pbps-ui-test", b"table: new\n");
+        let blob = attributes::hash(&git, b"table: new\n").unwrap();
+        let (device, inode) = identity_of(&scratch, "schema/new.yml");
+        let placed = a_created_path(&blob, device, inode);
+
+        // An editor saves its own file over the path after the crash.
+        scratch.write("schema/.swap", b"the editor's own\n");
+        std::fs::rename(scratch.path("schema/.swap"), scratch.path("schema/new.yml")).unwrap();
+
+        let outcome = undo(&git, &root, &placed);
+        assert!(
+            matches!(outcome, Undo::Refused(_)),
+            "the editor's file must be reported, not renamed away"
+        );
+        assert_eq!(
+            std::fs::read(scratch.path("schema/new.yml")).unwrap(),
+            b"the editor's own\n"
+        );
+
+        // The control: the file this compose actually placed *is* taken away.
+        std::fs::write(scratch.path("schema/new.yml"), b"table: new\n").unwrap();
+        let (device, inode) = identity_of(&scratch, "schema/new.yml");
+        let placed = a_created_path(&blob, device, inode);
+        assert!(matches!(undo(&git, &root, &placed), Undo::Done));
+        assert!(!scratch.path("schema/new.yml").exists());
+    }
+
+    #[test]
+    fn a_name_holding_something_unreadable_is_neither_absent_nor_restored() {
+        // Absent, empty and unreadable are three different things, and
+        // collapsing the last two would have recovery report a link as a
+        // completed restoration.
+        let scratch = Scratch::new("undo-unusable");
+        scratch.write("schema/keep.yml", b"table: keep\n");
+        scratch.commit("one");
+        let git = scratch.runner();
+        let root = Dir::open_root(&scratch.root).unwrap();
+        std::os::unix::fs::symlink("keep.yml", scratch.path("schema/new.yml")).unwrap();
+        let placed = a_created_path("whatever", 1, 2);
+
+        assert!(matches!(undo(&git, &root, &placed), Undo::Refused(_)));
+        assert!(
+            std::fs::symlink_metadata(scratch.path("schema/new.yml")).is_ok(),
+            "and it is left alone"
+        );
+    }
 }

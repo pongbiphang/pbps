@@ -1050,7 +1050,7 @@ impl Compose<'_> {
         mut held: Guard,
         placement: &mut Placement,
     ) -> Result<Done, Refusal> {
-        let deciding = self.deciding_tip(record, lease);
+        let (deciding, deciding_lock) = self.deciding_tip(record, lease);
         // The whole entry set of the deciding tip for the paths in question,
         // read as *entries*: the same blob at `100755` is a file the placed
         // one does not match, and a `120000` or `160000` entry with that id is
@@ -1074,7 +1074,17 @@ impl Compose<'_> {
         self.reached(Phase::RollingBack);
 
         let keeping: BTreeSet<String> = kept.iter().cloned().collect();
-        placement.undo_selected(&|path: &str| keeping.contains(path));
+        let unresolved: Vec<String> = placement
+            .undo_selected(&|path: &str| keeping.contains(path))
+            .into_iter()
+            .filter_map(|outcome| match outcome {
+                super::place::Undone::Reported { path, detail } => {
+                    Some(format!("{path}: {detail}"))
+                }
+                super::place::Undone::Restored { .. }
+                | super::place::Undone::RenamedAway { .. } => None,
+            })
+            .collect();
         // A kept path still owes step 2's retention: the file it displaced is
         // beside it under a temporary name and must not be left there.
         let previous_directory = self.git_dir.join("pbps-ui").join("previous");
@@ -1089,14 +1099,34 @@ impl Compose<'_> {
         // locks go with it. The record stays only if something could not be
         // put back, which `undo_selected` reports through the page.
         held.release();
-        let _ = records.remove(record);
-        Err(Refusal::CommitStandsButCheckoutMoved {
+        // Held from before the tip was read until after every selected path
+        // has been undone: releasing it the moment the tip was read would let
+        // another worktree advance that ref during the decision, and the files
+        // would then be kept or undone against a tip the checkout no longer
+        // has.
+        if let Some(lock) = deciding_lock {
+            let _ = lock.release();
+        }
+        let why = Refusal::CommitStandsButCheckoutMoved {
             commit: commit.to_owned(),
             branch: lease.reference.clone(),
             deciding: deciding.unwrap_or_else(|| "a ref with no commit".to_owned()),
             kept,
             undone: selected,
-        })
+        };
+        if unresolved.is_empty() {
+            let _ = records.remove(record);
+            Err(why)
+        } else {
+            // The record stays: the checkout is not what the decision says it
+            // is, and this record is the only thing that can tell the next
+            // launch which paths are still out of place.
+            Err(Refusal::RollbackIncomplete {
+                why: Box::new(why),
+                unresolved,
+                record: record.id.clone(),
+            })
+        }
     }
 
     /// The tip that decides, read from the name its own lock holds.
@@ -1104,9 +1134,13 @@ impl Compose<'_> {
     /// `None` where nothing can be held still long enough to decide by: a
     /// chain, a lock another `git` holds, or a target with no commit. Every
     /// one of those undoes step 2 for every path, which asks no tip at all.
-    fn deciding_tip(&self, record: &mut Record, lease: &Lease) -> Option<String> {
-        let target = refs::head_names(self.git).ok()?;
-        let lock_file = locks::lock_file_for(self.git, &target).ok()?;
+    fn deciding_tip(&self, record: &mut Record, lease: &Lease) -> (Option<String>, Option<Held>) {
+        let Ok(target) = refs::head_names(self.git) else {
+            return (None, None);
+        };
+        let Ok(lock_file) = locks::lock_file_for(self.git, &target) else {
+            return (None, None);
+        };
         // Taken here the way the others are, and named in the record before it
         // is relied on, so a crash in the rollback leaves one the record can
         // both name and tell from another `git`'s.
@@ -1114,21 +1148,22 @@ impl Compose<'_> {
             reference: target.clone(),
             lock_file: lock_file.display().to_string(),
         });
-        let held = locks::take(
+        let Ok(held) = locks::take(
             self.git.root(),
             &lock_file,
             record.id.as_bytes(),
             &record.id,
-        )
-        .ok()?;
+        ) else {
+            return (None, None);
+        };
         let tip = refs::must_be_direct(self.git, &target)
             .ok()
             .and_then(|()| refs::tip_of(self.git, &target).ok());
-        // Held only while the question is asked; the answer is the value its
-        // lock held.
-        let _ = held.release();
         let _ = lease;
-        tip
+        // The lock goes back to the caller, not released here: the value it
+        // holds still has to be true when the per-path decision is published
+        // and acted on.
+        (tip, Some(held))
     }
 
     /// One path's whole entry in a tree: the mode and the object id.
@@ -1480,31 +1515,49 @@ impl Compose<'_> {
         Ok(changed)
     }
 
+    /// Take `<index>.lock`, then fill it from the index.
+    ///
+    /// In that order, and the order is the whole of it. Reading the index
+    /// first and linking the copy afterwards leaves a window in which another
+    /// `git` takes the lock, installs a *newer* index and releases it — and
+    /// step 6 then renames this stale snapshot over it, silently discarding
+    /// whatever that `git` staged. Creating the name first is what stops
+    /// every other `git` from touching the index at all, so the bytes read
+    /// after it cannot go out of date while this compose holds it.
+    ///
+    /// The lock is filled in place through the handle that created it, which
+    /// is safe here and nowhere else: `EEXIST` has already established that
+    /// this process is the only one that can be writing it, and the record
+    /// carries the file's hash after each write so recovery can still tell
+    /// the UI's copy from a running `git`'s.
     fn copy_index(&self, index_file: &Path, index_lock: &Path) -> Result<(), Refusal> {
-        // The index lock is a *copy of the index*, not a lock holding an id:
-        // a byte added to it stops being an index at all.
-        if index_lock.exists() {
-            return Err(Refusal::Lock(LockRefusal::Held {
-                path: index_lock.to_path_buf(),
-                holding: String::new(),
-            }));
-        }
-        let bytes = std::fs::read(index_file).unwrap_or_default();
-        let writing = PathBuf::from(format!("{}.pbps-ui-writing", index_lock.display()));
-        std::fs::write(&writing, &bytes).map_err(|e| Refusal::Io(e.to_string()))?;
-        match std::fs::hard_link(&writing, index_lock) {
-            Ok(()) => {
-                let _ = std::fs::remove_file(&writing);
-                Ok(())
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&writing);
-                Err(Refusal::Lock(LockRefusal::Held {
+        let taken = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(index_lock)
+            .map_err(|e| {
+                Refusal::Lock(LockRefusal::Held {
                     path: index_lock.to_path_buf(),
-                    holding: e.to_string(),
-                }))
-            }
+                    holding: if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        String::new()
+                    } else {
+                        e.to_string()
+                    },
+                })
+            })?;
+        // Only now, with every other `git` locked out of it.
+        let bytes = std::fs::read(index_file).unwrap_or_default();
+        let written = (|| {
+            use std::io::Write as _;
+            let mut taken = taken;
+            taken.write_all(&bytes)?;
+            taken.sync_all()
+        })();
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(index_lock);
+            return Err(Refusal::Io(e.to_string()));
         }
+        Ok(())
     }
 }
 

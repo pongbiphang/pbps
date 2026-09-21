@@ -1010,3 +1010,106 @@ fn a_preview_leaves_no_file_beside_the_declarations_it_touched() {
     assert!(checkout.read("schema/customer.yml").contains("full_name"));
     assert!(!checkout.read("schema.ids.json").contains("full_name"));
 }
+
+// ---------------------------------------------------------------------------
+// Round five of review.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recovery_reports_a_third_party_file_over_an_exchanged_path_rather_than_swapping_it() {
+    // The evidence recovery decides by is the *whole* recorded identity of the
+    // two names. A file somebody else wrote at the path after the crash
+    // matches none of it, and a rollback that took it away would destroy work
+    // this UI never made.
+    let checkout = Checkout::new("recover-third-party");
+    edited(&checkout);
+    interrupt(&checkout, "composed");
+    let record = records_of(&checkout).remove(0);
+
+    // An editor writes its own file over the placed one.
+    checkout.write("schema.ids.json", "{\"version\": 1, \"theirs\": true}\n");
+
+    let git = checkout.runner();
+    let recovered = pbps_ui::compose::recover::at_launch(&git, &checkout.path(".git"));
+
+    let pbps_ui::compose::recover::Recovered::RolledBack { reported, .. } = &recovered[0] else {
+        panic!("{recovered:?}");
+    };
+    assert_eq!(reported.len(), 1, "{reported:?}");
+    assert!(reported[0].contains("schema.ids.json"), "{reported:?}");
+    assert_eq!(
+        checkout.read("schema.ids.json"),
+        "{\"version\": 1, \"theirs\": true}\n",
+        "somebody else's work is still there"
+    );
+    assert!(
+        records_of(&checkout).contains(&record),
+        "and the record is kept, because the path is still out of place"
+    );
+}
+
+#[test]
+fn recovery_takes_its_leftovers_out_of_the_working_tree_before_it_forgets_them() {
+    // A restored exchange leaves the replacement beside its path. The record
+    // is the only thing that names it, so it is moved under `previous/` — kept
+    // rather than deleted, since an editor may hold it open — *before* the
+    // record goes.
+    let checkout = Checkout::new("recover-leftovers");
+    edited(&checkout);
+    interrupt(&checkout, "composed");
+
+    let git = checkout.runner();
+    let recovered = pbps_ui::compose::recover::at_launch(&git, &checkout.path(".git"));
+    assert!(
+        matches!(
+            recovered.first(),
+            Some(pbps_ui::compose::recover::Recovered::RolledBack { .. })
+        ),
+        "{recovered:?}"
+    );
+
+    let beside: Vec<String> = std::fs::read_dir(&checkout.root)
+        .unwrap()
+        .chain(std::fs::read_dir(checkout.path("schema")).unwrap())
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("pbps-ui"))
+        .collect();
+    assert!(beside.is_empty(), "left in the working tree: {beside:?}");
+    let kept = std::fs::read_dir(checkout.path(".git/pbps-ui/previous"))
+        .map(|entries| entries.filter_map(Result::ok).count())
+        .unwrap_or(0);
+    assert_eq!(kept, 1, "the replacement is kept, not deleted");
+    assert!(
+        records_of(&checkout).is_empty(),
+        "and only then is the record gone"
+    );
+    assert_eq!(
+        checkout.git(&["status", "--porcelain"]),
+        " M schema/customer.yml",
+        "the user's own edit, and nothing else"
+    );
+}
+
+#[test]
+fn an_index_lock_another_git_holds_refuses_the_compose_and_is_left_alone() {
+    // `<index>.lock` is taken *before* the index is read, so that no other
+    // `git` can install a newer index into the window between the two — and a
+    // lock already there is another `git` mid-operation.
+    let checkout = Checkout::new("index-lock-held");
+    edited(&checkout);
+    std::fs::write(checkout.path(".git/index.lock"), b"another git's").unwrap();
+    let git = checkout.runner();
+    let cli = checkout.cli();
+    let file = project_file();
+
+    let refusal = compose(&checkout, &git, &cli, &file)
+        .run(&rename_request())
+        .expect_err("a held index lock refuses the compose");
+    assert!(!refusal.left_changes(), "{refusal}");
+    assert_eq!(
+        std::fs::read(checkout.path(".git/index.lock")).unwrap(),
+        b"another git's",
+        "and the other git's lock is untouched"
+    );
+}

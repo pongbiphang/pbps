@@ -1641,7 +1641,13 @@ lock does, so that a failed record publication cannot strand `index.lock` and
 `HEAD.lock`; and the page's separate rendering of the two refusals that leave
 the repository changed, which is a `left_changes` flag on the answer and a
 different message, exercised by a unit test of the flag rather than through a
-browser. The
+browser. The fifth round adds two more of the same kind: the deciding ref's
+lock being held from before its tip is read until after the selected rollback
+has run, rather than released the moment the tip is known; and the
+deciding-ref path reporting an undo that could not finish as
+`RollbackIncomplete` and keeping its record. Both need another worktree
+moving a ref inside a window this protocol exists to close, so both are
+stated here. The
 interruption points *within* the rollback — after the record's publication, after each undo
 operation, after its flush, after each progress update and during retention
 cleanup — are implemented and are exercised only at their two ends. The
