@@ -18,5 +18,5 @@ result = subprocess.run([
     'resolver::native::namespace::sockets::tests::', '--nocapture',
 ], env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
 print(result.stdout, end='', flush=True)
-if result.returncode or '3 passed; 0 failed' not in result.stdout:
-    raise SystemExit('socket-holder fixture did not complete all three tests')
+if result.returncode or '4 passed; 0 failed' not in result.stdout:
+    raise SystemExit('socket-holder fixture did not complete all four tests')

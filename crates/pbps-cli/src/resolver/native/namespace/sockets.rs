@@ -107,11 +107,19 @@ fn observe_with(
 
 /// Positive service/backend relation, independent of the namespace census.
 /// A process in the same namespace is not necessarily part of this service.
-/// Walk upward only from the observed holder, retaining each parent's lease
-/// while reading its relation; no descendant-list completeness is inferred.
+/// Walk upward only from the observed holder, retaining every parent's lease
+/// through the final checks; no descendant-list completeness is inferred.
 pub(crate) fn belongs_to_service(
     owner: &ProcessLease,
     service: &ProcessLease,
+) -> Result<bool, UnqualifiedProcess> {
+    relation_with(owner, service, |_| {})
+}
+
+fn relation_with(
+    owner: &ProcessLease,
+    service: &ProcessLease,
+    mut after_parent: impl FnMut(u32),
 ) -> Result<bool, UnqualifiedProcess> {
     if !owner.same_namespace(service, "pid")? {
         return Ok(false);
@@ -119,18 +127,23 @@ pub(crate) fn belongs_to_service(
     let ProcSource::Namespace(view) = &owner.source else {
         return Err(Reading::Scope.refuse());
     };
-    let mut ancestors = BTreeSet::new();
-    let mut current = None;
+    let mut visited = BTreeSet::new();
+    let mut ancestors: Vec<ProcessLease> = Vec::new();
     loop {
-        let child = current.as_ref().unwrap_or(owner);
+        let child = ancestors.last().unwrap_or(owner);
         if child.same_process(service)? {
             owner.check()?;
+            // Live endpoints do not preserve their relation: an intermediate
+            // exit reparents the holder while both endpoints survive (#766).
+            for ancestor in &ancestors {
+                ancestor.check()?;
+            }
             service.check()?;
             return Ok(true);
         }
         child.check()?;
         let parent = parent_id(child)?;
-        if parent == 0 || !ancestors.insert(parent) {
+        if parent == 0 || !visited.insert(parent) {
             return Ok(false);
         }
         let directory =
@@ -140,7 +153,8 @@ pub(crate) fn belongs_to_service(
         if parent_id(child)? != parent {
             return Err(Reading::Scope.refuse());
         }
-        current = Some(next);
+        ancestors.push(next);
+        after_parent(parent);
     }
 }
 
