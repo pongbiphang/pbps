@@ -10,6 +10,8 @@ pub mod git;
 #[cfg(target_os = "linux")]
 pub mod attributes;
 #[cfg(target_os = "linux")]
+pub mod cli;
+#[cfg(target_os = "linux")]
 pub mod fsx;
 #[cfg(target_os = "linux")]
 pub mod listing;
@@ -17,6 +19,8 @@ pub mod listing;
 pub mod locks;
 #[cfg(target_os = "linux")]
 pub mod place;
+#[cfg(target_os = "linux")]
+pub mod push;
 #[cfg(target_os = "linux")]
 pub mod record;
 #[cfg(target_os = "linux")]
