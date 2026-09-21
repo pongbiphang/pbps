@@ -1,6 +1,92 @@
 use super::*;
 
 #[test]
+fn detached_coordinates_retain_one_namespace_handle_until_the_last_clone_drops() {
+    if std::env::var_os("PBPS_NAMESPACE_COORDINATE_FIXTURE").is_none() {
+        return;
+    }
+    assert_eq!(
+        std::process::id(),
+        1,
+        "the fixture needs a private PID namespace"
+    );
+    let namespace = FileIdentity::of(&File::open("/proc/self/ns/pid").unwrap()).unwrap();
+    let descriptors = || {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .map(|entry| std::fs::metadata(entry.unwrap().path()).unwrap())
+            .filter(|metadata| {
+                FileIdentity {
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                } == namespace
+            })
+            .count()
+    };
+    for group_coordinate in [false, true] {
+        let before = descriptors();
+        let mut child = super::super::spawned_and_execed(
+            std::process::Command::new("/bin/sleep").arg("30"),
+            "sleep",
+        );
+        let number = child.id();
+        let anchor = ProcessLease::capture(number).unwrap();
+        let view = NamespaceProcfs::capture(&anchor).unwrap();
+        let observed = view.observe().unwrap();
+        let task = observed
+            .iter()
+            .find(|task| task.id().number() == number)
+            .unwrap();
+        let id = if group_coordinate {
+            task.group()
+        } else {
+            task.id()
+        };
+        assert_eq!(id, task.group());
+        // Independent captures of this namespace must compare by kernel identity,
+        // not by the address of the shared owner or its descriptor number.
+        let other_view = NamespaceProcfs::capture(&anchor).unwrap();
+        let others = other_view.observe().unwrap();
+        let other = others
+            .iter()
+            .find(|task| task.id().number() == number)
+            .unwrap()
+            .id();
+        assert_eq!(id, other);
+        assert_eq!(id.cmp(&other), std::cmp::Ordering::Equal);
+        drop(other);
+        drop(others);
+        drop(other_view);
+        drop(observed);
+        drop(view);
+        drop(anchor);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(
+            descriptors(),
+            before + 1,
+            "detached coordinates must retain the namespace capability"
+        );
+
+        let copies = vec![id.clone(); 1024];
+        drop(id);
+        assert!(copies.iter().all(|id| id.number() == number));
+        assert_eq!(
+            descriptors(),
+            before + 1,
+            "cloning coordinates must share one descriptor"
+        );
+        drop(copies);
+        assert_eq!(
+            descriptors(),
+            before,
+            "the final coordinate releases its namespace handle"
+        );
+    }
+}
+
+#[test]
 fn a_hidden_or_unidentified_procfs_is_not_an_empty_namespace() {
     let row = "42 1 0:9 / /proc rw,nosuid,nodev,noexec - proc proc rw\n";
     visible_mount(row, 42).unwrap();
@@ -20,23 +106,22 @@ fn a_hidden_or_unidentified_procfs_is_not_an_empty_namespace() {
 }
 
 #[test]
-fn namespace_coordinates_cannot_substitute_for_another_namespaces_task() {
+fn namespace_coordinates_distinguish_task_numbers_and_reject_malformed_ids() {
+    let handle = Arc::new(File::open("/proc/self/ns/pid").unwrap());
+    let namespace = FileIdentity::of(&handle).unwrap();
     let first = NamespaceTaskId {
-        namespace: FileIdentity {
-            device: 4,
-            inode: 10,
-        },
+        namespace,
         number: 1,
+        handle: Arc::clone(&handle),
     };
     let second = NamespaceTaskId {
-        namespace: FileIdentity {
-            device: 4,
-            inode: 11,
-        },
-        number: 1,
+        namespace,
+        number: 2,
+        handle,
     };
-    assert_eq!(first.number(), second.number());
+    assert_ne!(first.number(), second.number());
     assert_ne!(first, second);
+    assert!(first < second);
     assert_eq!(status_id("Pid:\t17\nTgid:\t13\n", "Pid:").unwrap(), 17);
     for bad in ["", "Pid: 0", "Pid: 17 18", "Pid: 17\nPid: 18"] {
         assert!(status_id(bad, "Pid:").is_err());

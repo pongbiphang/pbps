@@ -77,7 +77,7 @@ fn observe_with(
                         return Ok(());
                     }
                     group.check()?;
-                    groups.insert(task.group, group);
+                    groups.insert(task.group(), group);
                     // Every caller permits at most three groups (the fixed
                     // bash/cat/cat forwarder). A fourth already refuses and
                     // must not consume one lease per arbitrary extra holder.
