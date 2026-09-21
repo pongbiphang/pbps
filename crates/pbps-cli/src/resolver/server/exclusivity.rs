@@ -2,13 +2,13 @@
 //!
 //! The engine has no reachable network: its namespace holds one loopback
 //! device and every session to it is a TCP connection whose both ends are in
-//! that namespace's own table. So the kernel's answer is complete for what
-//! reaches the engine over its port — every established row is either one
-//! end of a session this run opened, or an intruder — and the engine's own
-//! session list and cumulative counter are the independent second signal.
+//! that namespace's own table. Each observed established row must be one end
+//! of a session this run opened; the engine's session list and cumulative
+//! counter supply independent evidence between reads. Neither table reads
+//! nor holder observations form an atomic inventory (DECISIONS 533).
 
 use super::{Error, Signal};
-use crate::resolver::native::{ProcessLease, UnqualifiedProcess, socket_owners};
+use crate::resolver::native::{ProcessLease, UnqualifiedProcess, observed_socket_holders};
 use std::collections::BTreeSet;
 
 /// One session's two ends in the engine's network namespace.
@@ -43,7 +43,7 @@ pub(crate) fn bind(
         if row.peer != server_address || known.iter().any(|pair| pair.client == row.inode) {
             continue;
         }
-        let owners = socket_owners(forwarder, row.inode)
+        let owners = observed_socket_holders(forwarder, row.inode)
             .map_err(|_| "the forwarder's descriptors are unreadable")?;
         if owners.is_empty() {
             continue;
@@ -65,8 +65,8 @@ pub(crate) fn bind(
         }
     }
     let pair = found.ok_or("no session held by the forwarder reaches the engine's port")?;
-    let mut backends =
-        socket_owners(init, pair.server).map_err(|_| "the engine's descriptors are unreadable")?;
+    let mut backends = observed_socket_holders(init, pair.server)
+        .map_err(|_| "the engine's descriptors are unreadable")?;
     if backends.len() != 1 {
         return Err("the session's server end is not held by exactly one engine process");
     }
@@ -90,14 +90,14 @@ pub(crate) fn still_bound(
     {
         return Err(UnqualifiedProcess);
     }
-    let owners = socket_owners(init, pair.server)?;
+    let owners = observed_socket_holders(init, pair.server)?;
     if owners.len() != 1 || !owners[0].same_process(backend)? {
         return Err(UnqualifiedProcess);
     }
     backend.check()
 }
 
-/// Every socket in the engine's network namespace is accounted for.
+/// Account for every observed socket row in the engine's network namespace.
 ///
 /// A listener is the engine's and reachable from nowhere else. A row with no
 /// inode is a connection already gone, which the counter answers for. Any

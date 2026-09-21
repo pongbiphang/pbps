@@ -9,7 +9,8 @@ The staged replacement for descendant-based process observation is documented
 in [namespace-scoped observation](RESOLVER-NAMESPACE.md). Its primitive and
 fixtures are available under #740. Whole-container task qualification and
 engine discovery use that view under #741. The launch boundary is implemented
-under #742; target/socket-holder qualification remains #743.
+under #742; #743 observes socket holders through the same namespace view and
+separately binds the selected target service to its connected backend.
 
 ## Supported initial profile
 
@@ -18,8 +19,10 @@ observer on the same kernel. The API's actual Unix peer must be a live,
 root-installed Docker daemon, reached through a protected root-owned socket
 path. A root-owned proxy is insufficient. The target adapter accepts direct
 loopback verified TLS whose actual server socket belongs to the selected
-engine service's process tree. A configured PID bounds inspection; it does
-not assert identity. Database names, credentials and aliases do not establish
+engine service or an observed descendant. A configured PID selects that
+service and its qualified procfs view; it does not assert identity. A shared
+host PID namespace entails a host-wide observation, including unrelated
+process descriptor tables; a private namespace keeps this view small. Database names, credentials and aliases do not establish
 instance separation.
 
 Systemd socket activation (`dockerd -H fd://`) is supported with its protected
@@ -51,6 +54,42 @@ The host kernel, its administrators, the selected daemon and explicitly trusted
 image installation form the provisioning trust boundary. SQL privileges in
 scratch grant no authority over those external controls. This profile does not
 claim protection from a compromised kernel or provisioning administrator.
+
+## Target identity and socket observation (#743)
+
+`observed_socket_holders` visits the pinned namespace procfs and each visible
+thread group's tasks, independently of parent-child lists. It reads descriptor
+tables through held task entries and captures protected executable/process
+leases only for matching groups. Threads sharing a table count once, while a
+worker with an unshared table is still inspected. Group order is stable within
+the retained namespace view. More than three observed groups refuses without
+retaining an unbounded set of leases; the fixed forwarder permits three and an
+engine backend permits one.
+
+The native adapter separately follows the observed holder's parent chain to
+the selected service, with held identities and bracketed parent reads. Merely
+sharing a namespace or the engine executable name does not establish that
+relation. The authenticated connection identity, actual endpoint pair/socket
+inode, retained service/backend processes and engine-owned identity query are
+checked together. A new connection cannot reuse a lease; exit, exec replacement,
+changed endpoints, canceled checks and dropped target witnesses invalidate it.
+
+An empty observation receives one fresh pass for a backend that became visible
+after the first PID enumeration. A permission error, replaced view or observed
+ambiguity is never retried as absence. This bounded readiness handling does
+not prove completeness: acknowledged fixtures keep two holders alive throughout
+a scan while it observes one, and repeat that result across four passes with
+unchanged process identities and socket cookies. Forks can also add holders
+after enumeration. Excluding deliberate endpoint sharing by a cooperating
+engine/host is a responsibility of the trusted provisioning environment, not
+an exhaustive guarantee supplied by pbps. Known alias/proxy negatives remain
+required tests; they do not certify all possible cooperating proxies.
+
+The same observation is used by run-owned private channels and supplied-server
+binding/revalidation. Runtime-enforced launch privileges, namespaces, cgroups,
+foreign-sharer checks, session counters and scratch/target separation remain
+independent premises. No target is frozen or reconfigured. This runtime work
+does not deliver the later binding-planning or source-handling stages of #595.
 
 ## Dedicated scratch servers (#609)
 
@@ -159,16 +198,16 @@ attach stream. The operator supplies no relay, no socket directory and no
 process id; PostgreSQL listens on loopback with no Unix socket, SQL Server on
 its port. Each session is bound to the kernel: the one established pair to
 the engine's port whose client end the forwarder's processes hold, and whose
-server end exactly one engine process holds — on PostgreSQL the backend the
+server end is observed in one engine thread group — on PostgreSQL the backend the
 engine itself reports for the session. The forwarder's tasks are checked
 against the fixed program at the fixed privileges, as in the Docker profile.
 
-Exclusivity is decided by the kernel and confirmed by the engine. Because the
-namespace has no route out, every session to the engine is a TCP connection
-whose both ends are in that namespace's own table, so the census is complete
-for what reaches the engine: a listener is the engine's, a row with no inode
-is a connection already gone, and any other row is one end of a session this
-run opened or a refusal. Any Unix socket at all is a refusal — the recipe
+Exclusivity combines kernel observations with engine evidence under the
+trusted provisioning boundary. In the fixed loopback layout, both ends of
+an ordinary TCP session appear in the namespace's table: a listener is the
+engine's, a row with no inode is a connection already gone, and any other
+observed row must be one end of a session this run opened or a refusal. These
+reads are sequential observations, not an atomic socket/holder inventory. Any Unix socket at all is a refusal — the recipe
 gives the engine no Unix listener. What that cannot see is a session that
 opened and closed between two reads, so each engine also supplies a
 **cumulative** session counter, and only this run's own sessions may have
@@ -372,7 +411,10 @@ transport fixtures also reject corrupted and replayed TLS application records.
 The dedicated CI resolver matrix runs both profiles separately. On its
 disposable native Linux runner, `live-resolver-target.py --native-host` also
 exercises the complete public factory using a prebuilt test binary with root
-process-inspection access. All required CI jobs, including this matrix, must
+process-inspection access, with the target sharing the host PID namespace.
+`scripts/live-resolver-sockets.py` runs acknowledged reparenting, shared and
+unshared thread-table, service-mismatch, bounded empty-result and descriptor
+handoff cases in a disposable PID/mount namespace. All required CI jobs, including this matrix, must
 pass on the current PR head before merge. A component-only test run cannot
 stand in for this complete factory check.
 

@@ -143,11 +143,15 @@ against the named profile — an empty network namespace, an unprivileged engine
 bounded cgroup resources and a mount table every row of which the profile
 names — after proving from the actual processes that it is not the target's
 instance, and reaches it through a run-owned forwarder as the Docker profile
-does. Exclusivity is the kernel's complete census of that namespace plus each
+does. Exclusivity combines namespace socket/holder observations with each
 engine's cumulative session counter, so a session that opened and closed
 between two checks still invalidates the run. Its run-owned database and login
 are removed on every exit path. Like the Docker runtime, this is not wired into
-binding planning and exposes no SQL surface.
+binding planning and exposes no SQL surface. The #740–#743 runtime redesign
+uses a pinned namespace procfs view, verified launch privileges and positive
+target/backend/connection identities. Holder observations are explicitly
+non-exhaustive under concurrent descriptor transfer; trusted provisioning,
+containment and engine evidence remain separate premises (DECISIONS 533).
 
 Delivery is split into three stages:
 

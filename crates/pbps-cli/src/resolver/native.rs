@@ -24,10 +24,10 @@ pub(crate) use execution::{
     BoundedResourceLease, ExecutionLease, ExecutionProfile, MountEntry, ResourceCeilings,
     cgroup_relative, mount_rows,
 };
-pub(crate) use namespace::for_each_namespace_task;
 pub use namespace::{
     NamespaceError, NamespaceProcfs, NamespaceTaskId, TaskObservation, TaskReading,
 };
+pub(crate) use namespace::{for_each_namespace_task, observed_socket_holders};
 pub(crate) use private_channel::{
     FORWARDER_PRIVILEGES, PrivateChannelLease, PrivateChannelProfile, WorkloadPrivileges,
     awaiting_engine, guarded_tasks, private_network, security,
@@ -108,15 +108,11 @@ pub(crate) enum Reading {
     /// The engine's end is in that table more than once, which one
     /// established pair cannot be.
     PeerServerDuplicated,
-    /// The number of processes in the service's scope holding the socket,
-    /// where exactly one is the only answer a lease can be built on.
+    /// The number of observed thread groups holding the socket; this is not
+    /// a claim that no unobserved holder exists (DECISIONS 533).
     OwnerCount(usize),
-    /// Walking the service's descendants: a `task`, `children` or `stat` read
-    /// that did not merely say the process is gone.
+    /// Reading the observed backend's parent relation to the selected service.
     Scope,
-    /// A process named by `children` whose own `stat` no longer names the
-    /// parent that named it — a reparent, or a reused numeric PID.
-    ScopeParent,
     /// The descriptor table of a process in the scope.
     ScopeDescriptors,
     /// A process the walk has just seen has no `/proc` entry to open.
@@ -192,7 +188,6 @@ impl std::fmt::Display for Reading {
             Self::PeerServerDuplicated => f.write_str("peer-server-duplicated"),
             Self::OwnerCount(found) => write!(f, "owner-count({found})"),
             Self::Scope => f.write_str("scope"),
-            Self::ScopeParent => f.write_str("scope-parent"),
             Self::ScopeDescriptors => f.write_str("scope-descriptors"),
             Self::CaptureOpen => f.write_str("capture-open"),
             Self::CaptureStartTicks => f.write_str("capture-start-ticks"),
@@ -924,119 +919,6 @@ pub(crate) fn open_process(pid: u32) -> std::io::Result<File> {
     File::open(format!("/proc/{pid}"))
 }
 
-pub(crate) fn process_scope(
-    service: &ProcessLease,
-) -> Result<Vec<(u32, File)>, UnqualifiedProcess> {
-    // Socket qualification still uses observer coordinates until #743.
-    let pid = service.observer_pid()?;
-    let mut scope = vec![(
-        pid,
-        service
-            .directory
-            .try_clone()
-            .map_err(Reading::Scope.named())?,
-    )];
-    let mut seen = BTreeSet::from([pid]);
-    let mut cursor = 0;
-    while cursor < scope.len() {
-        let (parent_pid, directory) = &scope[cursor];
-        let parent_pid = *parent_pid;
-        let mut children = Vec::new();
-        let tasks = match std::fs::read_dir(proc_base(directory).join("task")) {
-            Ok(tasks) => tasks,
-            // Another session may exit while its already-observed proc
-            // directory is held. The selected service and socket owner have
-            // their own live leases; a vanished unrelated child is not an
-            // unreadable live process or a reason to invalidate that socket.
-            Err(error) if process_gone(&error) => {
-                cursor += 1;
-                continue;
-            }
-            Err(_) => return Err(Reading::Scope.refuse()),
-        };
-        for task in tasks {
-            let task = task.map_err(Reading::Scope.named())?;
-            let text = match std::fs::read_to_string(task.path().join("children")) {
-                Ok(text) if text.len() <= 65536 => text,
-                Err(error) if process_gone(&error) => continue,
-                Ok(_) | Err(_) => return Err(Reading::Scope.refuse()),
-            };
-            for pid in text.split_whitespace() {
-                children.push(pid.parse::<u32>().map_err(Reading::Scope.named())?);
-            }
-        }
-        for pid in children {
-            if !seen.insert(pid) {
-                continue;
-            }
-            // A bound against a pathological /proc, not a profile limit: it
-            // must exceed the largest `pids.max` any profile admits (the
-            // dedicated-server profile allows 2048) so that a runtime meeting
-            // its named ceiling is never refused for reaching this instead —
-            // `process_scope` counts processes, and threads do not add entries
-            // here, so real engines stay far below it (finding on #640).
-            if scope.len() >= 4096 {
-                return Err(Reading::Scope.refuse());
-            }
-            let directory = match open_process(pid) {
-                Ok(file) => file,
-                Err(error) if process_gone(&error) => continue,
-                Err(_) => return Err(Reading::Scope.refuse()),
-            };
-            let stat = match std::fs::read_to_string(proc_base(&directory).join("stat")) {
-                Ok(stat) => stat,
-                Err(error) if process_gone(&error) => continue,
-                Err(_) => return Err(Reading::Scope.refuse()),
-            };
-            let ppid = stat
-                .rsplit_once(')')
-                .and_then(|(_, fields)| fields.split_whitespace().nth(1))
-                .and_then(|value| value.parse::<u32>().ok())
-                .ok_or_else(|| Reading::Scope.refuse())?;
-            // A pid was in a `children` list a moment ago and its own `stat`
-            // now names a different parent. Two very different things look
-            // like this, and refusing both is what made a valid deployment
-            // intermittently refused (#674, DECISIONS 522).
-            //
-            // **Measured on this machine**, walking a shell that spawns and
-            // reaps two children in a loop: 1,155,160 walks produced 2,771 of
-            // these, and 2,769 of them were a process in state `X` or `Z` —
-            // the child caught mid-exit, its `stat` already reparented to the
-            // reaper while `/proc/<pid>` still answers.
-            //
-            // A process that is over is the one case that can be passed over
-            // without asking anything else: it holds no descriptor, runs no
-            // code and owns no socket, so no caller of this walk has a
-            // question it could answer.
-            //
-            // **`exited_stat` and not a state test written here.** This file
-            // already answers "is this process over", and it requires the
-            // thread count as well as the state, because a dead leader can
-            // retain live threads and a surviving thread can hold the socket
-            // or have descendants of its own —
-            // `a_zombie_leader_does_not_prove_that_its_other_threads_exited`
-            // pins exactly that. A second, weaker answer to one question was
-            // the first shape of this branch, and review caught it.
-            //
-            // **Anything not proved over refuses**, as it did before. Absence
-            // from a parent's list is not proof either: a live descendant
-            // reparented to a subreaper leaves the list while remaining in
-            // the scope, and passing it over would hand
-            // `PrivateChannelLease::check` and `check_kernel_parts` an
-            // incomplete scan that reads as a complete one.
-            if ppid != parent_pid {
-                if exited_stat(&stat).map_err(Reading::Scope.named())? {
-                    continue;
-                }
-                return Err(Reading::ScopeParent.refuse());
-            }
-            scope.push((pid, directory));
-        }
-        cursor += 1;
-    }
-    Ok(scope)
-}
-
 /// The tasks sharing one of a lease's namespaces, by kernel id.
 ///
 /// Tasks, not processes. Linux keeps credentials, the seccomp and
@@ -1216,47 +1098,22 @@ fn socket_owner(
         return Err(Reading::NetNamespace.refuse());
     }
     let inode = peer_inode(local, peer)?;
-    let mut owners = socket_owners(service, inode)?;
+    let mut owners = observed_socket_holders(service, inode)?;
     // The count itself is the diagnosis, so it is what gets reported: a
-    // second holder and none at all are different accidents, and a walk that
-    // saw a task appear or exit produces one or the other (#674).
+    // second holder and none at all are different observations (#674). The
+    // trusted provisioning boundary excludes hostile descriptor sharing; a
+    // singleton is not an exhaustive ownership proof (DECISIONS 533).
     if owners.len() != 1 {
         return Err(Reading::OwnerCount(owners.len()).refuse());
+    }
+    if !namespace::belongs_to_service(&owners[0], service)? {
+        return Err(Reading::SocketOwner.refuse());
     }
     service.check()?;
     if peer_inode(local, peer)? != inode {
         return Err(Reading::PeerInode.refuse());
     }
     Ok((owners.remove(0), inode))
-}
-
-pub(crate) fn socket_owners(
-    service: &ProcessLease,
-    inode: u64,
-) -> Result<Vec<ProcessLease>, UnqualifiedProcess> {
-    let expected = PathBuf::from(format!("socket:[{inode}]"));
-    let mut owners = Vec::new();
-    for (pid, directory) in process_scope(service)? {
-        let entries = match std::fs::read_dir(proc_base(&directory).join("fd")) {
-            Ok(entries) => entries,
-            Err(error) if process_gone(&error) => continue,
-            Err(_) => return Err(Reading::ScopeDescriptors.refuse()),
-        };
-        let mut owns_socket = false;
-        for entry in entries {
-            let entry = entry.map_err(Reading::ScopeDescriptors.named())?;
-            match std::fs::read_link(entry.path()) {
-                Ok(path) => owns_socket |= path == expected,
-                Err(error) if process_gone(&error) => (),
-                Err(_) => return Err(Reading::ScopeDescriptors.refuse()),
-            }
-        }
-        if owns_socket && let Some(lease) = observe_incidental(pid, &directory, Ok)? {
-            owners.push(lease);
-        }
-    }
-    service.check()?;
-    Ok(owners)
 }
 
 fn start_ticks(base: &Path) -> Result<u64, UnqualifiedProcess> {
@@ -1414,12 +1271,9 @@ mod tests {
 
     /// Establishing a process is named apart from re-reading one.
     ///
-    /// `socket_owners` recaptures every holder it finds through
-    /// `observe_incidental`, so a `capture` that refuses on a **live** process
-    /// propagates straight out of the socket-owner walk. Left unnamed, that is
-    /// the one way a refusal on the path #674 lives on could still reach a CI
-    /// log carrying nothing but the outer step — found in review of this
-    /// change, which had named only the re-reads.
+    /// Holder qualification establishes a lease through a held proc entry;
+    /// a refusal on a live process must name the capture reading separately
+    /// from later continuity checks (#674).
     ///
     /// `CaptureUnprotected` earns its own name rather than sharing
     /// `CaptureExecutable`: it is the rule a lease is built on and not a read
@@ -1457,87 +1311,6 @@ mod tests {
         assert_eq!(last_reading(), None, "nothing refused");
         child.kill().unwrap();
         child.wait().unwrap();
-    }
-
-    /// A child leaving the tree while the tree is being walked is not a
-    /// reason to refuse the walk.
-    ///
-    /// This is #674's liveness window, and it is the one the walk meets in
-    /// production: PostgreSQL forks a backend per connection and SQL Server's
-    /// engine runs 116 tasks, so the service's own process tree churns
-    /// exactly like this fixture. `socket_owners` walks that tree for every
-    /// `SocketOwnerLease::check`, so a refusal here reached the operator as
-    /// "the target this run was aimed at changed" — a valid deployment
-    /// intermittently refused.
-    ///
-    /// **Measured before the fix**: 785,426 walks of this fixture produced
-    /// 1,055 refusals, every one of them `scope-parent`. Classified over
-    /// 1,155,160 walks, all 2,771 occurrences had the pid **no longer listed**
-    /// as a child by the time it was asked again, and 2,761 of those were in
-    /// state `X`, the child caught mid-exit with its `stat` already
-    /// reparented. None was still listed and claiming another parent, which
-    /// is the inconsistency the check exists for and the one that still
-    /// refuses.
-    ///
-    /// The budget is time rather than iterations because the rate is what
-    /// matters: unfixed, this window opened roughly once per 750 walks, and
-    /// this machine walks it tens of thousands of times a second.
-    ///
-    /// **Zero is deliberately not the bar, and the residual is not a bug.**
-    /// Measured across five runs after the fix: 1 or 2 refusals per ~200,000
-    /// walks, against 267 before it. Those are a pid **reused** between the
-    /// `children` read and the `stat` read by a process outside the tree —
-    /// indistinguishable from a live descendant that reparented, without
-    /// comparing the opened process's `starttime` against the moment the list
-    /// was read, which needs a clock-tick conversion this crate's `rustix`
-    /// features do not carry. Refusing is the fail-closed answer to that
-    /// ambiguity, and at one walk in a hundred thousand — on a fixture that
-    /// spawns forty thousand processes a second, which no engine does — it is
-    /// not what made CI intermittent. Closing it is #729.
-    #[test]
-    fn a_child_leaving_the_tree_does_not_refuse_the_walk() {
-        let mut tree = spawned_and_execed(
-            Command::new("/bin/bash")
-                .args([
-                    "-c",
-                    "exec /bin/bash -c 'while :; do /usr/bin/true & /usr/bin/true & wait; done'",
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null()),
-            "bash",
-        );
-        // `/bin/bash` is root-installed, so a lease can be built on it without
-        // the root fixture the resolver matrix needs.
-        let lease = ProcessLease::capture(tree.id()).expect("a root-installed shell");
-
-        let mut walks = 0usize;
-        let mut refused: std::collections::BTreeMap<String, usize> = Default::default();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            walks += 1;
-            LAST_READING.with(|cell| cell.set(None));
-            if process_scope(&lease).is_err() {
-                let name = last_reading()
-                    .map(|reading| reading.to_string())
-                    .unwrap_or_else(|| "unnamed".to_owned());
-                *refused.entry(name).or_default() += 1;
-            }
-        }
-        tree.kill().unwrap();
-        tree.wait().unwrap();
-
-        assert!(
-            walks > 10_000,
-            "too few walks to say anything: {walks} in five seconds"
-        );
-        let refusals: usize = refused.values().sum();
-        assert!(
-            refusals * 20_000 < walks,
-            "{refusals} refusals in {walks} walks is the rate this fixture had before the \
-             departing child was passed over (267 in 206,771), not after it (1 or 2 in \
-             200,000): {refused:?}"
-        );
     }
 
     /// One established pair read twice is one socket, and the negative cases
@@ -1791,7 +1564,6 @@ mod tests {
             Reading::NetNamespace,
             Reading::PeerInode,
             Reading::Scope,
-            Reading::ScopeParent,
             Reading::ScopeDescriptors,
             Reading::CaptureOpen,
             Reading::CaptureStartTicks,

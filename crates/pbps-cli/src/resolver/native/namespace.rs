@@ -14,6 +14,9 @@ use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
+mod sockets;
+pub(crate) use sockets::{belongs_to_service, observed_socket_holders};
+
 /// Why an observation cannot be used. This API distinguishes an unsupported
 /// view from an unreadable live task and a replaced identity; it does not
 /// change the older native qualification error surface (#646).
