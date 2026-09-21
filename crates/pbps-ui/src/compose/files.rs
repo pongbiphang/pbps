@@ -80,6 +80,17 @@ impl Root {
     }
 
     pub fn read(&self, name: &str) -> Result<Option<FileBytes>> {
+        self.read_file(name, false)
+    }
+
+    pub fn input(&self, name: &str, declarations: &str) -> Result<Option<FileBytes>> {
+        self.read_file(
+            name,
+            name.starts_with(&format!("{declarations}/")) && declaration_path(name),
+        )
+    }
+
+    fn read_file(&self, name: &str, directory_is_absent: bool) -> Result<Option<FileBytes>> {
         path(name)?;
         let fd = match openat2(
             &self.0,
@@ -89,7 +100,10 @@ impl Root {
             ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
         ) {
             Ok(fd) => fd,
-            Err(rustix::io::Errno::NOENT) => return Ok(None),
+            // A former descendant also becomes absent when an ancestor is
+            // replaced by a file. NO_SYMLINKS still refuses linked parents;
+            // declaration enumeration separately refuses every special entry.
+            Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR) => return Ok(None),
             Err(_) => {
                 return Err(Error::new(
                     "A compose input is unreadable or not a contained regular file",
@@ -97,6 +111,11 @@ impl Root {
             }
         };
         let before = fstat(&fd).map_err(|_| Error::new("Could not inspect a compose input"))?;
+        // The recursive loader treats a directory ending in .yml as a
+        // directory. It has no declaration blob at its own pathname.
+        if directory_is_absent && FileType::from_raw_mode(before.st_mode) == FileType::Directory {
+            return Ok(None);
+        }
         if FileType::from_raw_mode(before.st_mode) != FileType::RegularFile {
             return Err(Error::new("Compose inputs must be regular files"));
         }

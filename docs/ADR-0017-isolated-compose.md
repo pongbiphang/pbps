@@ -363,6 +363,10 @@ or live declaration reads. Source capture budgets include those attribute files.
 Captured bytes are refused only when Git's raw and normalized object identities
 differ in a sterile private probe with the resolved text policy; CR-only input
 and non-converting `text=auto` content remain supported.
+File/directory replacements use compatible private attribute indexes for the
+old and new path shapes. The snapshot and candidate index remove admitted absent
+blobs before adding replacements. Empty private directories may be removed,
+but a replacement that would erase unrelated base content refuses.
 The CLI remains available for unsupported capture layouts.
 
 Each workflow retains one unconfirmed candidate for at most 24 hours. Source

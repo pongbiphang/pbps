@@ -207,6 +207,28 @@ fn blobs(git: &Git, entries: &BTreeMap<String, TreeEntry>) -> Result<BTreeMap<St
     Ok(result)
 }
 
+fn remove_input(root: &Path, name: &str, declarations: &str) -> Result<()> {
+    let path = root.join(name);
+    fs::remove_file(&path)
+        .map_err(|_| Error::new("Could not represent an absent input in the snapshot"))?;
+    let mut parent = path.parent();
+    let declarations = root.join(declarations);
+    while let Some(directory) =
+        parent.filter(|directory| *directory != root && *directory != declarations)
+    {
+        match fs::remove_dir(directory) {
+            Ok(()) => parent = directory.parent(),
+            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
+            Err(_) => {
+                return Err(Error::new(
+                    "Could not remove an empty private snapshot directory",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn write_file(root: &Path, name: &str, content: &FileBytes) -> Result<()> {
     files::path(name)?;
     let path = root.join(name);
@@ -214,6 +236,11 @@ fn write_file(root: &Path, name: &str, content: &FileBytes) -> Result<()> {
     // were checked and every base object is a regular file, never a symlink.
     fs::create_dir_all(path.parent().expect("contained file parent"))
         .map_err(|_| Error::new("Could not create a private snapshot directory"))?;
+    if path.is_dir() {
+        fs::remove_dir(&path).map_err(|_| {
+            Error::new("A declaration replacement would remove preserved base content")
+        })?;
+    }
     fs::write(&path, &content.bytes)
         .map_err(|_| Error::new("Could not write a private snapshot file"))?;
     fs::set_permissions(
@@ -288,7 +315,7 @@ fn attributes(git: &Git, name: &str, base: Option<&str>) -> Result<Vec<(String, 
 /// check-attr's text output cannot distinguish.
 struct AttributeView {
     directory: PathBuf,
-    index: PathBuf,
+    indexes: Vec<(PathBuf, BTreeSet<String>)>,
     recorded: BTreeMap<String, Option<FileBytes>>,
     normalizer: Git,
 }
@@ -304,27 +331,47 @@ impl AttributeView {
         let directory = workspace.join("attribute-view");
         fs::create_dir(&directory)
             .map_err(|_| Error::new("Could not create the private attribute view"))?;
-        let index = workspace.join("attribute.index");
-        let index_options = [
-            "-c",
-            "core.splitIndex=false",
-            "-c",
-            "core.sparseCheckout=false",
-            "-c",
-            "index.sparse=false",
-        ];
-        let mut command = index_options.to_vec();
-        command.extend(["read-tree", base]);
-        git.bytes(&command, &[], Some(&index))?;
-        // Placeholders expose both recorded and new input names. Attribute
-        // lookup uses GIT_ATTR_SOURCE, never these placeholder contents.
-        let mut records = Vec::new();
+        // Deleted ancestors and new descendants cannot coexist in a Git
+        // index. Partition names into compatible views; normally one suffices,
+        // while a file/directory replacement needs a second view.
+        let mut groups: Vec<BTreeSet<String>> = Vec::new();
         for name in names {
-            records.extend_from_slice(format!("100644 {placeholder}\t{name}\0").as_bytes());
+            let compatible = |group: &&mut BTreeSet<String>| {
+                !Path::new(name)
+                    .ancestors()
+                    .skip(1)
+                    .any(|parent| parent.to_str().is_some_and(|parent| group.contains(parent)))
+            };
+            if let Some(group) = groups.iter_mut().find(compatible) {
+                group.insert(name.clone());
+            } else {
+                groups.push(BTreeSet::from([name.clone()]));
+            }
         }
-        let mut command = index_options.to_vec();
-        command.extend(["update-index", "-z", "--index-info"]);
-        git.bytes(&command, &records, Some(&index))?;
+        let mut indexes = Vec::new();
+        for (number, group) in groups.into_iter().enumerate() {
+            let index = workspace.join(format!("attribute-{number}.index"));
+            let index_options = [
+                "-c",
+                "core.splitIndex=false",
+                "-c",
+                "core.sparseCheckout=false",
+                "-c",
+                "index.sparse=false",
+            ];
+            let mut command = index_options.to_vec();
+            command.extend(["read-tree", base]);
+            git.bytes(&command, &[], Some(&index))?;
+            // Attribute lookup uses GIT_ATTR_SOURCE, not placeholder bytes.
+            let mut records = Vec::new();
+            for name in &group {
+                records.extend_from_slice(format!("100644 {placeholder}\t{name}\0").as_bytes());
+            }
+            let mut command = index_options.to_vec();
+            command.extend(["update-index", "-z", "--index-info"]);
+            git.bytes(&command, &records, Some(&index))?;
+            indexes.push((index, group));
+        }
         let mut paths = BTreeSet::new();
         for name in names {
             let mut parent = Path::new(name).parent();
@@ -379,7 +426,7 @@ impl AttributeView {
                 deadline: git.deadline,
             },
             directory,
-            index,
+            indexes,
             recorded: paths
                 .into_iter()
                 .map(|name| {
@@ -471,48 +518,50 @@ impl AttributeView {
         base: &str,
         names: &BTreeSet<String>,
     ) -> Result<BTreeMap<String, String>> {
-        let mut command = git.command();
-        command
-            .env("GIT_INDEX_FILE", &self.index)
-            .env("GIT_WORK_TREE", &self.directory)
-            .env("GIT_ATTR_SOURCE", base)
-            .args(["ls-files", "--eol", "--cached", "-z", "--"])
-            .args(names);
-        let output = super::process::run(command, &[], git.deadline)?;
-        if !output.status.success() {
-            return Err(Error::new("Could not resolve Git line-ending policies"));
-        }
         let mut result = BTreeMap::new();
-        for row in output.stdout.split(|b| *b == 0).filter(|r| !r.is_empty()) {
-            let Some(tab) = row.iter().position(|b| *b == b'\t') else {
-                return Err(Error::new("Incomplete Git line-ending policy"));
-            };
-            let Ok(name) = std::str::from_utf8(&row[tab + 1..]) else {
-                continue;
-            };
-            if !names.contains(name) {
-                continue;
+        for (index, group) in &self.indexes {
+            let mut command = git.command();
+            command
+                .env("GIT_INDEX_FILE", index)
+                .env("GIT_WORK_TREE", &self.directory)
+                .env("GIT_ATTR_SOURCE", base)
+                .args(["ls-files", "--eol", "--cached", "-z", "--"])
+                .args(group);
+            let output = super::process::run(command, &[], git.deadline)?;
+            if !output.status.success() {
+                return Err(Error::new("Could not resolve Git line-ending policies"));
             }
-            let header = std::str::from_utf8(&row[..tab])
-                .map_err(|_| Error::new("Invalid Git line-ending policy"))?;
-            let (_, policy) = header
-                .split_once("attr/")
-                .ok_or_else(|| Error::new("Missing Git line-ending policy"))?;
-            let policy = policy.trim_end();
-            if !matches!(
-                policy,
-                "" | "-text"
-                    | "text"
-                    | "text=auto"
-                    | "text eol=lf"
-                    | "text eol=crlf"
-                    | "text=auto eol=lf"
-                    | "text=auto eol=crlf"
-            ) || result.insert(name.to_owned(), policy.to_owned()).is_some()
-            {
-                return Err(Error::new(
-                    "Unsupported or conflicting Git line-ending policy",
-                ));
+            for row in output.stdout.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+                let Some(tab) = row.iter().position(|b| *b == b'\t') else {
+                    return Err(Error::new("Incomplete Git line-ending policy"));
+                };
+                let Ok(name) = std::str::from_utf8(&row[tab + 1..]) else {
+                    continue;
+                };
+                if !group.contains(name) {
+                    continue;
+                }
+                let header = std::str::from_utf8(&row[..tab])
+                    .map_err(|_| Error::new("Invalid Git line-ending policy"))?;
+                let (_, policy) = header
+                    .split_once("attr/")
+                    .ok_or_else(|| Error::new("Missing Git line-ending policy"))?;
+                let policy = policy.trim_end();
+                if !matches!(
+                    policy,
+                    "" | "-text"
+                        | "text"
+                        | "text=auto"
+                        | "text eol=lf"
+                        | "text eol=crlf"
+                        | "text=auto eol=lf"
+                        | "text=auto eol=crlf"
+                ) || result.insert(name.to_owned(), policy.to_owned()).is_some()
+                {
+                    return Err(Error::new(
+                        "Unsupported or conflicting Git line-ending policy",
+                    ));
+                }
             }
         }
         if result.len() != names.len() {
@@ -526,6 +575,7 @@ fn manifest(
     git: &Git,
     root: &Root,
     names: &BTreeSet<String>,
+    declarations: &str,
     base: &str,
     view: &AttributeView,
 ) -> Result<(Manifest, BTreeMap<String, Option<FileBytes>>)> {
@@ -542,7 +592,7 @@ fn manifest(
     let attribute_files = view.files(root)?;
     let line_endings = view.policies(git, base, names)?;
     for name in names {
-        let file = root.read(name)?;
+        let file = root.input(name, declarations)?;
         let working = attributes(git, name, None)?;
         if working != attributes(git, name, Some(base))? {
             return Err(Error::new(
@@ -728,7 +778,8 @@ pub(super) fn capture(
         &workspace.path,
         &entries[&project_file].oid,
     )?;
-    let (evidence, captured) = manifest(&git, &root, &names, &base, &attribute_view)?;
+    let (evidence, captured) =
+        manifest(&git, &root, &names, &declarations, &base, &attribute_view)?;
     // Path admission was based on the base's configuration. The configuration
     // actually overlaid below must be those same bytes; checking the live file
     // before discovery alone leaves a config-change window before this capture.
@@ -762,12 +813,16 @@ pub(super) fn capture(
         }
     }
     observer(CaptureBoundary::InputsRead);
+    // Remove only admitted absent blobs before adding their replacements.
+    // Deleting a whole directory would discard unrelated base entries.
     for (name, file) in &captured {
-        match file {
-            Some(file) => write_file(&snapshot, name, file)?,
-            None if recorded.contains_key(name) => fs::remove_file(snapshot.join(name))
-                .map_err(|_| Error::new("Could not represent an absent input in the snapshot"))?,
-            None => {}
+        if file.is_none() && recorded.contains_key(name) {
+            remove_input(&snapshot, name, &declarations)?;
+        }
+    }
+    for (name, file) in &captured {
+        if let Some(file) = file {
+            write_file(&snapshot, name, file)?;
         }
     }
     cli.record(&snapshot_project, &request.intent, &base)?;
@@ -775,41 +830,41 @@ pub(super) fn capture(
     let private = Root::open(&snapshot)?;
     let mut result = BTreeMap::new();
     for name in &names {
-        result.insert(name.clone(), private.read(name)?);
+        result.insert(name.clone(), private.input(name, &declarations)?);
     }
     cli.validate(&snapshot_project, &base)?;
     for (name, expected) in &result {
-        if private.read(name)? != *expected {
+        if private.input(name, &declarations)? != *expected {
             return Err(Error::new("Candidate inputs changed during validation"));
         }
     }
     let index = workspace.path.join("candidate.index");
     snapshot_git.bytes(&["read-tree", &base], &[], Some(&index))?;
     for (name, file) in &result {
+        if file.is_none() && name != &project_file {
+            snapshot_git.bytes(
+                &["update-index", "--force-remove", "--", name],
+                &[],
+                Some(&index),
+            )?;
+        }
+    }
+    for (name, file) in &result {
         if name == &project_file {
             continue;
         }
-        match file {
-            Some(file) => {
-                let oid = snapshot_git.store(&file.bytes)?;
-                snapshot_git.bytes(
-                    &[
-                        "update-index",
-                        "--add",
-                        "--cacheinfo",
-                        &format!("{:o},{oid},{name}", file.mode),
-                    ],
-                    &[],
-                    Some(&index),
-                )?;
-            }
-            None => {
-                snapshot_git.bytes(
-                    &["update-index", "--force-remove", "--", name],
-                    &[],
-                    Some(&index),
-                )?;
-            }
+        if let Some(file) = file {
+            let oid = snapshot_git.store(&file.bytes)?;
+            snapshot_git.bytes(
+                &[
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("{:o},{oid},{name}", file.mode),
+                ],
+                &[],
+                Some(&index),
+            )?;
         }
     }
     let tree = text(snapshot_git.bytes(&["write-tree"], &[], Some(&index))?)?;
@@ -835,7 +890,15 @@ pub(super) fn capture(
     if !root.same_directory(&current_root)?
         || !selected_root.same_directory(&Root::open(&selected)?)?
         || current_root.declarations(&declarations)? != live
-        || manifest(&git, &current_root, &names, &base, &attribute_view)?.0 != evidence
+        || manifest(
+            &git,
+            &current_root,
+            &names,
+            &declarations,
+            &base,
+            &attribute_view,
+        )?
+        .0 != evidence
         || git.line(&["rev-parse", "--verify", "HEAD^{commit}"])? != base
         || destination::resolve(&git, &request.remote)? != destination
         || self::signing(&git)? != signing

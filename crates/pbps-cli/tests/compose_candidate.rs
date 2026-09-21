@@ -350,6 +350,92 @@ fn new_deleted_recreated_paths_and_modes_are_part_of_the_candidate() {
 }
 
 #[test]
+fn deleting_the_last_declaration_keeps_the_snapshot_input_directory() {
+    let repo = Repository::new("last-declaration", "");
+    fs::remove_file(repo.root.join("schema/t.yml")).unwrap();
+    let index = fs::read(repo.root.join(".git/index")).unwrap();
+    let ids = fs::read(repo.root.join("schema.ids.json")).unwrap();
+    let mut action = request();
+    action.intent = Intent::DropTable {
+        table: "dbo.t".into(),
+        reason: "Retired final table".into(),
+    };
+    let preview = repo.store().preview(action, SystemTime::now()).unwrap();
+    assert!(preview.diff.contains("Retired final table"));
+    assert!(repo.root.join("schema").is_dir());
+    assert_eq!(fs::read(repo.root.join(".git/index")).unwrap(), index);
+    assert_eq!(fs::read(repo.root.join("schema.ids.json")).unwrap(), ids);
+}
+
+#[test]
+fn declaration_file_directory_replacements_preserve_the_reviewed_scope() {
+    for (directory_first, foreign) in [(false, false), (true, false), (true, true)] {
+        let repo = Repository::new(&format!("replacement-{directory_first}-{foreign}"), "");
+        let file = "schema/t.yml";
+        let nested = "schema/t.yml/part.yml";
+        fs::write(repo.root.join(".gitattributes"), "*.yml text\n").unwrap();
+        let (old, new) = if directory_first {
+            fs::remove_file(repo.root.join(file)).unwrap();
+            fs::create_dir(repo.root.join(file)).unwrap();
+            fs::write(repo.root.join(nested), ORIGINAL).unwrap();
+            if foreign {
+                fs::write(
+                    repo.root.join("schema/t.yml/notes.txt"),
+                    "preserved base content",
+                )
+                .unwrap();
+            }
+            (nested, file)
+        } else {
+            (file, nested)
+        };
+        repo.commit();
+        if directory_first {
+            fs::remove_dir_all(repo.root.join(file)).unwrap();
+        } else {
+            fs::remove_file(repo.root.join(file)).unwrap();
+            fs::create_dir(repo.root.join(file)).unwrap();
+        }
+        fs::write(repo.root.join(new), RENAMED).unwrap();
+        let source = || {
+            vec![
+                fs::read(repo.root.join(new)).unwrap(),
+                fs::read(repo.root.join("schema.ids.json")).unwrap(),
+                fs::read(repo.root.join(".git/index")).unwrap(),
+                fs::read(repo.root.join(".git/HEAD")).unwrap(),
+                git(&repo.root, &["show-ref"]),
+            ]
+        };
+        let before = source();
+        let mut store = repo.store();
+        let now = SystemTime::now();
+        let result = store.preview(request(), now);
+        if foreign {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("preserved base content")
+            );
+        } else {
+            let preview = result.unwrap();
+            let candidate = store.confirm(&preview.candidate_id, now).unwrap();
+            assert!(candidate.manifest().inputs[old].is_none());
+            assert!(candidate.manifest().inputs[new].is_some());
+            assert_eq!(
+                git(
+                    &candidate.snapshot_repository(),
+                    &["show", &format!("{}:{new}", preview.tree)]
+                ),
+                RENAMED.as_bytes()
+            );
+            assert!(preview.diff.contains("+  ident:"));
+        }
+        assert_eq!(source(), before);
+    }
+}
+
+#[test]
 fn force_added_declarations_use_captured_bytes_without_admitting_ignored_untracked_files() {
     for (ignored, staged) in [(true, false), (true, true), (false, false)] {
         let repo = Repository::new(&format!("ignored-{ignored}-{staged}"), "");
