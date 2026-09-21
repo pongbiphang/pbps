@@ -2,10 +2,12 @@
 //! editor changes. The publisher is deliberately still absent (#746).
 #![cfg(target_os = "linux")]
 
+use std::cell::RefCell;
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -272,6 +274,82 @@ fn configuration_cannot_redirect_intent_writes_after_path_admission() {
         "path admission must protect the actual configuration used by the intent CLI"
     );
     assert_eq!(fs::read(repo.root.join(".git/index")).unwrap(), index);
+}
+
+#[test]
+fn index_flags_changed_during_capture_refuse_without_touching_the_writers_index_or_lock() {
+    for flag in ["--skip-worktree", "--assume-unchanged", "conflict"] {
+        let repo = Repository::new(&format!("late-index-{flag}"), "");
+        repo.table(RENAMED);
+        let now = SystemTime::now();
+        assert!(repo.store().preview(request(), now).is_ok());
+        let written = RefCell::new(None);
+        let result = repo.store().preview_observed(request(), now, &|at| {
+            if at != CaptureBoundary::TreeBuilt { return; }
+            if flag == "conflict" {
+                let oid = String::from_utf8(git(&repo.root, &["rev-parse", "HEAD:schema/t.yml"])).unwrap();
+                let oid = oid.trim();
+                let mut child = Command::new("git")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .arg("-C").arg(&repo.root)
+                    .args(["update-index", "--index-info"])
+                    .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+                    .spawn().unwrap();
+                let records = format!("0 {}\tschema/t.yml\n100644 {oid} 1\tschema/t.yml\n100644 {oid} 2\tschema/t.yml\n", "0".repeat(oid.len()));
+                child.stdin.take().unwrap().write_all(records.as_bytes()).unwrap();
+                checked(child.wait_with_output().unwrap());
+            } else {
+                git(&repo.root, &["update-index", flag, "schema/t.yml"]);
+            }
+            fs::write(repo.root.join(".git/index.lock"), "foreign writer").unwrap();
+            *written.borrow_mut() = Some(repo.preserved());
+        });
+        assert!(
+            result.unwrap_err().to_string().contains("conflict flags"),
+            "{flag}"
+        );
+        assert_eq!(repo.preserved(), written.borrow().as_ref().unwrap().clone());
+        assert_eq!(
+            fs::read(repo.root.join(".git/index.lock")).unwrap(),
+            b"foreign writer"
+        );
+        // The independent writer restores its own fixture; compose never does.
+        fs::remove_file(repo.root.join(".git/index.lock")).unwrap();
+        git(&repo.root, &["read-tree", "HEAD"]);
+        assert!(repo.store().preview(request(), now).is_ok());
+    }
+}
+
+#[test]
+fn an_empty_index_is_admitted_but_a_corrupt_index_is_never_empty_evidence() {
+    for late in [false, true] {
+        let repo = Repository::new(&format!("corrupt-index-{late}"), "");
+        repo.table(RENAMED);
+        git(&repo.root, &["read-tree", "--empty"]);
+        let before = repo.preserved();
+        assert!(repo.store().preview(request(), SystemTime::now()).is_ok());
+        assert_eq!(repo.preserved(), before);
+        let corrupt = || fs::write(repo.root.join(".git/index"), "corrupt index evidence").unwrap();
+        if !late {
+            corrupt();
+        }
+        let result = repo
+            .store()
+            .preview_observed(request(), SystemTime::now(), &|at| {
+                if late && at == CaptureBoundary::TreeBuilt {
+                    corrupt();
+                }
+            });
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(repo.root.join(".git/index")).unwrap(),
+            b"corrupt index evidence"
+        );
+        let after = repo.preserved();
+        assert_eq!(after[..2], before[..2]);
+        assert_eq!(after[3..], before[3..]);
+    }
 }
 
 #[test]

@@ -571,6 +571,23 @@ impl AttributeView {
     }
 }
 
+fn admit_index_flags(git: &Git, names: &BTreeSet<String>) -> Result<()> {
+    // Index flags are user intent to leave a path alone. Reading them does
+    // not refresh the index, and no status/add command runs in the source.
+    let flags = git.bytes(&["ls-files", "-v", "-z"], &[], None)?;
+    for row in flags.split(|b| *b == 0).filter(|r| r.len() >= 3) {
+        if let Ok(name) = std::str::from_utf8(&row[2..])
+            && names.contains(name)
+            && row[0] != b'H'
+        {
+            return Err(Error::new(
+                "Compose inputs cannot carry skip-worktree, assume-unchanged or conflict flags",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn manifest(
     git: &Git,
     root: &Root,
@@ -794,19 +811,7 @@ pub(super) fn capture(
     {
         return Err(Error::new("Declarations changed during capture"));
     }
-    // Index flags are user intent to leave a path alone. Reading them does
-    // not refresh the index, and no status/add command runs in the source.
-    let flags = git.bytes(&["ls-files", "-v", "-z"], &[], None)?;
-    for row in flags.split(|b| *b == 0).filter(|r| r.len() >= 3) {
-        if let Ok(name) = std::str::from_utf8(&row[2..])
-            && names.contains(name)
-            && row[0] != b'H'
-        {
-            return Err(Error::new(
-                "Compose inputs cannot carry skip-worktree, assume-unchanged or conflict flags",
-            ));
-        }
-    }
+    admit_index_flags(&git, &names)?;
     for name in live.keys().filter(|n| !recorded.contains_key(*n)) {
         if git.ignored(name)? {
             return Err(Error::new("A new declaration is ignored"));
@@ -907,6 +912,9 @@ pub(super) fn capture(
             "Inputs, base or publication choices changed during capture; refresh the preview",
         ));
     }
+    // A Git writer can record leave-alone intent while the private candidate
+    // is built. Recheck without taking or refreshing the source index.
+    admit_index_flags(&git, &names)?;
     observer(CaptureBoundary::InputsChecked);
     let output_ref = format!("refs/heads/pbps-compose/{operation_id}");
     #[derive(Serialize)]
