@@ -3,7 +3,7 @@
 //! its acceptor. Linux UNIX_DIAG_PEER supplies the actual connected socket;
 //! a protected PID file is only a candidate, never proof of that ownership.
 
-use super::{ProcessLease, UnqualifiedProcess, proc_base, process_gone, read_bounded};
+use super::{ProcessLease, UnqualifiedProcess, proc_base, process_gone};
 use rustix::net::{self, netlink, sockopt};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::MetadataExt as _;
@@ -69,7 +69,7 @@ impl DaemonLease {
         {
             return Err(UnqualifiedProcess);
         }
-        let status = read_bounded(&proc_base(&process.directory).join("status"), 16384)?;
+        let status = process.read_proc("status", 16384)?;
         if !status
             .lines()
             .find_map(|line| line.strip_prefix("Uid:"))

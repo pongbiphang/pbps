@@ -30,6 +30,30 @@ static void *root_worker(void *unused) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "opaque-name")) {
+        int ready[2];
+        if (pipe(ready)) return 1;
+        pid_t child = fork();
+        if (child < 0) return 1;
+        if (!child) {
+            close(ready[0]);
+            if (prctl(PR_SET_NAME, "odd\xff)(\n\t\\name", 0, 0, 0)) _exit(1);
+            if (write(ready[1], "1", 1) != 1) _exit(1);
+            close(ready[1]);
+            sleep(300);
+            _exit(0);
+        }
+        close(ready[1]);
+        char byte;
+        if (read(ready[0], &byte, 1) != 1 || byte != '1') return 1;
+        close(ready[0]);
+        FILE *signal = fopen("/dev/shm/name-ready", "w");
+        if (!signal) return 1;
+        fprintf(signal, "%d\n", child);
+        if (fclose(signal)) return 1;
+        sleep(300);
+        return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "many")) {
         pthread_t threads[96];
         for (unsigned int i = 0; i < sizeof(threads) / sizeof(threads[0]); ++i) {
