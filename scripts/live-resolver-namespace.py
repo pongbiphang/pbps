@@ -27,6 +27,7 @@ CHURN_TEST = PREFIX + "departing_incidental_tasks_do_not_refuse_an_unchanged_con
 ORPHAN_TEST = PREFIX + "reparenting_during_qualification_keeps_the_held_grandchild"
 FOREIGN_TEST = PREFIX + "foreign_namespace_sharers_remain_visible_outside_the_container_pid_view"
 MANY_TEST = PREFIX + "a_containers_task_count_does_not_consume_the_observers_descriptor_budget"
+COORDINATE_TEST = PREFIX + "detached_coordinates_retain_one_namespace_handle_until_the_last_clone_drops"
 
 
 def run(*args, **kwargs):
@@ -216,6 +217,8 @@ def main():
                 raise RuntimeError("the many-thread fixture did not become ready")
             test(binary, MANY_TEST, dict(os.environ, PBPS_NAMESPACE_MANY_PID=many_pid))
             test(binary, MOUNT_TEST, dict(os.environ, PBPS_NAMESPACE_MOUNT_FIXTURE="1"),
+                 prefix=("unshare", "--mount", "--pid", "--fork", "--mount-proc", "--propagation", "private"))
+            test(binary, COORDINATE_TEST, dict(os.environ, PBPS_NAMESPACE_COORDINATE_FIXTURE="1"),
                  prefix=("unshare", "--mount", "--pid", "--fork", "--mount-proc", "--propagation", "private"))
     finally:
         remaining = []

@@ -50,18 +50,41 @@ impl From<NamespaceError> for UnqualifiedProcess {
 }
 
 /// A task number in a particular PID namespace, never an observer PID.
-/// Keeping the namespace handle alive prevents its inode from being reused
-/// while an observation carries this coordinate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Each retained coordinate shares the namespace handle, preventing inode
+/// reuse even after its observation, view and anchor have been dropped.
+#[derive(Debug, Clone)]
 pub struct NamespaceTaskId {
     namespace: FileIdentity,
     number: u32,
+    handle: Arc<File>,
 }
 
 impl NamespaceTaskId {
     /// The namespace-local number. It must not be passed to host `/proc`.
-    pub fn number(self) -> u32 {
+    pub fn number(&self) -> u32 {
         self.number
+    }
+}
+
+impl PartialEq for NamespaceTaskId {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for NamespaceTaskId {}
+
+impl PartialOrd for NamespaceTaskId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NamespaceTaskId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Independently opened handles can pin the same namespace. Their
+        // descriptor numbers and shared-owner addresses are not coordinates.
+        (self.namespace, self.number).cmp(&(other.namespace, other.number))
     }
 }
 
@@ -76,7 +99,6 @@ pub enum TaskReading {
 /// can reuse the coordinate, but cannot substitute for this open directory.
 pub struct TaskObservation {
     directory: File,
-    namespace: Arc<File>,
     id: NamespaceTaskId,
     group: NamespaceTaskId,
     start_ticks: u64,
@@ -84,12 +106,12 @@ pub struct TaskObservation {
 
 impl TaskObservation {
     pub fn id(&self) -> NamespaceTaskId {
-        self.id
+        self.id.clone()
     }
 
     /// The group's leader coordinate, even if that leader has exited.
     pub fn group(&self) -> NamespaceTaskId {
-        self.group
+        self.group.clone()
     }
 
     /// Whether these held entries identify the same task in the same procfs
@@ -106,7 +128,7 @@ impl TaskObservation {
     /// still change credentials after this returns; launch controls must
     /// enforce whichever restrictions the caller needs between readings.
     pub fn status(&self) -> Result<TaskReading, NamespaceError> {
-        if FileIdentity::of(&self.namespace)? != self.id.namespace {
+        if FileIdentity::of(&self.id.handle)? != self.id.namespace {
             return Err(NamespaceError::Replaced);
         }
         if !task_alive(&self.directory, self.id.number, self.start_ticks)? {
@@ -251,14 +273,15 @@ impl<'a> NamespaceProcfs<'a> {
                 }
                 let task = TaskObservation {
                     directory,
-                    namespace: Arc::clone(&self.namespace),
                     id: NamespaceTaskId {
                         namespace,
                         number: tid,
+                        handle: Arc::clone(&self.namespace),
                     },
                     group: NamespaceTaskId {
                         namespace,
                         number: pid,
+                        handle: Arc::clone(&self.namespace),
                     },
                     start_ticks,
                 };
