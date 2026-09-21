@@ -202,6 +202,54 @@ fn a_rename_is_recorded_as_one_commit_holding_the_declaration_and_the_ids_file()
 }
 
 #[test]
+fn a_preview_shows_the_diff_and_leaves_the_checkout_exactly_as_it_was() {
+    // The page shows the diff before the commit, and the protocol holds the
+    // index lock throughout — so the preview is a compose that stops once the
+    // tree exists and undoes itself, rather than a pause that would hold every
+    // `git` in the checkout for as long as a person takes to read a diff.
+    let checkout = Checkout::new("preview");
+    let tip = checkout.git(&["rev-parse", "HEAD"]);
+    checkout.write(
+        "schema/customer.yml",
+        "table: dbo.customer\ncolumns:\n  id: {type: int, nullable: false}\n  \
+         full_name: {type: \"nvarchar(100)\", nullable: true}\nprimary_key: [id]\n",
+    );
+    let before = checkout.read("schema/customer.yml");
+    let ids_before = checkout.read("schema.ids.json");
+    let git = checkout.runner();
+    let cli = checkout.cli();
+    let file = project_file();
+
+    let preview = compose(&checkout, &git, &cli, &file)
+        .preview(&rename_request())
+        .expect("the preview finishes");
+
+    assert_eq!(preview.branch, "refs/heads/main");
+    assert_eq!(preview.tip, tip);
+    assert_eq!(
+        preview.message, "rename dbo.customer.customer_name full_name",
+        "prefilled the way the CLI spells the intent"
+    );
+    assert!(preview.diff.contains("customer_name"), "{}", preview.diff);
+    assert!(preview.diff.contains("full_name"), "{}", preview.diff);
+    let mut paths = preview.paths.clone();
+    paths.sort();
+    assert_eq!(paths, vec!["schema.ids.json", "schema/customer.yml"]);
+
+    // And nothing happened.
+    assert_eq!(checkout.git(&["rev-parse", "HEAD"]), tip);
+    assert_eq!(checkout.read("schema/customer.yml"), before);
+    assert_eq!(
+        checkout.read("schema.ids.json"),
+        ids_before,
+        "the ids file the command wrote in the snapshot never reached the checkout"
+    );
+    assert!(!checkout.path(".git/index.lock").exists());
+    assert!(!checkout.path(".git/HEAD.lock").exists());
+    assert!(records_of(&checkout).is_empty());
+}
+
+#[test]
 fn a_declaration_the_intent_does_not_match_refuses_and_changes_nothing() {
     // `--no-input` declines any question the command would have asked, so a
     // case it would ask about is refused and shown, never answered by the UI.

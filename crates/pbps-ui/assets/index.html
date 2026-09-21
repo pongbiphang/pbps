@@ -18,6 +18,10 @@
       <button type="button" data-view="timeline">Timeline</button>
       <button type="button" data-view="docs">Schema &amp; ERD</button>
     </nav>
+    <div class="section-label">RECORD</div>
+    <nav aria-label="Write views">
+      <button type="button" data-view="compose">Compose intent</button>
+    </nav>
     <div class="local"><span class="dot"></span> Local workspace<p>Read views · Nothing stored in this viewer</p></div>
   </aside>
   <main>
@@ -26,6 +30,38 @@
       <label id="input-label" for="selection-value">Environment name</label>
       <div class="input-row"><input id="selection-value" type="text" autocomplete="off" spellcheck="false" required><button type="submit" id="read">Read environment</button></div>
       <p id="input-help"></p>
+    </form>
+    <form id="compose" hidden>
+      <div class="panel">
+        <h2>What are you recording?</h2>
+        <label for="compose-kind">Kind of change</label>
+        <select id="compose-kind">
+          <option value="rename">Rename a column</option>
+          <option value="rename-table">Rename a table</option>
+          <option value="drop">Drop a column</option>
+          <option value="drop-table">Drop a table</option>
+          <option value="rename-role">Rename a role</option>
+          <option value="drop-role">Drop a role</option>
+        </select>
+        <label for="compose-first" id="compose-first-label">Old fully qualified name</label>
+        <input id="compose-first" type="text" autocomplete="off" spellcheck="false" required>
+        <label for="compose-second" id="compose-second-label">New name</label>
+        <input id="compose-second" type="text" autocomplete="off" spellcheck="false" required>
+        <p class="muted">Edit the declaration in your editor first. This records the
+        intent against what is already in your working tree; it never writes a
+        declaration for you.</p>
+      </div>
+      <div class="panel">
+        <h2>How it will be recorded</h2>
+        <label for="compose-message">Commit message</label>
+        <input id="compose-message" type="text" autocomplete="off" spellcheck="false" required>
+        <label for="compose-remote">Push to</label>
+        <select id="compose-remote"></select>
+        <div class="card-actions">
+          <button type="submit" id="compose-preview">Show the diff</button>
+          <button type="button" id="compose-record" hidden>Commit and push</button>
+        </div>
+      </div>
     </form>
     <div id="activity" role="status" aria-live="polite"></div>
     <section id="findings" aria-label="Findings"></section>

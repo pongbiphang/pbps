@@ -82,6 +82,31 @@ impl Viewer {
     fn read(&self, path: &str) -> (u16, String, String) {
         self.request("GET", path, &[("X-Pbps-Token", &self.token)])
     }
+
+    /// A write request, which is the only kind that carries a body.
+    fn post(&self, path: &str, headers: &[(&str, &str)], body: &str) -> (u16, String, String) {
+        let mut socket = TcpStream::connect(&self.address).unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+            .unwrap();
+        write!(
+            socket,
+            "POST {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n",
+            self.address,
+            body.len()
+        )
+        .unwrap();
+        for (name, value) in headers {
+            write!(socket, "{name}: {value}\r\n").unwrap();
+        }
+        write!(socket, "\r\n{body}").unwrap();
+        let mut response = String::new();
+        socket.read_to_string(&mut response).unwrap();
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+        (status, head.into(), body.into())
+    }
 }
 
 impl Drop for Viewer {
@@ -271,4 +296,116 @@ fn the_ui_has_no_host_or_write_option() {
         assert_eq!(output.status.code(), Some(2));
         assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
     }
+}
+
+#[test]
+fn the_compose_route_is_guarded_before_it_is_routed_and_is_the_only_write() {
+    // A write route is where decision 3's reasoning about *when* stops being
+    // hypothetical: the check that is not there for reads is the check that is
+    // missing when writes arrive. Every guard is asserted on the write route
+    // itself, not inferred from the read routes passing.
+    let viewer = Viewer::start("compose-guards");
+    let origin = format!("http://{}", viewer.address);
+    let body = r#"{"intent":{"kind":"rename","from":"dbo.t.a","to":"b"},
+                   "message":"rename dbo.t.a b","remote":""}"#;
+
+    // No token.
+    assert_eq!(
+        viewer
+            .post("/api/compose/preview", &[("Origin", &origin)], body)
+            .0,
+        403
+    );
+    // A foreign origin, with the token.
+    assert_eq!(
+        viewer
+            .post(
+                "/api/compose/preview",
+                &[
+                    ("Origin", "https://foreign.invalid"),
+                    ("X-Pbps-Token", &viewer.token)
+                ],
+                body
+            )
+            .0,
+        403
+    );
+    // No origin at all: required on every request that is not a GET or HEAD.
+    assert_eq!(
+        viewer
+            .post(
+                "/api/compose/preview",
+                &[("X-Pbps-Token", &viewer.token)],
+                body
+            )
+            .0,
+        403
+    );
+    // A rebinding Host, with everything else right.
+    assert_eq!(
+        viewer
+            .post(
+                "/api/compose/record",
+                &[
+                    ("Host", "rebind.invalid"),
+                    ("Origin", &origin),
+                    ("X-Pbps-Token", &viewer.token)
+                ],
+                body
+            )
+            .0,
+        403
+    );
+    // And there is still no other write. `apply` is step 5 of the epic and
+    // does not exist here.
+    assert_eq!(
+        viewer
+            .post(
+                "/api/apply",
+                &[("Origin", &origin), ("X-Pbps-Token", &viewer.token)],
+                body
+            )
+            .0,
+        405
+    );
+
+    // With every guard satisfied the request is answered rather than refused
+    // by the guards — as a refusal, since this fixture is not a checkout.
+    let (status, _, answered) = viewer.post(
+        "/api/compose/preview",
+        &[("Origin", &origin), ("X-Pbps-Token", &viewer.token)],
+        body,
+    );
+    assert_eq!(status, 409, "{answered}");
+    assert!(answered.contains("\"ok\":false"), "{answered}");
+
+    // And the context read says so in the same words, so the page can show the
+    // commands to run by hand instead.
+    let (status, _, context) = viewer.read("/api/compose");
+    assert_eq!(status, 200);
+    assert!(context.contains("\"available\":false"), "{context}");
+}
+
+#[test]
+fn a_compose_request_naming_a_field_this_version_does_not_know_is_refused() {
+    // `deny_unknown_fields` on the way in, for the same reason decision 6 puts
+    // it on the way out: a field the page invents must fail rather than be
+    // dropped on the floor.
+    let viewer = Viewer::start("compose-unknown");
+    let origin = format!("http://{}", viewer.address);
+    let (status, _, answered) = viewer.post(
+        "/api/compose/preview",
+        &[("Origin", &origin), ("X-Pbps-Token", &viewer.token)],
+        r#"{"intent":{"kind":"rename","from":"a","to":"b"},"message":"m","remote":"",
+            "project":"/etc"}"#,
+    );
+    assert_eq!(status, 400, "{answered}");
+
+    // And a kind that is not one of the six.
+    let (status, _, answered) = viewer.post(
+        "/api/compose/preview",
+        &[("Origin", &origin), ("X-Pbps-Token", &viewer.token)],
+        r#"{"intent":{"kind":"apply"},"message":"m","remote":""}"#,
+    );
+    assert_eq!(status, 400, "{answered}");
 }

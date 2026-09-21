@@ -8,8 +8,21 @@
     drift: ["Drift", "Compare a live environment with its recorded schema."],
     plan: ["Saved plan", "Read the changes and risks in an existing plan file."],
     timeline: ["Timeline", "Browse the deployment history recorded in an environment."],
-    docs: ["Schema & ERD", "Explore documentation and relationships from your declarations."]
+    docs: ["Schema & ERD", "Explore documentation and relationships from your declarations."],
+    compose: ["Compose intent", "Record a rename or a drop as a commit on this branch."]
   };
+  // The shape of each intent: what the two inputs mean, and how the commit
+  // message is spelled. The second field of a drop is its reason, which the
+  // CLI requires for the audit trail.
+  const intents = {
+    "rename": ["Old fully qualified column name", "New column name", (a, b) => `rename ${a} ${b}`],
+    "rename-table": ["Old fully qualified table name", "New table name", (a, b) => `rename table ${a} ${b}`],
+    "drop": ["Fully qualified column name", "Why it is being dropped", a => `drop ${a}`],
+    "drop-table": ["Fully qualified table name", "Why it is being dropped", a => `drop table ${a}`],
+    "rename-role": ["Old role name", "New role name", (a, b) => `rename role ${a} ${b}`],
+    "drop-role": ["Role name", "Why it is being dropped", a => `drop role ${a}`]
+  };
+  let context = null, previewed = null;
   let current = "status", generation = 0;
   function node(tag, text, className) {
     const el = document.createElement(tag);
@@ -103,10 +116,90 @@
       const box = panel(data.environment); box.append(fields(data)); content.append(box);
     }
   }
+  function intentBody() {
+    const kind = byId("compose-kind").value;
+    const first = byId("compose-first").value, second = byId("compose-second").value;
+    const intent = kind.startsWith("drop")
+      ? {kind, [kind === "drop" ? "column" : kind === "drop-table" ? "table" : "role"]: first, reason: second}
+      : {kind, from: first, to: second};
+    return {
+      intent,
+      message: byId("compose-message").value,
+      remote: byId("compose-remote").value,
+      shown: {}
+    };
+  }
+  function describeIntent() {
+    const kind = byId("compose-kind").value, shape = intents[kind];
+    byId("compose-first-label").textContent = shape[0];
+    byId("compose-second-label").textContent = shape[1];
+    byId("compose-message").value = shape[2](byId("compose-first").value, byId("compose-second").value);
+    byId("compose-record").hidden = true;
+    previewed = null;
+  }
+  function renderDiff(text) {
+    const box = node("pre", undefined, "diff");
+    for (const line of text.split("\n")) {
+      const kind = line.startsWith("+") && !line.startsWith("+++") ? "add"
+        : line.startsWith("-") && !line.startsWith("---") ? "remove" : "";
+      box.append(node("span", line + "\n", kind));
+    }
+    return box;
+  }
+  async function composeRequest(route) {
+    activity.className = ""; activity.textContent = "Working…";
+    content.replaceChildren(); findings.replaceChildren();
+    const response = await fetch(route, {
+      method: "POST",
+      headers: {"X-Pbps-Token": token, "Content-Type": "application/json"},
+      cache: "no-store",
+      credentials: "omit",
+      body: JSON.stringify(intentBody())
+    });
+    const answer = await response.json();
+    if (!answer.ok) {
+      activity.className = "error"; activity.textContent = answer.refusal;
+      empty("Nothing was changed", "The refusal above is the whole of what happened; your checkout is as it was.");
+      return null;
+    }
+    return answer.data;
+  }
+  async function composeView() {
+    content.replaceChildren(); findings.replaceChildren();
+    activity.className = ""; activity.textContent = "Reading this checkout…";
+    const response = await fetch("/api/compose", {headers: {"X-Pbps-Token": token}, cache: "no-store", credentials: "omit"});
+    context = await response.json();
+    const form = byId("compose");
+    for (const recovered of context.recovered || []) {
+      const box = node("article", undefined, "finding warning");
+      box.append(node("strong", "A previous compose was interrupted"), node("p", JSON.stringify(recovered)));
+      findings.append(box);
+    }
+    if (!context.available) {
+      form.hidden = true;
+      activity.className = "error"; activity.textContent = context.why || "Composing is not available here.";
+      const box = node("div", undefined, "empty");
+      box.append(node("h2", "Record this in a shell instead"));
+      for (const line of context.commands || []) box.append(node("pre", line));
+      content.append(box);
+      return;
+    }
+    form.hidden = false;
+    const remotes = byId("compose-remote");
+    remotes.replaceChildren();
+    for (const name of context.remotes) remotes.append(new Option(name, name));
+    remotes.append(new Option("Do not push", ""));
+    const warn = node("div", undefined, "warn");
+    warn.textContent = `On ${context.branch}. Your git hooks do not run for a commit or a push made here — this tool keeps policy in files and in CI.`;
+    content.append(warn);
+    activity.textContent = "";
+    describeIntent();
+  }
   async function load() {
     const own = ++generation, view = current;
     content.replaceChildren(); findings.replaceChildren(); activity.className = "";
     if (!token) { activity.textContent = "Open the complete URL printed by pbps ui, including its fragment."; return; }
+    if (view === "compose") { await composeView(); return; }
     let url = `/api/${view}`;
     if (["drift", "timeline", "plan"].includes(view)) {
       const value = byId("selection-value").value;
@@ -136,6 +229,7 @@
     for (const button of document.querySelectorAll("nav button")) {
       if (button.dataset.view === view) button.setAttribute("aria-current", "page"); else button.removeAttribute("aria-current");
     }
+    byId("compose").hidden = view !== "compose";
     byId("selection").hidden = !["drift", "timeline", "plan"].includes(view);
     byId("input-label").textContent = view === "plan" ? "Saved plan path" : "Environment name";
     byId("selection-value").value = value;
@@ -147,6 +241,42 @@
   for (const button of document.querySelectorAll("nav button")) button.addEventListener("click", () => select(button.dataset.view));
   document.querySelector(".brand").addEventListener("click", event => { event.preventDefault(); select("status"); });
   byId("selection").addEventListener("submit", event => { event.preventDefault(); load(); });
+  byId("compose-kind").addEventListener("change", describeIntent);
+  for (const id of ["compose-first", "compose-second"]) byId(id).addEventListener("input", describeIntent);
+  byId("compose").addEventListener("submit", async event => {
+    event.preventDefault();
+    const preview = await composeRequest("/api/compose/preview");
+    if (!preview) return;
+    previewed = preview;
+    const box = panel(`What ${preview.branch} would gain`);
+    box.append(renderDiff(preview.diff));
+    const list = node("ul");
+    for (const path of preview.paths) list.append(node("li", path));
+    box.append(node("h3", "Files"), list);
+    content.append(box);
+    byId("compose-record").hidden = false;
+    activity.textContent = "Nothing has been committed. Read the diff, then commit.";
+  });
+  byId("compose-record").addEventListener("click", async () => {
+    if (!previewed) return;
+    const composed = await composeRequest("/api/compose/record");
+    if (!composed) return;
+    byId("compose-record").hidden = true; previewed = null;
+    const box = panel("Recorded");
+    box.append(fields({
+      commit: composed.commit,
+      branch: composed.branch,
+      signature: composed.signature || "not signed",
+      pushed_to: composed.destination || "not pushed",
+      hooks_did_not_run: composed.hooks_did_not_run
+    }));
+    const list = node("ul");
+    for (const path of composed.paths) list.append(node("li", path));
+    box.append(node("h3", "Files in the commit"), list);
+    for (const kept of composed.retained) box.append(node("p", kept, "muted"));
+    content.append(box);
+    activity.textContent = `${composed.commit} on ${composed.branch}`;
+  });
   byId("refresh").addEventListener("click", load);
   load();
 })();

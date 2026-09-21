@@ -16,6 +16,8 @@ pub mod fsx;
 #[cfg(target_os = "linux")]
 pub mod listing;
 #[cfg(target_os = "linux")]
+pub mod locate;
+#[cfg(target_os = "linux")]
 pub mod locks;
 #[cfg(target_os = "linux")]
 pub mod place;

@@ -35,6 +35,43 @@ pub struct Request {
     pub shown: BTreeMap<String, String>,
 }
 
+/// How far a run goes.
+///
+/// The page shows the diff *before* the commit, so the preview is a compose
+/// that stops once the tree exists and then undoes itself under the ordinary
+/// rollback protocol. It costs the placement twice, and buys the thing the
+/// protocol otherwise cannot give: a human looking at the change while no
+/// lock is held. Pausing mid-compose instead would hold the index lock — and
+/// with it every `git` in the checkout — for as long as a person takes to
+/// read a diff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    Preview,
+    Commit,
+}
+
+/// What the page is shown before it asks for the commit.
+#[derive(Debug, serde::Serialize)]
+pub struct Preview {
+    pub branch: String,
+    pub tip: String,
+    /// `git diff <tip> <tree>`: the recorded tip against the tree the UI
+    /// built, exact by construction and rendered without presentation
+    /// filters.
+    pub diff: String,
+    pub paths: Vec<String>,
+    /// Prefilled from the intent, spelled the way the CLI spells it.
+    pub message: String,
+}
+
+/// Either answer.
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "stage", rename_all = "kebab-case")]
+pub enum Done {
+    Previewed(Preview),
+    Composed(Composed),
+}
+
 /// What a compose that finished produced.
 #[derive(Debug, serde::Serialize)]
 pub struct Composed {
@@ -202,6 +239,21 @@ impl Compose<'_> {
 
     /// The whole of it. A `Refusal` here means the checkout is as it was.
     pub fn run(&self, request: &Request) -> Result<Composed, Refusal> {
+        match self.attempt(request, Stage::Commit)? {
+            Done::Composed(composed) => Ok(composed),
+            Done::Previewed(_) => unreachable!("a commit stage answers with a commit"),
+        }
+    }
+
+    /// The same work, stopped once the tree exists, and undone.
+    pub fn preview(&self, request: &Request) -> Result<Preview, Refusal> {
+        match self.attempt(request, Stage::Preview)? {
+            Done::Previewed(preview) => Ok(preview),
+            Done::Composed(_) => unreachable!("a preview stage answers with a preview"),
+        }
+    }
+
+    fn attempt(&self, request: &Request, stage: Stage) -> Result<Done, Refusal> {
         let records = Records::open(&self.git_dir).map_err(|e| Refusal::Io(e.to_string()))?;
         if self.someone_else_is_composing(&records)? {
             return Err(Refusal::AlreadyComposing);
@@ -216,8 +268,10 @@ impl Compose<'_> {
             .publish(&record)
             .map_err(|e| Refusal::Unrecordable(e.to_string()))?;
 
-        let outcome = self.compose(request, &records, &mut record);
-        if outcome.is_err() {
+        let outcome = self.compose(request, stage, &records, &mut record);
+        // A preview owns its record until it has put everything back, which
+        // `compose` has done by here; a refusal is the same shape.
+        if outcome.is_err() || matches!(outcome, Ok(Done::Previewed(_))) {
             // A refused compose still owns its record until everything it
             // made has been put back; `compose` has done that by here, so the
             // record goes last, as it does on the success path.
@@ -245,9 +299,10 @@ impl Compose<'_> {
     fn compose(
         &self,
         request: &Request,
+        stage: Stage,
         records: &Records,
         record: &mut Record,
-    ) -> Result<Composed, Refusal> {
+    ) -> Result<Done, Refusal> {
         let root = Dir::open_root(self.git.root()).map_err(|e| Refusal::Io(e.to_string()))?;
 
         // Step 1's ref half, before anything is read or placed.
@@ -328,6 +383,7 @@ impl Compose<'_> {
         );
         let result = self.place_and_commit(
             request,
+            stage,
             records,
             record,
             &lease,
@@ -356,6 +412,7 @@ impl Compose<'_> {
     fn place_and_commit(
         &self,
         request: &Request,
+        stage: Stage,
         records: &Records,
         record: &mut Record,
         lease: &Lease,
@@ -367,7 +424,7 @@ impl Compose<'_> {
         index_lock: &Path,
         mut held: Guard,
         placement: &mut Placement,
-    ) -> Result<Composed, Refusal> {
+    ) -> Result<Done, Refusal> {
         // Everything the compose will commit: the listed files, which already
         // hold their bytes in the working tree, and every file the command
         // left different, which has to be placed. The command's output wins
@@ -487,6 +544,35 @@ impl Compose<'_> {
         tree::prepare_index(self.git, index_lock, &entries, &removals)?;
         record.index_lock_hash = Some(hash_file(index_lock).map_err(Refusal::Io)?);
 
+        if stage == Stage::Preview {
+            // The preview refuses itself on purpose: the caller gets the diff
+            // and the checkout gets everything back, through the same rollback
+            // a real refusal here would take — published first, like every
+            // other undo, so that a crash in the middle of one resumes as a
+            // rollback rather than as a success.
+            let diff = tree::preview(self.git, &lease.tip, &tree)?;
+            record
+                .advance(Phase::RollingBack)
+                .map_err(|e| Refusal::Unrecordable(e.to_string()))?;
+            records
+                .publish(record)
+                .map_err(|e| Refusal::Unrecordable(e.to_string()))?;
+            self.reached(Phase::RollingBack);
+            placement.undo_all();
+            held.release();
+            return Ok(Done::Previewed(Preview {
+                branch: lease.reference.clone(),
+                tip: lease.tip.clone(),
+                diff: String::from_utf8_lossy(&diff).into_owned(),
+                paths: entries
+                    .iter()
+                    .map(|entry| entry.path.to_string())
+                    .chain(removals.iter().map(RepoPath::to_string))
+                    .collect(),
+                message: request.intent.message(),
+            }));
+        }
+
         // Step 4: the commit.
         let commit = tree::commit_tree(
             self.git,
@@ -570,7 +656,7 @@ impl Compose<'_> {
         // The push, last, and only once the checkout is the commit's.
         let destination = self.publish(request, lease, &commit)?;
 
-        Ok(Composed {
+        Ok(Done::Composed(Composed {
             commit: commit.clone(),
             branch: lease.reference.clone(),
             signature: tree::signature_state(self.git, &commit),
@@ -582,7 +668,7 @@ impl Compose<'_> {
                 .chain(removals.iter().map(RepoPath::to_string))
                 .collect(),
             hooks_did_not_run: true,
-        })
+        }))
     }
 
     fn publish(

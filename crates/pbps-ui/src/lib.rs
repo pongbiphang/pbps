@@ -12,6 +12,9 @@ use tiny_http::{Header, Request, Response, Server, StatusCode};
 
 use client::{Client, View};
 
+#[cfg(target_os = "linux")]
+mod site;
+
 const TOKEN_HEADER: &str = "X-Pbps-Token";
 const HTML: &str = include_str!("../assets/index.html");
 const JS: &str = include_str!("../assets/app.js");
@@ -32,6 +35,12 @@ pub struct Viewer {
     token: String,
     client: Client,
     policy: String,
+    /// Where this project sits in a checkout, and everything composing needs.
+    /// `None` where the project is not in one, or on a platform whose file
+    /// calls ADR-0015 decision 5 has not had measured — either way the page
+    /// is told so and shown the commands to run by hand.
+    #[cfg(target_os = "linux")]
+    site: Option<site::Site>,
 }
 
 impl Viewer {
@@ -48,10 +57,14 @@ impl Viewer {
             return Err(io::Error::other("invalid documentation stylesheet hash"));
         }
         let token = config.token.iter().map(|b| format!("{b:02x}")).collect();
+        #[cfg(target_os = "linux")]
+        let site = site::Site::at(&config.executable, &config.project, config.token);
         Ok(Self {
             server,
             address,
             token,
+            #[cfg(target_os = "linux")]
+            site,
             client: Client {
                 executable: config.executable,
                 project: config.project,
@@ -69,8 +82,8 @@ impl Viewer {
 
     pub fn serve(self) -> io::Result<()> {
         loop {
-            let request = self.server.recv()?;
-            let (code, mime, body) = self.answer(&request);
+            let mut request = self.server.recv()?;
+            let (code, mime, body) = self.answer(&mut request);
             let response = Response::from_data(body)
                 .with_status_code(StatusCode(code))
                 .with_header(header("Content-Type", mime))
@@ -83,7 +96,7 @@ impl Viewer {
         }
     }
 
-    fn answer(&self, request: &Request) -> (u16, &'static str, Vec<u8>) {
+    fn answer(&self, request: &mut Request) -> (u16, &'static str, Vec<u8>) {
         let headers: Vec<_> = request
             .headers()
             .iter()
@@ -99,8 +112,21 @@ impl Viewer {
         ) {
             return plain(403, "Request refused");
         }
-        if !matches!(request.method().as_str(), "GET" | "HEAD") {
+        let method = request.method().as_str().to_owned();
+        let url = request.url().to_owned();
+        if method == "POST" {
+            // The only writes this server has, and they are writes to *git*,
+            // not to a database: step 5 is still outside this UI (#64).
+            return match url.as_str() {
+                "/api/compose/preview" | "/api/compose/record" => self.compose(request, &url),
+                _ => plain(405, "This viewer has no such write"),
+            };
+        }
+        if !matches!(method.as_str(), "GET" | "HEAD") {
             return plain(405, "This viewer accepts reads only");
+        }
+        if url == "/api/compose" {
+            return self.compose_context();
         }
         match request.url() {
             "/" => (200, "text/html; charset=utf-8", HTML.as_bytes().to_vec()),
@@ -126,6 +152,75 @@ impl Viewer {
                 Err(message) => plain(400, message),
             },
         }
+    }
+}
+
+impl Viewer {
+    #[cfg(target_os = "linux")]
+    fn compose_context(&self) -> (u16, &'static str, Vec<u8>) {
+        match &self.site {
+            Some(site) => json(200, &site.context()),
+            None => json(200, &site::Site::unavailable()),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn compose_context(&self) -> (u16, &'static str, Vec<u8>) {
+        json(200, &unsupported_platform())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn compose(&self, request: &mut Request, url: &str) -> (u16, &'static str, Vec<u8>) {
+        let mut body = Vec::new();
+        if std::io::Read::read_to_end(request.as_reader(), &mut body).is_err() {
+            return site::refused(400, "The request body could not be read");
+        }
+        // The shape of the request is decided before anything about this
+        // checkout is: `deny_unknown_fields` on the way in, for the same
+        // reason decision 6 puts it on the way out, and a field the page
+        // invents fails here whether or not a compose could have run.
+        let asked: crate::compose::run::Request = match serde_json::from_slice(&body) {
+            Ok(asked) => asked,
+            Err(e) => {
+                return site::refused(400, &format!("That is not a compose this UI accepts: {e}"));
+            }
+        };
+        match &self.site {
+            Some(site) => site.answer(url, &asked),
+            None => site::refused(
+                409,
+                "This project is not inside a git checkout, so there is nothing to record                  the intent in.",
+            ),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn compose(&self, _request: &mut Request, _url: &str) -> (u16, &'static str, Vec<u8>) {
+        json(409, &unsupported_platform())
+    }
+}
+
+/// Decision 5's own rule for a platform whose calls it has not had measured:
+/// refuse to compose and give the commands to run by hand, which is what a
+/// machine without `git` gets too.
+#[cfg(not(target_os = "linux"))]
+fn unsupported_platform() -> serde_json::Value {
+    serde_json::json!({
+        "available": false,
+        "why": "Composing has only been measured on Linux. Run the intent in a shell instead.",
+        "commands": [
+            "pbps rename <from> <to>",
+            "git add <the declaration> <the ids file>",
+            "git commit -m \"<the intent>\"",
+            "git push",
+        ],
+    })
+}
+
+fn json(code: u16, value: &impl serde::Serialize) -> (u16, &'static str, Vec<u8>) {
+    match serde_json::to_vec(value) {
+        Ok(bytes) => (code, "application/json", bytes),
+        Err(_) => plain(500, "The answer could not be rendered"),
     }
 }
 
