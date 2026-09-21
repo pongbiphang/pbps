@@ -246,6 +246,23 @@ impl std::fmt::Display for Refusal {
     }
 }
 
+impl Refusal {
+    /// Whether this refusal left the repository different from how it found
+    /// it.
+    ///
+    /// The page has to say which. "Nothing was changed; your checkout is as it
+    /// was" is true of almost every refusal here and *false* of exactly two —
+    /// a commit that stands on a branch whose checkout moved, and a rollback
+    /// that could not finish — and a user told the wrong one of those will
+    /// retry against a repository that has already moved.
+    pub fn left_changes(&self) -> bool {
+        matches!(
+            self,
+            Self::CommitStandsButCheckoutMoved { .. } | Self::RollbackIncomplete { .. }
+        )
+    }
+}
+
 macro_rules! from_refusal {
     ($($variant:ident => $type:ty),* $(,)?) => {
         $(impl From<$type> for Refusal {
@@ -475,20 +492,31 @@ impl Compose<'_> {
             let _ = std::fs::remove_file(&index_lock);
             Refusal::Lock(refusal)
         })?;
-        record.locks.push(RefLock {
-            reference: "HEAD".to_owned(),
-            lock_file: head_lock.path().display().to_string(),
-        });
-        records
-            .publish(record)
-            .map_err(|e| Refusal::Unrecordable(e.to_string()))?;
-        self.reached(Phase::Locking);
-
+        // The guard is built *here*, before the record is republished, and not
+        // after: both lock files already exist, and a failure to write or
+        // flush that version would otherwise leave them on disk with nothing
+        // releasing them and no record for recovery to clear them from. A
+        // guard that starts one fallible call later is a guard with a hole in
+        // it exactly where the first thing that can fail is.
         let held = Guard {
             index_lock: index_lock.clone(),
             head: Some(head_lock),
             branch: None,
         };
+        record.locks.push(RefLock {
+            reference: "HEAD".to_owned(),
+            lock_file: held
+                .head
+                .as_ref()
+                .expect("just taken")
+                .path()
+                .display()
+                .to_string(),
+        });
+        records
+            .publish(record)
+            .map_err(|e| Refusal::Unrecordable(e.to_string()))?;
+        self.reached(Phase::Locking);
 
         // From here a refusal has locks and possibly files to put back, so the
         // work happens in one place and the cleanup is the same either way.
@@ -514,6 +542,15 @@ impl Compose<'_> {
         );
         match result {
             Ok(done) => Ok(done),
+            // The deciding-ref protocol has already made a per-path decision
+            // and acted on it; running the generic rollback over that would
+            // undo the very paths it decided to keep and leave the checkout
+            // disagreeing with the tip it was decided against. A rollback that
+            // could not finish has likewise already run.
+            Err(
+                why @ (Refusal::CommitStandsButCheckoutMoved { .. }
+                | Refusal::RollbackIncomplete { .. }),
+            ) => Err(why),
             Err(why) => {
                 // Every undo publishes `rolling-back` first; the record's
                 // per-path evidence is what makes retrying an interrupted undo
@@ -522,17 +559,7 @@ impl Compose<'_> {
                     let _ = records.publish(record);
                     self.reached(Phase::RollingBack);
                 }
-                let unresolved: Vec<String> = placement
-                    .undo_all()
-                    .into_iter()
-                    .filter_map(|outcome| match outcome {
-                        super::place::Undone::Reported { path, detail } => {
-                            Some(format!("{path}: {detail}"))
-                        }
-                        super::place::Undone::Restored { .. }
-                        | super::place::Undone::RenamedAway { .. } => None,
-                    })
-                    .collect();
+                let unresolved = self.put_back(&mut placement, record);
                 if unresolved.is_empty() {
                     Err(why)
                 } else {
@@ -748,8 +775,19 @@ impl Compose<'_> {
                 .publish(record)
                 .map_err(|e| Refusal::Unrecordable(e.to_string()))?;
             self.reached(Phase::RollingBack);
-            placement.undo_all();
+            let unresolved = self.put_back(placement, record);
             held.release();
+            if !unresolved.is_empty() {
+                // A preview that could not put everything back is not a
+                // preview that changed nothing, and its record is the only
+                // thing that can tell the next launch what is still out of
+                // place.
+                return Err(Refusal::RollbackIncomplete {
+                    why: Box::new(Refusal::Io("the preview could not be undone".to_owned())),
+                    unresolved,
+                    record: record.id.clone(),
+                });
+            }
             return Ok(Done::Previewed(Preview {
                 branch: lease.reference.clone(),
                 tip: lease.tip.clone(),
@@ -768,12 +806,7 @@ impl Compose<'_> {
                     .iter()
                     .map(|entry| &entry.path)
                     .chain(removals.iter())
-                    .map(|path| {
-                        (
-                            path.to_string(),
-                            self.look_at(root, path).map(|(blob, _)| blob),
-                        )
-                    })
+                    .map(|path| (path.to_string(), self.hash_of(root, path)))
                     .collect(),
             }));
         }
@@ -931,6 +964,45 @@ impl Compose<'_> {
         }))
     }
 
+    /// Undo every placement and take the replacements out of the working
+    /// tree, answering whatever could not be done.
+    ///
+    /// The retention is not tidiness. An exchange that is swapped back leaves
+    /// the *replacement* under the temporary name beside the path, and that
+    /// file was at the path for a moment — an editor that opened it there
+    /// holds its inode and may still save through it — so it is moved under
+    /// `previous/` and kept rather than deleted, exactly as a swapped-out
+    /// original is. Without this a preview leaves a file beside every
+    /// declaration it touched, every time.
+    fn put_back(&self, placement: &mut Placement, record: &Record) -> Vec<String> {
+        let mut unresolved: Vec<String> = placement
+            .undo_all()
+            .into_iter()
+            .filter_map(|outcome| match outcome {
+                super::place::Undone::Reported { path, detail } => {
+                    Some(format!("{path}: {detail}"))
+                }
+                super::place::Undone::Restored { .. }
+                | super::place::Undone::RenamedAway { .. } => None,
+            })
+            .collect();
+        let previous_directory = self.git_dir.join("pbps-ui").join("previous");
+        match std::fs::create_dir_all(&previous_directory)
+            .map_err(|e| e.to_string())
+            .and_then(|()| Dir::open_root(&previous_directory).map_err(|e| e.to_string()))
+        {
+            Ok(previous) => {
+                for outcome in placement.retain_undone(&previous, &record.id) {
+                    if let super::place::Undone::Reported { path, detail } = outcome {
+                        unresolved.push(format!("{path}: {detail}"));
+                    }
+                }
+            }
+            Err(e) => unresolved.push(format!("the displaced files could not be kept: {e}")),
+        }
+        unresolved
+    }
+
     /// Every path the preview pinned still holds what it held — content where
     /// it had content, and *nothing* where it had nothing.
     fn still_as_shown(&self, root: &Dir, request: &Request) -> Result<(), Refusal> {
@@ -938,7 +1010,17 @@ impl Compose<'_> {
             let Ok(named) = RepoPath::new(path.as_bytes()) else {
                 return Err(Refusal::Place(PlaceRefusal::Changed { path: path.clone() }));
             };
-            if self.look_at(root, &named).map(|(blob, _)| blob) != *expected {
+            let now = match self.look_at(root, &named) {
+                listing::Seen::Present { blob, .. } => Some(blob),
+                listing::Seen::Absent => None,
+                listing::Seen::Unusable(why) => {
+                    return Err(Refusal::Listing(ListingRefusal::Unusable {
+                        path: path.clone(),
+                        why,
+                    }));
+                }
+            };
+            if now != *expected {
                 return Err(Refusal::Place(PlaceRefusal::Changed { path: path.clone() }));
             }
         }
@@ -998,7 +1080,10 @@ impl Compose<'_> {
         let previous_directory = self.git_dir.join("pbps-ui").join("previous");
         let _ = std::fs::create_dir_all(&previous_directory);
         if let Ok(previous) = Dir::open_root(&previous_directory) {
+            // The kept paths owe their displaced originals; the undone ones
+            // owe the replacements that were briefly at the path.
             placement.finish(&previous);
+            placement.retain_undone(&previous, &record.id);
         }
         // The prepared index is discarded without being installed, and the
         // locks go with it. The record stays only if something could not be
@@ -1256,20 +1341,40 @@ impl Compose<'_> {
     }
 
     /// What the working tree holds for one input: the blob `git` would store
-    /// for its bytes, and the execute bit `git add` would record.
-    fn look_at(&self, root: &Dir, path: &RepoPath) -> Option<(String, bool)> {
-        let (parent, leaf) = root.walk_to_parent(path).ok()?;
-        let look = parent.look(&leaf).ok()??;
-        if look.is_link || !look.is_regular {
-            return None;
+    /// for its bytes, the execute bit `git add` would record — or the reason
+    /// this is not a file the compose can read at all.
+    fn look_at(&self, root: &Dir, path: &RepoPath) -> listing::Seen {
+        let Ok((parent, leaf)) = root.walk_to_parent(path) else {
+            return listing::Seen::Unusable("under something this UI will not follow".to_owned());
+        };
+        let look = match parent.look(&leaf) {
+            Ok(Some(look)) => look,
+            Ok(None) => return listing::Seen::Absent,
+            Err(e) => return listing::Seen::Unusable(e.to_string()),
+        };
+        if look.is_link {
+            return listing::Seen::Unusable("a symbolic link".to_owned());
         }
-        let bytes = parent.open_file(&leaf).ok()?.read().ok()?;
-        let blob = super::attributes::hash(self.git, &bytes).ok()?;
-        Some((blob, look.mode & 0o111 != 0))
+        if !look.is_regular {
+            return listing::Seen::Unusable("not a regular file".to_owned());
+        }
+        match parent.open_file(&leaf).and_then(|file| file.read()) {
+            Ok(bytes) => match super::attributes::hash(self.git, &bytes) {
+                Ok(blob) => listing::Seen::Present {
+                    blob,
+                    executable: look.mode & 0o111 != 0,
+                },
+                Err(e) => listing::Seen::Unusable(e.to_string()),
+            },
+            Err(e) => listing::Seen::Unusable(format!("unreadable: {e}")),
+        }
     }
 
     fn hash_of(&self, root: &Dir, path: &RepoPath) -> Option<String> {
-        self.look_at(root, path).map(|(blob, _)| blob)
+        match self.look_at(root, path) {
+            listing::Seen::Present { blob, .. } => Some(blob),
+            listing::Seen::Absent | listing::Seen::Unusable(_) => None,
+        }
     }
 
     /// Every hash the UI takes of a working-tree file is taken over bytes read

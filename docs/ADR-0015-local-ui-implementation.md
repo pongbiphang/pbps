@@ -1634,7 +1634,14 @@ which is reached only when that path is a file or the filesystem refuses; and
 the kept record of a rollback that could not finish, which needs an undo to
 fail while another process holds a name. Each is structural — a branch that
 cannot be entered on demand — and each is stated here rather than counted as
-coverage. The
+coverage. Three more from the fourth round join them: the deciding-ref
+protocol's result being passed through the outer rollback arm untouched rather
+than undone a second time; the lock guard existing from the moment the first
+lock does, so that a failed record publication cannot strand `index.lock` and
+`HEAD.lock`; and the page's separate rendering of the two refusals that leave
+the repository changed, which is a `left_changes` flag on the answer and a
+different message, exercised by a unit test of the flag rather than through a
+browser. The
 interruption points *within* the rollback — after the record's publication, after each undo
 operation, after its flush, after each progress update and during retention
 cleanup — are implemented and are exercised only at their two ends. The

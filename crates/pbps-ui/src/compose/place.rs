@@ -572,6 +572,43 @@ impl Placement {
         reported
     }
 
+    /// Take the replacements out of the working tree after an undo.
+    ///
+    /// An exchange that is swapped back leaves the *replacement* under the
+    /// temporary name beside the path, and that file was at the path for a
+    /// moment: an editor that opened it there holds its inode and may save
+    /// through it, so it is moved under `previous/` and kept, never deleted —
+    /// exactly as a swapped-out original is. A `link()` that was renamed away
+    /// is moved the same way, and its own source unlinked, that being the one
+    /// name this UI ever unlinks.
+    pub fn retain_undone(&mut self, previous: &Dir, id: &str) -> Vec<Undone> {
+        let mut reported = Vec::new();
+        for done in &mut self.done {
+            if !done.undone {
+                continue;
+            }
+            let names = if done.created {
+                vec![
+                    OsString::from(format!("{}.rolled-back", done.temporary.to_string_lossy())),
+                    done.temporary.clone(),
+                ]
+            } else {
+                vec![done.temporary.clone()]
+            };
+            for name in names {
+                match move_beside(&done.parent, &name, previous, id) {
+                    Ok(()) => {}
+                    Err(detail) if detail == "absent" => {}
+                    Err(detail) => reported.push(Undone::Reported {
+                        path: done.path.to_string(),
+                        detail,
+                    }),
+                }
+            }
+        }
+        reported
+    }
+
     /// The names the page shows for what a refused compose left beside a path.
     pub fn retained_names(&self) -> Vec<String> {
         self.done
@@ -632,6 +669,28 @@ fn retain(parent: &Dir, temporary: &OsString, previous: &Dir) -> Result<(), Stri
     kept.write_all(&bytes).map_err(|e| e.to_string())?;
     kept.flush().map_err(|e| e.to_string())?;
     parent.unlink(temporary).map_err(|e| e.to_string())
+}
+
+/// Move one name out of the working tree and under the retention directory.
+///
+/// `Err("absent")` where the name is already gone, which is what running this
+/// twice looks like and is not a failure.
+fn move_beside(parent: &Dir, name: &OsString, previous: &Dir, id: &str) -> Result<(), String> {
+    let file = match parent.open_file(name) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err("absent".to_owned()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let bytes = file.read().map_err(|e| e.to_string())?;
+    let kept_as = OsString::from(format!("{}-{id}", name.to_string_lossy()));
+    let kept = match previous.create_new(&kept_as, 0o600) {
+        Ok(kept) => kept,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+    kept.write_all(&bytes).map_err(|e| e.to_string())?;
+    kept.flush().map_err(|e| e.to_string())?;
+    parent.unlink(name).map_err(|e| e.to_string())
 }
 
 /// Turn a leaf name into the one the temporary uses.

@@ -162,7 +162,17 @@
     const answer = await response.json();
     if (!answer.ok) {
       activity.className = "error"; activity.textContent = answer.refusal;
-      empty("Nothing was changed", "The refusal above is the whole of what happened; your checkout is as it was.");
+      // Two of these refusals leave the repository different from how they
+      // found it, and telling the user otherwise is how they come to make the
+      // same commit twice.
+      if (answer.left_changes) {
+        empty("Your repository was changed — read this before retrying",
+              "Do not run this again until you have looked at the state described above. " +
+              "Check `git log`, `git status` and the files named, and finish by hand if you " +
+              "want what the compose was making.");
+      } else {
+        empty("Nothing was changed", "The refusal above is the whole of what happened; your checkout is as it was.");
+      }
       return null;
     }
     return answer.data;

@@ -923,3 +923,90 @@ fn a_declaration_recreated_between_the_preview_and_the_commit_is_refused() {
         "{refusal}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Round four of review.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_declaration_replaced_by_a_link_is_refused_and_not_read_as_a_deletion() {
+    // Absent, empty and unreadable are three different things. Reading a
+    // symbolic link as a deletion would drop the tip's regular declaration
+    // from the composed tree while the link stayed in the checkout — a rename
+    // carried out against a schema the user never had.
+    let checkout = Checkout::new("link-input");
+    checkout.write(
+        "schema/second.yml",
+        "table: dbo.second\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n",
+    );
+    checkout.pbps(&["plan", "--no-input"]);
+    checkout.git(&["add", "-A"]);
+    checkout.git(&["commit", "-q", "-m", "two declarations"]);
+    let tip = checkout.git(&["rev-parse", "HEAD"]);
+    edited(&checkout);
+    std::fs::remove_file(checkout.path("schema/second.yml")).unwrap();
+    std::os::unix::fs::symlink("customer.yml", checkout.path("schema/second.yml")).unwrap();
+    let git = checkout.runner();
+    let cli = checkout.cli();
+    let file = project_file();
+
+    let refusal = compose(&checkout, &git, &cli, &file)
+        .run(&rename_request())
+        .expect_err("a link where a declaration was is refused");
+
+    assert!(
+        refusal.to_string().contains("schema/second.yml"),
+        "{refusal}"
+    );
+    assert!(refusal.to_string().contains("symbolic link"), "{refusal}");
+    assert!(!refusal.left_changes(), "and it changed nothing");
+    assert_eq!(checkout.git(&["rev-parse", "HEAD"]), tip);
+}
+
+#[test]
+fn a_preview_leaves_no_file_beside_the_declarations_it_touched() {
+    // An exchange that is swapped back leaves the *replacement* under the
+    // temporary name beside the path, and that file was at the path for a
+    // moment — so it is kept under `previous/` rather than deleted, and it is
+    // taken out of the working tree rather than left there. Without this a
+    // preview litters beside every declaration it touches, every time.
+    let checkout = Checkout::new("preview-litter");
+    edited(&checkout);
+    let git = checkout.runner();
+    let cli = checkout.cli();
+    let file = project_file();
+
+    for _ in 0..3 {
+        compose(&checkout, &git, &cli, &file)
+            .preview(&rename_request())
+            .expect("the preview finishes");
+    }
+
+    let beside: Vec<String> = std::fs::read_dir(checkout.path("schema"))
+        .unwrap()
+        .chain(std::fs::read_dir(&checkout.root).unwrap())
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("pbps-ui"))
+        .collect();
+    assert!(
+        beside.is_empty(),
+        "left beside the declarations: {beside:?}"
+    );
+
+    // And what was displaced is kept, never deleted: an editor that opened it
+    // while it was at the path may still save through it.
+    let kept = std::fs::read_dir(checkout.path(".git/pbps-ui/previous"))
+        .map(|entries| entries.filter_map(Result::ok).count())
+        .unwrap_or(0);
+    assert_eq!(kept, 3, "one retained replacement per preview");
+    // The user's own pending edit is exactly what the working tree still
+    // holds, and nothing else: the preview touched the ids file and put it
+    // back.
+    assert_eq!(
+        checkout.git(&["status", "--porcelain"]),
+        " M schema/customer.yml"
+    );
+    assert!(checkout.read("schema/customer.yml").contains("full_name"));
+    assert!(!checkout.read("schema.ids.json").contains("full_name"));
+}

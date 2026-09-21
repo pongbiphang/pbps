@@ -25,6 +25,21 @@ pub enum State {
     Deleted,
 }
 
+/// What the working tree holds at one path.
+///
+/// Three answers and not two. A tracked declaration replaced by a symbolic
+/// link, a directory, or a file that cannot be read is **not** a deleted one,
+/// and reading it as deleted would drop the tip's regular declaration from the
+/// composed tree while the unsupported object stayed in the checkout — a
+/// rename or a drop carried out against a schema the user never had. Absent,
+/// empty and unreadable are three different things.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Seen {
+    Present { blob: String, executable: bool },
+    Absent,
+    Unusable(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Input {
     pub path: RepoPath,
@@ -48,6 +63,12 @@ pub enum ListingRefusal {
     NotOrdinary {
         path: String,
         tag: char,
+    },
+    /// The working tree holds something at this path that is not a regular
+    /// file, or one that cannot be read.
+    Unusable {
+        path: String,
+        why: String,
     },
     /// A declaration matched by `.gitignore`. The intent command would see a
     /// working tree the commit cannot hold, and the shell's `git add` would
@@ -77,6 +98,11 @@ impl std::fmt::Display for ListingRefusal {
                     'R' => "removed",
                     _ => "not an ordinary entry",
                 }
+            ),
+            Self::Unusable { path, why } => write!(
+                f,
+                "`{path}` is {why} in your working tree, and this UI does not compose \
+                 for a declaration that is not an ordinary file"
             ),
             Self::Ignored { path } => write!(
                 f,
@@ -140,7 +166,7 @@ pub fn inputs(
     git: &Git,
     tip: &str,
     inputs: &Inputs<'_>,
-    mut look_at: impl FnMut(&RepoPath) -> Option<(String, bool)>,
+    mut look_at: impl FnMut(&RepoPath) -> Seen,
 ) -> Result<Vec<Input>, ListingRefusal> {
     let mut found: BTreeMap<RepoPath, Input> = BTreeMap::new();
 
@@ -163,13 +189,19 @@ pub fn inputs(
         // declaration whose execute bit was flipped as unchanged, leaves it
         // out of the commit, and leaves the checkout dirty afterwards.
         let state = match &found_now {
-            None => State::Deleted,
-            Some((blob, executable))
+            Seen::Unusable(why) => {
+                return Err(ListingRefusal::Unusable {
+                    path: entry.path.to_string(),
+                    why: why.clone(),
+                });
+            }
+            Seen::Absent => State::Deleted,
+            Seen::Present { blob, executable }
                 if *blob == entry.blob && *executable == (entry.mode == 0o100755) =>
             {
                 State::Unchanged
             }
-            Some(_) => State::Edited,
+            Seen::Present { .. } => State::Edited,
         };
         found.insert(
             entry.path.clone(),
@@ -177,7 +209,10 @@ pub fn inputs(
                 path: entry.path,
                 state,
                 recorded: Some((entry.mode, entry.blob)),
-                executable: found_now.map(|(_, executable)| executable),
+                executable: match found_now {
+                    Seen::Present { executable, .. } => Some(executable),
+                    Seen::Absent | Seen::Unusable(_) => None,
+                },
             },
         );
     }
@@ -192,7 +227,16 @@ pub fn inputs(
                 path: path.to_string(),
             });
         }
-        let executable = look_at(&path).map(|(_, executable)| executable);
+        let executable = match look_at(&path) {
+            Seen::Present { executable, .. } => Some(executable),
+            Seen::Unusable(why) => {
+                return Err(ListingRefusal::Unusable {
+                    path: path.to_string(),
+                    why,
+                });
+            }
+            Seen::Absent => None,
+        };
         found.entry(path.clone()).or_insert(Input {
             path,
             state: State::New,
@@ -345,17 +389,24 @@ mod tests {
         RepoPath::new(text.as_bytes()).unwrap()
     }
 
-    fn read_hashes(scratch: &Scratch) -> impl FnMut(&RepoPath) -> Option<(String, bool)> + '_ {
+    fn read_hashes(scratch: &Scratch) -> impl FnMut(&RepoPath) -> Seen + '_ {
         move |wanted: &RepoPath| {
             use std::os::unix::fs::PermissionsExt as _;
             let file = scratch.path(wanted.to_text().unwrap());
-            let bytes = std::fs::read(&file).ok()?;
-            let executable = std::fs::metadata(&file).ok()?.permissions().mode() & 0o111 != 0;
+            let Ok(found) = std::fs::symlink_metadata(&file) else {
+                return Seen::Absent;
+            };
+            if !found.is_file() {
+                return Seen::Unusable("not a regular file".to_owned());
+            }
+            let Ok(bytes) = std::fs::read(&file) else {
+                return Seen::Unusable("unreadable".to_owned());
+            };
             let git = scratch.runner();
-            Some((
-                super::super::attributes::hash(&git, &bytes).unwrap(),
-                executable,
-            ))
+            Seen::Present {
+                blob: super::super::attributes::hash(&git, &bytes).unwrap(),
+                executable: found.permissions().mode() & 0o111 != 0,
+            }
         }
     }
 

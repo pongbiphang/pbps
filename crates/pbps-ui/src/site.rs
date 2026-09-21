@@ -127,11 +127,11 @@ impl Site {
         match url {
             "/api/compose/preview" => match compose.preview(request) {
                 Ok(preview) => ok(&preview),
-                Err(refusal) => refused(409, &refusal.to_string()),
+                Err(refusal) => answer_refusal(&refusal),
             },
             "/api/compose/record" => match compose.run(request) {
                 Ok(composed) => ok(&composed),
-                Err(refusal) => refused(409, &refusal.to_string()),
+                Err(refusal) => answer_refusal(&refusal),
             },
             _ => refused(404, "No such compose route"),
         }
@@ -154,6 +154,20 @@ fn remotes(git: &Git) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// A refusal, carrying whether it left the repository different from how it
+/// found it. The page renders the two cases differently, because telling a
+/// user nothing changed when a commit stands on their branch is how they come
+/// to make it twice.
+fn answer_refusal(refusal: &crate::compose::run::Refusal) -> (u16, &'static str, Vec<u8>) {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "ok": false,
+        "refusal": refusal.to_string(),
+        "left_changes": refusal.left_changes(),
+    }))
+    .unwrap_or_else(|_| b"{\"ok\":false,\"left_changes\":true}".to_vec());
+    (409, "application/json", body)
 }
 
 fn ok(value: &impl serde::Serialize) -> (u16, &'static str, Vec<u8>) {
