@@ -35,7 +35,7 @@ async fn native_aliases_share_one_instance_and_backend_children_cannot_claim_ano
     );
     let connection = PeerVerifiedConn::connect(driver, &primary).await.unwrap();
     let observed = SocketOwnerLease::capture(&connection, main_pid).unwrap();
-    let backend = observed.owner().pid();
+    let backend = observed.owner().observer_pid().unwrap();
     assert_ne!(
         backend, main_pid,
         "this measured fixture must exercise its real backend child"
@@ -47,7 +47,14 @@ async fn native_aliases_share_one_instance_and_backend_children_cannot_claim_ano
 
     // The supervisor owns this fixture and explicitly permits its process to
     // be suspended. No production target is accepted by this ignored test.
-    let backend = first.current.as_ref().unwrap().lease.owner().pid();
+    let backend = first
+        .current
+        .as_ref()
+        .unwrap()
+        .lease
+        .owner()
+        .observer_pid()
+        .unwrap();
     let suspend = std::process::Command::new("/bin/kill")
         .args(["-STOP", &backend.to_string()])
         .status()

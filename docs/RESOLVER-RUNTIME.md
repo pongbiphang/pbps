@@ -7,8 +7,9 @@ authorization, retained-source permission or sealed binding evidence.
 
 The staged replacement for descendant-based process observation is documented
 in [namespace-scoped observation](RESOLVER-NAMESPACE.md). Its primitive and
-fixtures are available under #740; production caller migration and the revised
-launch/target contracts remain #741–#743.
+fixtures are available under #740. Whole-container task qualification and
+engine discovery use that view under #741; the revised launch/target contracts
+remain #742–#743. Socket-holder enumeration is part of the target stage.
 
 ## Supported initial profile
 

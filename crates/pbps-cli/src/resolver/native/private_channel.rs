@@ -3,8 +3,7 @@
 //! containment, target separation and the relevant engine compatibility.
 
 use super::{
-    File, ProcessLease, UnqualifiedProcess, observe_incidental, proc_base, process_scope,
-    socket_owners,
+    File, ProcessLease, UnqualifiedProcess, for_each_namespace_task, proc_base, socket_owners,
 };
 use pbps_db::resolver::{BackendProcess, InstanceObservation};
 use pbps_db::transport::ConnectionId;
@@ -132,14 +131,8 @@ impl PrivateChannelLease {
         if shells != 1 || readers_writers != 2 {
             return Err(UnqualifiedProcess);
         }
-        for (pid, directory) in process_scope(&self.workload)? {
-            if pid == self.workload.pid() {
-                continue;
-            }
-            observe_incidental(pid, &directory, |process| {
-                security(&process, self.profile.uid, self.profile.capabilities)
-            })?;
-        }
+        guarded_tasks(&self.workload, self.profile.uid, self.profile.capabilities)?;
+        guarded_tasks(&self.control, 65534, 0)?;
         // Re-read after descriptor inspection so a closed/replaced socket
         // cannot be accepted from an earlier table snapshot.
         if sockets(&self.workload, self.profile.port)? != self.sockets {
@@ -166,21 +159,46 @@ pub(crate) fn awaiting_engine(
     let root = ProcessLease::capture(pid)?;
     guard(&root)?;
     private_network(&root)?;
-    let scope = process_scope(&root)?;
-    if scope.len() != 2 {
+    let mut children = std::collections::BTreeSet::new();
+    for_each_namespace_task(&root, |task, process| {
+        if process.same_process(&root)? {
+            return Ok(());
+        }
+        if process
+            .executable_path()
+            .file_name()
+            .is_none_or(|name| name != "bash")
+        {
+            return Err(UnqualifiedProcess);
+        }
+        security(&process, profile.uid, profile.capabilities)?;
+        // Group numbers are used only while this observation owns its view.
+        children.insert(task.group().number());
+        Ok(())
+    })?;
+    if children.len() != 1 {
         return Err(UnqualifiedProcess);
     }
-    let child = ProcessLease::capture(scope[1].0)?;
-    if child
-        .executable_path()
-        .file_name()
-        .is_none_or(|name| name != "bash")
-    {
-        return Err(UnqualifiedProcess);
-    }
-    security(&child, profile.uid, profile.capabilities)?;
     root.check()?;
     Ok(root)
+}
+
+/// The fixed guard is the only privilege exception, bound to its live lease.
+/// Every other task is inspected, including runtime-exec entrants and workers
+/// whose credentials differ from their group's leader.
+pub(crate) fn guarded_tasks(
+    root: &ProcessLease,
+    uid: u32,
+    capabilities: u64,
+) -> Result<(), UnqualifiedProcess> {
+    guard(root)?;
+    for_each_namespace_task(root, |_, process| {
+        if process.same_process(root)? {
+            Ok(())
+        } else {
+            security(&process, uid, capabilities)
+        }
+    })
 }
 
 pub(crate) fn guard(process: &ProcessLease) -> Result<(), UnqualifiedProcess> {

@@ -1,7 +1,14 @@
 /* Keep a worker alive after its leader exits. This is a measurement helper,
  * not part of the resolver or a process installed on a target. */
 #define _GNU_SOURCE
+#include <errno.h>
+#include <linux/capability.h>
 #include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static void *worker(void *unused) {
@@ -10,7 +17,76 @@ static void *worker(void *unused) {
     return NULL;
 }
 
-int main(void) {
+static pthread_barrier_t credentials_ready;
+
+static void *root_worker(void *unused) {
+    (void)unused;
+    struct __user_cap_header_struct header = {_LINUX_CAPABILITY_VERSION_3, 0};
+    struct __user_cap_data_struct caps[2] = {{0}};
+    if (syscall(SYS_capset, &header, caps)) _exit(1);
+    pthread_barrier_wait(&credentials_ready);
+    sleep(300);
+    return NULL;
+}
+
+int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "orphan")) {
+        FILE *release = fopen("/dev/shm/release", "w");
+        if (!release || fclose(release)) return 1;
+        pid_t parent = fork();
+        if (parent < 0) return 1;
+        if (!parent) {
+            pid_t child = fork();
+            if (child < 0) _exit(1);
+            if (!child) {
+                FILE *ready = fopen("/dev/shm/ready", "w");
+                if (!ready) _exit(1);
+                fprintf(ready, "%d %d\n", getppid(), getpid());
+                if (fclose(ready)) _exit(1);
+                sleep(300);
+                _exit(0);
+            }
+            for (;;) {
+                FILE *signal = fopen("/dev/shm/release", "r");
+                if (!signal) _exit(1);
+                int byte = fgetc(signal);
+                fclose(signal);
+                if (byte == '1') _exit(0);
+                usleep(1000);
+            }
+        }
+        if (waitpid(parent, NULL, 0) != parent) return 1;
+        sleep(300);
+        return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "mixed")) {
+        // Linux credentials belong to tasks. Bypass libc's all-thread UID
+        // synchronization to retain a root worker beneath a UID-999 leader.
+        for (int cap = 0; cap < 64; ++cap) {
+            if (prctl(PR_CAPBSET_DROP, cap, 0, 0, 0) && errno != EINVAL) return 1;
+        }
+        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) return 1;
+        if (pthread_barrier_init(&credentials_ready, NULL, 2)) return 1;
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, root_worker, NULL)) return 1;
+        if (syscall(SYS_setresuid, 999, 999, 999)) return 1;
+        pthread_barrier_wait(&credentials_ready);
+        if (prctl(PR_SET_NAME, "pbps-mixed", 0, 0, 0)) return 1;
+        sleep(300);
+        return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "churn")) {
+        if (prctl(PR_SET_NAME, "pbps-churn", 0, 0, 0)) return 1;
+        for (;;) {
+            pid_t child = fork();
+            if (child < 0) return 1;
+            if (!child) {
+                usleep(100);
+                _exit(0);
+            }
+            if (waitpid(child, NULL, 0) != child) return 1;
+        }
+    }
     pthread_t thread;
     if (pthread_create(&thread, NULL, worker, NULL)) return 1;
     sleep(1);

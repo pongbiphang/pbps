@@ -6,7 +6,9 @@
 //! not an atomic snapshot, an origin claim, or continuous containment.
 //! DECISIONS 528 records the view, coordinate and lifetime contract.
 
-use super::{FileIdentity, ProcessLease, UnqualifiedProcess, exited_stat, process_gone};
+use super::{
+    FileIdentity, ProcSource, ProcessLease, UnqualifiedProcess, exited_stat, process_gone,
+};
 use rustix::fs::{Mode, OFlags, ResolveFlags};
 use std::fs::File;
 use std::os::fd::AsRawFd;
@@ -126,7 +128,7 @@ impl TaskObservation {
 /// requiring exact namespace equality must separately check each task.
 pub struct NamespaceProcfs<'a> {
     anchor: &'a ProcessLease,
-    directory: File,
+    directory: Arc<File>,
     namespace: Arc<File>,
     identity: FileIdentity,
     mount: u64,
@@ -150,7 +152,7 @@ impl<'a> NamespaceProcfs<'a> {
         let view = Self {
             identity: FileIdentity::of(&directory)?,
             mount: mount_id(&directory)?,
-            directory,
+            directory: Arc::new(directory),
             namespace: Arc::new(namespace),
             anchor,
         };
@@ -202,7 +204,7 @@ impl<'a> NamespaceProcfs<'a> {
                 Err(_) => return Err(NamespaceError::Unreadable),
             };
             let mut found = false;
-            for tid in ids(&tasks)? {
+            for tid in task_ids(&group, &tasks)? {
                 let directory = match open(&tasks, &tid.to_string(), OFlags::DIRECTORY) {
                     Ok(directory) => directory,
                     Err(error) if process_gone(&error) => continue,
@@ -249,10 +251,50 @@ impl<'a> NamespaceProcfs<'a> {
     }
 }
 
+/// Apply a container check through held task entries, never by translating
+/// a namespace-local number into an observer PID. Each task is qualified
+/// separately: threads may have different credentials. The callback may
+/// retain an engine lease, but no detached local coordinate is used later.
+pub(crate) fn for_each_namespace_task(
+    anchor: &ProcessLease,
+    mut inspect: impl FnMut(&TaskObservation, ProcessLease) -> Result<(), UnqualifiedProcess>,
+) -> Result<(), UnqualifiedProcess> {
+    let refusal = |error: NamespaceError| {
+        #[cfg(test)]
+        eprintln!("native namespace observation refused: {error}");
+        let _ = error;
+        UnqualifiedProcess
+    };
+    let view = NamespaceProcfs::capture(anchor).map_err(refusal)?;
+    for task in view.observe().map_err(refusal)? {
+        let result = (|| {
+            if matches!(task.status().map_err(refusal)?, TaskReading::Exited) {
+                return Ok(());
+            }
+            let process = ProcessLease::capture_held(
+                task.directory.try_clone().map_err(|_| UnqualifiedProcess)?,
+                ProcSource::Namespace(Arc::clone(&view.directory)),
+            )?;
+            if process.start_ticks != task.start_ticks || !anchor.same_namespace(&process, "pid")? {
+                return Err(UnqualifiedProcess);
+            }
+            inspect(&task, process)
+        })();
+        if let Err(error) = result {
+            // A held incidental task may exit during any read, including
+            // the callback. Unknown live state never becomes absence.
+            if !matches!(task.status().map_err(refusal)?, TaskReading::Exited) {
+                return Err(error);
+            }
+        }
+    }
+    view.check().map_err(refusal)
+}
+
 // Every ordinary component stays on the held procfs mount. Bind-mounting a
 // different proc entry over one PID keeps f_type=procfs; NO_XDEV catches the
 // substituted mount, including a bind from this same procfs superblock.
-fn open(directory: &File, path: &str, flags: OFlags) -> std::io::Result<File> {
+pub(super) fn open(directory: &File, path: &str, flags: OFlags) -> std::io::Result<File> {
     rustix::fs::openat2(
         directory,
         path,
@@ -292,6 +334,17 @@ fn group_exited(directory: &File) -> Result<bool, NamespaceError> {
     match read_stat(directory)? {
         Some(stat) => exited_stat(&stat).map_err(|_| NamespaceError::Metadata),
         None => Ok(true),
+    }
+}
+
+fn task_ids(group: &File, tasks: &File) -> Result<Vec<u32>, NamespaceError> {
+    match ids(tasks) {
+        Ok(ids) => Ok(ids),
+        // Opening `task` does not make its iterator immortal: read_from
+        // reopens ".", which can fail after the group exits (#754). The
+        // held group's stat must prove exit; a live worker still refuses.
+        Err(_) if group_exited(group)? => Ok(Vec::new()),
+        Err(error) => Err(error),
     }
 }
 
