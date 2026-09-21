@@ -8,8 +8,9 @@
 use super::profile::{self, ServerProfile};
 use super::{Error, Premise};
 use crate::resolver::native::{
-    BoundedResourceLease, ProcessLease, UnqualifiedProcess, cgroup_relative, for_each_occupant,
-    foreign_network_tasks, groups, mount_rows, private_network, process_scope, security,
+    BoundedResourceLease, ProcessLease, UnqualifiedProcess, cgroup_relative,
+    for_each_namespace_task, for_each_occupant, foreign_network_tasks, groups, mount_rows,
+    private_network, security,
 };
 
 /// The processes the daemon's record names, before anything is measured of
@@ -26,7 +27,7 @@ pub(crate) struct ServerProcesses {
 
 impl ServerProcesses {
     /// `init_pid` is the container's init as the daemon reports it. The
-    /// engine service is found beneath it rather than named by the operator:
+    /// engine service is found in its PID namespace rather than named by the operator:
     /// SQL Server's image starts the engine under a launcher, and a backend
     /// runs the same executable as its service root.
     pub(crate) fn identify(init_pid: u32, profile: &'static ServerProfile) -> Result<Self, Error> {
@@ -39,23 +40,26 @@ impl ServerProcesses {
             ));
         }
         let mut engines = Vec::new();
-        for (pid, _) in process_scope(&init)
-            .map_err(|_| Error::Unqualified("the supplied container's processes are unreadable"))?
-        {
-            let Ok(process) = ProcessLease::capture(pid) else {
-                continue;
-            };
-            if process
-                .executable_path()
-                .file_name()
-                .is_some_and(|name| name == profile.executable)
-                && !process.has_same_executable_parent().map_err(|_| {
-                    Error::Unqualified("the supplied container's processes are unreadable")
-                })?
+        for_each_namespace_task(&init, |task, process| {
+            // Engine identity counts processes; SQL Server's worker threads
+            // are still checked individually by `occupants` below.
+            if task.id() != task.group() {
+                return Ok(());
+            }
+            // Two candidates already make the identity ambiguous; do not
+            // retain one executable/namespace lease per extra task.
+            if engines.len() < 2
+                && process
+                    .executable_path()
+                    .file_name()
+                    .is_some_and(|name| name == profile.executable)
+                && !process.has_same_executable_parent()?
             {
                 engines.push(process);
             }
-        }
+            Ok(())
+        })
+        .map_err(|_| Error::Unqualified("the supplied container's processes are unreadable"))?;
         if engines.len() != 1 {
             return Err(Error::EngineExecutable);
         }
@@ -202,12 +206,14 @@ fn device_not_engine_writable(init: &ProcessLease) -> Result<(), UnqualifiedProc
 /// network and mount namespaces, and inside its cgroup.
 ///
 /// Judged as found, not against an earlier listing: a backend PostgreSQL
-/// forks or a thread SQL Server pools between two readings is a task the
-/// engine started, and refusing it for being new would end every run on a
+/// forks or a thread SQL Server pools between two readings may be new;
+/// refusing it for being new would end every run on a
 /// busy engine (finding on #640).
+/// Passing these credentials does not prove which engine launched a task.
 fn occupants(init: &ProcessLease, profile: &ServerProfile) -> Result<(), Error> {
     let bounded = cgroup_relative(init).map_err(Premise::Occupants.named())?;
-    for_each_occupant(init, "pid", |occupant| {
+    for_each_namespace_task(init, |_, occupant| {
+        let occupant = &occupant;
         // Membership has to hold both ways. A qualified task that left the
         // namespaces — into an externally connected network, say, or an
         // external IPC namespace to receive through foreign shared memory —
@@ -299,9 +305,9 @@ fn accounted(init: &ProcessLease, forwarders: &[&ProcessLease]) -> Result<(), Er
 fn refused(occupant: &ProcessLease, namespace: &str) {
     #[cfg(test)]
     eprintln!(
-        "accounting refused {} occupant pid={} exe={:?}",
+        "accounting refused {} occupant observer_pid={:?} exe={:?}",
         namespace,
-        occupant.pid(),
+        occupant.observer_pid(),
         occupant.executable_path()
     );
     let _ = (occupant, namespace);

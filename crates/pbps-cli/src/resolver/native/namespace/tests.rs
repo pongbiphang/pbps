@@ -62,6 +62,29 @@ fn held_task_exit_does_not_reopen_a_numeric_coordinate() {
 }
 
 #[test]
+fn a_held_task_iterator_may_disappear_only_after_its_group_exits() {
+    let mut child = super::super::spawned_and_execed(
+        std::process::Command::new("/bin/sleep").arg("30"),
+        "sleep",
+    );
+    let group = File::open(format!("/proc/{}", child.id())).unwrap();
+    let tasks = open(&group, "task", OFlags::DIRECTORY).unwrap();
+    assert!(task_ids(&group, &tasks).unwrap().contains(&child.id()));
+    let not_a_directory = open(&group, "stat", OFlags::empty()).unwrap();
+    assert!(
+        task_ids(&group, &not_a_directory).is_err(),
+        "a live unreadable group must refuse"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(
+        ids(&tasks).is_err(),
+        "the kernel fixture must exercise the failed iterator"
+    );
+    assert!(task_ids(&group, &tasks).unwrap().is_empty());
+}
+
+#[test]
 fn proc_component_reads_reject_symlinks_and_parent_escape() {
     let root = std::env::temp_dir().join(format!("pbps-proc-view-{}", rand::random::<u64>()));
     std::fs::create_dir(&root).unwrap();
@@ -102,6 +125,22 @@ fn namespace_procfs_fixture_observes_external_parent_tasks_and_retains_identity(
             .iter()
             .all(|task| second.iter().any(|other| task.same_task(other).unwrap()))
     );
+    // Production consumers qualify the held task itself. The namespace's
+    // init is the same live process even though this view's directory inode
+    // differs from the observer's, and a worker survives its dead leader.
+    let mut qualified = std::collections::BTreeSet::new();
+    for_each_namespace_task(&anchor, |task, process| {
+        assert!(process.observer_pid().is_err());
+        assert_eq!(process.same_process(&anchor)?, task.id().number() == 1);
+        super::super::security(&process, 999, 0)?;
+        qualified.insert(task.id().number());
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        qualified,
+        first.iter().map(|task| task.id().number()).collect()
+    );
     let regular = File::open(std::env::temp_dir()).unwrap();
     assert_ne!(
         rustix::fs::fstatfs(&regular).unwrap().f_type,
@@ -116,6 +155,12 @@ fn namespace_procfs_fixture_observes_external_parent_tasks_and_retains_identity(
                 .any(|task| task.group().number() == group && task.id().number() != group)
         );
         assert!(!first.iter().any(|task| task.id().number() == group));
+        let held_group = open(&view.directory, &group.to_string(), OFlags::DIRECTORY).unwrap();
+        let unreadable_tasks = open(&held_group, "stat", OFlags::empty()).unwrap();
+        assert!(
+            task_ids(&held_group, &unreadable_tasks).is_err(),
+            "a dead leader with a live worker is not an exited group"
+        );
     }
     if let Ok(other_pid) = std::env::var("PBPS_NAMESPACE_SECOND_PID") {
         let other = ProcessLease::capture(other_pid.parse().unwrap()).unwrap();
@@ -128,7 +173,172 @@ fn namespace_procfs_fixture_observes_external_parent_tasks_and_retains_identity(
             .unwrap();
         assert_ne!(this_init.id(), other_init.id());
         assert!(!this_init.same_task(other_init).unwrap());
+        assert!(!anchor.same_process(&other).unwrap());
     }
+}
+
+#[test]
+fn foreign_namespace_sharers_remain_visible_outside_the_container_pid_view() {
+    let Ok(pid) = std::env::var("PBPS_NAMESPACE_FOREIGN_PID") else {
+        return;
+    };
+    let namespace = std::env::var("PBPS_NAMESPACE_FOREIGN_KIND").unwrap();
+    assert!(matches!(namespace.as_str(), "mnt" | "ipc"));
+    let anchor = ProcessLease::capture(pid.parse().unwrap()).unwrap();
+    let mut foreign = false;
+    let result = super::super::for_each_occupant(&anchor, &namespace, |occupant| {
+        if !anchor.same_namespace(occupant, "pid")? {
+            foreign = true;
+            Err(UnqualifiedProcess)
+        } else {
+            Ok(())
+        }
+    });
+    assert!(
+        foreign,
+        "PID-scoped admission must retain the separate foreign-sharer census"
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn reparenting_during_qualification_keeps_the_held_grandchild() {
+    let Ok(pid) = std::env::var("PBPS_NAMESPACE_ORPHAN_PID") else {
+        return;
+    };
+    let anchor = ProcessLease::capture(pid.parse().unwrap()).unwrap();
+    let ready = anchor.read_root_file("dev/shm/ready", 128).unwrap();
+    let ids: Vec<u32> = ready
+        .split_whitespace()
+        .map(|s| s.parse().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    let mut grandchild = None;
+    let mut parent_exited = false;
+    for_each_namespace_task(&anchor, |task, process| {
+        super::super::security(&process, 999, 0)?;
+        if task.id().number() == ids[1] {
+            grandchild = Some(process);
+        } else if task.id().number() == ids[0] {
+            // The fixture owns this container and its private signal file.
+            // Release the parent only after its task has been inspected.
+            use std::io::Write as _;
+            // Open the existing fixture signal without O_CREAT: Linux's
+            // protected_regular correctly refuses creating over another
+            // user's file in a sticky directory, even for a root observer.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(super::super::proc_base(&anchor.directory).join("root/dev/shm/release"))
+                .unwrap()
+                .write_all(b"1")
+                .unwrap();
+            for _ in 0..1000 {
+                if matches!(task.status().unwrap(), TaskReading::Exited) {
+                    parent_exited = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(parent_exited);
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert!(parent_exited);
+    let child = grandchild.expect("reparenting must not remove the live grandchild");
+    child.check().unwrap();
+    assert_eq!(
+        status_id(&child.read_proc("status", 65536).unwrap(), "PPid:").unwrap(),
+        1
+    );
+}
+
+#[test]
+fn a_containers_task_count_does_not_consume_the_observers_descriptor_budget() {
+    let Ok(pid) = std::env::var("PBPS_NAMESPACE_MANY_PID") else {
+        return;
+    };
+    let limits = std::fs::read_to_string("/proc/self/limits").unwrap();
+    assert_eq!(
+        limits
+            .lines()
+            .find_map(|line| line.strip_prefix("Max open files"))
+            .and_then(|fields| fields.split_whitespace().next()),
+        Some("64")
+    );
+    let anchor = ProcessLease::capture(pid.parse().unwrap()).unwrap();
+    let mut count = 0;
+    for_each_namespace_task(&anchor, |_, process| {
+        super::super::security(&process, 999, 0)?;
+        count += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        count >= 98,
+        "every worker and the container init must be checked"
+    );
+}
+
+#[test]
+fn departing_incidental_tasks_do_not_refuse_an_unchanged_container_profile() {
+    let Ok(pid) = std::env::var("PBPS_NAMESPACE_CHURN_PID") else {
+        return;
+    };
+    let anchor = ProcessLease::capture(pid.parse().unwrap()).unwrap();
+    let started = std::time::Instant::now();
+    for _ in 0..500 {
+        for_each_namespace_task(&anchor, |_, process| {
+            super::super::security(&process, 999, 0)
+        })
+        .unwrap();
+    }
+    eprintln!(
+        "500 container qualifications under fork/exit churn: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn container_membership_does_not_hide_wrong_credentials_or_foreign_cgroups() {
+    let Ok(pid) = std::env::var("PBPS_NAMESPACE_NEGATIVE_PID") else {
+        return;
+    };
+    let anchor = ProcessLease::capture(pid.parse().unwrap()).unwrap();
+    let expectation = std::env::var("PBPS_NAMESPACE_NEGATIVE").unwrap();
+    let bounded = super::super::cgroup_relative(&anchor).unwrap();
+    let mut observed_violation = false;
+    let result = for_each_namespace_task(&anchor, |task, process| match expectation.as_str() {
+        "credentials" | "thread-credentials" => {
+            let status = process.read_proc("status", 65536)?;
+            let root = status.lines().any(|line| {
+                line.strip_prefix("Uid:")
+                    .is_some_and(|v| v.split_whitespace().all(|v| v == "0"))
+            });
+            if root && (expectation == "credentials" || task.id() != task.group()) {
+                observed_violation = true;
+            }
+            super::super::security(&process, 999, 0)
+        }
+        "cgroup" => {
+            let current = super::super::cgroup_relative(&process)?;
+            if current == bounded || current.starts_with(&format!("{bounded}/")) {
+                Ok(())
+            } else {
+                observed_violation = true;
+                Err(UnqualifiedProcess)
+            }
+        }
+        _ => panic!("unknown fixture expectation"),
+    });
+    assert!(
+        observed_violation,
+        "the intended task must reach its policy check"
+    );
+    assert!(
+        result.is_err(),
+        "a live out-of-profile task must refuse the container"
+    );
 }
 
 #[test]
@@ -213,6 +423,7 @@ fn namespace_mount_fixture_refuses_replaced_views_and_process_overmounts() {
         .find(|task| task.id() == held.id())
         .unwrap();
     assert!(!held.same_task(new_task).unwrap());
+    assert!(anchor.same_process(&new_anchor).is_err());
     replacement.kill().unwrap();
     replacement.wait().unwrap();
 }

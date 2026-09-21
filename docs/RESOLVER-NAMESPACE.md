@@ -1,9 +1,9 @@
 # Namespace-scoped process observation
 
 Issue #740 provides the observation primitive for the runtime redesign tracked
-by #737 and #740–#743. It does not migrate production callers yet. The existing
-target and scratch qualification paths retain their existing behavior until
-the dependent changes replace them.
+by #737 and #740–#743. Issue #741 uses it for whole-container privilege checks,
+supplied-server engine discovery and pre-engine membership. Target and socket
+holder qualification retain their existing paths until #743.
 
 ## Contract
 
@@ -28,6 +28,29 @@ coordinate. A coordinate is not a live identity: each `TaskObservation` holds
 the opened task directory and start time and brackets status reads through
 that directory. Directory identity comparisons apply within the same procfs
 instance, not across arbitrary views of one process.
+
+Production consumers capture a `ProcessLease` through each held task entry.
+They consume entries as they are enumerated, so descriptor use does not grow
+with the container's task count. The optional `observe` collector retains its
+returned entries and requires enough caller descriptor capacity; it is not the
+source for production qualification. Engine discovery retains at most the two
+candidates needed to distinguish a unique engine from an ambiguous selection.
+The lease records whether it came from the observer or a retained namespace
+view; only the former can supply an observer PID. Parent executable lookups
+use that same view. Cross-view identity compares the innermost task number,
+start time and retained namespace identities, bracketed by live checks of both
+leases. A departed held task cannot be replaced by a same-tick PID reuse.
+The fixed lifetime guard's privilege exception uses this identity, never a
+bare PID comparison. Other threads of its group do not inherit the exception.
+
+Engine discovery counts group leaders, whereas credentials are checked for
+every task, including workers with a different UID from their leader. The
+container consumers refuse visible child PID namespaces whose identity differs
+from the admitted namespace. Supplied-server cgroup subtree limits and foreign
+network/mount/IPC sharer accounting remain independent checks; the latter still
+needs the observer's wider view. Matching credentials does not establish engine
+origin, and neither the census nor an exception claims to contain a provisioning
+administrator (DECISIONS 529).
 
 The observation enumerates the namespace view and each visible group's task
 directory. It does not follow parent-child edges or enumerate unrelated host
@@ -105,7 +128,7 @@ Podman 4.9.3 rejected the documented Docker tmpfs `uid=999` option before
 startup. Therefore the engine recipe comparisons above were run on Docker;
 the Podman namespace measurements do not certify that recipe's portability.
 
-Stage #741 must preserve independent cgroup and foreign network/mount/IPC
+Stage #741 preserves independent cgroup and foreign network/mount/IPC
 accounting. Stage #742 must bind a launch invariant to the actual post-drop
 workload, not its still-privileged deadline guard, and account for every
 supported provisioning entry path. Merely observing PID 1 once is insufficient.

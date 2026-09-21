@@ -34,7 +34,7 @@ impl DaemonLease {
             .and_then(|name| name.to_str())
         {
             Some("dockerd") => creator,
-            Some("systemd") if creator.pid() == 1 => {
+            Some("systemd") if creator.observer_pid()? == 1 => {
                 let path = Path::new("/run/docker.pid");
                 for parent in path.ancestors().skip(1) {
                     let metadata = std::fs::metadata(parent).map_err(|_| UnqualifiedProcess)?;

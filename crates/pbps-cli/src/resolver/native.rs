@@ -24,11 +24,13 @@ pub(crate) use execution::{
     BoundedResourceLease, ExecutionLease, ExecutionProfile, MountEntry, ResourceCeilings,
     cgroup_relative, mount_rows,
 };
+pub(crate) use namespace::for_each_namespace_task;
 pub use namespace::{
     NamespaceError, NamespaceProcfs, NamespaceTaskId, TaskObservation, TaskReading,
 };
 pub(crate) use private_channel::{
-    PrivateChannelLease, PrivateChannelProfile, awaiting_engine, guard, private_network, security,
+    PrivateChannelLease, PrivateChannelProfile, awaiting_engine, guarded_tasks, private_network,
+    security,
 };
 pub(crate) use target::TargetWitness;
 pub use target::{EnvironmentError, NativeTarget, NativeTargetError};
@@ -226,8 +228,15 @@ pub struct ProcessLease {
     executable_path: PathBuf,
     start_ticks: u64,
     namespaces: Vec<(&'static str, File, FileIdentity)>,
-    pid: u32,
+    source: ProcSource,
     namespace_pid: u32,
+}
+
+// A local PID must never be reopened in the observer's procfs. Holding the
+// selected view also keeps its PID namespace alive for relative parent reads.
+enum ProcSource {
+    Observer(u32),
+    Namespace(std::sync::Arc<File>),
 }
 
 impl ProcessLease {
@@ -239,6 +248,10 @@ impl ProcessLease {
             return Err(Reading::CaptureOpen.refuse());
         }
         let directory = open_process(pid).map_err(Reading::CaptureOpen.named())?;
+        Self::capture_held(directory, ProcSource::Observer(pid))
+    }
+
+    fn capture_held(directory: File, source: ProcSource) -> Result<Self, UnqualifiedProcess> {
         let base = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
         let start_ticks = start_ticks(&base).map_err(Reading::CaptureStartTicks.named())?;
         let status =
@@ -278,7 +291,7 @@ impl ProcessLease {
             executable_path,
             start_ticks,
             namespaces,
-            pid,
+            source,
             namespace_pid,
         };
         lease.check()?;
@@ -397,8 +410,11 @@ impl ProcessLease {
         read_bounded(&proc_base(&self.directory).join(relative), limit)
     }
 
-    pub fn pid(&self) -> u32 {
-        self.pid
+    pub fn observer_pid(&self) -> Result<u32, UnqualifiedProcess> {
+        match self.source {
+            ProcSource::Observer(pid) => Ok(pid),
+            ProcSource::Namespace(_) => Err(UnqualifiedProcess),
+        }
     }
 
     /// PostgreSQL reports getpid() inside its own PID namespace. The kernel's
@@ -411,14 +427,21 @@ impl ProcessLease {
     pub fn same_process(&self, other: &Self) -> Result<bool, UnqualifiedProcess> {
         self.check()?;
         other.check()?;
-        Ok(self.start_ticks == other.start_ticks
-            && FileIdentity::of(&self.directory).map_err(Reading::SocketOwner.named())?
-                == FileIdentity::of(&other.directory).map_err(Reading::SocketOwner.named())?
+        // Different procfs instances assign different directory inodes to
+        // the same task. Both held entries must still be live: within a held
+        // PID namespace, two live tasks cannot share the innermost task ID.
+        let same = self.start_ticks == other.start_ticks
+            && self.namespace_pid == other.namespace_pid
             && self
                 .namespaces
                 .iter()
                 .zip(&other.namespaces)
-                .all(|(a, b)| a.0 == b.0 && a.2 == b.2))
+                .all(|(a, b)| a.0 == b.0 && a.2 == b.2);
+        // In particular, the first entry must not have exited before the
+        // second check and allowed same-tick PID reuse in another proc view.
+        self.check()?;
+        other.check()?;
+        Ok(same)
     }
 
     pub(crate) fn same_namespace(
@@ -451,8 +474,17 @@ impl ProcessLease {
         if parent == 0 {
             return Ok(false);
         }
+        let parent_directory = match &self.source {
+            ProcSource::Observer(_) => File::open(format!("/proc/{parent}")),
+            ProcSource::Namespace(directory) => namespace::open(
+                directory,
+                &parent.to_string(),
+                rustix::fs::OFlags::DIRECTORY,
+            ),
+        };
+        let parent_directory = parent_directory.map_err(|_| UnqualifiedProcess)?;
         let executable =
-            File::open(format!("/proc/{parent}/exe")).map_err(|_| UnqualifiedProcess)?;
+            File::open(proc_base(&parent_directory).join("exe")).map_err(|_| UnqualifiedProcess)?;
         let same = FileIdentity::of(&executable)? == FileIdentity::of(&self.executable)?;
         self.check()?;
         Ok(same)
@@ -895,14 +927,16 @@ pub(crate) fn open_process(pid: u32) -> std::io::Result<File> {
 pub(crate) fn process_scope(
     service: &ProcessLease,
 ) -> Result<Vec<(u32, File)>, UnqualifiedProcess> {
+    // Socket qualification still uses observer coordinates until #743.
+    let pid = service.observer_pid()?;
     let mut scope = vec![(
-        service.pid,
+        pid,
         service
             .directory
             .try_clone()
             .map_err(Reading::Scope.named())?,
     )];
-    let mut seen = BTreeSet::from([service.pid]);
+    let mut seen = BTreeSet::from([pid]);
     let mut cursor = 0;
     while cursor < scope.len() {
         let (parent_pid, directory) = &scope[cursor];

@@ -14181,3 +14181,35 @@ SPEC is in sync with all of these.
      certify those later contracts or replace the existing production callers
      in this stage. See [the contract, pre-implementation measurements and
      repeatable fixture](RESOLVER-NAMESPACE.md).
+
+529. **Container admission checks tasks through their held namespace view;
+     process identity and privilege exceptions do not use a bare PID (#741).**
+     Runtime-exec tasks may have parents outside the container, and a surviving
+     worker may have credentials different from its group leader. Workload and
+     forwarder checks therefore inspect every task from the qualified procfs
+     view. Supplied-server engine discovery counts process leaders separately;
+     a credential match is not evidence of engine origin. Pre-engine membership
+     uses the same source rather than a descendant count.
+
+     A namespace-derived lease retains its procfs view for relative parent
+     lookups and cannot supply an observer PID. Across procfs instances, the
+     same live task has different directory device/inode pairs: identity uses
+     the innermost task number, start time and retained namespace handles, with
+     both live leases checked before and after comparison. This binds the root
+     lifetime guard's exception to the actual task and refuses exited/reused
+     identities. Capture and callback failures are ignored only when that held
+     incidental task is proven to have exited.
+
+     Production consumes each held task before opening the next; collecting
+     all task-directory descriptors first would refuse an otherwise admitted
+     container whenever its task count exceeded the observer's descriptor
+     budget. Engine discovery retains at most two candidates, enough to refuse
+     ambiguity without making descriptor use proportional to the task count.
+
+     Cgroup subtree/resource limits and foreign network/mount/IPC accounting
+     remain separate; enumerating a cgroup cannot discover a namespace entrant
+     outside it. The foreign-sharer check still uses the observer's wider view.
+     Socket ownership remains #743, and launch enforcement remains #742. These
+     observations do not establish an atomic inventory, engine provenance or
+     protection against the provisioning administrator. The measured Docker
+     recipes and namespace fixtures qualify these distinct questions separately.

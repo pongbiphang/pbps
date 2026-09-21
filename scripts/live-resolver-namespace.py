@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import resource
 import signal
 import subprocess
 import sys
@@ -21,6 +22,11 @@ IMAGE = "postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb
 PREFIX = "resolver::native::namespace::tests::"
 PROC_TEST = PREFIX + "namespace_procfs_fixture_observes_external_parent_tasks_and_retains_identity"
 MOUNT_TEST = PREFIX + "namespace_mount_fixture_refuses_replaced_views_and_process_overmounts"
+NEGATIVE_TEST = PREFIX + "container_membership_does_not_hide_wrong_credentials_or_foreign_cgroups"
+CHURN_TEST = PREFIX + "departing_incidental_tasks_do_not_refuse_an_unchanged_container_profile"
+ORPHAN_TEST = PREFIX + "reparenting_during_qualification_keeps_the_held_grandchild"
+FOREIGN_TEST = PREFIX + "foreign_namespace_sharers_remain_visible_outside_the_container_pid_view"
+MANY_TEST = PREFIX + "a_containers_task_count_does_not_consume_the_observers_descriptor_budget"
 
 
 def run(*args, **kwargs):
@@ -34,8 +40,14 @@ def run(*args, **kwargs):
         raise
 
 
+def limited_descriptors():
+    _, maximum = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (64, maximum))
+
+
 def test(binary, name, env, prefix=()):
     result = run(*prefix, str(binary), "--exact", name, "--nocapture", env=env,
+                 preexec_fn=limited_descriptors if name == MANY_TEST else None,
                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     print(result.stdout, end="", flush=True)
     if "1 passed; 0 failed" not in result.stdout:
@@ -106,6 +118,103 @@ def main():
                 raise RuntimeError("the native helper did not retain a live thread after leader exit")
             test(binary, PROC_TEST, dict(os.environ, PBPS_NAMESPACE_FIXTURE_PID=str(pids[0]),
                  PBPS_NAMESPACE_SECOND_PID=str(pids[1]), PBPS_NAMESPACE_DEAD_GROUP=dead_group))
+            for namespace, option in [("mnt", "--mount"), ("ipc", "--ipc")]:
+                sharer = subprocess.Popen(["nsenter", "--target", str(pids[0]), option, "--", "sleep", "296"])
+                try:
+                    expected = os.readlink(f"/proc/{pids[0]}/ns/{namespace}")
+                    for _ in range(100):
+                        if (os.readlink(f"/proc/{sharer.pid}/ns/{namespace}") == expected
+                                and Path(f"/proc/{sharer.pid}/comm").read_text().strip() == "sleep"):
+                            break
+                        time.sleep(.01)
+                    else:
+                        raise RuntimeError("foreign namespace sharer did not become ready")
+                    test(binary, FOREIGN_TEST, dict(os.environ, PBPS_NAMESPACE_FOREIGN_PID=str(pids[0]),
+                         PBPS_NAMESPACE_FOREIGN_KIND=namespace))
+                finally:
+                    sharer.terminate()
+                    sharer.wait(timeout=10)
+            runtime("exec", "-d", owned[0], "/pbps-thread-exit", "churn")
+            for _ in range(100):
+                try:
+                    ready = any((p / "comm").read_text().strip() == "pbps-churn"
+                                for p in view.iterdir() if p.name.isdecimal())
+                except FileNotFoundError:
+                    ready = False
+                if ready:
+                    break
+                time.sleep(.01)
+            else:
+                raise RuntimeError("the churn helper did not become ready")
+            test(binary, CHURN_TEST, dict(os.environ, PBPS_NAMESPACE_CHURN_PID=str(pids[0])))
+            # Runtime exec has a parent outside init's descendant tree. Its
+            # root credentials must nevertheless participate in admission.
+            runtime("exec", "-d", "--user=0:0", owned[0], "sleep", "298")
+            test(binary, NEGATIVE_TEST, dict(os.environ, PBPS_NAMESPACE_NEGATIVE_PID=str(pids[0]),
+                 PBPS_NAMESPACE_NEGATIVE="credentials"))
+            runtime("exec", "-d", "--privileged", "--user=0:0", owned[1], "/pbps-thread-exit", "mixed")
+            second_view = Path(f"/proc/{pids[1]}/root/proc")
+            for _ in range(100):
+                if any((p / "comm").read_text().strip() == "pbps-mixed"
+                       for p in second_view.iterdir() if p.name.isdecimal()):
+                    break
+                time.sleep(.01)
+            else:
+                raise RuntimeError("the mixed-credential worker did not become ready")
+            test(binary, NEGATIVE_TEST, dict(os.environ, PBPS_NAMESPACE_NEGATIVE_PID=str(pids[1]),
+                 PBPS_NAMESPACE_NEGATIVE="thread-credentials"))
+            # Enter only the fixture's PID namespace, retaining our own
+            # cgroup. A cgroup-sourced census would omit this actual member.
+            before = {p.name for p in second_view.iterdir() if p.name.isdecimal()}
+            entrant = subprocess.Popen(["nsenter", "--target", str(pids[1]), "--pid", "--", "sleep", "297"])
+            try:
+                # The mixed-credential helper is already a second group.
+                for _ in range(100):
+                    if {p.name for p in second_view.iterdir() if p.name.isdecimal()} - before:
+                        break
+                    time.sleep(.01)
+                else:
+                    raise RuntimeError("outside-cgroup task did not enter the fixture namespace")
+                test(binary, NEGATIVE_TEST, dict(os.environ, PBPS_NAMESPACE_NEGATIVE_PID=str(pids[1]),
+                     PBPS_NAMESPACE_NEGATIVE="cgroup"))
+            finally:
+                # nsenter waits for its PID-namespace child; stopping only
+                # nsenter could orphan the sleeper. Remove our container to
+                # terminate every task in that private namespace, then reap.
+                runtime("stop", "--time=0", owned[1])
+                entrant.wait(timeout=10)
+            orphan = "pbps-namespace-" + uuid.uuid4().hex
+            owned.append(orphan)
+            runtime("run", "-d", "--name", orphan, "--pull=never", "--network=none", "--ipc=private",
+                    "--read-only", "--user=999:999", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+                    "--mount", f"type=bind,src={helper},dst=/pbps-thread-exit,readonly",
+                    "--entrypoint=/pbps-thread-exit", args.image, "orphan")
+            orphan_pid = runtime("inspect", "--format", "{{.State.Pid}}", orphan)
+            ready = Path(f"/proc/{orphan_pid}/root/dev/shm/ready")
+            for _ in range(100):
+                if ready.exists() and len(ready.read_text().split()) == 2:
+                    break
+                time.sleep(.01)
+            else:
+                raise RuntimeError("the orphan fixture did not become ready")
+            test(binary, ORPHAN_TEST, dict(os.environ, PBPS_NAMESPACE_ORPHAN_PID=orphan_pid))
+            many = "pbps-namespace-" + uuid.uuid4().hex
+            owned.append(many)
+            runtime("run", "-d", "--name", many, "--pull=never", "--network=none", "--ipc=private",
+                    "--read-only", "--user=999:999", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+                    "--mount", f"type=bind,src={helper},dst=/pbps-thread-exit,readonly",
+                    "--entrypoint=sleep", args.image, "300")
+            many_pid = runtime("inspect", "--format", "{{.State.Pid}}", many)
+            runtime("exec", "-d", many, "/pbps-thread-exit", "many")
+            many_view = Path(f"/proc/{many_pid}/root/proc")
+            for _ in range(100):
+                if any((p / "comm").read_text().strip() == "pbps-many"
+                       for p in many_view.iterdir() if p.name.isdecimal()):
+                    break
+                time.sleep(.01)
+            else:
+                raise RuntimeError("the many-thread fixture did not become ready")
+            test(binary, MANY_TEST, dict(os.environ, PBPS_NAMESPACE_MANY_PID=many_pid))
             test(binary, MOUNT_TEST, dict(os.environ, PBPS_NAMESPACE_MOUNT_FIXTURE="1"),
                  prefix=("unshare", "--mount", "--pid", "--fork", "--mount-proc", "--propagation", "private"))
     finally:
