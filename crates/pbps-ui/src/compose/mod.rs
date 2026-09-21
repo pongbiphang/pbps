@@ -10,5 +10,7 @@ pub mod git;
 #[cfg(target_os = "linux")]
 pub mod fsx;
 #[cfg(target_os = "linux")]
+pub mod locks;
+#[cfg(target_os = "linux")]
 pub mod record;
 pub mod repo_path;
