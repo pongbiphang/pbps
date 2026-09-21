@@ -142,6 +142,17 @@ impl Git {
         self.spawn(arguments, None, &BTreeMap::new(), None)
     }
 
+    /// For the one read that is fed a request: `cat-file --batch`, which takes
+    /// the object ids on its input and answers in one stream, rather than a
+    /// subprocess per declaration.
+    pub fn run_with_input<S: AsRef<OsStr>>(
+        &self,
+        arguments: &[S],
+        input: &[u8],
+    ) -> Result<Run, Failure> {
+        self.spawn(arguments, None, &BTreeMap::new(), Some(input))
+    }
+
     /// Step 3's private index, and step 6's locked copy of the user's.
     pub fn run_with_index<S: AsRef<OsStr>>(
         &self,

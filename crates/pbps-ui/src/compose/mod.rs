@@ -8,6 +8,8 @@ pub mod git;
 /// a platform without these calls is to refuse to compose and give the
 /// commands to run by hand.
 #[cfg(target_os = "linux")]
+pub mod attributes;
+#[cfg(target_os = "linux")]
 pub mod fsx;
 #[cfg(target_os = "linux")]
 pub mod locks;
@@ -18,3 +20,5 @@ pub mod refs;
 pub mod repo_path;
 #[cfg(all(test, target_os = "linux"))]
 pub mod scratch_repo;
+#[cfg(target_os = "linux")]
+pub mod snapshot;

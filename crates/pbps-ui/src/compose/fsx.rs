@@ -169,6 +169,26 @@ impl Dir {
         Ok(Self { fd })
     }
 
+    /// A second handle on the same directory, for a walk that starts here.
+    pub fn reopened(&self) -> io::Result<Self> {
+        self.reopen()
+    }
+
+    /// A directory this process has just created inside `self`, opened the
+    /// same no-link way as every other component: a snapshot's names came out
+    /// of a tree, and a tree's names are bytes `git` stores rather than paths
+    /// it has checked.
+    pub fn open_directory(&self, name: &OsStr) -> io::Result<Self> {
+        let fd = openat2(
+            &self.fd,
+            name,
+            OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+        )?;
+        Ok(Self { fd })
+    }
+
     fn reopen(&self) -> io::Result<Self> {
         let fd = openat(
             &self.fd,

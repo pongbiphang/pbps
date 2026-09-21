@@ -71,6 +71,37 @@ impl Scratch {
         )
     }
 
+    /// For the plumbing a fixture needs to build a tree by hand, such as
+    /// `mktree`, which is the only way to make the hostile shapes decision 5
+    /// refuses.
+    pub fn git_stdin(&self, arguments: &[&str], input: &str) -> String {
+        use std::io::Write as _;
+        use std::process::Stdio;
+        let mut child = Command::new("git")
+            .current_dir(&self.root)
+            .args(arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("git runs in the tests");
+        child
+            .stdin
+            .take()
+            .expect("stdin was piped")
+            .write_all(input.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {arguments:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .to_owned()
+    }
+
     pub fn write(&self, relative: &str, contents: &[u8]) {
         let path = self.root.join(relative);
         if let Some(parent) = path.parent() {
