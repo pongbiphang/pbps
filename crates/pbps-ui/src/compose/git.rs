@@ -163,6 +163,53 @@ impl Git {
         self.spawn(arguments, None, extra, None)
     }
 
+    /// A `git` the caller speaks to a line at a time, for the one command that
+    /// needs it: `update-ref --stdin`, whose transaction must be prepared,
+    /// then questioned while the lock is held, and only then committed.
+    pub fn interactive<S: AsRef<OsStr>>(&self, arguments: &[S]) -> Result<Session, Failure> {
+        let mut command = Command::new("git");
+        self.dress(&mut command, None, &BTreeMap::new());
+        command.args(arguments.iter().map(AsRef::as_ref));
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|e| Failure::Unstartable(e.to_string()))?;
+        let stdin = child.stdin.take().expect("stdin was piped");
+        let mut stdout = child.stdout.take().expect("stdout was piped");
+        let mut stderr = child.stderr.take().expect("stderr was piped");
+        let (send, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(&mut stdout);
+            loop {
+                let mut line = String::new();
+                match std::io::BufRead::read_line(&mut reader, &mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if send.send(line).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let errors = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stderr.read_to_end(&mut bytes);
+            bytes
+        });
+        Ok(Session {
+            child,
+            stdin: Some(stdin),
+            lines,
+            errors: Some(errors),
+            deadline: self.deadline,
+            printable: printable(arguments),
+        })
+    }
+
     fn spawn<S: AsRef<OsStr>>(
         &self,
         arguments: &[S],
@@ -284,6 +331,95 @@ impl Git {
             }),
             None => Err(Failure::Deadline {
                 command: printable.to_owned(),
+                after: self.deadline,
+            }),
+        }
+    }
+}
+
+/// A `git` held open, spoken to a line at a time.
+///
+/// It exists for `update-ref --stdin`, where the whole point is the interval
+/// between `prepare` and `commit`: the transaction holds the branch's lock,
+/// and the UI asks the *live* ref whether it is still direct before letting
+/// the write through. A one-shot command cannot ask a question in the middle
+/// of itself.
+#[derive(Debug)]
+pub struct Session {
+    child: Child,
+    stdin: Option<std::process::ChildStdin>,
+    lines: std::sync::mpsc::Receiver<String>,
+    errors: Option<std::thread::JoinHandle<Vec<u8>>>,
+    deadline: Duration,
+    printable: String,
+}
+
+impl Session {
+    pub fn send(&mut self, text: &str) -> Result<(), Failure> {
+        use std::io::Write as _;
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| Failure::Output("the transaction's input is closed".to_owned()))?;
+        stdin
+            .write_all(text.as_bytes())
+            .and_then(|()| stdin.flush())
+            .map_err(|e| Failure::Output(e.to_string()))
+    }
+
+    /// One line of `git`'s answer, or the deadline. A transaction that never
+    /// answers is killed with its process group like any other subprocess:
+    /// what it is holding is a ref lock, and waiting on it forever would hold
+    /// the checkout too.
+    pub fn line(&mut self) -> Result<String, Failure> {
+        match self.lines.recv_timeout(self.deadline) {
+            Ok(line) => Ok(line.trim_end_matches(['\n', '\r']).to_owned()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                kill_group(&mut self.child);
+                Err(Failure::Deadline {
+                    command: self.printable.clone(),
+                    after: self.deadline,
+                })
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(Failure::Output(
+                "the transaction ended without answering".to_owned(),
+            )),
+        }
+    }
+
+    /// Close the input and wait. The UI waits for the acknowledgement *and*
+    /// the process exit before retaking its own locks, because the
+    /// transaction releases `git`'s locks on its way out and a lock taken
+    /// before that is a lock taken against `git` itself.
+    pub fn finish(mut self) -> Result<Run, Failure> {
+        self.stdin = None;
+        let started = Instant::now();
+        let status = loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) => {}
+                Err(e) => return Err(Failure::Unstartable(e.to_string())),
+            }
+            if started.elapsed() >= self.deadline {
+                kill_group(&mut self.child);
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let stdout = self.lines.try_iter().collect::<Vec<_>>().join("");
+        let stderr = self
+            .errors
+            .take()
+            .map(|errors| errors.join().unwrap_or_default())
+            .unwrap_or_default();
+        match status {
+            Some(status) => Ok(Run {
+                code: status.code(),
+                stdout: stdout.into_bytes(),
+                stderr,
+            }),
+            None => Err(Failure::Deadline {
+                command: self.printable.clone(),
                 after: self.deadline,
             }),
         }

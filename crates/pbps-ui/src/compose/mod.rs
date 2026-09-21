@@ -13,4 +13,8 @@ pub mod fsx;
 pub mod locks;
 #[cfg(target_os = "linux")]
 pub mod record;
+#[cfg(target_os = "linux")]
+pub mod refs;
 pub mod repo_path;
+#[cfg(all(test, target_os = "linux"))]
+pub mod scratch_repo;
