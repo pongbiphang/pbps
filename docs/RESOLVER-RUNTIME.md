@@ -8,8 +8,8 @@ authorization, retained-source permission or sealed binding evidence.
 The staged replacement for descendant-based process observation is documented
 in [namespace-scoped observation](RESOLVER-NAMESPACE.md). Its primitive and
 fixtures are available under #740. Whole-container task qualification and
-engine discovery use that view under #741; the revised launch/target contracts
-remain #742–#743. Socket-holder enumeration is part of the target stage.
+engine discovery use that view under #741. The launch boundary is implemented
+under #742; target/socket-holder qualification remains #743.
 
 ## Supported initial profile
 
@@ -85,6 +85,23 @@ Admission connects through a **Docker-API daemon** (`dockerd`), the same peer-au
 | Resources | cgroup-v2 memory, swap, CPU and PID bounds on the init's cgroup that exist and are within the profile's ceilings; `max` is not a bound. Every task must be in that cgroup or below it |
 | Accounting | Nothing shares the container's mount or IPC namespace that is not in its PID namespace, and nothing shares its network namespace but those tasks and this run's own forwarders. A container joined with `--network container:` is in no process listing and is caught here. The forwarder exception is by PID namespace, not by an exact task set: a forwarder's `bash` reaps and respawns its `cat` pipes, so a captured task list races a legitimate child, and joining that namespace needs `--pid container:` on the same root daemon, whose socket also lists the container id — so what excludes it is not the name but that root daemon access is provisioning-administrator access, the boundary this profile does not claim to hold against. Narrowing the exception to the forwarder's exact tasks is #681 |
 | Lifetime | A bounded run deadline, which the forwarders' own root guards share: past it the next check refuses and the caller's exit path removes the resources. Not a watchdog — see #641 |
+
+The Docker PostgreSQL recipe starts directly as `999:999` with `--cap-drop ALL`.
+The runtime creates its private storage with that ownership, so neither
+`initdb` nor the engine needs a root ownership bootstrap. SQL Server starts as
+uid/gid 10001 with only `NET_BIND_SERVICE` in its bounding ceiling: the tested
+executable carries that file capability and an empty bounding set makes its
+exec fail. Both recipes, including their complete containment options, live
+in [`live-resolver-server.py`](../scripts/live-resolver-server.py).
+
+For the measured Podman 4.9 component, which rejects Docker's tmpfs `uid`
+option, the alternative is a fresh root-owned tmpfs, `chown` of its root to
+the final engine identity, then `setpriv` **before** password-file preparation
+or engine initialization. This bootstrap needs only `CHOWN`, `SETUID`,
+`SETGID`, `SETPCAP`, and SQL Server's `NET_BIND_SERVICE`; it clears groups and
+drops to the final capability ceiling. Both engines answered SQL under this
+alternative. It does not make a Podman-native daemon admissible (#686), nor
+does an operator's claim replace supplied-server qualification (531).
 
 ## Analysis scope qualification (#610 PostgreSQL, #611 SQL Server)
 
@@ -220,8 +237,11 @@ altered to make a server qualify.
 1. Acquire the selected image on the actual API connection. Another connection
    cannot reuse that acquisition's provenance for startup.
 2. Reserve an empty private runtime with a root lifetime guard and a fixed,
-   unprivileged bootstrap waiter. Remove inherited image environment variables
-   before execution and disable inherited healthchecks. No database is created.
+   unprivileged bootstrap waiter. The runtime prepares storage for the final
+   workload identity; `setpriv` drops the UID, GID, supplementary groups and
+   capability sets before the waiter acknowledges its probe. Remove inherited
+   image environment variables before execution and disable inherited
+   healthchecks. No database is created.
 3. Qualify the actual target, namespace separation, empty external network,
    effective mounts and resource limits. Retain these process and kernel
    handles while releasing the fixed bootstrap command.
@@ -246,6 +266,38 @@ unreadable premise discards the connection and requests owned cleanup. Cleanup
 may establish a separately authenticated connection only to remove the exact
 owned resource; it cannot resume analysis. A fresh analysis starts from fresh
 resources and qualification.
+
+The launch authority and final workload authority are deliberately separate:
+
+| Role | UID / GID | Capabilities |
+| --- | --- | --- |
+| Root bootstrap and deadline guard | 0 / 0, only its own supplementary group allowed | `SETUID`, `SETGID`, `SETPCAP`, `KILL`; add `NET_BIND_SERVICE` only for the SQL Server workload |
+| PostgreSQL waiter and workload | 999 / 999, supplementary groups cleared | All five capability sets empty |
+| Run-owned SQL Server waiter and workload | 10001 / 0, supplementary groups cleared | Each capability set at most `NET_BIND_SERVICE` |
+| Fixed forwarder | 65534 / 65534, supplementary groups cleared | All five capability sets empty |
+
+The guard must retain **effective `CAP_KILL`**, not merely stay below a maximum
+mask. Without it the measured root `timeout` could not terminate its differently
+owned child. Admission checks this before releasing bootstrap and during later
+channel checks. The source-free waiter must have the exact final UID/GID and
+empty supplementary group set; each engine's launch command and observer use
+the same workload identity. The guard's exception remains bound to its retained
+process identity, never inherited by another task at PID 1's numeric coordinate.
+
+Once applied, no-new-privileges and seccomp restrictions survive fork, clone
+and exec; ordinary workload code cannot undo the privilege drop. This was
+measured with a worker thread, fork child and exec child under both workload
+ceilings and the forwarder policy, including failed attempts to regain root,
+another group, `SYS_ADMIN` or a user namespace. The workload's connect syscall
+remained denied while the forwarder's remained allowed. See the kernel's
+[no-new-privileges](https://docs.kernel.org/userspace-api/no_new_privs.html) and
+[seccomp inheritance](https://docs.kernel.org/userspace-api/seccomp_filter.html)
+contracts. No-new-privileges alone is not a sandbox: it does not remove already
+held capabilities or constrain a provisioning administrator's runtime-exec
+entry point. Namespace task observations therefore remain, alongside mount,
+network, cgroup, endpoint and exclusivity checks. Exact effective seccomp-policy
+attestation (#633/#684), source handling (#617) and other delivery gates are
+not discharged by these launch measurements.
 
 Scratch also retains a weak witness to the target's live binding and its actual
 socket. Dropping or cancelling the target invalidates scratch's next identity
@@ -299,6 +351,15 @@ namespace, target replacement and loss, and a server stopped under a live run
 so that cleanup cannot be confirmed. It prints the daemon's record and the
 kernel's tables of the supplied server once at startup, which is where the
 unit tests' pinned layouts come from.
+
+`scripts/live-resolver-launch.py <pg|mssql> --test-binary <absolute-path>` runs
+as root on the disposable native host. It checks the real dropped waiter and
+refuses wrong UID/GID, supplementary groups, a larger capability bounding set,
+missing no-new-privileges and a guard without effective termination authority.
+No start line is sent, so every refusal precedes engine initialization. Each
+owned container is removed before the test asserts its result. The new group
+and guard regressions failed on the previous implementation and passed after
+the checks were added; CI runs them for both engines.
 
 `scripts/live-resolver-target.py <pg|mssql>` creates disposable TLS targets and
 confines each inspector to its owned target's PID/network namespaces. It checks

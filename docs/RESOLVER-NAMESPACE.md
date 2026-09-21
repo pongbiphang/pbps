@@ -2,7 +2,8 @@
 
 Issue #740 provides the observation primitive for the runtime redesign tracked
 by #737 and #740–#743. Issue #741 uses it for whole-container privilege checks,
-supplied-server engine discovery and pre-engine membership. Target and socket
+supplied-server engine discovery and pre-engine membership. Issue #742 enforces
+the separately documented launch/workload privilege boundary. Target and socket
 holder qualification retain their existing paths until #743.
 
 ## Contract
@@ -129,9 +130,15 @@ startup. Therefore the engine recipe comparisons above were run on Docker;
 the Podman namespace measurements do not certify that recipe's portability.
 
 Stage #741 preserves independent cgroup and foreign network/mount/IPC
-accounting. Stage #742 must bind a launch invariant to the actual post-drop
-workload, not its still-privileged deadline guard, and account for every
-supported provisioning entry path. Merely observing PID 1 once is insufficient.
+accounting. Stage #742 checks the actual post-drop workload separately from
+the privileged deadline guard and requires that guard's effective termination
+authority. The updated Docker supplied-PostgreSQL recipe starts directly under
+uid/gid 999 with no capabilities. A restructured ownership-only bootstrap for
+the Podman component needs CHOWN/SETUID/SETGID/SETPCAP, dropping before initdb;
+the earlier six-capability measurement above applies to the old root shell
+that also prepared the password and data directory. No repeated census was
+removed: inheritance bounds dropped descendants, not arbitrary administrator
+runtime-exec entrants. See [the launch contract](RESOLVER-RUNTIME.md#startup-and-continuity).
 
 For #743, a target in a shared host PID namespace cannot acquire a private
 container's small process scope by assumption. The flat namespace source can

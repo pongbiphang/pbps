@@ -1,10 +1,15 @@
 //! Fixed launch recipes. A recipe is not a measured runtime admission.
 
 use super::{CandidateImage, Error};
+use crate::resolver::native::{FORWARDER_PRIVILEGES, WorkloadPrivileges};
 use pbps_db::Driver;
 use serde_json::{Value, json};
 
 pub(super) mod engine;
+
+#[cfg(test)]
+#[path = "profile/launch_tests.rs"]
+mod launch_tests;
 
 pub(super) const OWNER_LABEL: &str = "io.pbps.resolver.owner";
 pub(super) const PROFILE: &str = "linux-amd64-v1";
@@ -55,12 +60,7 @@ impl Launch {
             "Image": image.identity.image_id,
             "User": "0:0",
             "Entrypoint": ["/usr/bin/timeout"],
-            "Cmd": [
-                "--signal=KILL", format!("{LIFETIME_SECS}s"),
-                "/usr/bin/setpriv", bootstrap.uid, bootstrap.gid,
-                "--clear-groups", bootstrap.bounding, bootstrap.inheritable,
-                bootstrap.ambient, "/bin/bash", "-ec", bootstrap.program
-            ],
+            "Cmd": guarded_command(bootstrap.privileges, LIFETIME_SECS, bootstrap.program)?,
             "Env": isolated_environment(image, bootstrap.environment)?,
             "Healthcheck": {"Test": ["NONE"]},
             "Labels": { OWNER_LABEL: owner, "io.pbps.resolver.profile": PROFILE },
@@ -74,7 +74,7 @@ impl Launch {
                 "AutoRemove": true,
                 "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
                 "CapDrop": ["ALL"],
-                "CapAdd": ["SETUID", "SETGID", "SETPCAP", "KILL", "NET_BIND_SERVICE"],
+                "CapAdd": bootstrap_capabilities(bootstrap.privileges),
                 "SecurityOpt": ["no-new-privileges", format!("seccomp={SECCOMP}")],
                 "Memory": 3221225472u64,
                 "MemorySwap": 3221225472u64,
@@ -119,20 +119,11 @@ impl Launch {
             .ok_or(Error::Profile)?
             .push(json!({"names":["connect"],"action":"SCMP_ACT_ALLOW"}));
         let body = &mut launch.body;
-        body["Cmd"] = json!([
-            "--signal=KILL",
-            format!("{lifetime_secs}s"),
-            "/usr/bin/setpriv",
-            "--reuid=65534",
-            "--regid=65534",
-            "--clear-groups",
-            "--bounding-set=-all",
-            "--inh-caps=-all",
-            "--ambient-caps=-all",
-            "/bin/bash",
-            "-ec",
+        body["Cmd"] = json!(guarded_command(
+            FORWARDER_PRIVILEGES,
+            lifetime_secs,
             engine::control_program(driver)
-        ]);
+        )?);
         body["Env"] = json!(isolated_environment(
             image,
             vec!["PATH=/usr/bin:/bin".into(), "LANG=C.UTF-8".into()]
@@ -146,7 +137,7 @@ impl Launch {
         body["HostConfig"]["NetworkMode"] = json!(format!("container:{workload}"));
         body["HostConfig"]["SecurityOpt"] =
             json!(["no-new-privileges", format!("seccomp={policy}")]);
-        body["HostConfig"]["CapAdd"] = json!(["SETUID", "SETGID", "SETPCAP", "KILL"]);
+        body["HostConfig"]["CapAdd"] = json!(bootstrap_capabilities(FORWARDER_PRIVILEGES));
         body["HostConfig"]["Memory"] = json!(134217728);
         body["HostConfig"]["MemorySwap"] = json!(134217728);
         body["HostConfig"]["NanoCpus"] = json!(500000000);
@@ -292,6 +283,45 @@ impl Launch {
         }
         Ok(())
     }
+}
+
+fn bootstrap_capabilities(privileges: WorkloadPrivileges) -> Vec<&'static str> {
+    // timeout forks setpriv before the child changes identity. The parent
+    // retains this bootstrap ceiling and needs KILL for the different UID;
+    // the child irreversibly drops to the separate workload ceiling (531).
+    let mut capabilities = vec!["SETUID", "SETGID", "SETPCAP", "KILL"];
+    if privileges.capabilities == 0x400 {
+        capabilities.push("NET_BIND_SERVICE");
+    }
+    capabilities
+}
+
+fn guarded_command(
+    privileges: WorkloadPrivileges,
+    lifetime_secs: u64,
+    program: &str,
+) -> Result<Vec<String>, Error> {
+    let capabilities = match privileges.capabilities {
+        0 => "-all",
+        // The tested SQL Server executable carries this file capability;
+        // removing it from the bounding set makes exec fail with EPERM.
+        0x400 => "-all,+net_bind_service",
+        _ => return Err(Error::Profile),
+    };
+    Ok(vec![
+        "--signal=KILL".into(),
+        format!("{lifetime_secs}s"),
+        "/usr/bin/setpriv".into(),
+        format!("--reuid={}", privileges.uid),
+        format!("--regid={}", privileges.gid),
+        "--clear-groups".into(),
+        format!("--bounding-set={capabilities}"),
+        format!("--inh-caps={capabilities}"),
+        format!("--ambient-caps={capabilities}"),
+        "/bin/bash".into(),
+        "-ec".into(),
+        program.into(),
+    ])
 }
 
 fn isolated_environment(

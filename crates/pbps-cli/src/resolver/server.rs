@@ -13,7 +13,9 @@
 //! the later #595 steps, and no declaration is transferred here.
 
 use crate::resolver::docker::{CandidateImage, LocalApi, forwarder::Forwarder};
-use crate::resolver::native::{NativeTarget, ProcessLease, TargetWitness, guarded_tasks};
+use crate::resolver::native::{
+    FORWARDER_PRIVILEGES, NativeTarget, ProcessLease, TargetWitness, guarded_tasks,
+};
 use crate::resolver::scope::{self, PlannedGrant};
 use pbps_db::Driver;
 use pbps_db::resolver::environment::{
@@ -554,7 +556,7 @@ fn check_kernel_parts(
     backend: &ProcessLease,
 ) -> Result<(), Error> {
     let channel = |reason: &str| Error::Channel(reason.to_owned());
-    guarded_tasks(forwarder_guard, 65534, 0)
+    guarded_tasks(forwarder_guard, FORWARDER_PRIVILEGES)
         .map_err(|_| channel("a forwarder task is not at the fixed privileges"))?;
     exclusivity::still_bound(init, pair, backend)
         .map_err(|_| channel("the session's kernel endpoints changed"))

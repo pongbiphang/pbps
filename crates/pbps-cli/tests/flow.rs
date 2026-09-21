@@ -964,6 +964,7 @@ fn two_renamed_from_annotations_on_one_column_are_refused_by_name() {
     let d = Demo::new("twoclaims");
     d.table("table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  old: {type: int}\n");
     assert_eq!(code(&d.run(&["plan"])), 0);
+    let original_ids = std::fs::read_to_string(d.ids_path()).unwrap();
     d.commit();
 
     d.table(
@@ -989,11 +990,12 @@ fn two_renamed_from_annotations_on_one_column_are_refused_by_name() {
     // And the plan really is refused, not merely reported: the ids file must
     // not have taken a side.
     let ids = std::fs::read_to_string(d.ids_path()).unwrap();
-    assert!(
-        ids.contains("old"),
-        "the recorded name must be untouched: {ids}"
+    // Opaque random IDs can contain the annotation names as substrings.
+    // Equality checks that no identity or name was changed by the refusal.
+    assert_eq!(
+        ids, original_ids,
+        "a refused plan must not rewrite identities"
     );
-    assert!(!ids.contains("aaa") && !ids.contains("zzz"), "{ids}");
 
     let json = d.run(&["plan", "--format", "json"]);
     assert_eq!(code(&json), FINDING, "{}", stderr(&json));

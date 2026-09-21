@@ -1555,6 +1555,7 @@ async fn isolated_pulls_and_read_backs_survive_continuous_foreign_ddl() {
     }
     let before = writes.load(Ordering::Relaxed);
     for _ in 0..10 {
+        let round_started = writes.load(Ordering::Relaxed);
         let pulled = pull(&mut conn).await;
         assert!(
             pulled
@@ -1580,6 +1581,22 @@ async fn isolated_pulls_and_read_backs_survive_continuous_foreign_ddl() {
                 .contains_key(&TableName::new("public", "uncommitted"))
         );
         conn.execute("ROLLBACK").await.expect("rollback");
+        // A batch includes 64 DDL statements. Fast reads can all finish
+        // before a slow writer completes even one batch; counting only at
+        // the end then measures scheduling, not fixture isolation. Require
+        // writer progress between read rounds, with a bounded failure if the
+        // burst stalls, while every catalog read still gets one attempt.
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while writes.load(Ordering::Relaxed) < round_started + 64 {
+                assert!(
+                    writers.iter().all(|writer| !writer.is_finished()),
+                    "a churn writer failed"
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("foreign DDL made progress between catalog reads");
     }
     let during = writes.load(Ordering::Relaxed) - before;
     stop.store(true, Ordering::Relaxed);

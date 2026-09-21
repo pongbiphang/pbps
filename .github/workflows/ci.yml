@@ -360,6 +360,10 @@ jobs:
           sudo python3 scripts/live-resolver-target.py "$FIXTURE_ENGINE" --native-host --test-binary "$PBPS_FIXTURE_BINARY"
         env:
           FIXTURE_ENGINE: ${{ matrix.engine }}
+      - name: Verified launch privileges before engine initialization
+        run: sudo python3 scripts/live-resolver-launch.py "$FIXTURE_ENGINE" --test-binary "$PBPS_FIXTURE_BINARY"
+        env:
+          FIXTURE_ENGINE: ${{ matrix.engine }}
       # A supplied server pbps did not provision. It runs a target and a
       # dedicated server at once, so it keeps the same disposable host.
       - name: Dedicated scratch server lifecycle and exclusivity

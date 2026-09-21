@@ -26,10 +26,10 @@ pub(crate) struct ServerProfile {
     /// The engine service's main executable, as installed by root.
     pub executable: &'static str,
     pub uid: u32,
-    /// Measured on Docker 28 and Podman 4.9: `--user 10001` resolves to the
-    /// image's matching group, and the PostgreSQL recipe's `setpriv` clears
-    /// the supplementary set outright. A process that kept a group such as
-    /// `docker` or `disk` would reach what that group owns.
+    /// Direct runtime users may retain their own image-resolved supplementary
+    /// group; an ownership bootstrap using `setpriv` clears it instead (531).
+    /// Both fit the same ceiling. A group such as `docker` or `disk` would
+    /// grant authority outside the measured engine identity.
     pub gid: u32,
     pub capabilities: u64,
     /// The loopback port the engine listens on inside its private namespace.
