@@ -79,6 +79,9 @@ pub struct SigningPolicy {
 pub struct Manifest {
     pub inputs: BTreeMap<String, Option<Evidence>>,
     pub attributes: BTreeMap<String, Vec<(String, String)>>,
+    pub attribute_files: BTreeMap<String, Option<Evidence>>,
+    pub line_endings: BTreeMap<String, String>,
+    pub autocrlf: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -14270,6 +14270,15 @@ SPEC is in sync with all of these.
      result against the captured base. `--no-dev` still writes the ordinary ids,
      skips only rehearsal and refuses explicit `--dev` or target planning.
 
+     Git resolves line-ending policy through a private index and an empty
+     worktree, with attributes sourced from the reviewed base. This preserves
+     legacy `crlf` semantics and attribute precedence without reproducing Git's
+     parser or executing filters. Relevant attribute files must match the base
+     byte-for-byte and enter the manifest: `check-attr` text alone cannot
+     distinguish an unset attribute from a string value literally named
+     `unset`. Contained parent path components are resolved, while escapes
+     beyond the project remain refusals.
+
      Real Git/CLI scheduling tests pin source preservation and frozen output;
      browser tests execute the shipped form rather than search its source for
      variable names. Node.js is required only to run those development tests

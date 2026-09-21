@@ -355,6 +355,9 @@ the loader policy tracked by #739. Filter, ident and encoding attributes,
 uncommitted relevant attributes, conversion-dependent CR input, ignored new
 declarations and special index flags refuse capture. Git mode is the observed
 executable bit even when a user's ordinary Git configuration ignores modes.
+Relevant attribute files are pinned as raw bytes; Git's resolved line-ending
+policy is queried using a private index and an empty worktree, without filters
+or live declaration reads. Source capture budgets include those attribute files.
 The CLI remains available for unsupported capture layouts.
 
 Each workflow retains one unconfirmed candidate for at most 24 hours. Source

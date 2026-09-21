@@ -490,6 +490,213 @@ fn git_boolean_aliases_cannot_admit_conversion_dependent_carriage_returns() {
 }
 
 #[test]
+fn legacy_and_modern_line_ending_attributes_follow_git_precedence() {
+    for (index, (attribute, autocrlf)) in [
+        ("crlf", "false"),
+        ("crlf=input", "false"),
+        ("crlf=unset", "true"),
+        ("text=unset", "true"),
+        ("text=unset", "false"),
+        ("text=set", "false"),
+        ("crlf=auto", "false"),
+        ("-crlf", "true"),
+        ("-text crlf", "true"),
+        ("text -crlf", "false"),
+        ("text=auto -crlf", "false"),
+        ("-text eol=lf", "true"),
+        ("text=bad crlf=input", "false"),
+        ("crlf=bad", "false"),
+        ("eol=bad", "false"),
+        ("eol=lf", "false"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let repo = Repository::new(&format!("eol-attributes-{index}"), "");
+        git(&repo.root, &["config", "core.autocrlf", autocrlf]);
+        fs::write(
+            repo.root.join(".gitattributes"),
+            format!("schema/*.yml {attribute}\nschema.ids.json {attribute}\n"),
+        )
+        .unwrap();
+        repo.commit();
+        repo.table(&RENAMED.replace('\n', "\r\n"));
+        let ids = fs::read_to_string(repo.project.join("schema.ids.json")).unwrap();
+        fs::write(
+            repo.project.join("schema.ids.json"),
+            ids.replace('\n', "\r\n"),
+        )
+        .unwrap();
+        let before = repo.preserved();
+        for path in ["schema/t.yml", "schema.ids.json"] {
+            let raw = git(&repo.root, &["hash-object", "--no-filters", path]);
+            let ordinary = git(
+                &repo.root,
+                &["hash-object", &format!("--path={path}"), path],
+            );
+            let result = repo.store().preview(request(), SystemTime::now());
+            assert_eq!(
+                result.is_ok(),
+                raw == ordinary,
+                "wrong capture admission for {path}: {attribute}, autocrlf={autocrlf}"
+            );
+        }
+        assert_eq!(repo.preserved(), before);
+    }
+}
+
+#[test]
+fn attribute_sentinel_aliases_cannot_hide_a_changed_policy() {
+    for during_capture in [false, true] {
+        let repo = Repository::new(&format!("attribute-alias-{during_capture}"), "project");
+        git(&repo.root, &["config", "core.autocrlf", "true"]);
+        let path = repo.root.join(".gitattributes");
+        fs::write(&path, "project/schema/*.yml -text\n").unwrap();
+        repo.commit();
+        repo.table(&RENAMED.replace('\n', "\r\n"));
+        let attrs = git(
+            &repo.root,
+            &["check-attr", "--all", "-z", "--", "project/schema/t.yml"],
+        );
+        let change = || {
+            fs::write(&path, "project/schema/*.yml text=unset\n").unwrap();
+            assert_eq!(
+                git(
+                    &repo.root,
+                    &["check-attr", "--all", "-z", "--", "project/schema/t.yml"]
+                ),
+                attrs
+            );
+        };
+        if !during_capture {
+            change();
+        }
+        let before = repo.preserved();
+        let result = repo
+            .store()
+            .preview_observed(request(), SystemTime::now(), &|at| {
+                if during_capture && at == CaptureBoundary::TreeBuilt {
+                    change();
+                }
+            });
+        assert!(
+            result.is_err(),
+            "attribute sentinel alias hid changed policy"
+        );
+        assert_eq!(repo.preserved(), before);
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "project/schema/*.yml text=unset\n"
+        );
+    }
+}
+
+#[test]
+fn resolving_line_ending_policy_never_executes_a_configured_filter() {
+    let repo = Repository::new("policy-filter", "");
+    repo.table(RENAMED);
+    let marker = repo.root.join("filter-ran");
+    fs::write(
+        repo.root.join(".git/info/attributes"),
+        "schema/*.yml filter=probe\n",
+    )
+    .unwrap();
+    git(
+        &repo.root,
+        &[
+            "config",
+            "filter.probe.clean",
+            &format!("touch '{}'; cat", marker.display()),
+        ],
+    );
+    let before = repo.preserved();
+    assert!(repo.store().preview(request(), SystemTime::now()).is_err());
+    assert!(!marker.exists(), "policy observation executed a filter");
+    assert_eq!(repo.preserved(), before);
+    // The fixture's helper is executable: ordinary filtered hashing runs it.
+    git(
+        &repo.root,
+        &["hash-object", "--path=schema/t.yml", "schema/t.yml"],
+    );
+    assert!(marker.exists());
+}
+
+#[test]
+fn private_attribute_indexes_do_not_create_source_split_index_files() {
+    let repo = Repository::new("policy-split-index", "");
+    git(&repo.root, &["config", "core.splitIndex", "true"]);
+    git(&repo.root, &["update-index", "--split-index"]);
+    repo.table(RENAMED);
+    let shared_indexes = || {
+        let mut names: Vec<_> = fs::read_dir(repo.root.join(".git"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with("sharedindex."))
+            .collect();
+        names.sort();
+        names
+    };
+    let before = repo.preserved();
+    let indexes = shared_indexes();
+    assert!(!indexes.is_empty());
+    repo.store().preview(request(), SystemTime::now()).unwrap();
+    assert_eq!(repo.preserved(), before);
+    assert_eq!(
+        shared_indexes(),
+        indexes,
+        "private policy index wrote source split indexes"
+    );
+}
+
+#[test]
+fn contained_parent_components_resolve_to_the_same_reviewed_inputs() {
+    for sub in ["", "project"] {
+        let repo = Repository::new(&format!("contained-parents-{sub}"), sub);
+        fs::write(
+            repo.project.join("pbps.yml"),
+            "dialect: mssql\nschema_dir: schema/../schema\nids_file: schema/../schema.ids.json\n",
+        )
+        .unwrap();
+        checked(repo.cli(&["validate"]));
+        repo.commit();
+        repo.table(RENAMED);
+        let before = repo.preserved();
+        let mut store = repo.store();
+        let now = SystemTime::now();
+        let preview = store
+            .preview(request(), now)
+            .expect("contained parent path refused");
+        let candidate = store.confirm(&preview.candidate_id, now).unwrap();
+        assert!(preview.diff.contains("+  ident:"));
+        assert!(
+            candidate
+                .manifest()
+                .inputs
+                .keys()
+                .all(|name| !name.contains(".."))
+        );
+        assert_eq!(repo.preserved(), before);
+        for config in [
+            "dialect: mssql\nschema_dir: schema/../../outside\n",
+            "dialect: mssql\nids_file: schema/../../outside.ids.json\n",
+        ] {
+            repo.table(ORIGINAL);
+            fs::write(repo.project.join("pbps.yml"), config).unwrap();
+            repo.commit();
+            repo.table(RENAMED);
+            let before = repo.preserved();
+            let error = repo
+                .store()
+                .preview(request(), now)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("cannot leave the project"), "{error}");
+            assert_eq!(repo.preserved(), before);
+        }
+    }
+}
+
+#[test]
 fn links_unreadable_inputs_and_literal_unspecified_filters_are_named_refusals() {
     for variant in ["link", "unreadable", "filter"] {
         let repo = Repository::new(variant, "");

@@ -68,8 +68,15 @@ fn relative(root: &Path, value: &str) -> Result<String> {
     let mut clean = PathBuf::new();
     for part in path.components() {
         match part {
-            Component::Normal(name) => clean.push(name),
+            Component::Normal(name) => {
+                files::path(
+                    name.to_str()
+                        .ok_or_else(|| Error::new("Compose paths must be UTF-8"))?,
+                )?;
+                clean.push(name);
+            }
             Component::CurDir => {}
+            Component::ParentDir if clean.pop() => {}
             Component::Prefix(_) | Component::RootDir | Component::ParentDir => {
                 return Err(Error::new("Compose input paths cannot leave the project"));
             }
@@ -275,17 +282,198 @@ fn attributes(git: &Git, name: &str, base: Option<&str>) -> Result<Vec<(String, 
     Ok(result)
 }
 
+/// Ask Git for its resolved policy using a private index and an empty worktree.
+/// `ls-files --eol` never executes filters, and cannot read live declaration
+/// bytes here. Its typed policy distinguishes `-text` from `text=unset`, which
+/// check-attr's text output cannot distinguish.
+struct AttributeView {
+    directory: PathBuf,
+    index: PathBuf,
+    recorded: BTreeMap<String, Option<FileBytes>>,
+}
+
+impl AttributeView {
+    fn new(
+        git: &Git,
+        base: &str,
+        names: &BTreeSet<String>,
+        workspace: &Path,
+        placeholder: &str,
+    ) -> Result<Self> {
+        let directory = workspace.join("attribute-view");
+        fs::create_dir(&directory)
+            .map_err(|_| Error::new("Could not create the private attribute view"))?;
+        let index = workspace.join("attribute.index");
+        let index_options = [
+            "-c",
+            "core.splitIndex=false",
+            "-c",
+            "core.sparseCheckout=false",
+            "-c",
+            "index.sparse=false",
+        ];
+        let mut command = index_options.to_vec();
+        command.extend(["read-tree", base]);
+        git.bytes(&command, &[], Some(&index))?;
+        // Placeholders expose both recorded and new input names. Attribute
+        // lookup uses GIT_ATTR_SOURCE, never these placeholder contents.
+        let mut records = Vec::new();
+        for name in names {
+            records.extend_from_slice(format!("100644 {placeholder}\t{name}\0").as_bytes());
+        }
+        let mut command = index_options.to_vec();
+        command.extend(["update-index", "-z", "--index-info"]);
+        git.bytes(&command, &records, Some(&index))?;
+        let mut paths = BTreeSet::new();
+        for name in names {
+            let mut parent = Path::new(name).parent();
+            while let Some(directory) = parent {
+                paths.insert(
+                    directory
+                        .join(".gitattributes")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                if paths.len() > MAX_FILES {
+                    return Err(Error::new("Compose has too many attribute paths"));
+                }
+                parent = directory.parent();
+            }
+        }
+        let listing = git.bytes(&["ls-tree", "-rz", base], &[], None)?;
+        let mut entries = BTreeMap::new();
+        for row in listing.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+            let Some(tab) = row.iter().position(|b| *b == b'\t') else {
+                return Err(Error::new("Incomplete attribute tree metadata"));
+            };
+            let Ok(name) = std::str::from_utf8(&row[tab + 1..]) else {
+                continue;
+            };
+            if !paths.contains(name) {
+                continue;
+            }
+            let header = std::str::from_utf8(&row[..tab])
+                .map_err(|_| Error::new("Invalid attribute tree metadata"))?;
+            let fields: Vec<_> = header.split(' ').collect();
+            let [mode @ ("100644" | "100755"), "blob", oid] = fields.as_slice() else {
+                return Err(Error::new("Attribute files must be regular files"));
+            };
+            entries.insert(
+                name.to_owned(),
+                TreeEntry {
+                    mode: if *mode == "100755" {
+                        0o100755
+                    } else {
+                        0o100644
+                    },
+                    oid: (*oid).to_owned(),
+                },
+            );
+        }
+        let mut recorded = blobs(git, &entries)?;
+        Ok(Self {
+            directory,
+            index,
+            recorded: paths
+                .into_iter()
+                .map(|name| {
+                    let bytes = recorded.remove(&name);
+                    (name, bytes)
+                })
+                .collect(),
+        })
+    }
+
+    fn files(&self, root: &Root) -> Result<BTreeMap<String, Option<super::Evidence>>> {
+        let mut evidence = BTreeMap::new();
+        for (name, expected) in &self.recorded {
+            let current = root.read(name)?;
+            if &current != expected {
+                return Err(Error::new(
+                    "Git attribute files changed from the selected base; commit them before composing",
+                ));
+            }
+            evidence.insert(name.clone(), current.as_ref().map(FileBytes::evidence));
+        }
+        Ok(evidence)
+    }
+
+    fn policies(
+        &self,
+        git: &Git,
+        base: &str,
+        names: &BTreeSet<String>,
+    ) -> Result<BTreeMap<String, String>> {
+        let mut command = git.command();
+        command
+            .env("GIT_INDEX_FILE", &self.index)
+            .env("GIT_WORK_TREE", &self.directory)
+            .env("GIT_ATTR_SOURCE", base)
+            .args(["ls-files", "--eol", "--cached", "-z", "--"])
+            .args(names);
+        let output = super::process::run(command, &[], git.deadline)?;
+        if !output.status.success() {
+            return Err(Error::new("Could not resolve Git line-ending policies"));
+        }
+        let mut result = BTreeMap::new();
+        for row in output.stdout.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+            let Some(tab) = row.iter().position(|b| *b == b'\t') else {
+                return Err(Error::new("Incomplete Git line-ending policy"));
+            };
+            let Ok(name) = std::str::from_utf8(&row[tab + 1..]) else {
+                continue;
+            };
+            if !names.contains(name) {
+                continue;
+            }
+            let header = std::str::from_utf8(&row[..tab])
+                .map_err(|_| Error::new("Invalid Git line-ending policy"))?;
+            let (_, policy) = header
+                .split_once("attr/")
+                .ok_or_else(|| Error::new("Missing Git line-ending policy"))?;
+            let policy = policy.trim_end();
+            if !matches!(
+                policy,
+                "" | "-text"
+                    | "text"
+                    | "text=auto"
+                    | "text eol=lf"
+                    | "text eol=crlf"
+                    | "text=auto eol=lf"
+                    | "text=auto eol=crlf"
+            ) || result.insert(name.to_owned(), policy.to_owned()).is_some()
+            {
+                return Err(Error::new(
+                    "Unsupported or conflicting Git line-ending policy",
+                ));
+            }
+        }
+        if result.len() != names.len() {
+            return Err(Error::new("Incomplete Git line-ending policies"));
+        }
+        Ok(result)
+    }
+}
+
 fn manifest(
     git: &Git,
     root: &Root,
     names: &BTreeSet<String>,
     base: &str,
+    view: &AttributeView,
 ) -> Result<(Manifest, BTreeMap<String, Option<FileBytes>>)> {
     let mut inputs = BTreeMap::new();
     let mut attr = BTreeMap::new();
     let mut bytes = BTreeMap::new();
-    let mut total = 0;
+    let mut total: usize = view
+        .recorded
+        .values()
+        .flatten()
+        .map(|file| file.bytes.len())
+        .sum();
     let crlf = git.converts_line_endings()?;
+    let attribute_files = view.files(root)?;
+    let line_endings = view.policies(git, base, names)?;
     for name in names {
         let file = root.read(name)?;
         let working = attributes(git, name, None)?;
@@ -299,12 +487,12 @@ fn manifest(
             if total > MAX_BYTES {
                 return Err(Error::new("Compose inputs exceed the total size limit"));
             }
-            if file.bytes.contains(&b'\r')
-                && (crlf
-                    || working
-                        .iter()
-                        .any(|(k, v)| matches!(k.as_str(), "text" | "eol") && v != "unset"))
-            {
+            let converts = match line_endings[name].as_str() {
+                "-text" => false,
+                "" => crlf,
+                _ => true,
+            };
+            if file.bytes.contains(&b'\r') && converts {
                 return Err(Error::new(
                     "Compose inputs must not require Git line-ending conversion",
                 ));
@@ -318,6 +506,9 @@ fn manifest(
         Manifest {
             inputs,
             attributes: attr,
+            attribute_files,
+            line_endings,
+            autocrlf: crlf,
         },
         bytes,
     ))
@@ -460,7 +651,14 @@ pub(super) fn capture(
     if names.len() > MAX_FILES {
         return Err(Error::new("Compose has too many input paths"));
     }
-    let (evidence, captured) = manifest(&git, &root, &names, &base)?;
+    let attribute_view = AttributeView::new(
+        &git,
+        &base,
+        &names,
+        &workspace.path,
+        &entries[&project_file].oid,
+    )?;
+    let (evidence, captured) = manifest(&git, &root, &names, &base, &attribute_view)?;
     // Path admission was based on the base's configuration. The configuration
     // actually overlaid below must be those same bytes; checking the live file
     // before discovery alone leaves a config-change window before this capture.
@@ -567,7 +765,7 @@ pub(super) fn capture(
     if !root.same_directory(&current_root)?
         || !selected_root.same_directory(&Root::open(&selected)?)?
         || current_root.declarations(&declarations)? != live
-        || manifest(&git, &current_root, &names, &base)?.0 != evidence
+        || manifest(&git, &current_root, &names, &base, &attribute_view)?.0 != evidence
         || git.line(&["rev-parse", "--verify", "HEAD^{commit}"])? != base
         || destination::resolve(&git, &request.remote)? != destination
         || self::signing(&git)? != signing
