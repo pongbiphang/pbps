@@ -9,4 +9,6 @@ pub mod git;
 /// commands to run by hand.
 #[cfg(target_os = "linux")]
 pub mod fsx;
+#[cfg(target_os = "linux")]
+pub mod record;
 pub mod repo_path;

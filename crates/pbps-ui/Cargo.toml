@@ -17,7 +17,7 @@ tiny_http.workspace = true
 # than `libc`. `rustix` is already in this tree for the resolver's socket
 # diagnostics, at this version: a direct edge to an audited node, not a new
 # one (DECISIONS 434 is the same move).
-rustix = { workspace = true, features = ["fs", "process", "thread"] }
+rustix = { workspace = true, features = ["fs", "process", "rand"] }
 
 [lints]
 workspace = true
