@@ -30,6 +30,11 @@ that directory. Directory identity comparisons apply within the same procfs
 instance, not across arbitrary views of one process.
 
 Production consumers capture a `ProcessLease` through each held task entry.
+They consume entries as they are enumerated, so descriptor use does not grow
+with the container's task count. The optional `observe` collector retains its
+returned entries and requires enough caller descriptor capacity; it is not the
+source for production qualification. Engine discovery retains at most the two
+candidates needed to distinguish a unique engine from an ambiguous selection.
 The lease records whether it came from the observer or a retained namespace
 view; only the former can supply an observer PID. Parent executable lookups
 use that same view. Cross-view identity compares the innermost task number,

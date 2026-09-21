@@ -14200,6 +14200,12 @@ SPEC is in sync with all of these.
      identities. Capture and callback failures are ignored only when that held
      incidental task is proven to have exited.
 
+     Production consumes each held task before opening the next; collecting
+     all task-directory descriptors first would refuse an otherwise admitted
+     container whenever its task count exceeded the observer's descriptor
+     budget. Engine discovery retains at most two candidates, enough to refuse
+     ambiguity without making descriptor use proportional to the task count.
+
      Cgroup subtree/resource limits and foreign network/mount/IPC accounting
      remain separate; enumerating a cgroup cannot discover a namespace entrant
      outside it. The foreign-sharer check still uses the observer's wider view.

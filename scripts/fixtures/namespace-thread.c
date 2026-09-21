@@ -30,6 +30,15 @@ static void *root_worker(void *unused) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "many")) {
+        pthread_t threads[96];
+        for (unsigned int i = 0; i < sizeof(threads) / sizeof(threads[0]); ++i) {
+            if (pthread_create(&threads[i], NULL, worker, NULL)) return 1;
+        }
+        if (prctl(PR_SET_NAME, "pbps-many", 0, 0, 0)) return 1;
+        sleep(300);
+        return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "orphan")) {
         FILE *release = fopen("/dev/shm/release", "w");
         if (!release || fclose(release)) return 1;

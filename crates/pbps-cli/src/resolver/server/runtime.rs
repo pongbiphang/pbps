@@ -46,10 +46,13 @@ impl ServerProcesses {
             if task.id() != task.group() {
                 return Ok(());
             }
-            if process
-                .executable_path()
-                .file_name()
-                .is_some_and(|name| name == profile.executable)
+            // Two candidates already make the identity ambiguous; do not
+            // retain one executable/namespace lease per extra task.
+            if engines.len() < 2
+                && process
+                    .executable_path()
+                    .file_name()
+                    .is_some_and(|name| name == profile.executable)
                 && !process.has_same_executable_parent()?
             {
                 engines.push(process);

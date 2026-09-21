@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import resource
 import signal
 import subprocess
 import sys
@@ -25,6 +26,7 @@ NEGATIVE_TEST = PREFIX + "container_membership_does_not_hide_wrong_credentials_o
 CHURN_TEST = PREFIX + "departing_incidental_tasks_do_not_refuse_an_unchanged_container_profile"
 ORPHAN_TEST = PREFIX + "reparenting_during_qualification_keeps_the_held_grandchild"
 FOREIGN_TEST = PREFIX + "foreign_namespace_sharers_remain_visible_outside_the_container_pid_view"
+MANY_TEST = PREFIX + "a_containers_task_count_does_not_consume_the_observers_descriptor_budget"
 
 
 def run(*args, **kwargs):
@@ -38,8 +40,14 @@ def run(*args, **kwargs):
         raise
 
 
+def limited_descriptors():
+    _, maximum = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (64, maximum))
+
+
 def test(binary, name, env, prefix=()):
     result = run(*prefix, str(binary), "--exact", name, "--nocapture", env=env,
+                 preexec_fn=limited_descriptors if name == MANY_TEST else None,
                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     print(result.stdout, end="", flush=True)
     if "1 passed; 0 failed" not in result.stdout:
@@ -190,6 +198,23 @@ def main():
             else:
                 raise RuntimeError("the orphan fixture did not become ready")
             test(binary, ORPHAN_TEST, dict(os.environ, PBPS_NAMESPACE_ORPHAN_PID=orphan_pid))
+            many = "pbps-namespace-" + uuid.uuid4().hex
+            owned.append(many)
+            runtime("run", "-d", "--name", many, "--pull=never", "--network=none", "--ipc=private",
+                    "--read-only", "--user=999:999", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+                    "--mount", f"type=bind,src={helper},dst=/pbps-thread-exit,readonly",
+                    "--entrypoint=sleep", args.image, "300")
+            many_pid = runtime("inspect", "--format", "{{.State.Pid}}", many)
+            runtime("exec", "-d", many, "/pbps-thread-exit", "many")
+            many_view = Path(f"/proc/{many_pid}/root/proc")
+            for _ in range(100):
+                if any((p / "comm").read_text().strip() == "pbps-many"
+                       for p in many_view.iterdir() if p.name.isdecimal()):
+                    break
+                time.sleep(.01)
+            else:
+                raise RuntimeError("the many-thread fixture did not become ready")
+            test(binary, MANY_TEST, dict(os.environ, PBPS_NAMESPACE_MANY_PID=many_pid))
             test(binary, MOUNT_TEST, dict(os.environ, PBPS_NAMESPACE_MOUNT_FIXTURE="1"),
                  prefix=("unshare", "--mount", "--pid", "--fork", "--mount-proc", "--propagation", "private"))
     finally:

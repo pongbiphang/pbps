@@ -37,6 +37,15 @@ impl From<UnqualifiedProcess> for NamespaceError {
     }
 }
 
+impl From<NamespaceError> for UnqualifiedProcess {
+    fn from(error: NamespaceError) -> Self {
+        #[cfg(test)]
+        eprintln!("native namespace observation refused: {error}");
+        let _ = error;
+        Self
+    }
+}
+
 /// A task number in a particular PID namespace, never an observer PID.
 /// Keeping the namespace handle alive prevents its inode from being reused
 /// while an observation carries this coordinate.
@@ -189,26 +198,42 @@ impl<'a> NamespaceProcfs<'a> {
     /// task directory refuses the observation. Success does not assert that
     /// no task could have appeared after its directory position was passed.
     pub fn observe(&self) -> Result<Vec<TaskObservation>, NamespaceError> {
-        self.check()?;
-        let namespace = FileIdentity::of(&self.namespace)?;
         let mut observations = Vec::new();
+        self.visit::<NamespaceError>(|task| {
+            observations.push(task);
+            Ok(())
+        })?;
+        Ok(observations)
+    }
+
+    // Production consumes each entry before opening the next. Collecting
+    // every held directory would make an admitted container's task ceiling
+    // depend on the observer's unrelated RLIMIT_NOFILE. The generic error
+    // preserves callback policy refusals separately from procfs diagnostics.
+    fn visit<E: From<NamespaceError>>(
+        &self,
+        mut inspect: impl FnMut(TaskObservation) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.check()?;
+        let namespace = FileIdentity::of(&self.namespace).map_err(NamespaceError::from)?;
+        let mut observed = false;
         for pid in ids(&self.directory)? {
             let group = match open(&self.directory, &pid.to_string(), OFlags::DIRECTORY) {
                 Ok(group) => group,
                 Err(error) if process_gone(&error) => continue,
-                Err(_) => return Err(NamespaceError::Unreadable),
+                Err(_) => return Err(NamespaceError::Unreadable.into()),
             };
             let tasks = match open(&group, "task", OFlags::DIRECTORY) {
                 Ok(tasks) => tasks,
                 Err(_) if group_exited(&group)? => continue,
-                Err(_) => return Err(NamespaceError::Unreadable),
+                Err(_) => return Err(NamespaceError::Unreadable.into()),
             };
             let mut found = false;
             for tid in task_ids(&group, &tasks)? {
                 let directory = match open(&tasks, &tid.to_string(), OFlags::DIRECTORY) {
                     Ok(directory) => directory,
                     Err(error) if process_gone(&error) => continue,
-                    Err(_) => return Err(NamespaceError::Unreadable),
+                    Err(_) => return Err(NamespaceError::Unreadable.into()),
                 };
                 let stat = match read_stat(&directory)? {
                     Some(stat) => stat,
@@ -216,7 +241,7 @@ impl<'a> NamespaceProcfs<'a> {
                 };
                 let (number, state, start_ticks) = task_stat(&stat)?;
                 if number != tid {
-                    return Err(NamespaceError::Unreadable);
+                    return Err(NamespaceError::Unreadable.into());
                 }
                 if matches!(state, "X" | "Z") {
                     continue;
@@ -236,18 +261,19 @@ impl<'a> NamespaceProcfs<'a> {
                 };
                 if let TaskReading::Live(_) = task.status()? {
                     found = true;
-                    observations.push(task);
+                    observed = true;
+                    inspect(task)?;
                 }
             }
             if !found && !group_exited(&group)? {
-                return Err(NamespaceError::Unreadable);
+                return Err(NamespaceError::Unreadable.into());
             }
         }
         self.check()?;
-        if observations.is_empty() {
-            return Err(NamespaceError::Unreadable);
+        if !observed {
+            return Err(NamespaceError::Unreadable.into());
         }
-        Ok(observations)
+        Ok(())
     }
 }
 
@@ -259,16 +285,10 @@ pub(crate) fn for_each_namespace_task(
     anchor: &ProcessLease,
     mut inspect: impl FnMut(&TaskObservation, ProcessLease) -> Result<(), UnqualifiedProcess>,
 ) -> Result<(), UnqualifiedProcess> {
-    let refusal = |error: NamespaceError| {
-        #[cfg(test)]
-        eprintln!("native namespace observation refused: {error}");
-        let _ = error;
-        UnqualifiedProcess
-    };
-    let view = NamespaceProcfs::capture(anchor).map_err(refusal)?;
-    for task in view.observe().map_err(refusal)? {
+    let view = NamespaceProcfs::capture(anchor)?;
+    view.visit(|task| {
         let result = (|| {
-            if matches!(task.status().map_err(refusal)?, TaskReading::Exited) {
+            if matches!(task.status()?, TaskReading::Exited) {
                 return Ok(());
             }
             let process = ProcessLease::capture_held(
@@ -283,12 +303,12 @@ pub(crate) fn for_each_namespace_task(
         if let Err(error) = result {
             // A held incidental task may exit during any read, including
             // the callback. Unknown live state never becomes absence.
-            if !matches!(task.status().map_err(refusal)?, TaskReading::Exited) {
+            if !matches!(task.status()?, TaskReading::Exited) {
                 return Err(error);
             }
         }
-    }
-    view.check().map_err(refusal)
+        Ok(())
+    })
 }
 
 // Every ordinary component stays on the held procfs mount. Bind-mounting a

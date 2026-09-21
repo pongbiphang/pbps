@@ -254,6 +254,33 @@ fn reparenting_during_qualification_keeps_the_held_grandchild() {
 }
 
 #[test]
+fn a_containers_task_count_does_not_consume_the_observers_descriptor_budget() {
+    let Ok(pid) = std::env::var("PBPS_NAMESPACE_MANY_PID") else {
+        return;
+    };
+    let limits = std::fs::read_to_string("/proc/self/limits").unwrap();
+    assert_eq!(
+        limits
+            .lines()
+            .find_map(|line| line.strip_prefix("Max open files"))
+            .and_then(|fields| fields.split_whitespace().next()),
+        Some("64")
+    );
+    let anchor = ProcessLease::capture(pid.parse().unwrap()).unwrap();
+    let mut count = 0;
+    for_each_namespace_task(&anchor, |_, process| {
+        super::super::security(&process, 999, 0)?;
+        count += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        count >= 98,
+        "every worker and the container init must be checked"
+    );
+}
+
+#[test]
 fn departing_incidental_tasks_do_not_refuse_an_unchanged_container_profile() {
     let Ok(pid) = std::env::var("PBPS_NAMESPACE_CHURN_PID") else {
         return;
