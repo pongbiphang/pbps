@@ -1625,7 +1625,16 @@ is the race itself: the window between `update-ref`'s commit and the retaken
 locks is measured in milliseconds and cannot be arranged on demand, so the
 refusal it produces — which names the commit, the deciding tip and what
 became of each path, and never reports "nothing changed" — is reached in
-tests through its parts rather than through a real interleaving. The
+tests through its parts rather than through a real interleaving. The same is
+true of three guards added in review and tested the same way: the comparison
+of a listed file's *final* read against what the preview pinned, which closes
+the window between the last check under the locks and the blob being stored;
+the routing of a failed retention-directory creation after step 6's rename,
+which is reached only when that path is a file or the filesystem refuses; and
+the kept record of a rollback that could not finish, which needs an undo to
+fail while another process holds a name. Each is structural — a branch that
+cannot be entered on demand — and each is stated here rather than counted as
+coverage. The
 interruption points *within* the rollback — after the record's publication, after each undo
 operation, after its flush, after each progress update and during retention
 cleanup — are implemented and are exercised only at their two ends. The

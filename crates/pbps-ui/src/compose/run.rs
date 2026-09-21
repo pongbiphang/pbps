@@ -147,6 +147,15 @@ pub enum Refusal {
     /// changes nothing rather than rolling back: an undo whose direction
     /// recovery cannot know must not be started.
     Unrecordable(String),
+    /// A refusal whose rollback could not finish. The record is **kept**, so
+    /// that the next launch can resume the undo from the same per-path
+    /// evidence; removing it would leave a replacement or a displaced file in
+    /// the checkout with nothing on disk to explain it.
+    RollbackIncomplete {
+        why: Box<Refusal>,
+        unresolved: Vec<String>,
+        record: String,
+    },
     /// Another compose is running in this checkout right now.
     AlreadyComposing,
     /// The branch moved and then something moved out from under it: `HEAD`
@@ -220,6 +229,17 @@ impl std::fmt::Display for Refusal {
                 } else {
                     undone.join(", ")
                 }
+            ),
+            Self::RollbackIncomplete {
+                why,
+                unresolved,
+                record,
+            } => write!(
+                f,
+                "{why} — and putting the checkout back did not finish: {}. \
+                 The record `{record}` has been kept; restart the viewer and it will resume \
+                 from where it stopped.",
+                unresolved.join("; ")
             ),
             Self::Io(detail) => write!(f, "{detail}"),
         }
@@ -338,10 +358,13 @@ impl Compose<'_> {
         let outcome = self.compose(request, stage, &records, &mut record);
         // A preview owns its record until it has put everything back, which
         // `compose` has done by here; a refusal is the same shape.
-        if outcome.is_err() || matches!(outcome, Ok(Done::Previewed(_))) {
-            // A refused compose still owns its record until everything it
-            // made has been put back; `compose` has done that by here, so the
-            // record goes last, as it does on the success path.
+        // A refused compose still owns its record until everything it made has
+        // been put back; `compose` has done that by here, so the record goes
+        // last, as it does on the success path. The exception is a rollback
+        // that could not finish: its record is the only thing that can tell
+        // the next launch what is still out of place.
+        let incomplete = matches!(outcome, Err(Refusal::RollbackIncomplete { .. }));
+        if !incomplete && (outcome.is_err() || matches!(outcome, Ok(Done::Previewed(_)))) {
             let _ = records.remove(&record);
         }
         // Whatever the outcome. Each run writes the project's subtree twice —
@@ -489,16 +512,38 @@ impl Compose<'_> {
             destination,
             remote_has_branch,
         );
-        if result.is_err() {
-            // Every undo publishes `rolling-back` first; the record's per-path
-            // evidence is what makes retrying an interrupted undo safe.
-            if record.advance(Phase::RollingBack).is_ok() {
-                let _ = records.publish(record);
-                self.reached(Phase::RollingBack);
+        match result {
+            Ok(done) => Ok(done),
+            Err(why) => {
+                // Every undo publishes `rolling-back` first; the record's
+                // per-path evidence is what makes retrying an interrupted undo
+                // safe.
+                if record.advance(Phase::RollingBack).is_ok() {
+                    let _ = records.publish(record);
+                    self.reached(Phase::RollingBack);
+                }
+                let unresolved: Vec<String> = placement
+                    .undo_all()
+                    .into_iter()
+                    .filter_map(|outcome| match outcome {
+                        super::place::Undone::Reported { path, detail } => {
+                            Some(format!("{path}: {detail}"))
+                        }
+                        super::place::Undone::Restored { .. }
+                        | super::place::Undone::RenamedAway { .. } => None,
+                    })
+                    .collect();
+                if unresolved.is_empty() {
+                    Err(why)
+                } else {
+                    Err(Refusal::RollbackIncomplete {
+                        why: Box::new(why),
+                        unresolved,
+                        record: record.id.clone(),
+                    })
+                }
             }
-            placement.undo_all();
         }
-        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -530,7 +575,10 @@ impl Compose<'_> {
             to_place.push(Wanted {
                 path: path.clone(),
                 bytes: bytes.clone(),
-                shown: request.shown.get(&path.to_string()).cloned().flatten(),
+                // The outer option is kept: `Some(None)` is "the preview
+                // expected nothing here", which is an instruction, and `None`
+                // is "the preview said nothing about this path", which is not.
+                shown: request.shown.get(&path.to_string()).cloned(),
             });
         }
         let untouched: Vec<&listing::Input> = listed
@@ -629,6 +677,20 @@ impl Compose<'_> {
                     path: input.path.to_string(),
                 })
             })?;
+            // The last read of a listed file, and therefore the last chance
+            // to notice a save. `still_as_shown` looked at this path twice
+            // already, and an editor can write between any two looks; these
+            // are the exact bytes about to become a blob, so this is the
+            // comparison that decides.
+            let now = super::attributes::hash(self.git, &bytes)
+                .map_err(|e| Refusal::Place(PlaceRefusal::Attribute(e)))?;
+            if let Some(expected) = request.shown.get(&input.path.to_string())
+                && *expected != Some(now.clone())
+            {
+                return Err(Refusal::Place(PlaceRefusal::Changed {
+                    path: input.path.to_string(),
+                }));
+            }
             // The attribute check belongs to every path the commit holds, not
             // only to the ones step 2 placed. A listed file keeps the bytes
             // the user gave it and the UI never writes it — but it does store
@@ -786,24 +848,46 @@ impl Compose<'_> {
         }
 
         // Step 6: the rename that is exactly the commit step of `git`'s own
-        // lock. Only a compose that has never entered `rolling-back` gets here.
-        std::fs::rename(index_lock, index_file).map_err(|e| Refusal::Io(e.to_string()))?;
-        record
+        // lock. Only a compose that has never entered `rolling-back` gets
+        // here — and if it cannot be done, the branch has already moved, so
+        // this goes to the deciding-ref protocol like every other failure on
+        // this side of the transaction rather than through the generic arm.
+        if std::fs::rename(index_lock, index_file).is_err() {
+            return self.decide_by_the_ref_the_checkout_is_on(
+                records, record, &commit, lease, held, placement,
+            );
+        }
+        // From here the compose has happened: the branch holds the commit, the
+        // index is installed and the working tree matches both. Nothing below
+        // may return `Err` — a cleanup that fails is something to *say*, not a
+        // reason to undo a commit that stands.
+        let mut trouble = Vec::new();
+        if let Err(e) = record
             .advance(Phase::Installed)
-            .map_err(|e| Refusal::Unrecordable(e.to_string()))?;
-        records
-            .publish(record)
-            .map_err(|e| Refusal::Unrecordable(e.to_string()))?;
+            .map_err(|e| e.to_string())
+            .and_then(|()| records.publish(record).map_err(|e| e.to_string()))
+        {
+            trouble.push(format!("the record could not be updated: {e}"));
+        }
         self.reached(Phase::Installed);
 
         let previous_directory = self.git_dir.join("pbps-ui").join("previous");
-        std::fs::create_dir_all(&previous_directory).map_err(|e| Refusal::Io(e.to_string()))?;
-        let previous =
-            Dir::open_root(&previous_directory).map_err(|e| Refusal::Io(e.to_string()))?;
-        let reported = placement.finish(&previous);
+        let reported = match std::fs::create_dir_all(&previous_directory)
+            .map_err(|e| e.to_string())
+            .and_then(|()| Dir::open_root(&previous_directory).map_err(|e| e.to_string()))
+        {
+            Ok(previous) => placement.finish(&previous),
+            Err(e) => {
+                trouble.push(format!(
+                    "the displaced files are still beside their paths: {e}"
+                ));
+                Vec::new()
+            }
+        };
         let retained: Vec<String> = reported
             .iter()
             .map(|outcome| format!("{outcome:?}"))
+            .chain(trouble)
             .collect();
 
         held.release();

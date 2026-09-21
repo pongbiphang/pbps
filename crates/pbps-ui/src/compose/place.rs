@@ -29,11 +29,15 @@ use super::repo_path::RepoPath;
 pub struct Wanted {
     pub path: RepoPath,
     pub bytes: Vec<u8>,
-    /// The blob id of the file as step 1 read it, where the path had one. The
-    /// locks stop `git`, not an editor saving the same file, and the browser's
-    /// copy would otherwise overwrite newer work (**measured**: the page's id
-    /// and the id after an editor's save differed).
-    pub shown: Option<String>,
+    /// What the preview saw at this path, where it saw anything at all.
+    ///
+    /// Two `Option`s and not one, because "the preview expected nothing here"
+    /// and "the preview said nothing about this path" are different
+    /// instructions: collapsing them lets a file created after the earlier
+    /// check be accepted as an existing one and exchanged away, and the commit
+    /// then holds bytes that replaced a creation nobody previewed. The locks
+    /// stop `git`, not an editor.
+    pub shown: Option<Option<String>>,
 }
 
 #[derive(Debug)]
@@ -201,6 +205,18 @@ impl Placement {
             path: wanted.path.to_string(),
             detail: e.to_string(),
         })?;
+        // Expected absent, and something is there now.
+        if matches!(wanted.shown, Some(None)) && existing.is_some() {
+            return Err(PlaceRefusal::Appeared {
+                path: wanted.path.to_string(),
+            });
+        }
+        // Expected content, and the path is gone.
+        if matches!(wanted.shown, Some(Some(_))) && existing.is_none() {
+            return Err(PlaceRefusal::Changed {
+                path: wanted.path.to_string(),
+            });
+        }
         let previous = match existing {
             None => None,
             Some(look) if look.is_link || !look.is_regular => {
@@ -218,7 +234,7 @@ impl Placement {
                     detail: e.to_string(),
                 })?;
                 let blob = attributes::hash(git, &bytes)?;
-                if let Some(shown) = &wanted.shown
+                if let Some(Some(shown)) = &wanted.shown
                     && *shown != blob
                 {
                     return Err(PlaceRefusal::Changed {
@@ -641,9 +657,11 @@ mod tests {
         Wanted {
             path: path(relative),
             bytes: bytes.to_vec(),
-            shown: std::fs::read(&file)
-                .ok()
-                .map(|old| attributes::hash(git, &old).unwrap()),
+            shown: Some(
+                std::fs::read(&file)
+                    .ok()
+                    .map(|old| attributes::hash(git, &old).unwrap()),
+            ),
         }
     }
 
@@ -862,6 +880,79 @@ mod tests {
     }
 
     #[test]
+    fn a_path_the_preview_expected_to_be_absent_is_refused_when_something_made_it() {
+        // Two options and not one. Collapsing "the preview expected nothing
+        // here" into "the preview said nothing" lets a file created after the
+        // last check be accepted as an existing one and exchanged away, and
+        // the commit then holds bytes that replaced a creation nobody
+        // previewed.
+        let scratch = Scratch::new("place-expected-absent");
+        scratch.write("schema/a.yml", b"table: a\n");
+        let tip = scratch.commit("one");
+        let git = scratch.runner();
+        let mut placement = Placement::new(Dir::open_root(&scratch.root).unwrap());
+
+        // Somebody created it between the preview and now.
+        scratch.write("schema/new.yml", b"somebody else's work\n");
+
+        let expecting_absence = Wanted {
+            path: path("schema/new.yml"),
+            bytes: b"table: new\n".to_vec(),
+            shown: Some(None),
+        };
+        let refusal = place_one(&mut placement, &git, &tip, &expecting_absence).unwrap_err();
+        assert!(
+            matches!(refusal, PlaceRefusal::Appeared { .. }),
+            "got {refusal}"
+        );
+        assert_eq!(
+            std::fs::read(scratch.path("schema/new.yml")).unwrap(),
+            b"somebody else's work\n"
+        );
+
+        // And the control: with no expectation at all the same placement is
+        // an ordinary exchange, which is why the two cases cannot share a
+        // representation.
+        let no_expectation = Wanted {
+            path: path("schema/new.yml"),
+            bytes: b"table: new\n".to_vec(),
+            shown: None,
+        };
+        place_one(&mut placement, &git, &tip, &no_expectation).unwrap();
+        assert_eq!(
+            std::fs::read(scratch.path("schema/new.yml")).unwrap(),
+            b"table: new\n"
+        );
+    }
+
+    #[test]
+    fn a_path_the_preview_expected_to_hold_something_is_refused_when_it_is_gone() {
+        let scratch = Scratch::new("place-expected-content");
+        scratch.write("schema/a.yml", b"table: a\n");
+        let tip = scratch.commit("one");
+        let git = scratch.runner();
+        let mut placement = Placement::new(Dir::open_root(&scratch.root).unwrap());
+        let blob = attributes::hash(&git, b"table: a\n").unwrap();
+        std::fs::remove_file(scratch.path("schema/a.yml")).unwrap();
+
+        let refusal = place_one(
+            &mut placement,
+            &git,
+            &tip,
+            &Wanted {
+                path: path("schema/a.yml"),
+                bytes: b"table: a2\n".to_vec(),
+                shown: Some(Some(blob)),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(refusal, PlaceRefusal::Changed { .. }),
+            "got {refusal}"
+        );
+    }
+
+    #[test]
     fn the_record_names_both_sides_of_the_exchange_before_it_happens() {
         // With only the name, a recovery would find a file at the path and a
         // file beside it and no way to tell which is which.
@@ -878,7 +969,7 @@ mod tests {
         assert_eq!(intent.temporary, "a.yml.pbps-ui-test");
         let (original_blob, _, original_inode) =
             intent.original.clone().expect("the path had a file");
-        assert_eq!(original_blob, wanted.shown.clone().unwrap());
+        assert_eq!(Some(original_blob), wanted.shown.clone().unwrap());
         assert_ne!(
             original_inode, intent.replacement.2,
             "the two identities are what tell the sides apart"

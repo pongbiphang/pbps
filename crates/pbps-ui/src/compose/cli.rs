@@ -427,7 +427,22 @@ mod tests {
             deadline: Duration::from_secs(20),
         };
         let started = std::time::Instant::now();
-        let found = cli.where_are_the_inputs(&directory).expect("it answers");
+        // `ETXTBSY` is not the property under test: another thread of this
+        // test binary forking while the script's write descriptor is still
+        // open is enough to produce it, and it clears on its own. Retried
+        // briefly so the assertion below is about the pipe and nothing else.
+        let found = loop {
+            match cli.where_are_the_inputs(&directory) {
+                Ok(found) => break found,
+                Err(CliRefusal::Unstartable(detail))
+                    if detail.contains("Text file busy")
+                        && started.elapsed() < Duration::from_secs(5) =>
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("it answers: {e}"),
+            }
+        };
 
         assert_eq!(found.declarations, "./schema");
         assert!(

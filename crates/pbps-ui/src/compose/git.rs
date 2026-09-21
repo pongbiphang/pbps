@@ -243,15 +243,27 @@ impl Git {
         let mut child = command
             .spawn()
             .map_err(|e| Failure::Unstartable(e.to_string()))?;
-        if let Some(bytes) = stdin {
+        let writing = stdin.map(|bytes| {
             let mut handle = child.stdin.take().expect("stdin was piped");
-            use std::io::Write as _;
-            // A `git` that refuses before reading all of it closes the pipe;
-            // that is its answer, not an error of ours.
-            let _ = handle.write_all(bytes);
-            drop(handle);
+            let bytes = bytes.to_vec();
+            // Written on a thread, and the readers below start before this
+            // returns. `cat-file --batch` answers *while* it is being asked,
+            // so a synchronous write of a long request fills the output pipe
+            // and blocks — with nothing draining it and the deadline not yet
+            // started, which is a hang rather than a refusal. It is the same
+            // shape the CLI runner already had fixed, and it was here too.
+            std::thread::spawn(move || {
+                use std::io::Write as _;
+                // A `git` that refuses before reading all of it closes the
+                // pipe; that is its answer, not an error of ours.
+                let _ = handle.write_all(&bytes);
+            })
+        });
+        let collected = self.collect(child, &printable);
+        if let Some(writing) = writing {
+            let _ = writing.join();
         }
-        self.collect(child, &printable)
+        collected
     }
 
     fn dress(
@@ -519,6 +531,45 @@ mod tests {
                 "{name} is the user's own configuration and must survive"
             );
         }
+    }
+
+    #[test]
+    fn a_request_larger_than_a_pipe_is_written_while_the_answer_is_read() {
+        // `cat-file --batch` answers *while* it is being asked. A request of
+        // object ids long enough to fill the output pipe before it has all
+        // been read blocks a synchronous write — with nothing draining the
+        // output and the deadline not yet started, which is a hang and not a
+        // refusal. The snapshot of a real project is exactly that shape.
+        let scratch = crate::compose::scratch_repo::Scratch::new("git-stdin");
+        scratch.write("a.yml", b"table: a\n");
+        scratch.commit("one");
+        let git = scratch.runner();
+        let blob = scratch.git(&["hash-object", "-w", "--", "a.yml"]);
+
+        // 4,000 ids is ~160 KB in and ~200 KB out: both pipes over capacity.
+        let asked = 4_000;
+        let request: String = std::iter::repeat_n(format!("{blob}\n"), asked).collect();
+        assert!(request.len() > 64 * 1024, "the request must exceed a pipe");
+
+        let started = Instant::now();
+        let answer = git
+            .run_with_input(&["cat-file", "--batch"], request.as_bytes())
+            .expect("it answers");
+
+        assert!(answer.ok());
+        assert_eq!(
+            answer
+                .stdout
+                .windows(9)
+                .filter(|w| *w == b"table: a\n")
+                .count(),
+            asked,
+            "every blob asked for came back"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "it finished at the deadline, which is what a blocked pipe looks like"
+        );
     }
 
     #[test]
