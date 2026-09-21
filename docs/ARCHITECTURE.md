@@ -30,9 +30,10 @@ pbps-db        Connections plus transaction framing. Owns "there is a network";
                names one. Driver isolation: see constraint 9
 pbps-docs      Markdown / self-contained HTML / Mermaid ERD from the model.
                Pure: no dialect, no connection, no configuration
-pbps-ui        Loopback read views over fixed CLI subprocess commands. Owns its
-               envelope consumer types and embedded page; depends on no other
-               workspace crate (ADR-0015 decision 6)
+pbps-ui        Loopback UI over fixed CLI subprocess commands; currently read
+               views. Owns envelope consumer types and the embedded page.
+               Planned compose orchestration is defined below; no other
+               workspace crate dependency (ADR-0015 decision 6)
 pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
                output is the one typed findings envelope every read-only
                command speaks; prompt is the TTY intent channel of SPEC 6.3.
@@ -51,12 +52,36 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
   crate names either. A third engine is a compile error in every `engine`
   function until it has an answer for each.
 - `spikes/` is workspace-`exclude`d: evaluation crates, not product code.
-- The synchronous local UI's only project-data source is `current_exe()` run
-  with `--no-input`. CLI supplies its launch token and the documentation style
-  hash; the UI neither reads configuration nor links the renderer or model.
+- Schema semantics and typed read reports reach the synchronous UI only through
+  `current_exe()` run with `--no-input`. CLI supplies its launch token and the
+  documentation style hash. The shipped viewer reads no project files itself;
+  planned compose may capture opaque bytes as specified below, but never parse
+  YAML/project configuration or link the renderer, loader or model.
 - The dialect supplies transaction statements; `pbps-db` owns the transaction
   framing. See [ADR-0014 §2](ADR-0014-driver-seam-tested.md#2-begin-holds-t-sql-in-the-crate-that-is-documented-to-hold-none)
   for the boundary correction.
+
+## Planned isolated compose
+
+[ADR-0017](ADR-0017-isolated-compose.md) is accepted design for #494; the shipped
+viewer remains read-only until #745–#748 are implemented and qualified. Raw file
+capture is an explicit future orchestration responsibility, not permission to
+move schema interpretation into the UI (#750).
+
+| Responsibility | Owner and boundary |
+| --- | --- |
+| Project/path resolution, declaration meaning and identity intent | Existing CLI commands and their existing config/load/diff dependencies. The UI asks the running executable; it does not interpret YAML, infer identity or perform schema validation. |
+| Raw Git/input capture | `pbps-ui` orchestrates guarded Git subprocesses and no-follow regular-file reads within the CLI-resolved project/input scope. Files are opaque bytes plus path/mode/membership metadata. Path/type admission protects capture; it does not decide schema validity. |
+| Candidate tree and diff | `pbps-ui` uses Git raw objects and a private index to construct the exact candidate and invokes the ordinary CLI against its isolated snapshot for intent resolution and validation. The source index/HEAD/files are not written. |
+| Candidate identity and storage | `pbps-ui` allocates and seals the operation/output-ref identity before showing the preview, owns bounded private storage and serves opaque candidate handles. The browser cannot supply replacement evidence or persist authority. |
+| Publication, receipts and recovery | `pbps-ui` orchestrates the guarded Git ref/push operations and private operational evidence under ADR-0017. Git holds the authoritative commit/ref result; records carry credential-free identity and recovery obligations, never schema truth or approval. |
+| Authentication | Existing approved environment/Git helper boundary, reacquired per invocation. The UI has no credential form or durable credential store; unsupported endpoint forms refuse before candidate sealing. |
+
+These responsibilities require no dependency from `pbps-ui` to another workspace
+crate and no YAML/model parser in the UI. Its own JSON types describe CLI reports
+and operational candidate/recovery metadata, not a second schema model. Any new
+semantic question must gain a CLI subprocess answer, not a UI-side validator.
+Database transport and deployment remain outside this compose flow.
 
 ## Planned engine-assisted planning
 
