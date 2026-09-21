@@ -1,6 +1,7 @@
 //! Local, read-only presentation over CLI subprocesses (ADR-0015).
 
 pub mod client;
+pub mod compose;
 pub mod contract;
 
 use std::collections::BTreeMap;
@@ -365,11 +366,21 @@ mod tests {
             .next()
             .unwrap();
         assert!(!dependencies.contains("pbps-"));
-        for line in dependencies.lines().filter(|line| line.contains('=')) {
-            assert!(matches!(
-                line.split('=').next().unwrap().trim(),
-                "serde.workspace" | "serde_json.workspace" | "tiny_http.workspace"
-            ));
+        for line in dependencies
+            .lines()
+            .filter(|line| line.contains('=') && !line.trim_start().starts_with('#'))
+        {
+            // The list is the decision, not a record of what happens to be
+            // there: decision 6 allows serde, one small HTTP crate and nothing
+            // of this workspace, and compose adds `rustix` for the syscalls a
+            // tree that forbids `unsafe` cannot otherwise reach.
+            assert!(
+                matches!(
+                    line.split('=').next().unwrap().trim(),
+                    "serde.workspace" | "serde_json.workspace" | "tiny_http.workspace" | "rustix"
+                ),
+                "{line}"
+            );
         }
         assert!(!HTML.contains("<script>"));
         assert!(!JS.contains("innerHTML"));
