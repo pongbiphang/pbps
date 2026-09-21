@@ -129,13 +129,10 @@ impl Git {
         let mut command = self.command();
         // check-ignore accepts literal pathname records but rejects Git's
         // global literal-pathspec magic. No browser value becomes an option.
-        command.args([
-            "--no-literal-pathspecs",
-            "check-ignore",
-            "--no-index",
-            "-z",
-            "--stdin",
-        ]);
+        // Let Git honor index membership: a force-added declaration is an
+        // explicit tracked input. Its content still comes from capture, not
+        // from the user's index; genuinely ignored untracked paths refuse.
+        command.args(["--no-literal-pathspecs", "check-ignore", "-z", "--stdin"]);
         let input = format!("{name}\0");
         let result = process::run(command, input.as_bytes(), self.deadline)?;
         match result.status.code() {

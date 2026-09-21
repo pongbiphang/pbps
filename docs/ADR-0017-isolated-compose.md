@@ -352,8 +352,10 @@ the files ref backend. A selected project must have committed configuration;
 declaration and identity paths must be distinct and contained, and the
 declaration directory cannot be the project root. The latter does not redefine
 the loader policy tracked by #739. Filter, ident and encoding attributes,
-uncommitted relevant attributes, conversion-dependent CR input, ignored new
-declarations and special index flags refuse capture. Git mode is the observed
+uncommitted relevant attributes, conversion-dependent CR input, ignored
+untracked declarations and special index flags refuse capture. Force-added
+declarations retain Git's tracked-file admission, while their captured working
+bytes, rather than staged content, enter the candidate. Git mode is the observed
 executable bit even when a user's ordinary Git configuration ignores modes.
 Relevant attribute files are pinned as raw bytes; Git's resolved line-ending
 policy is queried using a private index and an empty worktree, without filters

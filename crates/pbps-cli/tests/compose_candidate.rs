@@ -350,6 +350,59 @@ fn new_deleted_recreated_paths_and_modes_are_part_of_the_candidate() {
 }
 
 #[test]
+fn force_added_declarations_use_captured_bytes_without_admitting_ignored_untracked_files() {
+    for (ignored, staged) in [(true, false), (true, true), (false, false)] {
+        let repo = Repository::new(&format!("ignored-{ignored}-{staged}"), "");
+        if ignored {
+            fs::write(repo.root.join(".gitignore"), "schema/new.yml\n").unwrap();
+            repo.commit();
+        }
+        let name = "schema/new.yml";
+        let staged_bytes = "table: dbo.new\ncolumns:\n  id: {type: int}\n";
+        fs::write(repo.project.join(name), staged_bytes).unwrap();
+        if staged {
+            git(&repo.root, &["add", "-f", name]);
+            assert_eq!(
+                git(&repo.root, &["ls-files", "-v", "--", name]),
+                b"H schema/new.yml\n"
+            );
+        }
+        let captured_bytes = format!("{staged_bytes}  captured: {{type: int}}\n");
+        fs::write(repo.project.join(name), &captured_bytes).unwrap();
+        let before = repo.preserved();
+        let mut action = request();
+        action.intent = Intent::Declarations;
+        let mut store = repo.store();
+        let now = SystemTime::now();
+        let result = store.preview(action, now);
+        if ignored && !staged {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("new declaration is ignored")
+            );
+        } else {
+            let preview = result.unwrap();
+            let candidate = store.confirm(&preview.candidate_id, now).unwrap();
+            assert_eq!(
+                git(
+                    &candidate.snapshot_repository(),
+                    &["show", &format!("{}:{name}", preview.tree)]
+                ),
+                captured_bytes.as_bytes()
+            );
+            assert!(preview.diff.contains("+  captured:"));
+        }
+        assert_eq!(repo.preserved(), before);
+        assert_eq!(
+            fs::read(repo.project.join(name)).unwrap(),
+            captured_bytes.as_bytes()
+        );
+    }
+}
+
+#[test]
 fn captured_executable_modes_match_real_git_including_group_only_execute() {
     for mode in [0o654, 0o740] {
         let repo = Repository::new(&format!("git-mode-{mode:o}"), "");
