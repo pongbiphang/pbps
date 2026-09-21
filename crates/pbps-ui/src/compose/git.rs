@@ -149,7 +149,12 @@ impl Git {
 }
 
 pub(super) fn text(bytes: Vec<u8>) -> Result<String> {
-    String::from_utf8(bytes)
-        .map(|s| s.trim_end_matches(['\n', '\r']).to_owned())
-        .map_err(|_| Error::new("Git returned unsupported non-text metadata"))
+    let mut value = String::from_utf8(bytes)
+        .map_err(|_| Error::new("Git returned unsupported non-text metadata"))?;
+    // These Git commands append one LF. Any preceding CR/LF belongs to the
+    // value; stripping it would silently change paths or destination identity.
+    if value.pop() != Some('\n') {
+        return Err(Error::new("Git returned unterminated metadata"));
+    }
+    Ok(value)
 }

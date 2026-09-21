@@ -524,6 +524,32 @@ fn links_unreadable_inputs_and_literal_unspecified_filters_are_named_refusals() 
 }
 
 #[test]
+fn git_output_terminators_cannot_normalize_an_invalid_destination() {
+    let repo = Repository::new("destination-terminators", "");
+    repo.table(RENAMED);
+    let before = repo.preserved();
+    for suffix in ["", "\n", "\r", "\r\n", "\n\n", "\t"] {
+        let endpoint = format!("https://host.test/repo{suffix}");
+        git(&repo.root, &["config", "remote.origin.pushurl", &endpoint]);
+        // Real Git adds its own terminator after the literal config bytes.
+        assert_eq!(
+            git(
+                &repo.root,
+                &["remote", "get-url", "--push", "--all", "origin"]
+            ),
+            format!("{endpoint}\n").as_bytes()
+        );
+        let result = repo.store().preview(request(), SystemTime::now());
+        assert_eq!(
+            result.is_ok(),
+            suffix.is_empty(),
+            "destination control bytes {suffix:?} must not be normalized away"
+        );
+        assert_eq!(repo.preserved(), before);
+    }
+}
+
+#[test]
 fn changed_configuration_and_secret_bearing_destinations_do_not_seal() {
     let repo = Repository::new("settings", "");
     repo.table(RENAMED);
