@@ -27,7 +27,7 @@ measurements from the remaining production qualification.
 
 ### 1. The UI runs the `pbps` binary as a subprocess; it links none of the crates
 
-`pbps ui` starts a server, and every question the page asks is answered by
+`pbps ui` starts a server, and every schema question the page asks is answered by
 spawning the same executable (`std::env::current_exe()`) with the same
 arguments a user would type — `--no-input` always, and `--format json` for
 every command that speaks the envelope of SPEC §9.8 — and relaying what comes
@@ -43,11 +43,21 @@ frontend never reimplements validation* — and says it should hold
 "structurally rather than by discipline". A UI crate that can see `pbps_load`
 can, in some later commit, load a file itself to show a friendlier error, and
 from that day the browser and the CLI disagree about what is valid. A UI crate
-whose only inputs are JSON envelopes cannot; the compiler holds the line, not a
-review comment. The same boundary makes the UI an ordinary consumer of the
+that has no model/loader dependency cannot call that loader; the compiler holds
+the dependency line. The same boundary makes the UI an ordinary consumer of the
 envelope — the one SPEC §9.8 names beside the CI annotator and a team's own
 dashboard — so what it needs and what it breaks on is exactly what any
 third-party consumer needs and breaks on, and step 2 of #64 can test it as one.
+
+The read-only viewer consumes CLI output alone. The accepted future compose
+design in [ADR-0017](ADR-0017-isolated-compose.md) adds raw-byte orchestration:
+the UI may capture contained regular files, build a private Git tree/index and
+store candidate/recovery metadata, while the same executable still resolves
+intent and validates the snapshot. It cannot parse YAML/project configuration,
+infer identity or render a model by linking workspace crates. Git output and opaque
+file bytes are not additional sources of schema semantics. The responsibility
+table in [ARCHITECTURE](ARCHITECTURE.md#planned-isolated-compose) states this
+boundary; it does not enable writes in the currently shipped viewer (#750).
 
 The cost is a process per question and the JSON round trip. For one person on
 one machine, looking at one project, that is not a cost anyone can see.

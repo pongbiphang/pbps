@@ -68,11 +68,15 @@ the capture. Changes after the candidate is sealed do not enter that candidate.
    outside the permitted declaration/identity change set remain the base's
    entries. Render the diff from that exact tree with external diff and textconv
    disabled. Never reread live bytes to construct the preview's evidence.
-4. Seal the candidate on the server. Its identity binds project/repository,
-   base, complete input manifest, CLI intent, resulting tree, message, signing
-   policy and one resolved push endpoint/ref. Editing any of those fields needs
-   a new preview. The browser sends the candidate id for confirmation; it
-   cannot provide a replacement manifest, tree or destination. Stale asynchronous
+4. Allocate a fresh operation id and its output name
+   `refs/heads/pbps-compose/<operation-id>` before sealing the candidate. This
+   allocates a name, not a Git ref. Seal the candidate on the server and show
+   that name with the diff. Its identity binds project/repository, operation id,
+   base, complete input manifest, CLI intent, resulting tree, message, public
+   signing-policy fields and one credential-free destination identity/output ref
+   (defined below). Editing any bound field needs a new preview. The browser
+   sends the candidate id for confirmation; it cannot provide a replacement
+   manifest, tree or destination. Stale asynchronous
    responses cannot enable confirmation for a different form generation.
 
 An input's hash is not its entire identity: relevant path membership, absence,
@@ -95,12 +99,12 @@ not grant permission to execute repository-controlled hooks or filters.
    signing is required it must explicitly request signing. Failure to sign
    never falls back to an unsigned commit. Persist the exact resulting commit
    id and operation intent before attempting to make a branch visible.
-3. Allocate a fresh operation id and output branch under
-   `refs/heads/pbps-compose/<operation-id>`. The page shows this branch before
-   confirmation. Do not overwrite or reuse an arbitrary user branch. Prepare a
-   Git `create` transaction with `option no-deref`; while it holds the target
-   lock, verify the live target is not a symbolic ref and is not a checked-out
-   branch, including an unborn branch. Abort on a collision or unreadable check.
+3. Consume the operation id and output ref already sealed and displayed by
+   Capture and review step 4. Publication does not allocate another name or
+   mutate the candidate. Do not overwrite or reuse an arbitrary user branch.
+   Prepare a Git `create` transaction with `option no-deref`; while it holds the
+   target lock, verify the live target is not a symbolic ref and is not a
+   checked-out branch, including an unborn branch. Abort on a collision or unreadable check.
    An expected-zero CAS alone is insufficient: Git 2.43 overwrites a dangling
    symbolic ref in that case (retained experiment below).
 4. Commit that one ref transaction. There is no source HEAD lock, worktree
@@ -118,11 +122,11 @@ not grant permission to execute repository-controlled hooks or filters.
    of the same commit, different means collision, unreadable means unknown.
    An absent observation does not prove an earlier delivery never happened.
 
-The selected endpoint is one literal destination, not a remote alias that can
-fan out to several `pushurl`s or change the refspec. Reuse the existing design's
-bounded transport and signing helper policies: no interactive credential or
-pinentry prompt, finite deadline, and no automatic retry that changes the
-candidate or commit. MR links are derived from the selected known hosting shape;
+The selected endpoint is one credential-free literal destination, not a remote
+alias that can fan out to several `pushurl`s or change the refspec. Reuse the
+existing design's bounded transport and signing helper policies: no interactive
+credential or pinentry prompt, finite deadline, and no automatic retry that
+changes the candidate or commit. MR links are derived from the selected known hosting shape;
 an unknown host still gets the exact repository, branch and commit result.
 
 The retained Git execution safeguards are part of this contract, not optional
@@ -133,21 +137,97 @@ features of the discarded placement protocol:
   Disable replace objects, fsmonitor, hooks, external diff, textconv and filters;
   use literal pathspecs and raw objects. Reject relevant unsupported attributes
   instead of silently changing the bytes a user expects Git to record.
-- Resolve exactly one push URL. Refuse rewrite rules that can redirect the
-  chosen endpoint between observation and push. Freeze that configuration for
-  the operation. Pass sensitive endpoint data through an environment-only
-  remote, not an argv URL; "literal" above means a pinned endpoint, not an
-  instruction to expose credentials in the process command line.
+- Resolve exactly one push URL and admit it under the durable identity rules
+  below. Refuse rewrite rules that can redirect the chosen endpoint between
+  observation and push. Freeze the destination binding, not a copy of the raw
+  Git configuration or authentication material. Supply the approved endpoint
+  through the runner's environment-only remote. Authentication stays in the
+  approved environment/helper path; it is never embedded into that endpoint.
 - Rebuild display URLs from scheme, host/port and path, excluding userinfo,
-  query and fragment. Sanitize subprocess diagnostics and copyable commands
-  before the page receives them. The browser cannot select an executable,
-  arbitrary Git command, transport helper or credential source.
+  query and fragment. Keep the public SSH principal in a separate labelled field
+  when it is part of the durable destination. Copyable commands use only admitted
+  public identity fields. Raw authentication-helper/transport diagnostics can
+  contain credentials outside a URL: do not persist or relay them merely because
+  URL-shaped text was redacted. Return bounded, credential-free outcome fields
+  and a generic failure when safe diagnostics cannot be established. The browser
+  cannot select an executable, arbitrary Git command, transport helper or
+  credential source.
 - Disable terminal/askpass interaction, bound the entire subprocess group by
   a deadline, and retain the ordinary configured identity/signing and approved
   credential-helper behavior within that boundary. A timeout reports a refusal
   or uncertain publication as appropriate; it does not imply no side effect.
 - Disclose beside confirmation that client hooks will not run. Server/CI policy
   remains the organization's enforcement point.
+
+### Durable identity and transient authentication
+
+The following are separate representations, not two serialized views of a raw
+URL. A redacted display string or a hash of a secret-bearing URL is not a durable
+destination binding (#750).
+
+| Representation | Contents and lifetime |
+| --- | --- |
+| Destination identity | Admitted transport, exact host/port and repository path, and any explicit public SSH principal needed to identify that path; for a local Git destination, the admitted local repository identity/path. Paired with the selected remote base ref and sealed output ref. May be persisted. |
+| Candidate/operation identity | The operation id, destination identity, reviewed input/tree/parent/message and public signing-policy fields. Immutable from preview through confirmation, commit creation, retry and restart. |
+| Invocation authentication | Git and its approved helpers obtain credentials through the existing environment/helper/configuration boundary. The UI's runner holds only the capability to invoke that boundary. Authentication material is never serialized by compose, logged, sent to the browser, stored in a snapshot, or hashed into durable binding evidence. |
+
+These persistence/output restrictions apply to compose-owned artifacts and
+diagnostics. An existing credential helper's own configured authentication store
+remains in the user's Git boundary; compose does not copy it into its records.
+
+Admit an endpoint only if its repository identity can be represented without
+authentication material. HTTP(S) endpoints containing userinfo, a query or a
+fragment are refused **before sealing**, even if stripping those parts would
+produce a plausible URL. They can encode both credentials and routing; dropping
+them would silently choose another destination. A refusal identifies the unsafe
+component category without echoing its contents, and explains how to configure
+a credential-free endpoint plus an approved credential helper/environment.
+The existing CLI remains available for unsupported endpoint forms.
+
+For supported SSH forms, an explicit public account name is routing identity,
+not the private key or passphrase. Preserve that principal as a bound field;
+changing it may select a different repository for a relative scp-like path.
+An omitted/implicit principal or an opaque transport whose effective destination
+cannot be established is refused until that form has a qualified identity
+protocol. Never infer equality by comparing two redacted strings. Normal Git
+transport and host-authentication policy remain required; this identity is not
+a new remote-server attestation scheme. The underlying URL forms are described
+in [Git's push documentation](https://git-scm.com/docs/git-push); compose's
+admission rules above are deliberately narrower than all forms Git can parse.
+
+On restart/retry, have Git reacquire authentication from the currently approved
+source and independently resolve the endpoint again. Compare all admitted identity
+fields and refs with the sealed values before contacting it for publication.
+Missing authentication is an actionable failure with the local result retained.
+Refreshed authentication for the same bound destination can proceed under the
+ordinary state/retry rules; destination or ref drift requires a new candidate
+and review. Do not persist a raw config dump, helper command, environment,
+askpass response or secret-bearing URL to make retries reproducible. Durable
+signing policy contains only public requirements/selectors, not signing secrets
+or arbitrary helper configuration.
+
+| Input or event | Required behavior |
+| --- | --- |
+| HTTPS URL with userinfo | Refuse the endpoint without copying the userinfo into a candidate, receipt, log or HTTP response. |
+| HTTPS URL with a query token | Refuse the query form; do not remove the query and claim the resulting repository was reviewed. |
+| Explicit `git@host:team/repository.git` | Bind the public `git` principal, host, exact repository path and refs. Key/passphrase material stays transient. |
+| Credential-free HTTPS plus a credential helper | Persist only the admitted destination fields; obtain authentication for each invocation through the approved helper. |
+| Restart with missing/expired authentication | Preserve the receipt and local commit; report an authentication failure without changing the destination or regenerating a commit. |
+| Authentication refreshed for the same identity | Reuse the same operation and recorded commit where the publication state permits retry; do not regenerate a branch name. |
+| Changed host, port, path, public SSH principal or ref | Refuse reuse of the candidate, even if a display label or remote alias stayed the same. |
+| Unknown or unrepresentable endpoint | Named refusal; no guessed normalization or durable raw-URL fallback. |
+
+The sequence is therefore: allocate identity/name, seal and show it, confirm that
+candidate, create its exact commit, publish its already named ref, and reconcile
+that same operation on retry/restart. Refresh creates a new candidate identity
+and requires a new confirmation. An old confirmation never targets the refreshed
+candidate. The concrete publication/retirement states remain #746/#747.
+
+#746/#747 must exercise fake credential markers in userinfo, query tokens and
+helper output and assert they never appear in durable files, logs or HTTP
+responses. Endpoint-drift refusal and authentication refresh for the same
+identity need positive/negative controls. These are production implementation
+requirements, not properties demonstrated by the local bare-remote spike.
 
 ## State and retirement
 
@@ -171,8 +251,9 @@ the intent CLI or regenerate signed commits from a timestamped recipe.
 
 Records are operational evidence, not schema truth or approval. Keep a compact
 receipt of each published operation (base/input identity, commit, output ref,
-destination and result) outside browser storage. On restart the UI lists these
-results and pending recovery before accepting another confirmation. Repeated
+credential-free destination identity and result) outside browser storage. A
+receipt is never a copy of the raw endpoint/authentication configuration.
+On restart the UI lists these results and pending recovery before accepting another confirmation. Repeated
 confirmation/retry of the same operation returns the existing outcome. A new
 launch token grants access to this local evidence without reviving an old
 browser token.
@@ -227,12 +308,14 @@ write endpoint. Delivery remains #494, coordinated with PR #738's owner:
 
 | Issue | Selected scope |
 | --- | --- |
+| #750 | Clarify immutable operation/destination identity, credential-free persistence and the orchestration responsibility boundary before production implementation. |
 | #745 | Immutable isolated capture/tree/diff, guarded subprocess reuse, browser candidate generation and exact-output tests. Preview never invokes live placement. |
 | #746 | Single fresh-branch publication, explicit uncertain/published outcomes, receipts, retry and shared restart reconciler. No source-index or source-HEAD transaction. |
 | #747 | Durable private-record/resource ownership and retirement; remove live-placement recovery paths and safely identify legacy experimental records. |
 | #748 | Deterministic subprocess interruption/fault seams introduced alongside the operations above, then the full restart and browser qualification matrix. |
 
-Work proceeds sequentially after this decision: #745, #746, #747, then #748.
+Work proceeds sequentially after the #750 contract clarification: #745, #746,
+#747, then #748.
 Each implementation introduces the minimal controllable boundaries and property
 tests it needs; #748 completes the cross-boundary qualification. Do not build a
 large test harness for a protocol that is being deleted. The feature remains
