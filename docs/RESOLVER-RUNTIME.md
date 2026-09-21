@@ -5,6 +5,11 @@ by the CLI (#606); binding planning is still gated on the later #595 steps.
 Acquisition and a live candidate are not environment compatibility, deployment
 authorization, retained-source permission or sealed binding evidence.
 
+The staged replacement for descendant-based process observation is documented
+in [namespace-scoped observation](RESOLVER-NAMESPACE.md). Its primitive and
+fixtures are available under #740; production caller migration and the revised
+launch/target contracts remain #741–#743.
+
 ## Supported initial profile
 
 `linux-amd64-v1` uses a direct local Docker Unix API and a native Linux target

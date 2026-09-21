@@ -14156,3 +14156,28 @@ SPEC is in sync with all of these.
      #745–#748 implement and qualify the selected protocol. The read-only UI
      remains read-only until that delivery is complete; old experimental
      recovery records must be recognized and refused without losing evidence.
+
+528. **Observe a pinned PID-namespace procfs view without claiming a complete
+     process tree (issue #740).** A parent's exit can reparent a living child
+     behind a descendant walk's cursor without making any read fail. A procfs
+     view tied to the selected namespace avoids that dependency and bounds a
+     private container's enumeration without translating every local PID by
+     scanning the host. The anchor, namespace handle, procfs filesystem and
+     exact mount are pinned; hidden-process views and unverified mount layouts
+     refuse. Ordinary paths cannot cross a mount, including a same-filesystem
+     bind over one numeric process entry.
+
+     Task coordinates carry their namespace. A local number is neither an
+     observer PID nor a live identity; held task directories and start times
+     bind status reads, and per-thread reads include surviving workers after
+     their leader exits. A proven exit differs from an unreadable live task,
+     unknown view, or replaced identity. Sequential observations are still not
+     an atomic snapshot or continuous containment. Namespace membership,
+     cgroup membership, engine origin and connection ownership remain separate
+     questions, with launch controls enforcing restrictions between reads.
+
+     The primitive is introduced before caller migration (#741), the verified
+     launch boundary (#742), and native target integration (#743). It does not
+     certify those later contracts or replace the existing production callers
+     in this stage. See [the contract, pre-implementation measurements and
+     repeatable fixture](RESOLVER-NAMESPACE.md).

@@ -16,12 +16,16 @@ use std::path::{Path, PathBuf};
 mod daemon;
 pub(crate) mod executables;
 mod execution;
+mod namespace;
 mod private_channel;
 mod target;
 pub(crate) use daemon::DaemonLease;
 pub(crate) use execution::{
     BoundedResourceLease, ExecutionLease, ExecutionProfile, MountEntry, ResourceCeilings,
     cgroup_relative, mount_rows,
+};
+pub use namespace::{
+    NamespaceError, NamespaceProcfs, NamespaceTaskId, TaskObservation, TaskReading,
 };
 pub(crate) use private_channel::{
     PrivateChannelLease, PrivateChannelProfile, awaiting_engine, guard, private_network, security,
