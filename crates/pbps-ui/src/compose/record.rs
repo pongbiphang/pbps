@@ -1,13 +1,16 @@
 //! Compact operational evidence. No source placement or authentication data.
 
-use std::fs::{self, DirBuilder, File, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::{Candidate, Destination, Error, Result, SigningPolicy, git::Git, random_id};
+use super::{
+    Candidate, Destination, Error, Result, SigningPolicy,
+    durable::{self, Directory, ResourceObserver},
+    git::Git,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -110,6 +113,7 @@ impl RemotePhase {
 #[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum Phase {
     Preparing,
+    CommitKnown { commit: String },
     Prepared { commit: String },
     LocalAttempt { commit: String },
     LocalPublished { commit: String, remote: RemotePhase },
@@ -119,7 +123,8 @@ impl Phase {
     pub fn commit(&self) -> Option<&str> {
         match self {
             Self::Preparing => None,
-            Self::Prepared { commit }
+            Self::CommitKnown { commit }
+            | Self::Prepared { commit }
             | Self::LocalAttempt { commit }
             | Self::LocalPublished { commit, .. } => Some(commit),
         }
@@ -197,84 +202,50 @@ pub(super) fn oid(value: &str) -> bool {
 
 pub(super) struct Records {
     pub root: PathBuf,
-    _lock: File,
+    pub directory: Directory,
+    _lock: super::durable::Lease,
 }
 
 impl Records {
-    pub fn open(common: &Path) -> Result<Self> {
-        let root = common.join("pbps-compose-v2");
-        match DirBuilder::new().mode(0o700).create(&root) {
-            Ok(()) => (),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
-            Err(_) => return Err(Error::new("Cannot create the private compose records")),
+    pub fn open(common: &Path, observer: ResourceObserver) -> Result<Self> {
+        let directory = durable::store(common, observer)?;
+        let lock = directory.lock("owner.lock")?;
+        let records = Self {
+            root: directory.path.clone(),
+            directory,
+            _lock: lock,
+        };
+        records.names()?;
+        Ok(records)
+    }
+
+    fn names(&self) -> Result<Vec<String>> {
+        self._lock.check()?;
+        let mut ids = Vec::new();
+        for name in self.directory.names()? {
+            match name.as_str() {
+                "owner.lock" | "resources.lock" | "no-hooks" | "resources" | "snapshots" => (),
+                _ if name.strip_suffix(".json").is_some_and(identity) => {
+                    ids.push(name.trim_end_matches(".json").to_owned());
+                }
+                _ => {
+                    return Err(Error::new(
+                        "Unknown compose evidence must be preserved and resolved before publication",
+                    ));
+                }
+            }
         }
-        let metadata = fs::symlink_metadata(&root)
-            .map_err(|_| Error::new("Cannot inspect the compose records"))?;
-        if !metadata.is_dir()
-            || metadata.uid() != rustix::process::geteuid().as_raw()
-            || metadata.mode() & 0o077 != 0
-        {
-            return Err(Error::new(
-                "Compose records require an owned private directory",
-            ));
-        }
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-            .open(root.join("owner.lock"))
-            .map_err(|_| Error::new("Cannot open compose ownership evidence"))?;
-        if !lock
-            .metadata()
-            .map_err(|_| Error::new("Cannot inspect compose ownership"))?
-            .is_file()
-        {
-            return Err(Error::new(
-                "Compose ownership evidence is not a regular file",
-            ));
-        }
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-            .map_err(|_| Error::new("Another compose publisher owns this repository"))?;
-        // The lock file remains in place. Unlinking a locked inode would allow
-        // another publisher to lock a different inode under the same name.
-        Ok(Self { root, _lock: lock })
+        Ok(ids)
     }
 
     pub fn load(&self, id: &str) -> Result<Option<Record>> {
+        self.names()?;
         if !identity(id) {
             return Err(Error::new("Invalid compose operation identity"));
         }
-        let mut file = match OpenOptions::new()
-            .read(true)
-            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-            .open(self.root.join(format!("{id}.json")))
-        {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => {
-                return Err(Error::new(
-                    "The compose receipt is unreadable; preserve its evidence",
-                ));
-            }
+        let Some(bytes) = self.directory.read(&format!("{id}.json"), 1024 * 1024)? else {
+            return Ok(None);
         };
-        if !file
-            .metadata()
-            .map_err(|_| Error::new("Cannot inspect a compose receipt"))?
-            .is_file()
-        {
-            return Err(Error::new("A compose receipt is not a regular file"));
-        }
-        let mut bytes = Vec::new();
-        Read::by_ref(&mut file)
-            .take(1024 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| Error::new("Cannot read a compose receipt"))?;
-        if bytes.len() > 1024 * 1024 {
-            return Err(Error::new("Compose receipt exceeds its size limit"));
-        }
         let record: Record = serde_json::from_slice(&bytes)
             .map_err(|_| Error::new("The compose receipt is invalid; preserve it for diagnosis"))?;
         record.validate(id)?;
@@ -282,22 +253,8 @@ impl Records {
     }
 
     pub fn list(&self) -> Result<Vec<Record>> {
-        let mut ids = Vec::new();
-        for entry in
-            fs::read_dir(&self.root).map_err(|_| Error::new("Cannot enumerate compose receipts"))?
-        {
-            let name = entry
-                .map_err(|_| Error::new("Cannot enumerate compose receipts"))?
-                .file_name();
-            let name = name
-                .to_str()
-                .ok_or_else(|| Error::new("Invalid compose record name"))?;
-            if let Some(id) = name.strip_suffix(".json") {
-                ids.push(id.to_owned());
-            }
-        }
-        ids.sort();
-        ids.into_iter()
+        self.names()?
+            .into_iter()
             .map(|id| {
                 self.load(&id)?
                     .ok_or_else(|| Error::new("A compose receipt disappeared during discovery"))
@@ -309,24 +266,7 @@ impl Records {
         record.validate(&record.description.operation_id)?;
         let bytes = serde_json::to_vec(record)
             .map_err(|_| Error::new("Cannot encode a compose receipt"))?;
-        let temporary = self.root.join(format!("pending-{}", random_id()?));
-        let result = (|| -> std::io::Result<()> {
-            let mut file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .mode(0o600)
-                .open(&temporary)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            fs::rename(
-                &temporary,
-                self.root
-                    .join(format!("{}.json", record.description.operation_id)),
-            )?;
-            File::open(&self.root)?.sync_all()
-        })();
-        // A failure after rename can already have installed the new phase.
-        // Callers reconcile disk evidence and never infer rollback permission.
-        result.map_err(|_| Error::new("Compose receipt persistence is unresolved"))
+        self.directory
+            .save(&format!("{}.json", record.description.operation_id), &bytes)
     }
 }

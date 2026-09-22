@@ -1,7 +1,6 @@
 //! Publication only advances durable authorization. Recovery never replays it.
 
-use std::fs::{self, DirBuilder};
-use std::os::unix::fs::DirBuilderExt;
+use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
@@ -18,6 +17,7 @@ use super::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DurableStage {
     Preparing,
+    CommitKnown,
     Prepared,
     LocalAttempt,
     LocalPublished,
@@ -43,6 +43,7 @@ type Observer<'a> = &'a dyn Fn(PublicationBoundary) -> bool;
 fn stage(record: &Record) -> DurableStage {
     match &record.state {
         Phase::Preparing => DurableStage::Preparing,
+        Phase::CommitKnown { .. } => DurableStage::CommitKnown,
         Phase::Prepared { .. } => DurableStage::Prepared,
         Phase::LocalAttempt { .. } => DurableStage::LocalAttempt,
         Phase::LocalPublished {
@@ -66,10 +67,19 @@ pub struct Publications {
     git: Git,
     repository: RepositoryIdentity,
     records: Records,
+    resources: super::resources::Resources,
 }
 
 impl Publications {
     pub fn open(repository: &Path, deadline: Duration) -> Result<Self> {
+        Self::open_with_resources(repository, deadline, super::ResourceObserver::default())
+    }
+
+    pub fn open_with_resources(
+        repository: &Path,
+        deadline: Duration,
+        observer: super::ResourceObserver,
+    ) -> Result<Self> {
         let mut git = Git {
             root: repository.to_path_buf(),
             hooks: "/dev/null".into(),
@@ -77,20 +87,16 @@ impl Publications {
         };
         let identity = RepositoryIdentity::capture(&git)?;
         git.root = identity.source.clone();
-        let records = Records::open(&identity.common)?;
+        super::durable::refuse_legacy(&git)?;
+        let records = Records::open(&identity.common, observer.clone())?;
         git.hooks = records.root.join("no-hooks");
-        match DirBuilder::new().mode(0o700).create(&git.hooks) {
-            Ok(()) => (),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
-            Err(_) => return Err(Error::new("Cannot establish disabled compose hooks")),
-        }
-        if !fs::symlink_metadata(&git.hooks).is_ok_and(|m| m.is_dir()) {
-            return Err(Error::new("Invalid compose hooks directory"));
-        }
+        records.directory.child("no-hooks", true)?;
+        let resources = super::resources::Resources::open(&git, observer)?;
         Ok(Self {
             git,
             repository: identity,
             records,
+            resources,
         })
     }
 
@@ -172,6 +178,10 @@ impl Publications {
             Ok(None) => (),
         }
         let admission = (|| {
+            self.source_binding(&description)?;
+            self.resources
+                .admit(&id, &description.binding, &description.base, None)
+                .map_err(|_| Problem::ResourceUnavailable)?;
             self.remote_base(&description)?;
             self.signing(&description)?;
             if refs::observe(&self.git, &description.output_ref) != RefEvidence::Absent {
@@ -217,7 +227,16 @@ impl Publications {
         }
         let result = (|| {
             let d = &record.description;
-            let mut args = vec!["commit-tree", d.tree.as_str(), "-p", d.base.as_str()];
+            let mut args = vec![
+                "-c",
+                "core.fsync=all",
+                "-c",
+                "core.fsyncMethod=fsync",
+                "commit-tree",
+                d.tree.as_str(),
+                "-p",
+                d.base.as_str(),
+            ];
             args.push(if d.signing.required {
                 "-S"
             } else {
@@ -237,6 +256,13 @@ impl Publications {
             if !oid(&commit) || commit.len() != d.base.len() {
                 return Err(Problem::CommitUnavailable);
             }
+            record.state = Phase::CommitKnown {
+                commit: commit.clone(),
+            };
+            self.persist(&record, observer)?;
+            self.resources
+                .known_commit(&id, &commit)
+                .map_err(|_| Problem::ResourceUnavailable)?;
             record.state = Phase::Prepared { commit };
             self.persist(&record, observer)?;
             self.publish_local(&mut record, observer)?;
@@ -262,7 +288,19 @@ impl Publications {
             input.as_bytes(),
             None,
         )?;
-        self.git.bytes(&["index-pack", "--stdin"], &pack, None)?;
+        self.git.bytes(
+            &[
+                "-c",
+                "core.fsync=all",
+                "-c",
+                "core.fsyncMethod=fsync",
+                "index-pack",
+                "--stdin",
+            ],
+            &pack,
+            None,
+        )?;
+        self.resources.flush_import()?;
         Ok(())
     }
 
@@ -275,6 +313,14 @@ impl Publications {
             return Err(Problem::InvalidAction);
         };
         let commit = commit.clone();
+        self.resources
+            .admit(
+                &record.description.operation_id,
+                &record.description.binding,
+                &record.description.base,
+                Some(&commit),
+            )
+            .map_err(|_| Problem::ResourceUnavailable)?;
         self.remote_base(&record.description)?;
         let prepared = refs::Prepared::create(&self.git, &record.description.output_ref, &commit)
             .map_err(|_| Problem::RefCollision)?;
@@ -296,6 +342,9 @@ impl Publications {
         prepared
             .commit()
             .map_err(|_| Problem::PublicationUncertain)?;
+        self.resources
+            .flush_publication_ref(&record.description.output_ref)
+            .map_err(|_| Problem::PersistenceUncertain)?;
         if !observer(PublicationBoundary::RefInstalled) {
             return Err(Problem::Interrupted);
         }
@@ -319,6 +368,14 @@ impl Publications {
             return Err(Problem::InvalidAction);
         };
         let commit = commit.clone();
+        self.resources
+            .admit(
+                &record.description.operation_id,
+                &record.description.binding,
+                &record.description.base,
+                Some(&commit),
+            )
+            .map_err(|_| Problem::ResourceUnavailable)?;
         self.remote_base(&record.description)?;
         if refs::observe(&self.git, &record.description.output_ref)
             != RefEvidence::Direct(commit.clone())
@@ -366,6 +423,14 @@ impl Publications {
             return Err(Problem::InvalidAction);
         };
         let (commit, generation) = (commit.clone(), generation.clone());
+        self.resources
+            .admit(
+                &record.description.operation_id,
+                &record.description.binding,
+                &record.description.base,
+                Some(&commit),
+            )
+            .map_err(|_| Problem::ResourceUnavailable)?;
         if !observer(PublicationBoundary::BeforePush) {
             return Err(Problem::Interrupted);
         }
@@ -416,9 +481,34 @@ impl Publications {
             return recover::classify(&record, RefEvidence::Unreadable, None, Some(error));
         }
         let local = refs::observe(&self.git, &record.description.output_ref);
+        if !matches!(record.state, Phase::Preparing | Phase::CommitKnown { .. })
+            && self
+                .resources
+                .admit(
+                    &record.description.operation_id,
+                    &record.description.binding,
+                    &record.description.base,
+                    record.state.commit(),
+                )
+                .is_err()
+        {
+            problem = Some(Problem::ResourceUnavailable);
+        }
         if let Phase::LocalAttempt { commit } = &record.state
             && local == RefEvidence::Direct(commit.clone())
         {
+            if self
+                .resources
+                .flush_publication_ref(&record.description.output_ref)
+                .is_err()
+            {
+                return recover::classify(
+                    &record,
+                    local,
+                    None,
+                    Some(Problem::PersistenceUncertain),
+                );
+            }
             record.state = Phase::LocalPublished {
                 commit: commit.clone(),
                 remote: RemotePhase::Unattempted,
@@ -461,7 +551,22 @@ impl Publications {
                 problem = Some(error);
             }
         }
-        recover::classify(&record, local, remote, problem)
+        let mut result = recover::classify(&record, local, remote, problem);
+        result.cleanup_pending = self
+            .resources
+            .report(&record.description.operation_id)
+            .map_or(true, |r| r.cleanup_pending);
+        if matches!(
+            problem,
+            Some(
+                Problem::ResourceUnavailable
+                    | Problem::ReceiptUnavailable
+                    | Problem::PersistenceUncertain
+            )
+        ) {
+            result.cleanup_pending = true;
+        }
+        result
     }
 
     /// Read and reconcile only. In particular, absence after authorization is
@@ -485,6 +590,88 @@ impl Publications {
             .collect())
     }
 
+    pub fn resource_reports(&self) -> Result<Vec<super::ResourceReport>> {
+        self.resources.list()
+    }
+
+    pub fn recover_resources(&mut self, id: &str) -> Result<super::ResourceReport> {
+        self.recover_resources_at(id, std::time::SystemTime::now())
+    }
+
+    pub fn recover_resources_at(
+        &mut self,
+        id: &str,
+        now: std::time::SystemTime,
+    ) -> Result<super::ResourceReport> {
+        if self.records.load(id)?.is_none() {
+            self.resources.expire(id, now)?;
+        }
+        self.resources.resume_retirement(id)
+    }
+
+    pub fn discard_preview(&mut self, id: &str) -> Result<super::ResourceReport> {
+        if self.records.load(id)?.is_some() {
+            return Err(Error::new(
+                "A publication receipt cannot be discarded as a preview",
+            ));
+        }
+        self.resources.discard_preview(id)?;
+        self.resources.report(id)
+    }
+
+    /// Retire a completed snapshot while the exact commit stays rooted for its
+    /// retained receipt. An uncertain publication never enters this path.
+    pub fn cleanup(&mut self, id: &str) -> Outcome {
+        let record = match self.records.load(id) {
+            Ok(Some(record)) => record,
+            _ => return Outcome::unavailable(id, Problem::ReceiptUnavailable),
+        };
+        if !matches!(
+            record.state,
+            Phase::LocalPublished {
+                remote: RemotePhase::Delivered { .. },
+                ..
+            }
+        ) {
+            return self.reconcile(record, Some(Problem::InvalidAction), &|_| true);
+        }
+        let problem = self
+            .resources
+            .retire(id, true)
+            .err()
+            .map(|_| Problem::ResourceUnavailable);
+        self.finish(record, problem, &|_| true)
+    }
+
+    /// Explicitly forget a completed receipt; public Git branches are untouched.
+    pub fn forget(&mut self, id: &str) -> Result<super::ResourceReport> {
+        let record = self.records.load(id)?;
+        if let Some(record) = record {
+            if !matches!(
+                record.state,
+                Phase::LocalPublished {
+                    remote: RemotePhase::Delivered { .. },
+                    ..
+                }
+            ) {
+                return Err(Error::new(
+                    "Resolve publication before forgetting its receipt",
+                ));
+            }
+            self.source_binding(&record.description)
+                .map_err(|_| Error::new("The receipt repository is unavailable or changed"))?;
+            self.resources.retire(id, false)?;
+            self.records.directory.remove(&format!("{id}.json"))?;
+        }
+        let report = self.resources.report(id)?;
+        if report.state != super::ResourceState::Spent {
+            return Err(Error::new(
+                "Receipt retirement is incomplete; preserve its resource evidence",
+            ));
+        }
+        Ok(report)
+    }
+
     /// Only work that has no prior durable attempt may advance on ordinary
     /// retry. An attempted operation is always reconciled without replay.
     pub fn retry(&mut self, id: &str) -> Outcome {
@@ -503,7 +690,10 @@ impl Publications {
                 remote: RemotePhase::Unattempted,
                 ..
             } => self.publish_remote(&mut record, observer),
-            Phase::Preparing | Phase::LocalAttempt { .. } | Phase::LocalPublished { .. } => {
+            Phase::Preparing
+            | Phase::CommitKnown { .. }
+            | Phase::LocalAttempt { .. }
+            | Phase::LocalPublished { .. } => {
                 return self.reconcile(record, None, observer);
             }
         };

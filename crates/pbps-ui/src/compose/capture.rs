@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, DirBuilder};
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
@@ -15,32 +15,49 @@ use super::{
 
 pub(super) struct Workspace {
     pub path: PathBuf,
+    pub resources: super::resources::Resources,
+    pub operation: String,
+    observer: super::ResourceObserver,
 }
 
 impl Workspace {
-    fn new(id: &str) -> Result<Self> {
-        let path = std::env::temp_dir().join(format!("pbps-compose-{id}"));
-        DirBuilder::new()
-            .mode(0o700)
-            .create(&path)
-            .map_err(|_| Error::new("Could not allocate a private candidate directory"))?;
-        let workspace = Self { path };
-        let path = &workspace.path;
-        fs::create_dir(path.join("no-hooks"))
-            .map_err(|_| Error::new("Could not create the private Git hooks directory"))?;
-        fs::create_dir(path.join("repository"))
-            .map_err(|_| Error::new("Could not create the candidate snapshot"))?;
-        Ok(workspace)
+    fn new(id: &str, git: &Git, base: &str, observer: super::ResourceObserver) -> Result<Self> {
+        let resources = super::resources::Resources::open(git, observer.clone())?;
+        let path = resources.begin(id, base)?;
+        observer.around(
+            super::ResourceOperation::Create,
+            &path.join("no-hooks"),
+            || {
+                fs::create_dir(path.join("no-hooks"))
+                    .map_err(|_| Error::new("Could not create the private Git hooks directory"))
+            },
+        )?;
+        observer.around(
+            super::ResourceOperation::Create,
+            &path.join("repository"),
+            || {
+                fs::create_dir(path.join("repository"))
+                    .map_err(|_| Error::new("Could not create the candidate snapshot"))
+            },
+        )?;
+        Ok(Self {
+            path,
+            resources,
+            operation: id.into(),
+            observer,
+        })
+    }
+
+    pub fn retire_preview(&self) -> Result<()> {
+        if self.resources.report(&self.operation)?.state != super::ResourceState::Sealed {
+            return Err(Error::new("Only a sealed unconfirmed preview may expire"));
+        }
+        self.resources.discard_preview(&self.operation)
     }
 }
 
-impl Drop for Workspace {
-    fn drop(&mut self) {
-        // No published operation lives here yet. #747 owns durable recovery
-        // and explicit retirement before any write endpoint is enabled.
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
+// Dropping an in-memory handle cannot prove that children stopped or that a
+// fallible retirement completed. Durable resource records outlive this handle.
 
 #[derive(Clone)]
 struct TreeEntry {
@@ -207,17 +224,28 @@ fn blobs(git: &Git, entries: &BTreeMap<String, TreeEntry>) -> Result<BTreeMap<St
     Ok(result)
 }
 
-fn remove_input(root: &Path, name: &str, declarations: &str) -> Result<()> {
+fn remove_input(
+    root: &Path,
+    name: &str,
+    declarations: &str,
+    observer: &super::ResourceObserver,
+) -> Result<()> {
     let path = root.join(name);
-    fs::remove_file(&path)
-        .map_err(|_| Error::new("Could not represent an absent input in the snapshot"))?;
+    observer.around(super::ResourceOperation::Remove, &path, || {
+        fs::remove_file(&path)
+            .map_err(|_| Error::new("Could not represent an absent input in the snapshot"))
+    })?;
     let mut parent = path.parent();
     let declarations = root.join(declarations);
     while let Some(directory) =
         parent.filter(|directory| *directory != root && *directory != declarations)
     {
+        observer.at(super::ResourceOperation::Remove, false, directory)?;
         match fs::remove_dir(directory) {
-            Ok(()) => parent = directory.parent(),
+            Ok(()) => {
+                observer.at(super::ResourceOperation::Remove, true, directory)?;
+                parent = directory.parent();
+            }
             Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
             Err(_) => {
                 return Err(Error::new(
@@ -229,29 +257,44 @@ fn remove_input(root: &Path, name: &str, declarations: &str) -> Result<()> {
     Ok(())
 }
 
-fn write_file(root: &Path, name: &str, content: &FileBytes) -> Result<()> {
+fn write_file(
+    root: &Path,
+    name: &str,
+    content: &FileBytes,
+    observer: &super::ResourceObserver,
+) -> Result<()> {
     files::path(name)?;
     let path = root.join(name);
     // Only this private, fresh directory is written. All materialized names
     // were checked and every base object is a regular file, never a symlink.
-    fs::create_dir_all(path.parent().expect("contained file parent"))
-        .map_err(|_| Error::new("Could not create a private snapshot directory"))?;
+    observer.around(
+        super::ResourceOperation::Create,
+        path.parent().expect("contained file parent"),
+        || {
+            fs::create_dir_all(path.parent().unwrap())
+                .map_err(|_| Error::new("Could not create a private snapshot directory"))
+        },
+    )?;
     if path.is_dir() {
-        fs::remove_dir(&path).map_err(|_| {
-            Error::new("A declaration replacement would remove preserved base content")
+        observer.around(super::ResourceOperation::Remove, &path, || {
+            fs::remove_dir(&path).map_err(|_| {
+                Error::new("A declaration replacement would remove preserved base content")
+            })
         })?;
     }
+    observer.at(super::ResourceOperation::Write, false, &path)?;
     fs::write(&path, &content.bytes)
         .map_err(|_| Error::new("Could not write a private snapshot file"))?;
     fs::set_permissions(
-        path,
+        &path,
         fs::Permissions::from_mode(if content.mode == 0o100755 {
             0o700
         } else {
             0o600
         }),
     )
-    .map_err(|_| Error::new("Could not preserve a candidate Git mode"))
+    .map_err(|_| Error::new("Could not preserve a candidate Git mode"))?;
+    observer.at(super::ResourceOperation::Write, true, &path)
 }
 
 pub(super) fn signing(git: &Git) -> Result<SigningPolicy> {
@@ -318,6 +361,7 @@ struct AttributeView {
     indexes: Vec<(PathBuf, BTreeSet<String>)>,
     recorded: BTreeMap<String, Option<FileBytes>>,
     normalizer: Git,
+    observer: super::ResourceObserver,
 }
 
 impl AttributeView {
@@ -327,10 +371,13 @@ impl AttributeView {
         names: &BTreeSet<String>,
         workspace: &Path,
         placeholder: &str,
+        observer: super::ResourceObserver,
     ) -> Result<Self> {
         let directory = workspace.join("attribute-view");
-        fs::create_dir(&directory)
-            .map_err(|_| Error::new("Could not create the private attribute view"))?;
+        observer.around(super::ResourceOperation::Create, &directory, || {
+            fs::create_dir(&directory)
+                .map_err(|_| Error::new("Could not create the private attribute view"))
+        })?;
         // Deleted ancestors and new descendants cannot coexist in a Git
         // index. Partition names into compatible views; normally one suffices,
         // while a file/directory replacement needs a second view.
@@ -420,6 +467,7 @@ impl AttributeView {
         }
         let mut recorded = blobs(git, &entries)?;
         let view = Self {
+            observer,
             normalizer: Git {
                 root: directory.clone(),
                 hooks: git.hooks.clone(),
@@ -445,8 +493,14 @@ impl AttributeView {
             &[],
             false,
         )?;
-        fs::create_dir_all(view.directory.join(".git/info"))
-            .map_err(|_| Error::new("Could not prepare the private line-ending policy"))?;
+        view.observer.around(
+            super::ResourceOperation::Create,
+            &view.directory.join(".git/info"),
+            || {
+                fs::create_dir_all(view.directory.join(".git/info"))
+                    .map_err(|_| Error::new("Could not prepare the private line-ending policy"))
+            },
+        )?;
         Ok(view)
     }
 
@@ -481,11 +535,21 @@ impl AttributeView {
         // Git itself decides CRLF/binary heuristics, including bare CR mixed
         // with CRLF under text=auto. `input` and `true` have the same inbound
         // normalization; checkout and safecrlf warnings are not involved.
+        self.observer.at(
+            super::ResourceOperation::Write,
+            false,
+            &self.directory.join(".git/info/attributes"),
+        )?;
         fs::write(
             self.directory.join(".git/info/attributes"),
             format!("probe {policy} -filter -ident -working-tree-encoding\n"),
         )
         .map_err(|_| Error::new("Could not set the private line-ending policy"))?;
+        self.observer.at(
+            super::ResourceOperation::Write,
+            true,
+            &self.directory.join(".git/info/attributes"),
+        )?;
         let raw =
             self.normalize_command(&["hash-object", "--no-filters", "--stdin"], bytes, autocrlf)?;
         let converted =
@@ -655,6 +719,7 @@ pub(super) fn capture(
     config: &Config,
     request: Request,
     observer: &dyn Fn(CaptureBoundary),
+    resource_observer: super::ResourceObserver,
 ) -> Result<Candidate> {
     if request.message.trim().is_empty()
         || request.message.len() > 16 * 1024
@@ -663,8 +728,7 @@ pub(super) fn capture(
         return Err(Error::new("Provide a nonempty bounded commit message"));
     }
     let operation_id = random_id()?;
-    let workspace = Workspace::new(&operation_id)?;
-    let hooks = workspace.path.join("no-hooks");
+    let hooks = PathBuf::from("/dev/null");
     let selected_root = Root::open(&config.project)?;
     let selected = config
         .project
@@ -710,6 +774,8 @@ pub(super) fn capture(
     }
     let destination = destination::resolve(&git, &request.remote)?;
     let signing = signing(&git)?;
+    let workspace = Workspace::new(&operation_id, &git, &base, resource_observer)?;
+    let hooks = workspace.path.join("no-hooks");
     let root = Root::open(&source)?;
     let entries = tree_entries(&git, &base, &project)?;
     let recorded = blobs(&git, &entries)?;
@@ -724,7 +790,7 @@ pub(super) fn capture(
     }
     let snapshot = workspace.path.join("repository");
     for (name, file) in &recorded {
-        write_file(&snapshot, name, file)?;
+        write_file(&snapshot, name, file, &workspace.observer)?;
     }
     let snapshot_git = Git {
         root: snapshot.clone(),
@@ -751,11 +817,21 @@ pub(super) fn capture(
     if objects.contains(['\n', '\r']) {
         return Err(Error::new("Unsupported Git object directory path"));
     }
+    workspace.observer.at(
+        super::ResourceOperation::Write,
+        false,
+        &snapshot.join(".git/objects/info/alternates"),
+    )?;
     fs::write(
         snapshot.join(".git/objects/info/alternates"),
         format!("{objects}\n"),
     )
     .map_err(|_| Error::new("Could not connect the private Git object view"))?;
+    workspace.observer.at(
+        super::ResourceOperation::Write,
+        true,
+        &snapshot.join(".git/objects/info/alternates"),
+    )?;
     snapshot_git.bytes(
         &["update-ref", "refs/heads/captured-base", &base],
         &[],
@@ -795,6 +871,7 @@ pub(super) fn capture(
         &names,
         &workspace.path,
         &entries[&project_file].oid,
+        workspace.observer.clone(),
     )?;
     let (evidence, captured) =
         manifest(&git, &root, &names, &declarations, &base, &attribute_view)?;
@@ -823,12 +900,12 @@ pub(super) fn capture(
     // Deleting a whole directory would discard unrelated base entries.
     for (name, file) in &captured {
         if file.is_none() && recorded.contains_key(name) {
-            remove_input(&snapshot, name, &declarations)?;
+            remove_input(&snapshot, name, &declarations, &workspace.observer)?;
         }
     }
     for (name, file) in &captured {
         if let Some(file) = file {
-            write_file(&snapshot, name, file)?;
+            write_file(&snapshot, name, file, &workspace.observer)?;
         }
     }
     cli.record(&snapshot_project, &request.intent, &base)?;
@@ -934,23 +1011,22 @@ pub(super) fn capture(
         destination: &'a super::Destination,
         signing: &'a SigningPolicy,
     }
-    let binding = digest(
-        &serde_json::to_vec(&Binding {
-            version: 1,
-            repository: &source,
-            repository_identity: &repository_identity,
-            project: &project,
-            operation: &operation_id,
-            output_ref: &output_ref,
-            base: &base,
-            tree: &tree,
-            manifest: &evidence,
-            request: &request,
-            destination: &destination,
-            signing: &signing,
-        })
-        .map_err(|_| Error::new("Could not seal the candidate identity"))?,
-    );
+    let sealed_binding = serde_json::to_vec(&Binding {
+        version: 1,
+        repository: &source,
+        repository_identity: &repository_identity,
+        project: &project,
+        operation: &operation_id,
+        output_ref: &output_ref,
+        base: &base,
+        tree: &tree,
+        manifest: &evidence,
+        request: &request,
+        destination: &destination,
+        signing: &signing,
+    })
+    .map_err(|_| Error::new("Could not seal the candidate identity"))?;
+    let binding = digest(&sealed_binding);
     let preview = Preview {
         candidate_id: random_id()?,
         operation_id,
@@ -962,6 +1038,9 @@ pub(super) fn capture(
         destination,
         signing,
     };
+    workspace
+        .resources
+        .seal(&preview.operation_id, &preview.tree, &sealed_binding)?;
     Ok(Candidate {
         preview,
         request,

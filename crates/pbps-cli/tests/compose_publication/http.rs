@@ -274,6 +274,7 @@ fn authentication_failure_before_delivery_can_retry_the_same_commit_without_leak
             .unwrap()
             .contains("FAKE_HELPER_SECRET")
     );
+    resources::private_bytes_exclude(&f, "FAKE_HELPER_SECRET");
     drop(publisher);
     http.mode.store(0, Ordering::SeqCst);
     let result = f.publisher().retry(&preview.operation_id);

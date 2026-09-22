@@ -289,6 +289,7 @@ The live error path and startup recovery use one reconciler and these outcomes:
 | --- | --- | --- |
 | No receipt | Import the reviewed raw tree objects; persist `Preparing` before one `commit-tree` invocation. | Failed admission cannot publish a ref. |
 | `Preparing` | Only the current authorized invocation may construct the commit. | Missing acknowledgment stays preparation-unknown; restart cannot regenerate it. |
+| `CommitKnown(commit)` | Only the current invocation may acquire and acknowledge its private exact-commit root. | An interrupted root acquisition preserves its record and any ref; restart cannot infer ownership from a matching OID or regenerate the commit. |
 | `Prepared(commit)` | Prepare a no-deref create transaction, inspect collisions/checkouts while holding its lock, then persist `LocalAttempt`. | Failed prerequisite persistence aborts the transaction. The known commit remains available. |
 | `LocalAttempt(commit)` | Only the already-owned live transaction may send commit. | Exact direct ref means published; absent means unknown; symbolic, changed or unreadable evidence requires recovery. Restart never recreates the ref. |
 | `LocalPublished(commit, Unattempted)` | Revalidate endpoint/base and output ref; persist a remote attempt before a bounded expected-absent push. | Definite pre-attempt authentication/observation failure preserves the local result and permits ordinary retry. |
@@ -330,7 +331,7 @@ Completed snapshots may be removed after the receipt is durable; output branches
 and compact receipts are never automatically deleted. The results view provides
 an explicit forget action for completed receipts, explaining that it leaves the
 Git branch intact. Refusal and cleanup failure must remain distinguishable from
-success. #747 defines the precise durable record/cleanup implementation.
+success. The resource lifecycle below implements that contract (#747).
 
 ## Continued editing
 
@@ -415,13 +416,54 @@ retains known commit details after a failed read, discovers saved operations and
 separates continuation from an explicitly authorized old-base alternative.
 The alternative also pins that base through its next preview.
 
-Receipt writes use a private temporary file, file sync, rename and directory
-sync; repository-scoped ownership uses a retained flock inode. These are the
-minimal publication prerequisites, not completed power-loss/hostile-path
-qualification. #747 still owns private-object GC roots, resource retirement,
-legacy evidence admission and lower-level ownership/durability fault seams.
-The result therefore continues to report private cleanup pending; no receipt
-forget action or write endpoint is enabled yet.
+Resource durability and retirement are implemented by #747 and DECISIONS 535.
+The private common-directory namespace is `pbps-compose-v2`; publication receipts,
+resource records and snapshots are separate. The retained `owner.lock` inode
+serializes publishers. A short `resources.lock` lease serializes resource
+transitions, so capture does not require closing the publisher. Explicit checked
+unlock avoids extending a lease through another thread's forked open description;
+destructor unlock is fallback only and never certifies completed cleanup.
+
+| Resource state | Durable evidence and permitted retirement |
+| --- | --- |
+| `Capturing` | Acquisition intent precedes snapshot creation and each Git pin. Only acknowledged inode/ref ownership is recorded as owned. An interrupted unsealed capture remains a named manual-recovery obligation because surviving children and unacknowledged entries cannot be inferred away. |
+| `Sealed` | The complete credential-free binding manifest, private tree root and flushed inventory are acknowledged. Explicit discard, replacement, or 24-hour expiry may retire this unconfirmed preview. |
+| `Confirmed` | Publication may proceed only with the same manifest binding and owned base/exact-commit roots. Neither expiry nor preview discard applies. |
+| `Retiring` | Retirement intent and its keep-commit choice are durable before deleting anything. Restart resumes that choice, preserving changed, unknown, foreign and unreadable evidence. |
+| `Retained` | A completed snapshot and base pin are retired; the compact receipt and exact-commit root remain available. Explicit forget can retire the receipt and that root. |
+| `Spent` | A compact tombstone revokes all old candidate handles. Public output branches remain untouched. |
+
+Before an alternate borrows source objects, an operation-specific private annotated
+Git tag roots the base. Sealing roots the private candidate tree. After the one
+commit invocation acknowledges its OID, `CommitKnown` records it before acquiring
+its exact-commit root; only acknowledged root ownership permits `Prepared`.
+Pin creation is a fresh no-deref transaction. Pin deletion checks the recorded
+value and direct-ref type under Git's transaction lock; a matching value without
+acknowledged acquisition is never cleanup permission. Pending and retained roots
+survive forced source GC. Packed refs remain valid restart evidence.
+
+Record operations are descriptor-relative, no-follow, bounded regular-file
+operations. Replacement checks the prior inode and revision, writes a fresh
+private temporary file, flushes it, renames and flushes the containing directory.
+Unknown temporary names are retained as manual-recovery evidence, not swept by
+name. Snapshot retirement checks its acknowledged inventory, file identities and
+file revisions; added or changed entries block completion. Missing entries can
+discharge only an already durable retirement. Git object/ref writes request fsync,
+and affected file/directory entries are explicitly flushed before acknowledgment.
+Private inventory and manifest records are bounded to 64 MiB, 32,768 entries and
+80 directory levels; at most 32,768 operation resource records are admitted.
+Spent tombstones count toward that bound and are not automatically pruned.
+
+The production observer seam exposes operation-before/after boundaries without
+making hooks selectable through HTTP or persisted input. Tests inject I/O failure,
+kill actual processes, restart retirement twice, retain foreign locks/files, and
+exercise ordinary source `git add` after interruption. These checks do not prove
+arbitrary power-loss behavior on every filesystem or protection against an
+unrestricted malicious same-user process during private Git/CLI execution.
+#748 and integrated #494 still gate enabling writes and mounting recovery actions.
+Legacy `pbps-ui/composing` evidence refuses new compose with its location and
+matching-binary/manual recovery instructions; the new publisher never runs the
+old source-restoration algorithm.
 
 Initial capture uses Linux `openat2` no-follow reads, regular UTF-8 paths and
 the files ref backend. A selected project must have committed configuration;
@@ -452,8 +494,8 @@ and 64 directory levels. The base tree outside the project is reused without
 materialization; its complete private index is also limited to 4096 entries.
 Confirmed candidates cannot be refreshed or expired by the
 preview service; publication/receipt retirement belongs to #746/#747.
-The private object view currently borrows base objects through an alternate;
-#747 must establish durable GC reachability before enabling operations.
+The private object view borrows base objects through an alternate only after
+acknowledging its durable base root; #747 qualifies forced-GC reachability.
 
 [`spikes/git-compose-isolated`](../spikes/git-compose-isolated/README.md) runs
 real Git and the baseline CLI against local disposable repositories. It checks

@@ -44,6 +44,7 @@ pub enum DeliveryState {
 #[serde(rename_all = "snake_case")]
 pub enum Problem {
     ReceiptUnavailable,
+    ResourceUnavailable,
     RepositoryChanged,
     RepositoryUnavailable,
     DestinationChanged,
@@ -116,7 +117,9 @@ pub(super) fn classify(
     let local_matches =
         matches!(&local, RefEvidence::Direct(value) if Some(value.as_str()) == commit);
     let (local_state, mut status) = match &record.state {
-        Phase::Preparing => (LocalState::NotAttempted, Status::PreparationUnknown),
+        Phase::Preparing | Phase::CommitKnown { .. } => {
+            (LocalState::NotAttempted, Status::PreparationUnknown)
+        }
         Phase::Prepared { .. } if local == RefEvidence::Absent => {
             (LocalState::NotAttempted, Status::Prepared)
         }
@@ -141,7 +144,10 @@ pub(super) fn classify(
     };
     let remote_phase = match &record.state {
         Phase::LocalPublished { remote, .. } => Some(remote),
-        Phase::Preparing | Phase::Prepared { .. } | Phase::LocalAttempt { .. } => None,
+        Phase::Preparing
+        | Phase::CommitKnown { .. }
+        | Phase::Prepared { .. }
+        | Phase::LocalAttempt { .. } => None,
     };
     let delivery = match (remote_phase, &remote) {
         (None | Some(RemotePhase::Unattempted), _) => DeliveryState::NotAttempted,
@@ -158,7 +164,8 @@ pub(super) fn classify(
     if matches!(
         problem,
         Some(
-            Problem::PersistenceUncertain
+            Problem::ResourceUnavailable
+                | Problem::PersistenceUncertain
                 | Problem::ReceiptUnavailable
                 | Problem::RepositoryChanged
                 | Problem::RepositoryUnavailable

@@ -1,5 +1,7 @@
 //! Real publication, lost acknowledgements and restart from durable receipts.
 
+mod resources;
+
 use super::*;
 use pbps_ui::compose::{
     Candidate, DeliveryState, DurableStage, LocalState, Outcome, Preview, Problem,
