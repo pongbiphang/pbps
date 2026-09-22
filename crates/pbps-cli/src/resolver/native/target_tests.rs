@@ -32,6 +32,7 @@ async fn native_aliases_share_one_instance_and_backend_children_cannot_claim_ano
     );
     let witness = first.witness().unwrap();
     witness.check().unwrap();
+    assert!(first.identity().is_ok(), "unchanged live native target");
     let second = PeerVerifiedConn::connect(driver, &alias).await.unwrap();
     assert!(
         first
@@ -145,6 +146,55 @@ async fn native_aliases_share_one_instance_and_backend_children_cannot_claim_ano
 
     proxy::unprotected_backend_cannot_inherit_frontend_tls(driver, &primary, upstream, main_pid)
         .await;
+
+    let connection = PeerVerifiedConn::connect(driver, &primary).await.unwrap();
+    let mut expired = NativeTarget::establish(connection, main_pid).await.unwrap();
+    let witness = expired.witness().unwrap();
+    let query = match driver {
+        Driver::Postgres => "SELECT pg_backend_pid() AS id",
+        Driver::Mssql => "SELECT CONVERT(int, @@SPID) AS id",
+    };
+    let id = expired
+        .current
+        .as_mut()
+        .unwrap()
+        .connection
+        .query(query)
+        .await
+        .unwrap()[0]
+        .try_get::<i32>("id")
+        .unwrap()
+        .unwrap();
+    let mut administrator = PeerVerifiedConn::connect(driver, &primary).await.unwrap();
+    let terminate = match driver {
+        Driver::Postgres => format!("SELECT pg_terminate_backend({id}, 5000)"),
+        Driver::Mssql => format!("KILL {id}"),
+    };
+    administrator.query(&terminate).await.unwrap();
+    // Wait on independent kernel evidence of socket loss; do not invoke the
+    // target's mutating check, which would invalidate the cache for us.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while witness.check().is_ok() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        expired.identity().is_err(),
+        "a closed native socket cannot certify cached identity"
+    );
+    assert!(
+        expired.current.is_none(),
+        "accessor loss discards the complete binding"
+    );
+    let connection = PeerVerifiedConn::connect(driver, &primary).await.unwrap();
+    let mut replacement = NativeTarget::establish(connection, main_pid).await.unwrap();
+    assert!(replacement.identity().is_ok());
+    assert!(
+        expired.identity().is_err(),
+        "a new connection cannot revive the old capability"
+    );
 }
 
 // The production owner lease uses the selected procfs view. Only this owned

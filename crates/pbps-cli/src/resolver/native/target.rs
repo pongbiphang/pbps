@@ -56,6 +56,21 @@ struct BoundTarget {
     identity: InstanceObservation,
 }
 
+impl BoundTarget {
+    fn check_native(&self) -> Result<(), UnqualifiedProcess> {
+        self.lease.check(&self.connection).map_err(stage("lease"))?;
+        if self
+            .lease
+            .service()
+            .has_same_executable_parent()
+            .map_err(stage("service-root-unreadable"))?
+        {
+            return Err(stage("service-root")(UnqualifiedProcess));
+        }
+        Ok(())
+    }
+}
+
 /// Weak ownership prevents scratch from keeping a discarded target binding
 /// alive. Socket continuity still comes from the retained kernel handles.
 /// Names which reading of the target binding refused.
@@ -161,11 +176,13 @@ impl NativeTarget {
         })
     }
 
-    pub fn identity(&self) -> Result<&InstanceObservation, UnqualifiedProcess> {
-        self.current
-            .as_ref()
-            .map(|current| &current.identity)
-            .ok_or(UnqualifiedProcess)
+    pub fn identity(&mut self) -> Result<&InstanceObservation, UnqualifiedProcess> {
+        // A cached engine observation is usable only while its native socket
+        // and service binding still hold. Failure also expires weak witnesses.
+        let bound = self.current.take().ok_or(UnqualifiedProcess)?;
+        bound.check_native()?;
+        self.current = Some(bound);
+        Ok(&self.current.as_ref().ok_or(UnqualifiedProcess)?.identity)
     }
 
     /// The `CREATE DATABASE` recipe that reproduces the target's database on
@@ -240,18 +257,7 @@ impl NativeTarget {
         // Taking the complete binding before the first await makes failure or
         // cancellation terminal. A later change-and-restore cannot revive it.
         let mut bound = self.current.take().ok_or(UnqualifiedProcess)?;
-        bound
-            .lease
-            .check(&bound.connection)
-            .map_err(stage("lease"))?;
-        if bound
-            .lease
-            .service()
-            .has_same_executable_parent()
-            .map_err(stage("service-root-unreadable"))?
-        {
-            return Err(stage("service-root")(UnqualifiedProcess));
-        }
+        bound.check_native()?;
         let current = engine::identity(&mut bound.connection)
             .await
             .map_err(|_| stage("identity-read")(UnqualifiedProcess))?;
