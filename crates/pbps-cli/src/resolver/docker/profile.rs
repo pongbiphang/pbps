@@ -1,7 +1,7 @@
 //! Fixed launch recipes. A recipe is not a measured runtime admission.
 
 use super::{CandidateImage, Error};
-use crate::resolver::native::{FORWARDER_PRIVILEGES, WorkloadPrivileges};
+use crate::resolver::native::{FILE_DESCRIPTOR_LIMIT, FORWARDER_PRIVILEGES, WorkloadPrivileges};
 use pbps_db::Driver;
 use serde_json::{Value, json};
 
@@ -86,7 +86,7 @@ impl Launch {
                 "CgroupnsMode": "private",
                 "MaskedPaths": ["/proc/asound", "/proc/acpi", "/proc/interrupts", "/proc/kcore", "/proc/keys", "/proc/latency_stats", "/proc/timer_list", "/proc/timer_stats", "/proc/sched_debug", "/proc/scsi", "/sys"],
                 "ReadonlyPaths": ["/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"],
-                "Ulimits": [{"Name":"nofile", "Soft":1024, "Hard":1024}]
+                "Ulimits": [{"Name":"nofile", "Soft":FILE_DESCRIPTOR_LIMIT, "Hard":FILE_DESCRIPTOR_LIMIT}]
             }
         });
         Ok(Self { body })
@@ -235,7 +235,21 @@ impl Launch {
             .as_object()
             .ok_or(Error::RuntimeChanged)?
         {
-            if host[key] != *value {
+            if key == "Ulimits" {
+                // Docker appends daemon defaults for limits the launch did
+                // not specify. They must not hide or replace the requested
+                // limit, but an additional core=0 is not a changed launch.
+                let actual = host[key].as_array().ok_or(Error::RuntimeChanged)?;
+                for expected in value.as_array().ok_or(Error::RuntimeChanged)? {
+                    let name = expected["Name"].as_str().ok_or(Error::RuntimeChanged)?;
+                    let mut matching = actual
+                        .iter()
+                        .filter(|entry| entry["Name"].as_str() == Some(name));
+                    if matching.next() != Some(expected) || matching.next().is_some() {
+                        return Err(Error::RuntimeChanged);
+                    }
+                }
+            } else if host[key] != *value {
                 return Err(Error::RuntimeChanged);
             }
         }
@@ -353,6 +367,61 @@ fn isolated_environment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_defaults_do_not_replace_requested_descriptor_limits() {
+        let image: CandidateImage = serde_json::from_value::<super::super::ImageInspect>(json!({
+            "Id": format!("sha256:{}", "a".repeat(64)),
+            "Os": "linux", "Architecture": "amd64", "Config": {"Env": []}
+        }))
+        .unwrap()
+        .try_into()
+        .unwrap();
+        for driver in [Driver::Postgres, Driver::Mssql] {
+            for launch in [
+                Launch::new(&image, driver, "owner").unwrap(),
+                Launch::control(&image, driver, "owner", &"a".repeat(64), LIFETIME_SECS).unwrap(),
+            ] {
+                let mut observed = json!({
+                    "Config": launch.body.clone(),
+                    "HostConfig": launch.body["HostConfig"].clone(),
+                    "Mounts": []
+                });
+                let host = &mut observed["HostConfig"];
+                host["Privileged"] = json!(false);
+                host["PublishAllPorts"] = json!(false);
+                for key in ["PidMode", "IpcMode", "UTSMode", "UsernsMode"] {
+                    host[key] = json!("");
+                }
+                let requested = launch.body["HostConfig"]["Ulimits"][0].clone();
+                let core = json!({"Name":"core", "Soft":0, "Hard":0});
+                for limits in [
+                    json!([requested]),
+                    json!([requested, core]),
+                    json!([core, requested]),
+                ] {
+                    observed["HostConfig"]["Ulimits"] = limits;
+                    assert!(launch.check_configuration(&observed).is_ok());
+                }
+                for limits in [
+                    Value::Null,
+                    json!([]),
+                    json!([core]),
+                    json!([requested, requested]),
+                    json!([{"Name":"nofile", "Soft":1024, "Hard":2048}, core]),
+                    json!([{"Name":"nofile", "Soft":512, "Hard":1024}]),
+                    json!([{"Name":"nofile", "Soft":1024}]),
+                    json!([{"Name":"nofile", "Soft":-1, "Hard":-1}]),
+                ] {
+                    observed["HostConfig"]["Ulimits"] = limits.clone();
+                    assert!(
+                        launch.check_configuration(&observed).is_err(),
+                        "requested limit changed: {limits}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn unknown_inherited_environment_cannot_select_a_launch_profile() {

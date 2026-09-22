@@ -22,8 +22,8 @@ mod target;
 mod task_metadata;
 pub(crate) use daemon::DaemonLease;
 pub(crate) use execution::{
-    BoundedResourceLease, ExecutionLease, ExecutionProfile, MountEntry, ResourceCeilings,
-    cgroup_relative, mount_rows,
+    BoundedResourceLease, ExecutionLease, ExecutionProfile, FILE_DESCRIPTOR_LIMIT, MountEntry,
+    ResourceCeilings, cgroup_relative, mount_rows,
 };
 pub use namespace::{
     NamespaceError, NamespaceProcfs, NamespaceTaskId, TaskObservation, TaskReading,

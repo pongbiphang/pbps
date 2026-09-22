@@ -6,6 +6,20 @@ use crate::resolver::native::awaiting_engine;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 async fn accepts_waiter(change: impl FnOnce(&mut Launch)) -> bool {
+    inspect_waiter(change, |run, driver| {
+        awaiting_engine(
+            run.native_pid().unwrap(),
+            &engine::private_channel_profile(driver),
+        )
+        .is_ok()
+    })
+    .await
+}
+
+async fn inspect_waiter(
+    change: impl FnOnce(&mut Launch),
+    inspect: impl FnOnce(&CandidateRun, Driver) -> bool,
+) -> bool {
     let socket = std::env::var("PBPS_RESOLVER_TEST_SOCKET").unwrap();
     let reference = std::env::var("PBPS_RESOLVER_TEST_IMAGE").unwrap();
     let driver = match std::env::var("PBPS_RESOLVER_TEST_DRIVER").unwrap().as_str() {
@@ -43,7 +57,10 @@ async fn accepts_waiter(change: impl FnOnce(&mut Launch)) -> bool {
         }
         // Never send the start line: refusal must precede initialization,
         // independently of any later database handshake or declaration.
-        Ok(awaiting_engine(run.native_pid()?, &engine::private_channel_profile(driver)).is_ok())
+        let accepted = inspect(&run, driver);
+        // A host-side limit change must not alter Docker's reported recipe.
+        run.check().await?;
+        Ok(accepted)
     };
     let result = tokio::time::timeout(std::time::Duration::from_secs(15), observed).await;
     run.close().await.unwrap();
@@ -114,4 +131,161 @@ async fn the_launch_cannot_omit_inherited_no_new_privileges() {
         !accepted,
         "exec must not regain privileges after the checked drop"
     );
+}
+
+/// Changes only this fixture's held guard/waiter; the daemon still reports
+/// the requested 1024:1024 profile throughout each observation.
+#[tokio::test]
+#[ignore = "requires the explicit owned rootful Docker fixture on its native host"]
+async fn effective_descriptor_limits_are_required_before_initialization() {
+    use crate::resolver::native::{ExecutionLease, ProcessLease};
+    use rustix::process::{Pid, Resource, Rlimit, prlimit};
+
+    let mut accepted_unbounded = Vec::new();
+    for subject in ["guard", "waiter"] {
+        let accepted = inspect_waiter(
+            |_| {},
+            |run, driver| {
+                let pid = run.native_pid().unwrap();
+                let root = ProcessLease::capture(pid).unwrap();
+                let execution =
+                    ExecutionLease::capture(pid, engine::workload_limits(driver)).unwrap();
+                let limits = |process: &ProcessLease| {
+                    process.check().unwrap();
+                    let text = process.read_proc("limits", 16384).unwrap();
+                    let row = text
+                        .lines()
+                        .find(|line| line.starts_with("Max open files"))
+                        .unwrap()
+                        .to_owned();
+                    process.check().unwrap();
+                    row
+                };
+                let children = root
+                    .read_proc(&format!("task/{pid}/children"), 4096)
+                    .unwrap();
+                let children: Vec<u32> = children
+                    .split_whitespace()
+                    .map(|id| id.parse().unwrap())
+                    .collect();
+                assert_eq!(
+                    children.len(),
+                    1,
+                    "the fixed waiter has not begun initialization"
+                );
+                let waiter = ProcessLease::capture(children[0]).unwrap();
+                eprintln!(
+                    "nofile before {subject}: guard={}, waiter={}",
+                    limits(&root),
+                    limits(&waiter)
+                );
+                assert!(awaiting_engine(pid, &engine::private_channel_profile(driver)).is_ok());
+                let selected = if subject == "guard" { &root } else { &waiter };
+                let selected_pid =
+                    Pid::from_raw(selected.observer_pid().unwrap().try_into().unwrap()).unwrap();
+                prlimit(
+                    Some(selected_pid),
+                    Resource::Nofile,
+                    Rlimit {
+                        current: Some(1024),
+                        maximum: Some(2048),
+                    },
+                )
+                .unwrap();
+                selected.check().unwrap();
+                eprintln!(
+                    "nofile raised {subject}: guard={}, waiter={}",
+                    limits(&root),
+                    limits(&waiter)
+                );
+                if subject == "waiter" {
+                    // Lowering a parent's limit does not change an already-forked
+                    // child. A guard-only reading cannot certify the waiter.
+                    prlimit(
+                        Some(Pid::from_raw(pid.try_into().unwrap()).unwrap()),
+                        Resource::Nofile,
+                        Rlimit {
+                            current: Some(512),
+                            maximum: Some(512),
+                        },
+                    )
+                    .unwrap();
+                    eprintln!(
+                        "nofile lowered parent: guard={}, waiter={}",
+                        limits(&root),
+                        limits(&waiter)
+                    );
+                    assert!(
+                        execution.check().is_ok(),
+                        "a tighter root ceiling is bounded"
+                    );
+                    awaiting_engine(pid, &engine::private_channel_profile(driver)).is_ok()
+                } else {
+                    execution.check().is_ok()
+                }
+            },
+        )
+        .await;
+        if accepted {
+            accepted_unbounded.push(subject);
+        }
+    }
+    assert!(
+        accepted_unbounded.is_empty(),
+        "effective descriptor limits accepted: {accepted_unbounded:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the owned Docker fixture and a private observer mount namespace"]
+async fn unreadable_effective_limits_are_not_a_bounded_answer() {
+    use crate::resolver::native::{ExecutionLease, ProcessLease};
+    use std::process::Command;
+    assert_eq!(
+        std::env::var("PBPS_LIMITS_PRIVATE_PROC_FIXTURE").as_deref(),
+        Ok("1")
+    );
+    assert_ne!(
+        std::fs::read_link("/proc/self/ns/mnt").unwrap(),
+        std::fs::read_link("/proc/1/ns/mnt").unwrap()
+    );
+    let accepted = inspect_waiter(
+        |_| {},
+        |run, driver| {
+            let pid = run.native_pid().unwrap();
+            let process = ProcessLease::capture(pid).unwrap();
+            let execution = ExecutionLease::capture(pid, engine::workload_limits(driver)).unwrap();
+            let target = format!("/proc/{pid}/limits");
+            // Only this observer's private mount namespace changes. clear_refs
+            // has no read operation, while stat/exe/namespace identity stay live.
+            assert!(
+                Command::new("mount")
+                    .args(["--bind", &format!("/proc/{pid}/clear_refs"), &target])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let unreadable = process.read_proc("limits", 16384).is_err();
+            let unchanged = process.check().is_ok();
+            let accepted = execution.check().is_ok();
+            assert!(
+                Command::new("umount")
+                    .arg(&target)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(
+                unreadable && unchanged,
+                "refusal must concern limits, not lost identity"
+            );
+            assert!(
+                execution.check().is_ok(),
+                "restoring the observer view restores the kernel evidence"
+            );
+            accepted
+        },
+    )
+    .await;
+    assert!(!accepted, "unreadable effective limits were admitted");
 }

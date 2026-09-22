@@ -35,6 +35,10 @@ impl WorkloadPrivileges {
         let status = status(process)?;
         check_status(&status, self.uid, self.capabilities)?;
         check_groups(&status, self.gid, false)?;
+        // Children created before a guard's limit was lowered retain their
+        // old hard ceiling. Check the existing waiter/task observations too;
+        // this adds no claim of exhaustive lifetime enumeration (#632).
+        super::execution::check_file_descriptors(process)?;
         process.check()
     }
 }
