@@ -400,7 +400,13 @@ impl CandidateSession {
 
     pub fn identity(&mut self) -> Result<&InstanceObservation, Error> {
         let state = self.state.as_ref().ok_or(Error::ControlLost)?;
-        if let Err(error) = check_target(state) {
+        // The supervisor cannot clear this handle's cached state. Revalidate
+        // its native leases here even when no async check preceded the read.
+        let outcome = check_target(state).and_then(|()| match &state.native {
+            Some(native) => native.check(state),
+            None => Ok(()), // Only private transport fixtures lack native admission.
+        });
+        if let Err(error) = outcome {
             self.state = None;
             return Err(error);
         }

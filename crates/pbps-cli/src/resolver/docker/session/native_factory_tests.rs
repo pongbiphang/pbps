@@ -24,7 +24,16 @@ async fn native_factory_qualifies_before_bootstrap_and_rejects_rebound_target_co
         image: std::env::var("PBPS_RESOLVER_TEST_IMAGE").unwrap(),
         pull: PullPolicy::Never,
     };
-    for action in ["close", "rebound", "drop-target"] {
+    let mut stale_identities = Vec::new();
+    for action in [
+        "close",
+        "rebound",
+        "drop-target",
+        "kill-control",
+        "kill-workload",
+        "control-limit",
+        "workload-limit",
+    ] {
         let peer = PeerVerifiedConn::connect(driver, &primary).await.unwrap();
         let mut target = Some(NativeTarget::establish(peer, service).await.unwrap());
         let mut api = LocalApi::connect_native(&socket).await.unwrap();
@@ -44,6 +53,8 @@ async fn native_factory_qualifies_before_bootstrap_and_rejects_rebound_target_co
             .await
             .expect("the complete native factory must pass its real startup and backend gates");
         session.check().await.unwrap();
+        assert!(session.identity().is_ok(), "unchanged live candidate");
+        assert!(target.as_mut().unwrap().identity().is_ok());
         session
             .verify_target_separation(target.as_mut().unwrap())
             .await
@@ -68,7 +79,55 @@ async fn native_factory_qualifies_before_bootstrap_and_rejects_rebound_target_co
             .await
             .unwrap();
         session.check().await.unwrap();
-        if action == "rebound" {
+        if action.starts_with("kill-") || action.ends_with("-limit") {
+            let state = session.state.as_ref().unwrap();
+            let run = if action.contains("control") {
+                &state.control
+            } else {
+                &state.workload
+            };
+            if action.starts_with("kill-") {
+                let mut observer = LocalApi::connect_native(&socket).await.unwrap();
+                let (status, _) = observer
+                    .request(
+                        hyper::Method::POST,
+                        &format!("/v1.47/containers/{}/kill?signal=KILL", run.container_id()),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(status, hyper::StatusCode::NO_CONTENT);
+            } else {
+                // Change the actual owned cgroup without changing Docker's
+                // reported recipe, so only the native lease can notice it.
+                let cgroup =
+                    std::fs::read_to_string(format!("/proc/{}/cgroup", run.native_pid().unwrap()))
+                        .unwrap();
+                let relative = cgroup.trim().strip_prefix("0::/").unwrap();
+                let path = std::path::Path::new("/sys/fs/cgroup")
+                    .join(relative)
+                    .join("pids.max");
+                let previous: u64 = std::fs::read_to_string(&path)
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                std::fs::write(&path, (previous + 1).to_string()).unwrap();
+            }
+            target.as_mut().unwrap().check().await.unwrap();
+            // No CandidateSession::check may precede this access: that would
+            // erase the stale cached capability this regression exercises.
+            if session.identity().is_ok() {
+                stale_identities.push(action);
+            } else {
+                assert!(session.identity().is_err(), "failure is terminal");
+                assert!(session.check().await.is_err());
+            }
+            // Also clean up on the deliberately broken baseline, before the
+            // assertion below, so a regression cannot strand its fixtures.
+            if session.state.is_some() {
+                let _ = session.close().await;
+            }
+        } else if action == "rebound" {
             let peer = PeerVerifiedConn::connect(driver, &primary).await.unwrap();
             let mut replacement = NativeTarget::establish(peer, service).await.unwrap();
             assert!(
@@ -128,4 +187,8 @@ async fn native_factory_qualifies_before_bootstrap_and_rejects_rebound_target_co
             target.check().await.unwrap();
         }
     }
+    assert!(
+        stale_identities.is_empty(),
+        "direct identity access accepted expired runtime leases: {stale_identities:?}"
+    );
 }

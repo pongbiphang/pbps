@@ -343,6 +343,12 @@ socket. Dropping or cancelling the target invalidates scratch's next identity
 or continuity check; the scratch handle cannot keep that discarded connection
 alive merely by retaining its opaque identifier.
 
+Reading a cached identity revalidates its synchronous native leases: the target's
+socket/backend/service binding, and the candidate's workload/control containment
+and private channel. Failure discards the affected capability permanently, even
+without a preceding asynchronous continuity check; owned scratch cleanup follows
+the same drop path. This does not replace the engine re-read in that check.
+
 ## External containment
 
 | Boundary | Enforced premise |
