@@ -473,6 +473,12 @@ Private inventory and manifest records are bounded to 64 MiB, 32,768 entries and
 80 directory levels; at most 32,768 operation resource records are admitted.
 Spent tombstones count toward that bound and are not automatically pruned.
 
+A sealed capture rejected by the alternative-base check is retired through the
+same authorized preview-discard flow before its handle is released (#782).
+It keeps the ordinary spent tombstone. Failed retirement reports both the base
+mismatch and the pending cleanup, preserving its record and any foreign entries
+for discovery and restart; confirmed and unknown operations remain ineligible.
+
 Definite capture rejection follows DECISIONS 536 (#780). Bound the base tree and
 blobs and check committed configuration before acquiring private resources.
 Checks that require the private snapshot first capture a flushed inventory of
