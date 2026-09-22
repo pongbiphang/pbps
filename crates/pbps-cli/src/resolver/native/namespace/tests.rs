@@ -1,6 +1,57 @@
 use super::*;
 
 #[test]
+#[ignore = "requires the root-owned group helper from live-resolver-namespace.py"]
+fn a_process_with_the_kernel_maximum_groups_can_be_captured() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Command, Stdio};
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let helper = std::env::var("PBPS_GROUP_FIXTURE_HELPER").unwrap();
+    let mut child = OwnedChild(
+        Command::new(helper)
+            .arg("maximum-groups")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = child.0.stdin.take().unwrap();
+    let mut output = BufReader::new(child.0.stdout.take().unwrap());
+    let mut line = String::new();
+    output.read_line(&mut line).unwrap();
+    assert_eq!(line.trim(), "ready");
+    let status = std::fs::read_to_string(format!("/proc/{}/status", child.0.id())).unwrap();
+    assert!(status.len() > 65536);
+    let maximum: usize = std::fs::read_to_string("/proc/sys/kernel/ngroups_max")
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("Groups:"))
+            .unwrap()
+            .split_whitespace()
+            .count(),
+        maximum
+    );
+    let lease = ProcessLease::capture(child.0.id())
+        .expect("kernel-supported supplementary groups must not prevent process capture");
+    lease.check().unwrap();
+    assert_eq!(lease.namespace_pid, child.0.id());
+    input.write_all(b"q").unwrap();
+    assert!(child.0.wait().unwrap().success());
+    assert!(lease.check().is_err());
+}
+
+#[test]
 fn opaque_task_names_preserve_observation_identity_and_credentials() {
     let Ok(pid) = std::env::var("PBPS_NAMESPACE_NAME_PID") else {
         return;

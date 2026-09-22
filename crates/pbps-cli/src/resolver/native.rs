@@ -251,9 +251,12 @@ impl ProcessLease {
     fn capture_held(directory: File, source: ProcSource) -> Result<Self, UnqualifiedProcess> {
         let base = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
         let start_ticks = start_ticks(&base).map_err(Reading::CaptureStartTicks.named())?;
+        // Capturing identity imposes no supplementary-group policy. Linux
+        // permits 65,536 groups, each needing up to 11 bytes in status; leave
+        // room for the other fields instead of refusing valid native peers.
         let status = read_status(
             File::open(base.join("status")).map_err(Reading::CaptureStatus.named())?,
-            65536,
+            1024 * 1024,
         )
         .map_err(Reading::CaptureStatus.named())?;
         let namespace_pid = status

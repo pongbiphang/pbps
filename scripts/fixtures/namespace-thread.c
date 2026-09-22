@@ -3,10 +3,12 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <linux/capability.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/mman.h>
@@ -33,6 +35,18 @@ static void *root_worker(void *unused) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "maximum-groups")) {
+        long count = sysconf(_SC_NGROUPS_MAX);
+        if (count <= 0 || count > 65536) return 1;
+        gid_t *groups = calloc(count, sizeof(*groups));
+        if (!groups) return 1;
+        for (long i = 0; i < count; ++i) groups[i] = UINT32_MAX - 1 - i;
+        if (setgroups(count, groups)) return 1;
+        free(groups);
+        puts("ready");
+        fflush(stdout);
+        return getchar() == 'q' ? 0 : 1;
+    }
     if (argc == 3 && !strcmp(argv[1], "mapping-ranges")) {
         int fd = open(argv[2], O_RDONLY);
         long length = sysconf(_SC_PAGESIZE);
