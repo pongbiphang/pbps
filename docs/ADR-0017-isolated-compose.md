@@ -155,6 +155,8 @@ features of the discarded placement protocol:
   through the runner's environment-only remote. Disable HTTP(S) redirects for
   observations and pushes, including inherited URL-scoped `followRedirects`
   overrides: the configured identity does not bind a redirected repository.
+  Clear inherited `push.pushOption` values for each invocation: server-specific
+  actions such as CI or merge-request controls are not part of the sealed change.
   Authentication stays in the approved environment/helper path; it is never
   embedded into that endpoint.
 - Rebuild display URLs from scheme, host/port and path, excluding userinfo,

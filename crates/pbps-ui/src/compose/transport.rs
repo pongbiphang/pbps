@@ -22,6 +22,9 @@ fn command(git: &Git, description: &Description) -> Result<(std::process::Comman
     let settings = [
         (format!("remote.{alias}.url"), endpoint.clone()),
         (format!("remote.{alias}.pushurl"), endpoint.clone()),
+        // Push options can trigger server actions outside the reviewed change.
+        // An empty high-priority value clears Git's inherited multi-value list.
+        ("push.pushOption".into(), String::new()),
         ("http.followRedirects".into(), "false".into()),
         (format!("http.{endpoint}.followRedirects"), "false".into()),
         (

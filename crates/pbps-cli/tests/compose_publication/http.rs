@@ -281,3 +281,77 @@ fn authentication_failure_before_delivery_can_retry_the_same_commit_without_leak
     assert_eq!(result.details.unwrap().commit, commit);
     f.source_unchanged(&before);
 }
+
+fn inherited_push_options(advertise: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new(&format!("push-options-{advertise}"));
+    let http = Http::new(&f);
+    let server = http.root.join("reviewed.git");
+    git(
+        &server,
+        &[
+            "config",
+            "receive.advertisePushOptions",
+            if advertise { "true" } else { "false" },
+        ],
+    );
+    let hook = server.join("hooks/pre-receive");
+    fs::write(&hook, b"#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' \"${GIT_PUSH_OPTION_COUNT-unnegotiated}\" >> compose-push-options\n").unwrap();
+    fs::set_permissions(hook, fs::Permissions::from_mode(0o700)).unwrap();
+    git(
+        &f.repo.root,
+        &["remote", "set-url", "origin", &http.endpoint()],
+    );
+    let included = f.repo.root.join(".git/inherited-options.conf");
+    fs::write(&included, b"[push]\n\tpushOption = ci.skip\n").unwrap();
+    git(
+        &f.repo.root,
+        &["config", "include.path", included.to_str().unwrap()],
+    );
+    git(
+        &f.repo.root,
+        &["config", "--add", "push.pushOption", "merge_request.create"],
+    );
+    let configured = git(&f.repo.root, &["config", "--get-all", "push.pushOption"]);
+    assert_eq!(configured, b"ci.skip\nmerge_request.create\n");
+    let (_store, preview, candidate) = f.ready();
+    let before = f.repo.preserved();
+    let mut publisher = f.publisher();
+    let first = publisher.confirm(&candidate);
+    assert_eq!(first.status, Status::Delivered, "{first:?}");
+    let observed = server.join("compose-push-options");
+    let assert_no_options = |count| {
+        let values = fs::read_to_string(&observed).unwrap();
+        assert_eq!(values.lines().count(), count);
+        assert!(
+            values
+                .lines()
+                .all(|value| matches!(value, "0" | "unnegotiated")),
+            "unreviewed options reached the server: {values}"
+        );
+    };
+    assert_no_options(1);
+    // The shared transport guard also covers explicit same-commit republish.
+    git(&server, &["update-ref", "-d", &preview.output_ref]);
+    let changed = publisher.recover(&preview.operation_id);
+    assert_eq!(changed.remote, DeliveryState::Changed);
+    let republished = publisher.republish(&preview.operation_id, &generation(&changed));
+    assert_eq!(republished.status, Status::Delivered, "{republished:?}");
+    assert_eq!(commit(&republished), commit(&first));
+    assert_no_options(2);
+    assert_eq!(
+        git(&f.repo.root, &["config", "--get-all", "push.pushOption"]),
+        configured
+    );
+    f.source_unchanged(&before);
+}
+
+#[test]
+fn inherited_push_options_are_not_sent_to_a_supporting_server() {
+    inherited_push_options(true);
+}
+
+#[test]
+fn inherited_push_options_do_not_refuse_a_server_without_option_support() {
+    inherited_push_options(false);
+}
