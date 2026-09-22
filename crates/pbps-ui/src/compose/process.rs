@@ -132,3 +132,216 @@ mod tests {
         );
     }
 }
+
+/// A bounded exchange for Git's prepared ref transaction. The caller sends
+/// only fixed protocol commands, with a total input budget below a pipe page.
+pub(super) struct Transaction {
+    child: Option<Child>,
+    input: Option<std::process::ChildStdin>,
+    events: mpsc::Receiver<TransactionEvent>,
+    started: Instant,
+    deadline: Duration,
+    sent: usize,
+    stdout_closed: bool,
+    stderr_closed: bool,
+}
+
+enum TransactionEvent {
+    Line(Vec<u8>),
+    StdoutClosed,
+    StderrClosed,
+    Failed,
+}
+
+impl Transaction {
+    pub fn start(mut command: Command, deadline: Duration) -> Result<Self> {
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+        command
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|_| Error::new("Cannot start the ref transaction"))?;
+        let input = child.stdin.take();
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let (sender, events) = mpsc::sync_channel(16);
+        let errors = sender.clone();
+        std::thread::spawn(move || {
+            let event = if read(stderr).is_ok() {
+                TransactionEvent::StderrClosed
+            } else {
+                TransactionEvent::Failed
+            };
+            let _ = errors.send(event);
+        });
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            loop {
+                let mut line = Vec::new();
+                let result = reader.by_ref().take(8193).read_until(b'\n', &mut line);
+                let event = match result {
+                    Ok(0) => TransactionEvent::StdoutClosed,
+                    Ok(_) if line.len() <= 8192 && line.ends_with(b"\n") => {
+                        TransactionEvent::Line(line)
+                    }
+                    _ => TransactionEvent::Failed,
+                };
+                let end = !matches!(event, TransactionEvent::Line(_));
+                if sender.send(event).is_err() || end {
+                    break;
+                }
+            }
+        });
+        Ok(Self {
+            child: Some(child),
+            input,
+            events,
+            started: Instant::now(),
+            deadline,
+            sent: 0,
+            stdout_closed: false,
+            stderr_closed: false,
+        })
+    }
+
+    fn remaining(&self) -> Result<Duration> {
+        self.deadline
+            .checked_sub(self.started.elapsed())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| Error::new("Compose ref transaction exceeded its deadline"))
+    }
+
+    fn event(&mut self) -> Result<Option<Vec<u8>>> {
+        let remaining = self.remaining()?;
+        match self
+            .events
+            .recv_timeout(remaining.min(Duration::from_millis(5)))
+        {
+            Ok(TransactionEvent::Line(line)) => Ok(Some(line)),
+            Ok(TransactionEvent::StdoutClosed) => {
+                self.stdout_closed = true;
+                Ok(None)
+            }
+            Ok(TransactionEvent::StderrClosed) => {
+                self.stderr_closed = true;
+                Ok(None)
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+                if self.stdout_closed && self.stderr_closed =>
+            {
+                std::thread::sleep(remaining.min(Duration::from_millis(5)));
+                Ok(None)
+            }
+            _ => Err(Error::new("Compose ref transaction exchange failed")),
+        }
+    }
+
+    pub fn exchange(&mut self, input: &str, expected: &[u8]) -> Result<()> {
+        self.remaining()?;
+        self.sent += input.len();
+        if self.sent > 4096 || self.stdout_closed {
+            return Err(Error::new("Invalid ref transaction exchange"));
+        }
+        self.input
+            .as_mut()
+            .ok_or_else(|| Error::new("The ref transaction is closed"))?
+            .write_all(input.as_bytes())
+            .map_err(|_| Error::new("Ref transaction acknowledgement is unavailable"))?;
+        loop {
+            if let Some(line) = self.event()? {
+                return if line == expected {
+                    Ok(())
+                } else {
+                    Err(Error::new("Unexpected ref transaction acknowledgement"))
+                };
+            }
+            if self.stdout_closed {
+                return Err(Error::new("Ref transaction ended before acknowledgement"));
+            }
+        }
+    }
+
+    pub fn finish(mut self) -> Result<()> {
+        self.input.take();
+        loop {
+            let status = self
+                .child
+                .as_mut()
+                .expect("owned child")
+                .try_wait()
+                .map_err(|_| Error::new("Cannot determine ref transaction outcome"))?;
+            if let Some(status) = status
+                && self.stdout_closed
+                && self.stderr_closed
+            {
+                self.child.take();
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(Error::new("Git refused the ref transaction"))
+                };
+            }
+            if self.event()?.is_some() {
+                return Err(Error::new("Unexpected trailing ref transaction output"));
+            }
+        }
+    }
+}
+
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        self.input.take();
+        if let Some(child) = &mut self.child {
+            kill(child);
+        }
+    }
+}
+
+#[cfg(test)]
+mod transaction_tests {
+    use super::*;
+
+    #[test]
+    fn interactive_deadline_includes_a_helper_retaining_the_acknowledgement_pipe() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "read line; printf 'start: ok\\n'; sleep 30 & exit 0"]);
+        let start = Instant::now();
+        let mut transaction = Transaction::start(command, Duration::from_millis(100)).unwrap();
+        transaction.exchange("start\n", b"start: ok\n").unwrap();
+        assert!(
+            transaction
+                .finish()
+                .unwrap_err()
+                .to_string()
+                .contains("deadline")
+        );
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn interactive_exchange_requires_exact_acknowledgements_and_bounded_input() {
+        let mut transaction =
+            Transaction::start(Command::new("cat"), Duration::from_secs(2)).unwrap();
+        transaction.exchange("start\n", b"start\n").unwrap();
+        assert!(transaction.exchange("prepare\n", b"prepare: ok\n").is_err());
+        let mut transaction =
+            Transaction::start(Command::new("cat"), Duration::from_secs(2)).unwrap();
+        assert!(
+            transaction
+                .exchange(&"x".repeat(4097), b"unused\n")
+                .is_err()
+        );
+        assert!(
+            Transaction::start(
+                Command::new("/nonexistent/pbps-transaction"),
+                Duration::from_secs(1)
+            )
+            .is_err()
+        );
+    }
+}

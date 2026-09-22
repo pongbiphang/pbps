@@ -1,6 +1,6 @@
 //! Immutable isolated candidates (ADR-0017, DECISIONS 530).
 //!
-//! This backend has no source placement, user-index installation or publisher.
+//! Publication adds only private evidence, Git objects and a fresh output ref.
 //! The viewer continues to reject writes until #746–#748 qualify delivery.
 
 mod capture;
@@ -9,6 +9,11 @@ mod destination;
 mod files;
 mod git;
 mod process;
+mod record;
+mod recover;
+mod refs;
+mod run;
+mod transport;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -21,6 +26,9 @@ use sha2::{Digest, Sha256};
 pub use cli::Intent;
 pub use destination::Destination;
 pub use files::Evidence;
+pub use recover::{DeliveryState, Details, LocalState, Outcome, Problem, Status};
+pub use refs::RefEvidence;
+pub use run::{DurableStage, PublicationBoundary, Publications};
 
 #[derive(Debug)]
 pub struct Error(String);
@@ -66,7 +74,8 @@ pub struct Request {
 }
 
 /// Only public requirements/selectors, never helper commands or secrets.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SigningPolicy {
     required: bool,
     format: Option<String>,
@@ -105,6 +114,7 @@ pub struct Candidate {
     source: PathBuf,
     project: String,
     workspace: capture::Workspace,
+    repository_identity: record::RepositoryIdentity,
 }
 
 impl Candidate {
@@ -157,6 +167,7 @@ enum Stored {
 pub struct Candidates {
     config: Config,
     current: Option<Stored>,
+    alternative_base: Option<String>,
 }
 
 impl Candidates {
@@ -164,6 +175,7 @@ impl Candidates {
         Self {
             config,
             current: None,
+            alternative_base: None,
         }
     }
 
@@ -184,6 +196,15 @@ impl Candidates {
         }
         self.current = None;
         let candidate = Arc::new(capture::capture(&self.config, request, observer)?);
+        if self
+            .alternative_base
+            .as_ref()
+            .is_some_and(|base| base != &candidate.preview.base)
+        {
+            return Err(Error::new(
+                "The original base changed; start a separately reviewed workflow",
+            ));
+        }
         let preview = candidate.preview.clone();
         self.current = Some(Stored::Previewed {
             candidate,

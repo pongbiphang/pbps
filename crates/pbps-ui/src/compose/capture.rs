@@ -254,7 +254,7 @@ fn write_file(root: &Path, name: &str, content: &FileBytes) -> Result<()> {
     .map_err(|_| Error::new("Could not preserve a candidate Git mode"))
 }
 
-fn signing(git: &Git) -> Result<SigningPolicy> {
+pub(super) fn signing(git: &Git) -> Result<SigningPolicy> {
     let answer = git.output(
         &["config", "--type=bool", "--get", "commit.gpgSign"],
         &[],
@@ -702,6 +702,7 @@ pub(super) fn capture(
             "Compose is qualified for the files ref backend only",
         ));
     }
+    let repository_identity = super::record::RepositoryIdentity::capture(&git)?;
     let base = git.line(&["rev-parse", "--verify", "HEAD^{commit}"])?;
     git.bytes(&["check-ref-format", &request.remote_base_ref], &[], None)?;
     if !request.remote_base_ref.starts_with("refs/heads/") {
@@ -907,6 +908,7 @@ pub(super) fn capture(
         || git.line(&["rev-parse", "--verify", "HEAD^{commit}"])? != base
         || destination::resolve(&git, &request.remote)? != destination
         || self::signing(&git)? != signing
+        || super::record::RepositoryIdentity::capture(&git)? != repository_identity
     {
         return Err(Error::new(
             "Inputs, base or publication choices changed during capture; refresh the preview",
@@ -921,6 +923,7 @@ pub(super) fn capture(
     struct Binding<'a> {
         version: u32,
         repository: &'a Path,
+        repository_identity: &'a super::record::RepositoryIdentity,
         project: &'a str,
         operation: &'a str,
         output_ref: &'a str,
@@ -935,6 +938,7 @@ pub(super) fn capture(
         &serde_json::to_vec(&Binding {
             version: 1,
             repository: &source,
+            repository_identity: &repository_identity,
             project: &project,
             operation: &operation_id,
             output_ref: &output_ref,
@@ -965,5 +969,6 @@ pub(super) fn capture(
         source,
         project,
         workspace,
+        repository_identity,
     })
 }
