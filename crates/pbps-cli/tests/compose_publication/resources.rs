@@ -1039,7 +1039,7 @@ fn resource_stop_child() {
                         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
                         .is_some_and(|r| r["state"]["phase"] == "prepared")
             }
-            "snapshot-removed-file" => {
+            "snapshot-removed-file" | "rejection-removed-file" | "rejection-recovery" => {
                 point.operation == ResourceOperation::Remove
                     && point.after
                     && path.ends_with("project/schema/t.yml")
@@ -1049,6 +1049,15 @@ fn resource_stop_child() {
         if stop {
             let id = if resource_mode == "snapshot-created" {
                 path.file_name().unwrap().to_str().unwrap().to_owned()
+            } else if resource_mode.starts_with("rejection-") {
+                path.ancestors()
+                    .find(|p| p.parent().is_some_and(|p| p.ends_with("snapshots")))
+                    .unwrap()
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned()
             } else {
                 resource_id.lock().unwrap().clone()
             };
@@ -1056,6 +1065,14 @@ fn resource_stop_child() {
         }
         true
     });
+    if mode == "rejection-recovery" {
+        let id = std::env::var("PBPS_RESOURCE_TEST_OPERATION").unwrap();
+        let mut publisher =
+            Publications::open_with_resources(&repository, Duration::from_secs(15), observer)
+                .unwrap();
+        publisher.recover_resources(&id).unwrap();
+        panic!("the rejection recovery boundary was not reached");
+    }
     let mut candidates = Candidates::with_resources(
         Config {
             executable: BIN.into(),
@@ -1064,7 +1081,14 @@ fn resource_stop_child() {
         },
         observer.clone(),
     );
-    let preview = candidates.preview(request(), SystemTime::now()).unwrap();
+    let capture_request = if mode == "rejection-removed-file" {
+        invalid_capture_request()
+    } else {
+        request()
+    };
+    let preview = candidates
+        .preview(capture_request, SystemTime::now())
+        .unwrap();
     *operation.lock().unwrap() = preview.operation_id.clone();
     let candidate = candidates
         .confirm(&preview.candidate_id, SystemTime::now())
@@ -1095,9 +1119,36 @@ fn actual_process_death_preserves_acquisition_ref_handoff_and_retirement_evidenc
         "prepared-replaced",
         "ref-prepared",
         "snapshot-removed-file",
+        "rejection-removed-file",
+        "rejection-recovery",
     ] {
         let f = Fixture::new(&format!("kill-{mode}"));
         let before = f.repo.preserved();
+        let pending = if mode == "rejection-recovery" {
+            let observer = ResourceObserver::new(|at| {
+                !(at.operation == ResourceOperation::Remove
+                    && !at.after
+                    && at.path.ends_with("project/schema/t.yml"))
+            });
+            let mut candidates = Candidates::with_resources(
+                Config {
+                    executable: BIN.into(),
+                    project: f.repo.project.clone(),
+                    deadline: Duration::from_secs(15),
+                },
+                observer,
+            );
+            assert!(
+                candidates
+                    .preview(invalid_capture_request(), SystemTime::now())
+                    .is_err()
+            );
+            let reports = f.publisher().resource_reports().unwrap();
+            assert_eq!(reports[0].state, ResourceState::Retiring);
+            reports[0].operation_id.clone()
+        } else {
+            String::new()
+        };
         let socket = f.repo.root.join("stop.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -1113,6 +1164,7 @@ fn actual_process_death_preserves_acquisition_ref_handoff_and_retirement_evidenc
             .env("PBPS_RESOURCE_TEST_REPOSITORY", &f.repo.root)
             .env("PBPS_RESOURCE_TEST_SOCKET", &socket)
             .env("PBPS_RESOURCE_TEST_MODE", mode)
+            .env("PBPS_RESOURCE_TEST_OPERATION", pending)
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log))
             .spawn()
@@ -1144,6 +1196,20 @@ fn actual_process_death_preserves_acquisition_ref_handoff_and_retirement_evidenc
             .unwrap();
         let id = operation.trim();
         assert_eq!(id.len(), 64);
+        if mode.starts_with("rejection-") {
+            let resource: serde_json::Value = serde_json::from_slice(
+                &fs::read(root(&f).join(format!("resources/{id}.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(resource["state"], "retiring");
+            assert_eq!(resource["rejected"], true);
+            assert!(
+                !root(&f)
+                    .join(format!("snapshots/{id}/repository/project/schema/t.yml"))
+                    .exists()
+            );
+            assert!(!f.record(id).exists());
+        }
         if mode == "commit-root-owned" {
             let receipt: serde_json::Value =
                 serde_json::from_slice(&fs::read(f.record(id)).unwrap()).unwrap();
@@ -1172,6 +1238,25 @@ fn actual_process_death_preserves_acquisition_ref_handoff_and_retirement_evidenc
                 .any(|r| r.operation_id == id && r.cleanup_pending)
         );
         match mode {
+            "rejection-removed-file" | "rejection-recovery" => {
+                assert_eq!(
+                    publisher.recover_resources(id).unwrap().state,
+                    ResourceState::Spent
+                );
+                drop(publisher);
+                for _ in 0..2 {
+                    assert!(f.publisher().resource_reports().unwrap().is_empty());
+                    assert!(
+                        git(
+                            &f.repo.root,
+                            &["for-each-ref", "--format=%(refname)", "refs/pbps-compose/"]
+                        )
+                        .is_empty()
+                    );
+                }
+                assert!(!f.record(id).exists());
+                assert_eq!(f.remote_ref(&output_ref), None);
+            }
             "snapshot-created" => {
                 assert_eq!(reports[0].state, ResourceState::Capturing);
                 assert!(root(&f).join(format!("snapshots/{id}")).exists());
@@ -1636,4 +1721,315 @@ fn linked_worktrees_list_only_their_own_valid_receipts_and_resources() {
     assert_eq!(main.resource_reports().unwrap().len(), 1);
     assert_eq!(fs::read(&original_resource).unwrap(), original_bytes);
     f.source_unchanged(&source);
+}
+
+#[test]
+fn ordinary_rejected_captures_do_not_consume_recovery_slots_or_base_roots() {
+    for mode in [
+        "uncommitted",
+        "missing",
+        "paths",
+        "oversized",
+        "intent",
+        "schema",
+        "validation",
+    ] {
+        let f = Fixture::new(&format!("rejected-{mode}"));
+        let config = f.repo.project.join("pbps.yml");
+        let mut invalid = request();
+        let mut executable = PathBuf::from(BIN);
+        match mode {
+            "uncommitted" => fs::write(&config, "dialect: mssql\n# edited\n").unwrap(),
+            "missing" => {
+                git(&f.repo.root, &["rm", "--cached", "project/pbps.yml"]);
+                git(&f.repo.root, &["commit", "-qm", "remove configuration"]);
+            }
+            "paths" => {
+                f.repo.table(ORIGINAL);
+                fs::write(&config, "dialect: mssql\nschema_dir: ../outside\n").unwrap();
+                f.repo.commit();
+                f.repo.table(RENAMED);
+            }
+            "oversized" => fs::File::create(f.repo.project.join("schema/large.yml"))
+                .unwrap()
+                .set_len(64 * 1024 * 1024 + 1)
+                .unwrap(),
+            "intent" => {
+                invalid.intent = Intent::Rename {
+                    from: "dbo.t.missing".into(),
+                    to: "dbo.t.absent".into(),
+                }
+            }
+            "schema" => f.repo.table("not: [valid\n"),
+            "validation" => {
+                executable = f.repo.root.join("refusing-validation-cli");
+                fs::write(&executable, format!("#!/bin/sh\ncase \"$*\" in *validate*) exit 1 ;; *) exec '{BIN}' \"$@\" ;; esac\n")).unwrap();
+                fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before = f.repo.preserved();
+        for _ in 0..3 {
+            let error = Candidates::new(Config {
+                executable: executable.clone(),
+                project: f.repo.project.clone(),
+                deadline: Duration::from_secs(30),
+            })
+            .preview(invalid.clone(), SystemTime::now())
+            .unwrap_err();
+            assert!(!error.to_string().is_empty());
+            let reports = f.publisher().resource_reports().unwrap();
+            assert!(reports.is_empty(), "{mode}: {reports:?}");
+            assert!(
+                git(
+                    &f.repo.root,
+                    &["for-each-ref", "--format=%(refname)", "refs/pbps-compose/"]
+                )
+                .is_empty()
+            );
+            f.source_unchanged(&before);
+        }
+        fs::write(&config, "dialect: mssql\n").unwrap();
+        let large = f.repo.project.join("schema/large.yml");
+        if large.exists() {
+            fs::remove_file(large).unwrap();
+        }
+        f.repo.table(ORIGINAL);
+        git(&f.repo.root, &["add", "-A"]);
+        git(
+            &f.repo.root,
+            &["commit", "--allow-empty", "-qm", "correct inputs"],
+        );
+        f.repo.table(RENAMED);
+        let mut candidates = f.repo.store();
+        assert!(
+            candidates.preview(request(), SystemTime::now()).is_ok(),
+            "{mode}"
+        );
+        assert!(!f.repo.root.join(".git/index.lock").exists());
+        git(&f.repo.root, &["add", "--", "project/schema/t.yml"]);
+    }
+}
+
+fn invalid_capture_request() -> Request {
+    let mut value = request();
+    value.intent = Intent::Rename {
+        from: "dbo.t.missing".into(),
+        to: "dbo.t.absent".into(),
+    };
+    value
+}
+
+#[test]
+fn interrupted_children_and_unknown_or_changed_snapshot_entries_remain_retained() {
+    for mode in [
+        "signal",
+        "panic-status",
+        "temporary",
+        "changed",
+        "early-foreign",
+        "early-lock",
+    ] {
+        let f = Fixture::new(&format!("rejection-unknown-{mode}"));
+        let before = f.repo.preserved();
+        let executable = f.repo.root.join("refusing-cli");
+        let refusal = match mode {
+            "signal" => "kill -KILL $$",
+            "panic-status" => "exit 101",
+            "temporary" => "printf foreign > ../.git/index.lock; exit 1",
+            "changed" => "printf changed > schema.ids.json; exit 1",
+            _ => "exit 1",
+        };
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in *doctor*) exec '{BIN}' \"$@\" ;; *) {refusal} ;; esac\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let injected = Arc::new(AtomicBool::new(false));
+        let flag = injected.clone();
+        let observer = ResourceObserver::new(move |at| {
+            if mode.starts_with("early-")
+                && at.operation == ResourceOperation::Create
+                && at.after
+                && at.path.ends_with("repository")
+                && !flag.swap(true, Ordering::SeqCst)
+            {
+                fs::write(
+                    at.path.join(if mode == "early-lock" {
+                        "foreign.lock"
+                    } else {
+                        "foreign"
+                    }),
+                    "foreign",
+                )
+                .unwrap();
+            }
+            true
+        });
+        let mut candidates = Candidates::with_resources(
+            Config {
+                executable,
+                project: f.repo.project.clone(),
+                deadline: Duration::from_secs(15),
+            },
+            observer,
+        );
+        let error = candidates
+            .preview(invalid_capture_request(), SystemTime::now())
+            .unwrap_err();
+        let mut publisher = f.publisher();
+        let reports = publisher.resource_reports().unwrap();
+        assert_eq!(reports.len(), 1, "{mode}: {error}");
+        let id = &reports[0].operation_id;
+        let snapshot = root(&f).join(format!("snapshots/{id}/repository"));
+        let state = if matches!(mode, "temporary" | "changed") {
+            ResourceState::Retiring
+        } else {
+            ResourceState::Capturing
+        };
+        assert_eq!(reports[0].state, state, "{mode}: {error}");
+        for _ in 0..2 {
+            let result = publisher.recover_resources(id);
+            if state == ResourceState::Retiring {
+                assert!(result.is_err(), "{mode}");
+            } else {
+                assert_eq!(result.unwrap().state, state);
+            }
+            assert!(publisher.resource_reports().unwrap()[0].cleanup_pending);
+        }
+        let retained = match mode {
+            "temporary" => Some((snapshot.join(".git/index.lock"), "foreign")),
+            "changed" => Some((snapshot.join("project/schema.ids.json"), "changed")),
+            "early-foreign" => Some((snapshot.join("foreign"), "foreign")),
+            "early-lock" => Some((snapshot.join("foreign.lock"), "foreign")),
+            _ => None,
+        };
+        if let Some((path, contents)) = retained {
+            assert_eq!(fs::read_to_string(path).unwrap(), contents);
+        }
+        assert!(
+            !git(
+                &f.repo.root,
+                &["for-each-ref", "--format=%(refname)", "refs/pbps-compose/"]
+            )
+            .is_empty()
+        );
+        f.source_unchanged(&before);
+        assert!(!f.repo.root.join(".git/index.lock").exists());
+        git(&f.repo.root, &["add", "--", "project/schema/t.yml"]);
+    }
+}
+
+#[test]
+fn rejection_retirement_restarts_after_durable_transition_and_file_removal_failures() {
+    for after in [false, true] {
+        for boundary in ["transition", "file"] {
+            let f = Fixture::new(&format!("rejection-fault-{boundary}-{after}"));
+            let before = f.repo.preserved();
+            let fired = Arc::new(AtomicBool::new(false));
+            let flag = fired.clone();
+            let observer = ResourceObserver::new(move |at| {
+                let matches = if boundary == "transition" {
+                    at.operation == ResourceOperation::Sync
+                        && at.path.ends_with("resources")
+                        && fs::read_dir(&at.path)
+                            .unwrap()
+                            .filter_map(|e| e.ok())
+                            .any(|e| {
+                                fs::read(e.path())
+                                    .ok()
+                                    .and_then(|b| {
+                                        serde_json::from_slice::<serde_json::Value>(&b).ok()
+                                    })
+                                    .is_some_and(|r| {
+                                        r["rejected"] == true && r["state"] == "retiring"
+                                    })
+                            })
+                } else {
+                    at.operation == ResourceOperation::Remove
+                        && at.path.ends_with("project/schema/t.yml")
+                };
+                !(matches && at.after == after && !flag.swap(true, Ordering::SeqCst))
+            });
+            let mut candidates = Candidates::with_resources(
+                Config {
+                    executable: BIN.into(),
+                    project: f.repo.project.clone(),
+                    deadline: Duration::from_secs(15),
+                },
+                observer,
+            );
+            assert!(
+                candidates
+                    .preview(invalid_capture_request(), SystemTime::now())
+                    .is_err()
+            );
+            assert!(fired.load(Ordering::SeqCst), "{boundary}-{after}");
+            let mut publisher = f.publisher();
+            let reports = publisher.resource_reports().unwrap();
+            assert_eq!(reports.len(), 1);
+            assert_eq!(reports[0].state, ResourceState::Retiring);
+            let report = publisher
+                .recover_resources(&reports[0].operation_id)
+                .unwrap();
+            assert_eq!(report.state, ResourceState::Spent);
+            assert!(!report.cleanup_pending);
+            drop(publisher);
+            for _ in 0..2 {
+                let publisher = f.publisher();
+                assert!(publisher.resource_reports().unwrap().is_empty());
+                assert!(
+                    git(
+                        &f.repo.root,
+                        &["for-each-ref", "--format=%(refname)", "refs/pbps-compose/"]
+                    )
+                    .is_empty()
+                );
+            }
+            f.source_unchanged(&before);
+        }
+    }
+}
+
+#[test]
+fn an_unflushed_rejection_checkpoint_keeps_unsealed_acquisition_evidence() {
+    for after in [false, true] {
+        let f = Fixture::new(&format!("rejection-checkpoint-flush-{after}"));
+        let fired = Arc::new(AtomicBool::new(false));
+        let flag = fired.clone();
+        let observer = ResourceObserver::new(move |at| {
+            !(at.operation == ResourceOperation::Sync
+                && at.after == after
+                && at.path.ends_with("repository/.git/HEAD")
+                && !flag.swap(true, Ordering::SeqCst))
+        });
+        let mut candidates = Candidates::with_resources(
+            Config {
+                executable: BIN.into(),
+                project: f.repo.project.clone(),
+                deadline: Duration::from_secs(15),
+            },
+            observer,
+        );
+        let before = f.repo.preserved();
+        assert!(
+            candidates
+                .preview(invalid_capture_request(), SystemTime::now())
+                .is_err()
+        );
+        assert!(fired.load(Ordering::SeqCst));
+        let id = f.publisher().resource_reports().unwrap()[0]
+            .operation_id
+            .clone();
+        for _ in 0..2 {
+            let mut publisher = f.publisher();
+            let report = publisher.recover_resources(&id).unwrap();
+            assert_eq!(report.state, ResourceState::Capturing);
+            assert!(report.cleanup_pending);
+        }
+        f.source_unchanged(&before);
+    }
 }

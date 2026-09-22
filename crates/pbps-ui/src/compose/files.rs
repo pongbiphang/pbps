@@ -126,8 +126,10 @@ impl Root {
             .read_to_end(&mut bytes)
             .map_err(|_| Error::new("Could not read a compose input"))?;
         let after = fstat(&file).map_err(|_| Error::new("Could not recheck a compose input"))?;
-        if bytes.len() > MAX_BYTES
-            || before.st_size != after.st_size
+        if bytes.len() > MAX_BYTES {
+            return Err(Error::rejected("A compose input exceeds the size limit"));
+        }
+        if before.st_size != after.st_size
             || before.st_mtime != after.st_mtime
             || before.st_mtime_nsec != after.st_mtime_nsec
             || before.st_ctime != after.st_ctime
@@ -170,7 +172,9 @@ impl Root {
             };
             bytes += contents.bytes.len();
             if bytes > MAX_BYTES {
-                return Err(Error::new("Compose inputs exceed the total size limit"));
+                return Err(Error::rejected(
+                    "Compose inputs exceed the total size limit",
+                ));
             }
             result.insert(name, contents);
         }
@@ -185,7 +189,7 @@ impl Root {
         count: &mut usize,
     ) -> Result<()> {
         if depth > 64 {
-            return Err(Error::new(
+            return Err(Error::rejected(
                 "Compose declarations exceed the directory depth limit",
             ));
         }
@@ -203,7 +207,7 @@ impl Root {
             }
             *count += 1;
             if *count > MAX_FILES {
-                return Err(Error::new("Compose has too many input paths"));
+                return Err(Error::rejected("Compose has too many input paths"));
             }
             let full = format!("{prefix}/{name}");
             path(&full)?;

@@ -1,6 +1,6 @@
 //! An acknowledged private tree can be retired without sweeping unknown files.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path};
@@ -90,6 +90,19 @@ fn open(root: &File, path: &str) -> Result<Option<File>> {
 }
 
 impl Inventory {
+    pub fn before_check(root: &Directory, known: &BTreeSet<String>) -> Result<Self> {
+        let inventory = Self::capture(root)?;
+        // Only paths from completed fixed preparation steps can enter the
+        // rejection inventory. In particular, a leftover lock or unknown
+        // temporary file is not adopted merely because it is in our directory.
+        if inventory.entries.keys().any(|name| !known.contains(name)) {
+            return Err(Error::new(
+                "Unknown private snapshot entries require manual recovery",
+            ));
+        }
+        Ok(inventory)
+    }
+
     pub fn capture(root: &Directory) -> Result<Self> {
         let mut entries = BTreeMap::new();
         fn walk(

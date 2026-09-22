@@ -21,6 +21,21 @@ pub(super) struct Workspace {
 }
 
 impl Workspace {
+    fn check<T>(&self, known: &BTreeSet<String>, check: impl FnOnce() -> Result<T>) -> Result<T> {
+        let checkpoint = self.resources.before_check(&self.operation, known)?;
+        match check() {
+            Err(error) if error.failure == super::Failure::CompletedRejection => {
+                if let Err(retirement) = self.resources.reject(checkpoint) {
+                    return Err(Error::new(&format!(
+                        "{error}; private retirement remains pending: {retirement}"
+                    )));
+                }
+                Err(error)
+            }
+            result => result,
+        }
+    }
+
     fn new(id: &str, git: &Git, base: &str, observer: super::ResourceObserver) -> Result<Self> {
         let resources = super::resources::Resources::open(git, observer.clone())?;
         let path = resources.begin(id, base)?;
@@ -53,6 +68,30 @@ impl Workspace {
             return Err(Error::new("Only a sealed unconfirmed preview may expire"));
         }
         self.resources.discard_preview(&self.operation)
+    }
+}
+
+fn known_path(known: &mut BTreeSet<String>, name: &str) {
+    for path in Path::new(name).ancestors() {
+        if !path.as_os_str().is_empty() {
+            known.insert(path.to_str().expect("admitted private path").to_owned());
+        }
+    }
+}
+
+fn known_git(known: &mut BTreeSet<String>, directory: &str) {
+    // Empty-template init and the fixed private Git commands produce these
+    // entries before validation. No object writer, arbitrary ref or lock is
+    // admitted here. Extra files keep the unsealed acquisition retained.
+    for path in [
+        "HEAD",
+        "config",
+        "objects/info",
+        "objects/pack",
+        "refs/heads",
+        "refs/tags",
+    ] {
+        known_path(known, &format!("{directory}/.git/{path}"));
     }
 }
 
@@ -774,8 +813,6 @@ pub(super) fn capture(
     }
     let destination = destination::resolve(&git, &request.remote)?;
     let signing = signing(&git)?;
-    let workspace = Workspace::new(&operation_id, &git, &base, resource_observer)?;
-    let hooks = workspace.path.join("no-hooks");
     let root = Root::open(&source)?;
     let entries = tree_entries(&git, &base, &project)?;
     let recorded = blobs(&git, &entries)?;
@@ -787,6 +824,24 @@ pub(super) fn capture(
         return Err(Error::new(
             "Project configuration must match the selected base before composing",
         ));
+    }
+    // These bounded, read-only refusals need no private acquisition. The base
+    // is still pinned before any private alternate is connected below.
+    let workspace = Workspace::new(&operation_id, &git, &base, resource_observer)?;
+    let hooks = workspace.path.join("no-hooks");
+    let mut known = BTreeSet::new();
+    known_path(&mut known, "no-hooks");
+    known_git(&mut known, "repository");
+    for name in recorded.keys() {
+        known_path(&mut known, &format!("repository/{name}"));
+    }
+    for name in [
+        "objects/info/alternates",
+        "refs/heads/captured-base",
+        "logs/refs/heads/captured-base",
+        "logs/HEAD",
+    ] {
+        known_path(&mut known, &format!("repository/.git/{name}"));
     }
     let snapshot = workspace.path.join("repository");
     for (name, file) in &recorded {
@@ -850,11 +905,14 @@ pub(super) fn capture(
         deadline: config.deadline,
     };
     let snapshot_project = snapshot.join(&project);
-    let (declarations, ids) = inputs(&snapshot_project, cli.paths(&snapshot_project)?)?;
+    let (declarations, ids) = workspace.check(&known, || {
+        let paths = cli.paths(&snapshot_project)?;
+        inputs(&snapshot_project, paths).map_err(Error::rejection)
+    })?;
     observer(CaptureBoundary::PathsResolved);
     let declarations = join(&project, &declarations);
     let ids = join(&project, &ids);
-    let live = root.declarations(&declarations)?;
+    let live = workspace.check(&known, || root.declarations(&declarations))?;
     let is_input = |path: &str| {
         path == ids
             || (path.starts_with(&format!("{declarations}/")) && files::declaration_path(path))
@@ -908,14 +966,32 @@ pub(super) fn capture(
             write_file(&snapshot, name, file, &workspace.observer)?;
         }
     }
-    cli.record(&snapshot_project, &request.intent, &base)?;
+    for name in captured.keys() {
+        known_path(&mut known, &format!("repository/{name}"));
+    }
+    known_path(&mut known, &format!("repository/{declarations}"));
+    known_git(&mut known, "attribute-view");
+    known_path(&mut known, "attribute-view/.git/info/attributes");
+    for (index, _) in &attribute_view.indexes {
+        known_path(
+            &mut known,
+            index
+                .strip_prefix(&workspace.path)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+        );
+    }
+    workspace.check(&known, || {
+        cli.record(&snapshot_project, &request.intent, &base)
+    })?;
     observer(CaptureBoundary::IntentRecorded);
     let private = Root::open(&snapshot)?;
     let mut result = BTreeMap::new();
     for name in &names {
         result.insert(name.clone(), private.input(name, &declarations)?);
     }
-    cli.validate(&snapshot_project, &base)?;
+    workspace.check(&known, || cli.validate(&snapshot_project, &base))?;
     for (name, expected) in &result {
         if private.input(name, &declarations)? != *expected {
             return Err(Error::new("Candidate inputs changed during validation"));

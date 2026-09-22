@@ -59,6 +59,13 @@ struct Resource {
     inventory: Option<Inventory>,
     pins: BTreeMap<String, Pin>,
     keep_commit: bool,
+    #[serde(default)]
+    rejected: bool,
+}
+
+pub(super) struct Checkpoint {
+    operation: String,
+    inventory: Inventory,
 }
 
 pub(super) struct Resources {
@@ -209,9 +216,19 @@ impl Resources {
             ResourceState::Sealed
             | ResourceState::Confirmed
             | ResourceState::Retiring
-            | ResourceState::Retained => r.binding.as_deref().is_some_and(identity),
+            | ResourceState::Retained => {
+                if r.rejected {
+                    r.state == ResourceState::Retiring && r.binding.is_none()
+                } else {
+                    r.binding.as_deref().is_some_and(identity)
+                }
+            }
         };
-        if !shape || !binding {
+        if !shape
+            || !binding
+            || (r.rejected
+                && (r.state != ResourceState::Retiring || r.keep_commit || commit.is_some()))
+        {
             return Err(Error::new(
                 "Compose resource lifecycle evidence is incomplete; preserve it",
             ));
@@ -270,6 +287,7 @@ impl Resources {
                 inventory: None,
                 pins: BTreeMap::new(),
                 keep_commit: false,
+                rejected: false,
             };
             self.save(&r)?;
             let directory = self.snapshots.create_owned(id)?;
@@ -559,6 +577,49 @@ impl Resources {
         })
     }
 
+    pub fn before_check(
+        &self,
+        id: &str,
+        known: &std::collections::BTreeSet<String>,
+    ) -> Result<Checkpoint> {
+        self.locked(|| {
+            let r = self.load(id)?;
+            if r.state != ResourceState::Capturing {
+                return Err(Error::new(
+                    "Only an unexposed capture can prepare rejection retirement",
+                ));
+            }
+            self.verify_pins(&r)?;
+            let snapshot = self.snapshots.child(id, false)?;
+            if r.snapshot.as_ref() != Some(&snapshot.identity()?) {
+                return Err(Error::new("Private snapshot acquisition is unresolved"));
+            }
+            Ok(Checkpoint {
+                operation: id.into(),
+                inventory: Inventory::before_check(&snapshot, known)?,
+            })
+        })
+    }
+
+    pub fn reject(&self, checkpoint: Checkpoint) -> Result<()> {
+        self.locked(|| {
+            let mut r = self.load(&checkpoint.operation)?;
+            if r.state != ResourceState::Capturing
+                || r.snapshot.as_ref() != Some(&checkpoint.inventory.root)
+            {
+                return Err(Error::new(
+                    "Completed rejection no longer matches its private acquisition",
+                ));
+            }
+            self.verify_pins(&r)?;
+            r.inventory = Some(checkpoint.inventory);
+            r.rejected = true;
+            r.state = ResourceState::Retiring;
+            self.save(&r)?;
+            self.retire_locked(&r.operation, false)
+        })
+    }
+
     pub fn confirm(&self, id: &str) -> Result<()> {
         self.locked(|| {
             let mut r = self.load(id)?;
@@ -731,6 +792,12 @@ impl Resources {
             r.pins.get_mut(kind).unwrap().retired = true;
             self.save(&r)?;
         }
+        if r.rejected {
+            // No candidate handle was exposed, so there is nothing to revoke.
+            // Remove this record only after every acknowledged artifact and pin
+            // has been retired; ordinary spent handles keep their tombstones.
+            return self.records.remove(&format!("{id}.json"));
+        }
         r.state = if keep_commit {
             ResourceState::Retained
         } else {
@@ -777,9 +844,15 @@ impl Resources {
     }
 
     pub fn resume_retirement(&self, id: &str) -> Result<ResourceReport> {
-        let r = self.load(id)?;
+        let mut r = self.load(id)?;
         if r.state == ResourceState::Retiring {
             self.retire(id, r.keep_commit)?;
+            if r.rejected {
+                // This response follows successful retirement in this call;
+                // arbitrary missing records cannot produce the same success.
+                r.state = ResourceState::Spent;
+                return self.report_resource(r);
+            }
         }
         self.report(id)
     }
