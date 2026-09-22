@@ -218,19 +218,20 @@ pub(crate) async fn executables(
     Ok(ExecutableSet { engine, libraries })
 }
 
-/// One file-backed mapping as `maps` reports it.
+/// One file identity and its file-backed ranges as `maps` reports them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Mapping {
     pub start: u64,
     pub end: u64,
+    pub alternatives: Vec<(u64, u64)>,
     pub inode: u64,
     pub deleted: bool,
 }
 
 /// File-backed shared objects from a `maps` table, keyed by path, keeping
-/// the first (lowest) range of each. Anonymous, device and non-library
-/// mappings are skipped; a path is taken verbatim after the inode column, so
-/// one containing spaces survives.
+/// each range of the first file identity at that path. Anonymous, device and
+/// non-library mappings are skipped; a path is taken verbatim after the inode
+/// column, so one containing spaces survives.
 pub(crate) fn mappings(maps: &str, packages: &[&str]) -> BTreeMap<String, Mapping> {
     let mut found = BTreeMap::new();
     for line in maps.lines() {
@@ -263,12 +264,19 @@ pub(crate) fn mappings(maps: &str, packages: &[&str]) -> BTreeMap<String, Mappin
         ) else {
             continue;
         };
-        found.entry(path.to_owned()).or_insert(Mapping {
+        let mapping = found.entry(path.to_owned()).or_insert_with(|| Mapping {
             start,
             end,
+            alternatives: Vec::new(),
             inode,
             deleted,
         });
+        if mapping.inode == inode
+            && mapping.deleted == deleted
+            && (mapping.start, mapping.end) != (start, end)
+        {
+            mapping.alternatives.push((start, end));
+        }
     }
     found
 }
@@ -287,17 +295,28 @@ fn is_engine_code(path: &str, packages: &[&str]) -> bool {
 
 async fn mapped_library(lease: &ProcessLease, path: &str, mapping: &Mapping) -> ExecutableIdentity {
     let differs = mapping.deleted || disk_differs(lease, Path::new(path), mapping.inode);
-    // The mapped file object itself, when the inspector may open it.
-    if let Ok(file) = lease.open_proc(&format!("map_files/{:x}-{:x}", mapping.start, mapping.end))
-        && let Ok(digest) = digest_of(&file).await
+    // A package can acquire and retire individual mappings without changing
+    // its content. Reading only its lowest range made a departed range turn
+    // stable loaded content into DiskCandidate at the next scope check
+    // (#774). Try the same file's other observed ranges before weakening the
+    // evidence; DECISIONS 520/521 still require identifying loaded content.
+    for (start, end) in
+        std::iter::once((mapping.start, mapping.end)).chain(mapping.alternatives.iter().copied())
     {
-        return ExecutableIdentity {
-            role: ExecutableRole::Preloaded,
-            path: path.to_owned(),
-            digest: Some(digest),
-            provenance: Provenance::LoadedContent,
-            disk_differs_from_loaded: Some(differs),
-        };
+        if let Ok(file) = lease.open_proc(&format!("map_files/{start:x}-{end:x}"))
+            && file
+                .metadata()
+                .is_ok_and(|metadata| metadata.ino() == mapping.inode)
+            && let Ok(digest) = digest_of(&file).await
+        {
+            return ExecutableIdentity {
+                role: ExecutableRole::Preloaded,
+                path: path.to_owned(),
+                digest: Some(digest),
+                provenance: Provenance::LoadedContent,
+                disk_differs_from_loaded: Some(differs),
+            };
+        }
     }
     if differs {
         // The file on disk is not what is mapped, and the mapped content
@@ -481,7 +500,7 @@ mod tests {
 ";
 
     #[test]
-    fn only_file_backed_shared_objects_are_mapped_and_the_first_range_is_kept() {
+    fn only_file_backed_code_is_mapped_and_same_file_ranges_are_retained() {
         let found = mappings(MAPS, &[]);
         assert_eq!(
             found.keys().cloned().collect::<Vec<_>>(),
@@ -497,6 +516,18 @@ mod tests {
             (0x71e69568a000, 0x71e6956b2000, 510827)
         );
         assert!(!libc.deleted);
+        assert_eq!(libc.alternatives, [(0x71e6956b2000, 0x71e69583a000)]);
+        // Another file at the same path, or a removed version of it, cannot
+        // supply the surviving range of the identity captured first.
+        let mixed = format!(
+            "{MAPS}\
+71e696000000-71e696001000 r--p 00000000 08:30 999999 /usr/lib/x86_64-linux-gnu/libc.so.6\n\
+71e696001000-71e696002000 r--p 00000000 08:30 510827 /usr/lib/x86_64-linux-gnu/libc.so.6 (deleted)\n"
+        );
+        assert_eq!(
+            mappings(&mixed, &[])["/usr/lib/x86_64-linux-gnu/libc.so.6"],
+            *libc
+        );
         // The engine binary is not a library; the data file and anonymous
         // and stack mappings are not code the loader placed.
         assert!(!found.contains_key("/usr/lib/postgresql/18/bin/postgres"));
@@ -544,6 +575,76 @@ mod tests {
             found["/usr/lib/x86_64-linux-gnu/libz.so.1.3.1"].inode,
             510908
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the root-owned mapping helper from live-resolver-namespace.py"]
+    async fn a_surviving_mapping_keeps_loaded_content_after_the_first_range_exits() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Command, Stdio};
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let helper = std::env::var("PBPS_MAPPING_FIXTURE_HELPER").unwrap();
+        let path = std::env::var("PBPS_MAPPING_FIXTURE_FILE").unwrap();
+        let content = vec![b'a'; 65536];
+        std::fs::write(&path, &content).unwrap();
+        let mut child = OwnedChild(
+            Command::new(helper)
+                .args(["mapping-ranges", &path])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut input = child.0.stdin.take().unwrap();
+        let mut output = BufReader::new(child.0.stdout.take().unwrap());
+        let mut acknowledge = |expected: &str| {
+            let mut line = String::new();
+            output.read_line(&mut line).unwrap();
+            assert_eq!(line.trim(), expected);
+        };
+        acknowledge("ready");
+        let lease = ProcessLease::capture(child.0.id()).unwrap();
+        let maps = lease.read_proc("maps", 8 * 1024 * 1024).unwrap();
+        assert_eq!(maps.lines().filter(|line| line.ends_with(&path)).count(), 2);
+        let mapping = mappings(&maps, &[]).remove(&path).unwrap();
+        let initial = mapped_library(&lease, &path, &mapping).await;
+        assert_eq!(initial.provenance, Provenance::LoadedContent);
+        assert_eq!(
+            initial.digest,
+            Some(format!("{:x}", Sha256::digest(&content)))
+        );
+
+        input.write_all(b"1").unwrap();
+        acknowledge("one");
+        assert!(
+            lease
+                .open_proc(&format!("map_files/{:x}-{:x}", mapping.start, mapping.end))
+                .is_err()
+        );
+        let surviving = mapped_library(&lease, &path, &mapping).await;
+        assert_eq!(
+            surviving.provenance,
+            Provenance::LoadedContent,
+            "a surviving same-file mapping must preserve loaded-content evidence"
+        );
+        assert_eq!(surviving, initial);
+
+        input.write_all(b"2").unwrap();
+        acknowledge("none");
+        let gone = mapped_library(&lease, &path, &mapping).await;
+        assert_eq!(gone.provenance, Provenance::DiskCandidate);
+        assert_eq!(gone.digest, initial.digest);
+        std::fs::remove_file(&path).unwrap();
+        let absent = mapped_library(&lease, &path, &mapping).await;
+        assert!(matches!(absent.provenance, Provenance::Unreadable { .. }));
+        assert!(absent.digest.is_none());
+        input.write_all(b"q").unwrap();
     }
 
     #[test]

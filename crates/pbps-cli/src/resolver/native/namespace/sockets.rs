@@ -1,7 +1,7 @@
 //! Socket holder observations, not an exhaustive inventory (DECISIONS 533).
 
 use super::*;
-use crate::resolver::native::{Reading, proc_base};
+use crate::resolver::native::Reading;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(test)]
@@ -159,10 +159,12 @@ fn relation_with(
 }
 
 fn parent_id(process: &ProcessLease) -> Result<u32, UnqualifiedProcess> {
-    let stat = std::fs::read_to_string(proc_base(&process.directory).join("stat"))
+    let stat = super::super::read_bytes(process.open_proc("stat")?, 65536)
         .map_err(Reading::Scope.named())?;
-    stat.rsplit_once(')')
-        .and_then(|(_, fields)| fields.split_whitespace().nth(1))
+    super::super::stat_fields(&stat)?
+        .1
+        .split_whitespace()
+        .nth(1)
         .and_then(|parent| parent.parse().ok())
         .ok_or_else(|| Reading::Scope.refuse())
 }

@@ -29,6 +29,9 @@ FOREIGN_TEST = PREFIX + "foreign_namespace_sharers_remain_visible_outside_the_co
 MANY_TEST = PREFIX + "a_containers_task_count_does_not_consume_the_observers_descriptor_budget"
 COORDINATE_TEST = PREFIX + "detached_coordinates_retain_one_namespace_handle_until_the_last_clone_drops"
 ANCHOR_TEST = PREFIX + "anchor_loss_during_a_view_read_is_distinct_from_an_unreadable_view"
+NAME_TEST = PREFIX + "opaque_task_names_preserve_observation_identity_and_credentials"
+GROUP_TEST = PREFIX + "a_process_with_the_kernel_maximum_groups_can_be_captured"
+MAPPING_TEST = "resolver::native::executables::tests::a_surviving_mapping_keeps_loaded_content_after_the_first_range_exits"
 
 
 def run(*args, **kwargs):
@@ -47,8 +50,9 @@ def limited_descriptors():
     resource.setrlimit(resource.RLIMIT_NOFILE, (64, maximum))
 
 
-def test(binary, name, env, prefix=()):
-    result = run(*prefix, str(binary), "--exact", name, "--nocapture", env=env,
+def test(binary, name, env, prefix=(), ignored=False):
+    result = run(*prefix, str(binary), "--exact", name, "--nocapture",
+                 *(["--ignored"] if ignored else []), env=env,
                  preexec_fn=limited_descriptors if name == MANY_TEST else None,
                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     print(result.stdout, end="", flush=True)
@@ -88,6 +92,11 @@ def main():
             helper = Path(temporary) / "thread-exit"
             run("cc", "-static", "-pthread", "-Wall", "-Wextra", "-Werror", "-o", str(helper),
                 str(Path(__file__).parent / "fixtures/namespace-thread.c"))
+            test(binary, GROUP_TEST, dict(os.environ,
+                 PBPS_GROUP_FIXTURE_HELPER=str(helper)), ignored=True)
+            test(binary, MAPPING_TEST, dict(os.environ,
+                 PBPS_MAPPING_FIXTURE_HELPER=str(helper),
+                 PBPS_MAPPING_FIXTURE_FILE=str(Path(temporary) / "mapping.so")), ignored=True)
             pids = []
             for _ in range(2):
                 name = "pbps-namespace-" + uuid.uuid4().hex
@@ -217,6 +226,22 @@ def main():
             else:
                 raise RuntimeError("the many-thread fixture did not become ready")
             test(binary, MANY_TEST, dict(os.environ, PBPS_NAMESPACE_MANY_PID=many_pid))
+            names = "pbps-namespace-" + uuid.uuid4().hex
+            owned.append(names)
+            runtime("run", "-d", "--name", names, "--pull=never", "--network=none", "--ipc=private",
+                    "--read-only", "--user=999:999", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+                    "--mount", f"type=bind,src={helper},dst=/pbps-thread-exit,readonly",
+                    "--entrypoint=/pbps-thread-exit", args.image, "opaque-name")
+            names_pid = runtime("inspect", "--format", "{{.State.Pid}}", names)
+            ready = Path(f"/proc/{names_pid}/root/dev/shm/name-ready")
+            for _ in range(100):
+                if ready.exists() and ready.read_text().strip().isdigit():
+                    break
+                time.sleep(.01)
+            else:
+                raise RuntimeError("the opaque-name fixture did not become ready")
+            test(binary, NAME_TEST, dict(os.environ, PBPS_NAMESPACE_NAME_PID=names_pid,
+                 PBPS_NAMESPACE_NAME_CHILD=ready.read_text().strip()))
             test(binary, MOUNT_TEST, dict(os.environ, PBPS_NAMESPACE_MOUNT_FIXTURE="1"),
                  prefix=("unshare", "--mount", "--pid", "--fork", "--mount-proc", "--propagation", "private"))
             test(binary, COORDINATE_TEST, dict(os.environ, PBPS_NAMESPACE_COORDINATE_FIXTURE="1"),

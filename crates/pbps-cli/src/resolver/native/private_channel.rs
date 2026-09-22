@@ -3,12 +3,10 @@
 //! containment, target separation and the relevant engine compatibility.
 
 use super::{
-    File, ProcessLease, UnqualifiedProcess, for_each_namespace_task, observed_socket_holders,
-    proc_base,
+    ProcessLease, UnqualifiedProcess, for_each_namespace_task, observed_socket_holders, proc_base,
 };
 use pbps_db::resolver::{BackendProcess, InstanceObservation};
 use pbps_db::transport::ConnectionId;
-use std::io::Read as _;
 
 pub(crate) struct PrivateChannelProfile {
     pub executable: &'static str,
@@ -271,16 +269,7 @@ pub(crate) fn private_network(process: &ProcessLease) -> Result<(), UnqualifiedP
 }
 
 fn status(process: &ProcessLease) -> Result<String, UnqualifiedProcess> {
-    let mut text = String::new();
-    File::open(proc_base(&process.directory).join("status"))
-        .map_err(|_| UnqualifiedProcess)?
-        .take(65537)
-        .read_to_string(&mut text)
-        .map_err(|_| UnqualifiedProcess)?;
-    if text.len() > 65536 {
-        return Err(UnqualifiedProcess);
-    }
-    Ok(text)
+    process.read_proc("status", 65536)
 }
 
 pub(crate) fn security(
@@ -397,7 +386,14 @@ mod tests {
     #[test]
     fn unreadable_or_weakened_kernel_controls_cannot_qualify() {
         let status = "Uid:\t999 999 999 999\nNoNewPrivs:\t1\nSeccomp:\t2\nCapInh:\t0\nCapPrm:\t0\nCapEff:\t0\nCapBnd:\t0\nCapAmb:\t0\n";
-        check_status(status, 999, 0).unwrap();
+        let with_name = |text: &str| [b"Name:\tx\xff)(\\n\n".as_slice(), text.as_bytes()].concat();
+        let bytes = with_name(status);
+        check_status(
+            super::super::task_metadata::status_fields(&bytes).unwrap(),
+            999,
+            0,
+        )
+        .unwrap();
         for bad in [
             status.replace("NoNewPrivs:\t1", "NoNewPrivs:\t0"),
             status.replace("Seccomp:\t2", "Seccomp:\t0"),
@@ -405,9 +401,13 @@ mod tests {
             status.replace("CapBnd:\t0", "CapBnd:\t400"),
             status.replace("999 999 999 999", "999 0 999 999"),
             status.replace("CapAmb:\t0\n", ""),
+            status.replace("999 999 999 999", "999 bad 999 999"),
+            status.replace("CapEff:\t0", "CapEff:\tbad-hex"),
             format!("{status}Seccomp:\t2\n"),
         ] {
-            assert!(check_status(&bad, 999, 0).is_err());
+            let bytes = with_name(&bad);
+            let fields = super::super::task_metadata::status_fields(&bytes).unwrap();
+            assert!(check_status(fields, 999, 0).is_err());
         }
     }
 }

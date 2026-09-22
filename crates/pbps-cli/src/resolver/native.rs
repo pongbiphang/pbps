@@ -19,6 +19,7 @@ mod execution;
 mod namespace;
 mod private_channel;
 mod target;
+mod task_metadata;
 pub(crate) use daemon::DaemonLease;
 pub(crate) use execution::{
     BoundedResourceLease, ExecutionLease, ExecutionProfile, MountEntry, ResourceCeilings,
@@ -34,6 +35,7 @@ pub(crate) use private_channel::{
 };
 pub(crate) use target::TargetWitness;
 pub use target::{EnvironmentError, NativeTarget, NativeTargetError};
+use task_metadata::{read_bytes, read_status, stat_fields};
 
 #[derive(Debug, thiserror::Error)]
 #[error("the actual Linux peer process or its protected executable cannot be established")]
@@ -249,8 +251,14 @@ impl ProcessLease {
     fn capture_held(directory: File, source: ProcSource) -> Result<Self, UnqualifiedProcess> {
         let base = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
         let start_ticks = start_ticks(&base).map_err(Reading::CaptureStartTicks.named())?;
-        let status =
-            std::fs::read_to_string(base.join("status")).map_err(Reading::CaptureStatus.named())?;
+        // Capturing identity imposes no supplementary-group policy. Linux
+        // permits 65,536 groups, each needing up to 11 bytes in status; leave
+        // room for the other fields instead of refusing valid native peers.
+        let status = read_status(
+            File::open(base.join("status")).map_err(Reading::CaptureStatus.named())?,
+            1024 * 1024,
+        )
+        .map_err(Reading::CaptureStatus.named())?;
         let namespace_pid = status
             .lines()
             .find_map(|line| line.strip_prefix("NSpid:"))
@@ -397,11 +405,16 @@ impl ProcessLease {
         File::open(proc_base(&self.directory).join(relative)).map_err(|_| UnqualifiedProcess)
     }
 
+    /// Status exposes identity/credential text with the unused opaque Name
+    /// field omitted. Other proc files retain their whole-text contract.
     pub(crate) fn read_proc(
         &self,
         relative: &str,
         limit: usize,
     ) -> Result<String, UnqualifiedProcess> {
+        if relative == "status" {
+            return read_status(self.open_proc(relative)?, limit);
+        }
         read_bounded(&proc_base(&self.directory).join(relative), limit)
     }
 
@@ -459,11 +472,11 @@ impl ProcessLease {
 
     pub fn has_same_executable_parent(&self) -> Result<bool, UnqualifiedProcess> {
         self.check()?;
-        let stat = std::fs::read_to_string(proc_base(&self.directory).join("stat"))
-            .map_err(|_| UnqualifiedProcess)?;
-        let parent = stat
-            .rsplit_once(')')
-            .and_then(|(_, fields)| fields.split_whitespace().nth(1))
+        let stat = read_bytes(self.open_proc("stat")?, 65536).map_err(|_| UnqualifiedProcess)?;
+        let parent = stat_fields(&stat)?
+            .1
+            .split_whitespace()
+            .nth(1)
             .and_then(|value| value.parse::<u32>().ok())
             .ok_or(UnqualifiedProcess)?;
         if parent == 0 {
@@ -829,7 +842,9 @@ fn process_gone(error: &std::io::Error) -> bool {
 }
 
 fn process_exited(directory: &File) -> Result<bool, UnqualifiedProcess> {
-    let stat = match std::fs::read_to_string(proc_base(directory).join("stat")) {
+    let stat = match File::open(proc_base(directory).join("stat"))
+        .and_then(|file| read_bytes(file, 65536))
+    {
         Ok(stat) => stat,
         Err(error) if process_gone(&error) => return Ok(true),
         Err(_) => return Err(UnqualifiedProcess),
@@ -837,8 +852,8 @@ fn process_exited(directory: &File) -> Result<bool, UnqualifiedProcess> {
     exited_stat(&stat)
 }
 
-fn exited_stat(stat: &str) -> Result<bool, UnqualifiedProcess> {
-    let (_, fields) = stat.rsplit_once(')').ok_or(UnqualifiedProcess)?;
+fn exited_stat(stat: &[u8]) -> Result<bool, UnqualifiedProcess> {
+    let (_, fields) = stat_fields(stat)?;
     let fields: Vec<_> = fields.split_whitespace().collect();
     let state = fields.first().ok_or(UnqualifiedProcess)?;
     let threads: u32 = fields
@@ -1117,18 +1132,12 @@ fn socket_owner(
 }
 
 fn start_ticks(base: &Path) -> Result<u64, UnqualifiedProcess> {
-    let mut stat = String::new();
-    File::open(base.join("stat"))
-        .map_err(|_| UnqualifiedProcess)?
-        .take(8193)
-        .read_to_string(&mut stat)
-        .map_err(|_| UnqualifiedProcess)?;
-    if stat.len() > 8192 {
-        return Err(UnqualifiedProcess);
-    }
-    // comm is parenthesized and can itself contain spaces and ')'. The final
-    // ')' terminates it; fields from state onward cannot contain that byte.
-    let (_, fields) = stat.rsplit_once(')').ok_or(UnqualifiedProcess)?;
+    let stat = read_bytes(
+        File::open(base.join("stat")).map_err(|_| UnqualifiedProcess)?,
+        8192,
+    )
+    .map_err(|_| UnqualifiedProcess)?;
+    let (_, fields) = stat_fields(&stat)?;
     fields
         .split_whitespace()
         .nth(19)
@@ -1647,6 +1656,7 @@ mod tests {
                 "1 (fixture) name) {state} {} {threads}",
                 ["0"; 16].join(" ")
             )
+            .into_bytes()
         };
         assert!(!exited_stat(&stat("Z", "2")).unwrap());
         assert!(!exited_stat(&stat("S", "1")).unwrap());
@@ -1664,7 +1674,7 @@ mod tests {
         // A count nobody could read stays an error, which is a different
         // thing from a count of none.
         assert!(exited_stat(&stat("Z", "unknown")).is_err());
-        assert!(exited_stat("unreadable").is_err());
+        assert!(exited_stat(b"unreadable").is_err());
     }
 
     #[test]

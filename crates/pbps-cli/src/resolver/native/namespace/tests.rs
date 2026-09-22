@@ -1,6 +1,116 @@
 use super::*;
 
 #[test]
+#[ignore = "requires the root-owned group helper from live-resolver-namespace.py"]
+fn a_process_with_the_kernel_maximum_groups_can_be_captured() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Command, Stdio};
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let helper = std::env::var("PBPS_GROUP_FIXTURE_HELPER").unwrap();
+    let mut child = OwnedChild(
+        Command::new(helper)
+            .arg("maximum-groups")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = child.0.stdin.take().unwrap();
+    let mut output = BufReader::new(child.0.stdout.take().unwrap());
+    let mut line = String::new();
+    output.read_line(&mut line).unwrap();
+    assert_eq!(line.trim(), "ready");
+    let status = std::fs::read_to_string(format!("/proc/{}/status", child.0.id())).unwrap();
+    assert!(status.len() > 65536);
+    let maximum: usize = std::fs::read_to_string("/proc/sys/kernel/ngroups_max")
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("Groups:"))
+            .unwrap()
+            .split_whitespace()
+            .count(),
+        maximum
+    );
+    let lease = ProcessLease::capture(child.0.id())
+        .expect("kernel-supported supplementary groups must not prevent process capture");
+    lease.check().unwrap();
+    assert_eq!(lease.namespace_pid, child.0.id());
+    input.write_all(b"q").unwrap();
+    assert!(child.0.wait().unwrap().success());
+    assert!(lease.check().is_err());
+}
+
+#[test]
+fn opaque_task_names_preserve_observation_identity_and_credentials() {
+    let Ok(pid) = std::env::var("PBPS_NAMESPACE_NAME_PID") else {
+        return;
+    };
+    let pid: u32 = pid.parse().unwrap();
+    let child: u32 = std::env::var("PBPS_NAMESPACE_NAME_CHILD")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let base = format!("/proc/{pid}/root/proc/{child}");
+    for file in ["stat", "status"] {
+        let bytes = std::fs::read(format!("{base}/{file}")).unwrap();
+        assert!(
+            bytes.contains(&0xff),
+            "the fixture must retain opaque bytes"
+        );
+        assert!(std::str::from_utf8(&bytes).is_err());
+    }
+    assert_eq!(
+        std::fs::read(format!("{base}/comm")).unwrap(),
+        b"odd\xff)(\n\t\\name\n"
+    );
+    let anchor = ProcessLease::capture(pid).unwrap();
+    let view = NamespaceProcfs::capture(&anchor).unwrap();
+    let observations = view
+        .observe()
+        .expect("opaque task names must not refuse namespace observation");
+    let observation = observations
+        .iter()
+        .find(|task| task.id().number() == child)
+        .unwrap();
+    let TaskReading::Live(status) = observation.status().unwrap() else {
+        panic!("the named child is still alive");
+    };
+    assert_eq!(status_id(&status, "Pid:").unwrap(), child);
+    assert_eq!(status_id(&status, "Tgid:").unwrap(), child);
+    let mut held = None;
+    for_each_namespace_task(&anchor, |task, process| {
+        if task.id().number() == child {
+            held = Some(process);
+        }
+        Ok(())
+    })
+    .expect("opaque names must survive production qualification");
+    let held = held.unwrap();
+    held.check().unwrap();
+    assert!(held.has_same_executable_parent().unwrap());
+    assert!(belongs_to_service(&held, &anchor).unwrap());
+    assert_eq!(
+        status_id(&held.read_proc("status", 65536).unwrap(), "Pid:").unwrap(),
+        child
+    );
+    super::super::groups(&held).unwrap();
+    super::super::private_channel::security(&held, 999, 0).unwrap();
+    assert!(!super::super::process_exited(&held.directory).unwrap());
+    anchor.check().unwrap();
+}
+
+#[test]
 fn anchor_loss_during_a_view_read_is_distinct_from_an_unreadable_view() {
     if std::env::var_os("PBPS_NAMESPACE_ANCHOR_FIXTURE").is_none() {
         return;
@@ -229,15 +339,38 @@ fn a_held_task_iterator_may_disappear_only_after_its_group_exits() {
 fn proc_component_reads_reject_symlinks_and_parent_escape() {
     let root = std::env::temp_dir().join(format!("pbps-proc-view-{}", rand::random::<u64>()));
     std::fs::create_dir(&root).unwrap();
-    std::fs::write(root.join("status"), "Pid: 1\n").unwrap();
+    std::fs::write(root.join("status"), b"Name:\tx\xff\nPid: 1\n").unwrap();
     std::os::unix::fs::symlink("status", root.join("alias")).unwrap();
     let directory = File::open(&root).unwrap();
-    assert_eq!(read(&directory, "status").unwrap(), "Pid: 1\n");
-    assert!(read(&directory, "alias").is_err());
-    assert!(read(&directory, "../status").is_err());
-    assert!(read(&directory, "/proc/self/status").is_err());
+    assert_eq!(read_status(&directory, "status").unwrap(), "Pid: 1\n");
+    assert!(read_status(&directory, "alias").is_err());
+    assert!(read_status(&directory, "../status").is_err());
+    assert!(read_status(&directory, "/proc/self/status").is_err());
     assert!(namespace_init(&directory).is_err());
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn opaque_names_do_not_relax_required_task_identity_fields() {
+    let record = |id: &str, state: &str, start: &str| {
+        let mut bytes = format!("{id} (").into_bytes();
+        bytes.extend_from_slice(b"a\xff)\n(");
+        bytes.extend_from_slice(format!(") {state} {} {start}", ["0"; 18].join(" ")).as_bytes());
+        bytes
+    };
+    let valid = record("12", "S", "42");
+    assert_eq!(task_stat(&valid).unwrap(), (12, "S", 42));
+    for invalid in [
+        record("0", "S", "42"),
+        record("bad", "S", "42"),
+        record("12", "SS", "42"),
+        record("12", "S", "bad"),
+        record("12", "S", "-1"),
+        record("12", "S", "18446744073709551616"),
+        record("12", "S", ""),
+    ] {
+        assert!(matches!(task_stat(&invalid), Err(NamespaceError::Metadata)));
+    }
 }
 
 #[test]

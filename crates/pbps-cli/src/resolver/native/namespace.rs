@@ -127,6 +127,7 @@ impl TaskObservation {
     /// inode and matching kernel coordinate bracket the reading. A task can
     /// still change credentials after this returns; launch controls must
     /// enforce whichever restrictions the caller needs between readings.
+    /// The opaque, unused Name field is omitted from the returned text.
     pub fn status(&self) -> Result<TaskReading, NamespaceError> {
         if FileIdentity::of(&self.id.handle)? != self.id.namespace {
             return Err(NamespaceError::Replaced);
@@ -134,7 +135,7 @@ impl TaskObservation {
         if !task_alive(&self.directory, self.id.number, self.start_ticks)? {
             return Ok(TaskReading::Exited);
         }
-        let status = match read(&self.directory, "status") {
+        let status = match read_status(&self.directory, "status") {
             Ok(status) => status,
             Err(_) if !task_alive(&self.directory, self.id.number, self.start_ticks)? => {
                 return Ok(TaskReading::Exited);
@@ -379,25 +380,22 @@ pub(super) fn open(directory: &File, path: &str, flags: OFlags) -> std::io::Resu
     .map_err(Into::into)
 }
 
-fn read(directory: &File, path: &str) -> Result<String, NamespaceError> {
-    super::read_bounded_from(
-        open(directory, path, OFlags::empty()).map_err(|_| NamespaceError::Unreadable)?,
-        65536,
-    )
-    .map_err(Into::into)
+fn read_status(directory: &File, path: &str) -> Result<String, NamespaceError> {
+    let file = open(directory, path, OFlags::empty()).map_err(|_| NamespaceError::Unreadable)?;
+    super::read_status(file, 65536).map_err(Into::into)
 }
 
-fn read_stat(directory: &File) -> Result<Option<String>, NamespaceError> {
-    use std::io::Read;
+fn read_stat(directory: &File) -> Result<Option<Vec<u8>>, NamespaceError> {
     let file = match open(directory, "stat", OFlags::empty()) {
         Ok(file) => file,
         Err(error) if process_gone(&error) => return Ok(None),
         Err(_) => return Err(NamespaceError::Unreadable),
     };
-    let mut stat = String::new();
-    match file.take(65537).read_to_string(&mut stat) {
-        Ok(_) if stat.len() <= 65536 => Ok(Some(stat)),
-        Ok(_) => Err(NamespaceError::Metadata),
+    match super::read_bytes(file, 65536) {
+        Ok(stat) => Ok(Some(stat)),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            Err(NamespaceError::Metadata)
+        }
         Err(error) if process_gone(&error) => Ok(None),
         Err(_) => Err(NamespaceError::Unreadable),
     }
@@ -432,14 +430,8 @@ fn task_alive(directory: &File, id: u32, start: u64) -> Result<bool, NamespaceEr
     Ok(!matches!(state, "X" | "Z"))
 }
 
-fn task_stat(stat: &str) -> Result<(u32, &str, u64), NamespaceError> {
-    let (prefix, fields) = stat.rsplit_once(')').ok_or(NamespaceError::Metadata)?;
-    let number = prefix
-        .split_once(' ')
-        .ok_or(NamespaceError::Metadata)?
-        .0
-        .parse()
-        .map_err(|_| NamespaceError::Metadata)?;
+fn task_stat(stat: &[u8]) -> Result<(u32, &str, u64), NamespaceError> {
+    let (number, fields) = super::stat_fields(stat).map_err(|_| NamespaceError::Metadata)?;
     let mut fields = fields.split_whitespace();
     let state = fields.next().ok_or(NamespaceError::Metadata)?;
     let start = fields
