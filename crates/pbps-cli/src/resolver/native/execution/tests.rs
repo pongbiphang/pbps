@@ -150,3 +150,65 @@ async fn owned_root_guard_controls_are_measured_on_the_native_kernel() {
     );
     assert!(String::from_utf8_lossy(&tested.stdout).contains("1 passed"));
 }
+
+#[test]
+fn descriptor_limits_require_one_finite_bounded_soft_and_hard_pair() {
+    for pair in ["1024 1024", "512 1024", "512 512", "0 0"] {
+        assert!(
+            check_descriptor_limits(&format!(
+                "Limit Soft Limit Hard Limit Units\nMax open files    {pair} files\n"
+            ))
+            .is_ok()
+        );
+    }
+    for row in [
+        "",
+        "Max open files",
+        "Max open files 1024 files",
+        "Max open files 1024 1024",
+        "Max open files 1024 2048 files",
+        "Max open files 2048 2048 files",
+        "Max open files 1024 512 files",
+        "Max open files 1024 unlimited files",
+        "Max open files unlimited unlimited files",
+        "Max open files -1 1024 files",
+        "Max open files +1 1024 files",
+        "Max open files 1 18446744073709551616 files",
+        "Max open files 1 1024 bytes",
+        "Max open files 1 1024 files extra",
+        "Max open files 1024 1024 files\nMax open files 1024 1024 files",
+        "Max open files 1024 1024 files\nMax open files unlimited unlimited files",
+    ] {
+        assert!(check_descriptor_limits(row).is_err(), "{row:?}");
+    }
+}
+
+#[test]
+fn a_held_process_cannot_supply_limits_after_it_exits() {
+    use rustix::process::{Pid, Resource, Rlimit, prlimit};
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let lowered = prlimit(
+        Some(Pid::from_raw(pid.try_into().unwrap()).unwrap()),
+        Resource::Nofile,
+        Rlimit {
+            current: Some(512),
+            maximum: Some(512),
+        },
+    );
+    let process = ProcessLease::capture(pid);
+    let before = process.as_ref().ok().map(check_file_descriptors);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    lowered.unwrap();
+    before.unwrap().expect("a live, tighter limit is bounded");
+    let process = process.unwrap();
+    assert!(process.check().is_err());
+    assert!(
+        check_file_descriptors(&process).is_err(),
+        "held proc evidence must not survive process loss"
+    );
+}

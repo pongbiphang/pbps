@@ -1,4 +1,4 @@
-//! Effective mount and cgroup-v2 limits, read from the selected live process.
+//! Effective mount, cgroup-v2 and file-descriptor limits of live processes.
 //! Configuration replies do not substitute for these kernel observations.
 
 use super::{FileIdentity, ProcessLease, UnqualifiedProcess, proc_base, read_bounded};
@@ -7,6 +7,38 @@ use std::fs::File;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
+
+/// Shared by the fixed workload/forwarder launch and its kernel checks.
+pub(crate) const FILE_DESCRIPTOR_LIMIT: u64 = 1024;
+
+/// Callers bracket this held-directory read with their process continuity
+/// checks. The hard limit matters even when the current soft limit is lower:
+/// an unprivileged process may raise its soft limit up to that hard ceiling.
+pub(super) fn check_file_descriptors(process: &ProcessLease) -> Result<(), UnqualifiedProcess> {
+    check_descriptor_limits(&process.read_proc("limits", 16384)?)
+}
+
+fn check_descriptor_limits(text: &str) -> Result<(), UnqualifiedProcess> {
+    let mut rows = text
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .filter(|fields| fields.get(..3) == Some(&["Max", "open", "files"]));
+    let row = rows.next().ok_or(UnqualifiedProcess)?;
+    if rows.next().is_some() || row.len() != 6 || row[5] != "files" {
+        return Err(UnqualifiedProcess);
+    }
+    let finite = |value: &str| -> Result<u64, UnqualifiedProcess> {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(UnqualifiedProcess);
+        }
+        value.parse().map_err(|_| UnqualifiedProcess)
+    };
+    let (soft, hard) = (finite(row[3])?, finite(row[4])?);
+    if soft > hard || hard > FILE_DESCRIPTOR_LIMIT {
+        return Err(UnqualifiedProcess);
+    }
+    Ok(())
+}
 
 pub(crate) struct ExecutionProfile {
     pub memory: u64,
@@ -44,6 +76,7 @@ impl ExecutionLease {
 
     pub(crate) fn check(&self) -> Result<(), UnqualifiedProcess> {
         self.process.check()?;
+        check_file_descriptors(&self.process)?;
         if cgroup_path(&self.process)? != self.cgroup_path
             || FileIdentity::of(&File::open(&self.cgroup_path).map_err(|_| UnqualifiedProcess)?)?
                 != FileIdentity::of(&self.cgroup)?

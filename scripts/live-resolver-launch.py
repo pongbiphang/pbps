@@ -20,6 +20,8 @@ TESTS = [
     "a_wrong_workload_identity_is_refused_before_initialization",
     "a_guard_without_termination_authority_is_refused_before_initialization",
     "the_launch_cannot_omit_inherited_no_new_privileges",
+    "effective_descriptor_limits_are_required_before_initialization",
+    "unreadable_effective_limits_are_not_a_bounded_answer",
 ]
 
 
@@ -38,10 +40,15 @@ def main():
                PBPS_RESOLVER_TEST_DRIVER=args.engine,
                PBPS_RESOLVER_TEST_IMAGE=IMAGES[args.engine])
     for name in TESTS:
+        command = [str(binary), "--ignored", "--exact",
+                   "resolver::docker::profile::launch_tests::" + name, "--nocapture"]
+        selected = env
+        if name == "unreadable_effective_limits_are_not_a_bounded_answer":
+            command = ["unshare", "--mount", "--propagation", "private", "--", *command]
+            selected = dict(env, PBPS_LIMITS_PRIVATE_PROC_FIXTURE="1")
         result = subprocess.run(
-            [str(binary), "--ignored", "--exact",
-             "resolver::docker::profile::launch_tests::" + name, "--nocapture"],
-            env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            command,
+            env=selected, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         print(result.stdout, end="", flush=True)
         if result.returncode or "test result: ok. 1 passed" not in result.stdout:
             raise SystemExit("launch fixture must run exactly one passing test: " + name)

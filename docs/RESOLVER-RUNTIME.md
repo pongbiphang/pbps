@@ -55,6 +55,15 @@ race, for at most eight attempts with the same held root, path and confinement
 flags. This also covers the contained parent of a namespace magic link.
 Exhaustion and other errors remain refusals; there is no less confined retry.
 
+The fixed workload and forwarder request a soft and hard `RLIMIT_NOFILE` of
+1024. Admission and rechecks read effective limits through the held guard and
+existing waiter/task observations: both limits must be finite, ordered and no
+higher than 1024. A lower ceiling is supported; missing, malformed or unreadable
+limits refuse. Checking only the guard would miss an already-created child
+whose hard limit remained higher when its parent's was lowered. These checks
+retain the process-continuity and observation limits below; they do not establish
+a complete lifetime process census.
+
 The host kernel, its administrators, the selected daemon and explicitly trusted
 image installation form the provisioning trust boundary. SQL privileges in
 scratch grant no authority over those external controls. This profile does not

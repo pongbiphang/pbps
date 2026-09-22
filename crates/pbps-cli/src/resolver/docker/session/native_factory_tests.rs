@@ -33,6 +33,10 @@ async fn native_factory_qualifies_before_bootstrap_and_rejects_rebound_target_co
         "kill-workload",
         "control-limit",
         "workload-limit",
+        "control-nofile",
+        "workload-nofile",
+        "control-child-nofile",
+        "workload-child-nofile",
     ] {
         let peer = PeerVerifiedConn::connect(driver, &primary).await.unwrap();
         let mut target = Some(NativeTarget::establish(peer, service).await.unwrap());
@@ -79,7 +83,8 @@ async fn native_factory_qualifies_before_bootstrap_and_rejects_rebound_target_co
             .await
             .unwrap();
         session.check().await.unwrap();
-        if action.starts_with("kill-") || action.ends_with("-limit") {
+        if action.starts_with("kill-") || action.ends_with("-limit") || action.ends_with("-nofile")
+        {
             let state = session.state.as_ref().unwrap();
             let run = if action.contains("control") {
                 &state.control
@@ -96,6 +101,66 @@ async fn native_factory_qualifies_before_bootstrap_and_rejects_rebound_target_co
                     .await
                     .unwrap();
                 assert_eq!(status, hyper::StatusCode::NO_CONTENT);
+            } else if action.ends_with("-nofile") {
+                use crate::resolver::native::ProcessLease;
+                use rustix::process::{Pid, Resource, Rlimit, prlimit};
+                let root = run.native_pid().unwrap();
+                // This fixture's fixed, source-free tree is quiescent here.
+                // These IDs select owned mutation subjects, not a production
+                // completeness claim or a substitute for namespace admission.
+                let pids = if action.contains("-child-") {
+                    let mut pending = vec![root];
+                    let mut descendants = Vec::new();
+                    while let Some(pid) = pending.pop() {
+                        let process = ProcessLease::capture(pid).unwrap();
+                        let children = process
+                            .read_proc(&format!("task/{pid}/children"), 4096)
+                            .unwrap();
+                        for child in children
+                            .split_whitespace()
+                            .map(|pid| pid.parse::<u32>().unwrap())
+                        {
+                            assert!(!descendants.contains(&child));
+                            descendants.push(child);
+                            assert!(descendants.len() <= 512);
+                            pending.push(child);
+                        }
+                    }
+                    descendants
+                } else {
+                    vec![root]
+                };
+                assert!(!pids.is_empty());
+                for pid in pids {
+                    let process = ProcessLease::capture(pid).unwrap();
+                    let before = process.read_proc("limits", 16384).unwrap();
+                    let before = before
+                        .lines()
+                        .find(|line| line.starts_with("Max open files"))
+                        .unwrap();
+                    prlimit(
+                        Some(Pid::from_raw(pid.try_into().unwrap()).unwrap()),
+                        Resource::Nofile,
+                        Rlimit {
+                            current: Some(1024),
+                            maximum: Some(2048),
+                        },
+                    )
+                    .unwrap();
+                    process.check().unwrap();
+                    let after = process.read_proc("limits", 16384).unwrap();
+                    let after = after
+                        .lines()
+                        .find(|line| line.starts_with("Max open files"))
+                        .unwrap();
+                    eprintln!(
+                        "{action} {}: {before} -> {after}",
+                        process.executable_path().display()
+                    );
+                }
+                run.check()
+                    .await
+                    .expect("Docker's expected configuration still matches");
             } else {
                 // Change the actual owned cgroup without changing Docker's
                 // reported recipe, so only the native lease can notice it.
