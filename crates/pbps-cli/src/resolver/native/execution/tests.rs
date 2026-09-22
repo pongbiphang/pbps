@@ -186,10 +186,13 @@ fn descriptor_limits_require_one_finite_bounded_soft_and_hard_pair() {
 #[test]
 fn a_held_process_cannot_supply_limits_after_it_exits() {
     use rustix::process::{Pid, Resource, Rlimit, prlimit};
-    let mut child = std::process::Command::new("/bin/sleep")
-        .arg("30")
-        .spawn()
-        .unwrap();
+    // Capture only after exec, as the other native fixtures do (#638).
+    // Widen the transition so removing that wait exposes the wrong program
+    // instead of relying on the rare fork/exec window observed in CI.
+    let mut child = super::super::spawned_and_execed(
+        std::process::Command::new("/bin/bash").args(["-ec", "sleep 0.05; exec /usr/bin/sleep 30"]),
+        "sleep",
+    );
     let pid = child.id();
     let lowered = prlimit(
         Some(Pid::from_raw(pid.try_into().unwrap()).unwrap()),
@@ -200,10 +203,17 @@ fn a_held_process_cannot_supply_limits_after_it_exits() {
         },
     );
     let process = ProcessLease::capture(pid);
+    let running_sleep = process
+        .as_ref()
+        .is_ok_and(|process| process.executable_path().ends_with("sleep"));
     let before = process.as_ref().ok().map(check_file_descriptors);
     child.kill().unwrap();
     child.wait().unwrap();
     lowered.unwrap();
+    assert!(
+        running_sleep,
+        "the fixture must capture the executed program"
+    );
     before.unwrap().expect("a live, tighter limit is bounded");
     let process = process.unwrap();
     assert!(process.check().is_err());
