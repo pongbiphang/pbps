@@ -2033,3 +2033,184 @@ fn an_unflushed_rejection_checkpoint_keeps_unsealed_acquisition_evidence() {
         f.source_unchanged(&before);
     }
 }
+
+#[test]
+fn a_bounded_live_tree_with_an_over_budget_base_union_leaves_no_capture_obligation() {
+    let f = Fixture::new("rejection-union-bound");
+    let schema = f.repo.project.join("schema");
+    f.repo.table(ORIGINAL);
+    for n in 0..2100 {
+        fs::write(
+            schema.join(format!("old-{n}.yml")),
+            "# old declaration input\n",
+        )
+        .unwrap();
+    }
+    f.repo.commit();
+    f.repo.table(RENAMED);
+    for n in 0..2100 {
+        fs::remove_file(schema.join(format!("old-{n}.yml"))).unwrap();
+        fs::write(
+            schema.join(format!("new-{n}.yml")),
+            "# new declaration input\n",
+        )
+        .unwrap();
+    }
+    let before = f.repo.preserved();
+    for _ in 0..2 {
+        let error = f
+            .repo
+            .store()
+            .preview(request(), SystemTime::now())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("too many input paths"),
+            "{error}"
+        );
+        assert!(f.publisher().resource_reports().unwrap().is_empty());
+        assert!(
+            git(
+                &f.repo.root,
+                &["for-each-ref", "--format=%(refname)", "refs/pbps-compose/"]
+            )
+            .is_empty()
+        );
+        f.source_unchanged(&before);
+    }
+    for n in 0..2100 {
+        fs::remove_file(schema.join(format!("new-{n}.yml"))).unwrap();
+    }
+    f.repo.table(ORIGINAL);
+    f.repo.commit();
+    f.repo.table(RENAMED);
+    assert!(f.repo.store().preview(request(), SystemTime::now()).is_ok());
+}
+
+#[test]
+fn identity_and_aggregate_input_bounds_retire_only_completed_capture_checks() {
+    for mode in [
+        "identity",
+        "aggregate",
+        "attributes",
+        "attribute-object",
+        "live-attribute",
+        "live-attribute-total",
+    ] {
+        let f = Fixture::new(&format!("remaining-budget-{mode}"));
+        let ids = f.repo.project.join("schema.ids.json");
+        let original_ids = fs::read(&ids).unwrap();
+        if matches!(mode, "attributes" | "attribute-object") {
+            f.repo.table(ORIGINAL);
+            let size = if mode == "attributes" { 31 } else { 65 };
+            let comment = format!("#{}\n", " ".repeat(size * 1024 * 1024));
+            fs::write(f.repo.root.join(".gitattributes"), &comment).unwrap();
+            if mode == "attributes" {
+                fs::write(f.repo.project.join(".gitattributes"), &comment).unwrap();
+            }
+            f.repo.commit();
+        }
+        f.repo.table(RENAMED);
+        match mode {
+            "identity" => fs::OpenOptions::new()
+                .write(true)
+                .open(&ids)
+                .unwrap()
+                .set_len(64 * 1024 * 1024 + 1)
+                .unwrap(),
+            "aggregate" => {
+                let mut file = fs::OpenOptions::new().append(true).open(&ids).unwrap();
+                file.write_all(&vec![b' '; 62 * 1024 * 1024]).unwrap();
+                f.repo
+                    .table(&format!("{RENAMED}#{}\n", " ".repeat(3 * 1024 * 1024)));
+            }
+            "attributes" => f
+                .repo
+                .table(&format!("{RENAMED}#{}\n", " ".repeat(3 * 1024 * 1024))),
+            "attribute-object" => (),
+            "live-attribute" | "live-attribute-total" => {
+                let size = if mode == "live-attribute" { 65 } else { 33 };
+                let comment = format!("#{}\n", " ".repeat(size * 1024 * 1024));
+                fs::write(f.repo.root.join(".gitattributes"), &comment).unwrap();
+                if mode == "live-attribute-total" {
+                    fs::write(f.repo.project.join(".gitattributes"), &comment).unwrap();
+                }
+            }
+            _ => unreachable!(),
+        }
+        let before = f.repo.preserved();
+        for _ in 0..2 {
+            let error = f
+                .repo
+                .store()
+                .preview(request(), SystemTime::now())
+                .unwrap_err();
+            assert!(error.to_string().contains("limit"), "{mode}: {error}");
+            assert!(
+                f.publisher().resource_reports().unwrap().is_empty(),
+                "{mode}"
+            );
+            assert!(
+                git(
+                    &f.repo.root,
+                    &["for-each-ref", "--format=%(refname)", "refs/pbps-compose/"]
+                )
+                .is_empty()
+            );
+            f.source_unchanged(&before);
+        }
+        fs::write(&ids, &original_ids).unwrap();
+        if matches!(
+            mode,
+            "attributes" | "attribute-object" | "live-attribute" | "live-attribute-total"
+        ) {
+            fs::remove_file(f.repo.root.join(".gitattributes")).unwrap();
+        }
+        if matches!(mode, "attributes" | "live-attribute-total") {
+            fs::remove_file(f.repo.project.join(".gitattributes")).unwrap();
+        }
+        f.repo.table(ORIGINAL);
+        git(&f.repo.root, &["add", "-A"]);
+        git(
+            &f.repo.root,
+            &["commit", "--allow-empty", "-qm", "correct bounded inputs"],
+        );
+        f.repo.table(RENAMED);
+        assert!(
+            f.repo.store().preview(request(), SystemTime::now()).is_ok(),
+            "{mode}"
+        );
+    }
+}
+
+#[test]
+fn excessive_attribute_paths_are_refused_before_creating_private_attribute_indexes() {
+    let f = Fixture::new("remaining-attribute-path-budget");
+    let history = f.repo.project.join("schema/history");
+    f.repo.table(ORIGINAL);
+    for n in 0..2100 {
+        let directory = history.join(format!("{n}/nested"));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("t.yml"), "# previous declaration input\n").unwrap();
+    }
+    f.repo.commit();
+    fs::remove_dir_all(&history).unwrap();
+    f.repo.table(RENAMED);
+    let before = f.repo.preserved();
+    for _ in 0..2 {
+        let error = f
+            .repo
+            .store()
+            .preview(request(), SystemTime::now())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("too many attribute paths"),
+            "{error}"
+        );
+        assert!(f.publisher().resource_reports().unwrap().is_empty());
+        f.source_unchanged(&before);
+    }
+    f.repo.table(ORIGINAL);
+    f.repo.commit();
+    f.repo.table(RENAMED);
+    assert!(f.repo.store().preview(request(), SystemTime::now()).is_ok());
+}
