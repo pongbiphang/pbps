@@ -245,9 +245,15 @@ impl Candidates {
             .as_ref()
             .is_some_and(|base| base != &candidate.preview.base)
         {
-            return Err(Error::new(
-                "The original base changed; start a separately reviewed workflow",
-            ));
+            let refusal = "The original base changed; start a separately reviewed workflow";
+            // Capture has already sealed this preview. Use its acknowledged
+            // discard path and ordinary spent protection (DECISIONS 535).
+            if let Err(retirement) = candidate.workspace.retire_preview() {
+                return Err(Error::new(&format!(
+                    "{refusal}; private retirement remains pending: {retirement}"
+                )));
+            }
+            return Err(Error::new(refusal));
         }
         let preview = candidate.preview.clone();
         self.current = Some(Stored::Previewed {

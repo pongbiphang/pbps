@@ -2214,3 +2214,256 @@ fn excessive_attribute_paths_are_refused_before_creating_private_attribute_index
     f.repo.table(RENAMED);
     assert!(f.repo.store().preview(request(), SystemTime::now()).is_ok());
 }
+
+fn alternative_on_advanced_base(
+    f: &Fixture,
+    candidates: &mut Candidates,
+    publisher: &mut Publications,
+) -> (Preview, Arc<Candidate>, Outcome) {
+    let preview = candidates.preview(request(), SystemTime::now()).unwrap();
+    let candidate = candidates
+        .confirm(&preview.candidate_id, SystemTime::now())
+        .unwrap();
+    let delivered = publisher.confirm(&candidate);
+    assert_eq!(delivered.status, Status::Delivered);
+    publisher
+        .start_alternative(candidates, &preview.operation_id)
+        .unwrap();
+    git(
+        &f.repo.root,
+        &[
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "advance alternative source base",
+        ],
+    );
+    (preview, candidate, delivered)
+}
+
+#[test]
+fn rejected_alternatives_retire_their_sealed_snapshots_and_keep_existing_results() {
+    let f = Fixture::new("alternative-retirement");
+    let mut candidates = f.repo.store();
+    let mut publisher = f.publisher();
+    let (original, candidate, delivered) =
+        alternative_on_advanced_base(&f, &mut candidates, &mut publisher);
+    let before = f.repo.preserved();
+    let receipt = fs::read(f.record(&original.operation_id)).unwrap();
+    let pins = git(
+        &f.repo.root,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/pbps-compose/",
+        ],
+    );
+    for count in 1..=2 {
+        let error = candidates
+            .preview(request(), SystemTime::now())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("original base changed"),
+            "{error}"
+        );
+        let reports = publisher.resource_reports().unwrap();
+        assert_eq!(reports.len(), count + 1);
+        for report in reports
+            .iter()
+            .filter(|r| r.operation_id != original.operation_id)
+        {
+            assert_eq!(report.state, ResourceState::Spent);
+            assert!(!report.cleanup_pending);
+            assert!(
+                !root(&f)
+                    .join("snapshots")
+                    .join(&report.operation_id)
+                    .exists()
+            );
+            assert_eq!(
+                publisher
+                    .recover_resources(&report.operation_id)
+                    .unwrap()
+                    .state,
+                ResourceState::Spent
+            );
+        }
+        assert_eq!(fs::read(f.record(&original.operation_id)).unwrap(), receipt);
+        assert_eq!(
+            git(
+                &f.repo.root,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname) %(objectname)",
+                    "refs/pbps-compose/"
+                ]
+            ),
+            pins
+        );
+        assert_eq!(f.repo.preserved(), before);
+        assert!(
+            candidates
+                .confirm(&original.candidate_id, SystemTime::now())
+                .is_err()
+        );
+        assert_eq!(publisher.confirm(&candidate), delivered);
+    }
+    drop(publisher);
+    let mut restarted = f.publisher();
+    assert_eq!(restarted.recover(&original.operation_id), delivered);
+    // Restore only this fixture's empty commit; the original alternative
+    // authorization still requires its recorded base and untouched inputs.
+    git(&f.repo.root, &["reset", "--soft", &original.base]);
+    let accepted = candidates.preview(request(), SystemTime::now()).unwrap();
+    assert_eq!(accepted.base, original.base);
+    assert_ne!(accepted.operation_id, original.operation_id);
+}
+
+#[test]
+fn rejected_alternatives_preserve_retirement_faults_and_foreign_entries_across_restart() {
+    for (boundary, after) in [
+        ("transition", false),
+        ("transition", true),
+        ("file", false),
+        ("file", true),
+        ("foreign", false),
+    ] {
+        let f = Fixture::new(&format!("alternative-retirement-{boundary}-{after}"));
+        let enabled = Arc::new(AtomicBool::new(false));
+        let active = enabled.clone();
+        let fired = Arc::new(AtomicBool::new(false));
+        let flag = fired.clone();
+        let observer = ResourceObserver::new(move |at| {
+            if !active.load(Ordering::SeqCst) || at.after != after {
+                return true;
+            }
+            let matches = if boundary == "transition" {
+                at.operation == ResourceOperation::Sync
+                    && at.path.ends_with("resources")
+                    && fs::read_dir(&at.path)
+                        .unwrap()
+                        .filter_map(|e| e.ok())
+                        .any(|e| {
+                            fs::read(e.path())
+                                .ok()
+                                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                                .is_some_and(|r| r["state"] == "retiring")
+                        })
+            } else {
+                at.operation == ResourceOperation::Remove
+                    && at.path.ends_with("project/schema/t.yml")
+            };
+            if matches && !flag.swap(true, Ordering::SeqCst) {
+                if boundary == "foreign" {
+                    fs::write(
+                        at.path.ancestors().nth(3).unwrap().join("foreign.lock"),
+                        "foreign owner",
+                    )
+                    .unwrap();
+                }
+                return false;
+            }
+            true
+        });
+        let mut candidates = Candidates::with_resources(
+            Config {
+                executable: BIN.into(),
+                project: f.repo.project.clone(),
+                deadline: Duration::from_secs(15),
+            },
+            observer,
+        );
+        let mut publisher = f.publisher();
+        let (original, candidate, delivered) =
+            alternative_on_advanced_base(&f, &mut candidates, &mut publisher);
+        let before = f.repo.preserved();
+        let receipt = fs::read(f.record(&original.operation_id)).unwrap();
+        let pins = git(
+            &f.repo.root,
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/pbps-compose/",
+            ],
+        );
+        enabled.store(true, Ordering::SeqCst);
+        let error = candidates
+            .preview(request(), SystemTime::now())
+            .unwrap_err();
+        assert!(fired.load(Ordering::SeqCst), "{boundary}-{after}: {error}");
+        assert!(
+            error.to_string().contains("original base changed"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("private retirement remains pending"),
+            "{error}"
+        );
+        let reports = publisher.resource_reports().unwrap();
+        assert_eq!(reports.len(), 2);
+        let pending = reports
+            .iter()
+            .find(|r| r.operation_id != original.operation_id)
+            .unwrap();
+        assert_eq!(pending.state, ResourceState::Retiring);
+        assert!(pending.cleanup_pending);
+        let id = pending.operation_id.clone();
+        let snapshot = root(&f).join("snapshots").join(&id);
+        assert!(snapshot.exists());
+        let foreign = snapshot.join("repository/foreign.lock");
+        assert_eq!(f.repo.preserved(), before);
+        assert_eq!(fs::read(f.record(&original.operation_id)).unwrap(), receipt);
+        drop(candidate);
+        drop(candidates);
+        drop(publisher);
+        if boundary == "foreign" {
+            for _ in 0..2 {
+                let mut restarted = f.publisher();
+                assert!(restarted.recover_resources(&id).is_err());
+                let reports = restarted.resource_reports().unwrap();
+                assert!(
+                    reports
+                        .iter()
+                        .find(|r| r.operation_id == id)
+                        .unwrap()
+                        .cleanup_pending
+                );
+                assert_eq!(fs::read_to_string(&foreign).unwrap(), "foreign owner");
+            }
+            // Only the fixture removes its foreign file; recovery must never
+            // infer ownership from its location or from the failed discard.
+            fs::remove_file(&foreign).unwrap();
+        }
+        for _ in 0..2 {
+            let mut restarted = f.publisher();
+            let retired = restarted.recover_resources(&id).unwrap();
+            assert_eq!(retired.state, ResourceState::Spent);
+            assert!(!retired.cleanup_pending);
+            assert!(!snapshot.exists());
+            assert!(
+                root(&f)
+                    .join("resources")
+                    .join(format!("{id}.json"))
+                    .exists()
+            );
+            assert_eq!(fs::read(f.record(&original.operation_id)).unwrap(), receipt);
+            assert_eq!(restarted.recover(&original.operation_id), delivered);
+            assert!(restarted.discard_preview(&original.operation_id).is_err());
+            assert!(restarted.discard_preview("unknown").is_err());
+            assert_eq!(
+                git(
+                    &f.repo.root,
+                    &[
+                        "for-each-ref",
+                        "--format=%(refname) %(objectname)",
+                        "refs/pbps-compose/"
+                    ]
+                ),
+                pins
+            );
+            assert_eq!(f.repo.preserved(), before);
+        }
+    }
+}
