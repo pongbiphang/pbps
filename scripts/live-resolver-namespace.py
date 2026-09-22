@@ -33,6 +33,7 @@ SCAN_TEST = PREFIX + "scan_failures_recheck_the_anchor_without_replacing_callbac
 NAME_TEST = PREFIX + "opaque_task_names_preserve_observation_identity_and_credentials"
 GROUP_TEST = PREFIX + "a_process_with_the_kernel_maximum_groups_can_be_captured"
 MAPPING_TEST = "resolver::native::executables::tests::a_surviving_mapping_keeps_loaded_content_after_the_first_range_exits"
+DEVICE_TEST = "resolver::native::executables::tests::a_departed_mapping_cannot_use_the_same_inode_on_another_device"
 
 
 def run(*args, **kwargs):
@@ -101,6 +102,11 @@ def main():
             test(binary, MAPPING_TEST, dict(os.environ,
                  PBPS_MAPPING_FIXTURE_HELPER=str(helper),
                  PBPS_MAPPING_FIXTURE_FILE=str(Path(temporary) / "mapping.so")), ignored=True)
+            device_directory = Path(temporary) / "devices"
+            device_directory.mkdir()
+            test(binary, DEVICE_TEST, dict(os.environ,
+                 PBPS_MAPPING_FIXTURE_HELPER=str(helper),
+                 PBPS_MAPPING_FIXTURE_DIRECTORY=str(device_directory)), ignored=True)
             pids = []
             for _ in range(2):
                 name = "pbps-namespace-" + uuid.uuid4().hex

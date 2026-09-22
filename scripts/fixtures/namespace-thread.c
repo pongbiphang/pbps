@@ -12,6 +12,7 @@
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -35,6 +36,33 @@ static void *root_worker(void *unused) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "mapping-devices")) {
+        // Stacked private tmpfs mounts give the same rendered path and inode
+        // on two devices without altering any mount visible to the observer.
+        if (unshare(CLONE_NEWNS) || mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) return 1;
+        char path[4096];
+        int size = snprintf(path, sizeof(path), "%s/mapping.so", argv[2]);
+        if (size < 0 || (size_t)size >= sizeof(path)) return 1;
+        long length = sysconf(_SC_PAGESIZE);
+        if (length <= 0 || length > 65536) return 1;
+        void *ranges[2];
+        for (int i = 0; i < 2; ++i) {
+            if (mount("tmpfs", argv[2], "tmpfs", 0, "size=1m,inode64")) return 1;
+            int fd = open(path, O_CREAT | O_EXCL | O_RDWR, 0600);
+            char content[65536];
+            memset(content, 'a' + i, sizeof(content));
+            if (fd < 0 || write(fd, content, sizeof(content)) != sizeof(content)) return 1;
+            ranges[i] = mmap(NULL, length, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (ranges[i] == MAP_FAILED || close(fd)) return 1;
+        }
+        void *low = (uintptr_t)ranges[0] < (uintptr_t)ranges[1] ? ranges[0] : ranges[1];
+        puts("ready");
+        fflush(stdout);
+        if (getchar() != '1' || munmap(low, length)) return 1;
+        puts("one");
+        fflush(stdout);
+        return getchar() == 'q' ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "maximum-groups")) {
         long count = sysconf(_SC_NGROUPS_MAX);
         if (count <= 0 || count > 65536) return 1;
