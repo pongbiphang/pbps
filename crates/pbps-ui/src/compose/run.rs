@@ -190,7 +190,16 @@ impl Publications {
                 return Err(Problem::Interrupted);
             }
             self.binding(&description)?;
-            self.signing(&description)
+            self.signing(&description)?;
+            // Ask Git to validate both identities before recording an attempt.
+            // Neither identity diagnostics nor a preflight timestamp is evidence
+            // to persist; commit-tree still uses the ordinary configured identity.
+            for identity in ["GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"] {
+                self.git
+                    .bytes(&["var", identity], &[], None)
+                    .map_err(|_| Problem::IdentityUnavailable)?;
+            }
+            Ok(())
         })();
         if let Err(problem) = ready {
             return self.refused(description, problem);

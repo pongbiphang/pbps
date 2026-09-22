@@ -358,6 +358,62 @@ fn restored_pre_commit_prerequisites_allow_the_same_frozen_candidate_to_proceed(
 }
 
 #[test]
+fn restoring_each_git_identity_allows_the_same_frozen_candidate_to_proceed() {
+    for key in ["author.name", "committer.name"] {
+        let f = Fixture::new(&format!("identity-{key}"));
+        let (_store, preview, candidate) = f.ready();
+        let before = f.repo.preserved();
+        let mut publisher = f.publisher();
+        let created = std::cell::Cell::new(false);
+        let refused = publisher.confirm_observed(&candidate, &|at| {
+            if at == Boundary::BeforeCommit {
+                git(&f.repo.root, &["config", "user.useConfigOnly", "true"]);
+                for role in ["author", "committer"] {
+                    git(
+                        &f.repo.root,
+                        &["config", &format!("{role}.name"), "compose-test"],
+                    );
+                    git(
+                        &f.repo.root,
+                        &["config", &format!("{role}.email"), "compose@example.test"],
+                    );
+                }
+                // Empty role values fall back to user.*; remove that fallback too.
+                git(&f.repo.root, &["config", "user.name", ""]);
+                git(&f.repo.root, &["config", "user.email", ""]);
+                git(&f.repo.root, &["config", key, ""]);
+            }
+            if at == Boundary::CommitCreated {
+                created.set(true);
+            }
+            true
+        });
+        assert_eq!(refused.status, Status::Refused, "{key}: {refused:?}");
+        assert_eq!(refused.problem, Some(Problem::IdentityUnavailable));
+        assert_eq!(refused.local, LocalState::NotAttempted);
+        assert!(!created.get());
+        assert!(!f.record(&preview.operation_id).exists());
+        assert_eq!(refused.details.as_ref().unwrap().commit, None);
+        assert_eq!(f.remote_ref(&preview.output_ref), None);
+        f.source_unchanged(&before);
+
+        git(&f.repo.root, &["config", key, "compose-test"]);
+        let delivered = publisher.confirm(&candidate);
+        assert_eq!(delivered.status, Status::Delivered, "{key}: {delivered:?}");
+        assert_eq!(
+            String::from_utf8(git(
+                &f.repo.root,
+                &["show", "-s", "--format=%T%n%P", commit(&delivered)]
+            ))
+            .unwrap(),
+            format!("{}\n{}\n", preview.tree, preview.base)
+        );
+        assert_eq!(publisher.confirm(&candidate), delivered);
+        f.source_unchanged(&before);
+    }
+}
+
+#[test]
 fn unknown_push_then_independent_deletion_requires_fresh_informed_authorization() {
     let f = Fixture::new("push-ack");
     let (_, preview, candidate) = f.ready();
