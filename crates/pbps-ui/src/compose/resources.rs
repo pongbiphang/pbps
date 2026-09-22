@@ -373,6 +373,61 @@ impl Resources {
         self.sync_path(&objects)
     }
 
+    fn localize_pin_target(&self, target: &str) -> Result<()> {
+        let objects = PathBuf::from(self.git.line(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+        ])?);
+        let alternate = match std::fs::symlink_metadata(objects.join("info/alternates")) {
+            Ok(metadata) => metadata.len() != 0,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => return Err(Error::new("Cannot inspect borrowed Git object evidence")),
+        };
+        let packs = objects.join("pack");
+        let mut promised = false;
+        for entry in std::fs::read_dir(&packs)
+            .map_err(|_| Error::new("Cannot inspect promised Git object evidence"))?
+        {
+            let entry =
+                entry.map_err(|_| Error::new("Git object dependency discovery is incomplete"))?;
+            promised |= entry.file_name().as_encoded_bytes().ends_with(b".promisor");
+        }
+        if !alternate && !promised {
+            return Ok(());
+        }
+        // A borrower ref cannot protect an alternate donor from its own GC.
+        // Import a full, non-thin reachable closure before acknowledging the
+        // pin. Promisor packs need the same local guarantee. The existing
+        // subprocess size/deadline bounds apply; failure leaves ownership
+        // unacknowledged rather than promising a root into another store.
+        let pack = self.git.bytes(
+            &["pack-objects", "--stdout", "--revs"],
+            format!("{target}\n").as_bytes(),
+            None,
+        )?;
+        self.root
+            .observer
+            .at(ResourceOperation::Write, false, &packs)?;
+        self.git.bytes(
+            &[
+                "-c",
+                "core.fsync=all",
+                "-c",
+                "core.fsyncMethod=fsync",
+                "index-pack",
+                "--stdin",
+            ],
+            &pack,
+            None,
+        )?;
+        self.root
+            .observer
+            .at(ResourceOperation::Write, true, &packs)?;
+        self.flush_import()
+    }
+
     fn pin(&self, r: &mut Resource, kind: &str, target: &str) -> Result<()> {
         let reference = Self::pin_ref(&r.operation, kind);
         // A unique annotated tag is a private reachability root, not a public
@@ -397,6 +452,7 @@ impl Resources {
             },
         );
         self.save(r)?;
+        self.localize_pin_target(target)?;
         self.root.observer.at(
             ResourceOperation::Create,
             false,

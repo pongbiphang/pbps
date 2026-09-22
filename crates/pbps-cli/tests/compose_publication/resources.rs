@@ -64,6 +64,243 @@ fn forced_source_gc_preserves_the_frozen_base_and_exact_unpublished_commit() {
     assert_eq!(publisher.recover(&preview.operation_id), delivered);
 }
 
+fn external_object_fixture(name: &str, promised: bool) -> (Fixture, Fixture) {
+    let donor = Fixture::new(name);
+    donor.repo.table(ORIGINAL);
+    fs::write(
+        donor.repo.root.join("historical-payload"),
+        "old donor-only blob\n",
+    )
+    .unwrap();
+    donor.repo.commit();
+    fs::remove_file(donor.repo.root.join("historical-payload")).unwrap();
+    donor.repo.commit();
+    git(&donor.repo.root, &["push", "-q", "origin", "master"]);
+    let shared = donor.repo.root.with_extension("borrower");
+    let _ = fs::remove_dir_all(&shared);
+    if promised {
+        git(
+            &donor.repo.root,
+            &["config", "uploadpack.allowFilter", "true"],
+        );
+        git(
+            &donor.repo.root,
+            &[
+                "clone",
+                "--filter=blob:none",
+                "--no-checkout",
+                "-q",
+                &format!("file://{}", donor.repo.root.display()),
+                shared.to_str().unwrap(),
+            ],
+        );
+        git(&shared, &["checkout", "-q", "master"]);
+        assert!(
+            fs::read_dir(shared.join(".git/objects/pack"))
+                .unwrap()
+                .any(|e| {
+                    e.unwrap()
+                        .file_name()
+                        .as_encoded_bytes()
+                        .ends_with(b".promisor")
+                })
+        );
+        // Keep the promisor remote directed at its real object provider;
+        // delivery below uses a distinct ordinary origin endpoint.
+        git(&shared, &["remote", "rename", "origin", "provider"]);
+        git(
+            &shared,
+            &["remote", "add", "origin", donor.remote.to_str().unwrap()],
+        );
+    } else {
+        git(
+            &donor.repo.root,
+            &["clone", "--shared", "-q", ".", shared.to_str().unwrap()],
+        );
+        assert!(shared.join(".git/objects/info/alternates").exists());
+        git(
+            &shared,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                donor.remote.to_str().unwrap(),
+            ],
+        );
+    }
+    git(&shared, &["config", "user.name", "compose-test"]);
+    git(&shared, &["config", "user.email", "compose@example.test"]);
+    let f = Fixture {
+        repo: Repository {
+            project: shared.join("project"),
+            root: shared,
+        },
+        remote: donor.remote.clone(),
+    };
+    f.repo.table(RENAMED);
+    (donor, f)
+}
+
+#[test]
+fn borrowed_and_promised_objects_survive_donor_gc_after_pin_acknowledgment() {
+    for (promised, prepared) in [(false, false), (false, true), (true, false), (true, true)] {
+        let (donor, f) =
+            external_object_fixture(&format!("external-{promised}-{prepared}"), promised);
+        let before = f.repo.preserved();
+        if promised {
+            let missing = git(
+                &f.repo.root,
+                &["rev-list", "--objects", "--missing=print", "HEAD"],
+            );
+            assert!(
+                missing
+                    .split(|b| *b == b'\n')
+                    .any(|line| line.starts_with(b"?")),
+                "the filtered clone must start with an unfetched historical object"
+            );
+        }
+        let (_store, preview, candidate) = f.ready();
+        let exact = if prepared {
+            let mut publisher = f.publisher();
+            let stopped = publisher.confirm_observed(&candidate, &|at| {
+                at != Boundary::AfterPersist(DurableStage::Prepared)
+            });
+            assert_eq!(stopped.status, Status::RecoveryRequired, "{stopped:?}");
+            Some(commit(&stopped).to_owned())
+        } else {
+            None
+        };
+
+        // Actual shared and filtered clones both depend on another store.
+        // Its GC visits only its refs, not the borrower's private base pin.
+        let empty = String::from_utf8(git(&donor.repo.root, &["mktree"])).unwrap();
+        let unrelated = String::from_utf8(git(
+            &donor.repo.root,
+            &["commit-tree", empty.trim(), "-m", "independent donor root"],
+        ))
+        .unwrap();
+        git(
+            &donor.repo.root,
+            &["update-ref", "refs/heads/master", unrelated.trim()],
+        );
+        let donor_refs = String::from_utf8(git(
+            &donor.repo.root,
+            &["for-each-ref", "--format=%(refname)"],
+        ))
+        .unwrap();
+        for reference in donor_refs
+            .lines()
+            .filter(|name| *name != "refs/heads/master")
+        {
+            git(&donor.repo.root, &["update-ref", "-d", reference]);
+        }
+        git(
+            &donor.repo.root,
+            &["reflog", "expire", "--expire=now", "--all"],
+        );
+        git(&donor.repo.root, &["gc", "--prune=now"]);
+        assert!(
+            !Command::new("git")
+                .arg("-C")
+                .arg(&donor.repo.root)
+                .args(["cat-file", "-e", &preview.base])
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "the donor must really have pruned the borrowed base"
+        );
+        git(
+            &f.repo.root,
+            &["cat-file", "-e", &format!("{}^{{commit}}", preview.base)],
+        );
+        git(&f.repo.root, &["fsck", "--full", "--no-dangling"]);
+        let closure = git(
+            &f.repo.root,
+            &["rev-list", "--objects", "--missing=print", &preview.base],
+        );
+        assert!(
+            !closure
+                .split(|b| *b == b'\n')
+                .any(|line| line.starts_with(b"?")),
+            "the local root must include previously promised history objects"
+        );
+        git(
+            &candidate.snapshot_repository(),
+            &["cat-file", "-e", &preview.tree],
+        );
+        let mut publisher = f.publisher();
+        let delivered = if let Some(exact) = exact {
+            let recovered = publisher.recover(&preview.operation_id);
+            assert_eq!(recovered.status, Status::Prepared, "{recovered:?}");
+            assert_eq!(commit(&recovered), exact);
+            publisher.retry(&preview.operation_id)
+        } else {
+            publisher.confirm(&candidate)
+        };
+        assert_eq!(delivered.status, Status::Delivered, "{delivered:?}");
+        assert_eq!(publisher.recover(&preview.operation_id), delivered);
+        f.source_unchanged(&before);
+        fs::write(f.repo.root.join("after-donor-gc"), "ordinary edit").unwrap();
+        git(&f.repo.root, &["add", "after-donor-gc"]);
+    }
+}
+
+#[test]
+fn failed_borrowed_object_flush_never_acknowledges_a_base_pin() {
+    for after in [false, true] {
+        let (_donor, f) = external_object_fixture(&format!("borrow-flush-{after}"), false);
+        let before = f.repo.preserved();
+        let packs = f.repo.root.join(".git/objects/pack");
+        let fired = Arc::new(AtomicBool::new(false));
+        let hit = fired.clone();
+        let observer = ResourceObserver::new(move |at| {
+            if at.operation == ResourceOperation::Sync && at.after == after && at.path == packs {
+                hit.store(true, Ordering::SeqCst);
+                return false;
+            }
+            true
+        });
+        let mut store = Candidates::with_resources(
+            Config {
+                executable: BIN.into(),
+                project: f.repo.project.clone(),
+                deadline: Duration::from_secs(15),
+            },
+            observer,
+        );
+        assert!(store.preview(request(), SystemTime::now()).is_err());
+        assert!(fired.load(Ordering::SeqCst));
+        let mut publisher = f.publisher();
+        let reports = publisher.resource_reports().unwrap();
+        assert_eq!(reports.len(), 1);
+        let id = &reports[0].operation_id;
+        assert_eq!(reports[0].state, ResourceState::Capturing);
+        assert!(reports[0].cleanup_pending);
+        let record: serde_json::Value = serde_json::from_slice(
+            &fs::read(root(&f).join(format!("resources/{id}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["pins"]["base"]["owned"], false);
+        let foreign = root(&f).join(format!("snapshots/{id}/foreign.lock"));
+        fs::write(&foreign, "preserve foreign ownership").unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                publisher.recover_resources(id).unwrap().state,
+                ResourceState::Capturing
+            );
+            assert_eq!(
+                fs::read_to_string(&foreign).unwrap(),
+                "preserve foreign ownership"
+            );
+        }
+        assert!(!f.record(id).exists());
+        f.source_unchanged(&before);
+        fs::write(f.repo.root.join("after-copy-flush"), "ordinary edit").unwrap();
+        git(&f.repo.root, &["add", "after-copy-flush"]);
+    }
+}
+
 #[test]
 fn cleanup_retains_the_receipt_root_and_forgetting_revokes_every_old_handle() {
     let f = Fixture::new("forget");

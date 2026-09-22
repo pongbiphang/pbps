@@ -440,7 +440,15 @@ destructor unlock is fallback only and never certifies completed cleanup.
 | `Spent` | A compact tombstone revokes all old candidate handles. Public output branches remain untouched. |
 
 Before an alternate borrows source objects, an operation-specific private annotated
-Git tag roots the base. Sealing roots the private candidate tree. After the one
+Git tag roots the base. If the source itself uses alternates or promisor packs,
+import the pinned commit's full reachable object closure into its local object
+store and flush it before acknowledging the pin. Donor GC cannot see a borrower's
+refs. This applies to both base and exact-commit roots; failed import or flush
+leaves acquisition unacknowledged. The existing subprocess size and deadline
+bounds apply to the closure import, so a large borrowed history can refuse even
+when its project snapshot fits the capture limit. Ordinary self-contained stores
+do not need this extra pack import. Sealing roots the private candidate tree.
+After the one
 commit invocation acknowledges its OID, `CommitKnown` records it before acquiring
 its exact-commit root; only acknowledged root ownership permits `Prepared`.
 Pin creation is a fresh no-deref transaction. Pin deletion checks the recorded
