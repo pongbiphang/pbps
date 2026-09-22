@@ -2,11 +2,14 @@
  * not part of the resolver or a process installed on a target. */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/capability.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -30,6 +33,26 @@ static void *root_worker(void *unused) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "mapping-ranges")) {
+        int fd = open(argv[2], O_RDONLY);
+        long length = sysconf(_SC_PAGESIZE);
+        if (fd < 0 || length <= 0) return 1;
+        void *first = mmap(NULL, length, PROT_READ, MAP_PRIVATE, fd, 0);
+        void *second = mmap(NULL, length, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (first == MAP_FAILED || second == MAP_FAILED) return 1;
+        close(fd);
+        void *low = (uintptr_t)first < (uintptr_t)second ? first : second;
+        void *high = low == first ? second : first;
+        puts("ready");
+        fflush(stdout);
+        if (getchar() != '1' || munmap(low, length)) return 1;
+        puts("one");
+        fflush(stdout);
+        if (getchar() != '2' || munmap(high, length)) return 1;
+        puts("none");
+        fflush(stdout);
+        return getchar() == 'q' ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "opaque-name")) {
         int ready[2];
         if (pipe(ready)) return 1;

@@ -30,6 +30,7 @@ MANY_TEST = PREFIX + "a_containers_task_count_does_not_consume_the_observers_des
 COORDINATE_TEST = PREFIX + "detached_coordinates_retain_one_namespace_handle_until_the_last_clone_drops"
 ANCHOR_TEST = PREFIX + "anchor_loss_during_a_view_read_is_distinct_from_an_unreadable_view"
 NAME_TEST = PREFIX + "opaque_task_names_preserve_observation_identity_and_credentials"
+MAPPING_TEST = "resolver::native::executables::tests::a_surviving_mapping_keeps_loaded_content_after_the_first_range_exits"
 
 
 def run(*args, **kwargs):
@@ -48,8 +49,9 @@ def limited_descriptors():
     resource.setrlimit(resource.RLIMIT_NOFILE, (64, maximum))
 
 
-def test(binary, name, env, prefix=()):
-    result = run(*prefix, str(binary), "--exact", name, "--nocapture", env=env,
+def test(binary, name, env, prefix=(), ignored=False):
+    result = run(*prefix, str(binary), "--exact", name, "--nocapture",
+                 *(["--ignored"] if ignored else []), env=env,
                  preexec_fn=limited_descriptors if name == MANY_TEST else None,
                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     print(result.stdout, end="", flush=True)
@@ -89,6 +91,9 @@ def main():
             helper = Path(temporary) / "thread-exit"
             run("cc", "-static", "-pthread", "-Wall", "-Wextra", "-Werror", "-o", str(helper),
                 str(Path(__file__).parent / "fixtures/namespace-thread.c"))
+            test(binary, MAPPING_TEST, dict(os.environ,
+                 PBPS_MAPPING_FIXTURE_HELPER=str(helper),
+                 PBPS_MAPPING_FIXTURE_FILE=str(Path(temporary) / "mapping.so")), ignored=True)
             pids = []
             for _ in range(2):
                 name = "pbps-namespace-" + uuid.uuid4().hex
