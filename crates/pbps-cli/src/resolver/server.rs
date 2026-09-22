@@ -1678,6 +1678,42 @@ async fn remove(control: &mut Control, names: &ScratchNames) -> Result<(), ()> {
 /// The sections of the target's facts that differ between the sealed read
 /// and a fresh one, by name, for the refusal that says what moved.
 fn changed_sections(sealed: &EnvironmentFacts, fresh: &EnvironmentFacts) -> Vec<&'static str> {
+    // A live fixture failure must preserve the exact compared evidence before
+    // cleanup destroys it. A section name alone cannot distinguish changed
+    // content, late loading and a change in read provenance.
+    #[cfg(test)]
+    if sealed.executables != fresh.executables {
+        for (side, facts, other) in [
+            ("sealed", &sealed.executables, &fresh.executables),
+            ("fresh", &fresh.executables, &sealed.executables),
+        ] {
+            if facts.engine != other.engine {
+                eprintln!("executable drift ({side} engine): {:?}", facts.engine);
+            }
+            for library in &facts.libraries {
+                if !other.libraries.contains(library) {
+                    eprintln!("executable drift ({side} library): {library:?}");
+                }
+            }
+        }
+        if sealed.executables.engine == fresh.executables.engine
+            && sealed
+                .executables
+                .libraries
+                .iter()
+                .all(|library| fresh.executables.libraries.contains(library))
+            && fresh
+                .executables
+                .libraries
+                .iter()
+                .all(|library| sealed.executables.libraries.contains(library))
+        {
+            eprintln!(
+                "executable drift (library order or multiplicity): sealed={:?}; fresh={:?}",
+                sealed.executables.libraries, fresh.executables.libraries
+            );
+        }
+    }
     let mut changed = Vec::new();
     let (s, f) = (&sealed.catalog, &fresh.catalog);
     for (name, differs) in [
