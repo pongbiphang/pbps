@@ -6,12 +6,15 @@
 mod capture;
 mod cli;
 mod destination;
+mod durable;
 mod files;
 mod git;
+mod inventory;
 mod process;
 mod record;
 mod recover;
 mod refs;
+mod resources;
 mod run;
 mod transport;
 
@@ -25,9 +28,11 @@ use sha2::{Digest, Sha256};
 
 pub use cli::Intent;
 pub use destination::Destination;
+pub use durable::{ResourceBoundary, ResourceObserver, ResourceOperation};
 pub use files::Evidence;
 pub use recover::{DeliveryState, Details, LocalState, Outcome, Problem, Status};
 pub use refs::RefEvidence;
+pub use resources::{ResourceReport, ResourceState};
 pub use run::{DurableStage, PublicationBoundary, Publications};
 
 #[derive(Debug)]
@@ -168,14 +173,20 @@ pub struct Candidates {
     config: Config,
     current: Option<Stored>,
     alternative_base: Option<String>,
+    resource_observer: ResourceObserver,
 }
 
 impl Candidates {
     pub fn new(config: Config) -> Self {
+        Self::with_resources(config, ResourceObserver::default())
+    }
+
+    pub fn with_resources(config: Config, resource_observer: ResourceObserver) -> Self {
         Self {
             config,
             current: None,
             alternative_base: None,
+            resource_observer,
         }
     }
 
@@ -194,8 +205,15 @@ impl Candidates {
                 "This workflow already confirmed an operation; continue its result before starting another",
             ));
         }
-        self.current = None;
-        let candidate = Arc::new(capture::capture(&self.config, request, observer)?);
+        if let Some(Stored::Previewed { candidate, .. }) = self.current.take() {
+            candidate.workspace.retire_preview()?;
+        }
+        let candidate = Arc::new(capture::capture(
+            &self.config,
+            request,
+            observer,
+            self.resource_observer.clone(),
+        )?);
         if self
             .alternative_base
             .as_ref()
@@ -221,12 +239,14 @@ impl Candidates {
         let candidate = match current {
             Stored::Previewed { candidate, created } => {
                 let Ok(age) = now.duration_since(*created) else {
+                    candidate.workspace.retire_preview()?;
                     self.current = None;
                     return Err(Error::new(
                         "The preview clock changed; refresh the candidate",
                     ));
                 };
                 if age >= Duration::from_secs(24 * 60 * 60) {
+                    candidate.workspace.retire_preview()?;
                     self.current = None;
                     return Err(Error::new(
                         "The preview expired; refresh it before confirming",
@@ -241,6 +261,10 @@ impl Candidates {
                 "The candidate is unknown or was replaced; refresh the preview",
             ));
         }
+        candidate
+            .workspace
+            .resources
+            .confirm(&candidate.preview.operation_id)?;
         self.current = Some(Stored::Confirmed(Arc::clone(&candidate)));
         Ok(candidate)
     }

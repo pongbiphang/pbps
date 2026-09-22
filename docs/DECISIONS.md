@@ -14386,3 +14386,37 @@ SPEC is in sync with all of these.
      No remote attestation service, arbitrary command executor or new credential
      store is introduced. This decision does not enable the write endpoints
      before #747–#748 and integrated #494 qualification.
+
+
+535. **Compose retires acknowledged resources independently of publication.**
+     (#747, ADR-0017.) The private resource lifecycle is capturing, sealed,
+     confirmed, retiring, retained and spent. Acquisition intent is durable
+     before creation; acknowledgment records ownership. A pathname, matching
+     hash or matching Git OID without acknowledged acquisition is insufficient
+     authority to delete. Interrupted unsealed acquisition retains named manual
+     recovery evidence rather than guessing that every child has stopped.
+
+     Root the source base before borrowing objects through an alternate. Root
+     the candidate tree in its private repository. Record the returned exact
+     commit in `CommitKnown`, then acquire and acknowledge its private root before
+     `Prepared`; an interruption before acknowledgment cannot regenerate the
+     commit. Operation-specific annotated tags supply independent GC roots.
+     Direct no-deref transactions create/delete these private refs, while Git
+     owns its temporary ref locks. Never remove a foreign or ambiguous Git lock.
+
+     Descriptor-relative record replacement checks prior identity/revision and
+     flushes the file and containing directory. Private retirement is governed
+     by an acknowledged inventory and a durable retirement intent. Unknown,
+     changed or unreadable entries keep that intent and record pending. Known
+     completed deletion is idempotent. Explicit unlock uses a retained lock
+     inode; closing one descriptor alone can leave a fork-shared flock alive.
+     Destructors cannot establish successful retirement.
+
+     Only unconfirmed sealed previews expire after 24 hours. Completed snapshots
+     may retire while a compact receipt and exact-commit root remain. Explicit
+     forget retires those private artifacts and leaves a bounded spent tombstone
+     so an old candidate handle cannot recreate deleted output. Public branches
+     are never cleanup targets. Unknown publication or pin ownership cannot be
+     forgotten or expired. Legacy experimental evidence blocks new compose
+     without migration or old source recovery. Lower-level interruption tests
+     support these rules; #748 and #494 still gate the integrated write surface.

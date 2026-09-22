@@ -41,6 +41,18 @@ fn git(root: &Path, args: &[&str]) -> Vec<u8> {
     )
 }
 
+fn user_refs(root: &Path) -> Vec<u8> {
+    // Private recovery roots are permitted evidence. Every other ref, including
+    // public compose output branches, remains part of the preservation check.
+    String::from_utf8(git(root, &["show-ref"]))
+        .unwrap()
+        .lines()
+        .filter(|line| !line.contains(" refs/pbps-compose/"))
+        .map(|line| format!("{line}\n"))
+        .collect::<String>()
+        .into_bytes()
+}
+
 struct Repository {
     root: PathBuf,
     project: PathBuf,
@@ -101,7 +113,7 @@ impl Repository {
             fs::read(self.project.join("schema.ids.json")).unwrap(),
             fs::read(self.root.join(".git/index")).unwrap(),
             fs::read(self.root.join(".git/HEAD")).unwrap(),
-            git(&self.root, &["show-ref"]),
+            user_refs(&self.root),
         ]
     }
 }
@@ -481,7 +493,7 @@ fn declaration_file_directory_replacements_preserve_the_reviewed_scope() {
                 fs::read(repo.root.join("schema.ids.json")).unwrap(),
                 fs::read(repo.root.join(".git/index")).unwrap(),
                 fs::read(repo.root.join(".git/HEAD")).unwrap(),
-                git(&repo.root, &["show-ref"]),
+                user_refs(&repo.root),
             ]
         };
         let before = source();

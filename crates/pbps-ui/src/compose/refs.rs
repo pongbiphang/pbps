@@ -98,9 +98,41 @@ fn not_checked_out(git: &Git, reference: &str) -> Result<()> {
 pub(super) struct Prepared(Transaction);
 
 impl Prepared {
+    pub fn delete_owned(git: &Git, reference: &str, value: &str) -> Result<()> {
+        let mut command = git.command();
+        command.args([
+            "-c",
+            "core.fsync=all",
+            "-c",
+            "core.fsyncMethod=fsync",
+            "update-ref",
+            "--stdin",
+        ]);
+        let mut transaction = Transaction::start(command, git.deadline)?;
+        transaction.exchange("start\n", b"start: ok\n")?;
+        transaction.exchange(
+            &format!("option no-deref\ndelete {reference} {value}\nprepare\n"),
+            b"prepare: ok\n",
+        )?;
+        if observe(git, reference) != RefEvidence::Direct(value.to_owned()) {
+            transaction.exchange("abort\n", b"abort: ok\n")?;
+            transaction.finish()?;
+            return Err(Error::new("The owned private pin changed; preserve it"));
+        }
+        transaction.exchange("commit\n", b"commit: ok\n")?;
+        transaction.finish()
+    }
+
     pub fn create(git: &Git, reference: &str, commit: &str) -> Result<Self> {
         let mut command = git.command();
-        command.args(["update-ref", "--stdin"]);
+        command.args([
+            "-c",
+            "core.fsync=all",
+            "-c",
+            "core.fsyncMethod=fsync",
+            "update-ref",
+            "--stdin",
+        ]);
         let mut transaction = Transaction::start(command, git.deadline)?;
         transaction.exchange("start\n", b"start: ok\n")?;
         transaction.exchange(
