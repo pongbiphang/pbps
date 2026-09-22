@@ -29,6 +29,7 @@ FOREIGN_TEST = PREFIX + "foreign_namespace_sharers_remain_visible_outside_the_co
 MANY_TEST = PREFIX + "a_containers_task_count_does_not_consume_the_observers_descriptor_budget"
 COORDINATE_TEST = PREFIX + "detached_coordinates_retain_one_namespace_handle_until_the_last_clone_drops"
 ANCHOR_TEST = PREFIX + "anchor_loss_during_a_view_read_is_distinct_from_an_unreadable_view"
+SCAN_TEST = PREFIX + "scan_failures_recheck_the_anchor_without_replacing_callback_errors"
 NAME_TEST = PREFIX + "opaque_task_names_preserve_observation_identity_and_credentials"
 GROUP_TEST = PREFIX + "a_process_with_the_kernel_maximum_groups_can_be_captured"
 MAPPING_TEST = "resolver::native::executables::tests::a_surviving_mapping_keeps_loaded_content_after_the_first_range_exits"
@@ -58,6 +59,9 @@ def test(binary, name, env, prefix=(), ignored=False):
     print(result.stdout, end="", flush=True)
     if "1 passed; 0 failed" not in result.stdout:
         raise RuntimeError("the selected fixture test did not run")
+    if name == SCAN_TEST and result.stdout.count(
+            "native namespace observation refused: the selected process is no longer qualified") != 2:
+        raise RuntimeError("production scan failures did not preserve both lost-anchor diagnostics")
 
 
 def main():
@@ -247,6 +251,8 @@ def main():
             test(binary, COORDINATE_TEST, dict(os.environ, PBPS_NAMESPACE_COORDINATE_FIXTURE="1"),
                  prefix=("unshare", "--mount", "--pid", "--fork", "--mount-proc", "--propagation", "private"))
             test(binary, ANCHOR_TEST, dict(os.environ, PBPS_NAMESPACE_ANCHOR_FIXTURE="1"),
+                 prefix=("unshare", "--mount", "--pid", "--fork", "--mount-proc", "--propagation", "private"))
+            test(binary, SCAN_TEST, dict(os.environ, PBPS_NAMESPACE_SCAN_FIXTURE="1"),
                  prefix=("unshare", "--mount", "--pid", "--fork", "--mount-proc", "--propagation", "private"))
     finally:
         remaining = []

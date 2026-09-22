@@ -1,5 +1,148 @@
 use super::*;
 
+type ScanHook = Box<dyn FnOnce(&Arc<File>) -> Arc<File>>;
+thread_local! {
+    static SCAN_HOOK: std::cell::RefCell<Option<ScanHook>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn scan_directory(directory: &Arc<File>) -> Arc<File> {
+    let hook = SCAN_HOOK.with(|hook| hook.borrow_mut().take());
+    hook.map_or_else(|| Arc::clone(directory), |hook| hook(directory))
+}
+
+#[test]
+fn scan_failures_recheck_the_anchor_without_replacing_callback_errors() {
+    if std::env::var_os("PBPS_NAMESPACE_SCAN_FIXTURE").is_none() {
+        return;
+    }
+    assert_eq!(
+        std::process::id(),
+        1,
+        "the fixture needs a private PID namespace"
+    );
+    struct OwnedChild(std::process::Child);
+    impl OwnedChild {
+        fn exit(&mut self) {
+            self.0.kill().unwrap();
+            self.0.wait().unwrap();
+        }
+    }
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    struct FaultDirectory(std::path::PathBuf);
+    impl Drop for FaultDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+            SCAN_HOOK.with(|hook| hook.borrow_mut().take());
+        }
+    }
+    let fault = FaultDirectory(
+        std::env::temp_dir().join(format!("pbps-scan-fault-{}", rand::random::<u64>())),
+    );
+    std::fs::create_dir_all(fault.0.join("7/task/7")).unwrap();
+    // This is an injected malformed read, not a claim that the kernel emits
+    // malformed stat. The production parser and its early return are real.
+    std::fs::write(fault.0.join("7/task/7/stat"), b"malformed stat\n").unwrap();
+    for production in [false, true] {
+        for metadata in [false, true] {
+            if !metadata && std::env::var_os("PBPS_NAMESPACE_SCAN_METADATA_ONLY").is_some() {
+                continue;
+            }
+            for lost in [false, true] {
+                let child = std::rc::Rc::new(std::cell::RefCell::new(OwnedChild(
+                    super::super::spawned_and_execed(
+                        std::process::Command::new("/bin/sleep").arg("30"),
+                        "sleep",
+                    ),
+                )));
+                let anchor = ProcessLease::capture(child.borrow().0.id()).unwrap();
+                let view = NamespaceProcfs::capture(&anchor).unwrap();
+                let source = Arc::new(if metadata {
+                    File::open(&fault.0).unwrap()
+                } else {
+                    // Iterating a real held proc file produces ENOTDIR.
+                    open(&view.directory, "stat", OFlags::empty()).unwrap()
+                });
+                let scheduled_child = std::rc::Rc::clone(&child);
+                let called = std::rc::Rc::new(std::cell::Cell::new(false));
+                let scheduled_called = std::rc::Rc::clone(&called);
+                SCAN_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move |_| {
+                        if lost {
+                            scheduled_child.borrow_mut().exit();
+                        }
+                        scheduled_called.set(true);
+                        source
+                    }))
+                });
+                if production {
+                    let result = for_each_namespace_task(&anchor, |_, _| {
+                        panic!("the failed scan must not reach policy")
+                    });
+                    assert!(result.is_err());
+                    // The fixture runner also checks the existing diagnostic
+                    // emitted by From<NamespaceError> for these lost cases.
+                } else {
+                    let result = view.observe().map(|_| ());
+                    let expected = if lost {
+                        matches!(result, Err(NamespaceError::Anchor))
+                    } else if metadata {
+                        matches!(result, Err(NamespaceError::Metadata))
+                    } else {
+                        matches!(result, Err(NamespaceError::Unreadable))
+                    };
+                    assert!(
+                        expected,
+                        "scan diagnostic must retain anchor precedence: lost={lost}, metadata={metadata}, result={result:?}"
+                    );
+                }
+                assert!(called.get(), "fault must follow the initial view check");
+                if !lost {
+                    anchor.check().unwrap();
+                }
+            }
+        }
+    }
+    #[derive(Debug)]
+    enum CallbackError {
+        Namespace(NamespaceError),
+        Policy,
+    }
+    impl From<NamespaceError> for CallbackError {
+        fn from(error: NamespaceError) -> Self {
+            Self::Namespace(error)
+        }
+    }
+    for lost in [false, true] {
+        let mut child = OwnedChild(super::super::spawned_and_execed(
+            std::process::Command::new("/bin/sleep").arg("30"),
+            "sleep",
+        ));
+        let anchor = ProcessLease::capture(child.0.id()).unwrap();
+        let view = NamespaceProcfs::capture(&anchor).unwrap();
+        let result = view.visit::<CallbackError>(|_| {
+            if lost {
+                child.exit();
+            }
+            Err(CallbackError::Policy)
+        });
+        match result {
+            Err(CallbackError::Policy) => (),
+            Err(CallbackError::Namespace(error)) => {
+                panic!("callback error was replaced by {error:?}")
+            }
+            Ok(()) => panic!("callback refusal was lost"),
+        }
+        if !lost {
+            anchor.check().unwrap();
+        }
+    }
+}
+
 #[test]
 #[ignore = "requires the root-owned group helper from live-resolver-namespace.py"]
 fn a_process_with_the_kernel_maximum_groups_can_be_captured() {
