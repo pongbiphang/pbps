@@ -731,9 +731,28 @@ pub(crate) fn open_within(
     relative: &str,
     flags: rustix::fs::OFlags,
 ) -> std::io::Result<File> {
-    use rustix::fs::{Mode, OFlags, ResolveFlags};
+    open_within_using(root, relative, flags, |root, path, flags| {
+        rustix::fs::openat2(
+            root,
+            path,
+            flags,
+            rustix::fs::Mode::empty(),
+            rustix::fs::ResolveFlags::IN_ROOT,
+        )
+    })
+}
+
+// Keep the syscall seam below the path policy so deterministic error schedules
+// exercise both the ordinary open and the namespace-link parent's open.
+fn open_within_using(
+    root: &File,
+    relative: &str,
+    flags: rustix::fs::OFlags,
+    mut open: impl FnMut(&File, &str, rustix::fs::OFlags) -> rustix::io::Result<rustix::fd::OwnedFd>,
+) -> std::io::Result<File> {
+    use rustix::fs::{Mode, OFlags};
     let flags = OFlags::RDONLY | OFlags::CLOEXEC | flags;
-    match rustix::fs::openat2(root, relative, flags, Mode::empty(), ResolveFlags::IN_ROOT) {
+    match retry_resolution(|| open(root, relative, flags)) {
         Ok(fd) => Ok(File::from(fd)),
         // `RESOLVE_IN_ROOT` also refuses magic links (documented, as
         // `RESOLVE_NO_MAGICLINKS` does; measured as `EXDEV`, the escape
@@ -746,13 +765,13 @@ pub(crate) fn open_within(
         // a path-shaped one, and it is opened through the parent's handle.
         Err(rustix::io::Errno::LOOP | rustix::io::Errno::XDEV) => {
             let (parent, name) = relative.rsplit_once('/').unwrap_or((".", relative));
-            let dir = rustix::fs::openat2(
-                root,
-                parent,
-                OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                Mode::empty(),
-                ResolveFlags::IN_ROOT,
-            )?;
+            let dir = retry_resolution(|| {
+                open(
+                    root,
+                    parent,
+                    OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                )
+            })?;
             let target = rustix::fs::readlinkat(&dir, name, Vec::new())?;
             let target = target.to_bytes();
             if target.contains(&b'/') || !target.contains(&b':') {
@@ -765,10 +784,241 @@ pub(crate) fn open_within(
     }
 }
 
+fn retry_resolution(
+    mut open: impl FnMut() -> rustix::io::Result<rustix::fd::OwnedFd>,
+) -> rustix::io::Result<rustix::fd::OwnedFd> {
+    // IN_ROOT can return EAGAIN when unrelated renames prevent the kernel
+    // from proving confinement during this lookup (#786, openat2(2)). Retry
+    // the identical confined operation, never with weaker resolve flags.
+    // Eight total attempts bound work even if rename activity never settles.
+    let mut remaining = 7;
+    loop {
+        match open() {
+            Err(rustix::io::Errno::AGAIN) if remaining > 0 => remaining -= 1,
+            result => return result,
+        }
+    }
+}
+
 #[cfg(test)]
 mod confined_open_tests {
-    use super::open_within;
+    use super::{open_within, open_within_using};
     use std::io::Read as _;
+
+    #[test]
+    fn a_transient_resolution_race_retries_the_same_held_root_and_flags() {
+        use rustix::fd::AsRawFd as _;
+        use rustix::fs::{Mode, OFlags, ResolveFlags};
+        let root = std::fs::File::open("/").unwrap();
+        let mut attempts = 0;
+        let file = open_within_using(&root, "proc", OFlags::DIRECTORY, |held, path, flags| {
+            assert_eq!(held.as_raw_fd(), root.as_raw_fd());
+            assert_eq!(path, "proc");
+            assert_eq!(flags, OFlags::RDONLY | OFlags::CLOEXEC | OFlags::DIRECTORY);
+            attempts += 1;
+            if attempts == 1 {
+                Err(rustix::io::Errno::AGAIN)
+            } else {
+                rustix::fs::openat2(held, path, flags, Mode::empty(), ResolveFlags::IN_ROOT)
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, 2);
+        assert!(file.metadata().unwrap().is_dir());
+    }
+
+    #[test]
+    fn a_namespace_link_parent_retries_with_its_original_confinement() {
+        use rustix::fd::AsRawFd as _;
+        use rustix::fs::{Mode, OFlags, ResolveFlags};
+        use std::os::unix::fs::MetadataExt as _;
+        let root = std::fs::File::open("/").unwrap();
+        let parent = format!("proc/{}/ns", std::process::id());
+        let relative = format!("{parent}/pid");
+        let mut parent_attempts = 0;
+        let file = open_within_using(&root, &relative, OFlags::empty(), |held, path, flags| {
+            assert_eq!(held.as_raw_fd(), root.as_raw_fd());
+            if path == parent {
+                assert_eq!(flags, OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC);
+                parent_attempts += 1;
+                if parent_attempts <= 2 {
+                    return Err(rustix::io::Errno::AGAIN);
+                }
+            } else {
+                assert_eq!(path, relative);
+                assert_eq!(flags, OFlags::RDONLY | OFlags::CLOEXEC);
+            }
+            rustix::fs::openat2(held, path, flags, Mode::empty(), ResolveFlags::IN_ROOT)
+        })
+        .unwrap();
+        let expected = std::fs::metadata(format!("/{relative}")).unwrap();
+        let actual = file.metadata().unwrap();
+        assert_eq!(
+            (actual.dev(), actual.ino()),
+            (expected.dev(), expected.ino())
+        );
+        assert_eq!(parent_attempts, 3);
+    }
+
+    #[test]
+    fn persistent_races_are_bounded_and_other_lookup_errors_are_not_retried() {
+        use rustix::fs::{Mode, OFlags, ResolveFlags};
+        use rustix::io::Errno;
+        let root = std::fs::File::open("/").unwrap();
+        let parent = format!("proc/{}/ns", std::process::id());
+        let relative = format!("{parent}/pid");
+        for parent_only in [false, true] {
+            for error in [
+                Errno::AGAIN,
+                Errno::ACCESS,
+                Errno::NOENT,
+                Errno::NOSYS,
+                Errno::INTR,
+                Errno::IO,
+                Errno::MFILE,
+            ] {
+                let mut attempts = 0;
+                let result =
+                    open_within_using(&root, &relative, OFlags::empty(), |held, path, flags| {
+                        if !parent_only || path == parent {
+                            attempts += 1;
+                            // Pin the budget without letting a broken loop hang the suite.
+                            assert!(attempts <= 8);
+                            Err(error)
+                        } else {
+                            rustix::fs::openat2(
+                                held,
+                                path,
+                                flags,
+                                Mode::empty(),
+                                ResolveFlags::IN_ROOT,
+                            )
+                        }
+                    });
+                assert_eq!(
+                    result.unwrap_err().raw_os_error(),
+                    Some(error.raw_os_error())
+                );
+                assert_eq!(attempts, if error == Errno::AGAIN { 8 } else { 1 });
+            }
+        }
+    }
+
+    /// Rename activity can make IN_ROOT return EAGAIN without changing the
+    /// requested file. Count that signal rather than requiring a scheduler
+    /// to produce it, and never interpret a successful open as another object.
+    #[test]
+    #[ignore = "real-kernel rename-churn measurement; run explicitly"]
+    fn unrelated_rename_churn_preserves_confined_objects() {
+        use rustix::fs::{Mode, OFlags, ResolveFlags};
+        use std::os::unix::fs::MetadataExt as _;
+        use std::sync::{
+            Arc, Barrier,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let owned = std::env::temp_dir().join(format!(
+            "pbps-resolution-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&owned).unwrap();
+        let left = owned.join("moving-left");
+        let right = owned.join("moving-right");
+        std::fs::create_dir(&left).unwrap();
+        std::os::unix::fs::symlink("/", owned.join("root-link")).unwrap();
+        let parent = format!(
+            "{}/root-link/proc/{}/ns",
+            owned.display(),
+            std::process::id()
+        );
+        let namespace = format!("{parent}/pid");
+        let root = std::fs::File::open("/").unwrap();
+        let expected = ["/sys/class/net/lo/type", namespace.as_str()].map(|path| {
+            let meta = std::fs::metadata(path).unwrap();
+            (meta.dev(), meta.ino())
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(Barrier::new(2));
+        let mover = {
+            let stop = stop.clone();
+            let ready = ready.clone();
+            std::thread::spawn(move || {
+                ready.wait();
+                let mut moves = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    std::fs::rename(&left, &right).unwrap();
+                    std::fs::rename(&right, &left).unwrap();
+                    moves += 2;
+                }
+                moves
+            })
+        };
+        ready.wait();
+        let mut counts = [[0_usize; 2]; 4];
+        let mut unexpected = Vec::new();
+        for _ in 0..25_000 {
+            let outcomes = [
+                rustix::fs::openat2(
+                    &root,
+                    "sys/class/net/lo/type",
+                    OFlags::RDONLY | OFlags::CLOEXEC,
+                    Mode::empty(),
+                    ResolveFlags::IN_ROOT,
+                )
+                .map(std::fs::File::from)
+                .map_err(std::io::Error::from),
+                open_within(&root, "sys/class/net/lo/type", OFlags::empty()),
+                rustix::fs::openat2(
+                    &root,
+                    parent.as_str(),
+                    OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                    Mode::empty(),
+                    ResolveFlags::IN_ROOT,
+                )
+                .map(std::fs::File::from)
+                .map_err(std::io::Error::from),
+                open_within(&root, &namespace, OFlags::empty()),
+            ];
+            for (index, result) in outcomes.into_iter().enumerate() {
+                match result {
+                    Ok(file) => {
+                        counts[index][0] += 1;
+                        if index == 1 || index == 3 {
+                            match file.metadata() {
+                                Ok(meta) if (meta.dev(), meta.ino()) == expected[index / 2] => {}
+                                other => {
+                                    unexpected.push(format!("wrong object {index}: {other:?}"))
+                                }
+                            }
+                        }
+                    }
+                    Err(error)
+                        if error.raw_os_error()
+                            == Some(rustix::io::Errno::AGAIN.raw_os_error()) =>
+                    {
+                        counts[index][1] += 1
+                    }
+                    Err(error) => unexpected.push(format!("unexpected error {index}: {error}")),
+                }
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        let moves = mover.join().unwrap();
+        // Exhaustion during unbounded churn is an allowed refusal. Once the
+        // unrelated writer stops, the same held root must still resolve both.
+        let settled = ["sys/class/net/lo/type", namespace.as_str()]
+            .map(|path| open_within(&root, path, OFlags::empty()));
+        std::fs::remove_dir_all(&owned).unwrap();
+        eprintln!(
+            "rename moves={moves}; [success,EAGAIN] raw-file={:?} contained-file={:?} raw-parent={:?} contained-namespace={:?}",
+            counts[0], counts[1], counts[2], counts[3]
+        );
+        assert!(moves > 0);
+        assert!(unexpected.is_empty(), "{unexpected:?}");
+        assert!(settled.iter().all(Result::is_ok));
+        assert!(counts.iter().all(|row| row[0] > 0));
+    }
 
     /// A root of its own, with an absolute link pointing at a path that
     /// exists both inside it and on the host, and one that exists on the

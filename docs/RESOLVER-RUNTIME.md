@@ -50,6 +50,11 @@ is a read-only runtime observer, not a production agent or a target-side SQL
 write probe. Native target verification does not invoke Docker; the factory's
 Docker dependency belongs to scratch provisioning.
 
+Contained file lookup retries only the kernel's transient `EAGAIN` resolution
+race, for at most eight attempts with the same held root, path and confinement
+flags. This also covers the contained parent of a namespace magic link.
+Exhaustion and other errors remain refusals; there is no less confined retry.
+
 The host kernel, its administrators, the selected daemon and explicitly trusted
 image installation form the provisioning trust boundary. SQL privileges in
 scratch grant no authority over those external controls. This profile does not
