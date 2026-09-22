@@ -224,6 +224,7 @@ pub(crate) struct Mapping {
     pub start: u64,
     pub end: u64,
     pub alternatives: Vec<(u64, u64)>,
+    pub device: (u32, u32),
     pub inode: u64,
     pub deleted: bool,
 }
@@ -236,7 +237,7 @@ pub(crate) fn mappings(maps: &str, packages: &[&str]) -> BTreeMap<String, Mappin
     let mut found = BTreeMap::new();
     for line in maps.lines() {
         let mut fields = line.splitn(6, ' ');
-        let (Some(range), Some(_perms), Some(_offset), Some(_dev), Some(inode)) = (
+        let (Some(range), Some(_perms), Some(_offset), Some(device), Some(inode)) = (
             fields.next(),
             fields.next(),
             fields.next(),
@@ -257,10 +258,15 @@ pub(crate) fn mappings(maps: &str, packages: &[&str]) -> BTreeMap<String, Mappin
         let Some((start, end)) = range.split_once('-') else {
             continue;
         };
-        let (Ok(start), Ok(end), Ok(inode)) = (
+        let Some((major, minor)) = device.split_once(':') else {
+            continue;
+        };
+        let (Ok(start), Ok(end), Ok(inode), Ok(major), Ok(minor)) = (
             u64::from_str_radix(start, 16),
             u64::from_str_radix(end, 16),
             inode.parse::<u64>(),
+            u32::from_str_radix(major, 16),
+            u32::from_str_radix(minor, 16),
         ) else {
             continue;
         };
@@ -268,10 +274,15 @@ pub(crate) fn mappings(maps: &str, packages: &[&str]) -> BTreeMap<String, Mappin
             start,
             end,
             alternatives: Vec::new(),
+            device: (major, minor),
             inode,
             deleted,
         });
-        if mapping.inode == inode
+        // Inodes are unique only within one device. This compares two maps
+        // rows, not maps with stat: overlayfs reports a different device even
+        // through an opened map_files handle (measured for #776).
+        if mapping.device == (major, minor)
+            && mapping.inode == inode
             && mapping.deleted == deleted
             && (mapping.start, mapping.end) != (start, end)
         {
@@ -516,12 +527,14 @@ mod tests {
             (0x71e69568a000, 0x71e6956b2000, 510827)
         );
         assert!(!libc.deleted);
+        assert_eq!(libc.device, (8, 0x30));
         assert_eq!(libc.alternatives, [(0x71e6956b2000, 0x71e69583a000)]);
         // Another file at the same path, or a removed version of it, cannot
         // supply the surviving range of the identity captured first.
         let mixed = format!(
             "{MAPS}\
 71e696000000-71e696001000 r--p 00000000 08:30 999999 /usr/lib/x86_64-linux-gnu/libc.so.6\n\
+71e696002000-71e696003000 r--p 00000000 08:31 510827 /usr/lib/x86_64-linux-gnu/libc.so.6\n\
 71e696001000-71e696002000 r--p 00000000 08:30 510827 /usr/lib/x86_64-linux-gnu/libc.so.6 (deleted)\n"
         );
         assert_eq!(
@@ -532,6 +545,28 @@ mod tests {
         // and stack mappings are not code the loader placed.
         assert!(!found.contains_key("/usr/lib/postgresql/18/bin/postgres"));
         assert!(!found.contains_key("/usr/share/odd name/data.bin"));
+    }
+
+    #[test]
+    fn malformed_mapping_devices_do_not_alias_valid_file_identities() {
+        for device in [
+            "08",
+            ":30",
+            "08:",
+            "08:30:01",
+            "gg:30",
+            "100000000:30",
+            "08:100000000",
+        ] {
+            let line = format!("1000-2000 r--p 00000000 {device} 42 /lib/a.so");
+            assert!(mappings(&line, &[]).is_empty(), "{device}");
+        }
+        let rows = "1000-2000 r--p 00000000 08:30 42 /lib/a.so\n\
+                    3000-4000 r--p 00000000 0008:0030 42 /lib/a.so";
+        assert_eq!(
+            mappings(rows, &[])["/lib/a.so"].alternatives,
+            [(0x3000, 0x4000)]
+        );
     }
 
     /// An engine's own packages are code when the router names their suffix,
@@ -645,6 +680,88 @@ mod tests {
         assert!(matches!(absent.provenance, Provenance::Unreadable { .. }));
         assert!(absent.digest.is_none());
         input.write_all(b"q").unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the root-owned mapping helper from live-resolver-namespace.py"]
+    async fn a_departed_mapping_cannot_use_the_same_inode_on_another_device() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Command, Stdio};
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let helper = std::env::var("PBPS_MAPPING_FIXTURE_HELPER").unwrap();
+        let directory = std::env::var("PBPS_MAPPING_FIXTURE_DIRECTORY").unwrap();
+        let path = format!("{directory}/mapping.so");
+        let mut child = OwnedChild(
+            Command::new(helper)
+                .args(["mapping-devices", &directory])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut input = child.0.stdin.take().unwrap();
+        let mut output = BufReader::new(child.0.stdout.take().unwrap());
+        let mut acknowledge = |expected: &str| {
+            let mut line = String::new();
+            output.read_line(&mut line).unwrap();
+            assert_eq!(line.trim(), expected);
+        };
+        acknowledge("ready");
+        let lease = ProcessLease::capture(child.0.id()).unwrap();
+        let maps = lease.read_proc("maps", 8 * 1024 * 1024).unwrap();
+        let rows: Vec<_> = maps
+            .lines()
+            .filter(|line| line.ends_with(&path))
+            .map(|line| line.split_whitespace().collect::<Vec<_>>())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][4], rows[1][4], "the fixture must reuse an inode");
+        assert_ne!(rows[0][3], rows[1][3], "the fixture must use two devices");
+        let mapping = mappings(&maps, &[]).remove(&path).unwrap();
+        let initial = mapped_library(&lease, &path, &mapping).await;
+        assert_eq!(initial.provenance, Provenance::LoadedContent);
+        let first_file = lease
+            .open_proc(&format!("map_files/{}", rows[0][0]))
+            .unwrap();
+        let other_file = lease
+            .open_proc(&format!("map_files/{}", rows[1][0]))
+            .unwrap();
+        assert_eq!(initial.digest, Some(digest_of(&first_file).await.unwrap()));
+        assert_ne!(initial.digest, Some(digest_of(&other_file).await.unwrap()));
+
+        input.write_all(b"1").unwrap();
+        acknowledge("one");
+        assert!(
+            lease
+                .open_proc(&format!("map_files/{}", rows[0][0]))
+                .is_err()
+        );
+        assert!(
+            lease
+                .open_proc(&format!("map_files/{}", rows[1][0]))
+                .is_ok()
+        );
+        let departed = mapped_library(&lease, &path, &mapping).await;
+        assert_eq!(
+            departed.provenance,
+            Provenance::DiskCandidate,
+            "another device's same inode cannot stand in for the departed mapping"
+        );
+        assert_eq!(departed.disk_differs_from_loaded, Some(false));
+        assert_eq!(
+            departed.digest,
+            Some(format!("{:x}", Sha256::digest(vec![b'b'; 65536])))
+        );
+        input.write_all(b"q").unwrap();
+        assert!(child.0.wait().unwrap().success());
+        // Both tmpfs mounts belonged only to the child's mount namespace.
+        assert!(!Path::new(&path).exists());
     }
 
     #[test]
