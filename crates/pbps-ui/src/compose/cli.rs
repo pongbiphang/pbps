@@ -108,7 +108,15 @@ impl Cli {
             .args(arguments);
         let result = process::run(command, &[], self.deadline)?;
         if !result.status.success() {
-            return Err(Error::new(
+            // A signal, timeout or failed pipe exchange does not prove that
+            // private work completed. A normal refusal still needs the
+            // pre-command inventory before it can authorize retirement.
+            if !matches!(result.status.code(), Some(1 | 2)) {
+                return Err(Error::new(
+                    "The captured-input CLI did not return an ordinary refusal",
+                ));
+            }
+            return Err(Error::rejected(
                 "The CLI refused the captured inputs or intent; inspect them with the ordinary CLI",
             ));
         }

@@ -36,16 +36,42 @@ pub use resources::{ResourceReport, ResourceState};
 pub use run::{DurableStage, PublicationBoundary, Publications};
 
 #[derive(Debug)]
-pub struct Error(String);
+pub struct Error {
+    message: String,
+    failure: Failure,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Failure {
+    Uncertain,
+    CompletedRejection,
+}
 
 impl Error {
     fn new(message: &str) -> Self {
-        Self(message.to_owned())
+        Self {
+            message: message.to_owned(),
+            failure: Failure::Uncertain,
+        }
+    }
+
+    fn rejected(message: &str) -> Self {
+        Self {
+            message: message.to_owned(),
+            failure: Failure::CompletedRejection,
+        }
+    }
+
+    fn rejection(self) -> Self {
+        Self {
+            failure: Failure::CompletedRejection,
+            ..self
+        }
     }
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 impl std::error::Error for Error {}

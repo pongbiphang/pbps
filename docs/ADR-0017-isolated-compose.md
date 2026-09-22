@@ -473,6 +473,28 @@ Private inventory and manifest records are bounded to 64 MiB, 32,768 entries and
 80 directory levels; at most 32,768 operation resource records are admitted.
 Spent tombstones count toward that bound and are not automatically pruned.
 
+Definite capture rejection follows DECISIONS 536 (#780). Bound the base tree and
+blobs and check committed configuration before acquiring private resources.
+Checks that require the private snapshot first capture a flushed inventory of
+the paths produced by completed fixed preparation steps. Unknown files or locks
+cannot enter that inventory. A normal CLI refusal or an explicit input-bound/path
+refusal can enter durable `Retiring` with a completed-rejection marker and that
+pre-check inventory. Only the CLI's defined failure codes 1 and 2 count as normal
+refusals; panic/unrecognized exit codes retain the acquisition. Signal termination, failed pipe exchange, timeout, unreadable
+evidence and failed acquisition/flush do not authorize this transition. Changed
+files or new temporary entries after the checkpoint keep retirement pending;
+retirement never adopts a fresh post-error inventory.
+
+A rejected capture has never exposed a candidate handle. After all its snapshot
+entries and base pin are durably retired, remove its resource record; it does
+not consume a permanent spent-identity slot. The durable rejection marker is
+valid only for retirement without a commit or reviewed binding. Recovery resumes
+that same retirement and reports completion only after actually discharging it;
+an arbitrary absent record is not a successful-recovery witness. Existing sealed,
+confirmed and forgotten handles retain the ordinary tombstone rules. The bounded
+pre-check inventories add filesystem reads and flushes to successful capture;
+this cost buys rejection cleanup without a second acquisition/rollback protocol.
+
 The production observer seam exposes operation-before/after boundaries without
 making hooks selectable through HTTP or persisted input. Tests inject I/O failure,
 kill actual processes, restart retirement twice, retain foreign locks/files, and

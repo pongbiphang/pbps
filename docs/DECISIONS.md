@@ -14420,3 +14420,25 @@ SPEC is in sync with all of these.
      forgotten or expired. Legacy experimental evidence blocks new compose
      without migration or old source recovery. Lower-level interruption tests
      support these rules; #748 and #494 still gate the integrated write surface.
+
+
+536. **Completed capture rejection retires pre-check ownership without revoking
+     an unexposed handle.** (#780, ADR-0017.) Move bounded base/configuration
+     admission before private acquisition. For checks needing an isolated
+     snapshot, distinguish a normal completed refusal from uncertain child or
+     I/O outcomes. Use an inventory acknowledged before the check, limited to
+     the paths produced by completed fixed preparation steps; never infer
+     cleanup permission from a generic error, destructor, lock filename or a
+     fresh inventory taken after failure. Added or changed entries keep the
+     retirement pending, as do unresolved acquisition and required flushes.
+
+     Persist the completed-rejection fact with the ordinary retirement intent
+     before deleting anything. It is valid only for an unsealed capture without
+     a reviewed binding or commit. Restart uses the same attributable retirement
+     operations. Once every private artifact and base pin is durably retired,
+     remove that rejection record: no candidate handle was exposed, so no
+     permanent revocation tombstone is needed. This prevents routine invalid
+     inputs from exhausting the operation-record bound. Sealed, confirmed and
+     forgotten handles still require their normal spent-identity protection;
+     unknown children, temporary files and ambiguous pins remain retained.
+     No source checkout, index, HEAD or public branch is a cleanup target.
