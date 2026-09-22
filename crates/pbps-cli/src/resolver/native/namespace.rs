@@ -255,66 +255,98 @@ impl<'a> NamespaceProcfs<'a> {
         mut inspect: impl FnMut(TaskObservation) -> Result<(), E>,
     ) -> Result<(), E> {
         self.check()?;
-        let namespace = FileIdentity::of(&self.namespace).map_err(NamespaceError::from)?;
-        let mut observed = false;
-        for pid in ids(&self.directory)? {
-            let group = match open(&self.directory, &pid.to_string(), OFlags::DIRECTORY) {
-                Ok(group) => group,
-                Err(error) if process_gone(&error) => continue,
-                Err(_) => return Err(NamespaceError::Unreadable.into()),
-            };
-            let tasks = match open(&group, "task", OFlags::DIRECTORY) {
-                Ok(tasks) => tasks,
-                Err(_) if group_exited(&group)? => continue,
-                Err(_) => return Err(NamespaceError::Unreadable.into()),
-            };
-            let mut found = false;
-            for tid in task_ids(&group, &tasks)? {
-                let directory = match open(&tasks, &tid.to_string(), OFlags::DIRECTORY) {
-                    Ok(directory) => directory,
+        // Test-only fault inputs are installed after the real view check so
+        // the fixture can synchronize anchor exit with an actual scan error.
+        #[cfg(test)]
+        let scan_directory = tests::scan_directory(&self.directory);
+        #[cfg(not(test))]
+        let scan_directory = &self.directory;
+        let scanned = (|| -> Result<bool, ScanError<E>> {
+            let namespace = FileIdentity::of(&self.namespace).map_err(NamespaceError::from)?;
+            let mut observed = false;
+            for pid in ids(scan_directory.as_ref())? {
+                let group = match open(scan_directory.as_ref(), &pid.to_string(), OFlags::DIRECTORY)
+                {
+                    Ok(group) => group,
                     Err(error) if process_gone(&error) => continue,
                     Err(_) => return Err(NamespaceError::Unreadable.into()),
                 };
-                let stat = match read_stat(&directory)? {
-                    Some(stat) => stat,
-                    None => continue,
+                let tasks = match open(&group, "task", OFlags::DIRECTORY) {
+                    Ok(tasks) => tasks,
+                    Err(_) if group_exited(&group)? => continue,
+                    Err(_) => return Err(NamespaceError::Unreadable.into()),
                 };
-                let (number, state, start_ticks) = task_stat(&stat)?;
-                if number != tid {
+                let mut found = false;
+                for tid in task_ids(&group, &tasks)? {
+                    let directory = match open(&tasks, &tid.to_string(), OFlags::DIRECTORY) {
+                        Ok(directory) => directory,
+                        Err(error) if process_gone(&error) => continue,
+                        Err(_) => return Err(NamespaceError::Unreadable.into()),
+                    };
+                    let stat = match read_stat(&directory)? {
+                        Some(stat) => stat,
+                        None => continue,
+                    };
+                    let (number, state, start_ticks) = task_stat(&stat)?;
+                    if number != tid {
+                        return Err(NamespaceError::Unreadable.into());
+                    }
+                    if matches!(state, "X" | "Z") {
+                        continue;
+                    }
+                    let task = TaskObservation {
+                        directory,
+                        id: NamespaceTaskId {
+                            namespace,
+                            number: tid,
+                            handle: Arc::clone(&self.namespace),
+                        },
+                        group: NamespaceTaskId {
+                            namespace,
+                            number: pid,
+                            handle: Arc::clone(&self.namespace),
+                        },
+                        start_ticks,
+                    };
+                    if let TaskReading::Live(_) = task.status()? {
+                        found = true;
+                        observed = true;
+                        inspect(task).map_err(ScanError::Callback)?;
+                    }
+                }
+                if !found && !group_exited(&group)? {
                     return Err(NamespaceError::Unreadable.into());
                 }
-                if matches!(state, "X" | "Z") {
-                    continue;
-                }
-                let task = TaskObservation {
-                    directory,
-                    id: NamespaceTaskId {
-                        namespace,
-                        number: tid,
-                        handle: Arc::clone(&self.namespace),
-                    },
-                    group: NamespaceTaskId {
-                        namespace,
-                        number: pid,
-                        handle: Arc::clone(&self.namespace),
-                    },
-                    start_ticks,
-                };
-                if let TaskReading::Live(_) = task.status()? {
-                    found = true;
-                    observed = true;
-                    inspect(task)?;
-                }
             }
-            if !found && !group_exited(&group)? {
-                return Err(NamespaceError::Unreadable.into());
+            Ok(observed)
+        })();
+        let observed = match scanned {
+            Ok(observed) => observed,
+            Err(ScanError::Callback(error)) => return Err(error),
+            Err(ScanError::Namespace(error)) => {
+                // A failed scan still depends on its selected anchor. Keep
+                // callback policy errors separate: they are not failed proc
+                // reads and must retain their caller-defined meaning (#773).
+                self.anchor.check().map_err(|_| NamespaceError::Anchor)?;
+                return Err(error.into());
             }
-        }
+        };
         self.check()?;
         if !observed {
             return Err(NamespaceError::Unreadable.into());
         }
         Ok(())
+    }
+}
+
+enum ScanError<E> {
+    Namespace(NamespaceError),
+    Callback(E),
+}
+
+impl<E> From<NamespaceError> for ScanError<E> {
+    fn from(error: NamespaceError) -> Self {
+        Self::Namespace(error)
     }
 }
 
