@@ -387,9 +387,21 @@ impl Resources {
         };
         let packs = objects.join("pack");
         let mut promised = false;
-        for entry in std::fs::read_dir(&packs)
-            .map_err(|_| Error::new("Cannot inspect promised Git object evidence"))?
-        {
+        // Git can use an entirely loose store without this optional directory.
+        // Inspect the entry before reading it so a dangling link is not absence.
+        let entries = match std::fs::symlink_metadata(&packs) {
+            Ok(metadata) if metadata.is_dir() => Some(
+                std::fs::read_dir(&packs)
+                    .map_err(|_| Error::new("Cannot inspect promised Git object evidence"))?,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            _ => {
+                return Err(Error::new(
+                    "The local Git pack store is conflicting or unreadable",
+                ));
+            }
+        };
+        for entry in entries.into_iter().flatten() {
             let entry =
                 entry.map_err(|_| Error::new("Git object dependency discovery is incomplete"))?;
             promised |= entry.file_name().as_encoded_bytes().ends_with(b".promisor");
@@ -579,6 +591,21 @@ impl Resources {
         // A missing receipt cannot erase the exact commit's independent witness,
         // including an acquisition whose ownership acknowledgment was lost.
         Ok(self.load(id)?.pins.contains_key("commit"))
+    }
+
+    pub fn preparation_ready(
+        &self,
+        id: &str,
+        binding: &str,
+        base: &str,
+        commit: &str,
+    ) -> Result<bool> {
+        let resource = self.load(id)?;
+        if !resource.pins.get("commit").is_some_and(|pin| pin.owned) {
+            return Ok(false);
+        }
+        self.admit(id, binding, base, Some(commit))?;
+        Ok(true)
     }
 
     pub fn admit(&self, id: &str, binding: &str, base: &str, commit: Option<&str>) -> Result<()> {

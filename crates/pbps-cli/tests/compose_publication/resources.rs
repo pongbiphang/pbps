@@ -302,6 +302,200 @@ fn failed_borrowed_object_flush_never_acknowledges_a_base_pin() {
 }
 
 #[test]
+fn loose_only_sources_allow_an_absent_pack_directory_but_refuse_conflicting_evidence() {
+    for shape in ["absent", "file", "symlink"] {
+        let f = Fixture::new(&format!("loose-only-{shape}"));
+        let packs = f.repo.root.join(".git/objects/pack");
+        fs::remove_dir(&packs).unwrap();
+        let foreign = f.repo.root.join("foreign-pack-store");
+        match shape {
+            "file" => fs::write(&packs, "foreign pack evidence").unwrap(),
+            "symlink" => symlink(&foreign, &packs).unwrap(),
+            _ => (),
+        }
+        let before = f.repo.preserved();
+        let mut store = f.repo.store();
+        let preview = store.preview(request(), SystemTime::now());
+        match shape {
+            "file" => {
+                assert!(preview.is_err());
+                assert_eq!(fs::read_to_string(&packs).unwrap(), "foreign pack evidence");
+            }
+            "symlink" => {
+                assert!(preview.is_err());
+                assert_eq!(fs::read_link(&packs).unwrap(), foreign);
+                assert!(!foreign.exists());
+            }
+            _ => {
+                let preview = preview.unwrap();
+                let candidate = store
+                    .confirm(&preview.candidate_id, SystemTime::now())
+                    .unwrap();
+                assert_eq!(f.publisher().confirm(&candidate).status, Status::Delivered);
+            }
+        }
+        f.source_unchanged(&before);
+    }
+}
+
+fn stop_after_commit_root(f: &Fixture) -> (Candidates, Preview, Arc<Candidate>, String) {
+    let (store, preview, candidate) = f.ready();
+    let mut publisher = f.publisher();
+    let outcome = publisher.confirm_observed(&candidate, &|at| {
+        at != Boundary::BeforePersist(DurableStage::Prepared) && at != Boundary::BeforeReconcile
+    });
+    let exact = commit(&outcome).to_owned();
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(f.record(&preview.operation_id)).unwrap()).unwrap();
+    assert_eq!(record["state"]["phase"], "commit_known");
+    let resource: serde_json::Value = serde_json::from_slice(
+        &fs::read(root(f).join(format!("resources/{}.json", preview.operation_id))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(resource["pins"]["commit"]["owned"], true);
+    assert_eq!(resource["pins"]["commit"]["target"], exact);
+    (store, preview, candidate, exact)
+}
+
+#[test]
+fn acknowledged_commit_roots_resume_without_another_commit_invocation() {
+    for action in ["recover", "retry", "confirm", "list"] {
+        let f = Fixture::new(&format!("known-owned-{action}"));
+        let before = f.repo.preserved();
+        let (_store, preview, candidate, exact) = stop_after_commit_root(&f);
+        let objects = git(
+            &f.repo.root,
+            &[
+                "cat-file",
+                "--batch-all-objects",
+                "--batch-check=%(objectname) %(objecttype)",
+            ],
+        );
+        let mut publisher = f.publisher();
+        let outcome = match action {
+            "retry" => publisher.retry(&preview.operation_id),
+            "confirm" => publisher.confirm(&candidate),
+            "list" => publisher.list().unwrap().remove(0),
+            _ => publisher.recover(&preview.operation_id),
+        };
+        assert_eq!(commit(&outcome), exact);
+        assert_eq!(
+            outcome.status,
+            if action == "retry" {
+                Status::Delivered
+            } else {
+                Status::Prepared
+            },
+            "{action}: {outcome:?}"
+        );
+        if action != "retry" {
+            assert_eq!(f.remote_ref(&preview.output_ref), None);
+            assert_eq!(publisher.recover(&preview.operation_id), outcome);
+        }
+        let delivered = publisher.retry(&preview.operation_id);
+        assert_eq!(delivered.status, Status::Delivered, "{delivered:?}");
+        assert_eq!(commit(&delivered), exact);
+        assert_eq!(
+            git(
+                &f.repo.root,
+                &[
+                    "cat-file",
+                    "--batch-all-objects",
+                    "--batch-check=%(objectname) %(objecttype)"
+                ]
+            ),
+            objects
+        );
+        f.source_unchanged(&before);
+    }
+}
+
+#[test]
+fn known_commit_recovery_requires_acknowledged_matching_resources_and_durable_transition() {
+    for fault in [
+        "unacknowledged",
+        "absent-pin",
+        "missing-ref",
+        "wrong-target",
+        "before-write",
+        "after-write",
+    ] {
+        let f = Fixture::new(&format!("known-fault-{fault}"));
+        let (_store, preview, _candidate, exact) = stop_after_commit_root(&f);
+        let resource_path = root(&f).join(format!("resources/{}.json", preview.operation_id));
+        let mut resource: serde_json::Value =
+            serde_json::from_slice(&fs::read(&resource_path).unwrap()).unwrap();
+        match fault {
+            "unacknowledged" => resource["pins"]["commit"]["owned"] = false.into(),
+            "absent-pin" => {
+                resource["pins"].as_object_mut().unwrap().remove("commit");
+            }
+            "wrong-target" => resource["pins"]["commit"]["target"] = preview.base.clone().into(),
+            "missing-ref" => {
+                git(
+                    &f.repo.root,
+                    &[
+                        "update-ref",
+                        "-d",
+                        &format!("refs/pbps-compose/{}/commit", preview.operation_id),
+                    ],
+                );
+            }
+            _ => (),
+        }
+        if matches!(fault, "unacknowledged" | "absent-pin" | "wrong-target") {
+            fs::write(&resource_path, serde_json::to_vec(&resource).unwrap()).unwrap();
+        }
+        let mut publisher = f.publisher();
+        let outcome = publisher.recover_observed(&preview.operation_id, &|at| {
+            at != if fault == "before-write" {
+                Boundary::BeforePersist(DurableStage::Prepared)
+            } else if fault == "after-write" {
+                Boundary::AfterPersist(DurableStage::Prepared)
+            } else {
+                Boundary::BeforeCommit
+            }
+        });
+        assert_eq!(commit(&outcome), exact);
+        assert_eq!(
+            outcome.status,
+            if matches!(fault, "unacknowledged" | "absent-pin") {
+                Status::PreparationUnknown
+            } else {
+                Status::RecoveryRequired
+            },
+            "{fault}: {outcome:?}"
+        );
+        assert_eq!(f.remote_ref(&preview.output_ref), None);
+        if matches!(fault, "before-write" | "after-write") {
+            drop(publisher);
+            let mut publisher = f.publisher();
+            assert_eq!(
+                publisher.recover(&preview.operation_id).status,
+                Status::Prepared
+            );
+            assert_eq!(
+                publisher.recover(&preview.operation_id).status,
+                Status::Prepared
+            );
+            assert_eq!(
+                publisher.retry(&preview.operation_id).status,
+                Status::Delivered
+            );
+        } else {
+            assert_ne!(
+                publisher.retry(&preview.operation_id).status,
+                Status::Delivered
+            );
+            let record: serde_json::Value =
+                serde_json::from_slice(&fs::read(f.record(&preview.operation_id)).unwrap())
+                    .unwrap();
+            assert_eq!(record["state"]["phase"], "commit_known");
+        }
+    }
+}
+
+#[test]
 fn cleanup_retains_the_receipt_root_and_forgetting_revokes_every_old_handle() {
     let f = Fixture::new("forget");
     let (mut store, preview, candidate) = f.ready();
@@ -823,6 +1017,17 @@ fn resource_stop_child() {
                     && path.ends_with("commit")
                     && path.to_string_lossy().contains("/refs/pbps-compose/")
             }
+            "commit-root-owned" => {
+                let id = resource_id.lock().unwrap().clone();
+                point.operation == ResourceOperation::Sync
+                    && point.after
+                    && path.ends_with("resources")
+                    && !id.is_empty()
+                    && fs::read(path.join(format!("{id}.json")))
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                        .is_some_and(|r| r["pins"]["commit"]["owned"] == true)
+            }
             "prepared-replaced" => {
                 point.operation == ResourceOperation::Rename
                     && point.after
@@ -886,6 +1091,7 @@ fn actual_process_death_preserves_acquisition_ref_handoff_and_retirement_evidenc
     for mode in [
         "snapshot-created",
         "commit-root-created",
+        "commit-root-owned",
         "prepared-replaced",
         "ref-prepared",
         "snapshot-removed-file",
@@ -938,6 +1144,16 @@ fn actual_process_death_preserves_acquisition_ref_handoff_and_retirement_evidenc
             .unwrap();
         let id = operation.trim();
         assert_eq!(id.len(), 64);
+        if mode == "commit-root-owned" {
+            let receipt: serde_json::Value =
+                serde_json::from_slice(&fs::read(f.record(id)).unwrap()).unwrap();
+            assert_eq!(receipt["state"]["phase"], "commit_known");
+            let resource: serde_json::Value = serde_json::from_slice(
+                &fs::read(root(&f).join(format!("resources/{id}.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(resource["pins"]["commit"]["owned"], true);
+        }
         // SIGKILL bypasses destructors. Git at RefPrepared receives EOF only
         // after its parent dies; its lock must be observed, never guessed ours.
         child.kill().unwrap();
@@ -978,7 +1194,7 @@ fn actual_process_death_preserves_acquisition_ref_handoff_and_retirement_evidenc
                 assert_eq!(f.remote_ref(&output_ref), None);
                 assert!(f.record(id).exists());
             }
-            "prepared-replaced" | "ref-prepared" => {
+            "commit-root-owned" | "prepared-replaced" | "ref-prepared" => {
                 assert!(
                     !lock.exists(),
                     "the real Git transaction did not discharge its lock"

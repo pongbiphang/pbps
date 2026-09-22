@@ -480,6 +480,38 @@ impl Publications {
         }
     }
 
+    fn resume_preparation(
+        &self,
+        record: &mut Record,
+        observer: Observer<'_>,
+    ) -> std::result::Result<(), Problem> {
+        let Phase::CommitKnown { commit } = &record.state else {
+            return Ok(());
+        };
+        self.source_binding(&record.description)?;
+        if !self
+            .resources
+            .preparation_ready(
+                &record.description.operation_id,
+                &record.description.binding,
+                &record.description.base,
+                commit,
+            )
+            .map_err(|_| Problem::ResourceUnavailable)?
+        {
+            return Ok(());
+        }
+        // Acknowledged ownership closes the pre-pin uncertainty. Complete only
+        // the receipt; recovery never invokes commit-tree or publishes a ref.
+        let mut prepared = record.clone();
+        prepared.state = Phase::Prepared {
+            commit: commit.clone(),
+        };
+        self.persist(&prepared, observer)?;
+        *record = prepared;
+        Ok(())
+    }
+
     fn reconcile(
         &self,
         mut record: Record,
@@ -496,6 +528,9 @@ impl Publications {
         }
         if let Err(error) = self.source_binding(&record.description) {
             return recover::classify(&record, RefEvidence::Unreadable, None, Some(error));
+        }
+        if let Err(error) = self.resume_preparation(&mut record, observer) {
+            problem = Some(error);
         }
         let local = refs::observe(&self.git, &record.description.output_ref);
         if !matches!(record.state, Phase::Preparing | Phase::CommitKnown { .. })
@@ -704,6 +739,9 @@ impl Publications {
             Ok(Some(r)) => r,
             _ => return Outcome::unavailable(id, Problem::ReceiptUnavailable),
         };
+        if let Err(error) = self.resume_preparation(&mut record, observer) {
+            return self.finish(record, Some(error), observer);
+        }
         let result = match &record.state {
             Phase::Prepared { .. } => self
                 .publish_local(&mut record, observer)

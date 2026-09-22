@@ -451,6 +451,11 @@ do not need this extra pack import. Sealing roots the private candidate tree.
 After the one
 commit invocation acknowledges its OID, `CommitKnown` records it before acquiring
 its exact-commit root; only acknowledged root ownership permits `Prepared`.
+If the root acknowledgment is durable but the receipt is still `CommitKnown`,
+the shared reconciler verifies the matching owned root and candidate binding,
+then persists `Prepared`. Ordinary retry can continue that exact commit without
+invoking commit creation again. Missing or unacknowledged pins remain uncertain;
+conflicting evidence or a failed receipt transition preserves a pending result.
 Pin creation is a fresh no-deref transaction. Pin deletion checks the recorded
 value and direct-ref type under Git's transaction lock; a matching value without
 acknowledged acquisition is never cleanup permission. Pending and retained roots
