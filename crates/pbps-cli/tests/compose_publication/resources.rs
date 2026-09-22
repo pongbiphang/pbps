@@ -1,5 +1,7 @@
 //! Actual Git GC, attributable retirement, and production resource boundaries.
 
+mod private_refs;
+
 use super::*;
 use pbps_ui::compose::{ResourceObserver, ResourceOperation, ResourceState};
 use std::os::unix::fs::FileTypeExt;
@@ -1619,6 +1621,7 @@ fn linked_worktrees_list_only_their_own_valid_receipts_and_resources() {
     let (_store, original, candidate) = f.ready();
     let mut publisher = f.publisher();
     assert_eq!(publisher.confirm(&candidate).status, Status::Delivered);
+    git(&f.repo.root, &["pack-refs", "--all"]);
     let original_resource = root(&f).join(format!("resources/{}.json", original.operation_id));
     let original_bytes = fs::read(&original_resource).unwrap();
     let source = f.repo.preserved();

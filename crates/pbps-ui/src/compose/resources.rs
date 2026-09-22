@@ -256,6 +256,7 @@ impl Resources {
 
     pub fn begin(&self, id: &str, base: &str) -> Result<PathBuf> {
         self.locked(|| {
+            self.census_pins()?;
             if self.records.names()?.len() >= 32768 {
                 return Err(Error::new(
                     "Compose resource record limit reached; retain existing recovery evidence",
@@ -879,7 +880,46 @@ impl Resources {
         })
     }
 
+    fn census_pins(&self) -> Result<()> {
+        self.binding()?;
+        let read = || refs::private_census(&self.repository.common, self.root.observer.clone());
+        let pins = read()?;
+        let mut records = BTreeMap::new();
+        for (reference, value) in &pins {
+            let (id, kind) = refs::private_parts(reference)?;
+            let unavailable = || {
+                Error::new(&format!(
+                    "Private compose ref {reference} has unavailable or mismatched ownership; preserve it for manual recovery"
+                ))
+            };
+            if !records.contains_key(id) {
+                // Validate common-store ownership before filtering by source.
+                // Pending acquisition remains pending; correlation grants no
+                // right to retire an unacknowledged pin.
+                records.insert(id, self.read(id).map_err(|_| unavailable())?);
+            }
+            let resource = &records[id];
+            if resource
+                .pins
+                .get(kind)
+                .is_none_or(|pin| pin.retired || pin.value != *value)
+            {
+                return Err(unavailable());
+            }
+        }
+        refs::verify_private_census(&self.git, &pins)?;
+        // Packing may move a ref between representations during enumeration.
+        // A changing or incomplete census cannot certify absence.
+        if read()? != pins {
+            return Err(Error::new(
+                "Private compose refs changed during the ownership census; preserve their evidence",
+            ));
+        }
+        self.binding()
+    }
+
     pub fn list(&self) -> Result<Vec<ResourceReport>> {
+        self.census_pins()?;
         let names = self.records.names()?;
         for snapshot in self.snapshots.names()? {
             if !identity(&snapshot) || !names.contains(&format!("{snapshot}.json")) {

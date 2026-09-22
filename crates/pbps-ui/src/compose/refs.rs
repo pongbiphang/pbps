@@ -1,5 +1,11 @@
 //! Fresh output refs only. A prepared Git transaction owns the deciding lock.
 
+mod census;
+
+pub(super) use census::{
+    parts as private_parts, read as private_census, verify as verify_private_census,
+};
+
 use serde::Serialize;
 
 use super::{
