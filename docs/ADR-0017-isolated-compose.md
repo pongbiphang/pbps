@@ -485,6 +485,16 @@ evidence and failed acquisition/flush do not authorize this transition. Changed
 files or new temporary entries after the checkpoint keep retirement pending;
 retirement never adopts a fresh post-error inventory.
 
+The checked input admission also bounds the base/live path union, identity and
+configuration bytes, and the combined declaration and attribute evidence (#789).
+Discover and size recorded attribute blobs before building private attribute
+indexes; `cat-file --batch-check` also admits the complete body stream against
+the existing subprocess output limit before requesting bodies. Live attribute
+bytes and the ancestor attribute-path count have the same checked admission.
+The admitted input bytes become the manifest and snapshot overlay, and the final
+capture check rereads the source evidence. This adds no cleanup authority for
+an interrupted child, unreadable evidence or an arbitrary later private write.
+
 A rejected capture has never exposed a candidate handle. After all its snapshot
 entries and base pin are durably retired, remove its resource record; it does
 not consume a permanent spent-identity slot. The durable rejection marker is

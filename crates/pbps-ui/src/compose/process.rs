@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use super::{Error, Result};
 
-const OUTPUT_LIMIT: u64 = 64 * 1024 * 1024;
+pub(super) const OUTPUT_LIMIT: u64 = 64 * 1024 * 1024;
 
 fn read(mut stream: impl Read) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();

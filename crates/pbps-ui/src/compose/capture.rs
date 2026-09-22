@@ -221,6 +221,44 @@ fn blobs(git: &Git, entries: &BTreeMap<String, TreeEntry>) -> Result<BTreeMap<St
         .values()
         .map(|entry| format!("{}\n", entry.oid))
         .collect();
+    // Establish a completed budget refusal before starting a body stream that
+    // would exceed the subprocess limit. A failed exchange is still uncertain,
+    // even when an oversized object was the likely reason for it (DECISIONS 536).
+    let metadata = git.bytes(&["cat-file", "--batch-check"], request.as_bytes(), None)?;
+    let mut rows = metadata.split_inclusive(|b| *b == b'\n');
+    let mut body_bytes = 0_u64;
+    let mut wire_bytes = 0_u64;
+    for entry in entries.values() {
+        let row = rows
+            .next()
+            .ok_or_else(|| Error::new("Git omitted required object metadata"))?;
+        let header = row
+            .strip_suffix(b"\n")
+            .and_then(|row| std::str::from_utf8(row).ok())
+            .ok_or_else(|| Error::new("Git returned incomplete object metadata"))?;
+        let fields: Vec<_> = header.split(' ').collect();
+        let [oid, "blob", length] = fields.as_slice() else {
+            return Err(Error::new("Git could not size a required base blob"));
+        };
+        if *oid != entry.oid {
+            return Err(Error::new("Git returned metadata for another object"));
+        }
+        let length: u64 = length
+            .parse()
+            .map_err(|_| Error::new("Git returned an invalid object length"))?;
+        body_bytes = body_bytes.saturating_add(length);
+        wire_bytes = wire_bytes
+            .saturating_add(length)
+            .saturating_add(row.len() as u64 + 1);
+        if body_bytes > MAX_BYTES as u64 || wire_bytes > super::process::OUTPUT_LIMIT {
+            return Err(Error::rejected(
+                "The project snapshot exceeds its size limit",
+            ));
+        }
+    }
+    if rows.next().is_some() {
+        return Err(Error::new("Git returned unexpected object metadata"));
+    }
     let answer = git.bytes(&["cat-file", "--batch"], request.as_bytes(), None)?;
     let mut rest = answer.as_slice();
     let mut result = BTreeMap::new();
@@ -404,6 +442,67 @@ struct AttributeView {
 }
 
 impl AttributeView {
+    fn recorded(
+        git: &Git,
+        base: &str,
+        names: &BTreeSet<String>,
+    ) -> Result<BTreeMap<String, Option<FileBytes>>> {
+        let mut paths = BTreeSet::new();
+        for name in names {
+            let mut parent = Path::new(name).parent();
+            while let Some(directory) = parent {
+                paths.insert(
+                    directory
+                        .join(".gitattributes")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                if paths.len() > MAX_FILES {
+                    return Err(Error::rejected("Compose has too many attribute paths"));
+                }
+                parent = directory.parent();
+            }
+        }
+        let listing = git.bytes(&["ls-tree", "-rz", base], &[], None)?;
+        let mut entries = BTreeMap::new();
+        for row in listing.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+            let Some(tab) = row.iter().position(|b| *b == b'\t') else {
+                return Err(Error::new("Incomplete attribute tree metadata"));
+            };
+            let Ok(name) = std::str::from_utf8(&row[tab + 1..]) else {
+                continue;
+            };
+            if !paths.contains(name) {
+                continue;
+            }
+            let header = std::str::from_utf8(&row[..tab])
+                .map_err(|_| Error::new("Invalid attribute tree metadata"))?;
+            let fields: Vec<_> = header.split(' ').collect();
+            let [mode @ ("100644" | "100755"), "blob", oid] = fields.as_slice() else {
+                return Err(Error::new("Attribute files must be regular files"));
+            };
+            entries.insert(
+                name.to_owned(),
+                TreeEntry {
+                    mode: if *mode == "100755" {
+                        0o100755
+                    } else {
+                        0o100644
+                    },
+                    oid: (*oid).to_owned(),
+                },
+            );
+        }
+        let mut recorded = blobs(git, &entries)?;
+        Ok(paths
+            .into_iter()
+            .map(|name| {
+                let bytes = recorded.remove(&name);
+                (name, bytes)
+            })
+            .collect())
+    }
+
     fn new(
         git: &Git,
         base: &str,
@@ -411,6 +510,7 @@ impl AttributeView {
         workspace: &Path,
         placeholder: &str,
         observer: super::ResourceObserver,
+        recorded: BTreeMap<String, Option<FileBytes>>,
     ) -> Result<Self> {
         let directory = workspace.join("attribute-view");
         observer.around(super::ResourceOperation::Create, &directory, || {
@@ -458,53 +558,6 @@ impl AttributeView {
             git.bytes(&command, &records, Some(&index))?;
             indexes.push((index, group));
         }
-        let mut paths = BTreeSet::new();
-        for name in names {
-            let mut parent = Path::new(name).parent();
-            while let Some(directory) = parent {
-                paths.insert(
-                    directory
-                        .join(".gitattributes")
-                        .to_string_lossy()
-                        .into_owned(),
-                );
-                if paths.len() > MAX_FILES {
-                    return Err(Error::new("Compose has too many attribute paths"));
-                }
-                parent = directory.parent();
-            }
-        }
-        let listing = git.bytes(&["ls-tree", "-rz", base], &[], None)?;
-        let mut entries = BTreeMap::new();
-        for row in listing.split(|b| *b == 0).filter(|r| !r.is_empty()) {
-            let Some(tab) = row.iter().position(|b| *b == b'\t') else {
-                return Err(Error::new("Incomplete attribute tree metadata"));
-            };
-            let Ok(name) = std::str::from_utf8(&row[tab + 1..]) else {
-                continue;
-            };
-            if !paths.contains(name) {
-                continue;
-            }
-            let header = std::str::from_utf8(&row[..tab])
-                .map_err(|_| Error::new("Invalid attribute tree metadata"))?;
-            let fields: Vec<_> = header.split(' ').collect();
-            let [mode @ ("100644" | "100755"), "blob", oid] = fields.as_slice() else {
-                return Err(Error::new("Attribute files must be regular files"));
-            };
-            entries.insert(
-                name.to_owned(),
-                TreeEntry {
-                    mode: if *mode == "100755" {
-                        0o100755
-                    } else {
-                        0o100644
-                    },
-                    oid: (*oid).to_owned(),
-                },
-            );
-        }
-        let mut recorded = blobs(git, &entries)?;
         let view = Self {
             observer,
             normalizer: Git {
@@ -514,13 +567,7 @@ impl AttributeView {
             },
             directory,
             indexes,
-            recorded: paths
-                .into_iter()
-                .map(|name| {
-                    let bytes = recorded.remove(&name);
-                    (name, bytes)
-                })
-                .collect(),
+            recorded,
         };
         view.normalize_command(
             &[
@@ -691,6 +738,41 @@ fn admit_index_flags(git: &Git, names: &BTreeSet<String>) -> Result<()> {
     Ok(())
 }
 
+fn bounded_inputs(
+    root: &Root,
+    names: &BTreeSet<String>,
+    declarations: &str,
+    attributes: &BTreeMap<String, Option<FileBytes>>,
+) -> Result<BTreeMap<String, Option<FileBytes>>> {
+    let mut base_total: usize = attributes.values().flatten().map(|f| f.bytes.len()).sum();
+    let mut live_total = 0;
+    // Attribute evidence is also bounded before private normalization starts.
+    // Its identity/equality checks still run in the ordinary manifest pass.
+    for name in attributes.keys() {
+        live_total += root.read(name)?.map_or(0, |file| file.bytes.len());
+        if live_total > MAX_BYTES {
+            return Err(Error::rejected(
+                "Compose attribute inputs exceed the total size limit",
+            ));
+        }
+    }
+    let mut bytes = BTreeMap::new();
+    for name in names {
+        let file = root.input(name, declarations)?;
+        if let Some(file) = &file {
+            base_total += file.bytes.len();
+            live_total += file.bytes.len();
+        }
+        if base_total > MAX_BYTES || live_total > MAX_BYTES {
+            return Err(Error::rejected(
+                "Compose inputs exceed the total size limit",
+            ));
+        }
+        bytes.insert(name.clone(), file);
+    }
+    Ok(bytes)
+}
+
 fn manifest(
     git: &Git,
     root: &Root,
@@ -698,32 +780,25 @@ fn manifest(
     declarations: &str,
     base: &str,
     view: &AttributeView,
+    captured: Option<BTreeMap<String, Option<FileBytes>>>,
 ) -> Result<(Manifest, BTreeMap<String, Option<FileBytes>>)> {
     let mut inputs = BTreeMap::new();
     let mut attr = BTreeMap::new();
-    let mut bytes = BTreeMap::new();
-    let mut total: usize = view
-        .recorded
-        .values()
-        .flatten()
-        .map(|file| file.bytes.len())
-        .sum();
+    let bytes = match captured {
+        Some(bytes) => bytes,
+        None => bounded_inputs(root, names, declarations, &view.recorded)?,
+    };
     let crlf = git.converts_line_endings()?;
     let attribute_files = view.files(root)?;
     let line_endings = view.policies(git, base, names)?;
-    for name in names {
-        let file = root.input(name, declarations)?;
+    for (name, file) in &bytes {
         let working = attributes(git, name, None)?;
         if working != attributes(git, name, Some(base))? {
             return Err(Error::new(
                 "Git attributes changed from the selected base; commit them before composing",
             ));
         }
-        if let Some(file) = &file {
-            total += file.bytes.len();
-            if total > MAX_BYTES {
-                return Err(Error::new("Compose inputs exceed the total size limit"));
-            }
+        if let Some(file) = file {
             let converts = match line_endings[name].as_str() {
                 "-text" => false,
                 "" => crlf,
@@ -740,7 +815,6 @@ fn manifest(
         }
         inputs.insert(name.clone(), file.as_ref().map(FileBytes::evidence));
         attr.insert(name.clone(), working);
-        bytes.insert(name.clone(), file);
     }
     Ok((
         Manifest {
@@ -912,17 +986,23 @@ pub(super) fn capture(
     observer(CaptureBoundary::PathsResolved);
     let declarations = join(&project, &declarations);
     let ids = join(&project, &ids);
-    let live = workspace.check(&known, || root.declarations(&declarations))?;
     let is_input = |path: &str| {
         path == ids
             || (path.starts_with(&format!("{declarations}/")) && files::declaration_path(path))
     };
-    let mut names: BTreeSet<String> = recorded.keys().filter(|p| is_input(p)).cloned().collect();
-    names.extend(live.keys().cloned());
-    names.extend([project_file.clone(), ids.clone()]);
-    if names.len() > MAX_FILES {
-        return Err(Error::new("Compose has too many input paths"));
-    }
+    let (live, names, attribute_inputs, captured) = workspace.check(&known, || {
+        let live = root.declarations(&declarations)?;
+        let mut names: BTreeSet<String> =
+            recorded.keys().filter(|p| is_input(p)).cloned().collect();
+        names.extend(live.keys().cloned());
+        names.extend([project_file.clone(), ids.clone()]);
+        if names.len() > MAX_FILES {
+            return Err(Error::rejected("Compose has too many input paths"));
+        }
+        let attribute_inputs = AttributeView::recorded(&git, &base, &names)?;
+        let captured = bounded_inputs(&root, &names, &declarations, &attribute_inputs)?;
+        Ok((live, names, attribute_inputs, captured))
+    })?;
     let attribute_view = AttributeView::new(
         &git,
         &base,
@@ -930,9 +1010,17 @@ pub(super) fn capture(
         &workspace.path,
         &entries[&project_file].oid,
         workspace.observer.clone(),
+        attribute_inputs,
     )?;
-    let (evidence, captured) =
-        manifest(&git, &root, &names, &declarations, &base, &attribute_view)?;
+    let (evidence, captured) = manifest(
+        &git,
+        &root,
+        &names,
+        &declarations,
+        &base,
+        &attribute_view,
+        Some(captured),
+    )?;
     // Path admission was based on the base's configuration. The configuration
     // actually overlaid below must be those same bytes; checking the live file
     // before discovery alone leaves a config-change window before this capture.
@@ -1056,6 +1144,7 @@ pub(super) fn capture(
             &declarations,
             &base,
             &attribute_view,
+            None,
         )?
         .0 != evidence
         || git.line(&["rev-parse", "--verify", "HEAD^{commit}"])? != base
