@@ -243,6 +243,121 @@ fn missing_commit_acknowledgement_never_generates_a_second_commit() {
 }
 
 #[test]
+fn absent_initial_intent_is_retryable_but_unreadable_or_later_missing_evidence_is_not() {
+    let f = Fixture::new("initial-intent-refusal");
+    let (_store, preview, candidate) = f.ready();
+    let before = f.repo.preserved();
+    let mut publisher = f.publisher();
+    let created = std::cell::Cell::new(false);
+    let first = publisher.confirm_observed(&candidate, &|at| {
+        if at == Boundary::CommitCreated {
+            created.set(true);
+        }
+        at != Boundary::BeforePersist(DurableStage::Preparing)
+    });
+    assert_eq!(first.status, Status::Refused, "{first:?}");
+    assert_eq!(first.local, LocalState::NotAttempted);
+    assert_eq!(first.problem, Some(Problem::PersistenceUncertain));
+    assert!(
+        first.cleanup_pending,
+        "persistence failure does not certify cleanup"
+    );
+    assert!(!created.get());
+    assert!(!f.record(&preview.operation_id).exists());
+    assert_eq!(f.remote_ref(&preview.output_ref), None);
+    f.source_unchanged(&before);
+    let retried = publisher.confirm(&candidate);
+    assert_eq!(retried.status, Status::Delivered, "{retried:?}");
+    assert_eq!(retried.details.as_ref().unwrap().tree, preview.tree);
+    assert_eq!(retried.details.as_ref().unwrap().base, preview.base);
+    assert_eq!(publisher.confirm(&candidate), retried);
+    f.source_unchanged(&before);
+
+    for after_commit in [false, true] {
+        let f = Fixture::new(&format!("unavailable-intent-{after_commit}"));
+        let (_store, preview, candidate) = f.ready();
+        let mut publisher = f.publisher();
+        let outcome = publisher.confirm_observed(&candidate, &|at| {
+            if !after_commit && at == Boundary::BeforePersist(DurableStage::Preparing) {
+                fs::write(f.record(&preview.operation_id), b"unreadable receipt").unwrap();
+                return false;
+            }
+            if after_commit && at == Boundary::CommitCreated {
+                fs::remove_file(f.record(&preview.operation_id)).unwrap();
+                return false;
+            }
+            true
+        });
+        assert_eq!(outcome.status, Status::RecoveryRequired, "{outcome:?}");
+        assert_eq!(outcome.problem, Some(Problem::ReceiptUnavailable));
+        assert_eq!(
+            publisher.retry(&preview.operation_id).status,
+            Status::RecoveryRequired
+        );
+        assert_eq!(f.remote_ref(&preview.output_ref), None);
+        if !after_commit {
+            assert_eq!(
+                fs::read(f.record(&preview.operation_id)).unwrap(),
+                b"unreadable receipt"
+            );
+        }
+    }
+}
+
+#[test]
+fn restored_pre_commit_prerequisites_allow_the_same_frozen_candidate_to_proceed() {
+    for signing in [false, true] {
+        let f = Fixture::new(&format!("late-prerequisite-{signing}"));
+        let (_store, preview, candidate) = f.ready();
+        let before = f.repo.preserved();
+        let offline = f.remote.with_extension("offline");
+        let mut publisher = f.publisher();
+        let created = std::cell::Cell::new(false);
+        let refused = publisher.confirm_observed(&candidate, &|at| {
+            if at == Boundary::BeforeCommit {
+                if signing {
+                    git(
+                        &f.repo.root,
+                        &["config", "commit.gpgSign", "invalid-boolean"],
+                    );
+                } else {
+                    fs::rename(&f.remote, &offline).unwrap();
+                }
+            }
+            if at == Boundary::CommitCreated {
+                created.set(true);
+            }
+            true
+        });
+        assert_eq!(refused.status, Status::Refused, "{refused:?}");
+        assert_eq!(refused.local, LocalState::NotAttempted);
+        assert!(!created.get());
+        assert!(!f.record(&preview.operation_id).exists());
+        assert_eq!(refused.details.as_ref().unwrap().commit, None);
+        assert_eq!(
+            refused.problem,
+            Some(if signing {
+                Problem::SigningUnavailable
+            } else {
+                Problem::RemoteUnavailable
+            })
+        );
+        if signing {
+            git(&f.repo.root, &["config", "--unset", "commit.gpgSign"]);
+        } else {
+            fs::rename(&offline, &f.remote).unwrap();
+        }
+        f.source_unchanged(&before);
+        let completed = publisher.confirm(&candidate);
+        assert_eq!(completed.status, Status::Delivered, "{completed:?}");
+        assert_eq!(completed.details.as_ref().unwrap().tree, preview.tree);
+        assert_eq!(completed.details.as_ref().unwrap().base, preview.base);
+        assert_eq!(publisher.confirm(&candidate), completed);
+        f.source_unchanged(&before);
+    }
+}
+
+#[test]
 fn unknown_push_then_independent_deletion_requires_fresh_informed_authorization() {
     let f = Fixture::new("push-ack");
     let (_, preview, candidate) = f.ready();

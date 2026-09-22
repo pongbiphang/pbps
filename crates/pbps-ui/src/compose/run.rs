@@ -183,15 +183,31 @@ impl Publications {
         if let Err(problem) = admission {
             return self.refused(description, problem);
         }
-        let mut record = Record::new(description);
-        let result = (|| {
-            self.persist(&record, observer)?;
+        // Definite prerequisite failures precede the durable commit intent.
+        // Once that intent exists, a restart cannot prove whether Git ran.
+        let ready = (|| {
             if !observer(PublicationBoundary::BeforeCommit) {
                 return Err(Problem::Interrupted);
             }
+            self.binding(&description)?;
+            self.signing(&description)
+        })();
+        if let Err(problem) = ready {
+            return self.refused(description, problem);
+        }
+        let mut record = Record::new(description);
+        if let Err(problem) = self.persist(&record, observer) {
+            // Only this call site proves commit-tree was never invoked. A
+            // missing receipt after a later attempt must remain uncertain.
+            if matches!(self.records.load(&id), Ok(None)) {
+                let mut result = self.refused(record.description, problem);
+                result.cleanup_pending = true;
+                return result;
+            }
+            return self.finish(record, Some(problem), observer);
+        }
+        let result = (|| {
             let d = &record.description;
-            self.binding(d)?;
-            self.signing(d)?;
             let mut args = vec!["commit-tree", d.tree.as_str(), "-p", d.base.as_str()];
             args.push(if d.signing.required {
                 "-S"
