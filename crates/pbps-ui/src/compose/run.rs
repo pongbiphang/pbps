@@ -157,9 +157,16 @@ impl Publications {
 
     fn refused(&self, description: Description, problem: Problem) -> Outcome {
         let local = refs::observe(&self.git, &description.output_ref);
+        // Definite publication refusal does not discharge candidate resources.
+        // An unreadable report is unresolved; only acknowledged retirement can
+        // say that no private cleanup remains, including a spent old handle.
+        let cleanup_pending = self
+            .resources
+            .report(&description.operation_id)
+            .map_or(true, |report| report.cleanup_pending);
         let mut result = recover::classify(&Record::new(description), local, None, Some(problem));
         result.status = Status::Refused;
-        result.cleanup_pending = false;
+        result.cleanup_pending = cleanup_pending;
         result
     }
 
@@ -179,6 +186,13 @@ impl Publications {
         }
         let admission = (|| {
             self.source_binding(&description)?;
+            if self
+                .resources
+                .preparation_recorded(&id)
+                .map_err(|_| Problem::ResourceUnavailable)?
+            {
+                return Err(Problem::ReceiptUnavailable);
+            }
             self.resources
                 .admit(&id, &description.binding, &description.base, None)
                 .map_err(|_| Problem::ResourceUnavailable)?;
@@ -191,6 +205,9 @@ impl Publications {
                 .map_err(|_| Problem::ObjectImportFailed)
         })();
         if let Err(problem) = admission {
+            if problem == Problem::ReceiptUnavailable {
+                return Outcome::unavailable(&id, problem);
+            }
             return self.refused(description, problem);
         }
         // Definite prerequisite failures precede the durable commit intent.

@@ -990,3 +990,87 @@ fn secret_bearing_endpoints_never_enter_private_acquisition_evidence() {
         assert!(!root(&f).join("resources").exists());
     }
 }
+
+#[test]
+fn pre_receipt_refusals_keep_retained_or_unreadable_resources_pending() {
+    for reason in ["manifest", "resource", "signing"] {
+        let f = Fixture::new(&format!("refused-pending-{reason}"));
+        let (_store, preview, candidate) = f.ready();
+        match reason {
+            "manifest" => fs::write(
+                candidate
+                    .snapshot_repository()
+                    .parent()
+                    .unwrap()
+                    .join("manifest.json"),
+                b"changed evidence",
+            )
+            .unwrap(),
+            "resource" => fs::write(
+                root(&f).join(format!("resources/{}.json", preview.operation_id)),
+                b"unreadable ownership",
+            )
+            .unwrap(),
+            "signing" => {
+                git(
+                    &f.repo.root,
+                    &["config", "user.signingKey", "changed-public-selector"],
+                );
+            }
+            _ => unreachable!(),
+        }
+        let mut publisher = f.publisher();
+        for _ in 0..2 {
+            let refused = publisher.confirm(&candidate);
+            assert_eq!(refused.status, Status::Refused);
+            assert!(refused.cleanup_pending, "{reason}: {refused:?}");
+            assert_eq!(refused.local, LocalState::NotAttempted);
+            assert!(refused.details.as_ref().unwrap().commit.is_none());
+            assert!(candidate.snapshot_repository().exists());
+            assert!(!f.record(&preview.operation_id).exists());
+            assert_eq!(f.remote_ref(&preview.output_ref), None);
+        }
+    }
+    let f = Fixture::new("spent-not-pending");
+    let (_store, preview, candidate) = f.ready();
+    let mut publisher = f.publisher();
+    assert_eq!(publisher.confirm(&candidate).status, Status::Delivered);
+    publisher.forget(&preview.operation_id).unwrap();
+    let refused = publisher.confirm(&candidate);
+    assert_eq!(refused.status, Status::Refused);
+    assert!(!refused.cleanup_pending, "{refused:?}");
+}
+
+#[test]
+fn an_owned_commit_root_prevents_repreparation_after_receipt_loss() {
+    let f = Fixture::new("known-root-missing-receipt");
+    let (_store, preview, candidate) = f.ready();
+    let mut publisher = f.publisher();
+    let prepared = publisher.confirm_observed(&candidate, &|at| {
+        at != Boundary::AfterPersist(DurableStage::Prepared) && at != Boundary::BeforeReconcile
+    });
+    let exact = commit(&prepared).to_owned();
+    let resource = root(&f).join(format!("resources/{}.json", preview.operation_id));
+    let original = fs::read(&resource).unwrap();
+    // Deliberate evidence-loss fixture after real preparation, not power loss.
+    fs::remove_file(f.record(&preview.operation_id)).unwrap();
+    let invoked = std::cell::Cell::new(false);
+    let repeated = publisher.confirm_observed(&candidate, &|at| {
+        if at == Boundary::CommitCreated {
+            invoked.set(true);
+        }
+        true
+    });
+    assert!(
+        !invoked.get(),
+        "an existing exact root permitted another commit invocation"
+    );
+    assert_eq!(repeated.status, Status::RecoveryRequired, "{repeated:?}");
+    assert_eq!(repeated.problem, Some(Problem::ReceiptUnavailable));
+    assert!(repeated.cleanup_pending);
+    assert!(!f.record(&preview.operation_id).exists());
+    assert_eq!(fs::read(resource).unwrap(), original);
+    assert_eq!(f.remote_ref(&preview.output_ref), None);
+    git(&f.repo.root, &["cat-file", "-e", &exact]);
+    assert_eq!(publisher.confirm(&candidate), repeated);
+}

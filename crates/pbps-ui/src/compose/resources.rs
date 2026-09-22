@@ -504,6 +504,12 @@ impl Resources {
         })
     }
 
+    pub fn preparation_recorded(&self, id: &str) -> Result<bool> {
+        // A missing receipt cannot erase the exact commit's independent witness,
+        // including an acquisition whose ownership acknowledgment was lost.
+        Ok(self.load(id)?.pins.contains_key("commit"))
+    }
+
     pub fn admit(&self, id: &str, binding: &str, base: &str, commit: Option<&str>) -> Result<()> {
         self.locked(|| {
             let r = self.load(id)?;
