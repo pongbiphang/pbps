@@ -418,7 +418,13 @@ The alternative also pins that base through its next preview.
 
 Resource durability and retirement are implemented by #747 and DECISIONS 535.
 The private common-directory namespace is `pbps-compose-v2`; publication receipts,
-resource records and snapshots are separate. The retained `owner.lock` inode
+resource records and snapshots are separate. Discovery validates every record,
+then lists only the current source worktree's receipts and resources. Known
+records for another source sharing the common directory are retained and excluded
+from that view; unknown versions, malformed records and a changed identity at the
+same source path still refuse. Per-operation reads and mutations keep the stricter
+source identity check, so filtering never authorizes another worktree's cleanup.
+The retained `owner.lock` inode
 serializes publishers. A short `resources.lock` lease serializes resource
 transitions, so capture does not require closing the publisher. Explicit checked
 unlock avoids extending a lease through another thread's forked open description;

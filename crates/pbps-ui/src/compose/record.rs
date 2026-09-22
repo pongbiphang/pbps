@@ -24,6 +24,31 @@ pub(super) struct RepositoryIdentity {
 }
 
 impl RepositoryIdentity {
+    /// Filtering is only permitted for a valid different source in this common
+    /// store. A changed inode at the same path (or a moved same inode) is not an
+    /// unrelated worktree and must remain visible as unresolved evidence.
+    pub fn source_scope(&self, current: &Self) -> Result<bool> {
+        if self.common != current.common
+            || self.common_device != current.common_device
+            || self.common_inode != current.common_inode
+            || !self.source.is_absolute()
+        {
+            return Err(Error::new(
+                "Compose evidence does not match this Git common directory",
+            ));
+        }
+        let path = self.source == current.source;
+        let inode = self.source_device == current.source_device
+            && self.source_inode == current.source_inode;
+        match (path, inode) {
+            (true, true) => Ok(true),
+            (false, false) => Ok(false),
+            _ => Err(Error::new(
+                "Compose source identity changed; preserve its evidence",
+            )),
+        }
+    }
+
     pub fn capture(git: &Git) -> Result<Self> {
         let source = git
             .root

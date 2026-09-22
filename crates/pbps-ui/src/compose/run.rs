@@ -599,12 +599,17 @@ impl Publications {
     }
 
     pub fn list(&mut self) -> Result<Vec<Outcome>> {
-        Ok(self
-            .records
-            .list()?
-            .into_iter()
-            .map(|r| self.reconcile(r, None, &|_| true))
-            .collect())
+        let mut outcomes = Vec::new();
+        for record in self.records.list()? {
+            if record
+                .description
+                .repository
+                .source_scope(&self.repository)?
+            {
+                outcomes.push(self.reconcile(record, None, &|_| true));
+            }
+        }
+        Ok(outcomes)
     }
 
     pub fn resource_reports(&self) -> Result<Vec<super::ResourceReport>> {

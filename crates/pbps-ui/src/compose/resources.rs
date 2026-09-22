@@ -110,6 +110,16 @@ impl Resources {
     }
 
     fn load(&self, id: &str) -> Result<Resource> {
+        let r = self.read(id)?;
+        if !r.repository.source_scope(&self.repository)? {
+            return Err(Error::new(
+                "Compose resource belongs to another source worktree",
+            ));
+        }
+        Ok(r)
+    }
+
+    fn read(&self, id: &str) -> Result<Resource> {
         if !identity(id) {
             return Err(Error::new("Invalid resource operation identity"));
         }
@@ -136,10 +146,10 @@ impl Resources {
     }
 
     fn validate(&self, r: &Resource, id: &str) -> Result<()> {
+        r.repository.source_scope(&self.repository)?;
         if !identity(id)
             || r.version != 1
             || r.operation != id
-            || r.repository != self.repository
             || r.pins.iter().any(|(kind, p)| {
                 !matches!(kind.as_str(), "base" | "commit") || !oid(&p.target) || !oid(&p.value)
             })
@@ -212,6 +222,11 @@ impl Resources {
     fn save(&self, r: &Resource) -> Result<()> {
         self.binding()?;
         self.validate(r, &r.operation)?;
+        if !r.repository.source_scope(&self.repository)? {
+            return Err(Error::new(
+                "Cannot write another source worktree's resource evidence",
+            ));
+        }
         let bytes =
             serde_json::to_vec(r).map_err(|_| Error::new("Cannot encode resource ownership"))?;
         if bytes.len() > 64 * 1024 * 1024 {
@@ -687,12 +702,16 @@ impl Resources {
     }
 
     pub fn report(&self, id: &str) -> Result<ResourceReport> {
-        let r = self.load(id)?;
+        self.report_resource(self.load(id)?)
+    }
+
+    fn report_resource(&self, r: Resource) -> Result<ResourceReport> {
+        let id = &r.operation;
         if r.state == ResourceState::Retained {
             self.verify_pins(&r)?;
         }
         Ok(ResourceReport {
-            operation_id: id.into(),
+            operation_id: id.clone(),
             state: r.state,
             cleanup_pending: !matches!(r.state, ResourceState::Retained | ResourceState::Spent),
             location: self.records.path.join(format!("{id}.json")),
@@ -722,7 +741,10 @@ impl Resources {
                 .ok_or_else(|| {
                     Error::new("Unknown resource acquisition evidence requires manual recovery")
                 })?;
-            result.push(self.report(id)?);
+            let record = self.read(id)?;
+            if record.repository.source_scope(&self.repository)? {
+                result.push(self.report_resource(record)?);
+            }
         }
         Ok(result)
     }

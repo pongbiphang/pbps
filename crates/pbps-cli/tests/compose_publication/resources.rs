@@ -1074,3 +1074,113 @@ fn an_owned_commit_root_prevents_repreparation_after_receipt_loss() {
     git(&f.repo.root, &["cat-file", "-e", &exact]);
     assert_eq!(publisher.confirm(&candidate), repeated);
 }
+
+#[test]
+fn linked_worktrees_list_only_their_own_valid_receipts_and_resources() {
+    let f = Fixture::new("worktree-scopes");
+    let (_store, original, candidate) = f.ready();
+    let mut publisher = f.publisher();
+    assert_eq!(publisher.confirm(&candidate).status, Status::Delivered);
+    let original_resource = root(&f).join(format!("resources/{}.json", original.operation_id));
+    let original_bytes = fs::read(&original_resource).unwrap();
+    let source = f.repo.preserved();
+    drop(publisher);
+    let linked = Repository {
+        root: f.repo.root.with_extension("linked"),
+        project: f.repo.root.with_extension("linked").join("project"),
+    };
+    git(
+        &f.repo.root,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            "-q",
+            linked.root.to_str().unwrap(),
+            &original.output_ref,
+        ],
+    );
+    let mut service = Publications::open(&linked.root, Duration::from_secs(15)).unwrap();
+    assert!(service.resource_reports().unwrap().is_empty());
+    assert!(service.list().unwrap().is_empty());
+    assert!(service.recover_resources(&original.operation_id).is_err());
+    assert!(service.forget(&original.operation_id).is_err());
+    assert_eq!(fs::read(&original_resource).unwrap(), original_bytes);
+    linked.table(&RENAMED.replace("ident", "next_ident"));
+    let mut store = linked.store();
+    let mut action = request();
+    action.intent = Intent::Rename {
+        from: "dbo.t.ident".into(),
+        to: "next_ident".into(),
+    };
+    action.remote_base_ref = original.output_ref.clone();
+    let next = store.preview(action, SystemTime::now()).unwrap();
+    let candidate = store
+        .confirm(&next.candidate_id, SystemTime::now())
+        .unwrap();
+    assert_eq!(service.confirm(&candidate).status, Status::Delivered);
+    assert_eq!(
+        service
+            .resource_reports()
+            .unwrap()
+            .iter()
+            .map(|r| r.operation_id.as_str())
+            .collect::<Vec<_>>(),
+        [&next.operation_id]
+    );
+    assert_eq!(
+        service
+            .list()
+            .unwrap()
+            .iter()
+            .map(|r| r.operation_id.as_str())
+            .collect::<Vec<_>>(),
+        [&next.operation_id]
+    );
+    drop(service);
+    let mut main = f.publisher();
+    assert_eq!(
+        main.resource_reports()
+            .unwrap()
+            .iter()
+            .map(|r| r.operation_id.as_str())
+            .collect::<Vec<_>>(),
+        [&original.operation_id]
+    );
+    assert_eq!(
+        main.list()
+            .unwrap()
+            .iter()
+            .map(|r| r.operation_id.as_str())
+            .collect::<Vec<_>>(),
+        [&original.operation_id]
+    );
+    // Only a fully validated record can be classified as another worktree's.
+    for path in [
+        root(&f).join(format!("resources/{}.json", next.operation_id)),
+        f.record(&next.operation_id),
+    ] {
+        let saved = fs::read(&path).unwrap();
+        let mut bad: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+        bad["version"] = serde_json::json!(999);
+        fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
+        if path.parent().unwrap().ends_with("resources") {
+            assert!(main.resource_reports().is_err());
+        } else {
+            assert!(main.list().is_err());
+        }
+        fs::write(path, saved).unwrap();
+    }
+    let mut changed: serde_json::Value = serde_json::from_slice(&original_bytes).unwrap();
+    changed["repository"]["source_inode"] =
+        serde_json::json!(changed["repository"]["source_inode"].as_u64().unwrap() + 1);
+    fs::write(&original_resource, serde_json::to_vec(&changed).unwrap()).unwrap();
+    assert!(
+        main.resource_reports().is_err(),
+        "a replaced source at the same path was hidden as foreign"
+    );
+    fs::write(&original_resource, &original_bytes).unwrap();
+    assert_eq!(main.resource_reports().unwrap().len(), 1);
+    assert_eq!(fs::read(&original_resource).unwrap(), original_bytes);
+    f.source_unchanged(&source);
+}
