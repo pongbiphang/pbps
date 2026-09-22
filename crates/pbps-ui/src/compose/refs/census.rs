@@ -1,13 +1,15 @@
 //! Git enumeration omits some broken refs, so raw evidence must corroborate it.
 
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 
-use rustix::fs::AtFlags;
+use rustix::fs::{AtFlags, Mode, OFlags, ResolveFlags, openat2};
 
 use super::super::{
     Error, Result,
-    durable::{Directory, ResourceObserver},
+    durable::{Directory, ResourceObserver, ResourceOperation},
     git::{Git, text},
     record::{identity, oid},
 };
@@ -18,6 +20,45 @@ fn refusal(reference: &str) -> Error {
     Error::new(&format!(
         "Private compose ref evidence at {reference} is incomplete or unreadable; preserve it for manual recovery"
     ))
+}
+
+fn git_file(directory: &Directory, entry: &str, limit: u64) -> Result<Option<Vec<u8>>> {
+    let path = directory.path.join(entry);
+    let unreadable = || refusal(&path.display().to_string());
+    directory.check()?;
+    let result = directory
+        .observer
+        .around(ResourceOperation::Read, &path, || {
+            let fd = match openat2(
+                &directory.file,
+                entry,
+                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+            ) {
+                Ok(fd) => fd,
+                Err(rustix::io::Errno::NOENT) => return Ok(None),
+                Err(_) => return Err(unreadable()),
+            };
+            let mut file = File::from(fd);
+            // Git may share these files across users or inodes. Reading a ref is
+            // not acquisition of its inode: only the separate private record and
+            // Git's expected-value transaction can authorize pin retirement.
+            if !file.metadata().map_err(|_| unreadable())?.is_file() {
+                return Err(unreadable());
+            }
+            let mut bytes = Vec::new();
+            Read::by_ref(&mut file)
+                .take(limit + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| unreadable())?;
+            if bytes.len() as u64 > limit {
+                return Err(unreadable());
+            }
+            Ok(Some(bytes))
+        })?;
+    directory.check()?;
+    Ok(result)
 }
 
 fn child(parent: &Directory, name: &str) -> Result<Option<Directory>> {
@@ -70,7 +111,7 @@ pub(in super::super) fn read(
     // Read the physical packed table too: Git may suppress malformed names or
     // dangling symbolic refs from for-each-ref. Only private names are text;
     // unrelated Git refs may contain non-UTF-8 bytes.
-    if let Some(bytes) = root.read("packed-refs", 64 * 1024 * 1024)? {
+    if let Some(bytes) = git_file(&root, "packed-refs", 64 * 1024 * 1024)? {
         if !bytes.is_empty() && !bytes.ends_with(b"\n") {
             return Err(refusal("packed-refs"));
         }
@@ -116,8 +157,7 @@ pub(in super::super) fn read(
             for kind in directory.names()? {
                 let reference = format!("{PREFIX}/{operation}/{kind}");
                 parts(&reference)?;
-                let bytes = directory
-                    .read(&kind, 4096)
+                let bytes = git_file(&directory, &kind, 4096)
                     .map_err(|_| refusal(&reference))?
                     .ok_or_else(|| refusal(&reference))?;
                 let value = std::str::from_utf8(&bytes).map_err(|_| refusal(&reference))?;

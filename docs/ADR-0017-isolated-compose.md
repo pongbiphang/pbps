@@ -426,7 +426,10 @@ same source path still refuse. Per-operation reads and mutations keep the strict
 source identity check, so filtering never authorizes another worktree's cleanup.
 Discovery and new-resource admission also census `refs/pbps-compose` (#783).
 Read both loose and packed evidence without following symlinks and corroborate
-it with Git's direct-ref enumeration; repeat the physical census to refuse a
+it with Git's direct-ref enumeration. Git-owned ref files use bounded regular-file
+reads without private-record UID or link-count restrictions, permitting shared
+repository metadata; private resource records keep their stricter ownership
+policy. Repeat the physical census to refuse a
 changing view, including refs moving between packed and loose storage. Each
 surviving pin requires a valid resource record for the same common directory
 and its recorded, non-retired value before source-worktree filtering. Missing,

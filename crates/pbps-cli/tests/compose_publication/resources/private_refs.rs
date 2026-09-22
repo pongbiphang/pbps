@@ -255,3 +255,43 @@ fn incomplete_or_changing_private_ref_enumeration_cannot_certify_absence() {
     assert!(error.contains(&orphan_id), "{error}");
     assert!(error.contains("ownership"), "{error}");
 }
+
+#[test]
+fn shared_git_metadata_does_not_inherit_private_resource_ownership_rules() {
+    let f = Fixture::new("shared-git-ref-evidence");
+    git(&f.repo.root, &["config", "core.sharedRepository", "group"]);
+    git(&f.repo.root, &["pack-refs", "--all"]);
+    let packed = f.repo.root.join(".git/packed-refs");
+    if rustix::process::geteuid().is_root() {
+        // The root-qualified run exercises a different authorized file owner;
+        // ordinary CI still exercises the independent shared-inode restriction.
+        rustix::fs::chown(&packed, Some(rustix::process::Uid::from_raw(65534)), None).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert_ne!(fs::metadata(&packed).unwrap().uid(), 0);
+    } else {
+        fs::hard_link(&packed, f.repo.root.join("packed-evidence-link")).unwrap();
+    }
+    let before = f.repo.preserved();
+    let (_store, preview, _candidate) = f.ready();
+    let loose = f.repo.root.join(format!(
+        ".git/refs/pbps-compose/{}/base",
+        preview.operation_id
+    ));
+    fs::hard_link(&loose, f.repo.root.join("base-evidence-link")).unwrap();
+    assert_eq!(f.publisher().resource_reports().unwrap().len(), 1);
+    assert!(f.repo.store().preview(request(), SystemTime::now()).is_ok());
+    assert_eq!(f.repo.preserved(), before);
+
+    // Git metadata is read-only evidence. The separate private ownership
+    // record remains single-link storage, even when its JSON is unchanged.
+    let record = root(&f).join(format!("resources/{}.json", preview.operation_id));
+    fs::hard_link(&record, f.repo.root.join("resource-evidence-link")).unwrap();
+    assert!(f.publisher().resource_reports().is_err());
+    assert!(
+        f.repo
+            .store()
+            .preview(request(), SystemTime::now())
+            .is_err()
+    );
+    assert_eq!(f.repo.preserved(), before);
+}
