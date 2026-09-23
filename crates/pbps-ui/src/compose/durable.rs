@@ -13,6 +13,7 @@ use super::{Error, Result, random_id};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceOperation {
+    Identify,
     Open,
     Create,
     Read,

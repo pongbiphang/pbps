@@ -265,6 +265,12 @@ impl Records {
 
     pub fn load(&self, id: &str) -> Result<Option<Record>> {
         self.names()?;
+        self.load_in_pass(id)
+    }
+
+    // The caller brackets a batch with complete namespace/lease checks;
+    // direct recovery reads retain their own fresh names() check above.
+    fn load_in_pass(&self, id: &str) -> Result<Option<Record>> {
         if !identity(id) {
             return Err(Error::new("Invalid compose operation identity"));
         }
@@ -278,13 +284,20 @@ impl Records {
     }
 
     pub fn list(&self) -> Result<Vec<Record>> {
-        self.names()?
-            .into_iter()
+        let names = self.names()?;
+        let records = names
+            .iter()
             .map(|id| {
-                self.load(&id)?
+                self.load_in_pass(id)?
                     .ok_or_else(|| Error::new("A compose receipt disappeared during discovery"))
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        if self.names()? != names {
+            return Err(Error::new(
+                "Compose receipt evidence changed during discovery; preserve it",
+            ));
+        }
+        Ok(records)
     }
 
     pub fn save(&self, record: &Record) -> Result<()> {

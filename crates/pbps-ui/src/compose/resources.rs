@@ -1,6 +1,6 @@
 //! Durable ownership is acquired explicitly; uncertain acquisition is retained.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -108,7 +108,14 @@ impl Resources {
 
     fn binding(&self) -> Result<()> {
         self.root.check()?;
-        if RepositoryIdentity::capture(&self.git)? != self.repository {
+        if self
+            .root
+            .observer
+            .around(ResourceOperation::Identify, &self.git.root, || {
+                RepositoryIdentity::capture(&self.git)
+            })?
+            != self.repository
+        {
             return Err(Error::new(
                 "Compose resource repository changed; preserve the original evidence",
             ));
@@ -126,18 +133,39 @@ impl Resources {
         Ok(r)
     }
 
-    fn read(&self, id: &str) -> Result<Resource> {
-        if !identity(id) {
-            return Err(Error::new("Invalid resource operation identity"));
-        }
-        self.binding()?;
-        for name in self.records.names()? {
+    fn names(&self) -> Result<BTreeSet<String>> {
+        let names = self.records.names()?;
+        for name in &names {
             if !name.strip_suffix(".json").is_some_and(identity) {
                 return Err(Error::new(&format!(
                     "Unacknowledged resource evidence at {}; preserve it for manual recovery",
                     self.records.path.join(name).display()
                 )));
             }
+        }
+        Ok(names.into_iter().collect())
+    }
+
+    fn check_pass(&self, names: &BTreeSet<String>) -> Result<()> {
+        if &self.names()? != names {
+            return Err(Error::new(
+                "Compose resource evidence changed during discovery; preserve it",
+            ));
+        }
+        self.binding()
+    }
+
+    fn read(&self, id: &str) -> Result<Resource> {
+        self.binding()?;
+        self.names()?;
+        self.read_in_pass(id)
+    }
+
+    // Batch callers bind the repository and validated names at both ends.
+    // Direct operations still use read(), so a batch grants no later authority.
+    fn read_in_pass(&self, id: &str) -> Result<Resource> {
+        if !identity(id) {
+            return Err(Error::new("Invalid resource operation identity"));
         }
         let bytes = self
             .records
@@ -256,8 +284,11 @@ impl Resources {
 
     pub fn begin(&self, id: &str, base: &str) -> Result<PathBuf> {
         self.locked(|| {
-            self.census_pins()?;
-            if self.records.names()?.len() >= 32768 {
+            self.binding()?;
+            let names = self.names()?;
+            self.census_pins(&names)?;
+            self.check_pass(&names)?;
+            if names.len() >= 32768 {
                 return Err(Error::new(
                     "Compose resource record limit reached; retain existing recovery evidence",
                 ));
@@ -880,8 +911,7 @@ impl Resources {
         })
     }
 
-    fn census_pins(&self) -> Result<()> {
-        self.binding()?;
+    fn census_pins(&self, names: &BTreeSet<String>) -> Result<BTreeMap<String, Resource>> {
         let read = || refs::private_census(&self.repository.common, self.root.observer.clone());
         let physical = read()?;
         let pins = refs::verify_private_census(&self.git, &physical)?;
@@ -897,7 +927,13 @@ impl Resources {
                 // Validate common-store ownership before filtering by source.
                 // Pending acquisition remains pending; correlation grants no
                 // right to retire an unacknowledged pin.
-                records.insert(id, self.read(id).map_err(|_| unavailable())?);
+                if !names.contains(&format!("{id}.json")) {
+                    return Err(unavailable());
+                }
+                records.insert(
+                    id.to_owned(),
+                    self.read_in_pass(id).map_err(|_| unavailable())?,
+                );
             }
             let resource = &records[id];
             if resource
@@ -915,14 +951,16 @@ impl Resources {
                 "Private compose refs changed during the ownership census; preserve their evidence",
             ));
         }
-        self.binding()
+        Ok(records)
     }
 
     pub fn list(&self) -> Result<Vec<ResourceReport>> {
-        self.census_pins()?;
-        let names = self.records.names()?;
-        for snapshot in self.snapshots.names()? {
-            if !identity(&snapshot) || !names.contains(&format!("{snapshot}.json")) {
+        self.binding()?;
+        let names = self.names()?;
+        let mut records = self.census_pins(&names)?;
+        let snapshots = self.snapshots.names()?;
+        for snapshot in &snapshots {
+            if !identity(snapshot) || !names.contains(&format!("{snapshot}.json")) {
                 return Err(Error::new(&format!(
                     "Unattributable snapshot at {}; preserve it for manual recovery",
                     self.snapshots.path.join(snapshot).display()
@@ -930,18 +968,27 @@ impl Resources {
             }
         }
         let mut result = Vec::new();
-        for name in names {
+        for name in &names {
             let id = name
                 .strip_suffix(".json")
                 .filter(|id| identity(id))
                 .ok_or_else(|| {
                     Error::new("Unknown resource acquisition evidence requires manual recovery")
                 })?;
-            let record = self.read(id)?;
+            let record = match records.remove(id) {
+                Some(record) => record,
+                None => self.read_in_pass(id)?,
+            };
             if record.repository.source_scope(&self.repository)? {
                 result.push(self.report_resource(record)?);
             }
         }
+        if self.snapshots.names()? != snapshots {
+            return Err(Error::new(
+                "Compose snapshot evidence changed during discovery; preserve it",
+            ));
+        }
+        self.check_pass(&names)?;
         Ok(result)
     }
 }
