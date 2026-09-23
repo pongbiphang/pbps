@@ -1,7 +1,9 @@
 //! Fixed launch recipes. A recipe is not a measured runtime admission.
 
 use super::{CandidateImage, Error};
-use crate::resolver::native::{FILE_DESCRIPTOR_LIMIT, FORWARDER_PRIVILEGES, WorkloadPrivileges};
+use crate::resolver::native::{
+    FILE_DESCRIPTOR_LIMIT, FORWARDER_PRIVILEGES, MASKED_PROC_PATHS, WorkloadPrivileges,
+};
 use pbps_db::Driver;
 use serde_json::{Value, json};
 
@@ -84,7 +86,7 @@ impl Launch {
                 "Tmpfs": tmpfs,
                 "LogConfig": {"Type": "none", "Config": {}},
                 "CgroupnsMode": "private",
-                "MaskedPaths": ["/proc/asound", "/proc/acpi", "/proc/interrupts", "/proc/kcore", "/proc/keys", "/proc/latency_stats", "/proc/timer_list", "/proc/timer_stats", "/proc/sched_debug", "/proc/scsi", "/sys"],
+                "MaskedPaths": MASKED_PROC_PATHS.iter().copied().chain(["/sys"]).collect::<Vec<_>>(),
                 "ReadonlyPaths": ["/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"],
                 "Ulimits": [{"Name":"nofile", "Soft":FILE_DESCRIPTOR_LIMIT, "Hard":FILE_DESCRIPTOR_LIMIT}]
             }

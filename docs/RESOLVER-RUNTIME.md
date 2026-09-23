@@ -67,6 +67,15 @@ The shared guard check also covers the control and analysis forwarders of a
 supplied server, whose root guards do not have a Docker-factory execution lease.
 The supplied engine itself retains its separate operator resource contract.
 
+The Docker workload and control execution leases verify every requested
+optional `/proc` mask through the held process root. Only a leaf's actual
+`ENOENT` beneath the identified procfs parent counts as absence. Existing
+objects must match their visible mount IDs: a directory is an empty read-only
+tmpfs, and a file is the same null device bound from the run's `/dev/null`.
+Missing masks, different objects, writable or nonempty directories, symlinks
+and unreadable state refuse. Kernels without an optional interface remain
+supported. Docker's `MaskedPaths` report alone cannot establish these facts.
+
 The host kernel, its administrators, the selected daemon and explicitly trusted
 image installation form the provisioning trust boundary. SQL privileges in
 scratch grant no authority over those external controls. This profile does not
@@ -422,6 +431,13 @@ No start line is sent, so every refusal precedes engine initialization. Each
 owned container is removed before the test asserts its result. The new group
 and guard regressions failed on the previous implementation and passed after
 the checks were added; CI runs them for both engines.
+
+The same runner also mutates only explicitly marked owned workload/control
+mount namespaces to test omitted masks, replacement devices, nonempty or
+writable masks, and unreadable directories while Docker's report remains
+unchanged. It drops the observer's DAC bypass capabilities for the unreadable
+case. Unchanged masks and genuinely absent optional interfaces must still pass;
+all helper failures follow owned cleanup before the test reports a failure.
 
 `scripts/live-resolver-target.py <pg|mssql>` creates disposable TLS targets and
 confines each inspector to its owned target's PID/network namespaces. It checks

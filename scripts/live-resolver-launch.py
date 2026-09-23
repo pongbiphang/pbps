@@ -22,6 +22,7 @@ TESTS = [
     "the_launch_cannot_omit_inherited_no_new_privileges",
     "effective_descriptor_limits_are_required_before_initialization",
     "unreadable_effective_limits_are_not_a_bounded_answer",
+    "masks::every_existing_proc_interface_requires_its_effective_mask",
 ]
 
 
@@ -46,6 +47,10 @@ def main():
         if name == "unreadable_effective_limits_are_not_a_bounded_answer":
             command = ["unshare", "--mount", "--propagation", "private", "--", *command]
             selected = dict(env, PBPS_LIMITS_PRIVATE_PROC_FIXTURE="1")
+        if name.startswith("masks::"):
+            # Root can still observe the guard with SYS_PTRACE, but must not
+            # bypass a mask directory's absent read/search permissions.
+            command = ["setpriv", "--bounding-set=-dac_override,-dac_read_search", "--", *command]
         result = subprocess.run(
             command,
             env=selected, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)

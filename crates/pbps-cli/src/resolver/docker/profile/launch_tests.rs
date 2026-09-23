@@ -5,6 +5,9 @@ use crate::resolver::docker::{CandidateRun, LocalApi};
 use crate::resolver::native::awaiting_engine;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+#[path = "launch_tests/masks.rs"]
+mod masks;
+
 async fn accepts_waiter(change: impl FnOnce(&mut Launch)) -> bool {
     inspect_waiter(change, |run, driver| {
         awaiting_engine(
