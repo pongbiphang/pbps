@@ -136,6 +136,11 @@ impl ServerRuntime {
         anchors(init).map_err(Premise::Anchors.named())?;
         let rows = mount_rows(init).map_err(Premise::Mounts.named())?;
         profile::contained(&rows, self.profile).map_err(Error::Mount)?;
+        crate::resolver::native::runtime_files::check(init).map_err(|_| {
+            Error::Unqualified(
+                "the supplied host and DNS files do not match the private runtime profile",
+            )
+        })?;
         device_not_engine_writable(init).map_err(Premise::Device.named())?;
         occupants(init, self.profile)?;
         accounted(init, forwarders)?;

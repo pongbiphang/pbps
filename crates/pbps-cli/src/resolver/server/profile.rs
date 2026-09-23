@@ -326,7 +326,8 @@ pub(crate) fn contained(rows: &[MountEntry], profile: &ServerProfile) -> Result<
             path if PRIVATE_TMPFS.contains(&path) => tmpfs && all(&["nosuid", "nodev", "noexec"]),
             path if RUNTIME_FILES.contains(&path) => {
                 // The file the runtime wrote, wherever it keeps it: the row's
-                // root ends in the same name. Its contents are #630's scope.
+                // root ends in the same name. ServerRuntime independently
+                // qualifies the complete actual contents (#630).
                 has("ro") && ordinary && entry.root.rsplit('/').next() == path.rsplit('/').next()
             }
             path if READONLY_PROC.contains(&path) => {

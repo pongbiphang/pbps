@@ -146,6 +146,7 @@ impl ExecutionLease {
             return Err(UnqualifiedProcess);
         }
         masks::check(&self.process, &parsed)?;
+        super::runtime_files::check(&self.process)?;
         self.process.check()
     }
 }

@@ -33,6 +33,7 @@ ENGINE_UID = {"pg": 999, "mssql": 10001}
 EXECUTABLE = {"pg": "postgres", "mssql": "sqlservr"}
 QUIET = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
 TESTS = [
+    "host_files::host_file_loss_refuses_admission_and_discards_live_analysis",
     "a_supported_dedicated_server_compiles_declarations_and_removes_only_its_own_resources",
     "guard_limits::every_forwarder_guard_requires_effective_descriptor_evidence",
     # PostgreSQL analysis-scope qualification (#610); no-ops on SQL Server (#611).
@@ -58,6 +59,8 @@ DOCKER_SOCKET = "/var/run/docker.sock"
 # every privilege the engine does not need is gone before it starts.
 RECIPE = [
     "--network", "none", "--ipc", "private", "--read-only",
+    "--hostname", "pbps-resolver", "--dns", "127.0.0.1",
+    "--dns-search", ".", "--dns-option", "ndots:0",
     "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,size=67108864,mode=1777",
     # /run and /var/tmp forced to noexec: Podman auto-mounts them rw without
     # noexec, and the profile requires no executable private storage.

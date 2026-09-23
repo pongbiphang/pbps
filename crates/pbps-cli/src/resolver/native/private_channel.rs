@@ -252,6 +252,9 @@ fn guard(process: &ProcessLease, workload_capabilities: u64) -> Result<(), Unqua
     // Supplied-server forwarders have no ExecutionLease for this root, and
     // guarded_tasks checks WorkloadPrivileges only on its other tasks (#794).
     super::execution::check_file_descriptors(process)?;
+    // Supplied-server forwarders share the server's runtime files, but have
+    // no factory ExecutionLease. Qualify their actual view as well (#630).
+    super::runtime_files::check(process)?;
     process.check()
 }
 

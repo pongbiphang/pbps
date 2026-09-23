@@ -17,6 +17,7 @@ IMAGES = {
     "mssql": "mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1",
 }
 TESTS = [
+    "host_information_is_refused_before_engine_initialization",
     "a_wrong_workload_identity_is_refused_before_initialization",
     "a_guard_without_termination_authority_is_refused_before_initialization",
     "the_launch_cannot_omit_inherited_no_new_privileges",

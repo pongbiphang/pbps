@@ -23,6 +23,14 @@ async fn inspect_waiter(
     change: impl FnOnce(&mut Launch),
     inspect: impl FnOnce(&CandidateRun, Driver) -> bool,
 ) -> bool {
+    inspect_waiter_with_file(change, inspect, None).await
+}
+
+async fn inspect_waiter_with_file(
+    change: impl FnOnce(&mut Launch),
+    inspect: impl FnOnce(&CandidateRun, Driver) -> bool,
+    mutation: Option<(&str, &str)>,
+) -> bool {
     let socket = std::env::var("PBPS_RESOLVER_TEST_SOCKET").unwrap();
     let reference = std::env::var("PBPS_RESOLVER_TEST_IMAGE").unwrap();
     let driver = match std::env::var("PBPS_RESOLVER_TEST_DRIVER").unwrap().as_str() {
@@ -60,7 +68,21 @@ async fn inspect_waiter(
         }
         // Never send the start line: refusal must precede initialization,
         // independently of any later database handshake or declaration.
+        let changed = if let Some((path, mode)) = mutation {
+            use crate::resolver::docker::file_fixture::{ChangedFile, mutations};
+            let mut observer = LocalApi::connect(std::path::Path::new(&socket)).await?;
+            let changed = ChangedFile::capture(&mut observer, run.container_id(), path).await;
+            let (_, text) = mutations(path, changed.original())
+                .into_iter()
+                .find(|(name, _)| *name == mode)
+                .expect("known fixture mutation");
+            changed.replace(&text);
+            Some(changed)
+        } else {
+            None
+        };
         let accepted = inspect(&run, driver);
+        drop(changed);
         // A host-side limit change must not alter Docker's reported recipe.
         run.check().await?;
         Ok(accepted)
@@ -291,4 +313,40 @@ async fn unreadable_effective_limits_are_not_a_bounded_answer() {
     )
     .await;
     assert!(!accepted, "unreadable effective limits were admitted");
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit owned rootful Docker fixture"]
+async fn host_information_is_refused_before_engine_initialization() {
+    let mut wrong = Vec::new();
+    let mut cases = vec![None];
+    for path in ["/etc/resolv.conf", "/etc/hosts", "/etc/hostname"] {
+        for (mode, _) in crate::resolver::docker::file_fixture::mutations(path, "") {
+            cases.push(Some((path, mode)));
+        }
+    }
+    for mutation in cases {
+        let admits = inspect_waiter_with_file(
+            |_| (),
+            |run, driver| {
+                let pid = run.native_pid().unwrap();
+                crate::resolver::native::ExecutionLease::capture(
+                    pid,
+                    engine::workload_limits(driver),
+                )
+                .is_ok()
+                    && awaiting_engine(pid, &engine::private_channel_profile(driver)).is_ok()
+            },
+            mutation,
+        )
+        .await;
+        eprintln!("pre-initialization host files mutation={mutation:?}, admitted={admits}");
+        if admits != mutation.is_none() {
+            wrong.push(mutation);
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "wrong pre-initialization admission: {wrong:?}"
+    );
 }
