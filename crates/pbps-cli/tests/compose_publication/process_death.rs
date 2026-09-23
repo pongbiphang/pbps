@@ -177,6 +177,27 @@ fn commits(f: &Fixture) -> usize {
         .count()
 }
 
+/// Counts commits so that a repeated commit-tree is observable: with the same
+/// inputs in the same second Git would reproduce the same OID, so the
+/// committer identity is changed first and any later invocation is a new
+/// object. The returned check asserts the count did not move, then proves
+/// the counter itself moves on one explicit invocation.
+fn commit_counter(f: &Fixture) -> impl Fn(&str) + '_ {
+    git(
+        &f.repo.root,
+        &["config", "user.email", "after-death@example.test"],
+    );
+    let objects = commits(f);
+    move |label: &str| {
+        assert_eq!(commits(f), objects, "{label}: commit creation ran again");
+        git(
+            &f.repo.root,
+            &["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "probe"],
+        );
+        assert_eq!(commits(f), objects + 1, "{label}: the counter is blind");
+    }
+}
+
 /// The source checkout is exactly as it was and stays ordinary to edit.
 fn source_intact(f: &Fixture, before: &[Vec<u8>]) {
     f.source_unchanged(before);
@@ -192,14 +213,7 @@ fn death_after_commit_creation_never_yields_a_second_commit() {
     let id = killed_at(&f, "commit-created", "");
     // commit-tree ran; nothing durable names its result yet.
     assert_eq!(receipt(&f, &id)["state"]["phase"], "preparing");
-    // A repeated commit-tree with the same inputs within the same second
-    // would reproduce the same OID. A new committer identity makes any
-    // further invocation a new object, so the count can observe it.
-    git(
-        &f.repo.root,
-        &["config", "user.email", "after-death@example.test"],
-    );
-    let objects = commits(&f);
+    let unchanged = commit_counter(&f);
     let mut publisher = f.publisher();
     let first = publisher.recover(&id);
     assert_eq!(first.status, Status::PreparationUnknown, "{first:?}");
@@ -207,13 +221,7 @@ fn death_after_commit_creation_never_yields_a_second_commit() {
     for _ in 0..2 {
         assert_eq!(publisher.retry(&id), first);
     }
-    assert_eq!(commits(&f), objects, "retry invoked commit creation again");
-    // The detector itself: one more invocation right now is a new object.
-    git(
-        &f.repo.root,
-        &["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "probe"],
-    );
-    assert_eq!(commits(&f), objects + 1);
+    unchanged("retry after commit creation");
     assert_eq!(local_ref(&f, &id), None);
     assert_eq!(f.remote_ref(&format!("refs/heads/pbps-compose/{id}")), None);
     assert_eq!(receipt(&f, &id)["state"]["phase"], "preparing");
@@ -231,7 +239,7 @@ fn death_after_the_local_ref_is_installed_resumes_that_exact_commit() {
     assert_eq!(local_ref(&f, &id).as_deref(), Some(exact.as_str()));
     let output_ref = format!("refs/heads/pbps-compose/{id}");
     assert_eq!(f.remote_ref(&output_ref), None);
-    let objects = commits(&f);
+    let unchanged = commit_counter(&f);
     let mut publisher = f.publisher();
     let recovered = publisher.recover(&id);
     assert_eq!(recovered.status, Status::Published, "{recovered:?}");
@@ -241,7 +249,7 @@ fn death_after_the_local_ref_is_installed_resumes_that_exact_commit() {
     assert_eq!(delivered.status, Status::Delivered, "{delivered:?}");
     assert_eq!(commit(&delivered), exact);
     assert_eq!(f.remote_ref(&output_ref).as_deref(), Some(exact.as_str()));
-    assert_eq!(commits(&f), objects);
+    unchanged("recovery and retry after the local ref");
     source_intact(&f, &before);
 }
 
