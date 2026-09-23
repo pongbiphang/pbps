@@ -539,7 +539,8 @@ pub(crate) fn read_expr(quoted: &str, base: &str) -> String {
         // The MAX conversion path overflows for valid floats (including
         // -255) on SQL Server 17.0.4075.5, even with varchar as the target.
         // Render into a bounded buffer first; 99 characters exceed the
-        // signed 17-digit scientific form, then widen without formatting.
+        // signed 17-digit scientific form, then widen without formatting
+        // (DECISIONS 540).
         "float" | "real" => {
             format!("CONVERT(nvarchar(max), CONVERT(varchar(99), {quoted}, 3))")
         }
