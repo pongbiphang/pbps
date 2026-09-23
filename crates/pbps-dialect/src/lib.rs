@@ -2114,6 +2114,27 @@ pub trait Dialect {
         None
     }
 
+    /// The transaction each pre-flight probe runs in, or `None` where a probe
+    /// can run without one.
+    ///
+    /// A probe evaluates the operator's declared expression against the live
+    /// rows, between "this plan was approved" and "these statements
+    /// executed". On an engine where an expression can write — PostgreSQL
+    /// accepts `CHECK (nextval('s') > 0)` — that evaluation is a side effect
+    /// nobody approved, and one a rollback does not undo. A read-only
+    /// transaction makes the engine refuse the write itself, so the probe fails
+    /// and is reported unchecked, instead of pbps judging which expressions
+    /// are safe to run (DECISIONS 537).
+    ///
+    /// The runner opens it with `begin` and always closes it with `rollback`,
+    /// one transaction per probe, so a probe the engine refuses cannot abort
+    /// the next one. It runs outside any transaction of the deployment's own.
+    ///
+    /// Required, not defaulted, for the reason [`Dialect::transaction_framing`]
+    /// gives: whether an engine's expressions can write is the engine's
+    /// answer, and a default would be one engine's answer under a neutral name.
+    fn probe_framing(&self) -> Option<TransactionFraming>;
+
     /// Whether a read-back can tell a cell of this column that is at its
     /// default from one that is not.
     ///
@@ -2874,6 +2895,9 @@ mod tests {
         fn transaction_framing(&self) -> TransactionFraming {
             MinimalDialect.transaction_framing()
         }
+        fn probe_framing(&self) -> Option<TransactionFraming> {
+            MinimalDialect.probe_framing()
+        }
         fn normalize_type(&self, ty: &ColumnType) -> Result<ColumnType, DialectError> {
             Ok(ty.clone())
         }
@@ -3381,6 +3405,12 @@ impl Dialect for MinimalDialect {
             commit: "COMMIT;",
             rollback: "ROLLBACK;",
         }
+    }
+
+    /// None: nothing opens a connection with this dialect, so nothing probes
+    /// through it.
+    fn probe_framing(&self) -> Option<TransactionFraming> {
+        None
     }
 
     /// No alias expansion — which names alias which is real-dialect knowledge.

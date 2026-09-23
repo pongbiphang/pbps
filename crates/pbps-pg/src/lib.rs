@@ -439,6 +439,21 @@ impl Dialect for Postgres {
         }
     }
 
+    /// Read only, because a declared expression can write here: measured on
+    /// 18.6, `CHECK (nextval('s') > 0)` is accepted, a probe evaluating it
+    /// advances the sequence once per row, and the advance survives the
+    /// probe's rollback. Under `READ ONLY` the engine refuses `nextval` itself
+    /// and an ordinary probe is untouched (DECISIONS 537). No pins here: the
+    /// runner establishes them on the connection first, as plain `SET`s that
+    /// outlive this transaction.
+    fn probe_framing(&self) -> Option<TransactionFraming> {
+        Some(TransactionFraming {
+            begin: "BEGIN READ ONLY;",
+            commit: "COMMIT;",
+            rollback: "ROLLBACK;",
+        })
+    }
+
     /// The same pins, for the mode that opens no transaction to carry them.
     ///
     /// This is the hole [`Dialect::transaction_framing`] names above: a staged
