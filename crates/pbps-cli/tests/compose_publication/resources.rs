@@ -1,5 +1,6 @@
 //! Actual Git GC, attributable retirement, and production resource boundaries.
 
+mod batching;
 mod private_refs;
 
 use super::*;

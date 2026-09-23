@@ -424,6 +424,18 @@ records for another source sharing the common directory are retained and exclude
 from that view; unknown versions, malformed records and a changed identity at the
 same source path still refuse. Per-operation reads and mutations keep the stricter
 source identity check, so filtering never authorizes another worktree's cleanup.
+Resource and receipt discovery batch validated names and record reads (#784).
+Resource discovery and the private-pin admission census bind repository identity
+before and after the batch; complete namespace passes bracket each batch, and
+resource discovery also rechecks snapshot membership. A missing, unknown,
+unreadable or changing entry refuses the batch. Pin-owning records read during
+the census are reused within resource discovery, then discarded with the batch.
+The cache never authorizes a later operation: direct reads, mutations and receipt
+reconciliation retain their individual authority checks. The bounded-pass claim
+covers discovery enumeration and admission census, not per-receipt recovery or
+per-pin Git verification. Admission still validates the contents of pin-owning
+records; validation of every prior record before acquisition is separate #785.
+
 Discovery and new-resource admission also census `refs/pbps-compose` (#783).
 Read both loose and packed evidence without following symlinks and corroborate
 it with Git's direct-ref enumeration. Physical names and byte fingerprints prove
