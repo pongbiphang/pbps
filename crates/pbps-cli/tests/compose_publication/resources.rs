@@ -998,6 +998,7 @@ fn resource_stop_child() {
     let repository = PathBuf::from(std::env::var_os("PBPS_RESOURCE_TEST_REPOSITORY").unwrap());
     let socket = PathBuf::from(std::env::var_os("PBPS_RESOURCE_TEST_SOCKET").unwrap());
     let mode = std::env::var("PBPS_RESOURCE_TEST_MODE").unwrap();
+    super::process_death::assert_no_core_dumps();
     let operation = Arc::new(std::sync::Mutex::new(String::new()));
     let send = move |id: &str| -> ! {
         let mut connection = UnixStream::connect(&socket).unwrap();
@@ -1160,7 +1161,10 @@ fn actual_process_death_preserves_acquisition_ref_handoff_and_retirement_evidenc
         listener.set_nonblocking(true).unwrap();
         let log_path = f.repo.root.join("child.log");
         let log = fs::File::create(&log_path).unwrap();
-        let mut child = Command::new(std::env::current_exe().unwrap())
+        // Core dumps are disabled for the stopped child (#748).
+        let mut child = Command::new("sh")
+            .args(["-c", "ulimit -c 0 && exec \"$0\" \"$@\""])
+            .arg(std::env::current_exe().unwrap())
             .args([
                 "--ignored",
                 "--exact",
