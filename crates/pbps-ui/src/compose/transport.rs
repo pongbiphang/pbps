@@ -97,7 +97,90 @@ pub(super) fn observe(git: &Git, description: &Description, reference: &str) -> 
     read().unwrap_or(RefEvidence::Unreadable)
 }
 
-pub(super) fn push(git: &Git, description: &Description, commit: &str) -> Result<()> {
+/// Git's own `push.gpgSign` modes. Read once and passed to Git explicitly, so
+/// the preflight and the push obey the same requirement (#775).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PushSigning {
+    Never,
+    IfAsked,
+    Required,
+}
+
+impl PushSigning {
+    fn flag(self) -> &'static str {
+        match self {
+            Self::Never => "--signed=no",
+            Self::IfAsked => "--signed=if-asked",
+            Self::Required => "--signed=yes",
+        }
+    }
+}
+
+pub(super) fn push_signing(git: &Git) -> Result<PushSigning> {
+    let Some(value) = git.config("push.gpgSign")? else {
+        return Ok(PushSigning::Never);
+    };
+    if value.eq_ignore_ascii_case("if-asked") {
+        return Ok(PushSigning::IfAsked);
+    }
+    // Git owns boolean spelling, including bare keys; anything else is a
+    // configuration Git itself refuses, not a weaker requirement.
+    match git
+        .line(&["config", "--type=bool", "--get", "push.gpgSign"])?
+        .as_str()
+    {
+        "true" => Ok(PushSigning::Required),
+        "false" => Ok(PushSigning::Never),
+        _ => Err(Error::new("Unusable push signing policy")),
+    }
+}
+
+pub(super) enum Preflight {
+    Unsupported,
+    Unavailable,
+}
+
+/// A required push certificate the destination cannot accept refuses before
+/// any remote attempt is recorded. A dry run sends no commands, so neither
+/// probe can write; `--signed=if-asked` succeeding where `yes` failed isolates
+/// the capability as the reason without parsing localized diagnostics. Git
+/// signs only in the real push, so a failing signer surfaces there, after the
+/// attempt, as uncertain delivery.
+pub(super) fn preflight(
+    git: &Git,
+    description: &Description,
+    commit: &str,
+    signing: PushSigning,
+) -> std::result::Result<(), Preflight> {
+    if signing != PushSigning::Required {
+        return Ok(());
+    }
+    let dry = |mode| run_push(git, description, commit, mode, true).is_ok();
+    if dry(PushSigning::Required) {
+        Ok(())
+    } else if dry(PushSigning::IfAsked) {
+        Err(Preflight::Unsupported)
+    } else {
+        Err(Preflight::Unavailable)
+    }
+}
+
+pub(super) fn push(
+    git: &Git,
+    description: &Description,
+    commit: &str,
+    signing: PushSigning,
+) -> Result<()> {
+    run_push(git, description, commit, signing, false)
+}
+
+fn run_push(
+    git: &Git,
+    description: &Description,
+    commit: &str,
+    signing: PushSigning,
+    dry_run: bool,
+) -> Result<()> {
     let (mut command, alias) = command(git, description)?;
     if local_evidence(git, description, &description.output_ref)
         .is_some_and(|evidence| evidence != RefEvidence::Absent)
@@ -106,14 +189,18 @@ pub(super) fn push(git: &Git, description: &Description, commit: &str) -> Result
             "The local destination ref is not directly absent",
         ));
     }
+    command.args([
+        "push",
+        "--porcelain",
+        "--no-verify",
+        "--no-follow-tags",
+        "--recurse-submodules=no",
+        signing.flag(),
+    ]);
+    if dry_run {
+        command.arg("--dry-run");
+    }
     command
-        .args([
-            "push",
-            "--porcelain",
-            "--no-verify",
-            "--no-follow-tags",
-            "--recurse-submodules=no",
-        ])
         .arg(format!("--force-with-lease={}:", description.output_ref))
         .arg(alias)
         .arg(format!("{commit}:{}", description.output_ref));
