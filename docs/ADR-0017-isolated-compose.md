@@ -102,9 +102,12 @@ not grant permission to execute repository-controlled hooks or filters.
    observation of the remote, not a lock preventing a later remote force-push.
 2. Obtain the user's normal Git identity and signing policy through the guarded
    runner. `commit-tree` creates precisely the reviewed tree and parent; when
-   signing is required it must explicitly request signing. Failure to sign
-   never falls back to an unsigned commit. Persist the exact resulting commit
-   id and operation intent before attempting to make a branch visible.
+   signing is required it must explicitly request signing with the sealed
+   public key and format (an unset format is pinned to Git's default), so a
+   configuration change after the policy check cannot choose the signature
+   (#770). Failure to sign never falls back to an unsigned commit. Persist the
+   exact resulting commit id and operation intent before attempting to make a
+   branch visible.
 3. Consume the operation id and output ref already sealed and displayed by
    Capture and review step 4. Publication does not allocate another name or
    mutate the candidate. Do not overwrite or reuse an arbitrary user branch.

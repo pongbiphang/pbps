@@ -244,18 +244,23 @@ impl Publications {
         }
         let result = (|| {
             let d = &record.description;
-            let mut args = vec![
-                "-c",
-                "core.fsync=all",
-                "-c",
-                "core.fsyncMethod=fsync",
-                "commit-tree",
-                d.tree.as_str(),
-                "-p",
-                d.base.as_str(),
-            ];
+            // The policy check above reads configuration a moment before
+            // commit-tree reads it again. Pass the sealed public selectors
+            // explicitly so a writer in between cannot substitute a key or
+            // format; an unset format is pinned to Git's own default. An
+            // implicit key stays implicit, as reviewed (#770).
+            let format = format!(
+                "gpg.format={}",
+                d.signing.format.as_deref().unwrap_or("openpgp")
+            );
+            let key = format!("-S{}", d.signing.key.as_deref().unwrap_or(""));
+            let mut args = vec!["-c", "core.fsync=all", "-c", "core.fsyncMethod=fsync"];
+            if d.signing.required {
+                args.extend(["-c", format.as_str()]);
+            }
+            args.extend(["commit-tree", d.tree.as_str(), "-p", d.base.as_str()]);
             args.push(if d.signing.required {
-                "-S"
+                key.as_str()
             } else {
                 "--no-gpg-sign"
             });
