@@ -14497,3 +14497,18 @@ SPEC is in sync with all of these.
      without the restoration was rejected: a plan that leaves the table
      keyless would then have its row changes matched on a uniqueness the
      engine does not enforce.
+
+539. **A key restored on a column the baseline does not have is refused with
+     its own diagnostic, not as a moved key.** (#808, amending 538.) Entry
+     538 said each refused shape gets a diagnostic "rather than a moved-key
+     one", and one of the three it listed was refused with
+     `DataKeyColumnChanged`, whose message says the primary key moved to
+     another column and advises renaming the column instead. Both halves were
+     false for that shape: the baseline had no key to move, and there is no
+     column to rename back.
+
+     `DataBaselineKeyOnNewColumn` names the table and the new key column and
+     advises the two ways out that do work: restore the key on a column the
+     table already has (538's accepted shape), or remove the block, apply the
+     key change, and declare the rows again. With this, 538's sentence holds
+     as written; the refusal itself is unchanged.
