@@ -25,6 +25,14 @@ fn actual_owned_root_limits_and_visible_mounts_match_the_profile() {
         .expect("explicit owned root guard PID")
         .parse()
         .unwrap();
+    if std::env::var("PBPS_TEST_UTS_READABLE").unwrap() == "false" {
+        let process = ProcessLease::capture(pid).unwrap();
+        assert!(
+            super::super::uts::check(&process).is_err(),
+            "readable process metadata cannot replace permission to read its UTS values"
+        );
+        return;
+    }
     let lease = ExecutionLease::capture(pid, profile())
         .expect("actual kernel execution controls must match");
     lease.check().unwrap();
@@ -100,55 +108,67 @@ async fn owned_root_guard_controls_are_measured_on_the_native_kernel() {
         .trim()
         .to_owned();
     assert!(pid.parse::<u32>().is_ok_and(|pid| pid > 0));
-    let name = format!("pbps-kernel-reader-{:032x}", rand::random::<u128>());
-    // No host bind, runtime socket, DAC capability, external network or
-    // arbitrary process enumeration enters the inspector. SYS_PTRACE permits
-    // reading this known root-owned guard's proc metadata from its ancestor
-    // PID namespace. The cgroup filesystem remains Docker's read-only mount.
-    let created = Command::new("docker").args(["--host", &host, "create", "--name", &name,
+    let mut observations = Vec::new();
+    for can_read_uts in [false, true] {
+        let name = format!("pbps-kernel-reader-{:032x}", rand::random::<u128>());
+        // No host bind, runtime socket, DAC capability, external network or
+        // arbitrary process enumeration enters the inspector. SYS_PTRACE permits
+        // reading this known root-owned guard's proc metadata from its ancestor
+        // PID namespace. UTS entry additionally needs SYS_ADMIN; exercise its
+        // absence first. The cgroup filesystem remains Docker's read-only mount.
+        let capability = if can_read_uts {
+            "SYS_ADMIN"
+        } else {
+            "SYS_PTRACE"
+        };
+        let created = Command::new("docker").args(["--host", &host, "create", "--name", &name,
         "--pull", "never", "--network", "none", "--pid", "host", "--cgroupns", "host",
-        "--cap-drop", "ALL", "--cap-add", "SYS_PTRACE", "--security-opt", "no-new-privileges",
+        "--cap-drop", "ALL", "--cap-add", "SYS_PTRACE", "--cap-add", capability, "--security-opt", "no-new-privileges",
         "--memory", "768m", "--cpus", "1", "--pids-limit", "256",
-        "-e", &format!("PBPS_TEST_EXECUTION_PID={pid}"), "-e", &format!("PBPS_TEST_EXECUTION_ENGINE={engine}"),
+        "-e", &format!("PBPS_TEST_UTS_READABLE={can_read_uts}"), "-e", &format!("PBPS_TEST_EXECUTION_PID={pid}"), "-e", &format!("PBPS_TEST_EXECUTION_ENGINE={engine}"),
         "--entrypoint", "/usr/bin/timeout", "postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280",
         "--signal=KILL", "30s", "/pbps-kernel-tests", "--ignored", "--exact",
         "resolver::native::execution::tests::actual_owned_root_limits_and_visible_mounts_match_the_profile", "--nocapture"
     ]).output().unwrap();
-    if !created.status.success() {
-        run.close().await.unwrap();
-        panic!("cannot create owned kernel inspector");
+        if !created.status.success() {
+            run.close().await.unwrap();
+            panic!("cannot create owned kernel inspector");
+        }
+        let reader = String::from_utf8(created.stdout).unwrap().trim().to_owned();
+        let copied = Command::new("docker")
+            .args(["--host", &host, "cp"])
+            .arg(std::env::current_exe().unwrap())
+            .arg(format!("{reader}:/pbps-kernel-tests"))
+            .output()
+            .unwrap();
+        let tested = if copied.status.success() {
+            Some(
+                Command::new("docker")
+                    .args(["--host", &host, "start", "--attach", &reader])
+                    .output()
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let removed = Command::new("docker")
+            .args(["--host", &host, "rm", "--force", "--volumes", &reader])
+            .output()
+            .unwrap();
+        observations.push((removed.status.success(), tested));
     }
-    let reader = String::from_utf8(created.stdout).unwrap().trim().to_owned();
-    let copied = Command::new("docker")
-        .args(["--host", &host, "cp"])
-        .arg(std::env::current_exe().unwrap())
-        .arg(format!("{reader}:/pbps-kernel-tests"))
-        .output()
-        .unwrap();
-    let tested = if copied.status.success() {
-        Some(
-            Command::new("docker")
-                .args(["--host", &host, "start", "--attach", &reader])
-                .output()
-                .unwrap(),
-        )
-    } else {
-        None
-    };
-    let removed = Command::new("docker")
-        .args(["--host", &host, "rm", "--force", "--volumes", &reader])
-        .output()
-        .unwrap();
-    let closed = run.close().await;
-    assert!(removed.status.success());
-    closed.unwrap();
-    let tested = tested.expect("the fixture binary must be copied into the owned inspector");
-    assert!(
-        tested.status.success(),
-        "native inspector failed: {}",
-        String::from_utf8_lossy(&tested.stdout)
-    );
-    assert!(String::from_utf8_lossy(&tested.stdout).contains("1 passed"));
+    run.close().await.unwrap();
+    for (removed, tested) in observations {
+        assert!(removed);
+        let tested = tested.expect("the fixture binary must be copied into the owned inspector");
+        assert!(
+            tested.status.success(),
+            "native inspector failed: {} {}",
+            String::from_utf8_lossy(&tested.stdout),
+            String::from_utf8_lossy(&tested.stderr)
+        );
+        assert!(String::from_utf8_lossy(&tested.stdout).contains("1 passed"));
+    }
 }
 
 #[test]

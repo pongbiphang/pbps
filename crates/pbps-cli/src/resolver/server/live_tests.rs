@@ -881,3 +881,6 @@ mod guard_limits;
 
 #[path = "live_tests/host_files.rs"]
 mod host_files;
+
+#[path = "live_tests/uts.rs"]
+mod uts;

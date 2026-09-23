@@ -15,9 +15,11 @@ host path, volume or runtime socket is mounted into any of them.
 
 import argparse
 from fixture_diagnostics import report
+import http.client
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import time
@@ -34,6 +36,7 @@ EXECUTABLE = {"pg": "postgres", "mssql": "sqlservr"}
 QUIET = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
 TESTS = [
     "host_files::host_file_loss_refuses_admission_and_discards_live_analysis",
+    "uts::kernel_name_loss_refuses_admission_and_discards_each_live_view",
     "a_supported_dedicated_server_compiles_declarations_and_removes_only_its_own_resources",
     "guard_limits::every_forwarder_guard_requires_effective_descriptor_evidence",
     # PostgreSQL analysis-scope qualification (#610); no-ops on SQL Server (#611).
@@ -157,13 +160,14 @@ def await_engine(container, engine):
     raise RuntimeError(f"owned fixture {container} did not become ready")
 
 
-def start_dedicated(engine, name, owned, network=None):
+def start_dedicated(engine, name, owned, network=None, empty_runtime_files=False):
     """One supplied server, contained as `linux-dedicated-v1` requires."""
     owned.append(name)
     recipe = list(RECIPE)
     if network is not None:
         recipe[recipe.index("none")] = network
-    common = ["--name", name, "--pull", "never", *recipe, "--tmpfs", STORAGE[engine]]
+    common = ["--name", name, "--label", "io.pbps.resolver.fixture=dedicated-server",
+              "--pull", "never", *recipe, "--tmpfs", STORAGE[engine]]
     if engine == "pg":
         run("docker", "create", *common, "--user", "999:999", "--cap-drop", "ALL",
             "-e", f"PBPS_FIXTURE_PASSWORD={PASSWORD}",
@@ -177,7 +181,32 @@ def start_dedicated(engine, name, owned, network=None):
             "-e", "ACCEPT_EULA=Y", "-e", f"MSSQL_SA_PASSWORD={PASSWORD}",
             "-e", "MSSQL_MEMORY_LIMIT_MB=1024",
             "--entrypoint", "/bin/bash", IMAGES[engine], "-ec", MSSQL_BOOT, **QUIET)
+    if empty_runtime_files:
+        # Docker's API-only NetworkDisabled layout leaves all three runtime
+        # files empty while the kernel UTS names remain observable (#804).
+        # Recreate only this unstarted, labelled fixture with that one change.
+        record = json.loads(run("docker", "inspect", name, stdout=subprocess.PIPE).stdout)[0]
+        assert record["Name"] == "/" + name and not record["State"]["Running"]
+        assert record["Config"]["Labels"]["io.pbps.resolver.fixture"] == "dedicated-server"
+        body = dict(record["Config"], HostConfig=record["HostConfig"], NetworkDisabled=True)
+        run("docker", "rm", record["Id"], **QUIET)
+        connection = http.client.HTTPConnection("localhost", timeout=15)
+        connection.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.sock.settimeout(15)
+        try:
+            connection.sock.connect(DOCKER_SOCKET)
+            connection.request("POST", "/v1.47/containers/create?name=" + name,
+                               json.dumps(body), {"Content-Type": "application/json"})
+            response = connection.getresponse()
+            data = response.read()
+            if response.status != 201:
+                raise RuntimeError(f"empty-files fixture creation failed: {response.status} {data!r}")
+        finally:
+            connection.close()
     started(name)
+    if empty_runtime_files:
+        for path in ("/etc/hostname", "/etc/hosts", "/etc/resolv.conf"):
+            assert run("docker", "exec", name, "/bin/cat", path, stdout=subprocess.PIPE).stdout == ""
 
 
 def started(name):
@@ -317,7 +346,14 @@ def fixture(args, binary, root, owned):
     exposing = "an_unimplemented_profile_or_an_exposed_runtime_is_refused_by_name"
     intruding = "a_process_the_engine_did_not_start_refuses_its_namespaces"
     joining = "a_container_joined_to_the_engines_network_refuses_the_run"
-    for test in TESTS:
+    uts = "uts::kernel_name_loss_refuses_admission_and_discards_each_live_view"
+    cases = [(test, empty) for test in TESTS for empty in ([False, True] if test == uts else [False])]
+    for test, empty in cases:
+        empty_server = f"pbps-dedicated-empty-{unique}"
+        if empty:
+            start_dedicated(engine, empty_server, owned, empty_runtime_files=True)
+            await_engine(empty_server, engine)
+            statement(empty_server, engine, f"CREATE DATABASE {MARKER}")
         # The exposed control is a second supplied server whose runtime does
         # not give it a private network; everything else about it qualifies.
         # Started only for its own test and removed after it, so that only
@@ -342,6 +378,9 @@ def fixture(args, binary, root, owned):
         command = [binary, "--ignored", "--exact",
                    f"resolver::server::live_tests::{test}", "--nocapture"]
         selected = dict(os.environ, **environment)
+        if empty:
+            selected["PBPS_SERVER_ENDPOINT"] = endpoint(empty_server)
+        selected["PBPS_SERVER_EMPTY_RUNTIME_FILES"] = "1" if empty else "0"
         if test == "guard_limits::every_forwarder_guard_requires_effective_descriptor_evidence":
             # Only this test's observer view hides an owned guard's limits.
             command = ["/usr/bin/unshare", "--mount", "--propagation", "private", "--", *command]
@@ -357,10 +396,12 @@ def fixture(args, binary, root, owned):
             run("docker", "rm", "--force", exposed, check=False, **QUIET)
         print(result.stdout, end="", flush=True)
         if result.returncode or "test result: ok. 1 passed" not in result.stdout:
-            describe(supplied)
+            describe(empty_server if empty else supplied)
             print(run("docker", "ps", "-a", "--filter", "name=pbps-", stdout=subprocess.PIPE,
                       check=False).stdout, flush=True)
             raise RuntimeError(f"dedicated-server fixture failed: {test}")
+        if empty:
+            run("docker", "rm", "--force", "--volumes", empty_server, **QUIET)
 
 
 def main():

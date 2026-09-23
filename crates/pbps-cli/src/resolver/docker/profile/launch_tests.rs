@@ -11,6 +11,9 @@ mod masks;
 #[path = "launch_tests/seccomp.rs"]
 mod seccomp;
 
+#[path = "launch_tests/uts.rs"]
+mod uts;
+
 async fn accepts_waiter(change: impl FnOnce(&mut Launch)) -> bool {
     inspect_waiter(change, |run, driver| {
         awaiting_engine(

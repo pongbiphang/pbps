@@ -247,6 +247,9 @@ async fn inspect_pair(
         "SYS_PTRACE",
         "--cap-add",
         "DAC_READ_SEARCH",
+        // Read the held workload/control UTS values on a short-lived thread.
+        "--cap-add",
+        "SYS_ADMIN",
         "--security-opt",
         "no-new-privileges",
         "--memory",

@@ -14656,3 +14656,29 @@ SPEC is in sync with all of these.
      The test and CI configurations name `sslmode=disable` for their
      TLS-less throwaway servers. `connect_verified` (the resolver's peer
      hop) is unchanged: it still refuses anything but an explicit `require`.
+
+544. **Private resolver names are qualified in the actual held UTS namespace,
+     independently of runtime files and Docker configuration (#804).** Both
+     pinned engines can start with three empty runtime files while arbitrary
+     kernel hostname/domainname values remain visible. PostgreSQL SQL reads
+     both; SQL Server's `MachineName` exposes the hostname (its measured procfs
+     bulk reads fail). Merely restricting the empty-file branch would leave the
+     same independent kernel inputs unchecked under generated fixed files.
+
+     A process lease therefore retains UTS identity alongside its other
+     namespace handles. A short-lived scoped thread enters only that held UTS
+     namespace using safe rustix, reads `uname`, and terminates before the
+     observer continues. A target-root procfs path, even pre-opened, answers for
+     the reading thread's UTS namespace instead. Moving an async worker and
+     trying to restore it would introduce an unnecessary recovery obligation.
+     Unknown permission, failed entry or replaced identity refuses admission.
+
+     The complete hostname is `pbps-resolver`; the complete NIS name is empty,
+     `(none)` or `localdomain`. These literal generic values contain no
+     operator-specific data. Empty Docker configuration is not an alternative
+     proof: on the measured daemon it retains `localdomain`. Each workload and
+     forwarder has its own qualified view, including both supplied forwarders;
+     existing task observations require the corresponding UTS membership.
+     Name loss discards live analysis even if the name is later restored.
+     This adds no continuous census or privileged target write, and retains
+     DECISIONS 533's trusted-provisioning boundary between observations.

@@ -104,6 +104,26 @@ recipe; an arbitrary host-derived file is not qualified by being read-only.
 Image acquisition remains a separate explicitly trusted phase, and the fixed
 private connection needs no external name resolution or workload egress.
 
+The workload and each forwarder also qualify the actual kernel UTS hostname
+and NIS domain name (#804, DECISIONS 544). Empty files and empty Docker
+`Config.Domainname` do not prove empty kernel values. The hostname must be
+exactly `pbps-resolver`; the complete NIS value must be empty, `(none)` or
+`localdomain`. These fixed generic literals carry no operator-specific input.
+Each process lease retains its UTS namespace handle and identity; existing task
+observations require membership in that runtime's qualified UTS view.
+
+The observer enters only the held UTS namespace on a fresh short-lived thread,
+reads `uname`, and joins the thread before returning. It requires permission to
+join that namespace; unavailable evidence refuses qualification. The ordinary
+observer thread never changes namespace, and no target state is written.
+Reading `/proc/PID/root/proc/sys/kernel/hostname` from outside that namespace
+would instead return the observer's name, even through a pre-opened procfs file.
+The same check runs before bootstrap release, supplied admission and continued
+analysis, independently for the workload and both supplied forwarders. Replacing
+a UTS namespace or changing its names invalidates retained qualification;
+restoring a name cannot revive a discarded analysis. Trusted provisioning still
+owns excluding deliberate changes restored between observations.
+
 The host kernel, its administrators, the selected daemon and explicitly trusted
 image installation form the provisioning trust boundary. SQL privileges in
 scratch grant no authority over those external controls. This profile does not
@@ -174,7 +194,7 @@ Admission connects through a **Docker-API daemon** (`dockerd`), the same peer-au
 | Network | The container's network namespace holds only a loopback device — a real one, by link type and flag — with no IPv4 or IPv6 route and no address but `::1` |
 | Anchors | PID 1 seen through the container's `/proc` is in its own PID namespace, and its `/sys` shows only that loopback device: a host procfs or sysfs bound in keeps the type and not these |
 | Mounts | Every row of the init's mount table, uncollapsed, is one the profile names: the read-only image root; `/proc`, `/sys`, `/dev`, `/dev/pts`, `/dev/mqueue` and `/sys/fs/cgroup` with their kinds and flags; the read-only `/proc` files on the same procfs; the masks Docker lays as empty tmpfs and Podman as binds of `/dev/null`; the tmpfs `/tmp`, `/dev/shm`, `/run` and `/var/tmp`; the runtime's `/etc` files bound read-only from an ordinary filesystem with the complete private contents described above; and the engine's storage as a fresh tmpfs. Two rows at one target are two mounts stacked, which no runtime lays out. Both runtimes' layouts were measured and are pinned by unit tests |
-| Privileges | Every task in the container's PID namespace — not only the ones the service started — at the profile's uid **and** group, with no-new-privileges, a seccomp filter and the capability ceiling, still in the container's network and mount namespaces, judged as found rather than against an earlier listing. That a seccomp filter is *loaded* is measured (`Seccomp: 2`); its BPF contents cannot be read from `/proc`, so attesting the exact policy — to exclude a non-IP channel such as `AF_VSOCK` that the loopback network checks do not contain — is the operator's provisioning responsibility, tracked in #684 |
+| Privileges | Every task in the container's PID namespace — not only the ones the service started — at the profile's uid **and** group, with no-new-privileges, a seccomp filter and the capability ceiling, still in the container's network, mount, IPC and UTS namespaces, judged as found rather than against an earlier listing. That a seccomp filter is *loaded* is measured (`Seccomp: 2`); its BPF contents cannot be read from `/proc`, so attesting the exact policy — to exclude a non-IP channel such as `AF_VSOCK` that the loopback network checks do not contain — is the operator's provisioning responsibility, tracked in #684 |
 | Resources | cgroup-v2 memory, swap, CPU and PID bounds on the init's cgroup that exist and are within the profile's ceilings; `max` is not a bound. Every task must be in that cgroup or below it |
 | Accounting | Nothing shares the container's mount or IPC namespace that is not in its PID namespace, and nothing shares its network namespace but those tasks and this run's own forwarders. A container joined with `--network container:` is in no process listing and is caught here. The forwarder exception is by PID namespace, not by an exact task set: a forwarder's `bash` reaps and respawns its `cat` pipes, so a captured task list races a legitimate child, and joining that namespace needs `--pid container:` on the same root daemon, whose socket also lists the container id — so what excludes it is not the name but that root daemon access is provisioning-administrator access, the boundary this profile does not claim to hold against. Narrowing the exception to the forwarder's exact tasks is #681 |
 | Lifetime | A bounded run deadline, which the forwarders' own root guards share: past it the next check refuses and the caller's exit path removes the resources. Not a watchdog — see #641 |
@@ -480,7 +500,10 @@ or Docker socket enters those sentinels. The pairing inspector has a private PID
 and receives only read-only proc directories from its owned workload/control
 trees. It receives no host PID namespace, runtime socket or external network.
 The root-control inspector separately measures its one owned root guard and
-read-only cgroup controls. These test access paths are not production adapters.
+read-only cgroup controls, with and without permission to join the owned UTS
+namespace. The containerized inspectors need `SYS_ADMIN` for the supported UTS
+read; the missing-permission case must refuse. These test access paths are not
+production adapters.
 
 `scripts/live-resolver-server.py <pg|mssql>` builds a disposable TLS target and
 a supplied scratch server this script — not pbps — starts from the documented
@@ -539,6 +562,18 @@ intermediate proxies. A TLS-terminating proxy deliberately alters a managed-only
 query on a plaintext backend connection: the real client accepts the TLS hop
 and engine result, while native qualification refuses the proxy. The database
 transport fixtures also reject corrupted and replayed TLS application records.
+
+The UTS regressions run on both real engines with fixed generated files and
+Docker API `NetworkDisabled=true` empty image files. Synthetic hostname and NIS
+markers refuse before initialization/admission; in-place changes to each
+workload and forwarder discard live analysis while Docker's recorded recipe is
+unchanged. Ordinary table/view DDL and owned cleanup still succeed. PostgreSQL
+can read both names through `pg_read_file`; SQL Server's `MachineName` property
+exposes the hostname, while the measured procfs `OPENROWSET` reads fail with
+error 12703 and are not counted as successful reads. A separate process fixture
+changes only its UTS namespace while retaining its PID and executable; the
+lease must fail without moving the observer's namespace. Actual removed-check
+runs pin the negative cases.
 
 The dedicated CI resolver matrix runs both profiles separately. On its
 disposable native Linux runner, `live-resolver-target.py --native-host` also
