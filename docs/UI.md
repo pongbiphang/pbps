@@ -39,7 +39,7 @@ after replacing the pbps executable.
 
 The server and page are designed for one user on loopback. There is no `--host`
 option. [ADR-0015](ADR-0015-local-ui-implementation.md) records the process,
-credential and browser boundaries; [DECISIONS 457](DECISIONS.md) records the HTTP
+credential and browser boundaries; [DECISIONS 457](decisions/compose-and-ui.md#decision-457) records the HTTP
 dependency and the initial size measurement.
 
 

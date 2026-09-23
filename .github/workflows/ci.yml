@@ -61,6 +61,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Before the toolchain: it needs none, and a duplicate decision
+      # identifier from two branches merges without a textual conflict, so this
+      # is the only place it is caught (DEC-671.1).
+      - run: python3 scripts/check_decisions_test.py
+      - run: python3 scripts/check-decisions.py
       - uses: actions/setup-node@v4
         with:
           node-version: 24

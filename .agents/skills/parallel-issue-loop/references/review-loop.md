@@ -17,6 +17,7 @@ them before advancing a PR.
 5. Before every push, run and observe all commands required by `AGENTS.md`:
 
    ```bash
+   python3 scripts/check-decisions.py
    cargo fmt --all --check
    cargo clippy --workspace --all-targets
    cargo test --workspace --all-targets

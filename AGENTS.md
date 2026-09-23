@@ -12,9 +12,11 @@ checksum-pinned, and state lives in the database itself.
 
 - **[docs/SPEC.md](docs/SPEC.md)** — the design. Read before changing the data
   model or adding a kind of change.
-- **[docs/DECISIONS.md](docs/DECISIONS.md)** — numbered record of every choice
-  that is not the obvious one. Code comments cite these numbers; append, never
-  renumber.
+- **[docs/DECISIONS.md](docs/DECISIONS.md)** — index of the record of every
+  choice that is not the obvious one; the entries live by topic in
+  `docs/decisions/`. Code comments cite their identifiers; never renumber. A new
+  entry is `DEC-<issue>.<k>` at the end of its topic file, never the next
+  sequential number (the index says why).
 - **[docs/PITFALLS.md](docs/PITFALLS.md)** — bugs shipped or nearly shipped, and
   the shapes they belong to.
 - **[docs/STATUS.md](docs/STATUS.md)** — phase, command surface, open items.
@@ -37,8 +39,9 @@ checksum-pinned, and state lives in the database itself.
 - Treat the issue as the specification: fix what it says, at the size it says.
 - Work in a git worktree, never in the main checkout. Remove it after merge.
 - One branch per issue, cut from `origin/master`, named `fix/issue-<n>-<slug>`.
-- Before every push, run locally what CI runs: `cargo fmt --all --check`,
-  `cargo clippy --workspace --all-targets` warning-free, `cargo test --workspace
+- Before every push, run locally what CI runs: `python3
+  scripts/check-decisions.py`, `cargo fmt --all --check`, `cargo clippy
+  --workspace --all-targets` warning-free, `cargo test --workspace
   --all-targets`, `scripts/live-tests.sh` and `scripts/live-tests-pg.sh`. All
   green, then push.
 - Push the issue branch without asking. Never push to `master` or to another

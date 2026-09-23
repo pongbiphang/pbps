@@ -179,11 +179,11 @@ has a home, the entry links there instead of repeating its content.
 8. **Annotations travel beside the model, never inside it.** `strategy:`,
    `depends_on:` and `public_execute:` come back as `Loaded.hints`, or
    constraint 1 breaks. See also
-   [decision 16](DECISIONS.md#phase-2--pull-normalization-strategy).
+   [decision 16](decisions/identity.md#decision-16).
 9. See the driver isolation rule in
    [ADR-0007 decision 5](ADR-0007-connection-strategy.md#decision) and its
    [measured limits in ADR-0014](ADR-0014-driver-seam-tested.md#the-claim-under-test).
    With two drivers it reads **one file per driver**: `pbps-db::mssql` names
    `tiberius`, `pbps-db::postgres` names `tokio_postgres`, and nothing else in
    the workspace names either — `pbps-db::Conn` dispatches between them and
-   holds no driver type ([decision 225](DECISIONS.md)).
+   holds no driver type ([decision 225](decisions/connection.md#decision-225)).

@@ -422,7 +422,7 @@ The structural validator subsequently landed in
 `Postgres::validate_table` now checks nonempty keys and existing local columns,
 repeated primary/unique columns, matching nonempty foreign-key lists, included
 column existence, and empty CHECK/filter expressions
-([DECISIONS 452](DECISIONS.md)). Its unit and emitted-DDL live matrix preserve
+([DECISIONS 452](decisions/data/declared.md#decision-452)). Its unit and emitted-DDL live matrix preserve
 PostgreSQL's legal repeated index/INCLUDE and local foreign-key columns.
 Index width and key-type eligibility remain target questions: server build
 limits and installed operator classes can make a declaration valid, so the
