@@ -183,10 +183,12 @@ fn commits(f: &Fixture) -> usize {
 /// object. The returned check asserts the count did not move, then proves
 /// the counter itself moves on one explicit invocation.
 fn commit_counter(f: &Fixture) -> impl Fn(&str) + '_ {
-    git(
-        &f.repo.root,
-        &["config", "user.email", "after-death@example.test"],
-    );
+    // Role-specific selectors outrank user.email, and production Git reads
+    // the global ones this helper's own `git()` suppresses; local values
+    // outrank both scopes.
+    for key in ["user.email", "author.email", "committer.email"] {
+        git(&f.repo.root, &["config", key, "after-death@example.test"]);
+    }
     let objects = commits(f);
     move |label: &str| {
         assert_eq!(commits(f), objects, "{label}: commit creation ran again");
