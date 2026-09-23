@@ -21,6 +21,7 @@ mod private_channel;
 pub(crate) mod runtime_files;
 mod target;
 mod task_metadata;
+mod uts;
 pub(crate) use daemon::DaemonLease;
 pub(crate) use execution::{
     BoundedResourceLease, ExecutionLease, ExecutionProfile, FILE_DESCRIPTOR_LIMIT,
@@ -282,8 +283,9 @@ impl ProcessLease {
         // a container sharing the engine's IPC namespace reaches its shared
         // memory. The Docker profile only ever asks about pid/mnt/net/user, so
         // this is additive — `same_process` and `check` iterate whatever was
-        // captured, and no caller assumes the set's size.
-        for name in ["pid", "mnt", "net", "user", "ipc"] {
+        // captured, and no caller assumes the set's size. UTS is retained too:
+        // kernel names must be read in this exact namespace, not the observer's.
+        for name in ["pid", "mnt", "net", "user", "ipc", "uts"] {
             let file = File::open(base.join("ns").join(name))
                 .map_err(Reading::CaptureNamespace.named())?;
             let identity = FileIdentity::of(&file).map_err(Reading::CaptureNamespace.named())?;

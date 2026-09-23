@@ -20,6 +20,7 @@ TESTS = [
     "resolver::docker::profile::launch_tests::" + name
     for name in [
         "host_information_is_refused_before_engine_initialization",
+        "uts::kernel_names_are_required_before_engine_initialization",
         "a_wrong_workload_identity_is_refused_before_initialization",
         "a_guard_without_termination_authority_is_refused_before_initialization",
         "the_launch_cannot_omit_inherited_no_new_privileges",
@@ -30,9 +31,11 @@ TESTS = [
         "seccomp::the_owned_forwarder_requires_its_effective_process_and_fastopen_restrictions",
     ]
 ] + [
+    "resolver::native::uts::tests::a_uts_only_replacement_invalidates_the_lease_without_moving_the_observer",
     # SQL file reads also inspect root-owned guards and mutate only the owned
     # mount namespace. Keep this with the native root tests, not cargo's user.
     "resolver::docker::session::tests::host_files::host_information_cannot_enter_either_private_runtime_view",
+    "resolver::docker::session::tests::uts::kernel_names_cannot_enter_either_private_runtime_view",
 ]
 
 

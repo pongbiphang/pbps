@@ -52,6 +52,7 @@ const FILES: [(&str, &[&str]); 3] = [
 
 pub(crate) fn check(process: &ProcessLease) -> Result<(), UnqualifiedProcess> {
     process.check()?;
+    super::uts::check(process)?;
     let root = process.root()?;
     for (path, expected) in FILES {
         // NONBLOCK lets us reject a substituted FIFO without waiting for a

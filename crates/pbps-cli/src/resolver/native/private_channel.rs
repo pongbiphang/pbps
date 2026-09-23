@@ -188,6 +188,9 @@ pub(crate) fn awaiting_engine(
     private_network(&root)?;
     let mut children = std::collections::BTreeSet::new();
     for_each_namespace_task(&root, |task, process| {
+        if !root.same_namespace(&process, "uts")? {
+            return Err(UnqualifiedProcess);
+        }
         if process.same_process(&root)? {
             return Ok(());
         }
@@ -219,6 +222,11 @@ pub(crate) fn guarded_tasks(
 ) -> Result<(), UnqualifiedProcess> {
     guard(root, privileges.capabilities)?;
     for_each_namespace_task(root, |_, process| {
+        // The fixed values read on the guard cover a task only while it
+        // shares that UTS namespace. This reuses the existing observation.
+        if !root.same_namespace(&process, "uts")? {
+            return Err(UnqualifiedProcess);
+        }
         if process.same_process(root)? {
             Ok(())
         } else {

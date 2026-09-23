@@ -138,7 +138,7 @@ impl ServerRuntime {
         profile::contained(&rows, self.profile).map_err(Error::Mount)?;
         crate::resolver::native::runtime_files::check(init).map_err(|_| {
             Error::Unqualified(
-                "the supplied host and DNS files do not match the private runtime profile",
+                "the supplied host and DNS files or kernel UTS names do not match the private runtime profile",
             )
         })?;
         device_not_engine_writable(init).map_err(Premise::Device.named())?;
@@ -224,7 +224,7 @@ fn occupants(init: &ProcessLease, profile: &ServerProfile) -> Result<(), Error> 
         // external IPC namespace to receive through foreign shared memory —
         // would bridge the run straight out of its containment while keeping
         // its access to the engine.
-        for namespace in ["net", "mnt", "ipc"] {
+        for namespace in ["net", "mnt", "ipc", "uts"] {
             if !init.same_namespace(occupant, namespace)? {
                 return Err(UnqualifiedProcess);
             }
