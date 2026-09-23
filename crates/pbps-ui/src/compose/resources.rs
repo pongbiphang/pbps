@@ -286,7 +286,20 @@ impl Resources {
         self.locked(|| {
             self.binding()?;
             let names = self.names()?;
-            self.census_pins(&names)?;
+            let owners = self.census_pins(&names)?;
+            // A spent or interrupted acquisition can own no physical pin.
+            // Admission must still classify its evidence before creating more.
+            for name in &names {
+                let id = name.trim_end_matches(".json");
+                if !owners.contains_key(id) {
+                    self.read_in_pass(id).map_err(|error| {
+                        Error::new(&format!(
+                            "Cannot admit a compose acquisition while {} is unresolved: {error}; preserve it for manual recovery",
+                            self.records.path.join(name).display()
+                        ))
+                    })?;
+                }
+            }
             self.check_pass(&names)?;
             if names.len() >= 32768 {
                 return Err(Error::new(

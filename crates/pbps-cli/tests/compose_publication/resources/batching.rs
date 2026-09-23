@@ -153,7 +153,7 @@ fn discovery_and_admission_have_bounded_passes_and_linear_record_reads() {
         eprintln!("admission n={n}: {c:?}");
         assert!(c.resource_passes <= 2, "{c:?}");
         assert!(c.identities <= 3, "{c:?}");
-        assert_eq!(c.resource_reads, 2 * n + 1, "{c:?}");
+        assert_eq!(c.resource_reads, 19 * n + 1, "{c:?}");
         f.publisher()
             .discard_preview(&preview.operation_id)
             .unwrap();
