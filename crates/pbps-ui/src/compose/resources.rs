@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     Error, Result,
-    durable::{self, Directory, Identity, ResourceObserver, ResourceOperation},
+    durable::{self, Directory, Identity, ReadRevision, ResourceObserver, ResourceOperation},
     git::Git,
     inventory::Inventory,
     record::{RepositoryIdentity, identity, oid},
@@ -146,11 +146,19 @@ impl Resources {
         Ok(names.into_iter().collect())
     }
 
-    fn check_pass(&self, names: &BTreeSet<String>) -> Result<()> {
+    fn check_pass(
+        &self,
+        names: &BTreeSet<String>,
+        revisions: &BTreeMap<String, ReadRevision>,
+    ) -> Result<()> {
         if &self.names()? != names {
             return Err(Error::new(
                 "Compose resource evidence changed during discovery; preserve it",
             ));
+        }
+        for (id, revision) in revisions {
+            self.records
+                .check_revision(&format!("{id}.json"), Some(revision))?;
         }
         self.binding()
     }
@@ -158,18 +166,28 @@ impl Resources {
     fn read(&self, id: &str) -> Result<Resource> {
         self.binding()?;
         self.names()?;
-        self.read_in_pass(id)
+        self.read_record(id).map(|(record, _)| record)
     }
 
-    // Batch callers bind the repository and validated names at both ends.
-    // Direct operations still use read(), so a batch grants no later authority.
-    fn read_in_pass(&self, id: &str) -> Result<Resource> {
+    // A batch tracks only compact revisions after consuming the record. Direct
+    // operations still use read(), so a batch grants no later authority.
+    fn read_in_pass(
+        &self,
+        id: &str,
+        revisions: &mut BTreeMap<String, ReadRevision>,
+    ) -> Result<Resource> {
+        let (record, revision) = self.read_record(id)?;
+        revisions.insert(id.to_owned(), revision);
+        Ok(record)
+    }
+
+    fn read_record(&self, id: &str) -> Result<(Resource, ReadRevision)> {
         if !identity(id) {
             return Err(Error::new("Invalid resource operation identity"));
         }
-        let bytes = self
+        let (bytes, revision) = self
             .records
-            .read(&format!("{id}.json"), 64 * 1024 * 1024)?
+            .read_with_revision(&format!("{id}.json"), 64 * 1024 * 1024)?
             .ok_or_else(|| {
                 Error::new("Compose resource ownership is unavailable; preserve its evidence")
             })?;
@@ -177,7 +195,7 @@ impl Resources {
             Error::new("Unknown compose resource evidence; preserve it for manual recovery")
         })?;
         self.validate(&r, id)?;
-        Ok(r)
+        Ok((r, revision))
     }
 
     fn validate(&self, r: &Resource, id: &str) -> Result<()> {
@@ -286,13 +304,14 @@ impl Resources {
         self.locked(|| {
             self.binding()?;
             let names = self.names()?;
-            let owners = self.census_pins(&names)?;
+            let mut revisions = BTreeMap::new();
+            let owners = self.census_pins(&names, &mut revisions)?;
             // A spent or interrupted acquisition can own no physical pin.
             // Admission must still classify its evidence before creating more.
             for name in &names {
                 let id = name.trim_end_matches(".json");
                 if !owners.contains_key(id) {
-                    self.read_in_pass(id).map_err(|error| {
+                    self.read_in_pass(id, &mut revisions).map_err(|error| {
                         Error::new(&format!(
                             "Cannot admit a compose acquisition while {} is unresolved: {error}; preserve it for manual recovery",
                             self.records.path.join(name).display()
@@ -300,7 +319,7 @@ impl Resources {
                     })?;
                 }
             }
-            self.check_pass(&names)?;
+            self.check_pass(&names, &revisions)?;
             if names.len() >= 32768 {
                 return Err(Error::new(
                     "Compose resource record limit reached; retain existing recovery evidence",
@@ -924,7 +943,11 @@ impl Resources {
         })
     }
 
-    fn census_pins(&self, names: &BTreeSet<String>) -> Result<BTreeMap<String, Resource>> {
+    fn census_pins(
+        &self,
+        names: &BTreeSet<String>,
+        revisions: &mut BTreeMap<String, ReadRevision>,
+    ) -> Result<BTreeMap<String, Resource>> {
         let read = || refs::private_census(&self.repository.common, self.root.observer.clone());
         let physical = read()?;
         let pins = refs::verify_private_census(&self.git, &physical)?;
@@ -945,7 +968,8 @@ impl Resources {
                 }
                 records.insert(
                     id.to_owned(),
-                    self.read_in_pass(id).map_err(|_| unavailable())?,
+                    self.read_in_pass(id, revisions)
+                        .map_err(|_| unavailable())?,
                 );
             }
             let resource = &records[id];
@@ -970,7 +994,8 @@ impl Resources {
     pub fn list(&self) -> Result<Vec<ResourceReport>> {
         self.binding()?;
         let names = self.names()?;
-        let mut records = self.census_pins(&names)?;
+        let mut revisions = BTreeMap::new();
+        let mut records = self.census_pins(&names, &mut revisions)?;
         let snapshots = self.snapshots.names()?;
         for snapshot in &snapshots {
             if !identity(snapshot) || !names.contains(&format!("{snapshot}.json")) {
@@ -990,7 +1015,7 @@ impl Resources {
                 })?;
             let record = match records.remove(id) {
                 Some(record) => record,
-                None => self.read_in_pass(id)?,
+                None => self.read_in_pass(id, &mut revisions)?,
             };
             if record.repository.source_scope(&self.repository)? {
                 result.push(self.report_resource(record)?);
@@ -1001,7 +1026,7 @@ impl Resources {
                 "Compose snapshot evidence changed during discovery; preserve it",
             ));
         }
-        self.check_pass(&names)?;
+        self.check_pass(&names, &revisions)?;
         Ok(result)
     }
 }

@@ -441,6 +441,23 @@ obligation. Healthy other-source records are validated against the common store;
 they grant no current-source cleanup authority. Direct preview admission enforces
 this condition even when discovery was never requested.
 
+Each record read binds its bytes to metadata from the same opened, owned regular
+file (#799): inode identity, length, modification time and change time. It also
+retains a SHA-256 content digest: rapid equal-length overwrites can leave all
+those metadata fields unchanged. Recheck the descriptor and verify the named
+file's metadata and contents before returning the read. Resource discovery,
+admission and receipt discovery retain these compact revisions, including census
+owner reads, and compare them again at the closing batch boundary. Detected
+replacement or in-place change refuses without granting new acquisition or
+cleanup authority. Each JSON record is decoded once, while revision verification
+streams its bytes again with an observed-length bound and a fixed-size buffer.
+That extra content I/O buys detection of same-timestamp overwrites; record work
+remains linear with bounded directory and repository discovery passes. Revisions
+are invocation-local and grant no later authority. Admission's existing lease
+serializes cooperating resource writers; checks cannot exclude an arbitrary
+external write after the last observation. This is not a filesystem transaction
+or a stronger guarantee for writers that bypass compose coordination.
+
 Discovery and new-resource admission also census `refs/pbps-compose` (#783).
 Read both loose and packed evidence without following symlinks and corroborate
 it with Git's direct-ref enumeration. Physical names and byte fingerprints prove

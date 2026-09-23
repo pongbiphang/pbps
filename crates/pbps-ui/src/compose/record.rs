@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     Candidate, Destination, Error, Result, SigningPolicy,
-    durable::{self, Directory, ResourceObserver},
+    durable::{self, Directory, ReadRevision, ResourceObserver},
     git::Git,
 };
 
@@ -265,22 +265,25 @@ impl Records {
 
     pub fn load(&self, id: &str) -> Result<Option<Record>> {
         self.names()?;
-        self.load_in_pass(id)
+        Ok(self.load_in_pass(id)?.map(|(record, _)| record))
     }
 
     // The caller brackets a batch with complete namespace/lease checks;
     // direct recovery reads retain their own fresh names() check above.
-    fn load_in_pass(&self, id: &str) -> Result<Option<Record>> {
+    fn load_in_pass(&self, id: &str) -> Result<Option<(Record, ReadRevision)>> {
         if !identity(id) {
             return Err(Error::new("Invalid compose operation identity"));
         }
-        let Some(bytes) = self.directory.read(&format!("{id}.json"), 1024 * 1024)? else {
+        let Some((bytes, revision)) = self
+            .directory
+            .read_with_revision(&format!("{id}.json"), 1024 * 1024)?
+        else {
             return Ok(None);
         };
         let record: Record = serde_json::from_slice(&bytes)
             .map_err(|_| Error::new("The compose receipt is invalid; preserve it for diagnosis"))?;
         record.validate(id)?;
-        Ok(Some(record))
+        Ok(Some((record, revision)))
     }
 
     pub fn list(&self) -> Result<Vec<Record>> {
@@ -297,7 +300,12 @@ impl Records {
                 "Compose receipt evidence changed during discovery; preserve it",
             ));
         }
-        Ok(records)
+        for (id, (_, revision)) in names.iter().zip(&records) {
+            self.directory
+                .check_revision(&format!("{id}.json"), Some(revision))?;
+        }
+        self._lock.check()?;
+        Ok(records.into_iter().map(|(record, _)| record).collect())
     }
 
     pub fn save(&self, record: &Record) -> Result<()> {

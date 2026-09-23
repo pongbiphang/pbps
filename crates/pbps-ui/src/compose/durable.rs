@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use rustix::fs::{AtFlags, Mode, OFlags, ResolveFlags, openat2};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::{Error, Result, random_id};
 
@@ -105,6 +106,28 @@ struct Revision {
     changed: (i64, i64),
 }
 
+pub(super) struct ReadRevision {
+    metadata: Revision,
+    digest: [u8; 32],
+}
+
+impl Revision {
+    fn of(file: &File) -> Result<Self> {
+        // Ownership/type and the revision come from one metadata observation
+        // of the descriptor whose bytes are read, never a later pathname open.
+        let m = Directory::regular(file)?;
+        Ok(Self {
+            identity: Identity {
+                device: m.dev(),
+                inode: m.ino(),
+            },
+            length: m.len(),
+            modified: (m.mtime(), m.mtime_nsec()),
+            changed: (m.ctime(), m.ctime_nsec()),
+        })
+    }
+}
+
 pub(super) struct Lease {
     file: File,
     path: PathBuf,
@@ -176,16 +199,7 @@ impl Directory {
                 ));
             }
         };
-        Self::regular(&file)?;
-        let m = file
-            .metadata()
-            .map_err(|_| Error::new("Cannot inspect compose evidence revision"))?;
-        Ok(Some(Revision {
-            identity: Identity::of(&file)?,
-            length: m.len(),
-            modified: (m.mtime(), m.mtime_nsec()),
-            changed: (m.ctime(), m.ctime_nsec()),
-        }))
+        Ok(Some(Revision::of(&file)?))
     }
     pub fn open(path: &Path, observer: ResourceObserver) -> Result<Self> {
         observer.at(ResourceOperation::Open, false, path)?;
@@ -299,6 +313,64 @@ impl Directory {
     }
 
     pub fn read(&self, entry: &str, limit: u64) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .read_with_revision(entry, limit)?
+            .map(|(bytes, _)| bytes))
+    }
+
+    pub fn check_revision(&self, entry: &str, expected: Option<&ReadRevision>) -> Result<()> {
+        name(entry)?;
+        self.check()?;
+        let matches = || -> Result<bool> {
+            let Some(expected) = expected else {
+                return Ok(self.revision(entry)?.is_none());
+            };
+            let fd = openat2(
+                &self.file,
+                entry,
+                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+            )
+            .map_err(|_| Error::new("Cannot reopen compose evidence for revision verification"))?;
+            let mut file = File::from(fd);
+            if Revision::of(&file)? != expected.metadata {
+                return Ok(false);
+            }
+            // Fast equal-length writes can share all filesystem timestamps.
+            // Stream at most the observed length plus one; metadata alone must
+            // never certify bytes from a different content revision.
+            let mut reader = Read::by_ref(&mut file).take(expected.metadata.length + 1);
+            let mut hasher = Sha256::new();
+            let mut buffer = [0; 8192];
+            loop {
+                let read = reader
+                    .read(&mut buffer)
+                    .map_err(|_| Error::new("Cannot verify compose evidence contents"))?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+            let digest: [u8; 32] = hasher.finalize().into();
+            Ok(digest == expected.digest
+                && Revision::of(&file)? == expected.metadata
+                && self.revision(entry)?.as_ref() == Some(&expected.metadata))
+        };
+        if !matches!(matches(), Ok(true)) {
+            return Err(Error::new(&format!(
+                "Compose evidence at {} changed or is unavailable; preserve it",
+                self.path.join(entry).display()
+            )));
+        }
+        self.check()
+    }
+
+    pub fn read_with_revision(
+        &self,
+        entry: &str,
+        limit: u64,
+    ) -> Result<Option<(Vec<u8>, ReadRevision)>> {
         name(entry)?;
         self.check()?;
         let path = self.path.join(entry);
@@ -314,12 +386,13 @@ impl Directory {
             Err(rustix::io::Errno::NOENT) => {
                 self.check()?;
                 self.observer.at(ResourceOperation::Read, true, &path)?;
+                self.check_revision(entry, None)?;
                 return Ok(None);
             }
             Err(_) => return Err(Error::new("Compose evidence is unreadable; preserve it")),
         };
         let mut file = File::from(fd);
-        Self::regular(&file)?;
+        let revision = Revision::of(&file)?;
         let mut bytes = Vec::new();
         Read::by_ref(&mut file)
             .take(limit + 1)
@@ -329,11 +402,21 @@ impl Directory {
             return Err(Error::new("Compose evidence exceeds its size limit"));
         }
         self.observer.at(ResourceOperation::Read, true, &path)?;
-        self.check()?;
-        Ok(Some(bytes))
+        if Revision::of(&file)? != revision {
+            return Err(Error::new(&format!(
+                "Compose evidence at {} changed while being read; preserve it",
+                path.display()
+            )));
+        }
+        let revision = ReadRevision {
+            metadata: revision,
+            digest: Sha256::digest(&bytes).into(),
+        };
+        self.check_revision(entry, Some(&revision))?;
+        Ok(Some((bytes, revision)))
     }
 
-    fn regular(file: &File) -> Result<()> {
+    fn regular(file: &File) -> Result<std::fs::Metadata> {
         let m = file
             .metadata()
             .map_err(|_| Error::new("Cannot inspect compose evidence"))?;
@@ -342,7 +425,7 @@ impl Directory {
                 "Compose evidence must be an owned single-link regular file",
             ));
         }
-        Ok(())
+        Ok(m)
     }
 
     pub fn lock(&self, entry: &str) -> Result<Lease> {
@@ -528,6 +611,86 @@ pub(super) fn refuse_legacy(git: &super::git::Git) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn equal_metadata_does_not_certify_different_record_bytes() {
+        let path = std::env::temp_dir().join(format!("pbps-read-content-{}", random_id().unwrap()));
+        std::fs::create_dir(&path).unwrap();
+        let entry = path.join("record.json");
+        std::fs::write(&entry, b"before").unwrap();
+        let directory = Directory::open(&path, ResourceObserver::default()).unwrap();
+        let (_, mut revision) = directory
+            .read_with_revision("record.json", 100)
+            .unwrap()
+            .unwrap();
+        directory
+            .check_revision("record.json", Some(&revision))
+            .unwrap();
+        std::fs::write(&entry, b"after!").unwrap();
+        // Model timestamp aliasing deterministically: the metadata comparison
+        // succeeds, so only the digest can distinguish these equal-length bytes.
+        revision.metadata = directory.revision("record.json").unwrap().unwrap();
+        assert!(
+            directory
+                .check_revision("record.json", Some(&revision))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&entry).unwrap(), b"after!");
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn a_record_read_never_certifies_a_later_revision() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        for mode in ["replace", "rewrite", "remove", "appear"] {
+            let path =
+                std::env::temp_dir().join(format!("pbps-read-revision-{}", random_id().unwrap()));
+            std::fs::create_dir(&path).unwrap();
+            let entry = path.join("record.json");
+            if mode != "appear" {
+                std::fs::write(&entry, b"before").unwrap();
+            }
+            let armed = Arc::new(AtomicBool::new(false));
+            let enabled = armed.clone();
+            let fired = Arc::new(AtomicBool::new(false));
+            let flag = fired.clone();
+            let target = entry.clone();
+            let observer = ResourceObserver::new(move |at| {
+                if enabled.load(Ordering::SeqCst)
+                    && at.operation == ResourceOperation::Read
+                    && at.after
+                    && at.path == target
+                    && !flag.swap(true, Ordering::SeqCst)
+                {
+                    match mode {
+                        "replace" => {
+                            let replacement = target.with_extension("replacement");
+                            std::fs::write(&replacement, b"after!").unwrap();
+                            std::fs::rename(replacement, &target).unwrap();
+                        }
+                        "remove" => std::fs::remove_file(&target).unwrap(),
+                        _ => std::fs::write(&target, b"after!").unwrap(),
+                    }
+                }
+                true
+            });
+            let directory = Directory::open(&path, observer).unwrap();
+            assert_eq!(
+                directory.read("record.json", 100).unwrap(),
+                (mode != "appear").then(|| b"before".to_vec())
+            );
+            armed.store(true, Ordering::SeqCst);
+            assert!(directory.read("record.json", 100).is_err(), "{mode}");
+            assert!(fired.load(Ordering::SeqCst));
+            if mode == "remove" {
+                assert!(!entry.exists());
+            } else {
+                assert_eq!(std::fs::read(entry).unwrap(), b"after!");
+            }
+            std::fs::remove_dir_all(path).unwrap();
+        }
+    }
 
     #[test]
     fn a_shared_open_description_cannot_extend_a_released_resource_lease() {
