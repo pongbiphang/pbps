@@ -295,3 +295,72 @@ fn shared_git_metadata_does_not_inherit_private_resource_ownership_rules() {
     );
     assert_eq!(f.repo.preserved(), before);
 }
+
+#[test]
+fn git_valid_ref_spellings_preserve_discovery_and_preview_admission() {
+    fn uppercase_packed(path: &Path) {
+        let bytes = fs::read_to_string(path).unwrap();
+        let updated = bytes
+            .lines()
+            .map(|line| {
+                if let Some(peeled) = line.strip_prefix('^') {
+                    format!("^{}\n", peeled.to_ascii_uppercase())
+                } else if let Some((oid, name)) = line.split_once(' ')
+                    && oid.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    format!("{} {name}\n", oid.to_ascii_uppercase())
+                } else {
+                    format!("{line}\n")
+                }
+            })
+            .collect::<String>();
+        fs::write(path, updated).unwrap();
+    }
+    let f = Fixture::new("git-valid-ref-spellings");
+    let before = f.repo.preserved();
+    let packed = f.repo.root.join(".git/packed-refs");
+    git(&f.repo.root, &["pack-refs", "--all"]);
+    uppercase_packed(&packed);
+    // Git accepts the unrelated packed refs before any compose resource exists.
+    assert_eq!(f.repo.preserved(), before);
+    let (_store, preview, _candidate) = f.ready();
+    let reference = format!("refs/pbps-compose/{}/base", preview.operation_id);
+    let value = String::from_utf8(git(&f.repo.root, &["rev-parse", &reference])).unwrap();
+    let value = value.trim();
+    git(&f.repo.root, &["pack-refs", "--all"]);
+    uppercase_packed(&packed);
+    assert_eq!(
+        String::from_utf8(git(&f.repo.root, &["rev-parse", &reference]))
+            .unwrap()
+            .trim(),
+        value
+    );
+    assert_eq!(f.publisher().resource_reports().unwrap().len(), 1);
+
+    let loose = f.repo.root.join(".git").join(&reference);
+    fs::create_dir_all(loose.parent().unwrap()).unwrap();
+    for ending in ["", "\n", "\r\n", "\t \r\n"] {
+        fs::write(&loose, format!("{}{ending}", value.to_ascii_uppercase())).unwrap();
+        assert_eq!(
+            String::from_utf8(git(&f.repo.root, &["rev-parse", &reference]))
+                .unwrap()
+                .trim(),
+            value
+        );
+        assert_eq!(f.publisher().resource_reports().unwrap().len(), 1);
+    }
+    assert!(f.repo.store().preview(request(), SystemTime::now()).is_ok());
+    assert_eq!(f.repo.preserved(), before);
+
+    // A different valid Git value still cannot become the recorded owner.
+    fs::write(&loose, git(&f.repo.root, &["rev-parse", "HEAD"])).unwrap();
+    let error = f.publisher().resource_reports().unwrap_err().to_string();
+    assert!(error.contains("ownership"), "{error}");
+    assert!(
+        f.repo
+            .store()
+            .preview(request(), SystemTime::now())
+            .is_err()
+    );
+    assert_eq!(f.repo.preserved(), before);
+}

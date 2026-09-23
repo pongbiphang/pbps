@@ -8,13 +8,17 @@ use std::path::Path;
 use rustix::fs::{AtFlags, Mode, OFlags, ResolveFlags, openat2};
 
 use super::super::{
-    Error, Result,
+    Error, Result, digest,
     durable::{Directory, ResourceObserver, ResourceOperation},
     git::{Git, text},
     record::{identity, oid},
 };
 
 const PREFIX: &str = "refs/pbps-compose";
+
+// Physical fingerprints prove a stable census, never an object identity.
+#[derive(PartialEq, Eq)]
+pub(in super::super) struct Physical(BTreeMap<String, String>);
 
 fn refusal(reference: &str) -> Error {
     Error::new(&format!(
@@ -91,9 +95,6 @@ pub(in super::super) fn parts(reference: &str) -> Result<(&str, &str)> {
 
 fn insert(pins: &mut BTreeMap<String, String>, reference: &str, value: &str) -> Result<()> {
     parts(reference)?;
-    if !oid(value) {
-        return Err(refusal(reference));
-    }
     pins.insert(reference.into(), value.into());
     // At most two roots per admitted resource record.
     if pins.len() > 2 * 32768 {
@@ -102,46 +103,27 @@ fn insert(pins: &mut BTreeMap<String, String>, reference: &str, value: &str) -> 
     Ok(())
 }
 
-pub(in super::super) fn read(
-    common: &Path,
-    observer: ResourceObserver,
-) -> Result<BTreeMap<String, String>> {
+pub(in super::super) fn read(common: &Path, observer: ResourceObserver) -> Result<Physical> {
     let root = Directory::open(common, observer)?;
     let mut pins = BTreeMap::new();
     // Read the physical packed table too: Git may suppress malformed names or
     // dangling symbolic refs from for-each-ref. Only private names are text;
     // unrelated Git refs may contain non-UTF-8 bytes.
     if let Some(bytes) = git_file(&root, "packed-refs", 64 * 1024 * 1024)? {
-        if !bytes.is_empty() && !bytes.ends_with(b"\n") {
-            return Err(refusal("packed-refs"));
-        }
-        for line in bytes
-            .split_inclusive(|b| *b == b'\n')
-            .map(|line| &line[..line.len() - 1])
-        {
-            if line.starts_with(b"#") {
-                continue;
-            }
-            if let Some(peeled) = line.strip_prefix(b"^") {
-                if !std::str::from_utf8(peeled).is_ok_and(oid) {
-                    return Err(refusal("packed-refs"));
-                }
+        for line in bytes.split(|b| *b == b'\n').filter(|line| !line.is_empty()) {
+            if line.starts_with(b"#") || line.starts_with(b"^") {
                 continue;
             }
             let Some(space) = line.iter().position(|b| *b == b' ') else {
                 return Err(refusal("packed-refs"));
             };
-            let (value, name) = (&line[..space], &line[space + 1..]);
-            let value = std::str::from_utf8(value).map_err(|_| refusal("packed-refs"))?;
-            if !oid(value) || name.is_empty() {
-                return Err(refusal("packed-refs"));
-            }
+            let name = &line[space + 1..];
             if name == PREFIX.as_bytes() || name.starts_with(b"refs/pbps-compose/") {
                 let name = std::str::from_utf8(name).map_err(|_| refusal(PREFIX))?;
                 if pins.contains_key(name) {
                     return Err(refusal(name));
                 }
-                insert(&mut pins, name, value)?;
+                insert(&mut pins, name, &digest(line))?;
             }
         }
     }
@@ -160,14 +142,9 @@ pub(in super::super) fn read(
                 let bytes = git_file(&directory, &kind, 4096)
                     .map_err(|_| refusal(&reference))?
                     .ok_or_else(|| refusal(&reference))?;
-                let value = std::str::from_utf8(&bytes).map_err(|_| refusal(&reference))?;
-                // A symbolic ref is evidence even when Git omits its missing
-                // target. Never dereference it or infer a cleanup capability.
-                insert(
-                    &mut pins,
-                    &reference,
-                    value.strip_suffix('\n').unwrap_or(value),
-                )?;
+                // Names and bytes are evidence even when Git omits a broken
+                // or dangling ref. Git alone decodes its accepted spellings.
+                insert(&mut pins, &reference, &digest(&bytes))?;
             }
             directory.check()?;
         }
@@ -175,10 +152,10 @@ pub(in super::super) fn read(
         refs.check()?;
     }
     root.check()?;
-    Ok(pins)
+    Ok(Physical(pins))
 }
 
-pub(in super::super) fn verify(git: &Git, physical: &BTreeMap<String, String>) -> Result<()> {
+pub(in super::super) fn verify(git: &Git, physical: &Physical) -> Result<BTreeMap<String, String>> {
     let output = git.output(
         &[
             "for-each-ref",
@@ -196,14 +173,14 @@ pub(in super::super) fn verify(git: &Git, physical: &BTreeMap<String, String>) -
     if !output.stdout.is_empty() {
         for line in text(output.stdout)?.lines() {
             let fields: Vec<_> = line.split('\0').collect();
-            if fields.len() != 3 || !fields[2].is_empty() {
+            if fields.len() != 3 || !oid(fields[1]) || !fields[2].is_empty() {
                 return Err(refusal(PREFIX));
             }
             insert(&mut visible, fields[0], fields[1])?;
         }
     }
-    if visible != *physical {
+    if !visible.keys().eq(physical.0.keys()) {
         return Err(refusal(PREFIX));
     }
-    Ok(())
+    Ok(visible)
 }

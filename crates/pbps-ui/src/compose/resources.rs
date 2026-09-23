@@ -883,7 +883,8 @@ impl Resources {
     fn census_pins(&self) -> Result<()> {
         self.binding()?;
         let read = || refs::private_census(&self.repository.common, self.root.observer.clone());
-        let pins = read()?;
+        let physical = read()?;
+        let pins = refs::verify_private_census(&self.git, &physical)?;
         let mut records = BTreeMap::new();
         for (reference, value) in &pins {
             let (id, kind) = refs::private_parts(reference)?;
@@ -907,10 +908,9 @@ impl Resources {
                 return Err(unavailable());
             }
         }
-        refs::verify_private_census(&self.git, &pins)?;
         // Packing may move a ref between representations during enumeration.
         // A changing or incomplete census cannot certify absence.
-        if read()? != pins {
+        if read()? != physical {
             return Err(Error::new(
                 "Private compose refs changed during the ownership census; preserve their evidence",
             ));
