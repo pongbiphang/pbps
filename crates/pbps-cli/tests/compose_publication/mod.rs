@@ -1,6 +1,8 @@
 //! Real publication, lost acknowledgements and restart from durable receipts.
 
+mod process_death;
 mod push_signing;
+mod removed_states;
 mod resources;
 mod signing;
 

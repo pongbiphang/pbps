@@ -589,7 +589,44 @@ kill actual processes, restart retirement twice, retain foreign locks/files, and
 exercise ordinary source `git add` after interruption. These checks do not prove
 arbitrary power-loss behavior on every filesystem or protection against an
 unrestricted malicious same-user process during private Git/CLI execution.
-#748 and integrated #494 still gate enabling writes and mounting recovery actions.
+Integrated #494 still gates enabling writes and mounting recovery actions.
+
+#### Acceptance coverage (#748)
+
+Each family of #748's acceptance matrix maps to the named cases below. Paths are relative to `crates/pbps-cli/tests/` unless marked `ui:`
+(`crates/pbps-ui/tests/`). "Killed" means an actual child process stopped by
+SIGKILL at a named `PublicationBoundary` or resource operation, with core
+dumps disabled and asserted off inside the child; "injected" means the
+production observer refused an operation, which exercises the same
+reconciliation path but is not process death.
+
+| Family | Executed cases | Kind |
+| --- | --- | --- |
+| 1. Capture versus editor saves, stale form responses, new/deleted/mode-only inputs | `compose_candidate.rs`: `edits_during_capture_are_refused_and_never_become_post_diff_evidence`, `a_new_path_or_mode_change_at_the_capture_barrier_is_not_omitted`, `new_deleted_recreated_paths_and_modes_are_part_of_the_candidate`, `captured_executable_modes_match_real_git_including_group_only_execute`, `index_flags_changed_during_capture_refuse_without_touching_the_writers_index_or_lock`, `refresh_replaces_the_handle_and_expiry_requires_another_preview`; `ui:browser.rs`: `compose_form_keeps_confirmation_bound_to_the_latest_reviewed_generation` | Barrier-synchronized edits; shipped script under out-of-order responses and repeated clicks |
+| 2. Resource and pin acquisition before ownership, record replacement, object pinning, preparation and cleanup failures | `compose_publication/resources.rs`: `actual_process_death_preserves_acquisition_ref_handoff_and_retirement_evidence`, `failed_borrowed_object_flush_never_acknowledges_a_base_pin`, `every_receipt_and_retirement_io_failure_preserves_unresolved_evidence`, `replacing_a_receipt_or_lock_inode_cannot_transfer_ownership`, `forced_source_gc_preserves_the_frozen_base_and_exact_unpublished_commit`, `borrowed_and_promised_objects_survive_donor_gc_after_pin_acknowledgment`, `known_commit_recovery_requires_acknowledged_matching_resources_and_durable_transition`, `interrupted_children_and_unknown_or_changed_snapshot_entries_remain_retained`; `compose_publication/resources/lifecycle.rs`: `every_state_refuses_pin_and_keep_commit_combinations_no_transition_writes` | Killed; injected; synthetic states labelled as such |
+| 3. Lost acknowledgements, local result surviving a failed or unknown push, no second commit | `compose_publication/process_death.rs`: `death_after_commit_creation_never_yields_a_second_commit`, `death_after_the_local_ref_is_installed_resumes_that_exact_commit`, `death_after_the_remote_attempt_intent_needs_informed_republish`, `death_after_the_push_finds_the_delivered_commit_without_pushing_again`; `compose_publication/mod.rs`: `lost_local_acknowledgement_and_post_write_record_failure_share_recovery`, `missing_commit_acknowledgement_never_generates_a_second_commit`, `unknown_push_then_independent_deletion_requires_fresh_informed_authorization`, `an_offline_destination_is_unavailable_and_restoration_reuses_the_known_commit`; `resources.rs`: `acknowledged_commit_roots_resume_without_another_commit_invocation` | Killed; injected |
+| 4. Removed placement, index, HEAD-repair and undo states unreachable; legacy and unknown records refused unchanged | `compose_publication/removed_states.rs`: `receipts_in_removed_or_unknown_states_refuse_without_mutation`; `resources.rs`: `legacy_and_unknown_evidence_refuse_without_modifying_retained_data`, `unknown_resource_versions_and_impossible_states_preserve_all_evidence`; `compose_publication/resources/admission.rs`: `direct_admission_preserves_bad_prior_evidence_without_allocating_resources` | Receipt phase type has no removed variant; synthetic records derived from actual ones |
+| 5. Recovery boundaries, conflicting third-party refs and locks, unreadable evidence, repeated recovery | `process_death.rs`: `recovery_killed_before_its_own_receipt_write_restarts_to_the_same_result`; `resources.rs`: `interrupted_retirement_restarts_without_erasing_foreign_locks_or_receipts`, `rejection_retirement_restarts_after_durable_transition_and_file_removal_failures`, `foreign_pin_locks_and_nonregular_receipts_are_never_cleared_or_waited_on`; `mod.rs`: `an_unreadable_prepared_ref_remains_unavailable_and_never_claims_a_known_change`, `deleted_local_publication_and_unreadable_receipts_are_never_empty_evidence`, `late_dangling_symbolic_collision_is_rejected_under_the_prepared_ref_lock` | Killed (recovery itself); injected; concurrent Git writer at an exact boundary |
+| 6. Output-branch obligations: source invariance, collisions, unpublished ancestry, output ref found after a lost acknowledgement, expiry and cleanup | `compose_candidate.rs`: `confirmation_keeps_the_reviewed_tree_and_preserves_source_and_staged_work`; `mod.rs`: `direct_symbolic_and_unborn_checked_out_collisions_preserve_the_source`, `a_refused_collision_reports_its_actual_direct_symbolic_or_unreadable_evidence`, `unpublished_ancestry_and_required_signer_failure_refuse_without_unsigned_fallback`; `process_death.rs`: `death_after_the_push_finds_the_delivered_commit_without_pushing_again`; `resources.rs`: `only_unconfirmed_sealed_previews_expire_or_allow_explicit_discard_after_restart`, `cleanup_retains_the_receipt_root_and_forgetting_revokes_every_old_handle` | Killed; injected; real Git collisions |
+
+Each kill regression was checked against a restored defect: disabling the
+recovery transitions from `LocalAttempt` to `LocalPublished` and from
+`Attempted` to `Delivered`, or letting ordinary retry replay an authorized
+push, fails the corresponding `process_death.rs` cases; accepting any receipt
+version fails `removed_states.rs`; and a child launched without the core-limit
+wrapper under an unlimited parent limit fails its in-child assertion.
+
+The child harness is the test binary re-executing one `#[ignore]`d test, not
+the `examples/compose-interrupted.rs` program of the superseded #738 branch.
+Remaining limits, stated precisely: SIGKILL and injected refusals do not
+exercise a kernel or filesystem that loses acknowledged writes, so power-loss
+durability rests on the explicit `fsync` ordering above, not on a test. Only
+Linux with Git's files ref backend is qualified; reftable, macOS and Windows
+(#471) are not. Remote transport is qualified against local and loopback
+smart-HTTP destinations served by `git http-backend`, not TLS, proxies or
+hosting services. The browser family runs the shipped script against a Node
+DOM harness, not a browser engine. A concurrent same-user process that
+bypasses compose coordination is outside the guarantee, as stated above.
 Legacy `pbps-ui/composing` evidence refuses new compose with its location and
 matching-binary/manual recovery instructions; the new publisher never runs the
 old source-restoration algorithm.
