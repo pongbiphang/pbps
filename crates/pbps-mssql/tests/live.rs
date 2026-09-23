@@ -3040,15 +3040,25 @@ async fn a_default_this_engine_fills_every_row_from_is_not_counted_as_missing() 
     let mut db = TestDb::create("addvalue").await;
     let name = TableName::new("dbo", "t");
 
-    for (default, counted_rows) in [
+    // (default, rows the probe counts, whether the engine refuses the ALTER)
+    for (default, counted_rows, engine_refuses) in [
         // The engine evaluates it to `1` and takes the change.
-        (Some("NULLIF(1, 2)"), None),
+        (Some("NULLIF(1, 2)"), None, false),
         // An expression this crate will not evaluate: no probe, rather than a
         // guess in either direction (DECISIONS 124's rule).
-        (Some("NULLIF(1, 1)"), None),
+        (Some("NULLIF(1, 1)"), None, true),
         // Both halves the count still exists for.
-        (Some("NULL"), Some(3)),
-        (None, Some(3)),
+        (Some("NULL"), Some(3), true),
+        (None, Some(3), true),
+        // #297: a commented `NULL` is still `NULL`, and still refused.
+        (Some("NULL /* reason */"), Some(3), true),
+        (
+            Some("(/* a /* nested */ comment */ NULL) -- reason"),
+            Some(3),
+            true,
+        ),
+        // And a comment that only says NULL is no value at all.
+        (Some("1 /* NULL */"), None, false),
     ] {
         db.conn
             .execute(
@@ -3106,7 +3116,7 @@ async fn a_default_this_engine_fills_every_row_from_is_not_counted_as_missing() 
             .err();
         assert_eq!(
             refused.is_some(),
-            default != Some("NULLIF(1, 2)"),
+            engine_refuses,
             "default {default:?}: the engine said {refused:?}"
         );
     }

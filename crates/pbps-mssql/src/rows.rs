@@ -673,6 +673,24 @@ pub fn is_constant(default: &str) -> bool {
     constant_operand(&clean, 0)
 }
 
+/// Whether a default is the literal `NULL`, under any parentheses and any
+/// comments — `NULL /* reason */` included.
+///
+/// The same trivia reading [`is_constant`] uses, so the two cannot disagree:
+/// a default that one calls a literal and the other does not call `NULL`
+/// was read as a non-null constant, and the required-add probe was dropped
+/// for a change the engine refuses (#297). Runs nothing.
+pub fn is_null_literal(default: &str) -> bool {
+    let Some(clean) = constant_trivia(default) else {
+        return false;
+    };
+    let mut s = clean.trim();
+    while s.len() >= 2 && s.starts_with('(') && s.ends_with(')') {
+        s = s[1..s.len() - 1].trim();
+    }
+    s.eq_ignore_ascii_case("null")
+}
+
 // Preserve token boundaries: removing a comment must not turn `1/*c*/2`
 // into a number, or `-/*c*/-1` into a line comment.
 fn constant_trivia(text: &str) -> Option<String> {
