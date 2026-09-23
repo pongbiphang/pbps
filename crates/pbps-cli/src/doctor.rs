@@ -290,6 +290,11 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
 
     let mut environments = Vec::new();
     if let Some(Requested { name, target }) = one {
+        // The engine the remedies speak for: the one connected to, and the
+        // project's own when no connection could even be formed.
+        let driver = target
+            .as_ref()
+            .map_or_else(|_| db::driver_for(project.config.dialect), |t| t.driver());
         let d = match target {
             Ok(target) => {
                 // Named by the environment when there is one, and by the
@@ -315,7 +320,12 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                 format!("{e:#}"),
             ),
         };
-        findings.extend(env_findings(&d, counts.modules > 0, dialect.as_ref()));
+        findings.extend(env_findings(
+            &d,
+            counts.modules > 0,
+            dialect.as_ref(),
+            driver,
+        ));
         environments.push(d);
     } else if project.config.environments.is_empty() {
         findings.push(
@@ -350,7 +360,12 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
                     EnvDiagnosis::unconfigured(name.clone(), Some(name.clone()), e.to_string())
                 }
             };
-            findings.extend(env_findings(&d, counts.modules > 0, dialect.as_ref()));
+            findings.extend(env_findings(
+                &d,
+                counts.modules > 0,
+                dialect.as_ref(),
+                db::driver_for(project.config.dialect),
+            ));
             environments.push(d);
         }
     }
@@ -867,8 +882,10 @@ fn env_findings(
     d: &EnvDiagnosis,
     declares_modules: bool,
     dialect: &dyn pbps_dialect::Dialect,
+    driver: pbps_db::Driver,
 ) -> Vec<output::Finding> {
     let mut out = Vec::new();
+    let remedies = crate::engine::read_remedies(driver);
     match d.state {
         // Unreachable and unconfigured are errors: this is the command whose
         // whole job is to answer "can I deploy from here", and it cannot.
@@ -940,7 +957,7 @@ fn env_findings(
                         .unwrap_or("the deployment lock could not be read")
                 ),
             )
-            .remedy("grant SELECT on dbo.__pbps_lock, or check that the table is intact"),
+            .remedy(remedies.lock.clone()),
         ),
         // An error, not a warning. `doctor` answers "can I deploy from here",
         // and while the lock is held an apply is refused — so a readiness check
@@ -995,7 +1012,7 @@ fn env_findings(
                     d.environment
                 ),
             )
-            .remedy("grant VIEW DEFINITION, or check what the login is mapped to in this database"),
+            .remedy(remedies.permissions),
         );
     }
     for gap in &d.missing_permissions {
@@ -1301,10 +1318,15 @@ mod tests {
     }
 
     fn remedy(schema: &str) -> Option<String> {
-        env_findings(&absent(schema), false, &pbps_mssql::Mssql)
-            .into_iter()
-            .find(|f| f.id == "schema.absent")
-            .and_then(|f| f.remedy)
+        env_findings(
+            &absent(schema),
+            false,
+            &pbps_mssql::Mssql,
+            pbps_db::Driver::Mssql,
+        )
+        .into_iter()
+        .find(|f| f.id == "schema.absent")
+        .and_then(|f| f.remedy)
     }
 
     fn with_rows(
@@ -1407,7 +1429,7 @@ mod tests {
             detail.find("sys.schemas") < detail.find("__pbps_lock"),
             "{detail}"
         );
-        let findings = env_findings(&d, false, &pbps_mssql::Mssql);
+        let findings = env_findings(&d, false, &pbps_mssql::Mssql, pbps_db::Driver::Mssql);
         let ids: Vec<&str> = findings.iter().map(|f| f.id.as_str()).collect();
         assert!(ids.contains(&"permission.unknown"), "{ids:?}");
         assert!(ids.contains(&"state.lock-unknown"), "{ids:?}");
@@ -1418,6 +1440,54 @@ mod tests {
             .unwrap();
         assert!(lock.message.contains("sys.schemas"), "{}", lock.message);
         assert!(lock.message.contains("__pbps_lock"), "{}", lock.message);
+    }
+
+    /// #306: a failed lock read and a failed permission read are remedied in
+    /// the connected engine's words. PostgreSQL was told to grant `SELECT` on
+    /// `dbo.__pbps_lock` and `VIEW DEFINITION`, neither of which exists there.
+    #[test]
+    fn a_failed_read_is_remedied_in_the_connected_engines_words() {
+        let remedies = |driver: pbps_db::Driver| {
+            let mut d =
+                EnvDiagnosis::unknown("prod".to_owned(), Some("prod".to_owned()), "unreachable");
+            d.permissions_unknown = true;
+            d.note("could not read the deployment lock: permission denied".to_owned());
+            d.state = "lock-unknown";
+            let findings = match driver {
+                pbps_db::Driver::Mssql => env_findings(&d, false, &pbps_mssql::Mssql, driver),
+                pbps_db::Driver::Postgres => {
+                    env_findings(&d, false, &pbps_pg::Postgres::new(), driver)
+                }
+            };
+            let remedy = |id: &str| {
+                findings
+                    .iter()
+                    .find(|f| f.id == id)
+                    .and_then(|f| f.remedy.clone())
+                    .unwrap_or_else(|| panic!("no remedy for {id}: {findings:?}"))
+            };
+            (remedy("state.lock-unknown"), remedy("permission.unknown"))
+        };
+
+        let (lock, permissions) = remedies(pbps_db::Driver::Postgres);
+        assert!(lock.contains("public.__pbps_lock"), "{lock}");
+        assert!(lock.contains("USAGE on schema public"), "{lock}");
+        assert!(permissions.contains("pg_catalog"), "{permissions}");
+        // And nothing of the other engine's vocabulary.
+        for text in [&lock, &permissions] {
+            for foreign in ["dbo.", "VIEW DEFINITION", "login"] {
+                assert!(!text.contains(foreign), "{foreign:?} in {text}");
+            }
+        }
+
+        let (lock, permissions) = remedies(pbps_db::Driver::Mssql);
+        assert!(lock.contains("dbo.__pbps_lock"), "{lock}");
+        assert!(permissions.contains("VIEW DEFINITION"), "{permissions}");
+        for text in [&lock, &permissions] {
+            for foreign in ["public.", "USAGE", "pg_catalog"] {
+                assert!(!text.contains(foreign), "{foreign:?} in {text}");
+            }
+        }
     }
 
     /// The first cause is not decorated: a diagnosis with one thing to say
@@ -1450,7 +1520,7 @@ mod tests {
         assert!(why.contains("'Edition'"), "{why}");
         assert!(why.find("ProductVersion") < why.find("'Edition'"), "{why}");
 
-        let findings = env_findings(&d, false, &pbps_mssql::Mssql);
+        let findings = env_findings(&d, false, &pbps_mssql::Mssql, pbps_db::Driver::Mssql);
         let unknown: Vec<&output::Finding> = findings
             .iter()
             .filter(|f| f.id == "server.capabilities-unknown")
@@ -1508,9 +1578,14 @@ mod tests {
         assert_eq!(remedy("with\0nul"), None);
         // And the finding itself is still reported.
         assert!(
-            env_findings(&absent("with\0nul"), false, &pbps_mssql::Mssql)
-                .iter()
-                .any(|f| f.id == "schema.absent")
+            env_findings(
+                &absent("with\0nul"),
+                false,
+                &pbps_mssql::Mssql,
+                pbps_db::Driver::Mssql
+            )
+            .iter()
+            .any(|f| f.id == "schema.absent")
         );
     }
 
@@ -1523,7 +1598,7 @@ mod tests {
     /// offered `pbps baseline --env "localhost,14330/master" --reason ...`
     /// (DECISIONS 197).
     fn remedies(d: &EnvDiagnosis) -> Vec<String> {
-        env_findings(d, true, &pbps_mssql::Mssql)
+        env_findings(d, true, &pbps_mssql::Mssql, pbps_db::Driver::Mssql)
             .into_iter()
             .filter_map(|f| f.remedy)
             .collect()

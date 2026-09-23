@@ -6486,6 +6486,73 @@ fn doctor_exercises_a_real_non_superuser_and_names_the_permission_removed_from_i
     succeeds(d.run(&["doctor", "--db", &login]));
 }
 
+/// #306: a role that cannot read the deployment lock is told what to grant in
+/// PostgreSQL's words — `public.__pbps_lock` and `USAGE` on its schema — and
+/// not SQL Server's `dbo.__pbps_lock` and `VIEW DEFINITION`. A real restricted
+/// role against a ledger another role created, as a deployment account meets
+/// it.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn doctor_tells_a_role_that_cannot_read_the_lock_what_to_grant_in_postgres_terms() {
+    struct Role(String, String);
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
+    let server = server();
+    let role = Role(
+        server.clone(),
+        format!("pbps_lock_reader_{}", std::process::id()),
+    );
+    let own = OwnDatabase::new(&server, "lock_remedy");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "lock-remedy", ONE_COLUMN);
+    on_server(
+        connection,
+        &format!(
+            "CREATE ROLE {} LOGIN NOSUPERUSER PASSWORD 'pw-306-secret'; \
+             REVOKE SELECT ON public.__pbps_lock FROM PUBLIC",
+            role.1
+        ),
+    );
+    let login = format!(
+        "{} user={} password=pw-306-secret",
+        connection
+            .split_whitespace()
+            .filter(|w| !w.starts_with("user=") && !w.starts_with("password="))
+            .collect::<Vec<_>>()
+            .join(" "),
+        role.1
+    );
+    let refused = d.run(&["doctor", "--db", &login, "--format", "json"]);
+    assert_ne!(
+        code(&refused),
+        0,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    let report = json_output(refused);
+    let lock = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "state.lock-unknown")
+        .unwrap_or_else(|| panic!("no lock finding: {report}"));
+    let remedy = lock["remedy"].as_str().unwrap_or_default();
+    assert!(remedy.contains("public.__pbps_lock"), "{report}");
+    assert!(remedy.contains("USAGE on schema public"), "{report}");
+    let text = report.to_string();
+    for foreign in ["dbo.__pbps_lock", "VIEW DEFINITION"] {
+        assert!(!text.contains(foreign), "{foreign:?} in {report}");
+    }
+    assert!(
+        !text.contains("pw-306-secret"),
+        "the password leaked: {report}"
+    );
+}
+
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn reference_data_applies_pulls_defaults_and_refuses_rows_arriving_after_the_plan() {
