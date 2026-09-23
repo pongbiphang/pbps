@@ -1220,7 +1220,8 @@ fn diff_data(
         let error = match BaselineDataKey::of(base) {
             BaselineDataKey::Absent => {
                 // The constraint diff runs first. Retained rows can still be
-                // compared using the declared key when this very plan restores it.
+                // compared using the declared key when this very plan restores
+                // it on a column the baseline already has (DECISIONS 538).
                 let restored = changes.iter().any(|change| {
                     matches!(change,
                     Change::SetPrimaryKey { table, from: None, to: Some(pk) }
