@@ -875,3 +875,6 @@ async fn a_run_qualifies_its_analysis_scope_against_the_target() {
         setup.query(statement).await.unwrap();
     }
 }
+
+#[path = "live_tests/guard_limits.rs"]
+mod guard_limits;

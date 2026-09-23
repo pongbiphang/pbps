@@ -556,8 +556,9 @@ fn check_kernel_parts(
     backend: &ProcessLease,
 ) -> Result<(), Error> {
     let channel = |reason: &str| Error::Channel(reason.to_owned());
-    guarded_tasks(forwarder_guard, FORWARDER_PRIVILEGES)
-        .map_err(|_| channel("a forwarder task is not at the fixed privileges"))?;
+    guarded_tasks(forwarder_guard, FORWARDER_PRIVILEGES).map_err(|_| {
+        channel("a forwarder task does not meet the fixed privilege and descriptor limits")
+    })?;
     exclusivity::still_bound(init, pair, backend)
         .map_err(|_| channel("the session's kernel endpoints changed"))
 }

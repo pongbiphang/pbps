@@ -249,6 +249,9 @@ fn guard(process: &ProcessLease, workload_capabilities: u64) -> Result<(), Unqua
     if effective & 0x20 == 0 {
         return Err(UnqualifiedProcess);
     }
+    // Supplied-server forwarders have no ExecutionLease for this root, and
+    // guarded_tasks checks WorkloadPrivileges only on its other tasks (#794).
+    super::execution::check_file_descriptors(process)?;
     process.check()
 }
 

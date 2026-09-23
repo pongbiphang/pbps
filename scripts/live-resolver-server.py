@@ -34,6 +34,7 @@ EXECUTABLE = {"pg": "postgres", "mssql": "sqlservr"}
 QUIET = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
 TESTS = [
     "a_supported_dedicated_server_compiles_declarations_and_removes_only_its_own_resources",
+    "guard_limits::every_forwarder_guard_requires_effective_descriptor_evidence",
     # PostgreSQL analysis-scope qualification (#610); no-ops on SQL Server (#611).
     "a_run_qualifies_its_analysis_scope_against_the_target",
     "a_server_inside_the_target_instance_is_refused_before_any_scratch_resource",
@@ -335,9 +336,14 @@ def fixture(args, binary, root, owned):
             run("docker", "run", "-d", "--name", joined, "--pull", "never",
                 "--network", "container:" + supplied, "--entrypoint", "/bin/sleep",
                 IMAGES[engine], "120", **QUIET)
-        result = run(binary, "--ignored", "--exact",
-                     f"resolver::server::live_tests::{test}", "--nocapture",
-                     env=dict(os.environ, **environment), stdout=subprocess.PIPE,
+        command = [binary, "--ignored", "--exact",
+                   f"resolver::server::live_tests::{test}", "--nocapture"]
+        selected = dict(os.environ, **environment)
+        if test == "guard_limits::every_forwarder_guard_requires_effective_descriptor_evidence":
+            # Only this test's observer view hides an owned guard's limits.
+            command = ["/usr/bin/unshare", "--mount", "--propagation", "private", "--", *command]
+            selected["PBPS_LIMITS_PRIVATE_PROC_FIXTURE"] = "1"
+        result = run(*command, env=selected, stdout=subprocess.PIPE,
                      stderr=subprocess.STDOUT, check=False)
         if test == intruding:
             run("docker", "exec", "--user", "0", supplied,
