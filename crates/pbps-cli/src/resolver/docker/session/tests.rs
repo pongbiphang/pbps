@@ -117,6 +117,30 @@ async fn the_private_channel_compiles_declarations_and_control_loss_discards_the
             Ok::<_, pbps_db::DbError>((one_row, filesystem_write.is_err(), network.is_err()))
         }
         .await;
+        // Exercise Fast Open with a real socket and the running engine's
+        // loopback address, not only the bootstrap's harmless invalid operands.
+        // A normal response still uses the existing private connection.
+        let fast_open = tokio::process::Command::new("docker")
+            .args([
+                "--host", &format!("unix://{}", path.display()), "exec", &workload,
+                "/usr/bin/perl", "-e",
+                r#"use strict; use warnings; use Socket; use Errno qw(EPERM);
+                    socket(my $socket, AF_INET, SOCK_STREAM, 0) or die "socket";
+                    my $fd=fileno($socket); my $address=sockaddr_in($ARGV[0],inet_aton("127.0.0.1"));
+                    my $payload="x";
+                    my $result=syscall(44,$fd,$payload,1,0x20000000,$address,length($address));
+                    die "sendto did not deny Fast Open" unless $result==-1 && $!==EPERM;
+                    my $iov=pack("J J",unpack("J",pack("P",$payload)),1);
+                    my $header=pack("J L x4 J J J J L x4",unpack("J",pack("P",$address)),length($address),unpack("J",pack("P",$iov)),1,0,0,0);
+                    $result=syscall(46,$fd,$header,0x20000000);
+                    die "sendmsg did not deny Fast Open" unless $result==-1 && $!==EPERM;
+                    my $messages=$header.pack("L x4",0);
+                    $result=syscall(307,$fd,$messages,1,0x20000000);
+                    die "sendmmsg did not deny Fast Open" unless $result==-1 && $!==EPERM;
+                "#,
+                &engine::private_channel_profile(driver).port.to_string(),
+            ])
+            .output().await.unwrap();
         if lose_control {
             let (status, _) = observer
                 .request(
@@ -160,6 +184,11 @@ async fn the_private_channel_compiles_declarations_and_control_loss_discards_the
         })
         .await
         .expect("both exact owned resources must be removed");
+        assert!(
+            fast_open.status.success(),
+            "real-socket Fast Open restriction: {}",
+            String::from_utf8_lossy(&fast_open.stderr)
+        );
         let (one_row, filesystem_blocked, network_blocked) = compile.unwrap();
         assert!(one_row);
         assert!(

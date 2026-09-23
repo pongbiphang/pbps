@@ -14592,3 +14592,36 @@ SPEC is in sync with all of these.
      for the same identity proceeds under the ordinary retry rules. The
      regressions for fake credential markers, endpoint drift and refresh
      belong to #745–#747.
+
+542. **The resolver qualifies inherited seccomp behavior before releasing its
+     fixed bootstrap, without tracing processes (#633).** A real filter that
+     allows `connect` or TCP Fast Open still has mode 2 and a filter count of
+     one. Both pinned engine images admitted these incorrect policies through
+     the old native waiter check. Docker's reported JSON is not independent
+     evidence of what the kernel installed.
+
+     Native target separation and containment come first. A fixed source-free
+     probe then checks prohibited calls through x86-64, i386 and x32, including
+     multiplexed connect and all three Fast Open send calls. A distinct
+     acknowledgement precedes rechecking the retained native leases and
+     releasing initialization. Each owned forwarder runs its corresponding
+     probe before the fixed protocol program. Failed, unavailable, incomplete
+     or canceled evidence cannot release the engine or restore a discarded run.
+
+     The tiny fixed ELF is generated in safe Rust and executed from a sealed
+     anonymous file by the images' existing Perl. There is no host compiler,
+     additional image, persisted helper, writable executable mount, or new
+     unsafe-code exception. Fork/clone/exec inheritance maintains the measured
+     restriction for the fixed bootstrap's engine descendants; this adds no
+     lifetime process census and does not certify a preexisting supplied
+     engine's policy (#684).
+
+     Kernel BPF reads were measured too: they need an unfiltered privileged
+     ptracer and a stopped tracee. Equivalent policies also showed different
+     architecture-dispatch ordering, making a raw hash unsuitable as a portable
+     policy identity. Fixed behavioral checks fit DECISIONS 533's trusted
+     provisioning premise; they do not promise arbitrary BPF equivalence or
+     protection against an administrator deliberately manufacturing
+     probe-specific behavior. Real-engine compilation, additional loopback
+     connections, valid-socket Fast Open attempts, wrong-policy bootstrap
+     refusal and actual removed-probe controls pin the supported contract.

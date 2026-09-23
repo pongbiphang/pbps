@@ -8,6 +8,7 @@ use pbps_db::Driver;
 use serde_json::{Value, json};
 
 pub(super) mod engine;
+mod seccomp_probe;
 
 #[cfg(test)]
 #[path = "profile/launch_tests.rs"]
@@ -141,7 +142,11 @@ impl Launch {
         body["Cmd"] = json!(guarded_command(
             FORWARDER_PRIVILEGES,
             lifetime_secs,
-            engine::control_program(driver)
+            &format!(
+                "{}; {}",
+                seccomp_probe::command(seccomp_probe::Role::Forwarder),
+                engine::control_program(driver)
+            )
         )?);
         body["Env"] = json!(isolated_environment(
             image,
@@ -177,7 +182,8 @@ impl Launch {
             .last_mut()
             .ok_or(Error::Profile)?;
         *program = json!(format!(
-            "IFS= read -r probe; test \"$probe\" = pbps-bootstrap-probe-v1; printf 'pbps-bootstrap-ready-v1\\n'; IFS= read -r start; test \"$start\" = pbps-bootstrap-start-v1; {}",
+            "IFS= read -r probe; test \"$probe\" = pbps-bootstrap-probe-v1; printf 'pbps-bootstrap-ready-v1\\n'; IFS= read -r verify; test \"$verify\" = pbps-seccomp-probe-v1; {}; printf 'pbps-seccomp-ready-v1\\n'; IFS= read -r start; test \"$start\" = pbps-bootstrap-start-v1; {}",
+            seccomp_probe::command(seccomp_probe::Role::Workload),
             program.as_str().ok_or(Error::Profile)?
         ));
         for key in [

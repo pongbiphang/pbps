@@ -8,6 +8,9 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 #[path = "launch_tests/masks.rs"]
 mod masks;
 
+#[path = "launch_tests/seccomp.rs"]
+mod seccomp;
+
 async fn accepts_waiter(change: impl FnOnce(&mut Launch)) -> bool {
     inspect_waiter(change, |run, driver| {
         awaiting_engine(
