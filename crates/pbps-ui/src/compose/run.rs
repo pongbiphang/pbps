@@ -417,6 +417,7 @@ impl Publications {
             RefEvidence::Unreadable => return Err(Problem::RemoteUnavailable),
             RefEvidence::Direct(_) | RefEvidence::Symbolic => return Err(Problem::RefCollision),
         }
+        let signing = self.push_signing(&record.description, &commit)?;
         record.state = Phase::LocalPublished {
             commit,
             remote: RemotePhase::Attempted {
@@ -424,13 +425,30 @@ impl Publications {
             },
         };
         self.persist(record, observer)?;
-        self.authorized_push(record, observer)
+        self.authorized_push(record, observer, signing)
+    }
+
+    fn push_signing(
+        &self,
+        description: &Description,
+        commit: &str,
+    ) -> std::result::Result<transport::PushSigning, Problem> {
+        let signing =
+            transport::push_signing(&self.git).map_err(|_| Problem::SigningUnavailable)?;
+        transport::preflight(&self.git, description, commit, signing).map_err(|refusal| {
+            match refusal {
+                transport::Preflight::Unsupported => Problem::PushSigningUnsupported,
+                transport::Preflight::Unavailable => Problem::RemoteUnavailable,
+            }
+        })?;
+        Ok(signing)
     }
 
     fn authorized_push(
         &self,
         record: &mut Record,
         observer: Observer<'_>,
+        signing: transport::PushSigning,
     ) -> std::result::Result<(), Problem> {
         let Phase::LocalPublished {
             commit,
@@ -451,7 +469,7 @@ impl Publications {
         if !observer(PublicationBoundary::BeforePush) {
             return Err(Problem::Interrupted);
         }
-        transport::push(&self.git, &record.description, &commit)
+        transport::push(&self.git, &record.description, &commit, signing)
             .map_err(|_| Problem::PublicationUncertain)?;
         if !observer(PublicationBoundary::PushFinished) {
             return Err(Problem::Interrupted);
@@ -802,7 +820,9 @@ impl Publications {
                 &record.description,
                 &record.description.output_ref,
             ) {
-                RefEvidence::Absent => self.authorized_push(&mut record, observer),
+                RefEvidence::Absent => self
+                    .push_signing(&record.description, &commit)
+                    .and_then(|signing| self.authorized_push(&mut record, observer, signing)),
                 RefEvidence::Direct(value) if value == commit => {
                     record.state = Phase::LocalPublished {
                         commit,

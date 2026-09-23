@@ -1,5 +1,6 @@
 //! Real publication, lost acknowledgements and restart from durable receipts.
 
+mod push_signing;
 mod resources;
 
 use super::*;

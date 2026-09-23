@@ -50,6 +50,7 @@ pub enum Problem {
     DestinationChanged,
     SigningChanged,
     SigningUnavailable,
+    PushSigningUnsupported,
     IdentityUnavailable,
     RemoteBaseChanged,
     ObjectImportFailed,

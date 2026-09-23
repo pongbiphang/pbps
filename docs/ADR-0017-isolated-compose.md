@@ -122,7 +122,13 @@ not grant permission to execute repository-controlled hooks or filters.
    changes during reconciliation and retain the evidence instead of undoing them.
 5. Push the persisted commit id to the one reviewed endpoint and output ref,
    with an expected-absent remote lease, no tags, submodule recursion or hooks.
-   Do not use the subsequently read local branch tip as the push source. A failed
+   Do not use the subsequently read local branch tip as the push source. The
+   configured `push.gpgSign` mode is read once and passed to that push
+   explicitly. When it requires a certificate, a dry-run preflight refuses a
+   destination that cannot accept one before the remote attempt is recorded,
+   so the local commit remains and ordinary retry proceeds once the capability
+   or policy is repaired. The requirement is never dropped (#775). A dry run
+   cannot exercise the signer, so a signer failure is an uncertain push. A failed
    or uncertain push keeps the local commit and displays its branch/id. Query
    that exact remote ref on retry: equal means delivered, different means
    collision, and unreadable means unknown. Absence after an authorized attempt
