@@ -188,7 +188,7 @@ fn capturing_evidence_with_a_retired_base_pin_is_refused_in_either_worktree() {
 #[test]
 fn every_state_refuses_pin_and_keep_commit_combinations_no_transition_writes() {
     type Case = (&'static str, fn(&Fixture) -> String, fn(&Fixture, &str));
-    let cases: [Case; 6] = [
+    let cases: [Case; 7] = [
         ("unowned-base-retired", unacknowledged_base, |f, id| {
             edit(f, id, |r| r["pins"]["base"]["retired"] = true.into())
         }),
@@ -231,6 +231,23 @@ fn every_state_refuses_pin_and_keep_commit_combinations_no_transition_writes() {
                     r["pins"]["base"]["retired"] = true.into();
                 });
                 remove_pin(f, id, "base");
+            },
+        ),
+        (
+            // Retirement clears the snapshot and inventory as it marks them.
+            "retiring-retired-snapshot-kept",
+            |f| {
+                f.repo
+                    .store()
+                    .preview(request(), SystemTime::now())
+                    .unwrap()
+                    .operation_id
+            },
+            |f, id| {
+                edit(f, id, |r| {
+                    r["state"] = "retiring".into();
+                    r["snapshot_retired"] = true.into();
+                })
             },
         ),
         (

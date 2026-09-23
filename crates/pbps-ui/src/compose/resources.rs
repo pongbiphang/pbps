@@ -219,7 +219,8 @@ impl Resources {
             .zip(r.inventory.as_ref())
             .is_some_and(|(identity, inventory)| identity == &inventory.root);
         let complete_base = base.is_some_and(|pin| pin.owned && !pin.retired);
-        // Each arm admits only what the transitions can write. Pins retire
+        // Each arm admits only what the transitions can write. Retiring the
+        // snapshot clears its evidence in the same write. Pins retire
         // only under Retiring, after the snapshot and base before commit, and
         // keep_commit is set only together with Retiring; an unacknowledged
         // base or commit intent is a legitimate interruption and stays valid.
@@ -243,7 +244,8 @@ impl Resources {
                     && commit.is_none_or(|pin| !pin.retired)
             }
             ResourceState::Retiring => {
-                (sealed || (r.snapshot_retired && r.snapshot.is_none() && r.inventory.is_none()))
+                ((sealed && !r.snapshot_retired)
+                    || (r.snapshot_retired && r.snapshot.is_none() && r.inventory.is_none()))
                     && base.is_some_and(|pin| pin.owned)
                     && commit.is_none_or(|pin| pin.owned)
                     && (!r.keep_commit || commit.is_some_and(|pin| !pin.retired))

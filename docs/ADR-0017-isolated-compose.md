@@ -493,7 +493,8 @@ destructor unlock is fallback only and never certifies completed cleanup.
 | `Spent` | A compact tombstone revokes all old candidate handles. Public output branches remain untouched. |
 
 Every read, admission and write validates a record against the transitions that
-write it, not only against its own state's fields (#802). A pin is retired only
+write it, not only against its own state's fields (#802). Retiring the snapshot
+clears its identity and inventory in the same write. A pin is retired only
 under `Retiring`, after the snapshot, and the base pin before the commit pin.
 The keep-commit choice exists only from `Retiring` onward. A record combining
 these any other way cannot come from an interruption. Admission, discovery
