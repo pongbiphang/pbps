@@ -18,6 +18,7 @@ pub(crate) mod executables;
 mod execution;
 mod namespace;
 mod private_channel;
+pub(crate) mod runtime_files;
 mod target;
 mod task_metadata;
 pub(crate) use daemon::DaemonLease;

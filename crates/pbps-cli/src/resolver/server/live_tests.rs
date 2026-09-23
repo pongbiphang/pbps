@@ -878,3 +878,6 @@ async fn a_run_qualifies_its_analysis_scope_against_the_target() {
 
 #[path = "live_tests/guard_limits.rs"]
 mod guard_limits;
+
+#[path = "live_tests/host_files.rs"]
+mod host_files;

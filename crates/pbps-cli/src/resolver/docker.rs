@@ -525,6 +525,9 @@ impl Drop for RequestGuard<'_> {
 }
 
 #[cfg(test)]
+pub(crate) mod file_fixture;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;

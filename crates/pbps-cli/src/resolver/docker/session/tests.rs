@@ -172,3 +172,6 @@ async fn the_private_channel_compiles_declarations_and_control_loss_discards_the
         );
     }
 }
+
+#[path = "tests/host_files.rs"]
+mod host_files;

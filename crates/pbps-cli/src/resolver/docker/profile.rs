@@ -67,11 +67,16 @@ impl Launch {
             "Healthcheck": {"Test": ["NONE"]},
             "Labels": { OWNER_LABEL: owner, "io.pbps.resolver.profile": PROFILE },
             "WorkingDir": "/",
+            "Hostname": crate::resolver::native::runtime_files::HOSTNAME,
+            "Domainname": "",
             "OpenStdin": false,
             "Tty": false,
             "NetworkDisabled": true,
             "HostConfig": {
                 "NetworkMode": "none",
+                "Dns": ["127.0.0.1"],
+                "DnsSearch": ["."],
+                "DnsOptions": ["ndots:0"],
                 "ReadonlyRootfs": true,
                 "AutoRemove": true,
                 "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
@@ -121,6 +126,18 @@ impl Launch {
             .ok_or(Error::Profile)?
             .push(json!({"names":["connect"],"action":"SCMP_ACT_ALLOW"}));
         let body = &mut launch.body;
+        // Docker reuses the workload's generated runtime-file paths in this
+        // mode and rejects per-forwarder hostname/DNS overrides. Native checks
+        // still qualify both views, including operator-supplied servers (#630).
+        for key in ["Hostname", "Domainname"] {
+            body.as_object_mut().ok_or(Error::Profile)?.remove(key);
+        }
+        for key in ["Dns", "DnsSearch", "DnsOptions"] {
+            body["HostConfig"]
+                .as_object_mut()
+                .ok_or(Error::Profile)?
+                .remove(key);
+        }
         body["Cmd"] = json!(guarded_command(
             FORWARDER_PRIVILEGES,
             lifetime_secs,
@@ -193,6 +210,15 @@ impl Launch {
             let omitted_false =
                 key == "NetworkDisabled" && config.get(key).is_none() && self.body[key] == false;
             if config[key] != self.body[key] && !omitted_false {
+                return Err(Error::RuntimeChanged);
+            }
+        }
+        for key in ["Hostname", "Domainname"] {
+            if self
+                .body
+                .get(key)
+                .is_some_and(|expected| config[key] != *expected)
+            {
                 return Err(Error::RuntimeChanged);
             }
         }

@@ -76,6 +76,34 @@ Missing masks, different objects, writable or nonempty directories, symlinks
 and unreadable state refuse. Kernels without an optional interface remain
 supported. Docker's `MaskedPaths` report alone cannot establish these facts.
 
+The three runtime files `/etc/hostname`, `/etc/hosts` and `/etc/resolv.conf`
+must be empty or contain the complete fixed bytes of the measured profile
+(#630). The measured Docker API with `NetworkDisabled=true` leaves three
+empty files; CLI `--network none` alone produces the generated layout below.
+The workload requests hostname `pbps-resolver`, DNS `127.0.0.1`, search `.` and
+option `ndots:0`. Docker then produces a fixed hostname, its standard loopback
+hosts file and resolver contents with fixed generated comments. Every byte is
+qualified: unknown layouts, extra search domains, addresses or comments refuse.
+The generated resolver file may name either `/etc/resolv.conf` or
+`/run/systemd/resolve/resolv.conf` in Docker's fixed source-path comment. Both
+complete layouts are measured; arbitrary paths and additional comments still
+refuse. The latter is selected when the host uses the systemd-resolved stub.
+A file must be a readable regular file on an actual read-only mount; missing,
+oversized, symlinked and unreadable files are not empty answers. A nonempty
+truncated file does not match the complete generated layout.
+The verifier resolves each file below the held process root.
+
+Docker's `container:` network mode reuses the workload's generated file paths
+and forbids separate forwarder DNS/hostname overrides. With no generated paths,
+the empty image files remain in each separate mount view. Qualification checks
+both actual views. The source-free factory gate checks before
+engine initialization; execution and guard checks retain the requirement during
+the run. Supplied-server admission and its control/analysis forwarders use the
+same content requirement. Operators must use the complete documented fixture
+recipe; an arbitrary host-derived file is not qualified by being read-only.
+Image acquisition remains a separate explicitly trusted phase, and the fixed
+private connection needs no external name resolution or workload egress.
+
 The host kernel, its administrators, the selected daemon and explicitly trusted
 image installation form the provisioning trust boundary. SQL privileges in
 scratch grant no authority over those external controls. This profile does not
@@ -145,7 +173,7 @@ Admission connects through a **Docker-API daemon** (`dockerd`), the same peer-au
 | Separation | The container's init and engine service are neither the target's service process nor in any of its PID, mount or network namespaces, and the engine's instance identity is not the target's. Decided **before** the record and containment measurements, so an alias of the target refuses as the target |
 | Network | The container's network namespace holds only a loopback device — a real one, by link type and flag — with no IPv4 or IPv6 route and no address but `::1` |
 | Anchors | PID 1 seen through the container's `/proc` is in its own PID namespace, and its `/sys` shows only that loopback device: a host procfs or sysfs bound in keeps the type and not these |
-| Mounts | Every row of the init's mount table, uncollapsed, is one the profile names: the read-only image root; `/proc`, `/sys`, `/dev`, `/dev/pts`, `/dev/mqueue` and `/sys/fs/cgroup` with their kinds and flags; the read-only `/proc` files on the same procfs; the masks Docker lays as empty tmpfs and Podman as binds of `/dev/null`; the tmpfs `/tmp`, `/dev/shm`, `/run` and `/var/tmp`; the runtime's `/etc` files bound read-only from an ordinary filesystem; and the engine's storage as a fresh tmpfs. Two rows at one target are two mounts stacked, which no runtime lays out. Both runtimes' layouts were measured and are pinned by unit tests |
+| Mounts | Every row of the init's mount table, uncollapsed, is one the profile names: the read-only image root; `/proc`, `/sys`, `/dev`, `/dev/pts`, `/dev/mqueue` and `/sys/fs/cgroup` with their kinds and flags; the read-only `/proc` files on the same procfs; the masks Docker lays as empty tmpfs and Podman as binds of `/dev/null`; the tmpfs `/tmp`, `/dev/shm`, `/run` and `/var/tmp`; the runtime's `/etc` files bound read-only from an ordinary filesystem with the complete private contents described above; and the engine's storage as a fresh tmpfs. Two rows at one target are two mounts stacked, which no runtime lays out. Both runtimes' layouts were measured and are pinned by unit tests |
 | Privileges | Every task in the container's PID namespace — not only the ones the service started — at the profile's uid **and** group, with no-new-privileges, a seccomp filter and the capability ceiling, still in the container's network and mount namespaces, judged as found rather than against an earlier listing. That a seccomp filter is *loaded* is measured (`Seccomp: 2`); its BPF contents cannot be read from `/proc`, so attesting the exact policy — to exclude a non-IP channel such as `AF_VSOCK` that the loopback network checks do not contain — is the operator's provisioning responsibility, tracked in #684 |
 | Resources | cgroup-v2 memory, swap, CPU and PID bounds on the init's cgroup that exist and are within the profile's ceilings; `max` is not a bound. Every task must be in that cgroup or below it |
 | Accounting | Nothing shares the container's mount or IPC namespace that is not in its PID namespace, and nothing shares its network namespace but those tasks and this run's own forwarders. A container joined with `--network container:` is in no process listing and is caught here. The forwarder exception is by PID namespace, not by an exact task set: a forwarder's `bash` reaps and respawns its `cat` pipes, so a captured task list races a legitimate child, and joining that namespace needs `--pid container:` on the same root daemon, whose socket also lists the container id — so what excludes it is not the name but that root daemon access is provisioning-administrator access, the boundary this profile does not claim to hold against. Narrowing the exception to the forwarder's exact tasks is #681 |
@@ -438,6 +466,16 @@ writable masks, and unreadable directories while Docker's report remains
 unchanged. It drops the observer's DAC bypass capabilities for the unreadable
 case. Unchanged masks and genuinely absent optional interfaces must still pass;
 all helper failures follow owned cleanup before the test reports a failure.
+The launch runner also injects host information into actual files on owned waiters
+and verifies refusal without ever sending the engine-start line. Its SQL-read
+fixture also runs as root: qualifying the guard and changing the owned mount
+namespace require native host privileges. These fixtures change a generated
+file's already-bound inode or add a
+read-only overmount in the owned container when the file belongs to its image;
+the shared image layers and Docker's reported recipe remain unchanged. Both real engines read all synthetic bytes
+through SQL, including comment-only and alternate-layout injections; workload,
+control and shared forwarder-guard checks must reject them. Ordinary fixed files,
+contained DDL and confirmed cleanup remain positive controls.
 
 `scripts/live-resolver-target.py <pg|mssql>` creates disposable TLS targets and
 confines each inspector to its owned target's PID/network namespaces. It checks

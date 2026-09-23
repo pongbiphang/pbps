@@ -17,12 +17,20 @@ IMAGES = {
     "mssql": "mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1",
 }
 TESTS = [
-    "a_wrong_workload_identity_is_refused_before_initialization",
-    "a_guard_without_termination_authority_is_refused_before_initialization",
-    "the_launch_cannot_omit_inherited_no_new_privileges",
-    "effective_descriptor_limits_are_required_before_initialization",
-    "unreadable_effective_limits_are_not_a_bounded_answer",
-    "masks::every_existing_proc_interface_requires_its_effective_mask",
+    "resolver::docker::profile::launch_tests::" + name
+    for name in [
+        "host_information_is_refused_before_engine_initialization",
+        "a_wrong_workload_identity_is_refused_before_initialization",
+        "a_guard_without_termination_authority_is_refused_before_initialization",
+        "the_launch_cannot_omit_inherited_no_new_privileges",
+        "effective_descriptor_limits_are_required_before_initialization",
+        "unreadable_effective_limits_are_not_a_bounded_answer",
+        "masks::every_existing_proc_interface_requires_its_effective_mask",
+    ]
+] + [
+    # SQL file reads also inspect root-owned guards and mutate only the owned
+    # mount namespace. Keep this with the native root tests, not cargo's user.
+    "resolver::docker::session::tests::host_files::host_information_cannot_enter_either_private_runtime_view",
 ]
 
 
@@ -42,12 +50,12 @@ def main():
                PBPS_RESOLVER_TEST_IMAGE=IMAGES[args.engine])
     for name in TESTS:
         command = [str(binary), "--ignored", "--exact",
-                   "resolver::docker::profile::launch_tests::" + name, "--nocapture"]
+                   name, "--nocapture"]
         selected = env
-        if name == "unreadable_effective_limits_are_not_a_bounded_answer":
+        if name.endswith("::unreadable_effective_limits_are_not_a_bounded_answer"):
             command = ["unshare", "--mount", "--propagation", "private", "--", *command]
             selected = dict(env, PBPS_LIMITS_PRIVATE_PROC_FIXTURE="1")
-        if name.startswith("masks::"):
+        if "::launch_tests::masks::" in name:
             # Root can still observe the guard with SYS_PTRACE, but must not
             # bypass a mask directory's absent read/search permissions.
             command = ["setpriv", "--bounding-set=-dac_override,-dac_read_search", "--", *command]
