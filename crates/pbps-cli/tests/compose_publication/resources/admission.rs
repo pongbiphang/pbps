@@ -15,7 +15,7 @@ fn spent(f: &Fixture) -> Preview {
     preview
 }
 
-fn names(path: &Path) -> Vec<std::ffi::OsString> {
+pub(super) fn names(path: &Path) -> Vec<std::ffi::OsString> {
     let mut names = fs::read_dir(path)
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
@@ -24,7 +24,7 @@ fn names(path: &Path) -> Vec<std::ffi::OsString> {
     names
 }
 
-fn pins(f: &Fixture) -> Vec<u8> {
+pub(super) fn pins(f: &Fixture) -> Vec<u8> {
     git(
         &f.repo.root,
         &[
@@ -35,7 +35,7 @@ fn pins(f: &Fixture) -> Vec<u8> {
     )
 }
 
-fn store(f: &Fixture, observer: ResourceObserver) -> Candidates {
+pub(super) fn store(f: &Fixture, observer: ResourceObserver) -> Candidates {
     Candidates::with_resources(
         Config {
             executable: BIN.into(),
