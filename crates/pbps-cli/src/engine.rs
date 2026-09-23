@@ -1113,6 +1113,50 @@ pub async fn permissions(
     }
 }
 
+/// What `doctor` tells the operator when one of its own reads was refused, in
+/// this engine's words.
+///
+/// The two remedies used to be SQL Server's alone: a PostgreSQL environment
+/// whose lock read was denied was told to grant `SELECT` on `dbo.__pbps_lock`,
+/// a table that does not exist there, and one whose permission read failed was
+/// told to grant `VIEW DEFINITION`, which PostgreSQL does not have (#306).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadRemedies {
+    /// The deployment lock could not be read.
+    pub lock: String,
+    /// The account's permissions could not be read.
+    pub permissions: &'static str,
+}
+
+pub fn read_remedies(driver: Driver) -> ReadRemedies {
+    match driver {
+        Driver::Mssql => ReadRemedies {
+            lock: format!(
+                "grant SELECT on {}, or check that the table is intact",
+                pbps_mssql::state::LOCK_TABLE
+            ),
+            permissions: "grant VIEW DEFINITION, or check what the login is mapped to in this \
+                          database",
+        },
+        // Both grants, measured on 18.6: without `SELECT` the read is
+        // "permission denied for table __pbps_lock", and with it but without
+        // `USAGE` it is "permission denied for schema public".
+        Driver::Postgres => ReadRemedies {
+            lock: format!(
+                "grant SELECT on {} and USAGE on schema {} to this role, or check that the \
+                 table is intact",
+                pbps_pg::state::LOCK_TABLE,
+                pbps_pg::state::LEDGER_SCHEMA
+            ),
+            // The read asks `has_*_privilege` and the system catalogs, which
+            // every role may read unless someone revoked it; the other way it
+            // fails is a connection that is not the role meant to deploy.
+            permissions: "check that this role can read the system catalogs (`pg_catalog`), \
+                          and that the connection names the role that deploys",
+        },
+    }
+}
+
 // ---------------------------------------------------------------------------
 // What a rename touches (SPEC §7.4)
 // ---------------------------------------------------------------------------
