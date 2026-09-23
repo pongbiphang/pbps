@@ -21,7 +21,6 @@ IMAGES = {
     "mssql": "mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1",
 }
 TESTS = [
-    "docker::session::tests::host_files::host_information_cannot_enter_either_private_runtime_view",
     "docker::tests::local_image_acquisition_observes_immutable_content_without_pulling",
     "docker::lifecycle::tests::fixed_launch_survives_bootstrap_and_explicit_close_removes_the_live_candidate",
     "docker::lifecycle::tests::the_root_deadline_removes_even_a_detached_descendant",

@@ -463,8 +463,10 @@ unchanged. It drops the observer's DAC bypass capabilities for the unreadable
 case. Unchanged masks and genuinely absent optional interfaces must still pass;
 all helper failures follow owned cleanup before the test reports a failure.
 The launch runner also injects host information into actual files on owned waiters
-and verifies refusal without ever sending the engine-start line. The Docker
-runtime fixtures change a generated file's already-bound inode or add a
+and verifies refusal without ever sending the engine-start line. Its SQL-read
+fixture also runs as root: qualifying the guard and changing the owned mount
+namespace require native host privileges. These fixtures change a generated
+file's already-bound inode or add a
 read-only overmount in the owned container when the file belongs to its image;
 the shared image layers and Docker's reported recipe remain unchanged. Both real engines read all synthetic bytes
 through SQL, including comment-only and alternate-layout injections; workload,
