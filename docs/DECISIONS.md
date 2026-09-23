@@ -14544,3 +14544,51 @@ SPEC is in sync with all of these.
      keeps a future engine that pads differently from failing every read of
      an extreme value. The rendering read back is unchanged, so no recorded
      state moves.
+
+541. **A compose destination is a credential-free identity; authentication is
+     reacquired per invocation, and an endpoint that cannot be represented
+     without a secret is refused.** (#757, recording the policy #750 specified
+     in [ADR-0017](ADR-0017-isolated-compose.md#durable-identity-and-transient-authentication);
+     requested in [#756's review](https://github.com/pongbiphang/pbps/pull/756#discussion_r4062131848).)
+     ADR-0017 forbids a credential store, yet a candidate must bind the exact
+     destination it was reviewed against across confirmation, retry and
+     restart. Those two demands meet in three separate representations:
+     a durable *destination identity* (admitted transport, exact host, port
+     and repository path, any explicit public SSH principal, or the local
+     repository identity, paired with the base and output refs); the
+     *candidate identity* that binds it with the reviewed tree and signing
+     policy; and *invocation authentication*, which Git and its approved
+     helpers obtain afresh for every call and compose never serializes,
+     logs, relays to the browser, snapshots or hashes.
+
+     HTTP(S) endpoints carrying userinfo, a query or a fragment are refused
+     before sealing, not cleaned. A redacted display string cannot bind
+     anything, because two different destinations redact to the same text,
+     and equality of redactions is exactly the comparison drift detection
+     would then rely on. A hash of the secret-bearing URL is worse: it is
+     durable evidence derived from the secret, and it changes when the
+     secret rotates, so refreshed authentication for the same repository
+     would read as destination drift. Stripping the parts is not safe either,
+     since they can encode routing as well as credentials, and the stripped
+     URL may name a repository nobody reviewed. The refusal names the unsafe
+     component's category without echoing it, and points at a credential-free
+     endpoint plus a credential helper; the ordinary CLI remains available for
+     other forms.
+
+     An explicit SSH account name (`git@host:team/repository.git`) is kept as
+     a bound field. The trade-off is that a public principal becomes part of
+     durable records and of the reviewed identity: it is not secret, and for a
+     relative scp-like path it can select a different repository, so dropping
+     it would lose routing. Changing it therefore requires a new candidate,
+     like a changed host, port, path or ref. An implicit principal, or an
+     opaque transport whose effective destination cannot be established, is
+     refused until it has a qualified identity protocol. None of this attests
+     the server; ordinary Git transport and host-key policy still apply.
+
+     On retry or restart, authentication is reacquired from the currently
+     approved source and the endpoint re-resolved and compared field by field
+     with the sealed identity before contact. Missing authentication is an
+     actionable failure with the local result kept; refreshed authentication
+     for the same identity proceeds under the ordinary retry rules. The
+     regressions for fake credential markers, endpoint drift and refresh
+     belong to #745–#747.
