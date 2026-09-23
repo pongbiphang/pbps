@@ -84,6 +84,10 @@ The workload requests hostname `pbps-resolver`, DNS `127.0.0.1`, search `.` and
 option `ndots:0`. Docker then produces a fixed hostname, its standard loopback
 hosts file and resolver contents with fixed generated comments. Every byte is
 qualified: unknown layouts, extra search domains, addresses or comments refuse.
+The generated resolver file may name either `/etc/resolv.conf` or
+`/run/systemd/resolve/resolv.conf` in Docker's fixed source-path comment. Both
+complete layouts are measured; arbitrary paths and additional comments still
+refuse. The latter is selected when the host uses the systemd-resolved stub.
 A file must be a readable regular file on an actual read-only mount; missing,
 oversized, symlinked and unreadable files are not empty answers. A nonempty
 truncated file does not match the complete generated layout.
