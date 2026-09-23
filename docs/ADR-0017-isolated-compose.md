@@ -496,8 +496,8 @@ Every read, admission and write validates a record against the transitions that
 write it, not only against its own state's fields (#802). A pin is retired only
 under `Retiring`, after the snapshot, and the base pin before the commit pin.
 The keep-commit choice exists only from `Retiring` onward. A record combining
-these any other way cannot come from an interruption. It refuses with its
-recovery location and nothing consumes it. An unacknowledged base or commit
+these any other way cannot come from an interruption. Admission, discovery
+and recovery refuse it and nothing consumes it. An unacknowledged base or commit
 intent is the interruption the table above describes, and stays admissible.
 
 Before an alternate borrows source objects, an operation-specific private annotated
