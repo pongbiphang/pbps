@@ -26,6 +26,8 @@ TESTS = [
         "effective_descriptor_limits_are_required_before_initialization",
         "unreadable_effective_limits_are_not_a_bounded_answer",
         "masks::every_existing_proc_interface_requires_its_effective_mask",
+        "seccomp::reported_policy_and_filter_mode_cannot_replace_effective_bootstrap_probes",
+        "seccomp::the_owned_forwarder_requires_its_effective_process_and_fastopen_restrictions",
     ]
 ] + [
     # SQL file reads also inspect root-owned guards and mutate only the owned

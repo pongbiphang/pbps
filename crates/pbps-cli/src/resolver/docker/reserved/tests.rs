@@ -13,7 +13,13 @@ async fn a_reserved_runtime_has_no_database_until_its_fixed_bootstrap_gate_opens
     };
     let mut api = LocalApi::connect(&path).await.unwrap();
     let image = api.inspect_image(&image).await.unwrap().unwrap();
-    for action in ["cancel", "invalid", "release"] {
+    for action in [
+        "cancel",
+        "invalid",
+        "cancel-policy",
+        "cancel-qualified-policy",
+        "release",
+    ] {
         let mut reserved = ReservedSession::reserve_channels(
             LocalApi::connect(&path).await.unwrap(),
             LocalApi::connect(&path).await.unwrap(),
@@ -41,6 +47,21 @@ async fn a_reserved_runtime_has_no_database_until_its_fixed_bootstrap_gate_opens
             let mut session = reserved.release().await.unwrap();
             session.check().await.unwrap();
             session.close().await.unwrap();
+        } else if action == "cancel-policy" || action == "cancel-qualified-policy" {
+            reserved
+                .bootstrap
+                .write_all(b"pbps-seccomp-probe-v1\n")
+                .await
+                .unwrap();
+            reserved.bootstrap.flush().await.unwrap();
+            if action == "cancel-qualified-policy" {
+                let mut ready = [0; b"pbps-seccomp-ready-v1\n".len()];
+                reserved.bootstrap.read_exact(&mut ready).await.unwrap();
+                assert_eq!(&ready, b"pbps-seccomp-ready-v1\n");
+            }
+            // The probe request and its acknowledgement are neither a start
+            // command nor permission to revive a canceled session.
+            reserved.close().await.unwrap();
         } else if action == "invalid" {
             reserved
                 .bootstrap

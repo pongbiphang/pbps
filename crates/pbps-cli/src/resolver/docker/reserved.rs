@@ -155,7 +155,7 @@ impl ReservedSession {
         if let Err(cause) = gate.check(target) {
             return Err(self.close_failure(cause).await);
         }
-        let mut session = self.release().await?;
+        let mut session = self.release_with(|| gate.check(target)).await?;
         let checked = async {
             gate.check(target)?;
             session.capture_native()?;
@@ -216,7 +216,37 @@ impl ReservedSession {
         })
     }
 
-    pub(super) async fn release(mut self) -> Result<CandidateSession, StartFailure> {
+    #[cfg(test)]
+    pub(super) async fn release(self) -> Result<CandidateSession, StartFailure> {
+        self.release_with(|| Ok(())).await
+    }
+
+    async fn release_with(
+        mut self,
+        before_initialization: impl FnOnce() -> Result<(), Error>,
+    ) -> Result<CandidateSession, StartFailure> {
+        // Target separation and native containment precede this fixed probe.
+        // Keep initialization behind a second acknowledgement: a wrong filter,
+        // missing probe support or interrupted exchange must not release it.
+        let policy = async {
+            self.bootstrap.write_all(b"pbps-seccomp-probe-v1\n").await?;
+            self.bootstrap.flush().await?;
+            let mut ready = [0; b"pbps-seccomp-ready-v1\n".len()];
+            self.bootstrap.read_exact(&mut ready).await?;
+            if &ready != b"pbps-seccomp-ready-v1\n" {
+                return Err(std::io::Error::other("invalid seccomp readiness"));
+            }
+            Ok::<_, std::io::Error>(())
+        };
+        if !matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(15), policy).await,
+            Ok(Ok(()))
+        ) {
+            return Err(self.close_failure(Error::RuntimeChanged).await);
+        }
+        if let Err(cause) = before_initialization() {
+            return Err(self.close_failure(cause).await);
+        }
         let ready = async {
             self.bootstrap
                 .write_all(b"pbps-bootstrap-start-v1\n")

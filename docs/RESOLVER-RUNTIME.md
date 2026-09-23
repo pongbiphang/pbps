@@ -388,8 +388,10 @@ remained denied while the forwarder's remained allowed. See the kernel's
 contracts. No-new-privileges alone is not a sandbox: it does not remove already
 held capabilities or constrain a provisioning administrator's runtime-exec
 entry point. Namespace task observations therefore remain, alongside mount,
-network, cgroup, endpoint and exclusivity checks. Exact effective seccomp-policy
-attestation (#633/#684), source handling (#617) and other delivery gates are
+network, cgroup, endpoint and exclusivity checks. The factory and owned
+forwarders also require the fixed effective-policy
+probes below (#633). The supplied engine policy contract (#684), source
+handling (#617) and other delivery gates are
 not discharged by these launch measurements.
 
 Scratch also retains a weak witness to the target's live binding and its actual
@@ -402,6 +404,49 @@ socket/backend/service binding, and the candidate's workload/control containment
 and private channel. Failure discards the affected capability permanently, even
 without a preceding asynchronous continuity check; owned scratch cleanup follows
 the same drop path. This does not replace the engine re-read in that check.
+
+## Effective seccomp checks (#633)
+
+The factory checks actual prohibited-call behavior before engine initialization.
+A `Seccomp: 2` status and a Docker report matching the requested JSON are still
+necessary observations, but neither substitutes for this gate. Native target
+separation and containment qualification precede the probe; a separate fixed
+acknowledgement and a recheck of the retained native leases precede the
+engine-start command. Canceling either exchange removes the owned runtime.
+The fixed forwarder runs its own role-specific probe before accepting its
+private protocol channel, including forwarders used with supplied servers.
+
+The probe issues fixed harmless calls through x86-64, i386 `int 0x80`, and x32:
+workload `connect`, process inspection/descriptor theft, `unshare`, io_uring,
+`AF_VSOCK`, and all three send entry points with `MSG_FASTOPEN`. It also checks
+i386's multiplexed `socketcall(SYS_CONNECT)`. The intended derivative returns
+kernel `EPERM` before validating those calls' deliberately invalid operands.
+The forwarder omits the outbound-connect probes because that role must open
+the fixed private connection. Unknown results, missing interpreter support,
+unavailable ABI/memfd support, incomplete output and a failed probe refuse
+startup before declarations or scratch DDL. Ordinary compilation and real
+socket/SQL loopback negatives separately exercise the initialized engine.
+
+Safe Rust constructs a small fixed ELF with no dynamic loader, writable segment
+or compiler dependency. The supported engine images' existing Perl writes it
+to an anonymous memfd, seals it against writes/growth/shrinkage, and executes it
+with a close-on-exec descriptor. No extra image, host helper installation,
+persisted executable, writable executable mount or declaration-derived code
+is introduced. The file disappears when the probe exits. The bootstrap and its
+engine descendants inherit the same restrictions through fork/clone/exec;
+filters cannot be relaxed by those unprivileged descendants. Existing native
+process/session continuity checks remain in force. This does not add a global
+or continuous task census.
+
+This is a fixed behavioral qualification under DECISIONS 533's trusted
+provisioning premise, not equivalence checking of arbitrary BPF or resistance
+to an administrator deliberately providing probe-specific rules. It does not
+certify the filter of an already running supplied engine: that remains #684.
+The alternative kernel-read route was measured: `PTRACE_SECCOMP_GET_FILTER`
+requires a privileged unfiltered tracer and a stopped tracee, and equivalent
+Docker policies can differ in architecture-dispatch instruction ordering.
+The runtime therefore does not trace or stop target/scratch tasks to obtain a
+policy hash. DECISIONS 542 records the selected boundary.
 
 ## External containment
 
@@ -459,6 +504,16 @@ No start line is sent, so every refusal precedes engine initialization. Each
 owned container is removed before the test asserts its result. The new group
 and guard regressions failed on the previous implementation and passed after
 the checks were added; CI runs them for both engines.
+
+The launch runner also starts actual connect-permissive, Fast-Open-permissive,
+i386 socketcall-permissive and Docker-default filters. Their mode-only native
+checks still pass, and a simulated Docker report containing the expected policy
+passes the recipe check; the behavioral gate must refuse them. Missing probe
+support also refuses. The control fixture separately permits process inspection
+or Fast Open and requires refusal. The ordinary reserved-session test cancels
+both before and after the new policy acknowledgement; the private-channel test
+retains real-engine DDL, SQL-initiated extra-connection refusal, real-socket
+Fast Open refusal and terminal control-loss cleanup.
 
 The same runner also mutates only explicitly marked owned workload/control
 mount namespaces to test omitted masks, replacement devices, nonempty or
