@@ -4,7 +4,7 @@
 - Date: 2026-09-21
 - Supersedes: ADR-0015 decision 5's same-checkout publication protocol and
   PR #738's proposed DECISIONS 524 live-placement preview
-- Related: #744, #494, #745–#748, ADR-0006, DECISIONS 527
+- Related: #744, #494, #745–#748, ADR-0006, DECISIONS 527, 541
 
 ## Problem
 
@@ -218,7 +218,8 @@ The publisher never removes or rewrites a conflicting remote ref to make it fit.
 
 The following are separate representations, not two serialized views of a raw
 URL. A redacted display string or a hash of a secret-bearing URL is not a durable
-destination binding (#750).
+destination binding (#750). DECISIONS 541 records this policy
+and its trade-offs.
 
 | Representation | Contents and lifetime |
 | --- | --- |
