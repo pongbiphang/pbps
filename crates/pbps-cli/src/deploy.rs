@@ -5502,29 +5502,14 @@ async fn preflight(
             continue;
         }
         println!("\n{} {} affects:", target.verb(), report.target);
-        for r in &report.advisory {
-            let detail = r
-                .detail
-                .as_deref()
-                .map(|d| format!(" — {d}"))
-                .unwrap_or_default();
-            println!("  {} {}{detail}", r.kind, r.name);
+        for line in impact_lines(
+            &report,
+            &crate::engine::impact_notes(conn.driver(), &report),
+        ) {
+            println!("{line}");
         }
         for r in &report.blocking {
-            println!(
-                "  {} {} — SCHEMABINDING, which blocks the rename",
-                r.kind, r.name
-            );
             blocked.push(format!("{} {}", r.kind, r.name));
-        }
-        if !report.advisory.is_empty() {
-            // The list is of what the catalog can see. Applications, reports
-            // and downstream ELT are invisible to any query, and implying
-            // otherwise is worse than saying nothing.
-            println!(
-                "  Nothing outside the database is visible here: applications and downstream \
-                 consumers need a human's checklist."
-            );
         }
     }
     if !blocked.is_empty() {
@@ -5536,6 +5521,44 @@ async fn preflight(
     }
 
     run_probes(conn, dialect, &plan.changes).await
+}
+
+/// The body of one rename's impact report: what breaks, what blocks, and what
+/// the rename is carried into, each under its own wording.
+///
+/// `carried` used to be left out, so a PostgreSQL report holding only carried
+/// objects printed an "affects:" heading with nothing under it, and one that
+/// mixed them hid the half the engine handles (#307, DECISIONS 395). A carried
+/// object is never described as breaking or blocking. The notes are the
+/// engine's (`engine::impact_notes`), printed last: the list is of what the
+/// catalog can see, and applications and downstream ELT are invisible to any
+/// query.
+fn impact_lines(report: &pbps_db::impact::ImpactReport, notes: &[String]) -> Vec<String> {
+    let detail = |r: &pbps_db::impact::Referrer| {
+        r.detail
+            .as_deref()
+            .map(|d| format!(" — {d}"))
+            .unwrap_or_default()
+    };
+    let mut out = Vec::new();
+    for r in &report.advisory {
+        out.push(format!("  {} {}{}", r.kind, r.name, detail(r)));
+    }
+    for r in &report.blocking {
+        out.push(format!(
+            "  {} {} — SCHEMABINDING, which blocks the rename",
+            r.kind, r.name
+        ));
+    }
+    for r in &report.carried {
+        out.push(format!(
+            "  {} — carried into the new name, keeps working{}",
+            r.name,
+            detail(r)
+        ));
+    }
+    out.extend(notes.iter().map(|n| format!("  {n}")));
+    out
 }
 
 /// What this plan implies about the data, asked of the engine (SPEC §7.5).
@@ -6378,6 +6401,102 @@ mod tests {
     }
 
     use super::*;
+
+    fn referrer(kind: &str, name: &str, detail: Option<&str>) -> pbps_db::impact::Referrer {
+        pbps_db::impact::Referrer {
+            kind: kind.to_owned(),
+            name: name.to_owned(),
+            detail: detail.map(ToOwned::to_owned),
+        }
+    }
+
+    /// #307: a PostgreSQL report holding only carried objects printed an
+    /// "affects:" heading with nothing under it. Each carried object is now a
+    /// line of its own, with the engine's note about what carrying means.
+    #[test]
+    fn a_carried_only_report_prints_what_it_carries() {
+        let report = pbps_db::impact::ImpactReport {
+            target: "app.t.label".to_owned(),
+            carried: vec![referrer("carried", "rule _RETURN on view outside.v", None)],
+            ..Default::default()
+        };
+        let lines = impact_lines(
+            &report,
+            &crate::engine::impact_notes(pbps_db::Driver::Postgres, &report),
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("view outside.v")
+                && l.contains("carried into the new name, keeps working")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("keeps its old output column name")),
+            "{lines:#?}"
+        );
+    }
+
+    /// The negative half of #307: in a mixed report a carried object is never
+    /// described as breaking or blocking, and an advisory one is never
+    /// described as carried.
+    #[test]
+    fn a_carried_object_is_not_described_as_broken_or_blocking() {
+        let report = pbps_db::impact::ImpactReport {
+            target: "app.t.label".to_owned(),
+            advisory: vec![referrer("function", "outside.text_body()", None)],
+            carried: vec![referrer("carried", "rule _RETURN on view outside.v", None)],
+            ..Default::default()
+        };
+        let lines = impact_lines(
+            &report,
+            &crate::engine::impact_notes(pbps_db::Driver::Postgres, &report),
+        );
+        let carried: Vec<&String> = lines.iter().filter(|l| l.contains("outside.v")).collect();
+        assert_eq!(carried.len(), 1, "{lines:#?}");
+        assert!(!carried[0].contains("SCHEMABINDING"), "{lines:#?}");
+        let advisory: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("outside.text_body"))
+            .collect();
+        assert_eq!(advisory.len(), 1, "{lines:#?}");
+        assert!(!advisory[0].contains("carried"), "{lines:#?}");
+    }
+
+    /// SQL Server's output is unchanged: it carries nothing, and says what no
+    /// catalog can see only under an advisory list.
+    #[test]
+    fn sql_server_impact_output_is_unchanged() {
+        let report = pbps_db::impact::ImpactReport {
+            target: "dbo.t.email".to_owned(),
+            advisory: vec![referrer("procedure", "dbo.p", Some("reads it by name"))],
+            blocking: vec![referrer("view", "dbo.v", None)],
+            ..Default::default()
+        };
+        assert_eq!(
+            impact_lines(
+                &report,
+                &crate::engine::impact_notes(pbps_db::Driver::Mssql, &report)
+            ),
+            [
+                "  procedure dbo.p — reads it by name",
+                "  view dbo.v — SCHEMABINDING, which blocks the rename",
+                "  Nothing outside the database is visible here: applications and downstream \
+                 consumers need a human's checklist.",
+            ]
+        );
+        let blocking_only = pbps_db::impact::ImpactReport {
+            advisory: Vec::new(),
+            ..report
+        };
+        assert_eq!(
+            impact_lines(
+                &blocking_only,
+                &crate::engine::impact_notes(pbps_db::Driver::Mssql, &blocking_only)
+            ),
+            ["  view dbo.v — SCHEMABINDING, which blocks the rename"]
+        );
+    }
 
     #[test]
     fn intermediate_names_are_absent_unless_the_plan_deliberately_reuses_them() {
