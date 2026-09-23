@@ -224,3 +224,128 @@ fn transport_loss_and_a_lost_acknowledgement_are_not_proof_of_no_write() {
         assert_eq!(pushes(&f), ["cert"]);
     }
 }
+
+fn refused_unsigned_or_unusable(
+    f: &Fixture,
+    preview: &Preview,
+    result: &Outcome,
+    problem: Problem,
+) {
+    assert_eq!(result.local, LocalState::Present, "{result:?}");
+    assert_eq!(result.remote, DeliveryState::NotAttempted, "{result:?}");
+    assert_eq!(result.problem, Some(problem), "{result:?}");
+    assert_eq!(f.remote_ref(&preview.output_ref), None);
+    assert!(pushes(f).is_empty());
+}
+
+#[test]
+fn every_push_signing_spelling_git_accepts_selects_its_mode() {
+    // Against a server without certificates: a required spelling refuses
+    // before the attempt, a disabled one delivers unsigned. Against one with
+    // them, if-asked in any case sends a certificate.
+    for (value, certificates, expected) in [
+        ("yes", false, "required"),
+        ("on", false, "required"),
+        ("1", false, "required"),
+        ("TRUE", false, "required"),
+        ("bare", false, "required"),
+        ("no", true, "none"),
+        ("off", true, "none"),
+        ("0", true, "none"),
+        ("IF-ASKED", true, "cert"),
+        ("If-Asked", false, "none"),
+        ("bogus", true, "unusable"),
+    ] {
+        let f = Fixture::new(&format!("push-sign-spelling-{value}"));
+        destination(&f, certificates);
+        signer(&f, None);
+        if value == "bare" {
+            let config = f.repo.root.join(".git/config");
+            let mut text = fs::read_to_string(&config).unwrap();
+            text.push_str("[push]\n\tgpgSign\n");
+            fs::write(&config, text).unwrap();
+        } else {
+            git(&f.repo.root, &["config", "push.gpgSign", value]);
+        }
+        let (_store, preview, candidate) = f.ready();
+        let result = f.publisher().confirm(&candidate);
+        match expected {
+            "required" => {
+                refused_unsigned_or_unusable(&f, &preview, &result, Problem::PushSigningUnsupported)
+            }
+            "unusable" => {
+                refused_unsigned_or_unusable(&f, &preview, &result, Problem::SigningUnavailable)
+            }
+            carried => {
+                assert_eq!(result.status, Status::Delivered, "{value}: {result:?}");
+                assert_eq!(pushes(&f), [carried], "{value}");
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "subprocess run under a counting git wrapper by the single-read regression"]
+fn push_signing_count_child() {
+    let repository = PathBuf::from(std::env::var("PBPS_PUSH_SIGNING_REPOSITORY").unwrap());
+    let mut candidates = Candidates::new(Config {
+        executable: BIN.into(),
+        project: repository.join("project"),
+        deadline: Duration::from_secs(30),
+    });
+    let now = SystemTime::now();
+    let preview = candidates.preview(request(), now).unwrap();
+    let candidate = candidates.confirm(&preview.candidate_id, now).unwrap();
+    let result = Publications::open(&repository, Duration::from_secs(15))
+        .unwrap()
+        .confirm(&candidate);
+    assert_eq!(result.status, Status::Delivered, "{result:?}");
+}
+
+#[test]
+fn one_publication_reads_the_push_signing_mode_once() {
+    // PATH is process-wide, so the counting wrapper applies only to a child.
+    let f = Fixture::new("push-sign-single-read");
+    destination(&f, true);
+    signer(&f, Some("true"));
+    let real = String::from_utf8(checked(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap(),
+    ))
+    .unwrap();
+    let bin = f.repo.root.join(".git/counting-bin");
+    fs::create_dir(&bin).unwrap();
+    let log = f.repo.root.join(".git/push-signing-reads");
+    fs::write(
+        bin.join("git"),
+        format!(
+            "#!/bin/sh\ncase \" $* \" in *\" push.gpgSign \"*) echo read >> '{}';; esac\nexec '{}' \"$@\"\n",
+            log.display(),
+            real.trim()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "publication::push_signing::push_signing_count_child",
+            "--nocapture",
+        ])
+        .env("PATH", path)
+        .env("PBPS_PUSH_SIGNING_REPOSITORY", &f.repo.root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(pushes(&f), ["cert"]);
+    let reads = fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(reads.lines().count(), 1, "push.gpgSign reads: {reads:?}");
+}

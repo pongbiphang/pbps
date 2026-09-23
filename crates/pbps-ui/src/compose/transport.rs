@@ -117,21 +117,25 @@ impl PushSigning {
 }
 
 pub(super) fn push_signing(git: &Git) -> Result<PushSigning> {
-    let Some(value) = git.config("push.gpgSign")? else {
-        return Ok(PushSigning::Never);
-    };
-    if value.eq_ignore_ascii_case("if-asked") {
-        return Ok(PushSigning::IfAsked);
-    }
-    // Git owns boolean spelling, including bare keys; anything else is a
-    // configuration Git itself refuses, not a weaker requirement.
-    match git
-        .line(&["config", "--type=bool", "--get", "push.gpgSign"])?
-        .as_str()
-    {
-        "true" => Ok(PushSigning::Required),
-        "false" => Ok(PushSigning::Never),
-        _ => Err(Error::new("Unusable push signing policy")),
+    // One read: a second `git config` would let a concurrent writer change
+    // the value between them (#825). Git normalizes boolean spellings,
+    // including a bare key, and returns any other string verbatim.
+    let answer = git.output(
+        &["config", "--type=bool-or-str", "--get", "push.gpgSign"],
+        &[],
+        None,
+    )?;
+    match answer.status.code() {
+        Some(0) => match super::git::text(answer.stdout)?.as_str() {
+            "true" => Ok(PushSigning::Required),
+            "false" => Ok(PushSigning::Never),
+            value if value.eq_ignore_ascii_case("if-asked") => Ok(PushSigning::IfAsked),
+            // Anything else is a configuration Git itself refuses, not a
+            // weaker requirement.
+            _ => Err(Error::new("Unusable push signing policy")),
+        },
+        Some(1) if answer.stdout.is_empty() && answer.stderr.is_empty() => Ok(PushSigning::Never),
+        _ => Err(Error::new("Could not determine push signing policy")),
     }
 }
 
