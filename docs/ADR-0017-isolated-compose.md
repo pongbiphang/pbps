@@ -612,7 +612,10 @@ reconciliation path but is not process death.
 Each kill regression was checked against a restored defect: disabling the
 recovery transitions from `LocalAttempt` to `LocalPublished` and from
 `Attempted` to `Delivered`, or letting ordinary retry replay an authorized
-push, fails the corresponding `process_death.rs` cases; accepting any receipt
+push, fails the corresponding `process_death.rs` cases, as does recovery that
+runs `commit-tree` or `git push` again: a changed committer identity makes a
+repeated commit a new object, and the loopback server logs every push request,
+including one with nothing to update. Accepting any receipt
 version fails `removed_states.rs`; and a child launched without the core-limit
 wrapper under an unlimited parent limit fails its in-child assertion.
 

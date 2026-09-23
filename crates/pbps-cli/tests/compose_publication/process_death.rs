@@ -7,6 +7,7 @@
 //! `PublicationBoundary`, so each kill lands on the operation it names rather
 //! than on a phase that merely shares its name.
 
+use super::http::Http;
 use super::*;
 use std::io::{BufRead, BufReader};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -191,6 +192,13 @@ fn death_after_commit_creation_never_yields_a_second_commit() {
     let id = killed_at(&f, "commit-created", "");
     // commit-tree ran; nothing durable names its result yet.
     assert_eq!(receipt(&f, &id)["state"]["phase"], "preparing");
+    // A repeated commit-tree with the same inputs within the same second
+    // would reproduce the same OID. A new committer identity makes any
+    // further invocation a new object, so the count can observe it.
+    git(
+        &f.repo.root,
+        &["config", "user.email", "after-death@example.test"],
+    );
     let objects = commits(&f);
     let mut publisher = f.publisher();
     let first = publisher.recover(&id);
@@ -200,6 +208,12 @@ fn death_after_commit_creation_never_yields_a_second_commit() {
         assert_eq!(publisher.retry(&id), first);
     }
     assert_eq!(commits(&f), objects, "retry invoked commit creation again");
+    // The detector itself: one more invocation right now is a new object.
+    git(
+        &f.repo.root,
+        &["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "probe"],
+    );
+    assert_eq!(commits(&f), objects + 1);
     assert_eq!(local_ref(&f, &id), None);
     assert_eq!(f.remote_ref(&format!("refs/heads/pbps-compose/{id}")), None);
     assert_eq!(receipt(&f, &id)["state"]["phase"], "preparing");
@@ -231,9 +245,21 @@ fn death_after_the_local_ref_is_installed_resumes_that_exact_commit() {
     source_intact(&f, &before);
 }
 
+/// The destination is the loopback smart-HTTP server, which logs every
+/// request: a push, even one with nothing left to update, is observable.
+fn over_http(f: &Fixture) -> Http {
+    let http = Http::new(f);
+    git(
+        &f.repo.root,
+        &["remote", "set-url", "origin", &http.endpoint()],
+    );
+    http
+}
+
 #[test]
 fn death_after_the_remote_attempt_intent_needs_informed_republish() {
     let f = Fixture::new("death-remote-attempt");
+    let http = over_http(&f);
     let before = f.repo.preserved();
     let id = killed_at(&f, "remote-attempt", "");
     let state = receipt(&f, &id)["state"].clone();
@@ -241,7 +267,8 @@ fn death_after_the_remote_attempt_intent_needs_informed_republish() {
     let exact = state["commit"].as_str().unwrap().to_owned();
     let output_ref = format!("refs/heads/pbps-compose/{id}");
     // The push never ran, but the durable intent says it may have.
-    assert_eq!(f.remote_ref(&output_ref), None);
+    assert_eq!(http.push_requests(), 0);
+    assert_eq!(http.reviewed_ref(&output_ref), None);
     let mut publisher = f.publisher();
     let recovered = publisher.recover(&id);
     // The local result stands; absence after an authorized attempt is unknown
@@ -250,28 +277,50 @@ fn death_after_the_remote_attempt_intent_needs_informed_republish() {
     assert_eq!(recovered.remote, DeliveryState::Unknown, "{recovered:?}");
     // Ordinary retry reconciles; it never replays an authorized attempt.
     assert_eq!(publisher.retry(&id), recovered);
-    assert_eq!(f.remote_ref(&output_ref), None);
+    assert_eq!(http.push_requests(), 0, "recovery or retry pushed");
     let republished = publisher.republish(&id, &generation(&recovered));
     assert_eq!(republished.status, Status::Delivered, "{republished:?}");
     assert_eq!(commit(&republished), exact);
-    assert_eq!(f.remote_ref(&output_ref).as_deref(), Some(exact.as_str()));
+    assert!(http.push_requests() > 0);
+    assert_eq!(
+        http.reviewed_ref(&output_ref).as_deref(),
+        Some(exact.as_str())
+    );
     source_intact(&f, &before);
 }
 
 #[test]
 fn death_after_the_push_finds_the_delivered_commit_without_pushing_again() {
     let f = Fixture::new("death-push-finished");
+    let http = over_http(&f);
     let before = f.repo.preserved();
     let id = killed_at(&f, "push-finished", "");
     let state = receipt(&f, &id)["state"].clone();
     assert_eq!(state["remote"]["phase"], "attempted");
     let exact = state["commit"].as_str().unwrap().to_owned();
     let output_ref = format!("refs/heads/pbps-compose/{id}");
-    assert_eq!(f.remote_ref(&output_ref).as_deref(), Some(exact.as_str()));
+    assert_eq!(
+        http.reviewed_ref(&output_ref).as_deref(),
+        Some(exact.as_str())
+    );
+    let pushed = http.push_requests();
+    assert!(pushed > 0);
     let recovered = f.publisher().recover(&id);
     assert_eq!(recovered.status, Status::Delivered, "{recovered:?}");
     assert_eq!(commit(&recovered), exact);
     assert_eq!(receipt(&f, &id)["state"]["remote"]["phase"], "delivered");
+    assert_eq!(http.push_requests(), pushed, "recovery pushed again");
+    // The detector itself: an up-to-date push still reaches the server.
+    git(
+        &f.repo.root,
+        &[
+            "push",
+            "-q",
+            &http.endpoint(),
+            &format!("{exact}:{output_ref}"),
+        ],
+    );
+    assert!(http.push_requests() > pushed);
     source_intact(&f, &before);
 }
 

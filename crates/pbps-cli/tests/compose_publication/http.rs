@@ -8,7 +8,7 @@ use std::sync::{
 };
 use std::thread;
 
-struct Http {
+pub(super) struct Http {
     address: std::net::SocketAddr,
     mode: Arc<AtomicU8>,
     paths: Arc<Mutex<Vec<String>>>,
@@ -17,7 +17,7 @@ struct Http {
     root: PathBuf,
 }
 impl Http {
-    fn new(f: &Fixture) -> Self {
+    pub(super) fn new(f: &Fixture) -> Self {
         let root = f.repo.root.with_extension("http");
         fs::create_dir(&root).unwrap();
         for name in ["reviewed.git", "observation.git", "publication.git"] {
@@ -56,8 +56,30 @@ impl Http {
             root,
         }
     }
-    fn endpoint(&self) -> String {
+    pub(super) fn endpoint(&self) -> String {
         format!("http://{}/reviewed.git", self.address)
+    }
+    /// Every push, even one with nothing to update, first asks for the
+    /// receive-pack advertisement; observation uses upload-pack instead.
+    pub(super) fn push_requests(&self) -> usize {
+        self.paths
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| path.contains("service=git-receive-pack"))
+            .count()
+    }
+    pub(super) fn reviewed_ref(&self, reference: &str) -> Option<String> {
+        let result = Command::new("git")
+            .arg("-C")
+            .arg(self.root.join("reviewed.git"))
+            .args(["rev-parse", "--verify", "--quiet", reference])
+            .output()
+            .unwrap();
+        result
+            .status
+            .success()
+            .then(|| String::from_utf8(result.stdout).unwrap().trim().to_owned())
     }
     fn serve(
         mut stream: TcpStream,
