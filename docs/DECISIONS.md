@@ -14512,3 +14512,35 @@ SPEC is in sync with all of these.
      table already has (538's accepted shape), or remove the block, apply the
      key change, and declare the rows again. With this, 538's sentence holds
      as written; the refusal itself is unchanged.
+
+540. **SQL Server floats are rendered through a bounded `varchar(99)` before
+     widening to `nvarchar(max)`.** (#286, #288.) SPEC §4.6 has a cell spelled
+     the engine's way, and DECISIONS 149 has every recorded-cell comparison
+     share one rendering, so `float` and `real` are read with the
+     round-trippable style 3. The direct form is not usable on SQL Server
+     17.0.4075.5 (2025 RTM-CU8), measured on the pinned test image:
+
+     ```text
+     CONVERT(nvarchar(max), CAST(-255 AS float), 3)
+       Msg 8115: Arithmetic overflow error converting expression to data type nvarchar.
+     CONVERT(varchar(max), CAST(-255 AS float), 3)
+       Msg 232: Arithmetic overflow error for type varchar, value = -255.000000.
+     CONVERT(nvarchar(max), CONVERT(varchar(99), CAST(-255 AS float), 3))
+       -2.5500000000000000e+002
+     ```
+
+     The same holds for `-1.7976931348623157E+308`, while `0.1` and a `real`
+     `1.5` render identically on all three paths. So it is a fault of the MAX
+     conversion path on valid values, not of style 3 or of the value, and the
+     inner conversion to a bounded type is the workaround; the outer one only
+     widens text and applies no style.
+
+     Why 99 rather than an exact width: style 3 always prints a signed
+     17-digit mantissa and a signed three-digit exponent, so the longest
+     rendering is 24 characters (`-1.7976931348623157e+308`). Any bound at or
+     above that is equivalent, and one below it fails loudly rather than
+     truncating: measured, `varchar(23)` raises the same Msg 232 for that
+     value and `varchar(24)` renders it. A generous bound costs nothing and
+     keeps a future engine that pads differently from failing every read of
+     an extreme value. The rendering read back is unchanged, so no recorded
+     state moves.
