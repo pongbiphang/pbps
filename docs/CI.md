@@ -98,7 +98,7 @@ has no `url:` field for the same reason.
 
 | Secret | Used by | Notes |
 |---|---|---|
-| `PBPS_PROD_URL` | `plan --env prod`, `verify`, `apply`, `status` | ADO.NET form: `Server=host,1433;Database=app;UID=u;Password=p;TrustServerCertificate=true`. `UID=` rather than the more usual `User Id=`, because the space would stop GitLab masking it — see below. An **environment** secret / **protected** variable — see "Who can reach the credential" |
+| `PBPS_PROD_URL` | `plan --env prod`, `verify`, `apply`, `status` | ADO.NET form: `Server=host,1433;Database=app;UID=u;Password=p;TrustServerCertificate=true`. `UID=` rather than the more usual `User Id=`, because the space would stop GitLab masking it — see below. For PostgreSQL, a libpq string or `postgres://` URL; one that names no `sslmode` is connected with **verified** TLS (the server's certificate chain and host name, against the runner's trust store — DECISIONS 543), so write `sslmode=disable` only for a server without TLS on a network you trust. An **environment** secret / **protected** variable — see "Who can reach the credential" |
 | `PBPS_STAGING_URL` | the same, for staging | a separate account, with the same permissions |
 | `PBPS_PROD_URL` on `monitoring` | `verify`, `status` | the drift watch's copy. `verify` reads and writes nothing, so this one is a **read-only** account |
 | the plan's SHA-256 | `apply --checksum` | the explicit approval, supplied by whoever approved at the moment they approve. Current ordinary plans use a `workflow_dispatch` input on GitHub or a manual-job variable on GitLab; future confidential resolver plans have the additional handling rule below |

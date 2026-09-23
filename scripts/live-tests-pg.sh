@@ -65,8 +65,8 @@ done
 
 # A libpq keyword string rather than a URL: both are accepted, and this one
 # does not need the password percent-encoded.
-export PBPS_TEST_PG_DB="host=localhost port=$PORT user=postgres password=$PASSWORD dbname=$DB"
-export PBPS_TEST_PG_OLD_DB="host=localhost port=$OLD_PORT user=postgres password=$PASSWORD dbname=$DB"
+export PBPS_TEST_PG_DB="host=localhost port=$PORT user=postgres password=$PASSWORD dbname=$DB sslmode=disable"
+export PBPS_TEST_PG_OLD_DB="host=localhost port=$OLD_PORT user=postgres password=$PASSWORD dbname=$DB sslmode=disable"
 # The script-output regression uses this server's psql, including its lexer.
 export PBPS_TEST_PG_CONTAINER="$NAME"
 

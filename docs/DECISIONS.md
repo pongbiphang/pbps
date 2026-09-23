@@ -14625,3 +14625,34 @@ SPEC is in sync with all of these.
      probe-specific behavior. Real-engine compilation, additional loopback
      connections, valid-socket Fast Open attempts, wrong-policy bootstrap
      refusal and actual removed-probe controls pin the supported contract.
+
+543. **A PostgreSQL connection string that names no `sslmode` is connected
+     with verified TLS, not the driver's `prefer`.** (#311.) `prefer` sends
+     the SSL request and, when a server answers "N", carries on in
+     cleartext; anything that can answer on the port can then ask for a
+     cleartext password and receive the deployment credential. The security
+     review of #298 reproduced exactly that through `pbps doctor`. With
+     `require`, this crate's rustls connector verifies the chain against the
+     host's trust store and the host name (`postgres::tls`), so the unwritten
+     default is the authenticated one.
+
+     A written `sslmode` is honoured, `disable` and `prefer` included. Those
+     are an operator's decision about a network they know — a local
+     container, a socket inside one host — and refusing them would push
+     people to a different tool rather than to TLS. What changes is that the
+     insecure choice has to be spelled out where a reviewer can see it; the
+     error for a server that refuses TLS under the default says to add
+     `sslmode=disable`, and only on that failure, not on a refused socket or
+     a timeout.
+
+     "Names" is the driver's parser's answer, not a second parser here: the
+     string is parsed again with `sslmode=disable` placed before its own
+     keys, and the two agree exactly when the string names one. A scan
+     written here would have to agree with the driver on quoting, escapes
+     and the URL form, and every disagreement would be a silent `prefer`. A
+     probe the driver cannot parse is read as unnamed, which falls on the
+     verified side.
+
+     The test and CI configurations name `sslmode=disable` for their
+     TLS-less throwaway servers. `connect_verified` (the resolver's peer
+     hop) is unchanged: it still refuses anything but an explicit `require`.

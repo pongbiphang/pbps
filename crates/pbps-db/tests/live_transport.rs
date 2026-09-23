@@ -70,6 +70,31 @@ async fn verified_round_trips_reject_wrong_peers_and_corrupted_replies() {
             .await
             .is_err()
     );
+    // #311: the ordinary connection, with no `sslmode` in the string, gets
+    // the same verified TLS — a trusted server round-trips, and the same
+    // server under a name its certificate does not carry is refused.
+    if driver() == Driver::Postgres {
+        let unnamed = |host: &str| {
+            format!(
+                "host={host} port={} user=postgres password=Pbps!Test12345 dbname=postgres",
+                port()
+            )
+        };
+        let mut ordinary = pbps_db::Conn::connect(Driver::Postgres, &unnamed("localhost"))
+            .await
+            .unwrap_or_else(|e| panic!("a trusted server under the default: {e}"));
+        let rows = ordinary
+            .query("SELECT CAST(ssl AS INT) AS value FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
+            .await
+            .unwrap();
+        assert_eq!(rows[0].try_get::<i32>("value").unwrap(), Some(1));
+        assert!(
+            pbps_db::Conn::connect(Driver::Postgres, &unnamed("127.0.0.1"))
+                .await
+                .is_err(),
+            "a certificate for localhost accepted for 127.0.0.1 under the default"
+        );
+    }
     if driver() == Driver::Mssql {
         let ca = std::env::var("PBPS_TEST_TLS_CA").unwrap();
         let mut custom = PeerVerifiedConn::connect(
