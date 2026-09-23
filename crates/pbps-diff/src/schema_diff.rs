@@ -68,6 +68,19 @@ pub enum DiffError {
     )]
     DataBaselineKeyAbsent { table: TableName },
 
+    /// A baseline without a primary key, restored by this plan on a column
+    /// the baseline does not have. Not [`Self::DataKeyColumnChanged`]: there
+    /// was no key to move, and "rename the column instead" does not apply.
+    /// The recorded rows were keyed before that column existed, so none of
+    /// their keys are its values (DECISIONS 539).
+    #[error(
+        "{table} has no baseline primary key and this plan restores it on `{column}`, a column \
+         the baseline does not have, so the recorded data rows cannot be matched to the declared \
+         ones. Restore the key on a column the table already has, or remove the block, apply \
+         the key change, then declare the rows again"
+    )]
+    DataBaselineKeyOnNewColumn { table: TableName, column: String },
+
     #[error("{table} has a baseline primary key with {} columns ({columns:?}); pbps matches data rows only on a single-column key", columns.len())]
     DataBaselineKeyNotSingle {
         table: TableName,
@@ -1237,8 +1250,9 @@ fn diff_data(
                 {
                     // Adding a new key column cannot recover the identity of
                     // retained rows: their map keys predate that column.
-                    Some(DiffError::DataKeyColumnChanged {
+                    Some(DiffError::DataBaselineKeyOnNewColumn {
                         table: name.clone(),
+                        column: key_column.clone(),
                     })
                 } else {
                     None
@@ -3073,8 +3087,17 @@ mod tests {
         diff_data(&name, &base, &declared, &mapping, &mut changes, &mut errors);
         assert_eq!(
             errors,
-            vec![DiffError::DataKeyColumnChanged { table: name }]
+            vec![DiffError::DataBaselineKeyOnNewColumn {
+                table: name,
+                column: "new_code".to_owned(),
+            }]
         );
+        // The baseline had no key, so nothing moved: the diagnostic must not
+        // say it did, nor advise a rename that has nothing to rename (#808).
+        let message = errors[0].to_string();
+        assert!(!message.contains("moved"), "{message}");
+        assert!(!message.contains("rename"), "{message}");
+        assert!(message.contains("`new_code`"), "{message}");
         assert_eq!(changes.len(), 1, "{changes:?}");
     }
 
