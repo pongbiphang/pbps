@@ -424,6 +424,25 @@ records for another source sharing the common directory are retained and exclude
 from that view; unknown versions, malformed records and a changed identity at the
 same source path still refuse. Per-operation reads and mutations keep the stricter
 source identity check, so filtering never authorizes another worktree's cleanup.
+Discovery and new-resource admission also census `refs/pbps-compose` (#783).
+Read both loose and packed evidence without following symlinks and corroborate
+it with Git's direct-ref enumeration. Physical names and byte fingerprints prove
+census coverage and stability; Git decodes the ref values, including its accepted
+uppercase OIDs and loose-ref whitespace. Only its canonical direct-ref values are
+compared with recorded ownership. Git-owned ref files use bounded regular-file
+reads without private-record UID or link-count restrictions, permitting shared
+repository metadata; private resource records keep their stricter ownership
+policy. Repeat the physical census to refuse a
+changing view, including refs moving between packed and loose storage. Each
+surviving pin requires a valid resource record for the same common directory
+and its recorded, non-retired value before source-worktree filtering. Missing,
+malformed, symbolic, unreadable or incomplete evidence refuses with a recovery
+location. Correlation never acknowledges an interrupted acquisition, deletes an
+orphan, or reconstructs a candidate. Empty operation directories left by Git
+are harmless; unknown namespace shapes are not. The packed table uses the
+existing 64 MiB evidence bound, and the census admits at most two pins per
+32,768 resource records; exceeding a bound refuses rather than truncates.
+
 The retained `owner.lock` inode
 serializes publishers. A short `resources.lock` lease serializes resource
 transitions, so capture does not require closing the publisher. Explicit checked
