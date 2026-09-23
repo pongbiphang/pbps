@@ -235,7 +235,7 @@ fn written(value: &Value) -> Option<String> {
 /// (the line 80 drew), and not `NULL`, which references no row.
 fn constant_default(default: &str) -> Option<&str> {
     let d = unwrapped(default);
-    (crate::rows::is_constant(d) && !d.eq_ignore_ascii_case("null")).then_some(d)
+    (crate::rows::is_constant(d) && !is_null_default(d)).then_some(d)
 }
 
 fn assigned_default(default: &str, ty: Option<&ColumnType>) -> String {
@@ -249,10 +249,13 @@ fn assigned_default(default: &str, ty: Option<&ColumnType>) -> String {
     }
 }
 
-/// `NULL` under any number of parentheses: a default that references no
-/// row, and so is neither an arrival nor a write the probe has to refuse.
+/// `NULL` under any number of parentheses and comments: a default that
+/// references no row, and so is neither an arrival nor a write the probe has
+/// to refuse. Asked of the comment-aware reader rather than of the raw text,
+/// because [`crate::rows::is_constant`] already reads `NULL /* reason */` as a
+/// literal, and the two disagreeing dropped the required-add probe (#297).
 fn is_null_default(default: &str) -> bool {
-    unwrapped(default).eq_ignore_ascii_case("null")
+    crate::rows::is_null_literal(default)
 }
 
 fn unwrapped(default: &str) -> &str {
@@ -2107,6 +2110,66 @@ mod tests {
             column: Box::new(column),
         });
         assert_eq!(sql, ["SELECT COUNT(*) AS n FROM [dbo].[customer];"]);
+    }
+
+    /// #297: a commented `NULL` is still `NULL`. `is_constant` reads it as a
+    /// literal, so the raw-text check that stopped at the comment took it for
+    /// a non-null constant and returned no probe for a change the engine
+    /// refuses on any nonempty table.
+    #[test]
+    fn a_commented_null_default_does_not_hide_the_required_add_probe() {
+        for default in [
+            "NULL /* reason */",
+            "/* reason */ NULL",
+            "(/* a /* nested */ comment */ NULL)",
+            "((NULL) /* reason */)",
+            "NULL -- reason",
+            "-- reason\nNULL",
+        ] {
+            let mut column = pbps_model::Column::new(ty("int"));
+            column.nullable = false;
+            column.default = Some(default.into());
+            let sql = sql_of(&Change::AddColumn {
+                uid: uid("c_aaaaaa"),
+                table: tname("dbo.customer"),
+                name: "score".into(),
+                column: Box::new(column),
+            });
+            assert_eq!(
+                sql,
+                ["SELECT COUNT(*) AS n FROM [dbo].[customer];"],
+                "default {default:?}"
+            );
+        }
+    }
+
+    /// The negative half of #297: a comment is trivia, not a value. A literal
+    /// that fills every row stays unprobed however it is commented, a comment
+    /// that merely *says* NULL is not one, and an unterminated comment is not
+    /// read at all.
+    #[test]
+    fn a_comment_does_not_turn_a_value_into_null() {
+        for default in [
+            "1 /* NULL */",
+            "/* NULL */ 1",
+            "'NULL' /* reason */",
+            "0 -- NULL",
+            "NULL /* unterminated",
+        ] {
+            let mut column = pbps_model::Column::new(ty("int"));
+            column.nullable = false;
+            column.default = Some(default.into());
+            let sql = sql_of(&Change::AddColumn {
+                uid: uid("c_aaaaaa"),
+                table: tname("dbo.customer"),
+                name: "score".into(),
+                column: Box::new(column),
+            });
+            assert!(
+                !sql.contains(&"SELECT COUNT(*) AS n FROM [dbo].[customer];".to_owned()),
+                "default {default:?} produced: {sql:?}"
+            );
+        }
     }
 
     #[test]
