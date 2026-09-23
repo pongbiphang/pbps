@@ -14470,3 +14470,30 @@ SPEC is in sync with all of these.
      `Dialect::probe_framing` is required, not defaulted, for the reason
      `transaction_framing` is. SQL Server answers `None`: a T-SQL function
      cannot modify data, so a declared `CHECK` has nothing to set off.
+
+538. **A baseline with no primary key has its retained rows matched on the
+     declared key, but only when the same plan restores that key on a column
+     the baseline already has.** (#124, #280; ADR-0004 §2.) Row identity in a
+     data block is the key column's value, and each side's row keys are
+     values of that side's key. A baseline without a primary key has no key
+     of its own to compare against, and the obvious reading — "the key moved"
+     — is wrong: nothing moved, it is absent, and the diagnostic said
+     something false.
+
+     Matching on the declared key is sound in exactly one shape: the plan
+     carries `SetPrimaryKey { from: None, to }` for that table with the
+     single declared key column, and that column maps by uid to a column the
+     baseline already has. Then the retained rows' keys are values of the
+     same column on both sides, and `UpdateRow`, `InsertRow` and `DeleteRow`
+     compare like with like. The differ can see the restoration because the
+     constraint diff runs before the data diff and its changes are already
+     in the list.
+
+     Every other shape is refused, each with its own diagnostic rather than
+     a moved-key one: no restoration in the plan (`DataBaselineKeyAbsent`),
+     a restored key on a column added by this plan, whose values the
+     baseline's rows predate (`DataKeyColumnChanged`), and a baseline key
+     with more than one column (`DataBaselineKeyNotSingle`). Inferring a key
+     without the restoration was rejected: a plan that leaves the table
+     keyless would then have its row changes matched on a uniqueness the
+     engine does not enforce.
