@@ -187,17 +187,38 @@ fn smart_http_redirects_cannot_override_the_reviewed_destination() {
         let http = Http::new(&f);
         let endpoint = http.endpoint();
         git(&f.repo.root, &["remote", "set-url", "origin", &endpoint]);
-        // More specific inherited URL matching must not restore redirects.
+        // More specific inherited URL matching must not restore redirects,
+        // including scopes naming the request paths Git later fetches (#769).
         for url in [
-            &endpoint,
-            &format!("{endpoint}/"),
-            &format!("http://{}/", http.address),
+            endpoint.clone(),
+            format!("{endpoint}/"),
+            format!("http://{}/", http.address),
+            format!("{endpoint}/info"),
+            format!("{endpoint}/info/refs"),
+            format!("{endpoint}/git-upload-pack"),
+            format!("{endpoint}/git-receive-pack"),
         ] {
             git(
                 &f.repo.root,
                 &["config", &format!("http.{url}.followRedirects"), "true"],
             );
         }
+        // A standalone lookup against a request path does see `true`. It is
+        // not what the transport uses: remote-curl selects URL-scoped HTTP
+        // configuration once, against the repository URL plus a slash, so this
+        // answer is no evidence that an actual request follows a redirect.
+        assert_eq!(
+            git(
+                &f.repo.root,
+                &[
+                    "config",
+                    "--get-urlmatch",
+                    "http.followRedirects",
+                    &format!("{endpoint}/info/refs"),
+                ],
+            ),
+            b"true\n"
+        );
         let (_store, preview, candidate) = f.ready();
         let before = f.repo.preserved();
         http.mode.store(mode, Ordering::SeqCst);
