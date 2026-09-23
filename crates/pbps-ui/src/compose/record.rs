@@ -274,15 +274,18 @@ impl Records {
         if !identity(id) {
             return Err(Error::new("Invalid compose operation identity"));
         }
+        let path = self.directory.path.join(format!("{id}.json"));
         let Some((bytes, revision)) = self
             .directory
-            .read_with_revision(&format!("{id}.json"), 1024 * 1024)?
+            .read_with_revision(&format!("{id}.json"), 1024 * 1024)
+            .map_err(|error| error.at(&path))?
         else {
             return Ok(None);
         };
-        let record: Record = serde_json::from_slice(&bytes)
-            .map_err(|_| Error::new("The compose receipt is invalid; preserve it for diagnosis"))?;
-        record.validate(id)?;
+        let record: Record = serde_json::from_slice(&bytes).map_err(|_| {
+            Error::new("The compose receipt is invalid; preserve it for diagnosis").at(&path)
+        })?;
+        record.validate(id).map_err(|error| error.at(&path))?;
         Ok(Some((record, revision)))
     }
 

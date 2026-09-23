@@ -53,7 +53,11 @@ fn receipts_in_removed_or_unknown_states_refuse_without_mutation() {
             );
             assert_eq!(outcome.details, None, "{label}: nothing is inferred");
         }
-        assert!(publisher.list().is_err(), "{label}: discovery");
+        let listed = publisher.list().unwrap_err().to_string();
+        assert!(
+            listed.contains(&path.display().to_string()),
+            "{label}: discovery names the receipt: {listed}"
+        );
         assert!(publisher.forget(id).is_err(), "{label}: forget");
         // Positive control is the delivered receipt above; here nothing moved.
         assert_eq!(fs::read(&path).unwrap(), bytes, "{label}");

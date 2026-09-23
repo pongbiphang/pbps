@@ -185,16 +185,21 @@ impl Resources {
         if !identity(id) {
             return Err(Error::new("Invalid resource operation identity"));
         }
+        // Every read site, including discovery, names the record it refuses.
+        let path = self.records.path.join(format!("{id}.json"));
         let (bytes, revision) = self
             .records
-            .read_with_revision(&format!("{id}.json"), 64 * 1024 * 1024)?
+            .read_with_revision(&format!("{id}.json"), 64 * 1024 * 1024)
+            .map_err(|error| error.at(&path))?
             .ok_or_else(|| {
                 Error::new("Compose resource ownership is unavailable; preserve its evidence")
+                    .at(&path)
             })?;
         let r: Resource = serde_json::from_slice(&bytes).map_err(|_| {
             Error::new("Unknown compose resource evidence; preserve it for manual recovery")
+                .at(&path)
         })?;
-        self.validate(&r, id)?;
+        self.validate(&r, id).map_err(|error| error.at(&path))?;
         Ok((r, revision))
     }
 
@@ -323,10 +328,10 @@ impl Resources {
             for name in &names {
                 let id = name.trim_end_matches(".json");
                 if !owners.contains_key(id) {
+                    // The read names the record; admission adds only why.
                     self.read_in_pass(id, &mut revisions).map_err(|error| {
                         Error::new(&format!(
-                            "Cannot admit a compose acquisition while {} is unresolved: {error}; preserve it for manual recovery",
-                            self.records.path.join(name).display()
+                            "Cannot admit a compose acquisition while a prior record is unresolved: {error}; preserve it for manual recovery"
                         ))
                     })?;
                 }

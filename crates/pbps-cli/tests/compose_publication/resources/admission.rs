@@ -170,6 +170,13 @@ fn direct_admission_preserves_bad_prior_evidence_without_allocating_resources() 
         );
         if mode == "read-error" {
             assert!(read_failed.load(Ordering::SeqCst));
+        } else {
+            // Discovery names the same record, not merely that one is bad.
+            let listed = f.publisher().resource_reports().unwrap_err().to_string();
+            assert!(
+                listed.contains(&target.display().to_string()),
+                "{mode}: {listed}"
+            );
         }
         assert_eq!(names(&records), old_names, "{mode}");
         assert_eq!(names(&root(&f).join("snapshots")), old_snapshots, "{mode}");

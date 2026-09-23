@@ -327,3 +327,35 @@ fn legitimate_incomplete_and_retired_states_remain_admissible() {
     );
     assert_eq!(after, expected);
 }
+
+#[test]
+fn discovery_names_only_the_record_it_refuses() {
+    // Two records, one impossible and pinless: discovery reaches it through
+    // the batch read, never the census, and must say which one it is (#810).
+    let f = Fixture::new("lifecycle-discovery-location");
+    let id = capturing(&f);
+    let healthy = f
+        .repo
+        .store()
+        .preview(request(), SystemTime::now())
+        .unwrap()
+        .operation_id;
+    f.publisher().discard_preview(&healthy).unwrap();
+    edit(&f, &id, |r| r["pins"]["base"]["retired"] = true.into());
+    remove_pin(&f, &id, "base");
+    // One publisher at a time: each holds the owner lock while it lives.
+    let listed = f.publisher().resource_reports().unwrap_err().to_string();
+    let recovered = f
+        .publisher()
+        .recover_resources(&id)
+        .unwrap_err()
+        .to_string();
+    for error in [listed, recovered] {
+        assert!(
+            error.contains(&file(&f, &id).display().to_string()),
+            "{error}"
+        );
+        assert!(!error.contains(&healthy), "{error}");
+        assert!(error.contains("preserve"), "{error}");
+    }
+}
