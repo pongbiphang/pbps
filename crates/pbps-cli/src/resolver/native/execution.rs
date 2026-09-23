@@ -5,8 +5,11 @@ use super::{FileIdentity, ProcessLease, UnqualifiedProcess, proc_base, read_boun
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::os::fd::AsRawFd as _;
-use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
+
+mod masks;
+pub(crate) use masks::MASKED_PROC_PATHS;
 
 /// Shared by the fixed workload/forwarder launch and its kernel checks.
 pub(crate) const FILE_DESCRIPTOR_LIMIT: u64 = 1024;
@@ -119,7 +122,8 @@ impl ExecutionLease {
         // The later empty read-only /sys overmount must really hide the
         // underlying host sysfs/cgroup mounts still listed in mountinfo.
         let root = proc_base(&self.process.directory).join("root");
-        for (path, mount) in parse_mounts(&mounts)? {
+        let parsed = parse_mounts(&mounts)?;
+        for (path, mount) in &parsed {
             if path.starts_with("/sys/") {
                 continue;
             }
@@ -132,17 +136,7 @@ impl ExecutionLease {
                 .custom_flags(0x200000)
                 .open(root.join(path.strip_prefix('/').ok_or(UnqualifiedProcess)?))
                 .map_err(|_| UnqualifiedProcess)?;
-            let info = read_bounded(
-                &PathBuf::from(format!("/proc/self/fdinfo/{}", file.as_raw_fd())),
-                4096,
-            )?;
-            let actual: u64 = info
-                .lines()
-                .find_map(|line| line.strip_prefix("mnt_id:"))
-                .ok_or(UnqualifiedProcess)?
-                .trim()
-                .parse()
-                .map_err(|_| UnqualifiedProcess)?;
+            let actual = mount_id(&file)?;
             if actual != mount.id {
                 return Err(UnqualifiedProcess);
             }
@@ -151,21 +145,22 @@ impl ExecutionLease {
         if sys.next().is_some() {
             return Err(UnqualifiedProcess);
         }
-        for path in [
-            "proc/kcore",
-            "proc/keys",
-            "proc/latency_stats",
-            "proc/timer_list",
-        ] {
-            let metadata = std::fs::metadata(root.join(path)).map_err(|_| UnqualifiedProcess)?;
-            if !metadata.file_type().is_char_device() || metadata.rdev() != 0x103 {
-                // Linux device 1:3 is /dev/null. A reported masked path must
-                // not still expose the original readable kernel object.
-                return Err(UnqualifiedProcess);
-            }
-        }
+        masks::check(&self.process, &parsed)?;
         self.process.check()
     }
+}
+
+fn mount_id(file: &File) -> Result<u64, UnqualifiedProcess> {
+    let info = read_bounded(
+        &PathBuf::from(format!("/proc/self/fdinfo/{}", file.as_raw_fd())),
+        4096,
+    )?;
+    info.lines()
+        .find_map(|line| line.strip_prefix("mnt_id:"))
+        .ok_or(UnqualifiedProcess)?
+        .trim()
+        .parse()
+        .map_err(|_| UnqualifiedProcess)
 }
 
 fn cgroup_path(process: &ProcessLease) -> Result<PathBuf, UnqualifiedProcess> {
@@ -249,18 +244,6 @@ fn check_mounts(text: &str, profile: &ExecutionProfile) -> Result<(), Unqualifie
         "/proc/sys",
         "/proc/sysrq-trigger",
     ];
-    let masks = [
-        "/proc/asound",
-        "/proc/acpi",
-        "/proc/interrupts",
-        "/proc/kcore",
-        "/proc/keys",
-        "/proc/latency_stats",
-        "/proc/timer_list",
-        "/proc/timer_stats",
-        "/proc/sched_debug",
-        "/proc/scsi",
-    ];
     for (path, mount) in &mounts {
         let flags = &mount.options;
         let permitted = match *path {
@@ -285,7 +268,7 @@ fn check_mounts(text: &str, profile: &ExecutionProfile) -> Result<(), Unqualifie
             }
             "/etc/hostname" | "/etc/hosts" | "/etc/resolv.conf" => flags.contains("ro"),
             path if readonly_proc.contains(&path) => mount.kind == "proc" && flags.contains("ro"),
-            path if masks.contains(&path) => mount.kind == "tmpfs",
+            path if MASKED_PROC_PATHS.contains(&path) => mount.kind == "tmpfs",
             "/tmp" | "/dev/shm" => private_tmpfs(mount, 67108864)?,
             path if path == profile.storage_path => private_tmpfs(mount, profile.storage_bytes)?,
             _ => false,
