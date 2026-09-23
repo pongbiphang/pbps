@@ -63,6 +63,9 @@ limits refuse. Checking only the guard would miss an already-created child
 whose hard limit remained higher when its parent's was lowered. These checks
 retain the process-continuity and observation limits below; they do not establish
 a complete lifetime process census.
+The shared guard check also covers the control and analysis forwarders of a
+supplied server, whose root guards do not have a Docker-factory execution lease.
+The supplied engine itself retains its separate operator resource contract.
 
 The host kernel, its administrators, the selected daemon and explicitly trusted
 image installation form the provisioning trust boundary. SQL privileges in
