@@ -272,8 +272,8 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     env:
-      PBPS_TEST_PG_DB: "host=localhost port=54320 user=postgres password=Pbps!Ci12345 dbname=pbps_test"
-      PBPS_TEST_PG_OLD_DB: "host=localhost port=54321 user=postgres password=Pbps!Ci12345 dbname=pbps_test"
+      PBPS_TEST_PG_DB: "host=localhost port=54320 user=postgres password=Pbps!Ci12345 dbname=pbps_test sslmode=disable"
+      PBPS_TEST_PG_OLD_DB: "host=localhost port=54321 user=postgres password=Pbps!Ci12345 dbname=pbps_test sslmode=disable"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -155,10 +155,45 @@ impl Conn {
     /// same reason [`tcp_user_timeout_disposition`] takes it as a
     /// parameter rather than being `#[cfg]`-gated itself.
     async fn connect_as(connection_string: &str, is_linux: bool) -> Result<Self, DbError> {
-        let config: Config = connection_string
+        let mut config: Config = connection_string
             .parse()
             .map_err(|e: tokio_postgres::Error| DbError::BadConnectionString(e.to_string()))?;
-        Self::connect_config(config, is_linux).await
+        // A string that names no `sslmode` gets verified TLS, not the driver's
+        // `prefer`. `prefer` accepts a server's "N" to the SSL request and
+        // carries on in cleartext, so anything that can answer on the port
+        // could ask for a cleartext password and be sent the deployment
+        // credential (#311). `require` through this crate's rustls connector
+        // verifies the chain against the host's trust store and the host
+        // name, so the default is the authenticated one; an insecure mode is
+        // still available, but only by writing it (DECISIONS 543).
+        let defaulted = !names_ssl_mode(connection_string);
+        if defaulted {
+            config.ssl_mode(tokio_postgres::config::SslMode::Require);
+        }
+        Self::connect_config(config, is_linux)
+            .await
+            .map_err(|e| match e {
+                // Only a TLS failure: a refused socket, a timeout, a wrong
+                // password or a string refused before any socket opened says
+                // nothing about TLS, and a hint there would send the operator
+                // to the wrong fix. The driver names the handshake in its own
+                // message ("error performing TLS handshake: …").
+                DbError::Driver { ref message, .. } if defaulted && message.contains("TLS") => e
+                    .context(
+                        "this connection string names no `sslmode`, so pbps required verified TLS; \
+                     to connect without TLS on a network you trust, add `sslmode=disable` to it",
+                    ),
+                // Named rather than wildcarded: a new variant has to be
+                // decided on, since a TLS-shaped one would need the hint.
+                DbError::Driver { .. }
+                | DbError::BadConnectionString(_)
+                | DbError::Connect { .. }
+                | DbError::ConnectTimeout { .. }
+                | DbError::Context { .. }
+                | DbError::Refused(_)
+                | DbError::WrongSession { .. }
+                | DbError::BadRow(_) => e,
+            })
     }
 
     pub(crate) async fn connect_verified(connection_string: &str) -> Result<Self, DbError> {
@@ -657,6 +692,34 @@ fn apply_socket_options(
 
 /// Whether this connection needs a TLS stack at all.
 ///
+/// Whether the connection string chose its own `sslmode`.
+///
+/// Asked of the driver's own parser rather than of a second one written here:
+/// the string is parsed again with `sslmode=disable` placed where the string's
+/// own keys come after it, and a key the string names wins over the probe. The
+/// two answers agree exactly when the string named one. A hand-written scan
+/// would have to agree with the driver on quoting, escapes and the URL form,
+/// and a disagreement in the unsafe direction is a silent `prefer`.
+///
+/// A probe the driver cannot parse is read as "not named", which lands on the
+/// verified default — the direction a wrong answer here must fall in.
+fn names_ssl_mode(connection_string: &str) -> bool {
+    let is_url = connection_string.starts_with("postgres://")
+        || connection_string.starts_with("postgresql://");
+    let probe = if is_url {
+        match connection_string.split_once('?') {
+            Some((head, query)) => format!("{head}?sslmode=disable&{query}"),
+            None => format!("{connection_string}?sslmode=disable"),
+        }
+    } else {
+        format!("sslmode=disable {connection_string}")
+    };
+    match (connection_string.parse::<Config>(), probe.parse::<Config>()) {
+        (Ok(given), Ok(probed)) => given.get_ssl_mode() == probed.get_ssl_mode(),
+        _ => false,
+    }
+}
+
 /// `sslmode=disable` is the one answer that needs none — and needing none is
 /// not the same as having one that goes unused, because building one reads the
 /// host's certificate store and fails where there is not one to read.
@@ -837,6 +900,120 @@ mod tests {
 
     fn endpoint_of(connection: &str) -> Result<(String, u16), DbError> {
         endpoint(&config_of(connection))
+    }
+
+    /// #311: whether a string chose its `sslmode` is the driver parser's
+    /// answer, in both forms. Unnamed means verified TLS; named is honoured,
+    /// insecure modes included — they are a choice once they are written.
+    #[test]
+    fn only_a_string_that_names_its_sslmode_escapes_the_verified_default() {
+        for named in [
+            "host=db.example user=u sslmode=disable",
+            "host=db.example user=u sslmode=prefer",
+            "sslmode=require host=db.example user=u",
+            "host=db.example user=u sslmode = disable",
+            "postgres://u@db.example/app?sslmode=disable",
+            "postgresql://u@db.example/app?connect_timeout=5&sslmode=prefer",
+        ] {
+            assert!(names_ssl_mode(named), "{named}");
+        }
+        for unnamed in [
+            "host=db.example user=u",
+            // A value that merely spells the key is not the key.
+            "host=db.example user=u password='x sslmode=disable'",
+            "host=db.example user=u application_name=sslmode",
+            "postgres://u@db.example/app",
+            "postgres://u@db.example/app?connect_timeout=5",
+            "postgres://u:sslmode%3Ddisable@db.example/app",
+        ] {
+            assert!(!names_ssl_mode(unnamed), "{unnamed}");
+        }
+    }
+
+    /// #311, the downgrade itself: a server that answers "N" to the SSL
+    /// request and would ask for a cleartext password is never sent one when
+    /// the string names no `sslmode`. Under the old `prefer` default the
+    /// startup packet and the password followed the refusal.
+    #[tokio::test]
+    async fn an_unnamed_sslmode_cannot_be_downgraded_to_a_cleartext_login() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a listener");
+        let port = listener.local_addr().expect("the bound address").port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("a client");
+            let mut request = [0; 8];
+            socket
+                .read_exact(&mut request)
+                .await
+                .expect("an SSL request");
+            assert_eq!(request, [0, 0, 0, 8, 4, 210, 22, 47], "not an SSL request");
+            socket.write_all(b"N").await.expect("the refusal");
+            // Whatever the client sends next. If it is a startup packet, ask
+            // for a cleartext password, as the attacker in #311 does.
+            let mut after = Vec::new();
+            let mut buf = [0; 1024];
+            if let Ok(Ok(n)) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), socket.read(&mut buf)).await
+                && n > 0
+            {
+                after.extend_from_slice(&buf[..n]);
+                let _ = socket.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 3]).await;
+                if let Ok(Ok(n)) =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), socket.read(&mut buf))
+                        .await
+                {
+                    after.extend_from_slice(&buf[..n]);
+                }
+            }
+            after
+        });
+        let error = match Conn::connect_as(
+            &format!("host=localhost port={port} user=synthetic password=marker-311 dbname=d"),
+            false,
+        )
+        .await
+        {
+            Ok(_) => panic!("a server that refuses TLS must not be connected to"),
+            Err(error) => error,
+        };
+        let after = server.await.expect("the fake server");
+        assert!(
+            !after.windows(10).any(|w| w == b"marker-311"),
+            "the password was sent after the TLS refusal: {after:?}"
+        );
+        assert!(after.is_empty(), "the client carried on after the refusal");
+        assert!(error.to_string().contains("sslmode=disable"), "{error}");
+    }
+
+    /// The negative half: a string that names `sslmode=disable` is honoured —
+    /// no SSL request at all — so a local server without TLS stays reachable
+    /// once the operator has said so.
+    #[tokio::test]
+    async fn a_named_sslmode_disable_sends_no_ssl_request() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a listener");
+        let port = listener.local_addr().expect("the bound address").port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("a client");
+            let mut head = [0; 8];
+            socket.read_exact(&mut head).await.expect("a first packet");
+            head
+        });
+        let client = tokio::spawn(async move {
+            let _ = Conn::connect_as(
+                &format!("host=localhost port={port} user=synthetic dbname=d sslmode=disable"),
+                false,
+            )
+            .await;
+        });
+        let head = server.await.expect("the fake server");
+        client.abort();
+        // A startup packet (protocol 3.0 after the length), not an SSL request.
+        assert_eq!(&head[4..8], &[0, 3, 0, 0], "{head:?}");
     }
 
     fn config_of(connection: &str) -> Config {

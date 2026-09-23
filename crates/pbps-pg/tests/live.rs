@@ -16,7 +16,7 @@
 //! `scripts/live-tests-pg.sh`, or start one yourself and:
 //!
 //! ```text
-//! export PBPS_TEST_PG_DB='host=localhost port=54320 user=postgres password=... dbname=pbps_test'
+//! export PBPS_TEST_PG_DB='host=localhost port=54320 user=postgres password=... dbname=pbps_test sslmode=disable'
 //! cargo test -p pbps-pg --test live -- --ignored
 //! ```
 
