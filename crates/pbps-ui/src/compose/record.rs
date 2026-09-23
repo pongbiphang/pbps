@@ -294,8 +294,12 @@ impl Records {
         let records = names
             .iter()
             .map(|id| {
-                self.load_in_pass(id)?
-                    .ok_or_else(|| Error::new("A compose receipt disappeared during discovery"))
+                self.load_in_pass(id)?.ok_or_else(|| {
+                    Error::new(
+                        "A compose receipt disappeared during discovery; preserve its evidence",
+                    )
+                    .at(&self.directory.path.join(format!("{id}.json")))
+                })
             })
             .collect::<Result<Vec<_>>>()?;
         if self.names()? != names {

@@ -985,8 +985,12 @@ impl Resources {
                 }
                 records.insert(
                     id.to_owned(),
-                    self.read_in_pass(id, revisions)
-                        .map_err(|_| unavailable())?,
+                    // Keep the record's own refusal, which names its path.
+                    self.read_in_pass(id, revisions).map_err(|error| {
+                        Error::new(&format!(
+                            "Private compose ref {reference} has unavailable ownership: {error}; preserve it for manual recovery"
+                        ))
+                    })?,
                 );
             }
             let resource = &records[id];

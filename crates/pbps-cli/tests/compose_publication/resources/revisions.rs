@@ -226,9 +226,9 @@ fn changed_batch(closing: bool, kinds: &[&str]) {
             armed.store(true, Ordering::SeqCst);
             let refused = if let Some(publisher) = &mut publisher {
                 if kind == "receipt" {
-                    publisher.list().is_err()
+                    publisher.list().err().map(|e| e.to_string())
                 } else {
-                    publisher.resource_reports().is_err()
+                    publisher.resource_reports().err().map(|e| e.to_string())
                 }
             } else {
                 let mut fresh = Candidates::with_resources(
@@ -239,15 +239,21 @@ fn changed_batch(closing: bool, kinds: &[&str]) {
                     },
                     observer,
                 );
-                fresh.preview(request(), SystemTime::now()).is_err()
+                fresh
+                    .preview(request(), SystemTime::now())
+                    .err()
+                    .map(|e| e.to_string())
             };
             assert!(
                 fired.load(Ordering::SeqCst),
                 "{closing}/{kind}/{replace}: missed boundary"
             );
+            let refused = refused
+                .unwrap_or_else(|| panic!("{closing}/{kind}/{replace}: accepted changed record"));
+            // The refusal names the changed record, not only that one changed.
             assert!(
-                refused,
-                "{closing}/{kind}/{replace}: accepted changed record"
+                refused.contains(&target.display().to_string()),
+                "{closing}/{kind}/{replace}: {refused}"
             );
             assert!(
                 !created.load(Ordering::SeqCst),
@@ -302,4 +308,41 @@ fn receipt_reads_cannot_certify_revisions_observed_after_their_bytes() {
 #[test]
 fn receipt_discovery_rechecks_revisions_before_reconciliation() {
     changed_batch(true, &["receipt"]);
+}
+
+#[test]
+fn a_receipt_removed_during_discovery_is_named() {
+    let f = Fixture::new("receipt-removed-during-discovery");
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let (_store, preview, candidate) = f.ready();
+        assert_eq!(f.publisher().confirm(&candidate).status, Status::Delivered);
+        ids.push(preview.operation_id);
+    }
+    ids.sort();
+    let (first, second) = (
+        root(&f).join(format!("{}.json", ids[0])),
+        root(&f).join(format!("{}.json", ids[1])),
+    );
+    let preserved = f.repo.root.join("removed-receipt");
+    let (read, moved, kept) = (first.clone(), second.clone(), preserved.clone());
+    let fired = Arc::new(AtomicBool::new(false));
+    let flag = fired.clone();
+    let observer = ResourceObserver::new(move |at| {
+        // An external writer takes the second receipt away after the name
+        // pass listed it and before discovery opens it.
+        if at.operation == ResourceOperation::Read
+            && at.after
+            && at.path == read
+            && !flag.swap(true, Ordering::SeqCst)
+        {
+            fs::rename(&moved, &kept).unwrap();
+        }
+        true
+    });
+    let error = observed(&f, observer).list().unwrap_err().to_string();
+    assert!(fired.load(Ordering::SeqCst));
+    assert!(error.contains(&second.display().to_string()), "{error}");
+    assert!(!error.contains(&ids[0]), "{error}");
+    assert!(first.exists() && preserved.exists());
 }

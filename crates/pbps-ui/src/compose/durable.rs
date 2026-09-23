@@ -332,7 +332,10 @@ impl Directory {
                 Mode::empty(),
                 ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
             )
-            .map_err(|_| Error::new("Cannot reopen compose evidence for revision verification"))?;
+            .map_err(|_| {
+                Error::new("Cannot reopen compose evidence for revision verification")
+                    .at(&self.path.join(entry))
+            })?;
             let mut file = File::from(fd);
             if Revision::of(&file)? != expected.metadata {
                 return Ok(false);
@@ -344,9 +347,9 @@ impl Directory {
             let mut hasher = Sha256::new();
             let mut buffer = [0; 8192];
             loop {
-                let read = reader
-                    .read(&mut buffer)
-                    .map_err(|_| Error::new("Cannot verify compose evidence contents"))?;
+                let read = reader.read(&mut buffer).map_err(|_| {
+                    Error::new("Cannot verify compose evidence contents").at(&self.path.join(entry))
+                })?;
                 if read == 0 {
                     break;
                 }
