@@ -199,6 +199,12 @@ impl Dialect for Mssql {
             rollback: "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;",
         }
     }
+
+    /// None: a T-SQL function cannot modify data, so a declared `CHECK` has no
+    /// side effect for a probe to set off (DECISIONS 537).
+    fn probe_framing(&self) -> Option<TransactionFraming> {
+        None
+    }
 }
 
 #[cfg(test)]

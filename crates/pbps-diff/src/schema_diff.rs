@@ -5414,6 +5414,9 @@ mod tests {
         fn transaction_framing(&self) -> pbps_dialect::TransactionFraming {
             MinimalDialect.transaction_framing()
         }
+        fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
+            MinimalDialect.probe_framing()
+        }
     }
 
     /// The finding from round 3 of #462 (issue #176): a table renamed onto a
@@ -6498,6 +6501,9 @@ mod tests {
             fn transaction_framing(&self) -> pbps_dialect::TransactionFraming {
                 MinimalDialect.transaction_framing()
             }
+            fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
+                MinimalDialect.probe_framing()
+            }
         }
 
         fn kinds_on(
@@ -6991,6 +6997,9 @@ mod tests {
             fn transaction_framing(&self) -> pbps_dialect::TransactionFraming {
                 MinimalDialect.transaction_framing()
             }
+            fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
+                MinimalDialect.probe_framing()
+            }
         }
 
         /// The whole point of #248: a module rebuild takes the object's ACL
@@ -7215,6 +7224,9 @@ mod tests {
             }
             fn transaction_framing(&self) -> pbps_dialect::TransactionFraming {
                 MinimalDialect.transaction_framing()
+            }
+            fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
+                MinimalDialect.probe_framing()
             }
             fn overloads(&self, kind: pbps_model::ModuleKind) -> bool {
                 matches!(

@@ -14442,3 +14442,31 @@ SPEC is in sync with all of these.
      forgotten handles still require their normal spent-identity protection;
      unknown children, temporary files and ambiguous pins remain retained.
      No source checkout, index, HEAD or public branch is a cleanup target.
+
+537. **A pre-flight probe runs in a read-only transaction of its own on
+     PostgreSQL.** (#274.) A probe interpolates the declared expression into a
+     count over the live rows, and PostgreSQL accepts a volatile function in a
+     `CHECK`: measured on 18.6, `CHECK (nextval('s') > 0)` is accepted, the
+     probe advances the sequence once per row, and the advance survives the
+     rollback — a write between approval and the plan's first statement that
+     no reviewer saw and no abort undoes. Inside `BEGIN READ ONLY` the engine
+     refuses `nextval` itself and an ordinary probe is untouched.
+
+     That makes the side effect unrepresentable rather than detected. The
+     alternatives each judge the expression: a volatility check needs the
+     catalog's answer for every function it names, including ones the plan
+     creates, and a list of known-writing functions is the open set this
+     project keeps refusing to maintain. A refused probe is reported unchecked
+     by name, as any probe that cannot run already is, and the engine enforces
+     the constraint inside the apply's transaction.
+
+     One transaction per probe, opened by `begin` and always closed by
+     `rollback`, so a refused probe cannot abort the next. Opening or closing
+     it failing stops the apply instead of counting the probe unchecked: a
+     transaction left open would take the plan's own `BEGIN` inside it, which
+     PostgreSQL only warns about. The session pins stay plain `SET`s on the
+     connection (415), so the probe still runs under them.
+
+     `Dialect::probe_framing` is required, not defaulted, for the reason
+     `transaction_framing` is. SQL Server answers `None`: a T-SQL function
+     cannot modify data, so a declared `CHECK` has nothing to set off.

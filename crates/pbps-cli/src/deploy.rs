@@ -5569,7 +5569,7 @@ async fn run_probes(
         // rewritten by substitution. That is not a violation and it is not
         // silence either: the engine enforces the constraint inside the
         // transaction, where a failure rolls everything back.
-        let rows = match conn.query(&probe.sql).await {
+        let rows = match probe_query(conn, dialect, &probe.sql).await? {
             Ok(rows) => rows,
             Err(e) => {
                 unchecked += 1;
@@ -5645,6 +5645,32 @@ async fn run_probes(
         );
     }
     Ok(())
+}
+
+/// One probe, in the dialect's probe transaction when it has one.
+///
+/// The outer `Result` is the framing, the inner one the probe. A probe the
+/// engine refuses — a `nextval` in a `CHECK`, under `READ ONLY` — is an
+/// unchecked probe and the caller says so. A framing that cannot open or
+/// close is not: a transaction left open would carry the plan's own `BEGIN`
+/// inside it, where PostgreSQL only warns, so it stops the apply instead
+/// (DECISIONS 537).
+async fn probe_query(
+    conn: &mut Conn,
+    dialect: &dyn pbps_dialect::Dialect,
+    sql: &str,
+) -> anyhow::Result<Result<Vec<pbps_db::Row>, pbps_db::DbError>> {
+    let Some(framing) = dialect.probe_framing() else {
+        return Ok(conn.query(sql).await);
+    };
+    conn.begin(framing)
+        .await
+        .context("could not open the transaction a pre-flight probe runs in")?;
+    let rows = conn.query(sql).await;
+    conn.rollback(framing)
+        .await
+        .context("could not close the transaction a pre-flight probe ran in")?;
+    Ok(rows)
 }
 
 /// §7.5: a plan containing a non-transactional statement fails before it runs.
@@ -5917,6 +5943,127 @@ mod tests {
     /// Asserted against the engine's own verdict on the very statement, not
     /// against a remembered count: the two have to agree, and either one alone
     /// can be wrong for its own reasons.
+    /// Issue #274: a probe evaluates the declared expression, and PostgreSQL
+    /// accepts a volatile one in a `CHECK`. Before the probe transaction,
+    /// `nextval` advanced the sequence once per row between approval and the
+    /// plan's first statement, and a rollback did not take it back. Under
+    /// `READ ONLY` the engine refuses it: the sequence stays where it was, the
+    /// probe is reported unchecked rather than refusing the plan, and the
+    /// connection is left outside any transaction for the apply that follows.
+    #[test]
+    #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+    fn a_probe_cannot_advance_a_sequence_named_in_a_declared_check() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        rt.block_on(async {
+            let database = crate::test_pg::TestDb::create("probe_ro").await;
+            let mut conn = database.connect().await;
+            let schema = format!("pbps_probe_ro_{}", std::process::id());
+            conn.execute(&format!(
+                "DROP SCHEMA IF EXISTS {schema} CASCADE;
+                 CREATE SCHEMA {schema};
+                 CREATE SEQUENCE {schema}.s;
+                 CREATE TABLE {schema}.t (v integer);
+                 INSERT INTO {schema}.t VALUES (1), (2), (3);"
+            ))
+            .await
+            .expect("the fixture");
+            let sequence = format!(
+                "SELECT last_value::int, CASE WHEN is_called THEN 1 ELSE 0 END FROM {schema}.s"
+            );
+            let read = |rows: Vec<pbps_db::Row>| -> (i32, i32) {
+                let row = rows.first().expect("one row");
+                (
+                    row.try_get_at::<i32>(0).unwrap().unwrap(),
+                    row.try_get_at::<i32>(1).unwrap().unwrap(),
+                )
+            };
+            let before = read(conn.query(&sequence).await.expect("the sequence"));
+
+            let changes = check_on(&schema, &format!("nextval('{schema}.s') > 0"));
+            let probed = run_probes(&mut conn, &pbps_pg::Postgres::new(), &changes).await;
+            let after = read(conn.query(&sequence).await.expect("the sequence"));
+            // Outside any transaction, and not a read-only one: the apply's
+            // own `BEGIN` must open a real transaction after this.
+            let write = conn
+                .query(&format!("SELECT nextval('{schema}.s')::int"))
+                .await
+                .map(|_| ());
+
+            let cleanup = conn
+                .execute(&format!("DROP SCHEMA {schema} CASCADE;"))
+                .await;
+            assert_eq!(before, (1, 0), "the fixture's untouched sequence");
+            assert_eq!(after, before, "the probe advanced the sequence");
+            assert!(
+                probed.is_ok(),
+                "a probe the engine refuses is unchecked, not a refusal: {probed:?}"
+            );
+            assert!(
+                write.is_ok(),
+                "the probe left its transaction open: {write:?}"
+            );
+            cleanup.expect("drop");
+            drop(conn);
+            database.drop().await;
+        });
+    }
+
+    /// The negative half of #274: the read-only transaction changes what a
+    /// probe may do, not what it finds. A row that violates an ordinary
+    /// declared `CHECK` still refuses the plan.
+    #[test]
+    #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+    fn a_read_only_probe_still_refuses_a_violating_row() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        rt.block_on(async {
+            let database = crate::test_pg::TestDb::create("probe_ro_neg").await;
+            let mut conn = database.connect().await;
+            let schema = format!("pbps_probe_ro_neg_{}", std::process::id());
+            conn.execute(&format!(
+                "DROP SCHEMA IF EXISTS {schema} CASCADE;
+                 CREATE SCHEMA {schema};
+                 CREATE TABLE {schema}.t (v integer);
+                 INSERT INTO {schema}.t VALUES (1), (2), (3);"
+            ))
+            .await
+            .expect("the fixture");
+
+            let changes = check_on(&schema, "v > 1");
+            let probed = run_probes(&mut conn, &pbps_pg::Postgres::new(), &changes).await;
+
+            let cleanup = conn
+                .execute(&format!("DROP SCHEMA {schema} CASCADE;"))
+                .await;
+            let err = probed.expect_err("one row violates `v > 1`").to_string();
+            assert!(
+                err.contains("the data will not accept this plan") && err.contains("1 "),
+                "{err}"
+            );
+            cleanup.expect("drop");
+            drop(conn);
+            database.drop().await;
+        });
+    }
+
+    fn check_on(schema: &str, expression: &str) -> pbps_model::ChangeSet {
+        use pbps_model::{Change, ChangeSet, CheckConstraint, PlannedChange};
+        ChangeSet {
+            changes: vec![PlannedChange::new(Change::AddCheck {
+                table: format!("{schema}.t").parse().expect("a table name"),
+                name: "t_ck".to_owned(),
+                constraint: CheckConstraint {
+                    expression: expression.to_owned(),
+                },
+            })],
+        }
+    }
+
     #[test]
     #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
     fn a_probe_is_answered_under_the_settings_the_statement_will_run_under() {
