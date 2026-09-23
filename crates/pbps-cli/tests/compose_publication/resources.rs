@@ -2,6 +2,7 @@
 
 mod admission;
 mod batching;
+mod lifecycle;
 mod private_refs;
 mod revisions;
 

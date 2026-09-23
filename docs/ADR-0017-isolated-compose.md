@@ -492,6 +492,14 @@ destructor unlock is fallback only and never certifies completed cleanup.
 | `Retained` | A completed snapshot and base pin are retired; the compact receipt and exact-commit root remain available. Explicit forget can retire the receipt and that root. |
 | `Spent` | A compact tombstone revokes all old candidate handles. Public output branches remain untouched. |
 
+Every read, admission and write validates a record against the transitions that
+write it, not only against its own state's fields (#802). A pin is retired only
+under `Retiring`, after the snapshot, and the base pin before the commit pin.
+The keep-commit choice exists only from `Retiring` onward. A record combining
+these any other way cannot come from an interruption. It refuses with its
+recovery location and nothing consumes it. An unacknowledged base or commit
+intent is the interruption the table above describes, and stays admissible.
+
 Before an alternate borrows source objects, an operation-specific private annotated
 Git tag roots the base. If the source itself uses alternates or promisor packs,
 import the pinned commit's full reachable object closure into its local object
