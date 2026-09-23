@@ -40,10 +40,10 @@ checksum-pinned, and state lives in the database itself.
 - Work in a git worktree, never in the main checkout. Remove it after merge.
 - One branch per issue, cut from `origin/master`, named `fix/issue-<n>-<slug>`.
 - Before every push, run locally what CI runs: `python3
-  scripts/check-decisions.py`, `cargo fmt --all --check`, `cargo clippy
-  --workspace --all-targets` warning-free, `cargo test --workspace
-  --all-targets`, `scripts/live-tests.sh` and `scripts/live-tests-pg.sh`. All
-  green, then push.
+  scripts/check_decisions_test.py`, `python3 scripts/check-decisions.py`,
+  `cargo fmt --all --check`, `cargo clippy --workspace --all-targets`
+  warning-free, `cargo test --workspace --all-targets`, `scripts/live-tests.sh`
+  and `scripts/live-tests-pg.sh`. All green, then push.
 - Push the issue branch without asking. Never push to `master` or to another
   issue's branch.
 - Open the PR as a **draft**, with `Closes #<n>` in the body. Taking the issue is
