@@ -47,7 +47,8 @@ def new_entry(issue, k):
 def run(topics=None, cited=None, index=INDEX):
     files = {"docs/decisions/identity.md": IDENTITY, "docs/decisions/ledger.md": LEDGER}
     files.update(topics or {})
-    return cd.check(files, index, cited or {})
+    # The fixture's sequence closes at 4, the last number its index lists.
+    return cd.check(files, index, cited or {}, closed=4)
 
 
 class TheRecord(unittest.TestCase):
@@ -76,6 +77,13 @@ class TheRecord(unittest.TestCase):
         errors = run({"docs/decisions/ledger.md": stale})
         self.assertEqual(len(errors), 1)
         self.assertIn("5 is a new number in the closed sequence", errors[0])
+
+    def test_the_next_number_is_refused_even_with_an_index_row(self):
+        stale = LEDGER + '\n<a id="decision-5"></a>\n\n5. **Five.** Body.\n'
+        index = INDEX + "| 5 | [ledger](decisions/ledger.md#decision-5) | Five |\n"
+        errors = run({"docs/decisions/ledger.md": stale}, index=index)
+        self.assertIn("5 is a new number in the closed sequence", " ".join(errors))
+        self.assertIn("row 5 extends the closed sequence, which ends at 4", " ".join(errors))
 
     def test_a_number_taken_by_two_branches_in_two_files_is_refused(self):
         a = LEDGER + '\n<a id="decision-5"></a>\n\n5. **Five.** Body.\n'

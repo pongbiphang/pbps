@@ -10,8 +10,9 @@ the duplicate would merge unseen. This check is what makes that loud.
 
 It refuses:
   - an identifier that two entries claim;
-  - an entry in the closed sequence that the index does not list, or that the
-    index places in another file (a stale branch appending "N+1.");
+  - an entry numbered past the closed sequence's fixed end, even with an index
+    row for it (a stale branch appending "N+1."), one the index does not list,
+    or one the index places in another file;
   - an entry without the anchor its citations link to, or with the wrong one;
   - a citation, `DECISIONS <n>` or `DEC-<issue>.<k>`, that names no entry.
     A number the closed sequence skipped is accepted: branches reserved them,
@@ -32,6 +33,10 @@ LEGACY_ENTRY = re.compile(r"^(\d+)\. \*\*")
 NEW_ENTRY = re.compile(r"^\*\*DEC-(\d+)\.(\d+)\. ")
 ANCHOR = re.compile(r'^<a id="(decision-(\d+)|dec-(\d+)-(\d+))"></a>$')
 INDEX_ROW = re.compile(r"^\| (\d+) \| \[[^\]]+\]\(decisions/([^)#]+)#decision-(\d+)\) \|")
+# The last number of the closed sequence. Fixed here rather than read from the
+# index, which is an ordinary file a branch could extend along with its entry.
+CLOSED = 543
+
 CITE_LEGACY = re.compile(r"\bDECISIONS (\d+)\b")
 CITE_NEW = re.compile(r"\bDEC-(\d+)\.(\d+)\b")
 
@@ -57,7 +62,7 @@ def entries_of(path, text):
         yield ident, i + 1, problem
 
 
-def check(topic_files, index_text, cited_in):
+def check(topic_files, index_text, cited_in, closed=CLOSED):
     """topic_files: {path: text}; cited_in: {path: text}. Returns a list of errors."""
     errors = []
     where = {}
@@ -80,7 +85,7 @@ def check(topic_files, index_text, cited_in):
     legacy = {i: w for i, w in where.items() if not i.startswith("DEC-")}
     for ident, at in sorted(legacy.items(), key=lambda x: int(x[0])):
         path = at.rsplit(":", 1)[0]
-        if ident not in indexed:
+        if int(ident) > closed or ident not in indexed:
             errors.append(
                 f"{at}: {ident} is a new number in the closed sequence; "
                 f"name the entry DEC-<issue>.<k> instead (see {INDEX})"
@@ -88,10 +93,11 @@ def check(topic_files, index_text, cited_in):
         elif indexed[ident] != path:
             errors.append(f"{at}: {INDEX} places {ident} in {indexed[ident]}")
     for ident, path in indexed.items():
-        if ident not in legacy:
+        if int(ident) > closed:
+            errors.append(f"{INDEX}: row {ident} extends the closed sequence, which ends at {closed}")
+        elif ident not in legacy:
             errors.append(f"{INDEX}: {ident} is indexed but no entry in {path} has it")
 
-    closed = max((int(i) for i in indexed), default=0)
     skipped = set(range(1, closed + 1)) - {int(i) for i in indexed}
     for path, text in sorted(cited_in.items()):
         if path in NOT_CITATIONS:
