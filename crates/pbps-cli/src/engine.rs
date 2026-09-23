@@ -1161,6 +1161,29 @@ pub fn read_remedies(driver: Driver) -> ReadRemedies {
 // What a rename touches (SPEC §7.4)
 // ---------------------------------------------------------------------------
 
+/// The lines printed under a rename's impact report, in this engine's words.
+///
+/// What an empty list *means* is the engine's to say (`pbps_pg::impact::notes`
+/// explains the carried list and the view alias it keeps). SQL Server fills
+/// neither `carried` nor a note of its own beyond the one about what no
+/// catalog can see, which it says only under an advisory list, as before.
+pub fn impact_notes(driver: Driver, report: &ImpactReport) -> Vec<String> {
+    match driver {
+        Driver::Mssql => {
+            if report.advisory.is_empty() {
+                Vec::new()
+            } else {
+                vec![
+                    "Nothing outside the database is visible here: applications and \
+                     downstream consumers need a human's checklist."
+                        .to_owned(),
+                ]
+            }
+        }
+        Driver::Postgres => pbps_pg::impact::notes(report),
+    }
+}
+
 /// Every rename in a plan, as the objects they are renamed *from* — the name
 /// the catalog still knows them by. Which changes count is each engine's
 /// question: a module rename is a drop plus a create, and only SQL Server asks

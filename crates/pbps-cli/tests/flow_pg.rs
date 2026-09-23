@@ -6350,6 +6350,56 @@ fn a_cross_schema_cli_rename_requires_approval_and_records_only_its_declared_des
     assert!(stdout(&succeeds(d.run(&["plan", "--db", connection]))).contains("No changes"));
 }
 
+/// #307: a rename whose only dependant is a view the engine carries printed
+/// an "affects:" heading with nothing under it. The view is listed, as
+/// carried, with the note that it keeps its old output column name.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_carried_only_rename_impact_lists_what_the_rename_carries() {
+    let own = OwnDatabase::new(&server(), "carried_only");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "carried-only", TWO_COLUMNS);
+    on_server(
+        connection,
+        "CREATE SCHEMA outside; CREATE VIEW outside.follows AS SELECT label FROM app.t;",
+    );
+    d.table(&TWO_COLUMNS.replace(
+        "  label: {type: varchar(50)}",
+        "  note: {type: varchar(50), renamed_from: label}",
+    ));
+    let plan = connected_artifact(&d, connection, false);
+    let applied = succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "rename"],
+    ));
+    let out = stdout(&applied);
+    let heading = out
+        .lines()
+        .position(|l| l.ends_with("affects:"))
+        .unwrap_or_else(|| panic!("no impact heading: {out}"));
+    let body: Vec<&str> = out
+        .lines()
+        .skip(heading + 1)
+        .take_while(|l| l.starts_with("  "))
+        .collect();
+    assert!(
+        body.iter().any(|l| l.contains("outside.follows")
+            && l.contains("carried into the new name, keeps working")),
+        "{out}"
+    );
+    assert!(
+        body.iter()
+            .any(|l| l.contains("keeps its old output column name")),
+        "{out}"
+    );
+    assert_eq!(
+        scalar(connection, "SELECT count(*) FROM outside.follows"),
+        0
+    );
+}
+
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn postgres_rename_impact_reaches_the_cli_as_advisory_and_requires_explicit_approval() {
@@ -6389,6 +6439,21 @@ fn postgres_rename_impact_reaches_the_cli_as_advisory_and_requires_explicit_appr
     );
     assert!(
         stdout(&applied).contains("Nothing outside the database is visible"),
+        "{}",
+        stdout(&applied)
+    );
+    // #307: the view follows the rename and says so, as carried — never as
+    // something that breaks.
+    let carried = stdout(&applied)
+        .lines()
+        .filter(|l| l.contains("outside.carried"))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    assert!(
+        !carried.is_empty()
+            && carried
+                .iter()
+                .all(|l| l.contains("carried into the new name, keeps working")),
         "{}",
         stdout(&applied)
     );
