@@ -3,6 +3,7 @@
 mod admission;
 mod batching;
 mod private_refs;
+mod revisions;
 
 use super::*;
 use pbps_ui::compose::{ResourceObserver, ResourceOperation, ResourceState};
