@@ -1,6 +1,7 @@
 //! Real publication, lost acknowledgements and restart from durable receipts.
 
 mod resources;
+mod signing;
 
 use super::*;
 use pbps_ui::compose::{
