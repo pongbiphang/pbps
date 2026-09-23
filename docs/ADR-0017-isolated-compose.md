@@ -433,8 +433,13 @@ the census are reused within resource discovery, then discarded with the batch.
 The cache never authorizes a later operation: direct reads, mutations and receipt
 reconciliation retain their individual authority checks. The bounded-pass claim
 covers discovery enumeration and admission census, not per-receipt recovery or
-per-pin Git verification. Admission still validates the contents of pin-owning
-records; validation of every prior record before acquisition is separate #785.
+per-pin Git verification. Under the resource coordination lease, admission
+validates every prior resource record before creating a new record, snapshot or
+pin (#785), reusing pin-owner reads from the census. Unknown versions, malformed,
+unreadable or nonregular evidence refuse with a named retained-recovery
+obligation. Healthy other-source records are validated against the common store;
+they grant no current-source cleanup authority. Direct preview admission enforces
+this condition even when discovery was never requested.
 
 Discovery and new-resource admission also census `refs/pbps-compose` (#783).
 Read both loose and packed evidence without following symlinks and corroborate
