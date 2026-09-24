@@ -698,3 +698,30 @@ human and JSON `state list`, `status` including a staged checkpoint, the
 unsupported-version and fallback paths, and direct `SELECT *` on the ordinary
 table — never outputs a confidential checksum, while ordinary records' history
 and approval by the same SHA-256 keep working.
+
+<a id="dec-878-1"></a>
+
+**DEC-878.1. Each engine writes a confidential record's two halves in one
+statement, and prunes them together behind the protected table's integrity
+gate (#878; implements DEC-868.1's storage).** PostgreSQL inserts the ordinary
+row in a data-modifying CTE whose `RETURNING id` feeds the protected insert;
+SQL Server's ordinary insert carries `OUTPUT INSERTED.id … INTO
+dbo.__pbps_state_confidential` beside `OUTPUT INSERTED.id` for the caller. One
+statement, so a protected insert that fails — measured with the protected
+table's `INSERT` withheld from a least-privileged account — leaves no ordinary
+row either. On SQL Server the same clause is a guard: the engine refuses
+`OUTPUT … INTO` a table with an enabled trigger (Msg 331), so a trigger added to
+the protected table cannot run inside a confidential insert.
+
+No foreign key joins the halves. It would need `REFERENCES` on `__pbps_state`
+from a least-privileged deployment account, it adds engine-created triggers on
+PostgreSQL, and on SQL Server it would forbid the `OUTPUT … INTO` above; the
+one-statement write and the one-statement prune keep the halves together
+instead. Prune deletes both halves up to the same id in one statement on
+PostgreSQL and in one transaction on SQL Server, after the protected table is
+held to its recipe (DEC-313.1's method; on SQL Server a new shape, trigger,
+security-predicate and owner check, since DEC-313.1 was PostgreSQL's). The SQL
+Server batch takes an exclusive table lock *before* re-checking for a trigger,
+so none can be added between the check and the delete. The protected table is
+in both engines' ledger-name filters, so the pull never takes it for managed
+schema. Reader qualification is #879 and #880.

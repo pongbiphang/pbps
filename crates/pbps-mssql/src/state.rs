@@ -39,6 +39,114 @@ pub const LEDGER_SCHEMA: &str = "dbo";
 /// permission questions — asks here rather than repeating the spelling.
 pub const STATE_TABLE: &str = "dbo.__pbps_state";
 pub const LOCK_TABLE: &str = "dbo.__pbps_lock";
+/// The protected half of confidential records (DEC-868.1), created by the first
+/// one.
+pub const CONFIDENTIAL_TABLE: &str = "dbo.__pbps_state_confidential";
+
+/// The protected half's recipe. No foreign key and no trigger — both would
+/// stop the `OUTPUT ... INTO` that writes it (measured: Msg 331 for an enabled
+/// trigger), and that refusal is part of the guard: a trigger added to this
+/// table cannot run inside a confidential record's insert.
+const CREATE_CONFIDENTIAL: &str = "\
+IF OBJECT_ID(N'dbo.__pbps_state_confidential', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.__pbps_state_confidential (
+        state_id      BIGINT         NOT NULL
+                      CONSTRAINT pk___pbps_state_confidential PRIMARY KEY,
+        plan_checksum CHAR(64)       NULL,
+        reason        NVARCHAR(1000) NULL,
+        state_json    NVARCHAR(MAX)  NOT NULL
+    );
+END;";
+
+/// Every catalog fact about the protected table that decides what a write to
+/// it or a delete from it does, in [`CONFIDENTIAL_RECIPE`]'s spelling — the
+/// known layout compared whole (DEC-313.1's method on this engine). Names are
+/// collated to the database default: `sys` names are in the server's
+/// collation, and concatenating the two otherwise fails (measured, Msg 451).
+///
+/// **The spelling is a fact too.** On a case-insensitive database `OBJECT_ID`
+/// resolves the ledger's name to a project's own `__PBPS_STATE_CONFIDENTIAL`,
+/// which the pull keeps and validation allows because neither reserves more
+/// than the exact spelling. A table of the recipe's shape under that name would
+/// otherwise be written to and pruned as the ledger, and a later plan could
+/// alter or drop it.
+const CONFIDENTIAL_FACTS: &str = "\
+DECLARE @o int = OBJECT_ID(N'dbo.__pbps_state_confidential', N'U');
+SELECT 'spelled ' + OBJECT_NAME(@o) COLLATE DATABASE_DEFAULT AS fact
+ WHERE OBJECT_NAME(@o) COLLATE Latin1_General_BIN2 <> N'__pbps_state_confidential'
+UNION ALL
+SELECT 'column ' + c.name COLLATE DATABASE_DEFAULT + ' '
+       + TYPE_NAME(c.user_type_id) COLLATE DATABASE_DEFAULT + ' '
+       + CONVERT(varchar(11), c.max_length) + ' ' + CONVERT(varchar(11), c.precision) + ' '
+       + CONVERT(varchar(11), c.scale)
+       + CASE WHEN c.is_nullable = 1 THEN ' NULL' ELSE ' NOT NULL' END
+       + CASE WHEN c.is_identity = 1 THEN ' IDENTITY' ELSE '' END
+       + CASE WHEN c.is_computed = 1 THEN ' COMPUTED' ELSE '' END
+       + CASE WHEN c.default_object_id <> 0 THEN ' DEFAULT' ELSE '' END AS fact
+  FROM sys.columns c WHERE c.object_id = @o
+UNION ALL
+SELECT 'index ' + i.name COLLATE DATABASE_DEFAULT + ' ' + i.type_desc COLLATE DATABASE_DEFAULT
+       + CASE WHEN i.is_primary_key = 1 THEN ' PRIMARY KEY' ELSE '' END
+       + CASE WHEN i.has_filter = 1 THEN ' FILTERED' ELSE '' END + ' ('
+       + STRING_AGG(COL_NAME(ic.object_id, ic.column_id) COLLATE DATABASE_DEFAULT, ',')
+         WITHIN GROUP (ORDER BY ic.key_ordinal, ic.index_column_id) + ')'
+  FROM sys.indexes i
+  JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+ WHERE i.object_id = @o
+ GROUP BY i.name, i.type_desc, i.is_primary_key, i.has_filter
+UNION ALL
+SELECT 'check constraint ' + name COLLATE DATABASE_DEFAULT
+  FROM sys.check_constraints WHERE parent_object_id = @o
+UNION ALL
+SELECT 'foreign key ' + name COLLATE DATABASE_DEFAULT
+  FROM sys.foreign_keys WHERE parent_object_id = @o OR referenced_object_id = @o
+UNION ALL
+SELECT 'trigger ' + name COLLATE DATABASE_DEFAULT FROM sys.triggers WHERE parent_id = @o
+UNION ALL
+SELECT 'security predicate ' + OBJECT_NAME(object_id) COLLATE DATABASE_DEFAULT
+  FROM sys.security_predicates WHERE target_object_id = @o
+UNION ALL
+SELECT 'untrusted owner ' + USER_NAME(COALESCE(o.principal_id, s.principal_id)) COLLATE DATABASE_DEFAULT
+  FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id
+ WHERE o.object_id = @o
+   AND COALESCE(o.principal_id, s.principal_id) NOT IN (DATABASE_PRINCIPAL_ID('dbo'), USER_ID())
+   AND ISNULL(IS_ROLEMEMBER(USER_NAME(COALESCE(o.principal_id, s.principal_id))), 0) <> 1;";
+
+/// [`CREATE_CONFIDENTIAL`]'s catalog projection, measured on the pinned server.
+const CONFIDENTIAL_RECIPE: [&str; 5] = [
+    "column state_id bigint 8 19 0 NOT NULL",
+    "column plan_checksum char 64 0 0 NULL",
+    "column reason nvarchar 2000 0 0 NULL",
+    "column state_json nvarchar -1 0 0 NOT NULL",
+    "index pk___pbps_state_confidential CLUSTERED PRIMARY KEY (state_id)",
+];
+
+const SELECT_PROTECTED: &str = "\
+SELECT plan_checksum, reason, state_json
+  FROM dbo.__pbps_state_confidential WHERE state_id = @P1;";
+
+/// Both halves of every pruned record in one transaction, under an exclusive
+/// table lock taken *before* the trigger check, so a trigger cannot be added
+/// between the check and the delete (`CREATE TRIGGER` needs a schema lock the
+/// held table lock excludes). A trigger found is a refusal, and the rollback
+/// takes both deletes with it. The lock is taken by an assigning `SELECT`,
+/// which returns no result set: the driver reads the first one, and an empty
+/// `SELECT TOP (0)` there hid the count (measured).
+const DELETE_BOTH_UP_TO: &str = "\
+SET XACT_ABORT ON;
+DECLARE @locked BIGINT, @pruned BIGINT;
+BEGIN TRANSACTION;
+SELECT TOP (1) @locked = state_id FROM dbo.__pbps_state_confidential WITH (TABLOCKX, HOLDLOCK);
+IF EXISTS (SELECT 1 FROM sys.triggers
+            WHERE parent_id = OBJECT_ID(N'dbo.__pbps_state_confidential', N'U'))
+    THROW 50000, N'dbo.__pbps_state_confidential has a trigger, which pbps did not create; the prune was refused.', 1;
+DELETE FROM dbo.__pbps_state_confidential WHERE state_id <= @P1;
+DELETE FROM dbo.__pbps_state WHERE id <= @P1;
+SET @pruned = @@ROWCOUNT;
+COMMIT TRANSACTION;
+SET XACT_ABORT OFF;
+SELECT @pruned AS pruned;";
 
 /// `IF OBJECT_ID` rather than `CREATE OR ALTER`: creating the ledger must be
 /// safe to run on every command that writes one, and re-running must not
@@ -516,22 +624,7 @@ pub async fn record(conn: &mut Conn, snapshot: &StateSnapshot) -> Result<i64, Le
         message: format!("the snapshot could not be serialized: {e}"),
     })?;
 
-    let kind = snapshot.kind.as_str();
-    let state_version = saturating_i32(u64::from(snapshot.version));
-    let tables_count = saturating_i32(snapshot.schema.tables.len() as u64);
-    let modules_count = saturating_i32(snapshot.schema.modules.len() as u64);
-
-    let mut params: Vec<Param<'_>> = vec![
-        kind.into(),
-        snapshot.git_sha.as_deref().into(),
-        snapshot.plan_checksum.as_deref().into(),
-        state_json.as_str().into(),
-        snapshot.operator.as_str().into(),
-        snapshot.reason.as_deref().into(),
-        state_version.into(),
-        tables_count.into(),
-        modules_count.into(),
-    ];
+    let (params, staged) = ordinary_params(snapshot, &state_json);
     // `staged_completed`/`staged_total` cannot be bound as NULL through
     // `Param` — it has no nullable-integer variant, and adding one would mean
     // updating the binder `pbps_db::Param` matches in *both* drivers for two
@@ -539,13 +632,10 @@ pub async fn record(conn: &mut Conn, snapshot: &StateSnapshot) -> Result<i64, Le
     // static statements, chosen by whether this snapshot has staged progress
     // at all, cost nothing `no_statement_interpolates_a_value` would catch —
     // neither text is built from a value — and need no new binder variant.
-    let sql = match &snapshot.staged {
-        Some(progress) => {
-            params.push(saturating_i32(progress.completed as u64).into());
-            params.push(saturating_i32(progress.total as u64).into());
-            INSERT_STATE_STAGED
-        }
-        None => INSERT_STATE_NOT_STAGED,
+    let sql = if staged {
+        INSERT_STATE_STAGED
+    } else {
+        INSERT_STATE_NOT_STAGED
     };
     let rows = conn.query_with(sql, &params).await?;
     match rows.first() {
@@ -554,6 +644,184 @@ pub async fn record(conn: &mut Conn, snapshot: &StateSnapshot) -> Result<i64, Le
             "the ledger insert returned no id".into(),
         ))),
     }
+}
+
+/// The protected half of a confidential record, as read back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProtectedHalf {
+    /// The row is there. `state_json` is the whole snapshot, checksum included.
+    Found {
+        plan_checksum: Option<String>,
+        reason: Option<String>,
+        state_json: String,
+    },
+    /// No protected row for this id, or no protected table at all.
+    Missing,
+    /// There, but this principal may not read it. Never a checksum.
+    Denied,
+}
+
+/// Records a confidential entry: `ordinary` is the row every reader can see,
+/// `full` goes to the protected table under the same id (DEC-868.1).
+///
+/// **One statement**: the ordinary insert's `OUTPUT INSERTED.id ... INTO` writes
+/// the protected half, so neither exists without the other, and SQL Server
+/// refuses the statement outright if the protected table has an enabled
+/// trigger (Msg 331). The ordinary row must carry no verifier.
+pub async fn record_confidential(
+    conn: &mut Conn,
+    ordinary: &StateSnapshot,
+    full: &StateSnapshot,
+) -> Result<i64, LedgerError> {
+    if ordinary.plan_checksum.is_some() || ordinary.reason.is_some() {
+        return Err(LedgerError::BadEntry {
+            id: 0,
+            message: "the ordinary row of a confidential record would carry a plan checksum or a \
+                      reason, which pre-feature readers project; both belong to the protected \
+                      half only (DEC-868.1)"
+                .into(),
+        });
+    }
+    ensure_tables(conn).await?;
+    conn.execute(CREATE_CONFIDENTIAL).await?;
+    let problems = protected_table_problems(conn).await?;
+    if !problems.is_empty() {
+        return Err(LedgerError::Db(DbError::Refused(protected_table_message(
+            &problems,
+        ))));
+    }
+    let state_json = serde_json::to_string(ordinary).map_err(|e| LedgerError::BadEntry {
+        id: 0,
+        message: format!("the snapshot could not be serialized: {e}"),
+    })?;
+    let protected_json = serde_json::to_string(full).map_err(|e| LedgerError::BadEntry {
+        id: 0,
+        message: format!("the confidential snapshot could not be serialized: {e}"),
+    })?;
+    let (mut params, staged) = ordinary_params(ordinary, &state_json);
+    let n = params.len();
+    params.push(full.plan_checksum.as_deref().into());
+    params.push(full.reason.as_deref().into());
+    params.push(protected_json.as_str().into());
+    let staged_values = if staged { "@P10, @P11" } else { "NULL, NULL" };
+    let sql = format!(
+        "INSERT INTO dbo.__pbps_state
+             (kind, git_sha, plan_checksum, state_json, operator, reason,
+              state_version, tables_count, modules_count, staged_completed, staged_total)
+         OUTPUT INSERTED.id, @P{a}, @P{b}, @P{c}
+           INTO dbo.__pbps_state_confidential (state_id, plan_checksum, reason, state_json)
+         OUTPUT INSERTED.id
+         VALUES (@P1, @P2, @P3, @P4, @P5, @P6, @P7, @P8, @P9, {staged_values});",
+        a = n + 1,
+        b = n + 2,
+        c = n + 3,
+    );
+    let rows = conn.query_with(&sql, &params).await?;
+    match rows.first() {
+        Some(row) => Ok(get(row, "id")?),
+        None => Err(LedgerError::Db(DbError::BadRow(
+            "the confidential ledger insert returned no id".into(),
+        ))),
+    }
+}
+
+/// Reads the protected half of the record `id`.
+pub async fn protected_half(conn: &mut Conn, id: i64) -> Result<ProtectedHalf, DbError> {
+    let rows = match conn.query_with(SELECT_PROTECTED, &[id.into()]).await {
+        Ok(rows) => rows,
+        Err(e) if is_missing_table(&e) => return Ok(ProtectedHalf::Missing),
+        Err(e) if e.server_error_code().as_deref() == Some(SELECT_DENIED_ON_TABLE) => {
+            return Ok(ProtectedHalf::Denied);
+        }
+        Err(e) => return Err(e),
+    };
+    match rows.first() {
+        Some(row) => Ok(ProtectedHalf::Found {
+            plan_checksum: opt::<&str>(row, "plan_checksum")?.map(|v| v.trim_end().to_owned()),
+            reason: opt::<&str>(row, "reason")?.map(ToOwned::to_owned),
+            state_json: get::<&str>(row, "state_json")?.to_owned(),
+        }),
+        None => Ok(ProtectedHalf::Missing),
+    }
+}
+
+/// How the protected table differs from its recipe, one line per difference;
+/// empty when it matches or is not there yet.
+pub async fn protected_table_problems(conn: &mut Conn) -> Result<Vec<String>, DbError> {
+    let rows = conn.query(CONFIDENTIAL_FACTS).await?;
+    let mut held = std::collections::BTreeSet::new();
+    let mut problems = Vec::new();
+    for row in &rows {
+        let fact = get::<&str>(row, "fact")?.to_owned();
+        if let Some(owner) = fact.strip_prefix("untrusted owner ") {
+            problems.push(format!(
+                "{CONFIDENTIAL_TABLE} is owned by `{owner}`, which is neither dbo, this \
+                 principal, nor a role it belongs to"
+            ));
+        } else if let Some(spelling) = fact.strip_prefix("spelled ") {
+            problems.push(format!(
+                "{CONFIDENTIAL_TABLE} resolves to `dbo.{spelling}`, a table the project names \
+                 itself, which this database's collation folds onto the ledger's name"
+            ));
+        } else {
+            held.insert(fact);
+        }
+    }
+    if !held.is_empty() {
+        let recipe: std::collections::BTreeSet<String> = CONFIDENTIAL_RECIPE
+            .iter()
+            .map(|f| (*f).to_owned())
+            .collect();
+        problems.extend(
+            held.difference(&recipe)
+                .map(|f| format!("{CONFIDENTIAL_TABLE} has {f}, which pbps did not create")),
+        );
+        problems.extend(
+            recipe
+                .difference(&held)
+                .map(|f| format!("{CONFIDENTIAL_TABLE} lacks {f}")),
+        );
+    }
+    Ok(problems)
+}
+
+fn protected_table_message(problems: &[String]) -> String {
+    format!(
+        "{}.\n\
+         The protected ledger table is not the one pbps creates, so no confidential record is \
+         written to or pruned from it. If pbps made it and it was changed by hand, restore it; \
+         otherwise drop it and let pbps create its own (DEC-868.1).",
+        problems.join(";\n")
+    )
+}
+
+/// The ordinary row's parameters, shared by [`record`] and
+/// [`record_confidential`]; `true` when the two staged columns are bound.
+fn ordinary_params<'a>(snapshot: &'a StateSnapshot, state_json: &'a str) -> (Vec<Param<'a>>, bool) {
+    let kind = snapshot.kind.as_str();
+    let state_version = saturating_i32(u64::from(snapshot.version));
+    let tables_count = saturating_i32(snapshot.schema.tables.len() as u64);
+    let modules_count = saturating_i32(snapshot.schema.modules.len() as u64);
+    let mut params: Vec<Param<'a>> = vec![
+        kind.into(),
+        snapshot.git_sha.as_deref().into(),
+        snapshot.plan_checksum.as_deref().into(),
+        state_json.into(),
+        snapshot.operator.as_str().into(),
+        snapshot.reason.as_deref().into(),
+        state_version.into(),
+        tables_count.into(),
+        modules_count.into(),
+    ];
+    let staged = match &snapshot.staged {
+        Some(progress) => {
+            params.push(saturating_i32(progress.completed as u64).into());
+            params.push(saturating_i32(progress.total as u64).into());
+            true
+        }
+        None => false,
+    };
+    (params, staged)
 }
 
 /// Deletes all but the `keep` newest entries; returns how many went.
@@ -576,7 +844,41 @@ pub async fn prune(conn: &mut Conn, keep: u32) -> Result<u64, LedgerError> {
     let Some(highest) = doomed.first().copied() else {
         return Ok(0);
     };
+    // A ledger with confidential records prunes both halves together, after
+    // the protected table is held to its recipe; the batch re-checks for a
+    // trigger under its own table lock.
+    if confidential_present(conn).await? {
+        let problems = protected_table_problems(conn).await?;
+        if !problems.is_empty() {
+            return Err(LedgerError::Db(DbError::Refused(protected_table_message(
+                &problems,
+            ))));
+        }
+        let rows = conn
+            .query_with(DELETE_BOTH_UP_TO, &[highest.into()])
+            .await?;
+        return Ok(rows
+            .first()
+            .map(|row| get::<i64>(row, "pruned"))
+            .transpose()?
+            .map_or(0, |n| u64::try_from(n).unwrap_or(0)));
+    }
     Ok(conn.execute_with(DELETE_UP_TO, &[highest.into()]).await?)
+}
+
+async fn confidential_present(conn: &mut Conn) -> Result<bool, DbError> {
+    let rows = conn
+        .query(
+            "SELECT CASE WHEN OBJECT_ID(N'dbo.__pbps_state_confidential', N'U') IS NULL \
+             THEN 0 ELSE 1 END AS present;",
+        )
+        .await?;
+    Ok(rows
+        .first()
+        .map(|row| get::<i32>(row, "present"))
+        .transpose()?
+        .unwrap_or(0)
+        == 1)
 }
 
 /// Takes the apply lock, or reports who already holds it.
@@ -599,6 +901,9 @@ pub async fn lock(conn: &mut Conn, holder: &str) -> Result<(), LedgerError> {
 /// 229, "permission was denied", and keeping the two apart is the whole point
 /// of asking by error number.
 const INVALID_OBJECT_NAME: &str = "208";
+
+/// SQL Server's "SELECT permission was denied on the object": Msg 229.
+const SELECT_DENIED_ON_TABLE: &str = "229";
 
 /// Whether a failure means "that table does not exist".
 ///
@@ -928,6 +1233,13 @@ mod tests {
     fn the_statements_name_the_documented_tables() {
         assert_eq!(STATE_TABLE, format!("{LEDGER_SCHEMA}.{STATE_TABLE_NAME}"));
         assert_eq!(LOCK_TABLE, format!("{LEDGER_SCHEMA}.{LOCK_TABLE_NAME}"));
+        assert_eq!(
+            CONFIDENTIAL_TABLE,
+            format!(
+                "{LEDGER_SCHEMA}.{}",
+                pbps_db::ledger::CONFIDENTIAL_TABLE_NAME
+            )
+        );
         for sql in [
             CREATE_STATE,
             ADD_TIMELINE_COLUMNS,
