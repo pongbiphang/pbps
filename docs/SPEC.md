@@ -1024,12 +1024,14 @@ privileges. Tampering with the ledger's *contents* is a record problem; a
 ledger that runs someone else's code when the deployment account writes to it
 is an escalation. So on PostgreSQL, where a role with `CREATE` on `public` can
 make the ledger tables before pbps does, every command that writes the ledger
-first compares its two tables with the recipe pbps creates them from — columns,
-defaults, constraints, indexes, triggers, rules and row-security policies —
-and checks that every login role able to add a trigger to them (as owner or
-through `TRIGGER`) could already become the deployment account; it refuses
-before its first write otherwise, and `doctor` reports the same as
-`ledger.untrusted` (DEC-313.1, DEC-834.1).
+first compares its two tables with the recipe pbps creates them from — the
+table's kind, persistence, access method, replica identity, type and
+inheritance, its columns and the identity sequence, defaults, constraints,
+indexes, triggers, rules and row-security policies — and checks that every
+login role able to add a trigger to them (as owner or through `TRIGGER`) could
+already become the deployment account; it refuses before its first write
+otherwise, `prune` and `unlock` ask the same before they delete, and `doctor`
+reports the same as `ledger.untrusted` (DEC-313.1, DEC-834.1, DEC-901.1).
 
 ### 8.2 The drift check
 
