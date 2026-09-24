@@ -189,6 +189,17 @@ plugin execution system is introduced: these are admission requirements for
 the existing planned resolver lifecycle. The resolver is neither a performance
 test nor a production-data rehearsal, and does not replace apply's data probes.
 
+For the Linux profiles, fresh private tmpfs storage is also a trusted-provisioning
+premise. A prepopulated tmpfs transferred from a now-departed staging mount
+namespace is a **named unsupported provenance case** (#644). A matching mount
+layout, filesystem root `/`, propagation fields or current namespace inventory
+cannot prove creation history; legacy mount ID ordering is not such evidence
+either. The observer cannot reliably detect this arrangement. Provisioning
+must exclude it and recreate uncertain storage from qualified runtime inputs
+before analysis; this is not an additional guarantee supplied by a namespace
+census. The [runtime boundary](RESOLVER-RUNTIME.md#private-tmpfs-provenance-644)
+records the measured limit for both profiles and engines.
+
 ### 4. Discover requirements for both engines; verify the chosen environment
 
 Environment discovery and candidate recommendation cover PostgreSQL and SQL
