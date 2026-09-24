@@ -1008,12 +1008,23 @@ impl Graph {
         // runs with this user's access, and chaining need not be on for it;
         // that code is outside this database's catalog, so a signer that
         // reads cannot be qualified here at all.
-        for (&id, p) in &self.database {
-            if ["C", "K"].contains(&p.kind.as_str()) && readers.contains(&Who::User(id)) {
+        // The same holds for a certificate- or key-mapped login: its server
+        // permissions travel with the signature into any database.
+        let signers = self
+            .database
+            .iter()
+            .map(|(&id, p)| ("user", Who::User(id), p))
+            .chain(
+                self.server
+                    .iter()
+                    .map(|(&id, p)| ("login", Who::Login(id), p)),
+            );
+        for (what, who, p) in signers {
+            if ["C", "K"].contains(&p.kind.as_str()) && readers.contains(&who) {
                 problems.push(format!(
-                    "certificate- or key-mapped user `{}` can read {subject}; code signed with its \
-                     certificate or key in any database runs with that access, which this check \
-                     cannot follow",
+                    "certificate- or key-mapped {what} `{}` can read {subject}; code signed with \
+                     its certificate or key in any database runs with that access, which this \
+                     check cannot follow",
                     p.name
                 ));
             }

@@ -852,9 +852,11 @@ So the database's owner qualifies by what it can do, and needs no exemption
 (#863). There is no allowance beyond this rule.
 
 *Signers.* A certificate or key signs code in any database, and that code
-runs with the mapped user's access here without cross-database chaining. So a
-certificate- or key-mapped user that reads the table is named as something the
-check cannot follow, whatever this database's own code does.
+runs with the mapped user's access here without cross-database chaining. A
+login mapped to the same certificate or key carries its server permissions
+into that code. So a certificate- or key-mapped user or login that reads the
+table is named as something the check cannot follow, whatever this database's
+own code does.
 
 *Where the approximations lean.* A `DENY` never removes a reader, because
 telling which grant it overrides would be a second implementation of the

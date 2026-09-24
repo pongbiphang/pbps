@@ -2571,6 +2571,24 @@ async fn every_unqualified_reader_grantor_and_backup_principal_is_named() {
         .await
         .unwrap();
 
+    // A certificate-mapped login holding a server-wide read: it signs code in
+    // any database, so it is named for itself.
+    db.conn
+        .execute(&format!(
+            "USE master;
+             IF EXISTS (SELECT 1 FROM sys.server_principals WHERE name = N'l880_cert_{pid}')
+               DROP LOGIN [l880_cert_{pid}];
+             IF EXISTS (SELECT 1 FROM sys.certificates WHERE name = N'c880_login_{pid}')
+               DROP CERTIFICATE [c880_login_{pid}];
+             CREATE CERTIFICATE [c880_login_{pid}] ENCRYPTION BY PASSWORD = '{READER_PASSWORD}'
+               WITH SUBJECT = 'pbps';
+             CREATE LOGIN [l880_cert_{pid}] FROM CERTIFICATE [c880_login_{pid}];
+             GRANT SELECT ALL USER SECURABLES TO [l880_cert_{pid}];
+             USE [{}];",
+            db.name
+        ))
+        .await
+        .unwrap();
     let problems = pbps_mssql::confidential::protected_reader_problems(&mut db.conn)
         .await
         .expect("qualify");
@@ -2591,10 +2609,20 @@ async fn every_unqualified_reader_grantor_and_backup_principal_is_named() {
     }
     // A certificate user that reads is named for itself: code signed with its
     // certificate elsewhere is out of this database's sight.
-    for signer in ["u880_cert", "u880_viewcert"] {
-        assert!(names(&problems, signer), "{signer}: {problems:#?}");
+    for signer in [
+        "u880_cert".to_owned(),
+        "u880_viewcert".to_owned(),
+        format!("l880_cert_{pid}"),
+    ] {
+        assert!(names(&problems, &signer), "{signer}: {problems:#?}");
     }
     drop_logins(db, &logins).await;
+    let mut conn = connect_live(&conn_str()).await.expect("connect");
+    let _ = conn
+        .execute(&format!(
+            "USE master; DROP LOGIN [l880_cert_{pid}]; DROP CERTIFICATE [c880_login_{pid}];"
+        ))
+        .await;
 }
 
 /// #880: what cannot reach the table names nobody. Code naming the ledger's
