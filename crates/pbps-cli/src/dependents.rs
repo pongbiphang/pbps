@@ -277,6 +277,31 @@ fn named_at(changes: &[PlannedChange], i: usize, holds: &Holds) -> Holds {
     Holds::TablePart { table, part }
 }
 
+/// Rewrites a table part's change to name its table and column as `holds`
+/// does: the name that holds where the change is being moved to. A removal
+/// the differ put after a rename, moved before the module's drop, may land
+/// before that rename, where the table still has its old name.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn respell(p: &mut PlannedChange, holds: &Holds, dialect: &dyn Dialect) {
+    let Holds::TablePart { table, part } = holds else {
+        return;
+    };
+    match (&mut p.change, part) {
+        (
+            Change::DropCheck { table: t, .. }
+            | Change::AddCheck { table: t, .. }
+            | Change::DropIndex { table: t, .. }
+            | Change::AddIndex { table: t, .. },
+            _,
+        ) => *t = table.clone(),
+        (Change::AlterColumnDefault { column, .. }, Part::Default(c)) => {
+            *column = ColumnRef::new(table.clone(), c.clone());
+        }
+        _ => return,
+    }
+    p.risks = dialect.change_risks(&p.change);
+}
+
 /// The first change matching `test` against the dependent's name at that
 /// change's own position.
 fn find(
@@ -456,7 +481,12 @@ pub(crate) fn weave(
             let removed_at = match removal {
                 Some(i) if i < at.drop_at => i,
                 Some(i) => {
-                    let moved = cs.changes.remove(i);
+                    let mut moved = cs.changes.remove(i);
+                    respell(
+                        &mut moved,
+                        &named_at(&cs.changes, at.drop_at, &d.holds),
+                        dialect,
+                    );
                     cs.changes.insert(at.drop_at, moved);
                     at.drop_at
                 }
@@ -494,9 +524,14 @@ pub(crate) fn weave(
             match restoration {
                 Some(j) if j > after => {}
                 Some(j) => {
-                    let moved = cs.changes.remove(j);
+                    let mut moved = cs.changes.remove(j);
                     // `after` moved down by one if the restoration was above it.
                     let after = if j < after { after - 1 } else { after };
+                    respell(
+                        &mut moved,
+                        &named_at(&cs.changes, after + 1, &d.holds),
+                        dialect,
+                    );
                     cs.changes.insert(after + 1, moved);
                 }
                 None if at.create_at.is_some() => {
@@ -980,6 +1015,64 @@ mod tests {
         assert_eq!(shape[0], "drop check ck", "{shape:?}");
         assert_eq!(shape[1], "drop app.f(integer)", "{shape:?}");
         assert!(!shape.iter().any(|c| c == "add check ck"), "{shape:?}");
+        assert!(unaccounted(&cs, &found).is_empty());
+    }
+
+    /// A plan that drops a function for good, renames the table, and edits
+    /// the check so it no longer calls the function: the differ puts the
+    /// check's removal after the rename, and moving it before the function's
+    /// drop puts it before the rename too, where the table has its old name.
+    /// It is written in that name, so the plan is not refused and its SQL
+    /// names a table that exists.
+    #[test]
+    // A test's catch-all: any other change first is the failure it reports.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    fn a_removal_moved_before_a_rename_is_written_in_the_old_name() {
+        let (mut s, ids) = declared();
+        let mut t = s.tables.remove(&TableName::new("app", "t")).unwrap();
+        t.checks.insert(
+            "ck".into(),
+            CheckConstraint {
+                expression: "id >= 0".into(),
+            },
+        );
+        s.tables.insert(TableName::new("app", "u"), t.clone());
+        s.modules.remove(&id("app.f(integer)"));
+        let mut cs = plan(vec![
+            Change::DropModule {
+                id: id("app.f(integer)"),
+                kind: ModuleKind::Function,
+            },
+            Change::RenameTable {
+                uid: Uid::derived(UidKind::Table, "app.t", 0),
+                from: TableName::new("app", "t"),
+                to: TableName::new("app", "u"),
+            },
+            Change::DropCheck {
+                table: TableName::new("app", "u"),
+                name: "ck".into(),
+            },
+            Change::AddCheck {
+                table: TableName::new("app", "u"),
+                name: "ck".into(),
+                constraint: t.checks["ck"].clone(),
+            },
+        ]);
+        let found = BTreeMap::from([(
+            id("app.f(integer)"),
+            vec![part(
+                Part::Check("ck".into()),
+                "constraint ck on table app.t",
+            )],
+        )]);
+        weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).unwrap();
+        match &cs.changes[0].change {
+            Change::DropCheck { table, name } => {
+                assert_eq!(table.to_string(), "app.t");
+                assert_eq!(name, "ck");
+            }
+            other => panic!("expected the moved removal first, got {other:?}"),
+        }
         assert!(unaccounted(&cs, &found).is_empty());
     }
 }
