@@ -369,3 +369,42 @@ which says how to add an entry here.
      `destructive_rationale_covers_data_and_uniqueness_loss` pins the gate's
      explanation. This entry records the existing behavior; it changes no
      risk class or execution rule.
+
+<a id="dec-316-1"></a>
+
+**DEC-316.1. A PostgreSQL plan that creates a name the database already uses
+outside the recorded scope is refused before it is saved (#316, #320, #323).**
+The recorded scope is the baseline's and has to stay that way (SPEC §8.2,
+DECISIONS 417). So a table, view or routine this project never recorded is
+outside it even when a declaration now names it, and the differ plans a
+`CREATE` for the declaration. This engine has no `CREATE OR ALTER`, so the
+statement is refused at apply, after everything ordered before it has run.
+The transaction keeps that from recording anything, but a plan that
+predictably fails is what SPEC §7.5 exists to prevent.
+
+`plan --db` now compares every `CreateTable` and `CreateModule` with what the
+same read found outside the scope, and refuses by name and kind:
+
+- a readable table (#323);
+- a readable view or routine (#320);
+- a relation pbps cannot read, such as a partitioned table or a materialized
+  view (#316).
+
+Tables and views share one namespace per schema on this engine, so each is
+checked against both. A routine or trigger collides only with itself. A
+`CreateModule` after a `DropModule` of the same id is a rebuild and is left
+alone. An unmanaged occupant is never dropped by a plan, so nothing else in
+the plan can clear the name first.
+
+Refused, not adopted, and the scope is not widened. Adopting an object is an
+explicit act with a reason, and `baseline` already is that act. The refusal
+names it as the remedy for a readable occupant; the other remedies are
+removing the declaration or moving the object. A `CREATE OR REPLACE` would
+have been the shortest path, and it is exactly the silent replacement of an
+object nobody reviewed that ADR-0002 rules out.
+
+A name taken after the plan was saved is left to the apply. The `CREATE` fails
+inside the transaction and the ledger records nothing, which is the outcome a
+recheck could only have reported earlier. SQL Server is unchanged: its module
+path is `CREATE OR ALTER`, whose adoption of an existing module is a separate
+question.
