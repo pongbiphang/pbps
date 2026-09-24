@@ -40,23 +40,35 @@ async function exercise() {
   assert.equal(a.confirm.disabled, true);
   await a.confirm.fire("click"); assert.equal(a.calls.length, 1);
 
-  // Out-of-order responses cannot replace the most recently requested preview.
+  // One preview in flight (#857): a second submit while the first is pending
+  // sends nothing, so the server can never retire the handle the page keeps.
   const first = a.form.fire("submit");
-  const second = a.form.fire("submit");
-  a.calls[2].resolve(preview("new")); await second;
-  a.calls[1].resolve(preview("stale")); await first;
+  assert(a.root.find(e => e.dataset.action === "preview").disabled, "Refresh waits for the pending preview");
+  await a.form.fire("submit");
+  assert.equal(a.calls.length, 2, "no overlapping preview request");
+  a.calls[1].resolve(preview("new")); await first;
+  assert(!a.root.find(e => e.dataset.action === "preview").disabled);
   assert.equal(a.confirm.disabled, false);
   assert(!a.root.find(e => e.textContent.includes("common_inode")));
   assert(a.root.find(e => e.textContent === "diff-new"));
   const confirming = a.confirm.fire("click");
   await a.confirm.fire("click");
   await a.form.fire("submit");
-  assert.equal(a.calls.length, 4);
-  assert.deepEqual(a.calls[3].body, {candidate_id: "new"});
-  assert.equal(a.calls[3].action, "confirm");
+  assert.equal(a.calls.length, 3);
+  assert.deepEqual(a.calls[2].body, {candidate_id: "new"});
+  assert.equal(a.calls[2].action, "confirm");
   assert.equal(a.field("message").disabled, true);
-  a.calls[3].resolve({status: "published", operation_id: "operation-new", local: "present", remote: "not_attempted"}); await confirming;
-  await a.confirm.fire("click"); assert.equal(a.calls.length, 4);
+  a.calls[2].resolve({status: "published", operation_id: "operation-new", local: "present", remote: "not_attempted"}); await confirming;
+  await a.confirm.fire("click"); assert.equal(a.calls.length, 3);
+  // A failed preview also frees the form for the next one.
+  const c = setup();
+  const failing = c.form.fire("submit");
+  c.calls[0].reject(new Error("capture failed")); await failing;
+  assert(!c.root.find(e => e.dataset.action === "preview").disabled);
+  const retry = c.form.fire("submit");
+  assert.equal(c.calls.length, 2);
+  c.calls[1].resolve(preview("retry")); await retry;
+  assert.equal(c.confirm.disabled, false);
 
   // Invalidating a ready preview clears its rendered diff; errors never restore
   // the old handle, and an uncertain confirmation cannot retry publication.
