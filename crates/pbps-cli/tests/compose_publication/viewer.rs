@@ -322,6 +322,8 @@ fn a_stale_base_refusal_releases_the_workflow_for_a_fresh_preview() {
         .json();
     assert_eq!(refused["status"], "refused", "{refused}");
     assert_eq!(refused["problem"], "remote_base_changed");
+    // Released and retired in the same request: nothing is left pending.
+    assert_eq!(refused["cleanup_pending"], false, "{refused}");
     assert!(!f.record(operation).exists(), "a refusal wrote a receipt");
     // Reconfirming cannot cure a moved base; the workflow is released and
     // the refused operation's private resources are retired.
