@@ -495,3 +495,51 @@ entry here.
     `CREATE TABLE dbo.__pbps_state`, which then fails loudly — measured,
     `Msg 2714: There is already an object named '__pbps_state' in the
     database.` — rather than skip. No corresponding change was made there.
+
+<a id="dec-313-1"></a>
+
+**DEC-313.1. Before its first write, a PostgreSQL command compares the ledger's two
+tables with the recipe pbps creates them from, and refuses when they
+differ.** (#313, amending SPEC §8.1's trust model.) A role with `CREATE`
+on `public` can create `__pbps_state` and `__pbps_lock` before pbps
+does, grant them to `PUBLIC`, and attach a trigger; the deployment
+account's next `lock` or `record` then runs that trigger with its own
+privileges. Measured on 18.6 with separate attacker and deployment roles:
+the marker the trigger writes appears on the first `lock` without this
+check, and never with it. #217 had already refused a ledger name held by
+a view; an ordinary table of the right name passed.
+
+**A known layout, compared whole.** The ways a write can run code are
+catalog rows — a trigger, a rule, a row-security policy, a column
+default, a CHECK expression, an index expression, a column type with its
+own input function — and listing them would be an open set. The recipe
+is two `CREATE TABLE` statements whose catalog projection (columns with
+type, nullability, identity and default; non-`NOT NULL` constraints;
+index definitions) is closed and was measured identical on 18.6 and
+16.15, apart from the `contype = 'n'` rows 18 adds, which are left out
+because `attnotnull` carries them. Triggers, rules, policies and row
+security are listed so any of them is a difference. The facts are
+deparsed under the catalog reader's canonical settings
+(`catalog::canonical_query`), since a setting the deployment role
+carries — `quote_all_identifiers = on`, measured — otherwise renders the
+recipe pbps created as someone else's. A `__pbps_state`
+missing any of #103's five timeline columns is the recipe too: each is
+a plain nullable integer with no default, and the migration adds
+whichever are missing.
+
+**And the owner**, because the shape alone is checked once: an owner can
+add a trigger after the check passes. Trusted is the deployment account,
+a role whose privileges it inherits or that it can `SET ROLE` to, the
+database owner, or a superuser — owners whose powers the account already
+has. Both membership tests: `pg_has_role(…, 'USAGE')` is false for a
+`NOINHERIT` membership, which has `SET` (measured on 18.6 and 16.15). A least-privilege
+deployment whose ledger a superuser or the database owner created keeps
+working; one whose ledger belongs to some other role is refused by name,
+with the owner in the message.
+
+The comparison reads only world-readable catalogs, so `doctor` asks it
+of the least-privileged account and reports `ledger.untrusted`, through
+a field kept out of the published envelope schema (like `env_name`) so
+that no schema version moves for a finding. `prune` and `unlock` do not
+take the `ensure_tables` path and are #396's; SQL Server's ledger is not
+this decision's.

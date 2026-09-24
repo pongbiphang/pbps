@@ -6791,6 +6791,264 @@ async fn doctor_grant_authority_preserves_overloads_and_inherited_rights() {
     db.drop().await;
 }
 
+/// Issue #313: a role with `CREATE` on `public` makes the ledger tables before
+/// pbps does and attaches a trigger. The deployment account must refuse
+/// before its first write, so the trigger never runs — the marker it would
+/// insert stays absent. Each other way the tables can differ from the recipe
+/// is refused too, by name; and a correctly owned least-privilege ledger, and
+/// one from before issue #103, still work.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_ledger_pbps_did_not_create_is_refused_before_any_write() {
+    let mut db = TestDb::create("ledger_integrity").await;
+    let deployer = least_privilege_role(&mut db, "ledger_dep").await;
+    let attacker = least_privilege_role(&mut db, "ledger_atk").await;
+    let owner = least_privilege_role(&mut db, "ledger_own").await;
+    db.conn
+        .execute(&format!(
+            "GRANT CREATE ON SCHEMA public TO {deployer}, {attacker};
+             CREATE TABLE public.pbps_marker (n integer);
+             GRANT INSERT, SELECT ON public.pbps_marker TO PUBLIC;
+             CREATE FUNCTION public.pbps_mark() RETURNS trigger LANGUAGE plpgsql AS
+               $$ BEGIN INSERT INTO public.pbps_marker VALUES (1); RETURN NEW; END $$;"
+        ))
+        .await
+        .expect("the fixture");
+    let as_role = |role: &str| conn_str_as(role, "live-test", &db.name);
+    let recipe = "CREATE TABLE public.__pbps_state (
+        id bigint GENERATED ALWAYS AS IDENTITY CONSTRAINT pk___pbps_state PRIMARY KEY,
+        applied_at timestamp(3) NOT NULL DEFAULT (clock_timestamp() AT TIME ZONE 'UTC'),
+        kind varchar(16) NOT NULL, git_sha varchar(40) NULL, plan_checksum varchar(64) NULL,
+        state_json text NOT NULL, operator varchar(128) NOT NULL, reason varchar(1000) NULL,
+        state_version integer NULL, tables_count integer NULL, modules_count integer NULL,
+        staged_completed integer NULL, staged_total integer NULL);
+      CREATE TABLE public.__pbps_lock (
+        id integer NOT NULL CONSTRAINT pk___pbps_lock PRIMARY KEY
+           CONSTRAINT ck___pbps_lock_single CHECK (id = 1),
+        locked_by varchar(256) NOT NULL,
+        locked_at timestamp(3) NOT NULL DEFAULT (clock_timestamp() AT TIME ZONE 'UTC'));";
+
+    // (who builds the ledger, what is added after the recipe, what the
+    // refusal must name). `None` for the builder is the test's superuser.
+    let cases: [(Option<&str>, &str, &str); 7] = [
+        (
+            Some(attacker.as_str()),
+            "CREATE TRIGGER t BEFORE INSERT ON public.__pbps_lock FOR EACH ROW \
+             EXECUTE FUNCTION public.pbps_mark();",
+            "owned by",
+        ),
+        (Some(attacker.as_str()), "", "owned by"),
+        (
+            None,
+            "CREATE TRIGGER t BEFORE INSERT ON public.__pbps_lock FOR EACH ROW \
+             EXECUTE FUNCTION public.pbps_mark();",
+            "trigger t",
+        ),
+        (
+            None,
+            "CREATE RULE r AS ON INSERT TO public.__pbps_lock \
+             DO ALSO INSERT INTO public.pbps_marker VALUES (2);",
+            "rule r",
+        ),
+        (
+            None,
+            "ALTER TABLE public.__pbps_lock ENABLE ROW LEVEL SECURITY; \
+             CREATE POLICY p ON public.__pbps_lock USING (true);",
+            "policy p",
+        ),
+        (
+            None,
+            "ALTER TABLE public.__pbps_lock ALTER COLUMN locked_by SET DEFAULT current_user;",
+            "DEFAULT CURRENT_USER",
+        ),
+        (
+            None,
+            "CREATE INDEX x ON public.__pbps_state ((length(state_json)));",
+            "INDEX x",
+        ),
+    ];
+    for (builder, extra, named) in cases {
+        db.conn
+            .execute(
+                "DROP TABLE IF EXISTS public.__pbps_state, public.__pbps_lock;
+                 TRUNCATE public.pbps_marker;",
+            )
+            .await
+            .unwrap();
+        match builder {
+            Some(role) => {
+                let mut built = Conn::connect(Driver::Postgres, &as_role(role))
+                    .await
+                    .unwrap();
+                built.execute(recipe).await.expect("the attacker's tables");
+                // As a real attacker would: every role may write, so the
+                // deployment account's write reaches the trigger.
+                built
+                    .execute(
+                        "GRANT SELECT, INSERT, UPDATE, DELETE ON public.__pbps_state, \
+                         public.__pbps_lock TO PUBLIC",
+                    )
+                    .await
+                    .expect("the attacker's grant");
+                if !extra.is_empty() {
+                    built.execute(extra).await.expect("the attacker's addition");
+                }
+            }
+            None => {
+                db.conn.execute(recipe).await.unwrap();
+                db.conn.execute(extra).await.expect("the addition");
+                db.conn
+                    .execute(&format!(
+                        "GRANT SELECT, INSERT, DELETE ON public.__pbps_state, public.__pbps_lock \
+                         TO {deployer}"
+                    ))
+                    .await
+                    .unwrap();
+            }
+        }
+        let mut deploying = Conn::connect(Driver::Postgres, &as_role(&deployer))
+            .await
+            .unwrap();
+        let locked = state::lock(&mut deploying, "live-test").await;
+        let recorded = state::record(&mut deploying, &snapshot(StateKind::Baseline)).await;
+        let problems = state::ledger_problems(&mut deploying).await.unwrap();
+        drop(deploying);
+        let marks: i64 = db
+            .conn
+            .query("SELECT count(*)::int8 AS n FROM public.pbps_marker")
+            .await
+            .unwrap()[0]
+            .try_get::<i64>("n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(marks, 0, "{extra:?}: the deployment account ran it");
+        for result in [locked.map(|()| 0), recorded] {
+            let error = result.expect_err(extra).to_string();
+            assert!(
+                error.contains("not the ones pbps creates"),
+                "{extra:?}: {error}"
+            );
+            assert!(error.contains(named), "{extra:?} must be named: {error}");
+        }
+        assert!(
+            problems.iter().any(|p| p.contains(named)),
+            "{extra:?}: {problems:?}"
+        );
+    }
+
+    // The negative controls. A ledger the superuser built from the recipe and
+    // granted the deployment account least privilege on works...
+    db.conn
+        .execute("DROP TABLE IF EXISTS public.__pbps_state, public.__pbps_lock;")
+        .await
+        .unwrap();
+    db.conn.execute(recipe).await.unwrap();
+    db.conn
+        .execute(&format!(
+            "GRANT SELECT, INSERT, DELETE ON public.__pbps_state, public.__pbps_lock TO {deployer}"
+        ))
+        .await
+        .unwrap();
+    // With a session setting that changes how the catalog deparses — carried
+    // by the role, as a deployment account's `ALTER ROLE ... SET` would be —
+    // the recipe still reads as the recipe.
+    db.conn
+        .execute(&format!(
+            "ALTER ROLE {deployer} SET quote_all_identifiers = on"
+        ))
+        .await
+        .unwrap();
+    let mut deploying = Conn::connect(Driver::Postgres, &as_role(&deployer))
+        .await
+        .unwrap();
+    let quoting = deploying
+        .query("SELECT current_setting('quote_all_identifiers') AS q")
+        .await
+        .unwrap()[0]
+        .try_get::<&str>("q")
+        .unwrap()
+        .map(ToOwned::to_owned);
+    assert_eq!(quoting.as_deref(), Some("on"), "the role's setting applies");
+    let problems = state::ledger_problems(&mut deploying).await.unwrap();
+    assert!(
+        problems.is_empty(),
+        "under quote_all_identifiers: {problems:?}"
+    );
+    state::lock(&mut deploying, "live-test")
+        .await
+        .expect("lock");
+    state::record(&mut deploying, &snapshot(StateKind::Baseline))
+        .await
+        .expect("record");
+    drop(deploying);
+
+    // ...and so does one owned by a role the deployment account holds only
+    // as a `NOINHERIT` membership: it can `SET ROLE` to the owner, so the
+    // owner has no power it lacks, though `USAGE` alone says otherwise.
+    db.conn
+        .execute(&format!(
+            "DROP TABLE public.__pbps_state, public.__pbps_lock;
+             ALTER ROLE {deployer} NOINHERIT;
+             GRANT {owner} TO {deployer};
+             GRANT CREATE ON SCHEMA public TO {owner};"
+        ))
+        .await
+        .unwrap();
+    {
+        let mut owning = Conn::connect(Driver::Postgres, &as_role(&owner))
+            .await
+            .unwrap();
+        owning.execute(recipe).await.expect("the owner's tables");
+        owning
+            .execute(&format!(
+                "GRANT SELECT, INSERT, DELETE ON public.__pbps_state, public.__pbps_lock \
+                 TO {deployer}"
+            ))
+            .await
+            .unwrap();
+    }
+    let mut deploying = Conn::connect(Driver::Postgres, &as_role(&deployer))
+        .await
+        .unwrap();
+    let problems = state::ledger_problems(&mut deploying).await.unwrap();
+    assert!(problems.is_empty(), "a SET-capable owner: {problems:?}");
+    state::record(&mut deploying, &snapshot(StateKind::Baseline))
+        .await
+        .expect("a SET-capable owner's ledger records");
+    drop(deploying);
+
+    // ...and so does one pbps created itself before issue #103, which the
+    // migration then completes.
+    db.conn
+        .execute("DROP TABLE public.__pbps_state, public.__pbps_lock;")
+        .await
+        .unwrap();
+    state::ensure_tables(&mut db.conn)
+        .await
+        .expect("fresh tables");
+    db.conn
+        .execute(
+            "ALTER TABLE public.__pbps_state DROP COLUMN state_version, DROP COLUMN tables_count, \
+             DROP COLUMN modules_count, DROP COLUMN staged_completed, DROP COLUMN staged_total;",
+        )
+        .await
+        .unwrap();
+    assert!(
+        state::ledger_problems(&mut db.conn)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    state::record(&mut db.conn, &snapshot(StateKind::Baseline))
+        .await
+        .expect("a pre-#103 ledger still records");
+
+    for role in [&deployer, &attacker, &owner] {
+        cleanup_role(&mut db, role).await;
+    }
+    db.drop().await;
+}
+
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn doctor_requires_ownership_only_until_the_existing_ledger_is_migrated() {

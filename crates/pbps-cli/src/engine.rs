@@ -1040,6 +1040,21 @@ pub async fn permission_support(
 // `doctor`: what the connected account may do
 // ---------------------------------------------------------------------------
 
+/// How the ledger's tables differ from the recipe pbps creates them from, one
+/// line per difference; empty when they match or are not there yet.
+///
+/// PostgreSQL's answer is `pbps_pg::state::ledger_problems` (issue #313):
+/// there, a role with `CREATE` on `public` can make the ledger tables first
+/// and attach code the deployment account would run. SQL Server's ledger
+/// lives in `dbo`, and whether it needs the same check is not this issue's
+/// question, so it reports none.
+pub async fn ledger_problems(conn: &mut Conn) -> Result<Vec<String>, DbError> {
+    match conn.driver() {
+        Driver::Mssql => Ok(Vec::new()),
+        Driver::Postgres => pbps_pg::state::ledger_problems(conn).await,
+    }
+}
+
 /// A permission the deployment needs and the connected account does not hold,
 /// with the securable already spelled the way this engine's `GRANT` names it.
 #[derive(Debug, Clone, PartialEq, Eq)]

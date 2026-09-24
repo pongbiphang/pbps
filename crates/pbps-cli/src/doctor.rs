@@ -149,6 +149,13 @@ pub struct EnvDiagnosis {
     /// envelope stays as it was.
     #[serde(skip)]
     env_name: Option<String>,
+
+    /// How the ledger's tables differ from what pbps creates (issue #313),
+    /// reported as the `ledger.untrusted` finding. Not serialized: the
+    /// finding carries it, and the envelope's published schema stays as it
+    /// was.
+    #[serde(skip)]
+    untrusted_ledger: Vec<String>,
 }
 
 impl EnvDiagnosis {
@@ -179,6 +186,7 @@ impl EnvDiagnosis {
             absent_schemas: Vec::new(),
             server_capabilities_unknown: None,
             detail: None,
+            untrusted_ledger: Vec::new(),
         }
     }
 
@@ -770,6 +778,12 @@ async fn examine(
             d.resolver_discovery_unknown = Some(crate::engine::ledger_safe_reason(&error.into()));
         }
     }
+    // Before the ledger is written to, the question `ensure_tables` refuses
+    // on (issue #313). A check that could not run is not a clean ledger.
+    d.untrusted_ledger = match crate::engine::ledger_problems(&mut conn).await {
+        Ok(problems) => problems,
+        Err(e) => vec![format!("the ledger tables could not be checked: {e}")],
+    };
     let ask = pbps_db::doctor::Ask {
         managed_schemas: &declared.schemas,
         managed_tables: &declared.tables,
@@ -1001,6 +1015,24 @@ fn env_findings(
                 d.environment
             ),
         ));
+    }
+    if !d.untrusted_ledger.is_empty() {
+        out.push(
+            output::Finding::error(
+                "ledger.untrusted",
+                format!(
+                    "{}: the ledger tables are not the ones pbps creates, so no command will \
+                     write to them: {}",
+                    d.environment,
+                    d.untrusted_ledger.join("; ")
+                ),
+            )
+            .remedy(
+                "if pbps made them and they were changed by hand, restore them; otherwise drop \
+                 them and let pbps create its own, and keep CREATE on the ledger's schema away \
+                 from untrusted roles",
+            ),
+        );
     }
     if d.permissions_unknown {
         out.push(
@@ -1488,6 +1520,42 @@ mod tests {
                 assert!(!text.contains(foreign), "{foreign:?} in {text}");
             }
         }
+    }
+
+    /// Issue #313: a ledger that is not the one pbps creates is an error with
+    /// every difference in it; a matching one says nothing.
+    #[test]
+    fn an_untrusted_ledger_is_an_error_naming_each_difference() {
+        let mut d = EnvDiagnosis::unknown("prod".to_owned(), Some("prod".to_owned()), "ready");
+        d.untrusted_ledger = vec![
+            "public.__pbps_lock has trigger t, which pbps did not create".to_owned(),
+            "public.__pbps_state is owned by `mallory`".to_owned(),
+        ];
+        let findings = env_findings(
+            &d,
+            false,
+            &pbps_pg::Postgres::new(),
+            pbps_db::Driver::Postgres,
+        );
+        let ledger = findings
+            .iter()
+            .find(|f| f.id == "ledger.untrusted")
+            .unwrap_or_else(|| panic!("{findings:?}"));
+        assert_eq!(ledger.severity, output::Severity::Error);
+        assert!(ledger.message.contains("trigger t"), "{}", ledger.message);
+        assert!(ledger.message.contains("mallory"), "{}", ledger.message);
+
+        d.untrusted_ledger.clear();
+        assert!(
+            !env_findings(
+                &d,
+                false,
+                &pbps_pg::Postgres::new(),
+                pbps_db::Driver::Postgres
+            )
+            .iter()
+            .any(|f| f.id == "ledger.untrusted")
+        );
     }
 
     /// The first cause is not decorated: a diagnosis with one thing to say
