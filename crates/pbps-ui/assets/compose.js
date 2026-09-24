@@ -394,7 +394,20 @@ globalThis.PbpsCompose = Object.freeze({
           reconfirmable = true;
           confirm.disabled = false;
         }
-      } catch (_) {
+      } catch (error) {
+        if (error && error.status === 410) {
+          // The server refused before publishing: this handle expired or
+          // was replaced. Nothing to recover; review a new candidate.
+          confirming = false;
+          reconfirmable = false;
+          candidate = null;
+          operation = null;
+          refresh.disabled = false;
+          for (const field of Object.values(fields)) field.disabled = false;
+          invalidate();
+          activity.textContent = "This reviewed candidate expired or was replaced, and nothing was published. Preview again.";
+          return;
+        }
         activity.textContent = "Confirmation outcome is unknown. Inspect the operation result before continuing.";
         render({status: "recovery_required", operation_id: operation, local: "unavailable",
           remote: "unavailable", cleanup_pending: true});

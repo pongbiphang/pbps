@@ -194,10 +194,20 @@ impl Compose {
                         });
                     }
                 };
+                // A definite refusal (`Error::is_definite`) means no receipt
+                // or publication exists for the handle: an expired preview, a
+                // handle this workflow recorded as given up unpublished, or a
+                // releasing candidate. 410 says "nothing was published;
+                // preview again". Any other refusal, including an unknown
+                // handle or a resource failure after its durable confirmation,
+                // keeps the uncertain 409 and the page keeps recovery.
                 let candidate = self
                     .candidates
                     .confirm(&candidate_id, SystemTime::now())
-                    .map_err(refused)?;
+                    .map_err(|error| {
+                        let code = if error.is_definite() { 410 } else { 409 };
+                        (code, error.to_string())
+                    })?;
                 let mut outcome = publisher.confirm(&candidate);
                 // A refused confirmation persisted nothing (run.rs refuses
                 // only before the durable commit intent); any other status

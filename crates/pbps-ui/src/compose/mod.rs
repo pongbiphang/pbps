@@ -75,6 +75,9 @@ pub struct Error {
 enum Failure {
     Uncertain,
     CompletedRejection,
+    /// Refused with no publication or receipt for the handle. Its private
+    /// resources may have been retired, but nothing was committed or pushed.
+    BeforeTransition,
 }
 
 impl Error {
@@ -83,6 +86,21 @@ impl Error {
             message: message.to_owned(),
             failure: Failure::Uncertain,
         }
+    }
+
+    fn definite(message: &str) -> Self {
+        Self {
+            message: message.to_owned(),
+            failure: Failure::BeforeTransition,
+        }
+    }
+
+    /// True only for a refusal known to precede publication: no receipt,
+    /// commit or pushed branch exists for the handle, so a caller may report
+    /// "nothing was published". Private resource retirement may already have
+    /// happened; a resource-persistence failure is never definite.
+    pub fn is_definite(&self) -> bool {
+        self.failure == Failure::BeforeTransition
     }
 
     fn rejected(message: &str) -> Self {
@@ -242,6 +260,11 @@ pub struct Candidates {
     current: Option<Stored>,
     alternative_base: Option<String>,
     resource_observer: ResourceObserver,
+    /// Handles this workflow gave up while provably unpublished: replaced,
+    /// withdrawn, expired or released before any receipt. Only these may be
+    /// refused as "nothing was published"; any other unknown handle may be
+    /// an earlier confirmed result and stays uncertain.
+    unpublished: std::collections::BTreeSet<String>,
 }
 
 impl Candidates {
@@ -255,6 +278,7 @@ impl Candidates {
             current: None,
             alternative_base: None,
             resource_observer,
+            unpublished: std::collections::BTreeSet::new(),
         }
     }
 
@@ -278,6 +302,8 @@ impl Candidates {
                         "The refused candidate's private resources are still retiring: {error}; preserve them and preview again"
                     ))
                 })?;
+            self.unpublished
+                .insert(candidate.preview.candidate_id.clone());
             self.current = None;
         }
         if matches!(self.current, Some(Stored::Confirmed(_))) {
@@ -287,6 +313,8 @@ impl Candidates {
         }
         if let Some(Stored::Previewed { candidate, .. }) = self.current.take() {
             candidate.workspace.retire_preview()?;
+            self.unpublished
+                .insert(candidate.preview.candidate_id.clone());
         }
         let candidate = Arc::new(capture::capture(
             &self.config,
@@ -357,6 +385,8 @@ impl Candidates {
             .workspace
             .resources
             .retire(&candidate.preview.operation_id, false)?;
+        self.unpublished
+            .insert(candidate.preview.candidate_id.clone());
         self.current = None;
         Ok(())
     }
@@ -377,6 +407,8 @@ impl Candidates {
             return Err(Error::new("The preview to withdraw was replaced"));
         }
         candidate.workspace.retire_preview()?;
+        self.unpublished
+            .insert(candidate.preview.candidate_id.clone());
         self.current = None;
         Ok(())
     }
@@ -394,46 +426,63 @@ impl Candidates {
             None => false,
         };
         if owns {
+            // Only an unconfirmed preview is known to be unpublished; a
+            // forgotten confirmation may have delivered.
+            if let Some(Stored::Previewed { candidate, .. }) = &self.current {
+                self.unpublished
+                    .insert(candidate.preview.candidate_id.clone());
+            }
             self.current = None;
             self.alternative_base = None;
         }
     }
 
     pub fn confirm(&mut self, candidate_id: &str, now: SystemTime) -> Result<Arc<Candidate>> {
-        let current = self
-            .current
-            .as_ref()
-            .ok_or_else(|| Error::new("Preview the candidate before confirming"))?;
-        let candidate = match current {
-            Stored::Previewed { candidate, created } => {
-                let Ok(age) = now.duration_since(*created) else {
-                    candidate.workspace.retire_preview()?;
-                    self.current = None;
-                    return Err(Error::new(
-                        "The preview clock changed; refresh the candidate",
-                    ));
-                };
-                if age >= Duration::from_secs(24 * 60 * 60) {
-                    candidate.workspace.retire_preview()?;
-                    self.current = None;
-                    return Err(Error::new(
-                        "The preview expired; refresh it before confirming",
-                    ));
-                }
-                Arc::clone(candidate)
-            }
-            Stored::Confirmed(candidate) => Arc::clone(candidate),
-            Stored::Releasing(_) => {
-                return Err(Error::new(
-                    "This candidate was refused and released; preview again",
-                ));
+        // A handle that is not the current one is definite only if this
+        // workflow recorded giving it up unpublished; otherwise it may be an
+        // earlier confirmed result (for example before an alternative).
+        let elsewhere = |unpublished: &std::collections::BTreeSet<String>| {
+            let message = "The candidate is unknown or was replaced; refresh the preview";
+            if unpublished.contains(candidate_id) {
+                Error::definite(message)
+            } else {
+                Error::new(message)
             }
         };
-        if candidate.preview.candidate_id != candidate_id {
-            return Err(Error::new(
-                "The candidate is unknown or was replaced; refresh the preview",
-            ));
-        }
+        let candidate = match self.current.as_ref() {
+            None => return Err(elsewhere(&self.unpublished)),
+            Some(Stored::Releasing(candidate)) => {
+                return Err(if candidate.preview.candidate_id == candidate_id {
+                    Error::definite("This candidate was refused and released; preview again")
+                } else {
+                    elsewhere(&self.unpublished)
+                });
+            }
+            Some(Stored::Confirmed(candidate)) | Some(Stored::Previewed { candidate, .. })
+                if candidate.preview.candidate_id != candidate_id =>
+            {
+                return Err(elsewhere(&self.unpublished));
+            }
+            Some(Stored::Previewed { candidate, created }) => {
+                let candidate = Arc::clone(candidate);
+                let expired = match now.duration_since(*created) {
+                    Ok(age) if age < Duration::from_secs(24 * 60 * 60) => None,
+                    Ok(_) => Some("The preview expired; refresh it before confirming"),
+                    Err(_) => Some("The preview clock changed; refresh the candidate"),
+                };
+                if let Some(message) = expired {
+                    candidate.workspace.retire_preview()?;
+                    self.unpublished
+                        .insert(candidate.preview.candidate_id.clone());
+                    self.current = None;
+                    return Err(Error::definite(message));
+                }
+                candidate
+            }
+            Some(Stored::Confirmed(candidate)) => Arc::clone(candidate),
+        };
+        // A resource failure may follow its durable Confirmed write, so it
+        // stays uncertain: the handle and its evidence are preserved.
         candidate
             .workspace
             .resources

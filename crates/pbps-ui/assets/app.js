@@ -15,7 +15,12 @@
   // The only writes: fixed compose actions with an opaque JSON body.
   async function send(action, body) {
     const response = await fetch(`/api/compose/${action}`, {method:"POST", headers:{"X-Pbps-Token":token, "Content-Type":"application/json"}, body:JSON.stringify(body), cache:"no-store", credentials:"omit"});
-    if (!response.ok) throw new Error(await response.text());
+    if (!response.ok) {
+      // The status tells a definite refusal (410) from an uncertain one.
+      const error = new Error(await response.text());
+      error.status = response.status;
+      throw error;
+    }
     return response.json();
   }
   function node(tag, text, className) {

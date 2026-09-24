@@ -359,3 +359,67 @@ fn discovery_names_only_the_record_it_refuses() {
         assert!(error.contains("preserve"), "{error}");
     }
 }
+
+#[test]
+fn only_refusals_before_the_durable_confirmation_are_definite() {
+    // A failure after the resource's Confirmed record is durable must stay
+    // uncertain: the viewer answers 409 and keeps the handle (#852).
+    let f = Fixture::new("lifecycle-confirm-uncertain");
+    let records = common(&f).join("resources");
+    let observer = ResourceObserver::new(move |at| {
+        !(at.operation == ResourceOperation::Rename
+            && at.after
+            && at.path.parent() == Some(records.as_path())
+            && fs::read(&at.path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .is_some_and(|record| record["state"] == "confirmed"))
+    });
+    let mut candidates = store(&f, observer);
+    let preview = candidates.preview(request(), SystemTime::now()).unwrap();
+    let error = candidates
+        .confirm(&preview.candidate_id, SystemTime::now())
+        .map(|_| ())
+        .unwrap_err();
+    assert!(!error.is_definite(), "{error}");
+    assert_eq!(read(&f, &preview.operation_id)["state"], "confirmed");
+
+    // A replaced handle is refused before anything is written.
+    let f = Fixture::new("lifecycle-confirm-definite");
+    let mut candidates = f.repo.store();
+    let first = candidates.preview(request(), SystemTime::now()).unwrap();
+    candidates.preview(request(), SystemTime::now()).unwrap();
+    let error = candidates
+        .confirm(&first.candidate_id, SystemTime::now())
+        .map(|_| ())
+        .unwrap_err();
+    assert!(error.is_definite(), "{error}");
+
+    // A handle this workflow did not give up unpublished may be an earlier
+    // confirmed result: after delivery and an alternative, it is uncertain.
+    let f = Fixture::new("lifecycle-confirm-historical");
+    let (mut candidates, delivered, candidate) = f.ready();
+    let mut publisher = f.publisher();
+    assert_eq!(publisher.confirm(&candidate).status, Status::Delivered);
+    publisher
+        .start_alternative(&mut candidates, &delivered.operation_id)
+        .unwrap();
+    drop(publisher);
+    candidates.preview(request(), SystemTime::now()).unwrap();
+    let error = candidates
+        .confirm(&delivered.candidate_id, SystemTime::now())
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        !error.is_definite(),
+        "a delivered handle read as unpublished"
+    );
+    // A fresh workflow knows no handle at all: uncertain as well.
+    let error = f
+        .repo
+        .store()
+        .confirm(&delivered.candidate_id, SystemTime::now())
+        .map(|_| ())
+        .unwrap_err();
+    assert!(!error.is_definite(), "{error}");
+}
