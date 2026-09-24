@@ -648,9 +648,14 @@ PostgreSQL `log_statement` of `mod` or `all`, statement-duration logging,
 audit specification or extended-event session covering the table, its schema or
 the database — counts as a reader it cannot qualify. Anything it cannot
 establish, including a catalog it may not read, refuses the confidential
-operation; pbps never changes a grant or an audit policy to pass. A database
-backup is one of those authorized readers' reads: its storage is the operator's,
-as a downloaded plan file is (ADR-0016 decision 5), and is out of this boundary.
+operation; pbps never changes a grant or an audit policy to pass. A principal
+that can take a backup is a reader too, whatever its `SELECT`: on SQL Server
+`db_backupoperator`, `db_owner` and holders of `BACKUP DATABASE`/`BACKUP LOG`;
+on PostgreSQL roles with `REPLICATION` (a base backup copies every table) and
+`pg_read_all_data`/`pg_read_server_files`/`pg_execute_server_program`. Each must
+meet the same rule or the operation refuses. Once a qualified principal has
+taken a backup, the copy's storage is its holder's responsibility, as a
+downloaded plan file is (ADR-0016 decision 5); pbps cannot observe it.
 
 *Before the table exists.* It is created on first use, so the first
 confidential plan meets no table to qualify — and neither refusing that plan
