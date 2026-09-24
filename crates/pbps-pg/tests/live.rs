@@ -7150,6 +7150,39 @@ async fn a_ledger_pbps_did_not_create_is_refused_before_any_write() {
         problems.iter().any(|p| p.contains(&changed_by_attacker)),
         "a NOLOGIN attacker with a live session: {problems:?}"
     );
+    // And when the deployment account can see `backend_type` — a client
+    // backend is still a client backend.
+    db.conn
+        .execute(&format!(
+            "GRANT pg_read_all_stats TO {deployer} WITH INHERIT TRUE"
+        ))
+        .await
+        .unwrap();
+    let mut seeing = Conn::connect(Driver::Postgres, &as_role(&deployer))
+        .await
+        .unwrap();
+    // The control only means something if the column is really visible.
+    let visible: i64 = seeing
+        .query(&format!(
+            "SELECT count(*)::int8 AS n FROM pg_stat_activity \
+             WHERE usename = '{attacker}' AND backend_type = 'client backend'"
+        ))
+        .await
+        .unwrap()[0]
+        .try_get::<i64>("n")
+        .unwrap()
+        .unwrap();
+    assert_eq!(visible, 1, "backend_type is not visible to the deployer");
+    let problems = state::ledger_problems(&mut seeing).await.unwrap();
+    assert!(
+        problems.iter().any(|p| p.contains(&changed_by_attacker)),
+        "a live client session seen through pg_read_all_stats: {problems:?}"
+    );
+    drop(seeing);
+    db.conn
+        .execute(&format!("REVOKE pg_read_all_stats FROM {deployer}"))
+        .await
+        .unwrap();
     drop(lingering);
     // A session of the same role in another database is not one: it cannot
     // change database, so it cannot use the grant here.

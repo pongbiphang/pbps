@@ -614,7 +614,12 @@ async fn confirm_ledger_relations(conn: &mut Conn) -> Result<(), DbError> {
 /// role with a backend in `pg_stat_activity` is an actor whatever its flag
 /// says now (issue #862; `usesysid` is visible to every role). A backend in
 /// this database only: a session cannot change database, so one connected
-/// elsewhere cannot use a grant here. And only in a role that also has `USAGE` on the
+/// elsewhere cannot use a grant here. And a client backend only, where that
+/// can be seen: a logical-replication or other background worker running as
+/// the role cannot be told to `CREATE TRIGGER`. Measured on 18.6, the
+/// deployment account sees another role's `backend_type` only with
+/// `pg_read_all_stats` (or as a superuser) — otherwise it is NULL, and a row
+/// it cannot classify is counted, the safe direction. And only in a role that also has `USAGE` on the
 /// ledger's schema: measured on 18.6, a role holding `TRIGGER` without it is
 /// refused `CREATE TRIGGER` with `permission denied for schema public`, so it
 /// cannot change the ledger and is no reason to refuse it.
@@ -822,7 +827,9 @@ fn ledger_facts() -> String {
            JOIN pg_catalog.pg_database db ON db.datname = pg_catalog.current_database()
           WHERE (e.rolcanlogin
                  OR EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity a
-                             WHERE a.usesysid = e.oid AND a.datid = db.oid))
+                             WHERE a.usesysid = e.oid AND a.datid = db.oid
+                               AND (a.backend_type IS NULL
+                                    OR a.backend_type = 'client backend')))
             AND e.oid <> db.datdba
             AND NOT pg_catalog.pg_has_role(e.oid, current_user::regrole::oid, 'SET')
             AND NOT EXISTS (

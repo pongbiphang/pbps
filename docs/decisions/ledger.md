@@ -591,6 +591,11 @@ already has, so a role that connected while it could log in and was then made
 trigger between the check and the write. An editor is now a login role or any
 role with a backend in `pg_stat_activity` connected to this database
 (`usesysid` and `datid`, which every role may read — a session cannot change
-database, so one elsewhere cannot use a grant here); a `NOLOGIN` group with no session of its own is still not one, so a
+database, so one elsewhere cannot use a grant here) and, where the
+deployment account can see it, a client backend rather than a background
+worker. Another role's `backend_type` is visible only with `pg_read_all_stats`
+or as a superuser (measured; it is NULL otherwise), so an unclassifiable row
+is counted — a least-privileged account refuses while such a worker runs, and
+`pg_read_all_stats` lets it tell the two apart; a `NOLOGIN` group with no session of its own is still not one, so a
 group owner whose only login member is the deployment account keeps working.
 
