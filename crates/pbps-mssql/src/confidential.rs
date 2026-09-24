@@ -86,7 +86,10 @@ async fn qualify(conn: &mut Conn) -> Result<Vec<String>, DbError> {
 /// principal is not an absent one. On the other securable classes — a
 /// principal, a certificate, a key, a login — any such `DENY` refuses, since
 /// those are the rows the principal graph and the signatures are built from and
-/// `HAS_PERMS_BY_NAME` has no effective answer to offer for all of them.
+/// `HAS_PERMS_BY_NAME` has no effective answer to offer for all of them. A
+/// server-level `DENY` applies through anything in the session's login token —
+/// the login, its server roles and its Windows groups — which
+/// `IS_SRVROLEMEMBER` alone does not see (it names roles, not groups).
 const VISIBILITY: &str = "\
 SELECT CONVERT(int, ISNULL(IS_SRVROLEMEMBER('sysadmin'), 0)) AS sysadmin,
        CONVERT(int, ISNULL(HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW ANY DEFINITION'), 0)) AS any_definition,
@@ -109,8 +112,7 @@ SELECT CONVERT(int, ISNULL(IS_SRVROLEMEMBER('sysadmin'), 0)) AS sysadmin,
        + (SELECT COUNT(*) FROM sys.server_permissions sp
            WHERE sp.state = N'D'
              AND sp.permission_name IN (N'VIEW DEFINITION', N'CONTROL', N'VIEW ANY DEFINITION')
-             AND (sp.grantee_principal_id = SUSER_ID()
-                  OR IS_SRVROLEMEMBER(SUSER_NAME(sp.grantee_principal_id)) = 1)) AS hidden;";
+             AND sp.grantee_principal_id IN (SELECT principal_id FROM sys.login_token)) AS hidden;";
 
 async fn visibility_problems(conn: &mut Conn) -> Result<Vec<String>, DbError> {
     let rows = conn.query(VISIBILITY).await?;
@@ -196,6 +198,8 @@ SELECT @t AS table_id,
 /// context, and whether it names the protected table — which, owned by the
 /// table's owner, is an ownership chain that skips the table's permissions.
 /// A database DDL trigger is not in `sys.objects`; it fires for anyone's DDL.
+/// A disabled trigger fires for nobody and is left out; enabling it again
+/// takes `ALTER` on its table or the database, which is a grantor's path.
 /// A synonym is no code, but it chains the same way: measured, `SELECT` on a
 /// `dbo` synonym for a `dbo` table reads the table with no grant on it.
 const MODULES: &str = "\
@@ -226,9 +230,11 @@ SELECT c.object_id AS id,
   LEFT JOIN sys.schemas s ON s.schema_id = o.schema_id
   LEFT JOIN sys.objects p ON p.object_id = o.parent_object_id AND o.type IN ('TR', 'TA')
   LEFT JOIN sys.schemas ps ON ps.schema_id = p.schema_id
- WHERE o.object_id IS NOT NULL
+ WHERE (o.object_id IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM sys.triggers tr
+                         WHERE tr.object_id = c.object_id AND tr.is_disabled = 1))
     OR EXISTS (SELECT 1 FROM sys.triggers tr
-                WHERE tr.object_id = c.object_id AND tr.parent_class = 0)
+                WHERE tr.object_id = c.object_id AND tr.parent_class = 0 AND tr.is_disabled = 0)
 UNION ALL
 SELECT sn.object_id, CONVERT(nvarchar(2), N'SN'), sn.schema_id,
        COALESCE(sn.principal_id, ss.principal_id, 1), CONVERT(int, NULL), 0, 0, 0,
@@ -588,8 +594,13 @@ impl Graph {
     /// the database principal it enters as.
     fn login_reads(&self, login: i32) -> bool {
         let c = self.server_closure(login);
+        // `SELECT ALL USER SECURABLES` reads only a database the login can
+        // enter: through a user, `guest` or `public`, or `CONNECT ANY
+        // DATABASE`, which is a permission of its own.
+        let enters = self.user_of(login).is_some()
+            || self.server_grants(&c, &["CONNECT ANY DATABASE"], &[(SERVER, 0)]);
         self.controls_server(login)
-            || self.server_grants(&c, &["SELECT ALL USER SECURABLES"], &[(SERVER, 0)])
+            || (enters && self.server_grants(&c, &["SELECT ALL USER SECURABLES"], &[(SERVER, 0)]))
             || self.user_of(login).is_some_and(|u| self.user_reads(u))
     }
 

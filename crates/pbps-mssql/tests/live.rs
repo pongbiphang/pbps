@@ -2571,7 +2571,8 @@ async fn every_unqualified_reader_grantor_and_backup_principal_is_named() {
         .await
         .unwrap();
 
-    // A certificate-mapped login holding a server-wide read: it signs code in
+    // A certificate-mapped login holding a server-wide read, and the
+    // `CONNECT ANY DATABASE` that read needs to enter here: it signs code in
     // any database, so it is named for itself.
     db.conn
         .execute(&format!(
@@ -2583,7 +2584,7 @@ async fn every_unqualified_reader_grantor_and_backup_principal_is_named() {
              CREATE CERTIFICATE [c880_login_{pid}] ENCRYPTION BY PASSWORD = '{READER_PASSWORD}'
                WITH SUBJECT = 'pbps';
              CREATE LOGIN [l880_cert_{pid}] FROM CERTIFICATE [c880_login_{pid}];
-             GRANT SELECT ALL USER SECURABLES TO [l880_cert_{pid}];
+             GRANT SELECT ALL USER SECURABLES, CONNECT ANY DATABASE TO [l880_cert_{pid}];
              USE [{}];",
             db.name
         ))
@@ -2649,6 +2650,7 @@ async fn code_and_users_that_cannot_reach_the_table_are_not_named() {
         "viewer",
         "orphan",
         "countersigned",
+        "disabledtrigger",
     ] {
         reader_login(&mut db, &login(key)).await;
         logins.push(login(key));
@@ -2670,20 +2672,39 @@ async fn code_and_users_that_cannot_reach_the_table_are_not_named() {
              EXEC(N'CREATE PROCEDURE dbo.p880_countersigned AS EXEC(N''SELECT 1'');');
              ADD COUNTER SIGNATURE TO dbo.p880_countersigned BY CERTIFICATE c880_counter
                WITH PASSWORD = '{READER_PASSWORD}';
-             GRANT EXECUTE ON dbo.p880_countersigned TO [{countersigned}];",
+             GRANT EXECUTE ON dbo.p880_countersigned TO [{countersigned}];
+             CREATE TABLE dbo.w880 (n INT);
+             EXEC(N'CREATE TRIGGER dbo.tr880 ON dbo.w880 WITH EXECUTE AS OWNER AFTER INSERT AS
+                    SELECT state_id FROM dbo.__pbps_state_confidential;');
+             DISABLE TRIGGER dbo.tr880 ON dbo.w880;
+             GRANT INSERT ON dbo.w880 TO [{disabledtrigger}];
+             IF SUSER_ID('{outsider}') IS NOT NULL DROP LOGIN [{outsider}];
+             CREATE LOGIN [{outsider}] WITH PASSWORD = '{READER_PASSWORD}', CHECK_POLICY = OFF;
+             USE master; GRANT SELECT ALL USER SECURABLES TO [{outsider}]; USE [{db}];",
             elsewhere = login("elsewhere"),
             schemaexec = login("schemaexec"),
             viewer = login("viewer"),
             orphan = login("orphan"),
             countersigned = login("countersigned"),
+            disabledtrigger = login("disabledtrigger"),
+            outsider = login("outsider"),
+            db = db.name,
         ))
         .await
         .unwrap();
+    logins.push(login("outsider"));
     let problems = pbps_mssql::confidential::protected_reader_problems(&mut db.conn)
         .await
         .unwrap();
     assert!(names(&problems, &login("viewer")), "{problems:#?}");
-    for key in ["elsewhere", "schemaexec", "orphan", "countersigned"] {
+    for key in [
+        "elsewhere",
+        "schemaexec",
+        "orphan",
+        "countersigned",
+        "disabledtrigger",
+        "outsider",
+    ] {
         assert!(!names(&problems, &login(key)), "{key}: {problems:#?}");
     }
     drop_logins(db, &logins).await;
@@ -2945,10 +2966,17 @@ async fn a_first_use_by_a_deployer_that_does_not_own_the_database_qualifies_dbos
     assert!(!names(&revoked, &reader), "{revoked:#?}");
 
     // A DENY on a principal hides its rows from the deployer whatever the
-    // server-wide grant says, so it cannot establish anything any more.
+    // server-wide grant says, so it cannot establish anything any more. It
+    // is given through a server role: a server-level DENY reaches the
+    // deployer through its login token, not only by name.
     db.conn
         .execute(&format!(
-            "DENY VIEW DEFINITION ON USER::[{reader}] TO [{deployer}];"
+            "USE master;
+             CREATE SERVER ROLE [pbps880_denied_{pid}];
+             ALTER SERVER ROLE [pbps880_denied_{pid}] ADD MEMBER [{deployer}];
+             DENY VIEW DEFINITION ON LOGIN::[{reader}] TO [pbps880_denied_{pid}];
+             USE [{0}];",
+            db.name
         ))
         .await
         .unwrap();
@@ -2961,6 +2989,10 @@ async fn a_first_use_by_a_deployer_that_does_not_own_the_database_qualifies_dbos
     );
     drop(as_deployer);
     drop_logins(db, &logins).await;
+    let mut conn = connect_live(&conn_str()).await.expect("connect");
+    let _ = conn
+        .execute(&format!("DROP SERVER ROLE [pbps880_denied_{pid}];"))
+        .await;
 }
 
 /// SPEC §8.1: the whole state goes in and comes back out unchanged. Everything
