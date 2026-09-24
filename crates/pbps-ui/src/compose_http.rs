@@ -44,6 +44,9 @@ struct Nothing {}
 pub(crate) struct Compose {
     candidates: Candidates,
     project: PathBuf,
+    /// The confirmed handle whose last confirmation was refused before
+    /// publication: it is confirmed, yet provably has no receipt.
+    receiptless: Option<(String, String)>,
 }
 
 /// A refusal for the page: an HTTP status and a message that names no
@@ -71,6 +74,7 @@ impl Compose {
                 deadline: DEADLINE,
             }),
             project,
+            receiptless: None,
         }
     }
 
@@ -100,7 +104,18 @@ impl Compose {
                 let mut publisher = match self.publisher() {
                     Ok(publisher) => publisher,
                     Err(refusal) => {
-                        let Some(operation) = self.candidates.unconfirmed_operation(&candidate_id)
+                        // Only a handle known to have no receipt may be told
+                        // "not attempted"; any other confirmed handle may
+                        // have one, so it stays unavailable until readable.
+                        let receiptless = self
+                            .receiptless
+                            .as_ref()
+                            .filter(|(handle, _)| *handle == candidate_id)
+                            .map(|(_, operation)| operation.as_str());
+                        let Some(operation) = self
+                            .candidates
+                            .unconfirmed_operation(&candidate_id)
+                            .or(receiptless)
                         else {
                             return Err(refusal);
                         };
@@ -123,6 +138,11 @@ impl Compose {
                     .confirm(&candidate_id, SystemTime::now())
                     .map_err(refused)?;
                 let mut outcome = publisher.confirm(&candidate);
+                // A refused confirmation persisted nothing (run.rs refuses
+                // only before the durable commit intent); any other status
+                // may have written a receipt.
+                self.receiptless = (outcome.status == Status::Refused)
+                    .then(|| (candidate_id.clone(), outcome.operation_id.clone()));
                 // Stale authority is never cured by reconfirming, so release
                 // the handle for a fresh preview. The outcome was computed
                 // while the resources were still confirmed, so its cleanup

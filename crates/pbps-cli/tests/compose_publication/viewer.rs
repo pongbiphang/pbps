@@ -423,3 +423,31 @@ fn a_failed_stale_release_is_retried_by_the_next_preview() {
         .json();
     assert_eq!(delivered["status"], "delivered", "{delivered}");
 }
+
+#[test]
+fn a_receiptless_confirmed_handle_stays_definite_while_the_publisher_is_busy() {
+    let f = Fixture::new("viewer-compose-receiptless");
+    let served = serve(&f);
+    let preview = served.action("preview", intent()).json();
+    let confirm = || {
+        served.action(
+            "confirm",
+            serde_json::json!({"candidate_id": preview["candidate_id"]}),
+        )
+    };
+    // A transient prerequisite fails after review: the handle becomes
+    // confirmed, yet nothing was published and no receipt exists.
+    git(&f.repo.root, &["config", "commit.gpgSign", "not-a-boolean"]);
+    let first = confirm().json();
+    assert_eq!(first["status"], "refused", "{first}");
+    assert_eq!(first["problem"], "signing_unavailable");
+    // Retrying while another compose holds the lock is still a definite
+    // refusal the page may retry, not an unknown outcome.
+    let other = f.publisher();
+    let busy = confirm().json();
+    assert_eq!(busy["status"], "refused", "{busy}");
+    assert_eq!(busy["remote"], "not_attempted");
+    drop(other);
+    git(&f.repo.root, &["config", "--unset", "commit.gpgSign"]);
+    assert_eq!(confirm().json()["status"], "delivered");
+}
