@@ -7123,6 +7123,64 @@ async fn a_ledger_pbps_did_not_create_is_refused_before_any_write() {
         .await
         .expect("a pre-#103 ledger still records");
 
+    // #862: `NOLOGIN` ends no session. An attacker that connected first and
+    // was then made `NOLOGIN` still holds its `TRIGGER` grant in that
+    // session, so it is still an editor; once the session is gone it is not.
+    db.conn
+        .execute(&format!(
+            "DROP TABLE IF EXISTS public.__pbps_state, public.__pbps_lock;
+             {recipe}
+             GRANT SELECT, INSERT, DELETE ON public.__pbps_state, public.__pbps_lock TO {deployer};
+             GRANT TRIGGER ON public.__pbps_lock TO {attacker};"
+        ))
+        .await
+        .unwrap();
+    let lingering = Conn::connect(Driver::Postgres, &as_role(&attacker))
+        .await
+        .unwrap();
+    db.conn
+        .execute(&format!("ALTER ROLE {attacker} NOLOGIN"))
+        .await
+        .unwrap();
+    let mut deploying = Conn::connect(Driver::Postgres, &as_role(&deployer))
+        .await
+        .unwrap();
+    let problems = state::ledger_problems(&mut deploying).await.unwrap();
+    assert!(
+        problems.iter().any(|p| p.contains(&changed_by_attacker)),
+        "a NOLOGIN attacker with a live session: {problems:?}"
+    );
+    drop(lingering);
+    let mut gone = false;
+    for _ in 0..50 {
+        let sessions: i64 = db
+            .conn
+            .query(&format!(
+                "SELECT count(*)::int8 AS n FROM pg_stat_activity WHERE usename = '{attacker}'"
+            ))
+            .await
+            .unwrap()[0]
+            .try_get::<i64>("n")
+            .unwrap()
+            .unwrap();
+        if sessions == 0 {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(gone, "the attacker's session did not end");
+    let problems = state::ledger_problems(&mut deploying).await.unwrap();
+    assert!(
+        !problems.iter().any(|p| p.contains(&changed_by_attacker)),
+        "a NOLOGIN attacker with no session: {problems:?}"
+    );
+    drop(deploying);
+    db.conn
+        .execute(&format!("ALTER ROLE {attacker} LOGIN"))
+        .await
+        .unwrap();
+
     let _ = db
         .conn
         .execute(&format!(

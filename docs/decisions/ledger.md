@@ -579,3 +579,17 @@ a `TRIGGER` grant to the attacker, a `TRIGGER` grant to `PUBLIC`, and a group
 owner the attacker also inherits are each refused naming the attacker, while
 a `TRIGGER` grant to the deployment account and a `NOLOGIN` group owner the
 deployment account holds `NOINHERIT` are accepted.
+
+<a id="dec-862-1"></a>
+
+**DEC-862.1. A role with a live session is an actor even when it can no longer
+log in (#862; amends DEC-834.1).** DEC-834.1 counted only `rolcanlogin` roles
+as editors of the ledger, on the reasoning that a `NOLOGIN` role acts only
+through its members. `ALTER ROLE … NOLOGIN` does not end a session the role
+already has, so a role that connected while it could log in and was then made
+`NOLOGIN` keeps its ownership or `TRIGGER` grant in that session, and can add a
+trigger between the check and the write. An editor is now a login role or any
+role with a backend in `pg_stat_activity` (`usesysid`, which every role may
+read); a `NOLOGIN` group with no session of its own is still not one, so a
+group owner whose only login member is the deployment account keeps working.
+
