@@ -66,6 +66,10 @@ async fn native_aliases_share_one_instance_and_backend_children_cannot_claim_ano
         "a backend child cannot be relabeled as another service"
     );
 
+    if driver == Driver::Postgres {
+        postgres_capture_is_fresh_and_cancellation_expires_its_connection(&primary, main_pid).await;
+    }
+
     // The supervisor owns this fixture and explicitly permits its process to
     // be suspended. No production target is accepted by this ignored test.
     let backend = fixture_observer_pid(first.current.as_ref().unwrap().lease.owner());
@@ -207,4 +211,174 @@ fn fixture_observer_pid(owner: &super::super::ProcessLease) -> u32 {
     let candidate = super::super::ProcessLease::capture(pid).unwrap();
     assert!(candidate.same_process(owner).unwrap());
     pid
+}
+
+async fn postgres_capture_is_fresh_and_cancellation_expires_its_connection(
+    primary: &str,
+    main_pid: u32,
+) {
+    use pbps_pg::resolver::capture::{CandidateClass, CandidateSet, CaptureScope};
+    let mut connection = PeerVerifiedConn::connect(Driver::Postgres, primary)
+        .await
+        .unwrap();
+    for statement in [
+        "CREATE SCHEMA capture_fixture",
+        "CREATE TABLE capture_fixture.t(id integer)",
+        "CREATE VIEW capture_fixture.v AS SELECT id+1 AS id FROM capture_fixture.t",
+    ] {
+        connection.query(statement).await.unwrap();
+    }
+    let scope = CaptureScope {
+        retained: Default::default(),
+        candidates: [CandidateSet {
+            class: CandidateClass::Relation,
+            namespace: Some("capture_fixture".into()),
+            name: None,
+        }]
+        .into_iter()
+        .collect(),
+    };
+    let mut target = NativeTarget::establish(connection, main_pid).await.unwrap();
+    let captured = target.capture_postgres(&scope).await;
+    if std::env::var("PBPS_NATIVE_FACTORY_FIXTURE").as_deref() == Ok("1") {
+        let captured =
+            captured.expect("native capture must qualify actual loaded executable content");
+        let (_, unchanged) = target.recapture_postgres(&captured).await.unwrap();
+        assert!(
+            unchanged.is_empty(),
+            "an unchanged native target must recapture consistently: {unchanged:?}"
+        );
+        let mut writer = PeerVerifiedConn::connect(Driver::Postgres, primary)
+            .await
+            .unwrap();
+        writer
+            .query("ALTER TABLE capture_fixture.t ADD COLUMN added integer")
+            .await
+            .unwrap();
+        let (_, changed) = target.recapture_postgres(&captured).await.unwrap();
+        assert!(
+            !changed.is_empty(),
+            "a native recapture cannot reuse old catalog facts"
+        );
+        // This server belongs solely to the native fixture. Hold one catalog
+        // lock to put a real reload after session pinning and before rendering;
+        // never reload the shared development/CI database service.
+        let rows = target
+            .current
+            .as_mut()
+            .unwrap()
+            .connection
+            .query("SELECT pg_backend_pid()::text AS pid")
+            .await
+            .unwrap();
+        let backend: u32 = rows[0]
+            .try_get::<&str>("pid")
+            .unwrap()
+            .unwrap()
+            .parse()
+            .unwrap();
+        writer.query("BEGIN").await.unwrap();
+        writer
+            .query("LOCK TABLE pg_catalog.pg_cast IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        let trigger_reload = async {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            let mut reloaded = false;
+            while tokio::time::Instant::now() < deadline {
+                let sql = format!(
+                    "SELECT count(*)::text AS waiting FROM pg_stat_activity WHERE pid={backend} AND wait_event_type='Lock'"
+                );
+                let rows = writer.query(&sql).await.unwrap();
+                if rows[0].try_get::<&str>("waiting").unwrap() == Some("1") {
+                    writer.query("SELECT pg_reload_conf()").await.unwrap();
+                    reloaded = true;
+                    break;
+                }
+                // pg_stat_activity caches its snapshot within a transaction.
+                writer
+                    .query("SELECT pg_stat_clear_snapshot()")
+                    .await
+                    .unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            writer.query("COMMIT").await.unwrap();
+            reloaded
+        };
+        let (capture, reloaded) = tokio::join!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(45),
+                target.capture_postgres(&scope)
+            ),
+            trigger_reload,
+        );
+        assert!(
+            reloaded,
+            "the owned fixture must reload during the capture interval"
+        );
+        assert!(
+            matches!(
+                capture,
+                Ok(Err(CaptureFailure::Catalog(
+                    pbps_pg::resolver::capture::CaptureError::EnvironmentChanged
+                )))
+            ),
+            "a reload during rendering cannot qualify a coherent capture"
+        );
+        assert!(
+            target.identity().is_err(),
+            "a failed capture expires its native binding"
+        );
+    } else {
+        assert!(
+            matches!(captured, Err(CaptureFailure::Executables)),
+            "a disk-only library observation cannot qualify native target capture"
+        );
+        assert!(
+            target.identity().is_err(),
+            "failed build qualification expires its native binding"
+        );
+    }
+    let connection = PeerVerifiedConn::connect(Driver::Postgres, primary)
+        .await
+        .unwrap();
+    let mut target = NativeTarget::establish(connection, main_pid).await.unwrap();
+    let witness = target.witness().unwrap();
+    let backend = fixture_observer_pid(target.current.as_ref().unwrap().lease.owner());
+    assert!(
+        std::process::Command::new("/bin/kill")
+            .args(["-STOP", &backend.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let timed = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        target.capture_postgres(&scope),
+    )
+    .await;
+    let resumed = std::process::Command::new("/bin/kill")
+        .args(["-CONT", &backend.to_string()])
+        .status()
+        .unwrap();
+    assert!(
+        resumed.success(),
+        "resume the owned backend before asserting cancellation"
+    );
+    assert!(timed.is_err());
+    assert!(
+        target.identity().is_err(),
+        "cancelled capture must expire the complete connection"
+    );
+    assert!(
+        witness.check().is_err(),
+        "cancelled capture cannot leave a reusable scratch witness"
+    );
+    let mut administrator = PeerVerifiedConn::connect(Driver::Postgres, primary)
+        .await
+        .unwrap();
+    administrator
+        .query("DROP SCHEMA capture_fixture CASCADE")
+        .await
+        .unwrap();
 }

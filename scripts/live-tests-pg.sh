@@ -75,6 +75,9 @@ export PBPS_TEST_PG_CONTAINER="$NAME"
 # seconds is what proves the wait is bounded. It is why this suite takes half a
 # minute for six tests.
 cargo test -p pbps-pg --test live -- --ignored "$@"
+# Capture internals are private engine components. Their two-session live
+# regressions live in the library test target and must run here and in CI.
+cargo test -p pbps-pg --lib -- --ignored --test-threads=1 "$@"
 # The seam's own error conversion (issue #167): a real server error must
 # render its own sentence, not tokio_postgres's literal `db error`. `pbps-db`
 # has no other live suite of its own, so this is the one place its `From`

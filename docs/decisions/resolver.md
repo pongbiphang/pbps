@@ -692,3 +692,48 @@ existing task observations require the corresponding UTS membership.
 Name loss discards live analysis even if the name is later restored.
 This adds no continuous census or privileged target write, and retains
 DECISIONS 533's trusted-provisioning boundary between observations.
+
+<a id="dec-612-1"></a>
+
+**DEC-612.1. Target capture separates the owned catalog snapshot from rendering,
+session and native-build observations (#612).** A PostgreSQL repeatable-read
+snapshot can retain an old stored tree while `pg_get_*` prints names from a
+newer catalog. Reading the witness again in the same snapshot proves nothing.
+The capture therefore closes its owned read before a fresh tuple-witness
+observation; a changed row version refuses even after a name was restored.
+These physical coordinates are private interval witnesses, never fingerprints.
+Canonical and relevant user-context settings are transaction-local, session
+inputs are checked across the read, and actual collation-provider versions are
+separate from recorded metadata. Native capture encloses a fresh coherent read
+with actual executable-content and process/socket checks. Cancellation takes
+the complete bound connection away before the first await. Acquisition and
+compilation start only after capture has released the target transaction.
+
+<a id="dec-612-2"></a>
+
+**DEC-612.2. A resolver input is a complete logical property record and a complete
+membership predicate, not an object name or dependency edge (#612).** Stored
+PostgreSQL trees supply observable historical bindings, including pinned
+builtins absent from `pg_depend`. Snapshot rows resolve names/signatures and
+columns; no cross-database OID or live-cache name stands in for logical
+identity. The requested closure includes class-specific properties, referenced
+prerequisites and owned/extension members, with explicit empty candidate sets.
+Full catalog descriptors and serialized node fields qualify the measured
+16/18 layouts. Unknown required properties/classes refuse. Only selected,
+qualified definitions and datum/type-modifier output may be rendered.
+Versioned cryptographic comparison includes complete definitions and literals,
+baseline identity/state and effective session facts. Identity-preserving cast,
+type, operator, extension and authorization changes therefore invalidate inputs.
+
+<a id="dec-612-3"></a>
+
+**DEC-612.3. Connected capture stays private until the confidential artifact path
+can enforce its contract (#612).** Captured source, canonical properties and
+SHA-256 guessing verifiers have no ordinary `Debug`/serialization path or public
+verifier getter. Comparison reports contain logical objects and conditions
+outside semantic Schema equality. Runtime-bound routine bodies remain named
+limitations rather than empty dependency proofs; C routines still name native
+file prerequisites even without extension membership. A catalog read is not a
+native runtime qualification, a scope request is not proof of complete SQL
+analysis, and neither creates an applyable artifact. Reconstruction, compilation,
+ordering and #594's protected publication/apply/recording remain separate gates.

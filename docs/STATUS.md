@@ -154,6 +154,14 @@ target/backend/connection identities. Holder observations are explicitly
 non-exhaustive under concurrent descriptor transfer; trusted provisioning,
 containment and engine evidence remain separate premises (DECISIONS 533).
 
+The PostgreSQL target-input library (#612) captures actual historical bindings,
+recorded baseline, complete requested candidate sets and prerequisite properties
+on one owned snapshot. Fresh recapture compares private versioned fingerprints;
+native capture additionally qualifies executable content and expires canceled
+connections. Unknown required coverage refuses. This is a library boundary,
+not enabled CLI resolution or a saved-plan/apply path; reconstruction and #594
+remain required. See [the capture contract and fixtures](RESOLVER-CAPTURE.md).
+
 Delivery is split into three stages:
 
 1. Environment discovery, trusted candidate suggestions and compatibility

@@ -36,7 +36,9 @@ pub(crate) use private_channel::{
     awaiting_engine, guarded_tasks, private_network, security,
 };
 pub(crate) use target::TargetWitness;
-pub use target::{EnvironmentError, NativeTarget, NativeTargetError};
+pub use target::{
+    CaptureFailure, CapturedTargetInputs, EnvironmentError, NativeTarget, NativeTargetError,
+};
 use task_metadata::{read_bytes, read_status, stat_fields};
 
 #[derive(Debug, thiserror::Error)]
