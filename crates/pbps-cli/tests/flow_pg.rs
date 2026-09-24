@@ -1888,6 +1888,83 @@ fn init_from_a_database_says_which_permissions_it_could_not_take_with_it() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 
+    // #705: a schema literally named `$user` is one no plan can scope a
+    // statement to. The adoption leaves its table, its view and the grants on
+    // them out, says so, and writes a project the next command accepts —
+    // where it used to refuse the whole adoption over them.
+    let dollar = OwnDatabase::new(&server, "init-dollar-user");
+    on_server(
+        dollar.connection(),
+        &format!(
+            "CREATE SCHEMA app; CREATE TABLE app.t (id integer PRIMARY KEY); \
+             CREATE SCHEMA \"$user\"; CREATE TABLE \"$user\".mine (id integer PRIMARY KEY); \
+             CREATE VIEW \"$user\".v AS SELECT 1 AS x; \
+             GRANT USAGE ON SCHEMA \"$user\" TO {r}; GRANT SELECT ON \"$user\".mine TO {r}",
+            r = role.1
+        ),
+    );
+    let (dir, o) = adopt("dollar", dollar.connection());
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    for named in [
+        "table `$user.mine` was left out",
+        "view $user.v",
+        "on `$user.mine` was left out",
+        "on `schema::$user` was left out",
+    ] {
+        assert!(
+            stderr(&o).contains(named),
+            "`{named}` missing from: {}",
+            stderr(&o)
+        );
+    }
+    let schema_dir = dir.join("schema");
+    let mut dirs = vec![schema_dir.clone()];
+    while let Some(at) = dirs.pop() {
+        for entry in std::fs::read_dir(at).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                !text.contains("$user") && !path.to_string_lossy().contains("%24user"),
+                "{} carries `$user`:\n{text}",
+                path.display()
+            );
+        }
+    }
+    assert!(schema_dir.join("app.t.yml").is_file());
+    // And the command after it accepts the project: `validate`, and a plan
+    // that builds it — the `$user` view was the one `validate` used to pass
+    // and the emitter refuse.
+    let validated = Command::new(BIN)
+        .arg("--project")
+        .arg(&dir)
+        .arg("validate")
+        .output()
+        .unwrap();
+    assert_eq!(
+        code(&validated),
+        0,
+        "{}{}",
+        stdout(&validated),
+        stderr(&validated)
+    );
+    let empty = OwnDatabase::new(&server, "init-dollar-empty");
+    // `bootstrap` builds the declared objects, not the schemas they live in.
+    on_server(empty.connection(), "CREATE SCHEMA app");
+    let script = dir.join("bootstrap.sql");
+    let built = Command::new(BIN)
+        .arg("--project")
+        .arg(&dir)
+        .args(["bootstrap", "--db", empty.connection(), "--sql"])
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert_eq!(code(&built), 0, "{}{}", stdout(&built), stderr(&built));
+    let _ = std::fs::remove_dir_all(&dir);
+
     // The control: the same adoption against a database whose grants the
     // model can all hold.
     let plain = OwnDatabase::new(&server, "init-expressible");
@@ -1967,6 +2044,117 @@ fn init_from_a_database_says_which_permissions_it_could_not_take_with_it() {
         stderr(&baselined)
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Issue #902. The reader and the validator are two answers to "can a
+/// declaration say this?", and wherever they disagreed `pull` wrote a project
+/// the very next `validate` refused: an identity whose increment outruns its
+/// type (#504), a table, a view or a grant in a schema named `$user` (#705),
+/// a grant in a schema its role cannot use. Each is now left out of the files
+/// and named, and what is written passes `validate`.
+///
+/// The controls are the neighbours of each: an identity at exactly its span,
+/// a table and a grant in an ordinary schema.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn pull_leaves_out_and_names_what_validate_would_refuse() {
+    struct Role(String, String);
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
+    let server = server();
+    let role = Role(
+        server.clone(),
+        format!("pbps_pull_902_{}", std::process::id()),
+    );
+    let own = OwnDatabase::new(&server, "pull-refused");
+    let connection = own.connection().to_owned();
+    on_server(
+        &connection,
+        &format!(
+            "CREATE ROLE {r} NOSUPERUSER; CREATE SCHEMA app; CREATE SCHEMA other; \
+             CREATE TABLE app.t (id integer PRIMARY KEY); \
+             CREATE TABLE app.big (id smallint GENERATED ALWAYS AS IDENTITY \
+                 (START WITH 1 INCREMENT BY 40000) PRIMARY KEY); \
+             CREATE TABLE app.edge (id smallint GENERATED ALWAYS AS IDENTITY \
+                 (START WITH 1 INCREMENT BY 32766) PRIMARY KEY); \
+             CREATE TABLE other.u (id integer PRIMARY KEY); \
+             CREATE SCHEMA \"$user\"; CREATE TABLE \"$user\".mine (id integer PRIMARY KEY); \
+             CREATE VIEW \"$user\".v AS SELECT 1 AS x; \
+             GRANT USAGE ON SCHEMA app TO {r}; GRANT SELECT ON app.t TO {r}; \
+             GRANT SELECT ON other.u TO {r}; \
+             GRANT USAGE ON SCHEMA \"$user\" TO {r}; GRANT SELECT ON \"$user\".mine TO {r}",
+            r = role.1
+        ),
+    );
+
+    let d = Demo::new("pull-refused");
+    let o = d.run(&["pull", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let err = stderr(&o);
+    for named in [
+        "table `$user.mine` was left out",
+        "table `app.big` was left out",
+        // The identity the engine holds, not a corrected one.
+        "increment of 40000",
+        "view $user.v",
+        "on `$user.mine` was left out",
+        "on `schema::$user` was left out",
+        "on `other.u` was left out",
+    ] {
+        assert!(err.contains(named), "`{named}` missing from: {err}");
+    }
+    assert!(
+        stdout(&o).contains("could not be expressed and were left out"),
+        "{}",
+        stdout(&o)
+    );
+
+    // What was written is what `validate` accepts, and nothing of `$user` is
+    // in it.
+    let o = d.run(&["validate"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let mut files = Vec::new();
+    let mut dirs = vec![d.dir.join("schema")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    for path in &files {
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(
+            !text.contains("$user") && !path.to_string_lossy().contains("%24user"),
+            "{} carries `$user`:\n{text}",
+            path.display()
+        );
+    }
+    // The neighbours stayed: the exact-span identity, and the grant the
+    // role's `usage` makes valid.
+    let edge = std::fs::read_to_string(d.dir.join("schema/app.edge.yml")).unwrap();
+    assert!(edge.contains("32766"), "{edge}");
+    assert!(!d.dir.join("schema/app.big.yml").exists());
+    let granted =
+        std::fs::read_to_string(d.dir.join(format!("schema/roles/{}.yml", role.1))).unwrap();
+    assert!(granted.contains("app.t"), "{granted}");
+    assert!(!granted.contains("other.u"), "{granted}");
+
+    // A pull only reads: the identity the engine holds is the one it had.
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT increment_by FROM pg_sequences \
+             WHERE schemaname = 'app' AND sequencename = 'big_id_seq'"
+        ),
+        40000
+    );
 }
 
 /// Issue #261. A managed role that owns a managed object already holds every

@@ -14,7 +14,7 @@ use clap::Args;
 use pbps_config::{Config, ConfigError, DialectName, Environment, Hooks, Project, Unmanaged};
 use pbps_model::{IdsFile, Schema};
 
-use crate::{context, db, declaration_file};
+use crate::{context, db};
 
 /// Arguments for `pbps init`.
 #[derive(Debug, Args)]
@@ -178,11 +178,18 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
                     "cannot adopt the database because ${var} is not set.\nExport it, then run the same `pbps init --from ...` command again."
                 )
             })?;
-                let pulled = db::runtime()?.block_on(async {
+                let mut pulled = db::runtime()?.block_on(async {
                     let mut conn =
                         pbps_db::Conn::connect(db::driver_for(config.dialect), &connection).await?;
                     crate::engine::introspect(&mut conn, crate::engine::Read::Snapshot).await
                 })?;
+                // As `pull` does, and before identities are minted for it:
+                // what `validate` would refuse is left out and named, rather
+                // than refusing the whole adoption over it (#902).
+                crate::adopt::leave_out_what_validate_refuses(
+                    &mut pulled,
+                    crate::dialect_for(config.dialect).as_ref(),
+                );
                 let ids = mint_ids(&pulled.schema, &root)?;
                 (
                     pulled.schema,
@@ -474,38 +481,7 @@ fn stage_project(root: &Path, prepared: &Prepared) -> anyhow::Result<PathBuf> {
         std::fs::write(schema_dir.join(GITKEEP), "")
             .with_context(|| format!("cannot stage `{}`", schema_dir.join(GITKEEP).display()))?;
 
-        // Before the first declaration is staged: see `refuse_folded_paths`.
-        declaration_file::refuse_folded_paths(&declaration_file::paths_of(
-            &schema_dir,
-            &prepared.schema,
-        )?)?;
-        for (name, table) in &prepared.schema.tables {
-            let path = declaration_file::path(&schema_dir, name, None)?;
-            std::fs::write(&path, pbps_load::render(name, table, &[], None))
-                .with_context(|| format!("cannot stage `{}`", path.display()))?;
-        }
-        for (id, module) in &prepared.schema.modules {
-            let path = declaration_file::module_path(&schema_dir, id, module.kind)?;
-            std::fs::write(
-                &path,
-                pbps_load::render_module(
-                    id,
-                    module,
-                    &Default::default(),
-                    prepared.public_execute.contains(id),
-                ),
-            )
-            .with_context(|| format!("cannot stage `{}`", path.display()))?;
-        }
-        for (name, role) in &prepared.schema.roles {
-            let path = declaration_file::role_path(&schema_dir, name)?;
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("cannot stage `{}`", parent.display()))?;
-            }
-            std::fs::write(&path, pbps_load::render_role(name, role, &[]))
-                .with_context(|| format!("cannot stage `{}`", path.display()))?;
-        }
+        crate::adopt::write_declarations(&schema_dir, &prepared.schema, &prepared.public_execute)?;
         std::fs::write(stage.join(pbps_config::CONFIG_FILE), &prepared.config_text)
             .context("cannot stage pbps.yml")?;
         std::fs::write(
@@ -517,26 +493,14 @@ fn stage_project(root: &Path, prepared: &Prepared) -> anyhow::Result<PathBuf> {
         // Validate from the serialized files, not the values that produced
         // them. This catches renderer/loader drift before the project appears.
         let project = Project::load(&stage.join(pbps_config::CONFIG_FILE))?;
-        let loaded = pbps_load::load_schema_dir(&project.schema_dir()).map_err(|errors| {
-            anyhow::anyhow!("the staged declarations have {} problem(s)", errors.len())
-        })?;
-        if loaded.schema != prepared.schema {
-            bail!("the staged declarations do not round-trip to the pulled schema");
-        }
         // The whole list, not the half this function used to enumerate: the
         // roles and rows a `pull --data` writes are checked by the checks that
         // own them, and a staged project that `pbps validate` would reject is
         // one this command must not leave behind (DECISIONS 141).
         let dialect = crate::dialect_for(project.config.dialect);
-        let dialect_problems: Vec<String> = crate::declaration_problems(&loaded, dialect.as_ref())
-            .into_iter()
-            .map(|(_, problem)| problem)
-            .collect();
-        if !dialect_problems.is_empty() {
-            bail!(
-                "the staged declarations are not valid for mssql:\n  {}",
-                dialect_problems.join("\n  ")
-            );
+        let loaded = crate::adopt::check_staged(&project.schema_dir(), dialect.as_ref())?;
+        if loaded.schema != prepared.schema {
+            bail!("the staged declarations do not round-trip to the pulled schema");
         }
         let ids: IdsFile = serde_json::from_str(&std::fs::read_to_string(project.ids_file())?)?;
         ids.validate()?;

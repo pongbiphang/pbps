@@ -1617,6 +1617,53 @@ fn pull_reports_system_versioning_without_declaring_either_temporal_table() {
     assert_eq!(code(&validate), 0, "{}", stderr(&validate));
 }
 
+/// Issue #902, on this engine: the reader leaves the ledger's tables out of
+/// the pull but read a trigger on one of them (#891), and the pull wrote that
+/// trigger's declaration — which `validate` refuses, because its table is
+/// declared nowhere. The trigger is now left out and named, and what is
+/// written validates. A trigger on an ordinary table is the control.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn pull_leaves_out_a_trigger_whose_table_it_does_not_write() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "pull_ledger_trigger");
+    on_server(
+        own.connection(),
+        "CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY);",
+    );
+    let d = Demo::new("pull-ledger-trigger");
+    let o = d.run(&["pull", "--db", own.connection()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    // The ledger's tables exist from here on.
+    let o = d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    on_server(
+        own.connection(),
+        "CREATE TRIGGER dbo.tr_lock ON dbo.__pbps_lock AFTER UPDATE AS SET NOCOUNT ON;",
+    );
+    on_server(
+        own.connection(),
+        "CREATE TRIGGER dbo.tr_t ON dbo.t AFTER INSERT AS SET NOCOUNT ON;",
+    );
+
+    let o = d.run(&["pull", "--db", own.connection(), "--force"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("trigger dbo.__pbps_lock.tr_lock")
+            && stderr(&o).contains("is not among the declarations"),
+        "{}",
+        stderr(&o)
+    );
+    let mut written: Vec<String> = std::fs::read_dir(d.dir.join("schema"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    written.sort();
+    assert_eq!(written, ["dbo.t%2Etr_t.trigger.yml", "dbo.t.yml"]);
+    let o = d.run(&["validate"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+}
+
 /// DECISIONS 444 moved the refusal to shared identity adoption. The catalog
 /// must preserve the engine's separate parts until that boundary; splitting
 /// them early would make a different, apparently representable name.

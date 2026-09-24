@@ -527,3 +527,36 @@ says how to add an entry here.
      columns, retain their limitation reports, and introduce a supported
      character column to require exactly one reminder. Existing matching and
      non-matching column controls preserve DECISIONS 443's baseline.
+
+<a id="dec-902-1"></a>
+
+**DEC-902.1. An adoption asks the validator what it may write, and leaves out
+and names each object the validator refuses.** `pull` and `init --from` turned a
+catalog read into files without asking `declaration_problems` (DECISIONS 141),
+so wherever the reader and the validator disagreed the adoption wrote a project
+its next command refused: an identity increment past its type's span (#504), a
+table or grant in a schema named `$user` (#705), a trigger on a ledger table the
+reader filters out (#891), a grant in a schema its role holds no `usage` on.
+Teaching the reader each validator rule would keep the two in step only until
+the next rule; asking the validator keeps them in step by construction.
+
+Per object, not per project. `init --from` did ask, and refused the whole
+adoption over one table in a schema nobody uses — honest, but it leaves the
+operator nothing to start from. So each table, module or role the dialect's
+`validate_*` refuses is taken out and reported where the adoption already
+reports what it left behind (DECISIONS 14, 17): a table in the warnings, a
+module in the unmanaged inventory, a grant among the unexpressible permissions.
+A trigger whose table did not make it goes with the table. What no single
+object carries — two names that collide, say — is still refused whole: the
+files are staged outside the project, loaded back, and put through
+`declaration_problems`, and a problem there means nothing is written.
+
+A grant is judged by what removing it fixes, not by validating it alone. Some
+rules are about a role's grants together — PostgreSQL's "a grant in a schema
+needs `usage` on it" — and a grant checked in isolation would fail that rule
+for want of a `usage` its role does hold. A grant is left out only if the role
+has fewer problems without it; a role still refused with every grant gone is
+left out whole.
+
+The price is that a pull that used to "succeed" now reports omissions. That is
+the point: the success was a project `validate` rejected.
