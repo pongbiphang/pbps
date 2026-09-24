@@ -94,6 +94,7 @@ pub(super) fn datum(catalog: &Catalog, oid: u32) -> Result<(), Uncovered> {
                     "int4" => "int4out",
                     "int8" => "int8out",
                     "text" => "textout",
+                    "unknown" => "unknownout",
                     "varchar" => "varcharout",
                     "bpchar" => "bpcharout",
                     "numeric" => "numeric_out",
@@ -197,4 +198,28 @@ fn typmod(catalog: &Catalog, oid: u32, visiting: &mut BTreeSet<u32>) -> Result<(
     }
     visiting.remove(&oid);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn an_unknown_literal_requires_the_exact_builtin_output_handler() {
+        let catalog = |variant: &str| {
+            let row = |v: serde_json::Value| v.as_object().unwrap().clone();
+            Catalog::new(BTreeMap::from([
+                ("pg_namespace".into(),vec![row(json!({"oid":11,"nspname":"pg_catalog"})),row(json!({"oid":12,"nspname":"app"}))]),
+                ("pg_language".into(),vec![row(json!({"oid":13,"lanname":if variant=="language" {"sql"} else {"internal"}}))]),
+                ("pg_proc".into(),vec![row(json!({"oid":14,"proname":"unknownout","pronamespace":if variant=="function_namespace" {12} else {11},"proargtypes":[705],"prolang":13,"prosrc":if variant=="symbol" {"user_output"} else {"unknownout"}}))]),
+                ("pg_type".into(),vec![row(json!({"oid":705,"typname":"unknown","typnamespace":if variant=="type_namespace" {12} else {11},"typtype":"p","typoutput":14,"typelem":0,"typcategory":"X"}))]),
+            ])).unwrap_or_else(|e| panic!("{e:?}"))
+        };
+        assert!(datum(&catalog("builtin"), 705).is_ok());
+        for variant in ["language", "symbol", "function_namespace", "type_namespace"] {
+            assert!(datum(&catalog(variant), 705).is_err(), "{variant}");
+        }
+    }
 }

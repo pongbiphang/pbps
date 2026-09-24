@@ -60,6 +60,13 @@ order without persisting physical attribute slots. OIDs resolve only through
 snapshot rows; live-cache name helpers cannot name an older snapshot's objects.
 An unreadable required reference cannot become an optional identity slot.
 
+Derived query outputs use local query/range positions. A whole derived row
+retains its row type and every output label in order, checked against the
+range's complete output count. The existing full-tree bindings and catalog
+closure retain expression types, collations and routine/composite result
+descriptors; a row label list alone is not a completeness certificate. Missing,
+unreadable or truncated output shapes refuse coverage.
+
 The closure includes class-specific type, cast, operator, routine, extension,
 collation, relation and authorization properties; referenced prerequisites;
 owned children; extension membership; and initial privileges/dependencies.

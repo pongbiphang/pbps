@@ -540,3 +540,6 @@ mod coverage_tests;
 
 #[cfg(test)]
 mod expression_tests;
+
+#[cfg(test)]
+mod range_tests;

@@ -445,6 +445,8 @@ mod tests {
             (18, include_str!("fixtures/row-coercion-18.nodes")),
             (16, include_str!("fixtures/expression-results-16.nodes")),
             (18, include_str!("fixtures/expression-results-18.nodes")),
+            (16, include_str!("fixtures/query-ranges-16.nodes")),
+            (18, include_str!("fixtures/query-ranges-18.nodes")),
         ] {
             for (case, text) in fixtures.lines().enumerate() {
                 let value = decode(text, major)
@@ -578,6 +580,57 @@ mod tests {
                     .fields
                     .insert("unknown_binding".into(), Value::Atom("23".into()));
                 assert!(references(&Value::Node(unknown), major).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn query_range_nodes_require_every_reference_and_child_field() {
+        for (major, fixtures) in [
+            (16, include_str!("fixtures/query-ranges-16.nodes")),
+            (18, include_str!("fixtures/query-ranges-18.nodes")),
+        ] {
+            for (case, tag) in [
+                (0, "CTESEARCHCLAUSE"),
+                (1, "CTECYCLECLAUSE"),
+                (2, "TABLEFUNC"),
+            ] {
+                let tree = decode(fixtures.lines().nth(case).unwrap(), major)
+                    .unwrap_or_else(|e| panic!("{e:?}"));
+                let bindings = references(&tree, major).unwrap();
+                if tag == "CTECYCLECLAUSE" {
+                    assert!(bindings.iter().any(|b| b.class == ReferenceClass::Operator
+                        && b.path.last().is_some_and(|p| p == "cycle_mark_neop")));
+                }
+                if tag == "TABLEFUNC" {
+                    for field in ["docexpr", "coldefexprs"] {
+                        assert!(bindings.iter().any(|b| b.class == ReferenceClass::Routine
+                            && b.path.iter().any(|p| p == field)));
+                    }
+                }
+                let mut found = Vec::new();
+                nodes_with_tag(&tree, tag, &mut found);
+                assert!(!found.is_empty());
+                for node in found {
+                    let spec = specification(tag, major).unwrap();
+                    for field in spec.fields {
+                        let mut missing = node.clone();
+                        missing.fields.remove(*field);
+                        assert!(references(&Value::Node(missing), major).is_err());
+                    }
+                    for field in spec
+                        .children
+                        .iter()
+                        .map(|(field, _)| *field)
+                        .chain(spec.references.iter().map(|(field, _, _)| *field))
+                    {
+                        let mut unreadable = node.clone();
+                        unreadable
+                            .fields
+                            .insert(field.into(), Value::Atom("unreadable".into()));
+                        assert!(references(&Value::Node(unreadable), major).is_err());
+                    }
+                }
             }
         }
     }

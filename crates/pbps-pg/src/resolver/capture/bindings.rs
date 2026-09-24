@@ -198,7 +198,7 @@ fn variable(
             // OID. Its ordinal is a semantic projection position. Retain the
             // exact local source and output position, while the tree's own
             // underlying references are independently resolved above.
-            if !matches!(kind, 1..=6 | 8 | 9) || column <= 0 {
+            if !matches!(kind, 1..=6 | 8 | 9) || column < 0 {
                 return Err(Uncovered::Subobject);
             }
             let mut name = frame.path.clone();
@@ -208,10 +208,14 @@ fn variable(
                 "output".into(),
                 column.to_string(),
             ]);
+            let mut signature = vec![catalog.object("pg_type", node.number("vartype")?)?];
+            if column == 0 {
+                signature.extend(derived_row_fields(range)?);
+            }
             return Ok(ObjectIdentity {
                 class: "query-output".into(),
                 name,
-                signature: vec![catalog.object("pg_type", node.number("vartype")?)?],
+                signature,
             });
         }
         range.number("relid")?
@@ -221,6 +225,102 @@ fn variable(
     } else {
         catalog.column(relation, column).map_err(Into::into)
     }
+}
+
+// A whole derived row consumes every output position, including repeated
+// labels. Pin that ordered shape alongside its row type. The full-tree walk
+// and catalog closure independently retain each expression/type/collation
+// binding and the routine or named-composite result descriptor.
+fn derived_row_fields(range: &Node) -> Result<Vec<ObjectIdentity>> {
+    fn list<'a>(node: &'a Node, field: &str) -> Result<&'a [Value]> {
+        match node.fields.get(field) {
+            Some(Value::List(values)) => Ok(values),
+            Some(Value::Null) => Ok(&[]),
+            _ => Err(Uncovered::Subobject),
+        }
+    }
+    fn child<'a>(node: &'a Node, field: &str, tag: &str) -> Result<&'a Node> {
+        match node.fields.get(field) {
+            Some(Value::Node(child)) if child.tag == tag => Ok(child),
+            _ => Err(Uncovered::Subobject),
+        }
+    }
+    fn flag(node: &Node, field: &str) -> Result<bool> {
+        match node.fields.get(field) {
+            Some(Value::Atom(value)) if value == "true" => Ok(true),
+            Some(Value::Atom(value)) if value == "false" => Ok(false),
+            _ => Err(Uncovered::Subobject),
+        }
+    }
+    fn typed_columns(node: &Node) -> Result<usize> {
+        match list(node, "coltypes")? {
+            [] => Ok(0),
+            [Value::Atom(marker), columns @ ..] if marker == "o" => Ok(columns.len()),
+            _ => Err(Uncovered::Subobject),
+        }
+    }
+    let labels = list(child(range, "eref", "ALIAS")?, "colnames")?;
+    let width = match range.number("rtekind")? {
+        1 => {
+            let mut count = 0;
+            for target in list(child(range, "subquery", "QUERY")?, "targetList")? {
+                let Value::Node(target) = target else {
+                    return Err(Uncovered::Subobject);
+                };
+                if target.tag != "TARGETENTRY" {
+                    return Err(Uncovered::Subobject);
+                }
+                if !flag(target, "resjunk")? {
+                    if !matches!(target.fields.get("expr"), Some(Value::Node(_))) {
+                        return Err(Uncovered::Subobject);
+                    }
+                    count += 1;
+                }
+            }
+            count
+        }
+        2 => list(range, "joinaliasvars")?.len(),
+        3 => {
+            let mut count = usize::from(flag(range, "funcordinality")?);
+            for function in list(range, "functions")? {
+                let Value::Node(function) = function else {
+                    return Err(Uncovered::Subobject);
+                };
+                if function.tag != "RANGETBLFUNCTION" {
+                    return Err(Uncovered::Subobject);
+                }
+                count = count
+                    .checked_add(
+                        usize::try_from(function.number("funccolcount")?)
+                            .map_err(|_| Uncovered::Subobject)?,
+                    )
+                    .ok_or(Uncovered::Subobject)?;
+            }
+            count
+        }
+        4 => typed_columns(child(range, "tablefunc", "TABLEFUNC")?)?,
+        5 | 6 => typed_columns(range)?,
+        8 => 0,
+        9 => list(range, "groupexprs")?.len(),
+        _ => return Err(Uncovered::Subobject),
+    };
+    if labels.len() != width {
+        return Err(Uncovered::Subobject);
+    }
+    labels
+        .iter()
+        .enumerate()
+        .map(|(index, label)| {
+            let Value::Atom(label) = label else {
+                return Err(Uncovered::Subobject);
+            };
+            Ok(ObjectIdentity {
+                class: "query-field".into(),
+                name: vec![(index + 1).to_string(), label.clone()],
+                signature: vec![],
+            })
+        })
+        .collect()
 }
 
 fn signed(node: &Node, field: &str) -> Result<i32> {
@@ -386,6 +486,90 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn whole_row_shape_preserves_order_and_refuses_incomplete_labels() {
+        let mut rejected = Vec::new();
+        for (major, fixtures) in [
+            (16, include_str!("fixtures/query-ranges-16.nodes")),
+            (18, include_str!("fixtures/query-ranges-18.nodes")),
+        ] {
+            let tree = nodes::decode(fixtures.lines().nth(3).unwrap(), major)
+                .unwrap_or_else(|e| panic!("{e:?}"));
+            let query = find_node(&tree, "QUERY").unwrap();
+            let Value::List(ranges) = &query.fields["rtable"] else {
+                panic!("range fixture")
+            };
+            let range = ranges
+                .iter()
+                .find_map(|v| match v {
+                    Value::Node(n) if n.number("rtekind") == Ok(1) => Some(n),
+                    Value::Null
+                    | Value::Atom(_)
+                    | Value::List(_)
+                    | Value::Node(_)
+                    | Value::Datum => None,
+                })
+                .unwrap();
+            let original = derived_row_fields(range).unwrap();
+            assert_eq!(
+                original
+                    .iter()
+                    .map(|f| f.name[1].as_str())
+                    .collect::<Vec<_>>(),
+                ["id", "label"]
+            );
+            for case in [
+                "missing",
+                "unreadable",
+                "truncated",
+                "extra",
+                "empty",
+                "bad_label",
+                "reordered",
+                "renamed",
+            ] {
+                let mut changed = range.clone();
+                let Some(Value::Node(alias)) = changed.fields.get_mut("eref") else {
+                    panic!("alias fixture")
+                };
+                let Some(Value::List(labels)) = alias.fields.get_mut("colnames") else {
+                    panic!("label fixture")
+                };
+                match case {
+                    "missing" => {
+                        alias.fields.remove("colnames");
+                    }
+                    "unreadable" => {
+                        alias
+                            .fields
+                            .insert("colnames".into(), Value::Atom("unreadable".into()));
+                    }
+                    "truncated" => {
+                        labels.pop();
+                    }
+                    "extra" => labels.push(Value::Atom("extra".into())),
+                    "empty" => {
+                        alias.fields.insert("colnames".into(), Value::Null);
+                    }
+                    "bad_label" => labels[0] = Value::Null,
+                    "reordered" => labels.swap(0, 1),
+                    "renamed" => labels[0] = Value::Atom("renamed".into()),
+                    _ => unreachable!(),
+                }
+                let result = derived_row_fields(&changed);
+                if matches!(case, "reordered" | "renamed") {
+                    assert_ne!(result.unwrap(), original);
+                } else {
+                    rejected.push((major, case, result.is_err()));
+                }
+            }
+        }
+        assert!(
+            rejected.iter().all(|(_, _, refused)| *refused),
+            "incomplete shapes: {rejected:?}"
+        );
     }
 
     #[test]
