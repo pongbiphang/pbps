@@ -560,3 +560,24 @@ left out whole.
 
 The price is that a pull that used to "succeed" now reports omissions. That is
 the point: the success was a project `validate` rejected.
+
+<a id="dec-921-1"></a>
+
+**DEC-921.1. A `--data` table that `validate` refuses is left out like any other
+object, and its rows are not read (#921; extends DEC-902.1).** `pull --data`
+validated the requested table before DEC-902.1's filter ran. So a table the
+validator refuses stopped the whole pull when its rows were asked for, and was
+merely left out when they were not. The same catalog got two answers depending
+on a flag about rows.
+
+The filter now runs before any rows are read. A requested table it leaves out is
+named twice: once as left out, with the validator's reason, and once to say its
+rows were not read. The other `--data` tables in the same command still get
+their blocks.
+
+A refusal was the other candidate, and it was rejected. The operator did ask for
+those rows, but the table cannot be declared at all, so there is no `data:` block
+it could carry, and a refusal would only send them to rerun without the flag.
+What stays a refusal is a name the database does not have. That is a mistake on
+the command line, not a fact about the catalog. The dialect check that follows
+the row read stays too: by then it can only fail on the rows themselves.
