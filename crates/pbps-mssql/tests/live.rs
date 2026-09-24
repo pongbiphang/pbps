@@ -2646,6 +2646,11 @@ async fn statement_capture_and_table_tracking_are_named_until_removed() {
             ),
         ),
         (
+            "cross-database ownership chaining is on".into(),
+            format!("ALTER DATABASE [{dbn}] SET DB_CHAINING ON;"),
+            format!("ALTER DATABASE [{dbn}] SET DB_CHAINING OFF;"),
+        ),
+        (
             "change tracking tracks it".into(),
             format!(
                 "ALTER DATABASE [{dbn}] SET CHANGE_TRACKING = ON;

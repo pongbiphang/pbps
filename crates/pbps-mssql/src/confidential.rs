@@ -972,6 +972,11 @@ const CAPTURING_TRACE_EVENTS: &str = "10, 11, 12, 13, 40, 41, 42, 43, 44, 45, 71
 const CAPTURING_GROUPS: &str =
     "N'SCHEMA_OBJECT_ACCESS_GROUP', N'BATCH_STARTED_GROUP', N'BATCH_COMPLETED_GROUP'";
 
+/// Everything that records the confidential write or reads the table from
+/// outside this database's graph. Cross-database ownership chaining is here:
+/// it lets code in another database of the same owner read the table with only
+/// `EXECUTE` there, and rather than read every other database, the check names
+/// the setting as something it cannot establish.
 fn capture_query() -> String {
     format!(
         "DECLARE @t int = OBJECT_ID(N'dbo.__pbps_state_confidential', N'U');
@@ -1006,6 +1011,12 @@ SELECT N'database audit specification `' + s.name COLLATE DATABASE_DEFAULT + N'`
         OR d.class = 0
         OR (d.class = 3 AND d.major_id = SCHEMA_ID(N'dbo'))
         OR (d.class = 1 AND d.major_id = @t))
+UNION
+SELECT N'cross-database ownership chaining is on, so code in another database can read it through a \
+chain this check cannot follow'
+ WHERE EXISTS (SELECT 1 FROM sys.databases WHERE database_id = DB_ID() AND is_db_chaining_on = 1)
+    OR EXISTS (SELECT 1 FROM sys.configurations
+                WHERE name = N'cross db ownership chaining' AND CONVERT(int, value_in_use) = 1)
 UNION
 SELECT N'replication publishes it' FROM sys.tables
  WHERE object_id = @t AND (is_replicated = 1 OR is_merge_published = 1)

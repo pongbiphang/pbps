@@ -867,7 +867,12 @@ table before the first write (#870).
 - an enabled server or database audit specification that records
   `SCHEMA_OBJECT_ACCESS_GROUP` or batches, or any database audit action on the
   database, schema `dbo` or the table;
-- replication, change data capture or change tracking on the table.
+- replication, change data capture or change tracking on the table;
+- cross-database ownership chaining, on this database or server-wide. It lets
+  code in another database of the same owner read the table with only
+  `EXECUTE` there. The graph is this database's, so the setting is named as
+  something the check cannot establish, rather than every other database
+  being read.
 
 The event lists are known capture events, not every event. A session built
 only from events outside them is not named, and that is the method's stated
