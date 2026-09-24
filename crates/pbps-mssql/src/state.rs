@@ -365,9 +365,61 @@ const INSERT_LOCK: &str = "INSERT INTO dbo.__pbps_lock (id, locked_by) VALUES (1
 
 const DELETE_LOCK: &str = "DELETE FROM dbo.__pbps_lock WHERE id = 1;";
 
+/// The ordinary ledger tables' names as the catalog stores them, wherever that
+/// differs from the ledger's exact spelling — one row per such table.
+///
+/// On a case-insensitive database `OBJECT_ID(N'dbo.__pbps_state')` resolves
+/// to a project's own `dbo.__PBPS_STATE`, which the pull keeps and validation
+/// allows because both reserve only the exact spelling. `CREATE_STATE`'s
+/// `IF OBJECT_ID(…) IS NULL` then skips creating the ledger, and every read,
+/// write and prune after it lands on the project's table (#894). The
+/// protected table already carries this as its `spelled` fact (#884); these
+/// two are asked the same way. `Latin1_General_BIN2` compares code points, so
+/// a case-sensitive database, where `OBJECT_ID` is exact, never has a row.
+/// An invisible table resolves to NULL and has no row either: that is
+/// [`is_initialized`]'s question, not this one.
+const MISSPELT_LEDGER: &str = "\
+SELECT N'__pbps_state' AS ledger,
+       OBJECT_NAME(OBJECT_ID(N'dbo.__pbps_state', N'U')) COLLATE DATABASE_DEFAULT AS found
+ WHERE OBJECT_NAME(OBJECT_ID(N'dbo.__pbps_state', N'U')) COLLATE Latin1_General_BIN2
+       <> N'__pbps_state'
+UNION ALL
+SELECT N'__pbps_lock' AS ledger,
+       OBJECT_NAME(OBJECT_ID(N'dbo.__pbps_lock', N'U')) COLLATE DATABASE_DEFAULT AS found
+ WHERE OBJECT_NAME(OBJECT_ID(N'dbo.__pbps_lock', N'U')) COLLATE Latin1_General_BIN2
+       <> N'__pbps_lock';";
+
+/// Refuses when a ledger name resolves to a project's table spelled otherwise
+/// (#894). Asked before every statement that writes the ordinary ledger:
+/// [`ensure_tables`] for `record` and `lock`, and [`prune`] and [`unlock`]
+/// before their DELETE.
+async fn refuse_misspelt_ledger(conn: &mut Conn) -> Result<(), DbError> {
+    let rows = conn.query(MISSPELT_LEDGER).await?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let found = rows
+        .iter()
+        .map(|row| {
+            Ok(format!(
+                "dbo.{} resolves to `dbo.{}`",
+                get::<&str>(row, "ledger")?,
+                get::<&str>(row, "found")?
+            ))
+        })
+        .collect::<Result<Vec<_>, DbError>>()?;
+    Err(DbError::Refused(format!(
+        "{}: a table the project names itself, which this database's collation folds onto the \
+         ledger's name, so the ledger would be read and written through it. Rename that table, \
+         or point pbps at a database where the ledger's names are free.",
+        found.join("; ")
+    )))
+}
+
 /// Creates the ledger and lock tables if they are not there yet, and migrates
 /// a `__pbps_state` from before issue #103 to carry the timeline columns.
 pub async fn ensure_tables(conn: &mut Conn) -> Result<(), DbError> {
+    refuse_misspelt_ledger(conn).await?;
     conn.execute(CREATE_STATE).await?;
     conn.execute(CREATE_LOCK).await?;
     migrate_timeline_columns(conn).await
@@ -829,6 +881,7 @@ pub async fn prune(conn: &mut Conn, keep: u32) -> Result<u64, LedgerError> {
     if !is_initialized(conn).await? {
         return Err(LedgerError::NotInitialized);
     }
+    refuse_misspelt_ledger(conn).await?;
     let ids: Vec<i64> = conn
         .query(SELECT_IDS)
         .await?
@@ -942,6 +995,10 @@ pub async fn unlock(conn: &mut Conn) -> Result<bool, DbError> {
     // The *lock* table, not the state table. Guarding on `is_initialized` meant
     // a database whose `__pbps_state` had been dropped by hand reported "not
     // held" and left a live lock in place — with no command able to clear it.
+    //
+    // A lock table spelled otherwise is refused first (#894): the DELETE would
+    // remove a row from the project's own table.
+    refuse_misspelt_ledger(conn).await?;
     match conn.execute_with(DELETE_LOCK, &[]).await {
         Ok(n) => Ok(n > 0),
         Err(e) if is_missing_table(&e) => Ok(false),
