@@ -71,6 +71,9 @@ pub struct Details {
     pub binding: String,
     pub commit: Option<String>,
     pub output_ref: String,
+    /// The reviewed destination branch the candidate was checked against;
+    /// a merge request targets it, not the hosting service's default.
+    pub remote_base_ref: String,
     pub destination: Destination,
     pub source_project: String,
     pub project_suffix: String,
@@ -184,6 +187,7 @@ pub(super) fn classify(
             binding: d.binding.clone(),
             commit: commit.map(str::to_owned),
             output_ref: d.output_ref.clone(),
+            remote_base_ref: d.remote_base_ref.clone(),
             destination: d.destination.clone(),
             source_project: d
                 .repository
