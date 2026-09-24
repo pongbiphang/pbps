@@ -313,7 +313,31 @@ async function definiteHandleRefusal() {
   assert(!a.root.find(e => e.dataset.action === "preview").disabled, "Refresh is available");
   assert(!a.field("message").disabled);
   assert(!a.root.find(e => e.dataset.action === "recover"), "nothing to recover");
-  assert(a.root.find(e => e.textContent.includes("nothing was published")));
+  // The server's reason is shown, and the saved results are listed; an
+  // empty list does not replace the reason.
+  const reason = () => a.root.find(e => e.textContent.includes("nothing was published") && e.textContent.includes(gone.message));
+  assert(reason(), "the refusal names its reason");
+  assert.equal(a.calls[2].action, "list");
+  a.calls[2].resolve([]); await new Promise(resolve => setImmediate(resolve));
+  assert(reason(), "an empty list keeps the reason");
+  // A sibling delivered from the same base (#874): the page shows its reason
+  // and the delivered result, with the alternative the server asks for.
+  const c = setup();
+  p = c.form.fire("submit"); c.calls[0].resolve(preview("sibling")); await p;
+  p = c.confirm.fire("click");
+  const sibling = new Error("Operation operation-other already delivered a result from this base; start an alternative from it, or continue from its branch");
+  sibling.status = 410;
+  c.calls[1].reject(sibling); await p;
+  assert(c.root.find(e => e.textContent.includes("operation-other already delivered")));
+  assert.equal(c.calls[2].action, "list");
+  c.calls[2].resolve([{status: "delivered", operation_id: "operation-other", local: "present", remote: "delivered",
+    cleanup_pending: false, details: {commit: "a".repeat(40), output_ref: "refs/heads/pbps-compose/" + "b".repeat(64),
+      base: "base", tree: "tree", destination: {transport: "file", repository: "/srv/repo.git"},
+      source_project: "/source/project", project_suffix: "project", delivery_generation: "nonce"}}]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert(c.root.find(e => e.textContent === "Operation: operation-other"));
+  assert(c.root.find(e => e.dataset.action === "alternative"), "the alternative is offered");
+  assert(c.root.find(e => e.textContent.includes("operation-other already delivered")), "the reason stays");
   // Any other failure stays an unknown outcome with recovery.
   const b = setup();
   p = b.form.fire("submit"); b.calls[0].resolve(preview("lost")); await p;

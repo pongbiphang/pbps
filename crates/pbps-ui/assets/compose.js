@@ -312,18 +312,20 @@ globalThis.PbpsCompose = Object.freeze({
         activity.textContent = "Private resources could not be read. Existing evidence has been preserved.";
       } finally { privateButton.disabled = false; }
     });
-    const discover = async () => {
+    // Quiet keeps the activity line, which then carries another message,
+    // unless the results cannot be read.
+    const discover = async (quiet = false) => {
       if (saved.disabled) return;
       saved.disabled = true;
       try {
         const list = await send("list", {});
         for (const result of list) render(result);
-        if (!list.length) activity.textContent = "No saved publication results were found.";
+        if (!list.length && !quiet) activity.textContent = "No saved publication results were found.";
       } catch (_) {
         activity.textContent = "Saved results could not be read. Existing evidence has been preserved.";
       } finally { saved.disabled = false; }
     };
-    saved.addEventListener("click", discover);
+    saved.addEventListener("click", () => discover());
     const intentFields = new Set(Object.values(kinds).flat());
     const updateFields = () => {
       for (const name of intentFields) {
@@ -409,8 +411,10 @@ globalThis.PbpsCompose = Object.freeze({
         }
       } catch (error) {
         if (error && error.status === 410) {
-          // The server refused before publishing: this handle expired or
-          // was replaced. Nothing to recover; review a new candidate.
+          // The server refused before publishing: the handle expired, was
+          // replaced, or a sibling from its base now has a result (#874).
+          // Nothing to recover here; the server's reason says which, and the
+          // saved results show a sibling to reconcile or start from.
           confirming = false;
           reconfirmable = false;
           candidate = null;
@@ -418,7 +422,8 @@ globalThis.PbpsCompose = Object.freeze({
           refresh.disabled = false;
           for (const field of Object.values(fields)) field.disabled = false;
           invalidate();
-          activity.textContent = "This reviewed candidate expired or was replaced, and nothing was published. Preview again.";
+          activity.textContent = `This reviewed candidate cannot be confirmed, and nothing was published: ${error.message}`;
+          discover(true);
           return;
         }
         activity.textContent = "Confirmation outcome is unknown. Inspect the operation result before continuing.";
