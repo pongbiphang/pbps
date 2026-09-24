@@ -594,15 +594,22 @@ async fn confirm_ledger_relations(conn: &mut Conn) -> Result<(), DbError> {
 /// projection is small and closed, and anything else is a difference
 /// (DEC-313.1).
 ///
-/// **And the owner.** A table of exactly the right shape owned by a role the
-/// deployment account cannot vouch for can still be given a trigger after
-/// this check passes; only an owner the account trusts closes that window.
-/// Trusted is the account itself, a role whose privileges it inherits or
-/// that it can `SET ROLE` to, the database owner, or a superuser — owners
-/// whose powers the deployment account already has. Both membership tests,
-/// because `USAGE` alone is false for a `NOINHERIT` membership: measured on
-/// 18.6 and 16.15, a deployer granted the owner role `NOINHERIT` has `SET`
-/// but not `USAGE`, and a ledger it could always use was refused.
+/// **And who can change it afterwards.** The shape is compared once; a role
+/// that can create a trigger on a ledger table can add one after this check
+/// passes, and it runs with the deployment account's privileges. So every
+/// login role that can act as a role owning the table, or holding `TRIGGER`
+/// on it — directly, through `PUBLIC`, by inheritance, or by `SET ROLE` —
+/// must itself be able to `SET ROLE` to the deployment account, or to a
+/// superuser role, or be the database owner: then a trigger it adds runs no
+/// privilege it lacked. The superuser path is asked separately because
+/// `pg_has_role` does not follow it — measured on 18.6, a login role granted
+/// `postgres` has `SET` on `postgres` but not on the deployment account,
+/// though `SET ROLE postgres; SET ROLE deployer` reaches it. This is the all-effective-editors rule
+/// [`crate::data_triggers`] applies to a reference-data table's triggers
+/// (issues #834, #838; DEC-834.1). Login roles only, because a `NOLOGIN` role acts only
+/// through its members, and each of those is asked in its own right — which
+/// is what lets a group role own the ledger while only the deployment account
+/// logs in as a member of it.
 ///
 /// A `__pbps_state` missing any of issue #103's five timeline columns is the
 /// recipe too: [`migrate_timeline_columns`] adds whichever are missing.
@@ -629,11 +636,11 @@ pub async fn ledger_problems(conn: &mut Conn) -> Result<Vec<String>, DbError> {
         } else {
             &mut lock
         };
-        if let Some(owner) = fact.strip_prefix("untrusted owner ") {
+        if let Some(editor) = fact.strip_prefix("untrusted editor ") {
             problems.push(format!(
-                "{LEDGER_SCHEMA}.{relname} is owned by `{owner}`, a role this account neither \
-                 inherits nor can SET ROLE to, and that is neither the database owner nor a \
-                 superuser"
+                "{LEDGER_SCHEMA}.{relname} can be changed by `{editor}`, a login role that can \
+                 create triggers on it (as its owner, through a TRIGGER grant, or through a \
+                 role it can act as) and cannot SET ROLE to this account"
             ));
         } else {
             table.insert(fact);
@@ -800,14 +807,21 @@ fn ledger_facts() -> String {
          SELECT l.relname, 'row level security enabled'
            FROM ledger l WHERE l.relrowsecurity OR l.relforcerowsecurity
          UNION ALL
-         SELECT l.relname, 'untrusted owner ' || o.rolname
+         SELECT l.relname, 'untrusted editor ' || e.rolname
            FROM ledger l
-           JOIN pg_catalog.pg_roles o ON o.oid = l.relowner
+           CROSS JOIN pg_catalog.pg_roles e
            JOIN pg_catalog.pg_database db ON db.datname = pg_catalog.current_database()
-          WHERE NOT pg_catalog.pg_has_role(current_user, l.relowner, 'USAGE')
-            AND NOT pg_catalog.pg_has_role(current_user, l.relowner, 'SET')
-            AND l.relowner <> db.datdba
-            AND NOT o.rolsuper"
+          WHERE e.rolcanlogin
+            AND e.oid <> db.datdba
+            AND NOT pg_catalog.pg_has_role(e.oid, current_user::regrole::oid, 'SET')
+            AND NOT EXISTS (
+                SELECT 1 FROM pg_catalog.pg_roles su
+                 WHERE su.rolsuper AND pg_catalog.pg_has_role(e.oid, su.oid, 'SET'))
+            AND EXISTS (
+                SELECT 1 FROM pg_catalog.pg_roles g
+                 WHERE pg_catalog.pg_has_role(e.oid, g.oid, 'SET')
+                   AND (pg_catalog.has_table_privilege(g.oid, l.oid, 'TRIGGER')
+                        OR pg_catalog.pg_has_role(g.oid, l.relowner, 'USAGE')))"
     )
 }
 

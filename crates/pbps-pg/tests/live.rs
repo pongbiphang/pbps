@@ -6830,44 +6830,79 @@ async fn a_ledger_pbps_did_not_create_is_refused_before_any_write() {
 
     // (who builds the ledger, what is added after the recipe, what the
     // refusal must name). `None` for the builder is the test's superuser.
-    let cases: [(Option<&str>, &str, &str); 7] = [
+    let changed_by_attacker = format!("can be changed by `{attacker}`");
+    let group = format!("pbps_grp_ledger_{}", std::process::id());
+    let cases: Vec<(Option<&str>, String, String)> = vec![
         (
             Some(attacker.as_str()),
             "CREATE TRIGGER t BEFORE INSERT ON public.__pbps_lock FOR EACH ROW \
-             EXECUTE FUNCTION public.pbps_mark();",
-            "owned by",
+             EXECUTE FUNCTION public.pbps_mark();"
+                .to_owned(),
+            changed_by_attacker.clone(),
         ),
-        (Some(attacker.as_str()), "", "owned by"),
+        (
+            Some(attacker.as_str()),
+            String::new(),
+            changed_by_attacker.clone(),
+        ),
         (
             None,
             "CREATE TRIGGER t BEFORE INSERT ON public.__pbps_lock FOR EACH ROW \
-             EXECUTE FUNCTION public.pbps_mark();",
-            "trigger t",
+             EXECUTE FUNCTION public.pbps_mark();"
+                .to_owned(),
+            "trigger t".to_owned(),
         ),
         (
             None,
             "CREATE RULE r AS ON INSERT TO public.__pbps_lock \
-             DO ALSO INSERT INTO public.pbps_marker VALUES (2);",
-            "rule r",
+             DO ALSO INSERT INTO public.pbps_marker VALUES (2);"
+                .to_owned(),
+            "rule r".to_owned(),
         ),
         (
             None,
             "ALTER TABLE public.__pbps_lock ENABLE ROW LEVEL SECURITY; \
-             CREATE POLICY p ON public.__pbps_lock USING (true);",
-            "policy p",
+             CREATE POLICY p ON public.__pbps_lock USING (true);"
+                .to_owned(),
+            "policy p".to_owned(),
         ),
         (
             None,
-            "ALTER TABLE public.__pbps_lock ALTER COLUMN locked_by SET DEFAULT current_user;",
-            "DEFAULT CURRENT_USER",
+            "ALTER TABLE public.__pbps_lock ALTER COLUMN locked_by SET DEFAULT current_user;"
+                .to_owned(),
+            "DEFAULT CURRENT_USER".to_owned(),
         ),
         (
             None,
-            "CREATE INDEX x ON public.__pbps_state ((length(state_json)));",
-            "INDEX x",
+            "CREATE INDEX x ON public.__pbps_state ((length(state_json)));".to_owned(),
+            "INDEX x".to_owned(),
+        ),
+        // #834: a TRIGGER grant, to one role or to every role, lets the
+        // grantee add a trigger after the check.
+        (
+            None,
+            format!("GRANT TRIGGER ON public.__pbps_lock TO {attacker};"),
+            changed_by_attacker.clone(),
+        ),
+        (
+            None,
+            "GRANT TRIGGER ON public.__pbps_lock TO PUBLIC;".to_owned(),
+            changed_by_attacker.clone(),
+        ),
+        // #838: a group owner another login member inherits.
+        (
+            None,
+            format!(
+                "DROP ROLE IF EXISTS {group}; CREATE ROLE {group} NOLOGIN; \
+                 GRANT {group} TO {deployer}, {attacker}; \
+                 ALTER TABLE public.__pbps_state OWNER TO {group}; \
+                 ALTER TABLE public.__pbps_lock OWNER TO {group};"
+            ),
+            changed_by_attacker.clone(),
         ),
     ];
-    for (builder, extra, named) in cases {
+    for (builder, extra, named) in &cases {
+        let (extra, named) = (extra.as_str(), named.as_str());
         db.conn
             .execute(
                 "DROP TABLE IF EXISTS public.__pbps_state, public.__pbps_lock;
@@ -6945,7 +6980,18 @@ async fn a_ledger_pbps_did_not_create_is_refused_before_any_write() {
     db.conn.execute(recipe).await.unwrap();
     db.conn
         .execute(&format!(
-            "GRANT SELECT, INSERT, DELETE ON public.__pbps_state, public.__pbps_lock TO {deployer}"
+            "GRANT SELECT, INSERT, DELETE ON public.__pbps_state, public.__pbps_lock TO {deployer};
+             GRANT TRIGGER ON public.__pbps_lock TO {deployer};"
+        ))
+        .await
+        .unwrap();
+    // (`TRIGGER` for the deployment account itself: it can do nothing with it
+    // that it could not already do as itself, so it is not a finding. Nor is
+    // a login role that holds a superuser role: it can become anyone.)
+    db.conn
+        .execute(&format!(
+            "DROP ROLE IF EXISTS {group}_su; CREATE ROLE {group}_su LOGIN; \
+             GRANT postgres TO {group}_su;"
         ))
         .await
         .unwrap();
@@ -7007,6 +7053,12 @@ async fn a_ledger_pbps_did_not_create_is_refused_before_any_write() {
             .await
             .unwrap();
     }
+    // A group role, as such an owner is: once it cannot log in, it acts only
+    // through its members, and the deployment account is the only one.
+    db.conn
+        .execute(&format!("ALTER ROLE {owner} NOLOGIN"))
+        .await
+        .unwrap();
     let mut deploying = Conn::connect(Driver::Postgres, &as_role(&deployer))
         .await
         .unwrap();
@@ -7043,7 +7095,13 @@ async fn a_ledger_pbps_did_not_create_is_refused_before_any_write() {
         .await
         .expect("a pre-#103 ledger still records");
 
-    for role in [&deployer, &attacker, &owner] {
+    let _ = db
+        .conn
+        .execute(&format!(
+            "REVOKE postgres FROM {group}_su; DROP ROLE IF EXISTS {group}_su"
+        ))
+        .await;
+    for role in [&deployer, &attacker, &owner, &group] {
         cleanup_role(&mut db, role).await;
     }
     db.drop().await;
