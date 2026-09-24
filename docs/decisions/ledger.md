@@ -787,8 +787,11 @@ memberships or permissions. `VIEW ANY DEFINITION` and `VIEW SERVER STATE`
 show every row. `sys.traces` needs `ALTER TRACE`, and
 `sys.sql_expression_dependencies` needs `SELECT` on the view, which only
 `db_owner` holds by default. The qualification therefore refuses, naming the
-missing grant, unless the deployer is `sysadmin` or holds all four and no
-effective `DENY` of `VIEW DEFINITION` hides part of the database. An unseen
+missing grant, unless the deployer is `sysadmin` or holds all four. It also
+refuses when a `DENY` of `VIEW DEFINITION` or `CONTROL` hides part of the
+catalog: an effective one on the database, a schema or an object, and any one
+on another class (a principal, a certificate, a key, a login), since those rows
+are the principal graph and the signatures themselves. An unseen
 principal is not an absent one. `doctor` asks for these grants (#881).
 
 *Readers.* A principal reads the table through any of these paths:
@@ -797,9 +800,13 @@ principal is not an absent one. `doctor` asks for these grants (#881).
   on the database, directly or through any role, `public` included;
 - `CONTROL SERVER`, `sysadmin` or `SELECT ALL USER SECURABLES`;
 - running code that reads the table: `EXECUTE AS` a reader, an ownership
-  chain (code owned by the table's owner that names the table), or a
-  signature by a certificate or key mapped to a reader. A trigger counts for
-  whoever can write its table, and a database DDL trigger for everyone;
+  chain (code owned by the table's owner that names the table, or names
+  other code of the same owner that does, to a fixed point), or a signature
+  by a certificate or key mapped to a reader. A procedure counts for whoever
+  can execute it. A view, a table-valued function or a synonym counts for
+  whoever can select from it: measured, `SELECT` on a `dbo` synonym for the
+  table reads it with no grant on the table. A trigger counts for whoever can
+  write its table, and a database DDL trigger for everyone;
 - becoming a reader: `IMPERSONATE` or `CONTROL` on a reader user or login, to
   a fixed point.
 
@@ -831,6 +838,10 @@ deployment account, either its login or its database user, or else be
 - at the user: `IMPERSONATE`/`CONTROL` on the deployer's user, or `CONTROL` of
   the database, which `dbo` and `db_owner` hold. Measured: a `db_owner` member
   can `EXECUTE AS USER` both `dbo` and the deployer.
+
+Becoming is followed to a fixed point, because nested `EXECUTE AS` reaches
+the deployer through others. The chain never steps through a principal with a
+`DENY` in its reach.
 
 So the database's owner qualifies by what it can do, and needs no exemption
 (#863). There is no allowance beyond this rule.

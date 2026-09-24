@@ -83,7 +83,10 @@ async fn qualify(conn: &mut Conn) -> Result<Vec<String>, DbError> {
 /// `VIEW DEFINITION` below the database hides an object's rows whatever the
 /// server grant says, so an effective one refuses too — the proof
 /// `impact::key_drop_blockers` makes, and for the same reason: an invisible
-/// principal is not an absent one.
+/// principal is not an absent one. On the other securable classes — a
+/// principal, a certificate, a key, a login — any such `DENY` refuses, since
+/// those are the rows the principal graph and the signatures are built from and
+/// `HAS_PERMS_BY_NAME` has no effective answer to offer for all of them.
 const VISIBILITY: &str = "\
 SELECT CONVERT(int, ISNULL(IS_SRVROLEMEMBER('sysadmin'), 0)) AS sysadmin,
        CONVERT(int, ISNULL(HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW ANY DEFINITION'), 0)) AS any_definition,
@@ -101,7 +104,13 @@ SELECT CONVERT(int, ISNULL(IS_SRVROLEMEMBER('sysadmin'), 0)) AS sysadmin,
              OR (dp.class = 3 AND COALESCE(HAS_PERMS_BY_NAME(SCHEMA_NAME(dp.major_id),
                     'SCHEMA', 'VIEW DEFINITION'), 0) <> 1)
              OR (dp.class = 0 AND COALESCE(HAS_PERMS_BY_NAME(DB_NAME(),
-                    'DATABASE', 'VIEW DEFINITION'), 0) <> 1))) AS hidden;";
+                    'DATABASE', 'VIEW DEFINITION'), 0) <> 1)
+             OR dp.class NOT IN (0, 1, 3)))
+       + (SELECT COUNT(*) FROM sys.server_permissions sp
+           WHERE sp.state = N'D'
+             AND sp.permission_name IN (N'VIEW DEFINITION', N'CONTROL', N'VIEW ANY DEFINITION')
+             AND (sp.grantee_principal_id = SUSER_ID()
+                  OR IS_SRVROLEMEMBER(SUSER_NAME(sp.grantee_principal_id)) = 1)) AS hidden;";
 
 async fn visibility_problems(conn: &mut Conn) -> Result<Vec<String>, DbError> {
     let rows = conn.query(VISIBILITY).await?;
@@ -135,8 +144,7 @@ async fn visibility_problems(conn: &mut Conn) -> Result<Vec<String>, DbError> {
     if get::<i32>(row, "hidden")? != 0 {
         problems.push(format!(
             "the deployment account cannot establish who may read {CONFIDENTIAL_TABLE}: an \
-             effective DENY of VIEW DEFINITION or CONTROL hides part of this database's catalog \
-             from it"
+             effective DENY of VIEW DEFINITION or CONTROL hides part of the catalog from it"
         ));
     }
     Ok(problems)
@@ -188,6 +196,8 @@ SELECT @t AS table_id,
 /// context, and whether it names the protected table — which, owned by the
 /// table's owner, is an ownership chain that skips the table's permissions.
 /// A database DDL trigger is not in `sys.objects`; it fires for anyone's DDL.
+/// A synonym is no code, but it chains the same way: measured, `SELECT` on a
+/// `dbo` synonym for a `dbo` table reads the table with no grant on it.
 const MODULES: &str = "\
 DECLARE @t int = OBJECT_ID(N'dbo.__pbps_state_confidential', N'U');
 WITH code AS (
@@ -216,7 +226,30 @@ SELECT c.object_id AS id,
   LEFT JOIN sys.schemas ps ON ps.schema_id = p.schema_id
  WHERE o.object_id IS NOT NULL
     OR EXISTS (SELECT 1 FROM sys.triggers tr
-                WHERE tr.object_id = c.object_id AND tr.parent_class = 0);";
+                WHERE tr.object_id = c.object_id AND tr.parent_class = 0)
+UNION ALL
+SELECT sn.object_id, CONVERT(nvarchar(2), N'SN'), sn.schema_id,
+       COALESCE(sn.principal_id, ss.principal_id, 1), CONVERT(int, NULL), 0, 0, 0,
+       CONVERT(int, CASE WHEN OBJECT_ID(sn.base_object_name) = @t
+                           OR (PARSENAME(sn.base_object_name, 1) = N'__pbps_state_confidential'
+                               AND ISNULL(PARSENAME(sn.base_object_name, 2), N'dbo') = N'dbo'
+                               AND ISNULL(PARSENAME(sn.base_object_name, 3), DB_NAME()) = DB_NAME()
+                               AND PARSENAME(sn.base_object_name, 4) IS NULL)
+                         THEN 1 ELSE 0 END)
+  FROM sys.synonyms sn JOIN sys.schemas ss ON ss.schema_id = sn.schema_id;";
+
+/// Which code names which other code. An ownership chain continues from one
+/// module to another of the same owner, so a view over a view over the table
+/// reads it as surely as the first view does.
+const DEPENDENCIES: &str = "\
+SELECT d.referencing_id AS module, d.referenced_id AS target
+  FROM sys.sql_expression_dependencies d
+ WHERE d.referenced_id IS NOT NULL
+   AND EXISTS (SELECT 1 FROM sys.sql_modules m WHERE m.object_id = d.referenced_id)
+UNION ALL
+SELECT sn.object_id, OBJECT_ID(sn.base_object_name)
+  FROM sys.synonyms sn
+ WHERE OBJECT_ID(sn.base_object_name) IN (SELECT object_id FROM sys.sql_modules);";
 
 /// A module signed by a certificate or asymmetric key runs with the
 /// permissions of the principals mapped to that key, in this database and, for
@@ -313,6 +346,8 @@ struct Graph {
     modules: Vec<Module>,
     /// (module, signer user or 0, signer login or 0).
     signers: Vec<(i32, i32, i32)>,
+    /// (module, module it names).
+    dependencies: Vec<(i32, i32)>,
 }
 
 async fn principals(
@@ -397,6 +432,10 @@ impl Graph {
                 parent_owner: get::<i32>(row, "parent_owner")?,
                 names_table: get::<i32>(row, "names_table")? == 1,
             });
+        }
+        for row in &conn.query(DEPENDENCIES).await? {
+            g.dependencies
+                .push((get::<i32>(row, "module")?, get::<i32>(row, "target")?));
         }
         for row in &conn.query(SIGNERS).await? {
             g.signers.push((
@@ -527,7 +566,7 @@ impl Graph {
             || self.user_of(login).is_some_and(|u| self.user_reads(u))
     }
 
-    /// Whether running `m` reads the table, whoever runs it.
+    /// Whether running `m` reads the table by itself, whoever runs it.
     fn module_reads(&self, m: &Module) -> bool {
         let context = match m.execute_as {
             Some(-2) => self.user_reads(m.owner),
@@ -560,6 +599,18 @@ impl Graph {
                         &[(OBJECT, m.parent), (SCHEMA, m.parent_schema), (DATABASE, 0)],
                     )
             }
+            // A view, a table-valued function and a synonym are read, not
+            // executed: `SELECT` on them is what runs their chain. A synonym
+            // for a procedure is executed, so `EXECUTE` counts here too.
+            "V" | "IF" | "TF" | "FT" | "SN" => {
+                c.contains(&m.owner)
+                    || self.in_database_role(&c, "db_datareader")
+                    || self.database_grants(
+                        &c,
+                        &["SELECT", "EXECUTE", "CONTROL"],
+                        &[(OBJECT, m.id), (SCHEMA, m.schema), (DATABASE, 0)],
+                    )
+            }
             _ => {
                 c.contains(&m.owner)
                     || self.database_grants(
@@ -571,10 +622,41 @@ impl Graph {
         }
     }
 
-    fn user_reads_through_code(&self, user: i32) -> bool {
+    /// Every module whose running reads the table: by itself, or by naming
+    /// one that does under the same owner — the chain continues — to a fixed
+    /// point. Code of another owner adds nothing, since calling it checks the
+    /// caller's own permission on it.
+    fn reading_modules(&self) -> BTreeSet<i32> {
+        let mut reading: BTreeSet<i32> = self
+            .modules
+            .iter()
+            .filter(|m| self.module_reads(m))
+            .map(|m| m.id)
+            .collect();
+        let owner = |id: i32| self.modules.iter().find(|m| m.id == id).map(|m| m.owner);
+        loop {
+            let more: Vec<i32> = self
+                .dependencies
+                .iter()
+                .filter(|&&(m, target)| {
+                    !reading.contains(&m)
+                        && reading.contains(&target)
+                        && owner(m).is_some()
+                        && owner(m) == owner(target)
+                })
+                .map(|&(m, _)| m)
+                .collect();
+            if more.is_empty() {
+                return reading;
+            }
+            reading.extend(more);
+        }
+    }
+
+    fn user_reads_through_code(&self, user: i32, reading: &BTreeSet<i32>) -> bool {
         self.modules
             .iter()
-            .any(|m| self.module_reads(m) && self.user_runs(user, m))
+            .any(|m| reading.contains(&m.id) && self.user_runs(user, m))
     }
 
     /// Whether `x` can `EXECUTE AS USER` `y`: `CONTROL` of the database — which
@@ -611,12 +693,8 @@ impl Graph {
     /// or by becoming someone who does — to a fixed point, because becoming
     /// is transitive.
     fn readers(&self) -> BTreeSet<Who> {
-        let everyone: Vec<Who> = self
-            .server
-            .keys()
-            .map(|&id| Who::Login(id))
-            .chain(self.database.keys().map(|&id| Who::User(id)))
-            .collect();
+        let everyone = self.everyone();
+        let reading = self.reading_modules();
         let mut readers: BTreeSet<Who> = everyone
             .iter()
             .copied()
@@ -625,9 +703,9 @@ impl Graph {
                     self.login_reads(l)
                         || self
                             .user_of(l)
-                            .is_some_and(|u| self.user_reads_through_code(u))
+                            .is_some_and(|u| self.user_reads_through_code(u, &reading))
                 }
-                Who::User(u) => self.user_reads(u) || self.user_reads_through_code(u),
+                Who::User(u) => self.user_reads(u) || self.user_reads_through_code(u, &reading),
             })
             .collect();
         loop {
@@ -755,11 +833,39 @@ impl Graph {
         {
             return true;
         }
-        if self.denied(who) {
-            return false;
+        // Becoming is transitive — nested `EXECUTE AS` — so the deployer may be
+        // reached through others. A principal with a `DENY` in its reach is
+        // not stepped through, as it is not qualified itself.
+        let targets = [
+            Who::Login(self.deployer_login),
+            Who::User(self.deployer_user),
+        ];
+        let everyone = self.everyone();
+        let mut reached = BTreeSet::from([who]);
+        let mut todo = vec![who];
+        while let Some(x) = todo.pop() {
+            if self.denied(x) {
+                continue;
+            }
+            if targets.iter().any(|&t| self.becomes(x, t)) {
+                return true;
+            }
+            for &y in &everyone {
+                if !reached.contains(&y) && self.becomes(x, y) {
+                    reached.insert(y);
+                    todo.push(y);
+                }
+            }
         }
-        self.becomes(who, Who::Login(self.deployer_login))
-            || self.becomes(who, Who::User(self.deployer_user))
+        false
+    }
+
+    fn everyone(&self) -> Vec<Who> {
+        self.server
+            .keys()
+            .map(|&id| Who::Login(id))
+            .chain(self.database.keys().map(|&id| Who::User(id)))
+            .collect()
     }
 
     /// The principals a person signs in or switches to: every login but the
@@ -1154,6 +1260,65 @@ mod tests {
         g.modules.push(module(50, DBO, None, false));
         g.database_perms.push(grant(OBJECT, 50, U_ALICE, "EXECUTE"));
         assert!(!mentions(&named(&g), "alice"));
+    }
+
+    #[test]
+    fn selecting_from_a_chained_view_is_reading_and_the_chain_continues_through_views() {
+        let view = |id, owner, names_table| Module {
+            kind: "V".into(),
+            ..module(id, owner, None, names_table)
+        };
+        let mut g = graph();
+        g.modules.push(view(50, DBO, true));
+        g.database_perms.push(grant(OBJECT, 50, U_ALICE, "SELECT"));
+        assert!(mentions(&named(&g), "alice"));
+
+        // A view over that view, under the same owner, continues the chain.
+        let mut g = graph();
+        g.modules.push(view(50, DBO, true));
+        g.modules.push(view(60, DBO, false));
+        g.dependencies.push((60, 50));
+        g.database_perms.push(grant(OBJECT, 60, U_ALICE, "SELECT"));
+        assert!(mentions(&named(&g), "alice"));
+
+        // A synonym for the table chains the same way.
+        let mut g = graph();
+        g.modules.push(Module {
+            kind: "SN".into(),
+            ..module(70, DBO, None, true)
+        });
+        g.database_perms.push(grant(OBJECT, 70, U_ALICE, "SELECT"));
+        assert!(mentions(&named(&g), "alice"));
+
+        // Negative: under another owner the chain breaks, as the engine's does.
+        let mut g = graph();
+        g.modules.push(view(50, DBO, true));
+        g.modules.push(view(60, U_BOB, false));
+        g.dependencies.push((60, 50));
+        g.database_perms.push(grant(OBJECT, 60, U_ALICE, "SELECT"));
+        assert!(!mentions(&named(&g), "alice"));
+    }
+
+    #[test]
+    fn a_reader_qualifies_through_a_chain_of_impersonation() {
+        let chain = || {
+            let mut g = graph();
+            g.database_perms
+                .push(grant(OBJECT, TABLE, U_ALICE, "SELECT"));
+            g.database_perms
+                .push(grant(DATABASE_PRINCIPAL, U_BOB, U_ALICE, "IMPERSONATE"));
+            g.database_perms
+                .push(grant(DATABASE_PRINCIPAL, U_DEPLOYER, U_BOB, "IMPERSONATE"));
+            g
+        };
+        assert_eq!(named(&chain()), Vec::<String>::new());
+        // Negative: a DENY on the middle principal breaks the chain.
+        let mut g = chain();
+        g.database_perms.push(Perm {
+            state: "D".into(),
+            ..grant(DATABASE_PRINCIPAL, U_DEPLOYER, U_BOB, "IMPERSONATE")
+        });
+        assert!(mentions(&named(&g), "alice"));
     }
 
     #[test]

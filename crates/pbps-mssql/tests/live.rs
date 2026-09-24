@@ -2417,7 +2417,10 @@ async fn reader_login(db: &mut TestDb, login: &str) {
 async fn drop_logins(db: TestDb, logins: &[String]) {
     let mut conn = connect_live(&conn_str()).await.expect("connect");
     db.drop().await;
-    for login in logins {
+    // Newest first: a login a later one was granted `IMPERSONATE` on is the
+    // recorded grantor, and SQL Server refuses to drop a grantor (Msg 15173)
+    // until the grantee is gone.
+    for login in logins.iter().rev() {
         let _ = conn
             .execute(&format!(
                 "IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
@@ -2475,6 +2478,17 @@ async fn every_unqualified_reader_grantor_and_backup_principal_is_named() {
              EXEC(N'CREATE PROCEDURE dbo.p880_signed AS EXEC(N''SELECT 1'');');
              ADD SIGNATURE TO dbo.p880_signed BY CERTIFICATE c880 WITH PASSWORD = '{READER_PASSWORD}';
              GRANT EXECUTE ON dbo.p880_signed TO [{}];", login("signed"))),
+        ("view".into(), format!(
+            "EXEC(N'CREATE VIEW dbo.v880 AS SELECT state_id FROM {t};');
+             GRANT SELECT ON dbo.v880 TO [{}];", login("view"))),
+        ("nestedview".into(), format!(
+            "EXEC(N'CREATE VIEW dbo.v880_outer AS SELECT state_id FROM dbo.v880;');
+             GRANT SELECT ON dbo.v880_outer TO [{}];", login("nestedview"))),
+        ("function".into(), format!(
+            "EXEC(N'CREATE FUNCTION dbo.f880() RETURNS TABLE AS RETURN SELECT state_id FROM {t};');
+             GRANT SELECT ON dbo.f880 TO [{}];", login("function"))),
+        ("synonym".into(), format!(
+            "CREATE SYNONYM dbo.s880 FOR {t}; GRANT SELECT ON dbo.s880 TO [{}];", login("synonym"))),
         ("securityadmin".into(), format!("ALTER ROLE db_securityadmin ADD MEMBER [{}];", login("securityadmin"))),
         ("anyrole".into(), format!("GRANT ALTER ANY ROLE TO [{}];", login("anyrole"))),
         ("grantoption".into(), format!("GRANT SELECT ON {t} TO [{}] WITH GRANT OPTION;", login("grantoption"))),
@@ -2487,11 +2501,31 @@ async fn every_unqualified_reader_grantor_and_backup_principal_is_named() {
             "USE master; ALTER SERVER ROLE securityadmin ADD MEMBER [{}]; USE [{}];",
             login("serversecurity"), db.name)),
     ];
+    // A reader that reaches `sa` through another login qualifies: becoming
+    // is transitive.
     let controls = [
         (login("none"), String::new()),
         (
             login("owner"),
             format!("ALTER ROLE db_owner ADD MEMBER [{}];", login("owner")),
+        ),
+        (
+            login("hop"),
+            format!(
+                "USE master; GRANT IMPERSONATE ON LOGIN::sa TO [{}]; USE [{}];",
+                login("hop"),
+                db.name
+            ),
+        ),
+        (
+            login("twohops"),
+            format!(
+                "GRANT SELECT ON {t} TO [{0}];
+                 USE master; GRANT IMPERSONATE ON LOGIN::[{1}] TO [{0}]; USE [{2}];",
+                login("twohops"),
+                login("hop"),
+                db.name
+            ),
         ),
     ];
     let mut logins = Vec::new();
@@ -2746,6 +2780,22 @@ async fn a_first_use_by_a_deployer_that_does_not_own_the_database_qualifies_dbos
         .await
         .unwrap();
     assert!(!names(&revoked, &reader), "{revoked:#?}");
+
+    // A DENY on a principal hides its rows from the deployer whatever the
+    // server-wide grant says, so it cannot establish anything any more.
+    db.conn
+        .execute(&format!(
+            "DENY VIEW DEFINITION ON USER::[{reader}] TO [{deployer}];"
+        ))
+        .await
+        .unwrap();
+    let hidden = pbps_mssql::confidential::protected_reader_problems(&mut as_deployer)
+        .await
+        .unwrap();
+    assert!(
+        hidden.iter().any(|p| p.contains("DENY of VIEW DEFINITION")),
+        "{hidden:#?}"
+    );
     drop(as_deployer);
     drop_logins(db, &logins).await;
 }
