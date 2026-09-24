@@ -7458,6 +7458,49 @@ async fn a_trigger_on_the_protected_table_refuses_its_write_and_its_prune() {
     db.drop().await;
 }
 
+/// #878: a foreign key onto the protected table is recorded under the table
+/// that holds it, so the recipe must look for it there. With `ON DELETE
+/// CASCADE` it would carry a prune into the project's rows; the gate refuses
+/// the prune, by the constraint's name, and the project's row stays.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_foreign_key_onto_the_protected_table_refuses_the_prune() {
+    let mut db = TestDb::create("confidential_inbound").await;
+    let mut full = snapshot(StateKind::Apply);
+    full.plan_checksum = Some("e".repeat(64));
+    let stub = snapshot(StateKind::Apply);
+    let id = state::record_confidential(&mut db.conn, &stub, &full)
+        .await
+        .expect("the first confidential record");
+    state::record(&mut db.conn, &snapshot(StateKind::Apply))
+        .await
+        .unwrap();
+    db.conn
+        .execute(&format!(
+            "CREATE TABLE public.pbps_app (
+                 state_id bigint CONSTRAINT fk_app_protected
+                   REFERENCES public.__pbps_state_confidential ON DELETE CASCADE);
+             INSERT INTO public.pbps_app VALUES ({id});"
+        ))
+        .await
+        .unwrap();
+    let error = state::prune(&mut db.conn, 1)
+        .await
+        .expect_err("a foreign key onto the protected table")
+        .to_string();
+    assert!(error.contains("fk_app_protected"), "{error}");
+    let left = db
+        .conn
+        .query("SELECT count(*)::int8 AS n FROM public.pbps_app")
+        .await
+        .unwrap()[0]
+        .try_get::<i64>("n")
+        .unwrap()
+        .unwrap();
+    assert_eq!(left, 1, "the prune cascaded into the project's rows");
+    db.drop().await;
+}
+
 /// #878: a table inheriting from the protected one is outside its recipe, so
 /// the ledger never reaches it. A read returns the protected table's own half
 /// though the child holds another under the same `state_id`, and a prune

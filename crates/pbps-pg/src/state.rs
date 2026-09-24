@@ -872,6 +872,15 @@ fn ledger_facts() -> String {
            FROM ledger l JOIN pg_catalog.pg_constraint con ON con.conrelid = l.oid
           WHERE con.contype <> 'n'
          UNION ALL
+         -- A foreign key onto the protected table is recorded under the table
+         -- that holds it, and its triggers are internal, so neither branch
+         -- above sees it; an `ON DELETE CASCADE` one would carry the prune into
+         -- the project's rows. The ordinary tables are #900's.
+         SELECT l.relname, 'referencing constraint ' || con.conname || ' on '
+                || con.conrelid::pg_catalog.regclass::text
+           FROM ledger l JOIN pg_catalog.pg_constraint con ON con.confrelid = l.oid
+          WHERE l.relname = '{CONFIDENTIAL_TABLE_NAME}'
+         UNION ALL
          SELECT l.relname, 'index ' || pg_catalog.pg_get_indexdef(i.indexrelid)
            FROM ledger l JOIN pg_catalog.pg_index i ON i.indrelid = l.oid
          UNION ALL
