@@ -77,6 +77,13 @@ already edited in the declarations. It follows
    closed viewer. An unresolved, foreign or unreadable record is refused and
    preserved (#855).
 
+The saved receipts, not the page, decide whether a new preview may start
+(#854), so a restarted viewer keeps the rules. The page lists them when it
+opens. A preview from a base that already has an unresolved result is
+refused until that result is reconciled or retried. A base that already has
+a delivered result needs **Start an alternative** first. Receipts from other
+bases never block, so a result that cannot resolve does not close compose.
+
 The page sends only the intent fields and opaque handles. Every tree, manifest,
 destination and commit stays on the server side. Compose actions are fixed
 `POST /api/compose/<action>` requests. They require the launch token, the

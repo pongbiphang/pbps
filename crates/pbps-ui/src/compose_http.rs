@@ -94,16 +94,62 @@ impl Compose {
         Publications::open(&repository, DEADLINE).map_err(refused)
     }
 
+    /// Durable receipts, not browser state, decide whether a new candidate
+    /// may start from `preview.base` (#854). The gate is per base: another
+    /// result from the same base is either unresolved, so reconcile it
+    /// first, or delivered, so only an explicit alternative starts a
+    /// sibling. A receipt from another base does not block, so a receipt
+    /// that can never resolve cannot close compose for good.
+    fn admit_base(&self, preview: &compose::Preview) -> Result<(), Refusal> {
+        for outcome in self.publisher()?.list().map_err(refused)? {
+            let same_base = outcome
+                .details
+                .as_ref()
+                .is_none_or(|details| details.base == preview.base);
+            if outcome.operation_id == preview.operation_id || !same_base {
+                continue;
+            }
+            if outcome.status != Status::Delivered {
+                return Err((
+                    409,
+                    format!(
+                        "Operation {} from this base is unresolved; reconcile or retry it before starting another",
+                        outcome.operation_id
+                    ),
+                ));
+            }
+            if !self.candidates.admits_sibling_of(&preview.base) {
+                return Err((
+                    409,
+                    format!(
+                        "Operation {} already delivered a result from this base; start an alternative from it, or continue from its branch",
+                        outcome.operation_id
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn answer(&mut self, action: &str, body: &[u8]) -> Result<Vec<u8>, Refusal> {
         match action {
             "preview" => {
                 let request: Request = parse(body)?;
-                encode(
-                    &self
-                        .candidates
-                        .preview(request, SystemTime::now())
-                        .map_err(refused)?,
-                )
+                let preview = self
+                    .candidates
+                    .preview(request, SystemTime::now())
+                    .map_err(refused)?;
+                if let Err((code, message)) = self.admit_base(&preview) {
+                    // The sealed preview never reaches the page; retire it.
+                    let message = match self.candidates.withdraw(&preview.candidate_id) {
+                        Ok(()) => message,
+                        Err(error) => format!(
+                            "{message}; the refused preview's private retirement remains pending: {error}"
+                        ),
+                    };
+                    return Err((code, message));
+                }
+                encode(&preview)
             }
             "confirm" => {
                 let Handle { candidate_id } = parse(body)?;

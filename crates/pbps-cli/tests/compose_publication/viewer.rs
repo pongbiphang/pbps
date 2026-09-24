@@ -539,3 +539,78 @@ fn retirement_actions_clean_up_and_forget_only_what_their_state_allows() {
     assert!(kept.exists());
     assert_eq!(state(&pending), Some("sealed".into()));
 }
+
+#[test]
+fn a_restarted_viewer_gates_new_previews_on_the_same_bases_receipts() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new("viewer-compose-restart");
+    // The destination rejects the push, so the result stays unresolved.
+    let hook = f.remote.join("hooks/pre-receive");
+    fs::write(&hook, "#!/bin/sh\ncat >/dev/null\nexit 1\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+    let first = serve(&f);
+    let preview = first.action("preview", intent()).json();
+    let operation = preview["operation_id"].as_str().unwrap().to_owned();
+    let uncertain = first
+        .action(
+            "confirm",
+            serde_json::json!({"candidate_id": preview["candidate_id"]}),
+        )
+        .json();
+    assert_ne!(uncertain["status"], "delivered", "{uncertain}");
+    assert!(f.record(&operation).exists());
+    // A restarted viewer has no memory of that workflow; the receipt does.
+    let second = serve(&f);
+    let refused = second.action("preview", intent());
+    assert_eq!(refused.status, 409, "{}", refused.body);
+    assert!(
+        refused.body.contains(&operation) && refused.body.contains("unresolved"),
+        "{}",
+        refused.body
+    );
+    // The refused preview is withdrawn, not left sealed.
+    let sealed = f
+        .publisher()
+        .resource_reports()
+        .unwrap()
+        .into_iter()
+        .filter(|report| report.state == ResourceState::Sealed)
+        .count();
+    assert_eq!(sealed, 0, "a refused preview kept its private snapshot");
+    // Resolve it: the destination accepts, and the result is republished.
+    fs::remove_file(&hook).unwrap();
+    let diagnosed = second
+        .action("recover", serde_json::json!({"operation_id": operation}))
+        .json();
+    let generation = diagnosed["details"]["delivery_generation"].clone();
+    let delivered = second
+        .action(
+            "republish",
+            serde_json::json!({"operation_id": operation, "generation": generation}),
+        )
+        .json();
+    assert_eq!(delivered["status"], "delivered", "{delivered}");
+    // Delivered from this base: only an explicit alternative starts another.
+    let sibling = second.action("preview", intent());
+    assert_eq!(sibling.status, 409, "{}", sibling.body);
+    assert!(
+        sibling.body.contains("start an alternative"),
+        "{}",
+        sibling.body
+    );
+    second
+        .action(
+            "alternative",
+            serde_json::json!({"operation_id": operation}),
+        )
+        .json();
+    let alternative = second.action("preview", intent()).json();
+    assert_ne!(alternative["operation_id"], preview["operation_id"]);
+    // A different base is never blocked by another base's receipts.
+    let third = serve(&f);
+    fs::write(f.repo.root.join("unrelated"), "moved on").unwrap();
+    git(&f.repo.root, &["add", "unrelated"]);
+    git(&f.repo.root, &["commit", "-qm", "source moves on"]);
+    let moved = third.action("preview", intent()).json();
+    assert_ne!(moved["base"], preview["base"]);
+}
