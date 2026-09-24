@@ -543,3 +543,39 @@ a field kept out of the published envelope schema (like `env_name`) so
 that no schema version moves for a finding. `prune` and `unlock` do not
 take the `ensure_tables` path and are #396's; SQL Server's ledger is not
 this decision's.
+
+<a id="dec-834-1"></a>
+
+**DEC-834.1. Every login role that can add a trigger to the ledger must be
+able to become the deployment account (#834, #838; amends DEC-313.1's owner
+rule).** DEC-313.1 compared the ledger's shape once and trusted its owner when
+the deployment account could inherit it or `SET ROLE` to it. That left two
+ways to add a trigger after the check that the owner test never saw: a
+`TRIGGER` grant — to one role, to `PUBLIC`, or through default privileges —
+which PostgreSQL lets a grantee use without owning the table; and a group
+owner whose *other* members inherit it. Either trigger then runs with the
+deployment account's privileges on its next `lock` or `record`.
+
+The rule is now the one `crates/pbps-pg/src/data_triggers.rs` applies to a
+reference-data table's triggers: find every login role that can act — by
+inheritance or `SET ROLE` — as a role owning a ledger table or holding
+`TRIGGER` on it, and require each to be able to `SET ROLE` to the deployment
+account or to a superuser role, or to be the database owner. Such a role can
+add nothing that runs a privilege it lacked. The superuser path is asked on its
+own because `pg_has_role` does not follow it: measured, a login role granted
+`postgres` has `SET` on `postgres` and not on the deployment account, yet
+`SET ROLE postgres; SET ROLE <deployer>` reaches it. And the role acted as must
+also have `USAGE` on the ledger's schema: without it `CREATE TRIGGER` is
+refused at the schema (`permission denied for schema public`, measured), so a
+`TRIGGER` grant it cannot use is no reason to refuse a ledger. `NOLOGIN` roles are not actors
+themselves: they act only through their members, each of whom is asked in its
+own right, so a group role can still own the ledger while the deployment
+account is its only login member. A login role that owns the ledger and cannot
+become the deployment account is now refused even when the deployment account
+can become it — it could log in and add the trigger itself.
+
+Measured on 18.6 and 16.15 with separate deployment, attacker and group roles:
+a `TRIGGER` grant to the attacker, a `TRIGGER` grant to `PUBLIC`, and a group
+owner the attacker also inherits are each refused naming the attacker, while
+a `TRIGGER` grant to the deployment account and a `NOLOGIN` group owner the
+deployment account holds `NOINHERIT` are accepted.
