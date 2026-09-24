@@ -238,18 +238,20 @@ SELECT sn.object_id, CONVERT(nvarchar(2), N'SN'), sn.schema_id,
                          THEN 1 ELSE 0 END)
   FROM sys.synonyms sn JOIN sys.schemas ss ON ss.schema_id = sn.schema_id;";
 
-/// Which code names which other code. An ownership chain continues from one
+/// Which code names which other object. An ownership chain continues from one
 /// module to another of the same owner, so a view over a view over the table
-/// reads it as surely as the first view does.
+/// reads it as surely as the first view does. Every edge is kept, and
+/// [`Graph::reading_modules`] follows only those whose target it already knows
+/// to read — a filter here on what counts as code dropped the edges into CLR
+/// modules, which `sys.sql_modules` does not list.
 const DEPENDENCIES: &str = "\
 SELECT d.referencing_id AS module, d.referenced_id AS target
   FROM sys.sql_expression_dependencies d
  WHERE d.referenced_id IS NOT NULL
-   AND EXISTS (SELECT 1 FROM sys.sql_modules m WHERE m.object_id = d.referenced_id)
 UNION ALL
 SELECT sn.object_id, OBJECT_ID(sn.base_object_name)
   FROM sys.synonyms sn
- WHERE OBJECT_ID(sn.base_object_name) IN (SELECT object_id FROM sys.sql_modules);";
+ WHERE OBJECT_ID(sn.base_object_name) IS NOT NULL;";
 
 /// A module signed by a certificate or asymmetric key runs with the
 /// permissions of the principals mapped to that key, in this database and, for
@@ -1281,6 +1283,18 @@ mod tests {
         g.database_perms.push(grant(OBJECT, 60, U_ALICE, "SELECT"));
         assert!(mentions(&named(&g), "alice"));
 
+        // A wrapper chains into a CLR procedure of the same owner that runs as
+        // its owner: the edge is followed whatever kind of code it reaches.
+        let mut g = graph();
+        g.modules.push(Module {
+            kind: "PC".into(),
+            ..module(80, DBO, Some(-2), false)
+        });
+        g.modules.push(module(81, DBO, None, false));
+        g.dependencies.push((81, 80));
+        g.database_perms.push(grant(OBJECT, 81, U_ALICE, "EXECUTE"));
+        assert!(mentions(&named(&g), "alice"));
+
         // A synonym for the table chains the same way.
         let mut g = graph();
         g.modules.push(Module {
@@ -1297,6 +1311,14 @@ mod tests {
         g.dependencies.push((60, 50));
         g.database_perms.push(grant(OBJECT, 60, U_ALICE, "SELECT"));
         assert!(!mentions(&named(&g), "alice"));
+    }
+
+    /// A live CLR module needs a compiled assembly, which this suite does not
+    /// build; so the query itself is held to keeping every edge.
+    #[test]
+    fn the_dependency_read_keeps_edges_into_every_kind_of_code() {
+        assert!(!DEPENDENCIES.contains("sql_modules"), "{DEPENDENCIES}");
+        assert!(!DEPENDENCIES.contains("assembly_modules"), "{DEPENDENCIES}");
     }
 
     #[test]
