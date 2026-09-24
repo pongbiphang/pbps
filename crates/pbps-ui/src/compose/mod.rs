@@ -308,12 +308,13 @@ impl Candidates {
         Ok(preview)
     }
 
-    /// The operation behind the current handle, without confirming it: a
-    /// caller that cannot publish yet refuses before consuming the handle.
-    pub fn operation(&self, candidate_id: &str) -> Option<&str> {
-        let candidate = match self.current.as_ref()? {
-            Stored::Previewed { candidate, .. } | Stored::Confirmed(candidate) => candidate,
-            Stored::Releasing(_) => return None,
+    /// The operation behind a handle that is previewed but not yet
+    /// confirmed: only then can a caller that cannot publish say definitely
+    /// that nothing was attempted. A confirmed handle may already have a
+    /// receipt, which must be read, not assumed absent.
+    pub fn unconfirmed_operation(&self, candidate_id: &str) -> Option<&str> {
+        let Some(Stored::Previewed { candidate, .. }) = self.current.as_ref() else {
+            return None;
         };
         (candidate.preview.candidate_id == candidate_id)
             .then_some(candidate.preview.operation_id.as_str())

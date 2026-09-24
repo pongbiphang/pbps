@@ -100,7 +100,8 @@ impl Compose {
                 let mut publisher = match self.publisher() {
                     Ok(publisher) => publisher,
                     Err(refusal) => {
-                        let Some(operation) = self.candidates.operation(&candidate_id) else {
+                        let Some(operation) = self.candidates.unconfirmed_operation(&candidate_id)
+                        else {
                             return Err(refusal);
                         };
                         return encode(&Outcome {

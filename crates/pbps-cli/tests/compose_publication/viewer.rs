@@ -283,6 +283,14 @@ fn a_busy_publisher_refuses_confirmation_without_consuming_the_reviewed_handle()
             .as_deref(),
         delivered["details"]["commit"].as_str()
     );
+    // Once confirmed, a busy publisher can no longer mean "not attempted":
+    // the receipt exists, so the answer stays unavailable, never refused.
+    let other = f.publisher();
+    let busy = confirm();
+    assert_eq!(busy.status, 409, "{}", busy.body);
+    assert!(!busy.body.contains("not_attempted"), "{}", busy.body);
+    drop(other);
+    assert_eq!(confirm().json()["status"], "delivered");
 }
 
 #[test]
