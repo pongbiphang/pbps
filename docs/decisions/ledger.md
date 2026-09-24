@@ -821,8 +821,8 @@ principal is not an absent one. `doctor` asks for these grants (#881).
   `referenced_id`) is an edge to every object of that name. A part left out
   between dots (`[db]..reader`) is recorded as an empty string, not NULL
   (measured). A module's signer
-  or execution context may itself read only through other code, and that
-  counts too. A table whose computed column, default or check calls such code
+  or execution context may itself read only through other code, or only by
+  becoming a reader (nested `EXECUTE AS`), and both count too. A table whose computed column, default or check calls such code
   counts for whoever reads or writes the table. Measured: a default's or a
   check's call is recorded against the constraint, not the table, so it is
   moved to the table;
@@ -839,7 +839,8 @@ and holds `public`'s permissions.
 - server level: `securityadmin`, `ALTER ANY LOGIN`, `ALTER ANY SERVER ROLE`,
   and `ALTER`/`CONTROL` on a reader login;
 - database level: `db_owner`, `db_securityadmin`, `db_ddladmin` (which holds
-  `ALTER` on the database's objects without a permission row), `ALTER ANY ROLE`,
+  `ALTER` on the database's objects without a permission row), `db_accessadmin`
+  (likewise `ALTER ANY USER`), `ALTER ANY ROLE`,
   `ALTER ANY USER`, `ALTER ANY APPLICATION ROLE`, `ALTER`/`CONTROL`/
   `TAKE OWNERSHIP` on the table, schema `dbo` or the database, a grant option
   on `SELECT`/`CONTROL`, and `ALTER`/`CONTROL` on a reader principal.

@@ -681,11 +681,19 @@ impl Graph {
 
     /// Whether running `m` reads the table by itself, whoever runs it.
     fn module_reads(&self, m: &Module) -> bool {
+        // The context may itself become a reader — nested `EXECUTE AS` —
+        // so it reads if anyone it reaches does.
         let context = match m.execute_as {
-            Some(-2) => self.user_reads(m.owner),
-            Some(p) if p > 0 => self.user_reads(p),
-            _ => false,
-        };
+            Some(-2) => Some(m.owner),
+            Some(p) if p > 0 => Some(p),
+            _ => None,
+        }
+        .is_some_and(|u| {
+            self.reach(Who::User(u)).iter().any(|&r| match r {
+                Who::User(x) => self.user_reads(x),
+                Who::Login(l) => self.login_reads(l),
+            })
+        });
         let chained = m.names_table && m.owner == self.table_owner;
         let signed = self.signers.iter().any(|&(module, user, login)| {
             module == m.id
@@ -803,15 +811,21 @@ impl Graph {
             Some(p) if p > 0 => Some(p),
             _ => None,
         };
-        runs_as.is_some_and(|u| self.user_reads_through_code(u, reading))
-            || self.signers.iter().any(|&(module, user, login)| {
-                module == m.id
-                    && ((user != 0 && self.user_reads_through_code(user, reading))
-                        || (login != 0
-                            && self
-                                .user_of(login)
-                                .is_some_and(|u| self.user_reads_through_code(u, reading))))
+        runs_as.is_some_and(|u| {
+            self.reach(Who::User(u)).iter().any(|&r| match r {
+                Who::User(x) => self.user_reads_through_code(x, reading),
+                Who::Login(l) => self
+                    .user_of(l)
+                    .is_some_and(|x| self.user_reads_through_code(x, reading)),
             })
+        }) || self.signers.iter().any(|&(module, user, login)| {
+            module == m.id
+                && ((user != 0 && self.user_reads_through_code(user, reading))
+                    || (login != 0
+                        && self
+                            .user_of(login)
+                            .is_some_and(|u| self.user_reads_through_code(u, reading))))
+        })
     }
 
     fn user_reads_through_code(&self, user: i32, reading: &BTreeSet<i32>) -> bool {
@@ -926,9 +940,12 @@ impl Graph {
         // `db_ddladmin` holds `ALTER` on the database's objects without a row
         // for it, as `db_datareader` holds `SELECT`: it is the table `ALTER`
         // below, and can move the rows out (`ALTER TABLE … SWITCH`).
+        // `db_accessadmin` likewise holds `ALTER ANY USER` without a row: it
+        // can give a login that reads server-wide the user it needs to enter.
         self.in_database_role(&c, "db_owner")
             || self.in_database_role(&c, "db_securityadmin")
             || self.in_database_role(&c, "db_ddladmin")
+            || self.in_database_role(&c, "db_accessadmin")
             || self.database_grants(
                 &c,
                 &[

@@ -2524,6 +2524,16 @@ async fn every_unqualified_reader_grantor_and_backup_principal_is_named() {
             "CREATE ROLE [r880_exec_{pid}]; GRANT EXECUTE ON dbo.p880_chain TO [r880_exec_{pid}];
              GRANT ALTER ON ROLE::[r880_exec_{pid}] TO [{}];", login("rolealter"))),
         ("ddladmin".into(), format!("ALTER ROLE db_ddladmin ADD MEMBER [{}];", login("ddladmin"))),
+        ("accessadmin".into(), format!("ALTER ROLE db_accessadmin ADD MEMBER [{}];", login("accessadmin"))),
+        ("contextbecomes".into(), format!(
+            "CREATE USER u880_hopper WITHOUT LOGIN;
+             GRANT IMPERSONATE ON USER::[{}] TO u880_hopper;
+             CREATE USER u880_procowner WITHOUT LOGIN;
+             EXEC(N'CREATE SCHEMA app880b AUTHORIZATION u880_procowner;');
+             EXEC(N'CREATE PROCEDURE app880b.p880_hop WITH EXECUTE AS ''u880_hopper'' AS
+                    BEGIN EXECUTE AS USER = ''{}''; SELECT state_id FROM {t}; REVERT; END;');
+             GRANT EXECUTE ON app880b.p880_hop TO [{}];",
+            login("table"), login("table"), login("contextbecomes"))),
         ("grantoption".into(), format!("GRANT SELECT ON {t} TO [{}] WITH GRANT OPTION;", login("grantoption"))),
         ("alterschema".into(), format!("GRANT ALTER ON SCHEMA::dbo TO [{}];", login("alterschema"))),
         ("backupoperator".into(), format!("ALTER ROLE db_backupoperator ADD MEMBER [{}];", login("backupoperator"))),
