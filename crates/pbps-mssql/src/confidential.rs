@@ -181,7 +181,10 @@ async fn visibility_problems(conn: &mut Conn) -> Result<Vec<String>, DbError> {
 const SERVER_PRINCIPALS: &str = "\
 SELECT principal_id, name, CONVERT(nvarchar(2), type) AS kind,
        CONVERT(varchar(172), sid, 1) AS sid, CONVERT(bit, is_fixed_role) AS fixed,
-       CONVERT(bit, is_disabled) AS disabled
+       CONVERT(bit, CASE WHEN is_disabled = 1
+                          AND NOT EXISTS (SELECT 1 FROM sys.dm_exec_sessions es
+                                           WHERE es.security_id = sid)
+                         THEN 1 ELSE 0 END) AS disabled
   FROM sys.server_principals;";
 
 const SERVER_ROLE_MEMBERS: &str = "\
@@ -250,9 +253,9 @@ SELECT c.object_id AS id,
             WHERE d.referencing_id = c.object_id
               AND (d.referenced_id = @t
                    OR (d.referenced_entity_name = N'__pbps_state_confidential'
-                       AND ISNULL(d.referenced_schema_name, N'dbo') = N'dbo'
-                       AND ISNULL(d.referenced_database_name, DB_NAME()) = DB_NAME()
-                       AND d.referenced_server_name IS NULL)))
+                       AND ISNULL(NULLIF(d.referenced_schema_name, N''), N'dbo') = N'dbo'
+                       AND ISNULL(NULLIF(d.referenced_database_name, N''), DB_NAME()) = DB_NAME()
+                       AND NULLIF(d.referenced_server_name, N'') IS NULL)))
          THEN 1 ELSE 0 END) AS names_table
   FROM code c
   LEFT JOIN sys.objects o ON o.object_id = c.object_id
@@ -290,7 +293,9 @@ SELECT t.object_id, CONVERT(nvarchar(2), N'U'), t.schema_id,
 /// modules, which `sys.sql_modules` does not list. A name the engine resolves
 /// only at run time, such as `EXEC reader` with no schema, is recorded with no
 /// `referenced_id` (measured: `is_caller_dependent = 1`); it is kept as an edge
-/// to every object of that name the caller could reach.
+/// to every object of that name the caller could reach. A part left out
+/// between dots — `[db]..reader` — is recorded as an empty string, not NULL
+/// (measured), so each part is read through `NULLIF`.
 const DEPENDENCIES: &str = "\
 SELECT d.referencing_id AS module, d.referenced_id AS target
   FROM sys.sql_expression_dependencies d
@@ -300,10 +305,11 @@ SELECT d.referencing_id, o.object_id
   FROM sys.sql_expression_dependencies d
   JOIN sys.objects o
     ON o.name = d.referenced_entity_name
-   AND (d.referenced_schema_name IS NULL OR o.schema_id = SCHEMA_ID(d.referenced_schema_name))
+   AND (NULLIF(d.referenced_schema_name, N'') IS NULL
+        OR o.schema_id = SCHEMA_ID(d.referenced_schema_name))
  WHERE d.referenced_id IS NULL
-   AND d.referenced_database_name IS NULL
-   AND d.referenced_server_name IS NULL
+   AND ISNULL(NULLIF(d.referenced_database_name, N''), DB_NAME()) = DB_NAME()
+   AND NULLIF(d.referenced_server_name, N'') IS NULL
 UNION ALL
 SELECT sn.object_id, OBJECT_ID(sn.base_object_name)
   FROM sys.synonyms sn
@@ -337,8 +343,10 @@ struct Principal {
     fixed: bool,
     /// `sys.database_principals.authentication_type`; 0 on the server side.
     authentication: i32,
-    /// `sys.server_principals.is_disabled`; a disabled login cannot sign in
-    /// (measured), though whoever can become it still reaches its access.
+    /// A disabled login with no open session: it cannot sign in (measured),
+    /// though whoever can become it still reaches its access. Disabling one
+    /// does not end the sessions it already has, so a disabled login that is
+    /// still signed in stays an actor.
     disabled: bool,
 }
 
@@ -648,7 +656,12 @@ impl Graph {
         // `SELECT ALL USER SECURABLES` reads only a database the login can
         // enter: through a user, `guest` or `public`, or `CONNECT ANY
         // DATABASE`, which is a permission of its own and enters as `public`.
-        let enters = self.user_of(login).is_some();
+        // A Windows group's members sign in as themselves and may enter
+        // through users of their own, which the catalog cannot tie to the
+        // group; so a group's server-wide read counts whether or not the group
+        // enters on its own.
+        let enters =
+            self.user_of(login).is_some() || self.server.get(&login).is_some_and(|p| p.kind == "G");
         self.controls_server(login)
             || (enters && self.server_grants(&c, &["SELECT ALL USER SECURABLES"], &[(SERVER, 0)]))
             || self.user_of(login).is_some_and(|u| self.user_reads(u))
@@ -1004,11 +1017,16 @@ impl Graph {
     }
 
     /// `who` and everyone it can become, to a fixed point.
+    /// A context with a `DENY` in its reach is not stepped through, as in
+    /// [`Graph::qualified`], and keeps only what it holds itself.
     fn reach(&self, who: Who) -> BTreeSet<Who> {
         let everyone = self.everyone();
         let mut reached = BTreeSet::from([who]);
         let mut todo = vec![who];
         while let Some(x) = todo.pop() {
+            if self.denied(x) {
+                continue;
+            }
             for &y in &everyone {
                 if !reached.contains(&y) && self.becomes(x, y) {
                     reached.insert(y);
@@ -1612,6 +1630,36 @@ mod tests {
         assert!(mentions(&named(&g), "alice"));
         // The synonym arm keeps to this database's objects.
         assert!(DEPENDENCIES.contains("PARSENAME(sn.base_object_name, 3)"));
+    }
+
+    #[test]
+    fn a_windows_groups_server_wide_read_counts_and_a_denied_context_is_not_stepped_through() {
+        let mut g = graph();
+        g.server
+            .insert(320, principal("DOMAIN\\readers", "G", Some("0x32"), false));
+        g.server_perms
+            .push(grant(SERVER, 0, 320, "SELECT ALL USER SECURABLES"));
+        assert!(mentions(&named(&g), "DOMAIN\\readers"));
+
+        let mut g = graph();
+        g.database
+            .insert(16386, principal("db_securityadmin", "R", None, true));
+        g.database_roles.push((U_BOB, 16386));
+        g.database_perms.push(grant(
+            DATABASE_PRINCIPAL,
+            U_BOB,
+            READERS_ROLE,
+            "IMPERSONATE",
+        ));
+        g.database_roles.push((U_ALICE, READERS_ROLE));
+        g.database_perms.push(Perm {
+            state: "D".into(),
+            ..grant(DATABASE_PRINCIPAL, U_BOB, U_ALICE, "IMPERSONATE")
+        });
+        // Bob grants for himself; Alice, denied the step to Bob, does not.
+        let problems = named(&g);
+        assert!(mentions(&problems, "bob"), "{problems:?}");
+        assert!(!mentions(&problems, "alice"), "{problems:?}");
     }
 
     #[test]

@@ -804,7 +804,11 @@ principal is not an absent one. `doctor` asks for these grants (#881).
 - ownership, `dbo` or `db_owner`, or `db_datareader`;
 - `SELECT` or `CONTROL`, on the table (including a column), on schema `dbo` or
   on the database, directly or through any role, `public` included;
-- `CONTROL SERVER`, `sysadmin` or `SELECT ALL USER SECURABLES`;
+- `CONTROL SERVER`, `sysadmin` or `SELECT ALL USER SECURABLES`, the last for a
+  login that can enter the database. A Windows group's members sign in as
+  themselves and may enter through users of their own, which the catalog
+  cannot tie to the group. So a group's server-wide read counts whether or not
+  the group enters on its own;
 - running code that reads the table: `EXECUTE AS` a reader, an ownership
   chain (code owned by the table's owner that names the table, or names
   other code of the same owner that does, to a fixed point), or a signature
@@ -814,7 +818,9 @@ principal is not an absent one. `doctor` asks for these grants (#881).
   table reads it with no grant on the table. A trigger counts for whoever can
   write its table, and a database DDL trigger for everyone. A name resolved
   only at run time (`EXEC reader` with no schema; measured, recorded with no
-  `referenced_id`) is an edge to every object of that name. A module's signer
+  `referenced_id`) is an edge to every object of that name. A part left out
+  between dots (`[db]..reader`) is recorded as an empty string, not NULL
+  (measured). A module's signer
   or execution context may itself read only through other code, and that
   counts too. A table whose computed column, default or check calls such code
   counts for whoever reads or writes the table;
@@ -841,8 +847,9 @@ Backup principals are `db_owner`, `db_backupoperator`, and holders of
 
 *Actors and the rule.* The principals a person uses are:
 - logins, except those mapped to a certificate or key, the engine's `##`
-  principals, and disabled logins. Measured, a disabled login cannot sign in;
-  whoever can become one is still traced;
+  principals, and disabled logins with no open session. Measured, a disabled
+  login cannot sign in, but disabling one does not end a session it already
+  has. Whoever can become a disabled login is still traced;
 - database principals entered without a login: contained users, application
   roles, and `guest` when it may connect.
 
@@ -857,7 +864,7 @@ deployment account, either its login or its database user, or else be
 
 Becoming is followed to a fixed point, because nested `EXECUTE AS` reaches
 the deployer through others. The same reach counts for granting and backing
-up. An actor that can become a `db_securityadmin` member without a login
+up, and never steps through a principal with a `DENY` in its reach. An actor that can become a `db_securityadmin` member without a login
 grants as that member does. The chain never steps through a principal with a
 `DENY` in its reach.
 

@@ -2500,6 +2500,10 @@ async fn every_unqualified_reader_grantor_and_backup_principal_is_named() {
              EXEC(N'CREATE PROCEDURE app880.p880_signedview AS SELECT state_id FROM dbo.v880;');
              ADD SIGNATURE TO app880.p880_signedview BY CERTIFICATE c880v WITH PASSWORD = '{READER_PASSWORD}';
              GRANT EXECUTE ON app880.p880_signedview TO [{}];", login("signedview"))),
+        ("threepart".into(), format!(
+            "EXEC(N'CREATE PROCEDURE dbo.p880_tpreader AS SELECT state_id FROM {t};');
+             EXEC(N'CREATE PROCEDURE dbo.p880_tpwrapper AS EXEC [{db}]..p880_tpreader;');
+             GRANT EXECUTE ON dbo.p880_tpwrapper TO [{}];", login("threepart"), db = db.name)),
         ("computed".into(), format!(
             "EXEC(N'CREATE FUNCTION dbo.f880_scalar() RETURNS BIGINT AS
                     BEGIN RETURN (SELECT MAX(state_id) FROM {t}); END;');
@@ -2709,9 +2713,28 @@ async fn code_and_users_that_cannot_reach_the_table_are_not_named() {
         .await
         .unwrap();
     logins.push(login("outsider"));
+    // A login disabled while signed in keeps its session, and stays an actor.
+    let signedin = login("signedin");
+    reader_login(&mut db, &signedin).await;
+    logins.push(signedin.clone());
+    db.conn
+        .execute(&format!(
+            "GRANT SELECT ON dbo.__pbps_state_confidential TO [{signedin}];"
+        ))
+        .await
+        .unwrap();
+    let session = connect_live(&conn_str_as(&signedin, &db.name))
+        .await
+        .expect("sign in before the login is disabled");
+    db.conn
+        .execute(&format!("ALTER LOGIN [{signedin}] DISABLE;"))
+        .await
+        .unwrap();
     let problems = pbps_mssql::confidential::protected_reader_problems(&mut db.conn)
         .await
         .unwrap();
+    drop(session);
+    assert!(names(&problems, &signedin), "{problems:#?}");
     assert!(names(&problems, &login("viewer")), "{problems:#?}");
     for key in [
         "elsewhere",
