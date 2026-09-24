@@ -70,6 +70,23 @@ fn refused(error: compose::Error) -> Refusal {
     (409, error.to_string())
 }
 
+/// A confirmation refused before anything was attempted because the
+/// publications could not be used; the handle may be confirmed again.
+fn not_attempted(operation: &str) -> Result<Vec<u8>, Refusal> {
+    encode(&Outcome {
+        status: Status::Refused,
+        operation_id: operation.to_owned(),
+        details: None,
+        local: LocalState::NotAttempted,
+        local_evidence: RefEvidence::Absent,
+        remote: DeliveryState::NotAttempted,
+        remote_evidence: None,
+        problem: Some(Problem::RepositoryUnavailable),
+        // The sealed preview still owns private resources.
+        cleanup_pending: true,
+    })
+}
+
 fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, Refusal> {
     serde_json::to_vec(value).map_err(|_| (500, "Cannot encode the compose result".to_owned()))
 }
@@ -107,7 +124,23 @@ impl Compose {
             .project
             .canonicalize()
             .map_err(|_| (409, "Could not locate the selected project".to_owned()))?;
-        for outcome in self.publisher()?.list().map_err(refused)? {
+        let receipts = self.publisher()?.list().map_err(refused)?;
+        match self.sibling_conflict(&receipts, &project, preview) {
+            Some(message) => Err((409, message)),
+            None => Ok(()),
+        }
+    }
+
+    /// The receipt that forbids a sibling of `preview`, as the message
+    /// naming it: another operation of this project from the same base
+    /// that is unresolved, or delivered without an explicit alternative.
+    fn sibling_conflict(
+        &self,
+        receipts: &[Outcome],
+        project: &std::path::Path,
+        preview: &compose::Preview,
+    ) -> Option<String> {
+        for outcome in receipts {
             let same_base = outcome.details.as_ref().is_none_or(|details| {
                 details.base == preview.base
                     && std::path::Path::new(&details.source_project) == project
@@ -116,25 +149,19 @@ impl Compose {
                 continue;
             }
             if outcome.status != Status::Delivered {
-                return Err((
-                    409,
-                    format!(
-                        "Operation {} from this base is unresolved; reconcile or retry it before starting another",
-                        outcome.operation_id
-                    ),
+                return Some(format!(
+                    "Operation {} from this base is unresolved; reconcile or retry it before starting another",
+                    outcome.operation_id
                 ));
             }
             if !self.candidates.admits_sibling_of(&preview.base) {
-                return Err((
-                    409,
-                    format!(
-                        "Operation {} already delivered a result from this base; start an alternative from it, or continue from its branch",
-                        outcome.operation_id
-                    ),
+                return Some(format!(
+                    "Operation {} already delivered a result from this base; start an alternative from it, or continue from its branch",
+                    outcome.operation_id
                 ));
             }
         }
-        Ok(())
+        None
     }
 
     pub(crate) fn answer(&mut self, action: &str, body: &[u8]) -> Result<Vec<u8>, Refusal> {
@@ -189,20 +216,33 @@ impl Compose {
                         else {
                             return Err(refusal);
                         };
-                        return encode(&Outcome {
-                            status: Status::Refused,
-                            operation_id: operation.to_owned(),
-                            details: None,
-                            local: LocalState::NotAttempted,
-                            local_evidence: RefEvidence::Absent,
-                            remote: DeliveryState::NotAttempted,
-                            remote_evidence: None,
-                            problem: Some(Problem::RepositoryUnavailable),
-                            // The sealed preview still owns private resources.
-                            cleanup_pending: true,
-                        });
+                        return not_attempted(operation);
                     }
                 };
+                // Another viewer may have published from this base after this
+                // preview passed its gate (#874). The owner lock now held
+                // serializes publications, so rechecking here is final for
+                // this confirmation.
+                if let Some(preview) = self.candidates.unconfirmed_preview(&candidate_id).cloned() {
+                    let project = self.project.canonicalize().ok();
+                    let receipts = publisher.list().ok();
+                    let (Some(project), Some(receipts)) = (project, receipts) else {
+                        // Unreadable is not "no sibling": nothing is
+                        // attempted and the handle stays confirmable.
+                        return not_attempted(&preview.operation_id);
+                    };
+                    if let Some(message) = self.sibling_conflict(&receipts, &project, &preview) {
+                        // Refused before anything was written, so definite;
+                        // the handle can never pass, so its preview retires.
+                        let message = match self.candidates.withdraw(&candidate_id) {
+                            Ok(()) => message,
+                            Err(error) => format!(
+                                "{message}; the refused preview's private retirement remains pending: {error}"
+                            ),
+                        };
+                        return Err((410, message));
+                    }
+                }
                 // A definite refusal (`Error::is_definite`) means no receipt
                 // or publication exists for the handle: an expired preview, a
                 // handle this workflow recorded as given up unpublished, or a
