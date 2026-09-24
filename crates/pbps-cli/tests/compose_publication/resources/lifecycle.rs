@@ -394,4 +394,32 @@ fn only_refusals_before_the_durable_confirmation_are_definite() {
         .map(|_| ())
         .unwrap_err();
     assert!(error.is_definite(), "{error}");
+
+    // A handle this workflow did not give up unpublished may be an earlier
+    // confirmed result: after delivery and an alternative, it is uncertain.
+    let f = Fixture::new("lifecycle-confirm-historical");
+    let (mut candidates, delivered, candidate) = f.ready();
+    let mut publisher = f.publisher();
+    assert_eq!(publisher.confirm(&candidate).status, Status::Delivered);
+    publisher
+        .start_alternative(&mut candidates, &delivered.operation_id)
+        .unwrap();
+    drop(publisher);
+    candidates.preview(request(), SystemTime::now()).unwrap();
+    let error = candidates
+        .confirm(&delivered.candidate_id, SystemTime::now())
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        !error.is_definite(),
+        "a delivered handle read as unpublished"
+    );
+    // A fresh workflow knows no handle at all: uncertain as well.
+    let error = f
+        .repo
+        .store()
+        .confirm(&delivered.candidate_id, SystemTime::now())
+        .map(|_| ())
+        .unwrap_err();
+    assert!(!error.is_definite(), "{error}");
 }
