@@ -615,13 +615,16 @@ be the boundary.
 
 *Chosen: protected storage.* For a confidential record the ordinary row in
 `__pbps_state` keeps its identity and non-verifier columns (`id`, `applied_at`,
-`kind`, `git_sha`, `operator`, `reason`), writes `plan_checksum` as NULL, and
+`kind`, `git_sha`, `operator`), writes `plan_checksum` and `reason` as NULL —
+`reason` because a failure's tool-written reason can quote a checksum (a staged
+resume against a different plan names the checkpoint's), so it is not a
+non-verifier column — and
 stores a stub `state_json` carrying only a new state-format version and the
 confidential classification, with the matching `state_version`. A pre-feature
 reader therefore sees a NULL checksum and an unsupported version; its `status`
 and `plan` refuse on the version instead of printing anything. The complete
 snapshot — not a list of fields thought to be sensitive, which would be the
-open set this project refuses to maintain — and the plan checksum are written
+open set this project refuses to maintain — the plan checksum and the reason are written
 to `__pbps_state_confidential` (`public` on PostgreSQL, `dbo` on SQL Server),
 keyed by the ordinary row's `id`, in the same transaction as the ordinary row,
 so neither exists without the other. Ordinary records, and every existing row,
