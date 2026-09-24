@@ -223,6 +223,16 @@ globalThis.PbpsCompose = Object.freeze({
                 await send("forget", {operation_id: receipt.operation_id, acknowledged: true});
                 receipts.delete(receipt.operation_id);
                 draw();
+                if (receipt.operation_id === operation) {
+                  // The server released this workflow; so does the page.
+                  confirming = false;
+                  reconfirmable = false;
+                  operation = null;
+                  candidate = null;
+                  refresh.disabled = false;
+                  for (const field of Object.values(fields)) field.disabled = false;
+                  invalidate();
+                }
                 activity.textContent = "The receipt was forgotten. Branches already pushed are unchanged.";
               } catch (_) {
                 activity.textContent = "Forgetting did not complete. The receipt and its evidence are preserved.";
@@ -250,9 +260,13 @@ globalThis.PbpsCompose = Object.freeze({
       for (const report of reports.values()) {
         const card = make("article");
         card.append(make("p", `Operation: ${report.operation_id}`), make("p", stateText[report.state] || "Unknown state; preserve it."));
-        if (report.cleanup_pending) {
-          card.append(make("p", report.instruction));
-          const retire = make("button", "Retire what this operation still owns");
+        if (report.cleanup_pending) card.append(make("p", report.instruction));
+        // Only states that recover-resources can advance get a control: an
+        // interrupted retirement resumes, and a sealed preview retires once
+        // its 24-hour expiry has passed. Other states would just redraw.
+        const label = {retiring: "Finish this retirement", sealed: "Retire this preview if it has expired"}[report.state];
+        if (report.cleanup_pending && label) {
+          const retire = make("button", label);
           retire.type = "button";
           retire.dataset.action = "recover-resources";
           retire.addEventListener("click", async () => {
@@ -262,6 +276,11 @@ globalThis.PbpsCompose = Object.freeze({
               const next = await send("recover-resources", {operation_id: report.operation_id});
               reports.set(next.operation_id, next);
               drawReports();
+              if (next.state === report.state) {
+                activity.textContent = report.state === "sealed"
+                  ? "This preview has not reached its 24-hour expiry; it is kept."
+                  : "The retirement did not advance; its evidence is preserved.";
+              }
             } catch (_) {
               activity.textContent = "These resources could not be retired now; their evidence is preserved.";
               retire.disabled = false;

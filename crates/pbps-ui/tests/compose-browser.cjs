@@ -199,6 +199,10 @@ async function retirement() {
   assert.deepEqual(a.calls[3].body, {operation_id: "operation-retire", acknowledged: true});
   a.calls[3].resolve({operation_id: "operation-retire", state: "spent", cleanup_pending: false}); await p;
   assert(!visible("Operation: operation-retire"), "a forgotten receipt leaves the list");
+  // Forgetting this workflow's own result releases the form, as the server does.
+  assert(!button("preview").disabled, "Refresh is available after forgetting");
+  assert(!a.field("message").disabled, "inputs are editable after forgetting");
+  assert(a.confirm.disabled);
   // Unresolved results offer neither action.
   const b = setup();
   p = b.root.find(e => e.dataset.action === "list").fire("click");
@@ -210,14 +214,27 @@ async function retirement() {
   assert.equal(b.calls[1].action, "resources");
   b.calls[1].resolve([
     {operation_id: "sealed-one", state: "sealed", cleanup_pending: true, instruction: "Retry only the recorded retirement."},
+    {operation_id: "confirmed-one", state: "confirmed", cleanup_pending: true, instruction: "Clean up from its result."},
     {operation_id: "spent-one", state: "spent", cleanup_pending: false, instruction: "none"},
   ]); await p;
-  const retire = b.root.find(e => e.dataset.action === "recover-resources");
-  assert(retire, "a pending report offers retirement");
-  p = retire.fire("click");
+  // Only a state recover-resources can advance offers the control.
+  const controls = () => {
+    const found = [];
+    const walk = e => { if (e.dataset.action === "recover-resources") found.push(e); e.children.forEach(walk); };
+    walk(b.root);
+    return found;
+  };
+  assert.equal(controls().length, 1, "confirmed and spent reports offer no retirement");
+  assert(controls()[0].textContent.includes("if it has expired"));
+  // An unexpired preview is kept and the page says why.
+  p = controls()[0].fire("click");
   assert.deepEqual(b.calls[2].body, {operation_id: "sealed-one"});
-  b.calls[2].resolve({operation_id: "sealed-one", state: "spent", cleanup_pending: false, instruction: "none"}); await p;
-  assert(!b.root.find(e => e.dataset.action === "recover-resources"));
+  b.calls[2].resolve({operation_id: "sealed-one", state: "sealed", cleanup_pending: true, instruction: "kept"}); await p;
+  assert(b.root.find(e => e.textContent.includes("not reached its 24-hour expiry")));
+  // An expired preview retires.
+  p = controls()[0].fire("click");
+  b.calls[3].resolve({operation_id: "sealed-one", state: "spent", cleanup_pending: false, instruction: "none"}); await p;
+  assert.equal(controls().length, 0);
 }
 async function definiteRefusals() {
   for (const problem of ["remote_unavailable", "signing_unavailable"]) {
