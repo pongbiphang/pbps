@@ -50,6 +50,16 @@ pub const LEDGER_SCHEMA: &str = "public";
 /// row lives; the schema in front of them is this dialect's. Whoever has to
 /// name these tables from outside — the pull's exclusion filter, `doctor`'s
 /// permission questions — asks here rather than repeating the spelling.
+///
+/// Every read and delete here names them with `ONLY` (#900). Without it a
+/// statement on an inheritance parent reaches its descendants too, so a child
+/// row with a higher `id` reads as the newest snapshot and `prune` deletes
+/// through into a table the integrity check never inspected. The check does
+/// refuse a ledger in an inheritance tree ([`ledger_problems`]), but reads such
+/// as `latest` do not run it, and `ONLY` makes them read the table they name
+/// whatever it is attached to. Measured on 18.6 and 16.15: `ONLY` on a view or
+/// on a table without descendants changes nothing, so it costs the ordinary
+/// ledger nothing.
 pub const STATE_TABLE: &str = "public.__pbps_state";
 pub const LOCK_TABLE: &str = "public.__pbps_lock";
 pub const CONFIDENTIAL_TABLE: &str = "public.__pbps_state_confidential";
@@ -203,7 +213,7 @@ fn select_latest() -> String {
     let applied_at = rendered("applied_at");
     format!(
         "SELECT id, {applied_at}, state_json
-  FROM {STATE_TABLE}
+  FROM ONLY {STATE_TABLE}
  ORDER BY id DESC LIMIT 1"
     )
 }
@@ -212,7 +222,7 @@ fn select_history() -> String {
     let applied_at = rendered("applied_at");
     format!(
         "SELECT id, {applied_at}, state_json
-  FROM {STATE_TABLE}
+  FROM ONLY {STATE_TABLE}
  ORDER BY id DESC LIMIT $1"
     )
 }
@@ -231,7 +241,7 @@ fn select_timeline() -> String {
     format!(
         "SELECT id, {applied_at}, kind, git_sha, plan_checksum, operator, reason,
                 state_version, tables_count, modules_count, staged_completed, staged_total
-  FROM {STATE_TABLE}
+  FROM ONLY {STATE_TABLE}
  ORDER BY id DESC LIMIT $1"
     )
 }
@@ -256,7 +266,7 @@ fn select_timeline_unmigrated() -> String {
     let applied_at = rendered("applied_at");
     format!(
         "SELECT id, {applied_at}, kind, git_sha, plan_checksum, operator, reason
-  FROM {STATE_TABLE}
+  FROM ONLY {STATE_TABLE}
  ORDER BY id DESC LIMIT $1"
     )
 }
@@ -280,7 +290,7 @@ const MAX_PARAMETERS: usize = 65535;
 fn select_legacy_state_json(count: usize) -> String {
     let slots: Vec<String> = (1..=count).map(|i| format!("${i}")).collect();
     format!(
-        "SELECT id, state_json FROM {STATE_TABLE} WHERE id IN ({})",
+        "SELECT id, state_json FROM ONLY {STATE_TABLE} WHERE id IN ({})",
         slots.join(", ")
     )
 }
@@ -312,9 +322,9 @@ INSERT INTO public.__pbps_state
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NULL)
 RETURNING id";
 
-const SELECT_IDS: &str = "SELECT id FROM public.__pbps_state ORDER BY id DESC";
+const SELECT_IDS: &str = "SELECT id FROM ONLY public.__pbps_state ORDER BY id DESC";
 
-const DELETE_UP_TO: &str = "DELETE FROM public.__pbps_state WHERE id <= $1";
+const DELETE_UP_TO: &str = "DELETE FROM ONLY public.__pbps_state WHERE id <= $1";
 
 /// Both halves of every pruned record, in one statement: the protected rows go
 /// with the ordinary rows they belong to or not at all (DEC-868.1). The count
@@ -348,7 +358,7 @@ fn select_lock() -> String {
     let locked_at = rendered("locked_at");
     format!(
         "SELECT locked_by, {locked_at}
-  FROM {LOCK_TABLE} WHERE id = 1"
+  FROM ONLY {LOCK_TABLE} WHERE id = 1"
     )
 }
 
@@ -365,12 +375,12 @@ fn select_lock() -> String {
 const INSERT_LOCK: &str =
     "INSERT INTO public.__pbps_lock (id, locked_by) VALUES (1, $1) ON CONFLICT (id) DO NOTHING";
 
-const DELETE_LOCK: &str = "DELETE FROM public.__pbps_lock WHERE id = 1";
+const DELETE_LOCK: &str = "DELETE FROM ONLY public.__pbps_lock WHERE id = 1";
 
 /// The cheapest statement that resolves the ledger and checks the permission to
 /// read it without returning a row. See [`is_initialized`] for why it is a
 /// statement at all.
-const PROBE_STATE: &str = "SELECT 1 AS present FROM public.__pbps_state LIMIT 0";
+const PROBE_STATE: &str = "SELECT 1 AS present FROM ONLY public.__pbps_state LIMIT 0";
 
 /// Whether both tables are already there, asked of the catalog.
 ///
@@ -551,10 +561,7 @@ pub async fn ensure_tables(conn: &mut Conn) -> Result<(), DbError> {
     // attached code the deployment account would run on its next write
     // (issue #313). Refused before `migrate_timeline_columns`' ALTER and
     // before any caller's INSERT or DELETE.
-    let problems = ledger_problems(conn).await?;
-    if !problems.is_empty() {
-        return Err(DbError::Refused(untrusted_ledger_message(&problems)));
-    }
+    refuse_an_untrusted_ledger(conn).await?;
     // Both tables exist by this point, freshly created or already there —
     // either way a `__pbps_state` from before issue #103 still needs its
     // five timeline columns, and one just created by [`CREATE_STATE`] above
@@ -590,15 +597,10 @@ pub async fn ensure_tables(conn: &mut Conn) -> Result<(), DbError> {
 /// [`record`]) or not at all for the matching decoy table — into a clear,
 /// named refusal for the loud case, rather than a reported success.
 ///
-/// It is also bounded to the two callers that reach it. This runs on the
-/// [`ensure_tables`] path, which only [`record`] and [`lock`] take; [`prune`]
-/// and [`unlock`] ask [`is_initialized`] (or, for `unlock`, nothing) and never
-/// call [`ensure_tables`], so a decoy view at either ledger name still lets
-/// `prune`'s `DELETE_UP_TO` and `unlock`'s `DELETE_LOCK` write through it into
-/// the view's base table — measured on 18.6, not assumed. That gap is
-/// deliberately not closed here by adding an `ensure_tables` call to two
-/// commands whose whole point is to delete, not to create; it is tracked as
-/// issue #396 instead.
+/// It runs on the [`ensure_tables`] path, which only [`record`] and [`lock`]
+/// take. [`prune`] and [`unlock`] delete rather than create, so they do not take
+/// that path; they ask [`ledger_problems`] instead, which reports a non-table
+/// occupant in these same words, before their DELETE (#396).
 async fn confirm_ledger_relations(conn: &mut Conn) -> Result<(), DbError> {
     let rows = conn.query(&ledger_occupants()).await?;
     if rows.is_empty() {
@@ -635,7 +637,12 @@ async fn confirm_ledger_relations(conn: &mut Conn) -> Result<(), DbError> {
 /// Enumerating those would be the open set this project keeps refusing to
 /// maintain; the recipe is two `CREATE TABLE` statements, so its catalog
 /// projection is small and closed, and anything else is a difference
-/// (DEC-313.1).
+/// (DEC-313.1). Closed only if it reads the table as well as what hangs off
+/// it: an `UNLOGGED`, typed or inheriting table with the recipe's columns
+/// passed until [`ledger_facts`] read the table's own row and the identity
+/// column's sequence (DEC-901.1). A relation of another kind at a ledger name
+/// is a problem here too, in [`confirm_ledger_relations`]' words, so `doctor`
+/// reports it rather than reading it as an absent ledger.
 ///
 /// **And who can change it afterwards.** The shape is compared once; a role
 /// that can create a trigger on a ledger table can add one after this check
@@ -693,7 +700,12 @@ pub async fn ledger_problems(conn: &mut Conn) -> Result<Vec<String>, DbError> {
             CONFIDENTIAL_TABLE_NAME => &mut confidential,
             _ => &mut lock,
         };
-        if let Some(editor) = fact.strip_prefix("untrusted editor ") {
+        if let Some(relkind) = fact.strip_prefix("occupant ") {
+            problems.push(format!(
+                "{LEDGER_SCHEMA}.{relname} is {}, not an ordinary table",
+                relkind_name(relkind)
+            ));
+        } else if let Some(editor) = fact.strip_prefix("untrusted editor ") {
             problems.push(format!(
                 "{LEDGER_SCHEMA}.{relname} can be changed by `{editor}`, a login role that can \
                  create triggers on it (as its owner, through a TRIGGER grant, or through a \
@@ -775,12 +787,29 @@ fn differences(
     extra.chain(missing).collect()
 }
 
-/// The refusal [`ensure_tables`] gives, and the text `doctor` reports.
+/// Refuses, with [`untrusted_ledger_message`], when [`ledger_problems`] finds
+/// anything: the one gate in front of every statement that writes to the
+/// ledger. [`ensure_tables`] asks it for `record` and `lock`; [`prune`] and
+/// [`unlock`] ask it before their DELETE (#396), because a DELETE fires a
+/// trigger and follows a view exactly as an INSERT does, and a stale lock is
+/// cleared under the same account that would run whatever is attached.
+async fn refuse_an_untrusted_ledger(conn: &mut Conn) -> Result<(), DbError> {
+    let problems = ledger_problems(conn).await?;
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(DbError::Refused(untrusted_ledger_message(&problems)))
+    }
+}
+
+/// The refusal [`ensure_tables`], [`prune`] and [`unlock`] give, and the text
+/// `doctor` reports.
 pub fn untrusted_ledger_message(problems: &[String]) -> String {
     format!(
         "{}.\n\
          The ledger tables are not the ones pbps creates, so this account will not write to \
-         them: a trigger, rule, policy or expression on them would run with its privileges. \
+         them: a trigger, rule, policy or expression on them would run with its privileges, \
+         and a table of another shape does not keep what the ledger promises. \
          If they were made by pbps and changed by hand, restore them; otherwise drop them and \
          let pbps create its own, and keep CREATE on schema {LEDGER_SCHEMA} away from \
          untrusted roles.",
@@ -802,7 +831,7 @@ const STATE_TIMELINE_COLUMNS: [&str; 5] = [
 /// Measured on 18.6 and 16.15: identical on both, apart from the `NOT NULL`
 /// constraints 18 records as `contype = 'n'`, which the facts leave out
 /// because `attnotnull` already carries them.
-const STATE_RECIPE: [&str; 15] = [
+const STATE_RECIPE: [&str; 19] = [
     "column id bigint NOT NULL GENERATED ALWAYS AS IDENTITY",
     "column applied_at timestamp(3) without time zone NOT NULL DEFAULT (clock_timestamp() AT TIME ZONE 'UTC'::text)",
     "column kind character varying(16) NOT NULL",
@@ -818,6 +847,10 @@ const STATE_RECIPE: [&str; 15] = [
     "column staged_total integer",
     "constraint pk___pbps_state PRIMARY KEY (id)",
     "index CREATE UNIQUE INDEX pk___pbps_state ON public.__pbps_state USING btree (id)",
+    "table persistence permanent",
+    "table access method heap",
+    "table replica identity default",
+    "identity sequence of id bigint start 1 increment 1 minvalue 1 maxvalue 9223372036854775807 cache 1 no cycle",
 ];
 
 /// [`CREATE_CONFIDENTIAL`]'s catalog projection, measured on 18.6 and 16.15.
@@ -831,30 +864,88 @@ const CONFIDENTIAL_RECIPE: [&str; 6] = [
 ];
 
 /// [`CREATE_LOCK`]'s catalog projection, measured the same way.
-const LOCK_RECIPE: [&str; 6] = [
+const LOCK_RECIPE: [&str; 9] = [
     "column id integer NOT NULL",
     "column locked_by character varying(256) NOT NULL",
     "column locked_at timestamp(3) without time zone NOT NULL DEFAULT (clock_timestamp() AT TIME ZONE 'UTC'::text)",
     "constraint ck___pbps_lock_single CHECK ((id = 1))",
     "constraint pk___pbps_lock PRIMARY KEY (id)",
     "index CREATE UNIQUE INDEX pk___pbps_lock ON public.__pbps_lock USING btree (id)",
+    "table persistence permanent",
+    "table access method heap",
+    "table replica identity default",
 ];
 
 /// Every catalog fact about the two ledger tables that decides what a write to
-/// them does, one row each, in [`STATE_RECIPE`]'s spelling. Ordinary tables
-/// only: another kind is [`confirm_ledger_relations`]' refusal.
+/// them does, one row each, in [`STATE_RECIPE`]'s spelling.
+///
+/// **Every relation at a ledger name, not only ordinary tables** (#840). A
+/// view or another kind there is one `occupant <relkind>` row and nothing
+/// else, which [`ledger_problems`] reports in [`confirm_ledger_relations`]'
+/// words; filtering it out instead made `doctor` read a view as an absent
+/// ledger that every writing command then refused.
+///
+/// **And the table itself, not only what hangs off it** (#901). Persistence,
+/// access method, replica identity, a composite type it was created `OF`, and
+/// either end of `pg_inherits` are each a row, so an `UNLOGGED` ledger (which
+/// the engine truncates after a crash), a typed one (which `ALTER TYPE …
+/// CASCADE` changes without owning it) and one in an inheritance tree (whose
+/// reads reach a table never inspected) are differences, and a table with no
+/// columns still has facts to compare (#839). So is the identity column's
+/// sequence (#843): a descending or cycling one makes `ORDER BY id DESC` stop
+/// meaning newest-first. `pg_sequence` is world-readable, measured on 18.6 and
+/// 16.15, like the rest of this.
 fn ledger_facts() -> String {
     format!(
-        "WITH ledger AS (
-           SELECT c.oid, c.relname, c.relowner, c.relnamespace, c.relrowsecurity,
-                  c.relforcerowsecurity
+        "WITH occupant AS (
+           SELECT c.oid, c.relname, c.relkind, c.relowner, c.relnamespace, c.relrowsecurity,
+                  c.relforcerowsecurity, c.relpersistence, c.relreplident, c.reloftype, c.relam
              FROM pg_catalog.pg_class c
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
             WHERE n.nspname = '{LEDGER_SCHEMA}'
               AND c.relname IN ('{STATE_TABLE_NAME}', '{LOCK_TABLE_NAME}',
                                 '{CONFIDENTIAL_TABLE_NAME}')
-              AND c.relkind = 'r'
-         )
+         ),
+         ledger AS (SELECT * FROM occupant WHERE relkind = 'r')
+         SELECT o.relname, 'occupant ' || o.relkind::text AS fact
+           FROM occupant o WHERE o.relkind <> 'r'
+         UNION ALL
+         SELECT l.relname, 'table persistence '
+                || CASE l.relpersistence WHEN 'p' THEN 'permanent' WHEN 'u' THEN 'unlogged'
+                                         ELSE 'temporary' END
+           FROM ledger l
+         UNION ALL
+         SELECT l.relname, 'table access method ' || COALESCE(am.amname::text, 'none')
+           FROM ledger l LEFT JOIN pg_catalog.pg_am am ON am.oid = l.relam
+         UNION ALL
+         SELECT l.relname, 'table replica identity '
+                || CASE l.relreplident WHEN 'd' THEN 'default' WHEN 'n' THEN 'nothing'
+                                       WHEN 'f' THEN 'full' ELSE 'index' END
+           FROM ledger l
+         UNION ALL
+         SELECT l.relname, 'table of type ' || l.reloftype::pg_catalog.regtype::text
+           FROM ledger l WHERE l.reloftype <> 0
+         UNION ALL
+         SELECT l.relname, 'table inherits from ' || i.inhparent::pg_catalog.regclass::text
+           FROM ledger l JOIN pg_catalog.pg_inherits i ON i.inhrelid = l.oid
+         UNION ALL
+         SELECT l.relname, 'table inherited by ' || i.inhrelid::pg_catalog.regclass::text
+           FROM ledger l JOIN pg_catalog.pg_inherits i ON i.inhparent = l.oid
+         UNION ALL
+         SELECT l.relname, 'identity sequence of ' || a.attname || ' '
+                || pg_catalog.format_type(s.seqtypid, NULL)
+                || ' start ' || s.seqstart || ' increment ' || s.seqincrement
+                || ' minvalue ' || s.seqmin || ' maxvalue ' || s.seqmax
+                || ' cache ' || s.seqcache
+                || CASE WHEN s.seqcycle THEN ' cycle' ELSE ' no cycle' END
+           FROM ledger l
+           JOIN pg_catalog.pg_depend d
+             ON d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+            AND d.refobjid = l.oid AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+            AND d.deptype = 'i'
+           JOIN pg_catalog.pg_sequence s ON s.seqrelid = d.objid
+           JOIN pg_catalog.pg_attribute a ON a.attrelid = l.oid AND a.attnum = d.refobjsubid
+         UNION ALL
          SELECT l.relname,
                 'column ' || a.attname || ' ' || pg_catalog.format_type(a.atttypid, a.atttypmod)
                 || CASE WHEN a.attnotnull THEN ' NOT NULL' ELSE '' END
@@ -956,7 +1047,13 @@ fn relkind_name(relkind: &str) -> &'static str {
 }
 
 /// Whether the ledger's timeline-projection columns (issue #103) are already
-/// there.
+/// there — **all five**, not `state_version` alone (#841). The integrity check
+/// accepts any subset of them, since each is a plain nullable integer with no
+/// default; asking only for `state_version` let a ledger that had it and lacked
+/// another skip the migration, and `record`'s INSERT then failed on the missing
+/// column. Every caller wants "can the five be read and written": the
+/// migration adds whichever are missing (`ADD COLUMN IF NOT EXISTS`), and the
+/// timeline falls back to `state_json` until it has.
 ///
 /// `pg_attribute` joined by name, like [`ledger_is_there`]: world-readable, so
 /// this can be asked before [`migrate_timeline_columns`] decides whether to
@@ -969,17 +1066,23 @@ pub(crate) async fn timeline_columns_present(conn: &mut Conn) -> Result<bool, Db
         .map(|row| number(row, "present"))
         .transpose()?
         .unwrap_or(0);
-    Ok(present > 0)
+    Ok(present == STATE_TIMELINE_COLUMNS.len() as i64)
 }
 
 fn timeline_columns_probe() -> String {
+    let columns = STATE_TIMELINE_COLUMNS
+        .iter()
+        .map(|c| format!("'{c}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         "SELECT count(*)::int8 AS present
            FROM pg_catalog.pg_attribute a
            JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
           WHERE n.nspname = '{LEDGER_SCHEMA}' AND c.relname = '{STATE_TABLE_NAME}'
-            AND a.attname = 'state_version' AND a.attnum > 0 AND NOT a.attisdropped"
+            AND a.attname IN ({columns})
+            AND a.attnum > 0 AND NOT a.attisdropped"
     )
 }
 
@@ -1490,6 +1593,7 @@ pub async fn prune(conn: &mut Conn, keep: u32) -> Result<u64, LedgerError> {
     if !is_initialized(conn).await? {
         return Err(LedgerError::NotInitialized);
     }
+    refuse_an_untrusted_ledger(conn).await?;
     let ids: Vec<i64> = conn
         .query(SELECT_IDS)
         .await?
@@ -1596,6 +1700,12 @@ pub async fn unlock(conn: &mut Conn) -> Result<bool, DbError> {
     // mean a database whose `__pbps_state` had been dropped by hand reported
     // "not held" and left a live lock in place — with no command able to clear
     // it.
+    //
+    // The integrity check first (#396): a DELETE runs a trigger on the lock
+    // table, or writes through a view at its name, just as `lock`'s INSERT
+    // would. An absent lock table has no problems, so it still answers "not
+    // held" below.
+    refuse_an_untrusted_ledger(conn).await?;
     let guard = Recoverable::take(conn).await?;
     match conn.execute_with(DELETE_LOCK, &[]).await {
         Ok(n) => {
@@ -2026,11 +2136,11 @@ mod tests {
     fn the_legacy_query_binds_one_placeholder_per_id() {
         assert_eq!(
             select_legacy_state_json(3),
-            format!("SELECT id, state_json FROM {STATE_TABLE} WHERE id IN ($1, $2, $3)")
+            format!("SELECT id, state_json FROM ONLY {STATE_TABLE} WHERE id IN ($1, $2, $3)")
         );
         assert_eq!(
             select_legacy_state_json(1),
-            format!("SELECT id, state_json FROM {STATE_TABLE} WHERE id IN ($1)")
+            format!("SELECT id, state_json FROM ONLY {STATE_TABLE} WHERE id IN ($1)")
         );
     }
 

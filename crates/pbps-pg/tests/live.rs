@@ -6193,38 +6193,51 @@ async fn handled_ledger_failures_release_their_savepoint() {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn quiet_ledger_rewinds_restore_the_callers_same_named_savepoint() {
     let mut db = TestDb::create("quiet_recovery214").await;
+    // The DELETE has to fail on a ledger the integrity check accepts, since
+    // `unlock` now refuses any other shape before it gets there (#396): the
+    // recipe's tables, and a role that may read the lock table but not delete
+    // from it. A malformed lock table used to be the fixture.
+    let role = least_privilege_role(&mut db, "quiet214").await;
+    state::ensure_tables(&mut db.conn).await.unwrap();
     db.conn
-        .execute(
-            "CREATE TABLE public.__pbps_lock (wrong_column integer);
-                  CREATE TABLE public.caller_rows (id integer);
-                  BEGIN;
-                  INSERT INTO public.caller_rows VALUES (1);
-                  SAVEPOINT pbps_ensure_tables;
-                  INSERT INTO public.caller_rows VALUES (2)",
-        )
+        .execute(&format!(
+            "CREATE TABLE public.caller_rows (id integer);
+             GRANT SELECT ON public.__pbps_state, public.__pbps_lock TO {role};
+             GRANT SELECT, INSERT ON public.caller_rows TO {role};"
+        ))
         .await
         .unwrap();
-    let error = state::unlock(&mut db.conn)
+    let mut conn = Conn::connect(Driver::Postgres, &conn_str_as(&role, "live-test", &db.name))
         .await
-        .expect_err("an unreadable lock table remains an error");
-    assert_eq!(sqlstate(&error), "42703", "{error:?}");
-    db.conn
-        .execute("ROLLBACK TO SAVEPOINT pbps_ensure_tables")
+        .unwrap();
+    conn.execute(
+        "BEGIN;
+         INSERT INTO public.caller_rows VALUES (1);
+         SAVEPOINT pbps_ensure_tables;
+         INSERT INTO public.caller_rows VALUES (2)",
+    )
+    .await
+    .unwrap();
+    let error = state::unlock(&mut conn)
+        .await
+        .expect_err("a lock table this role may not delete from remains an error");
+    assert_eq!(sqlstate(&error), "42501", "{error:?}");
+    conn.execute("ROLLBACK TO SAVEPOINT pbps_ensure_tables")
         .await
         .expect("the caller's older savepoint survives the quiet rewind");
     assert_eq!(
-        number(&mut db.conn, "SELECT count(*)::int FROM public.caller_rows").await,
+        number(&mut conn, "SELECT count(*)::int FROM public.caller_rows").await,
         1,
         "rollback must reach the caller's checkpoint, not the tool's leaked marker"
     );
-    db.conn
-        .execute("RELEASE SAVEPOINT pbps_ensure_tables; COMMIT")
+    conn.execute("RELEASE SAVEPOINT pbps_ensure_tables; COMMIT")
         .await
         .unwrap();
     assert_eq!(
-        number(&mut db.conn, "SELECT count(*)::int FROM public.caller_rows").await,
+        number(&mut conn, "SELECT count(*)::int FROM public.caller_rows").await,
         1
     );
+    drop(conn);
     db.drop().await;
 }
 
@@ -6900,12 +6913,53 @@ async fn a_ledger_pbps_did_not_create_is_refused_before_any_write() {
             ),
             changed_by_attacker.clone(),
         ),
+        // #901: the table's own row, not only what hangs off it. Each of
+        // these kept every column, constraint and index of the recipe.
+        (
+            None,
+            "ALTER TABLE public.__pbps_lock SET UNLOGGED;".to_owned(),
+            "table persistence unlogged".to_owned(),
+        ),
+        (
+            None,
+            "DROP TYPE IF EXISTS public.pbps_lock_t;
+             CREATE TYPE public.pbps_lock_t AS
+               (id integer, locked_by varchar(256), locked_at timestamp(3));
+             ALTER TABLE public.__pbps_lock OF public.pbps_lock_t;"
+                .to_owned(),
+            "table of type public.pbps_lock_t".to_owned(),
+        ),
+        (
+            None,
+            "CREATE TABLE public.pbps_lock_child () INHERITS (public.__pbps_lock);".to_owned(),
+            "table inherited by public.pbps_lock_child".to_owned(),
+        ),
+        (
+            None,
+            "DROP TABLE IF EXISTS public.pbps_lock_parent;
+             CREATE TABLE public.pbps_lock_parent ();
+             ALTER TABLE public.__pbps_lock INHERIT public.pbps_lock_parent;"
+                .to_owned(),
+            "table inherits from public.pbps_lock_parent".to_owned(),
+        ),
+        (
+            None,
+            "ALTER TABLE public.__pbps_state ALTER COLUMN id SET INCREMENT BY -1;".to_owned(),
+            "increment -1".to_owned(),
+        ),
+        (
+            None,
+            "ALTER TABLE public.__pbps_lock DROP COLUMN id, DROP COLUMN locked_by, \
+             DROP COLUMN locked_at;"
+                .to_owned(),
+            "lacks column locked_by".to_owned(),
+        ),
     ];
     for (builder, extra, named) in &cases {
         let (extra, named) = (extra.as_str(), named.as_str());
         db.conn
             .execute(
-                "DROP TABLE IF EXISTS public.__pbps_state, public.__pbps_lock;
+                "DROP TABLE IF EXISTS public.__pbps_state, public.__pbps_lock CASCADE;
                  TRUNCATE public.pbps_marker;",
             )
             .await
@@ -27575,4 +27629,193 @@ async fn doctor_data_grant_targets_resolve_the_same_pending_table_identity() {
             .any(|g| g.why.contains("recorded grant target is absent")),
         "{missing:?}"
     );
+}
+
+/// #396, #842: `prune` and `unlock` delete, and a DELETE fires a trigger and
+/// follows a view exactly as `lock`'s INSERT does. Both now ask the integrity
+/// check before their DELETE, so neither writes through a decoy view into its
+/// base table nor runs a trigger someone attached, and each still works on the
+/// ledger pbps created.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn prune_and_unlock_refuse_an_untrusted_ledger_before_their_delete() {
+    let mut db = TestDb::create("prune_unlock396").await;
+
+    // Decoy views over tables with the ledger's columns and a row in each.
+    db.conn
+        .execute(
+            "CREATE TABLE public.state_base (
+                 id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                 applied_at timestamp(3) NOT NULL DEFAULT (clock_timestamp() AT TIME ZONE 'UTC'),
+                 kind varchar(16) NOT NULL, git_sha varchar(40), plan_checksum varchar(64),
+                 state_json text NOT NULL, operator varchar(128) NOT NULL, reason varchar(1000),
+                 state_version integer, tables_count integer, modules_count integer,
+                 staged_completed integer, staged_total integer);
+             INSERT INTO public.state_base (kind, state_json, operator)
+                  VALUES ('baseline', '{}', 'x'), ('apply', '{}', 'x');
+             CREATE TABLE public.lock_base (id integer PRIMARY KEY, locked_by varchar(256) NOT NULL,
+                 locked_at timestamp(3) NOT NULL DEFAULT (clock_timestamp() AT TIME ZONE 'UTC'));
+             INSERT INTO public.lock_base (id, locked_by) VALUES (1, 'someone');
+             CREATE VIEW public.__pbps_state AS SELECT * FROM public.state_base;
+             CREATE VIEW public.__pbps_lock AS SELECT * FROM public.lock_base;",
+        )
+        .await
+        .expect("the decoys");
+    let pruned = state::prune(&mut db.conn, 0).await;
+    let message = format!("{:?}", pruned.expect_err("prune through a view"));
+    assert!(message.contains("__pbps_state is a view"), "{message}");
+    let unlocked = state::unlock(&mut db.conn).await;
+    let message = format!("{:?}", unlocked.expect_err("unlock through a view"));
+    assert!(message.contains("__pbps_lock is a view"), "{message}");
+    assert_eq!(
+        number(&mut db.conn, "SELECT count(*)::int FROM public.state_base").await,
+        2,
+        "prune deleted through the view"
+    );
+    assert_eq!(
+        number(&mut db.conn, "SELECT count(*)::int FROM public.lock_base").await,
+        1,
+        "unlock deleted through the view"
+    );
+    // #840: the check `doctor` asks names the view rather than reading it as
+    // an absent ledger.
+    let problems = state::ledger_problems(&mut db.conn).await.unwrap();
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.contains("public.__pbps_state is a view, not an ordinary table")),
+        "{problems:?}"
+    );
+
+    // The recipe's tables with a DELETE trigger on each.
+    db.conn
+        .execute(
+            "DROP VIEW public.__pbps_state, public.__pbps_lock;
+             CREATE TABLE public.pbps_marker (n integer);
+             CREATE FUNCTION public.pbps_mark() RETURNS trigger LANGUAGE plpgsql AS
+               $$ BEGIN INSERT INTO public.pbps_marker VALUES (1); RETURN OLD; END $$;",
+        )
+        .await
+        .unwrap();
+    state::ensure_tables(&mut db.conn).await.unwrap();
+    state::record(&mut db.conn, &snapshot(StateKind::Baseline))
+        .await
+        .unwrap();
+    state::record(&mut db.conn, &snapshot(StateKind::Baseline))
+        .await
+        .unwrap();
+    state::lock(&mut db.conn, "live-test").await.unwrap();
+    db.conn
+        .execute(
+            "CREATE TRIGGER t BEFORE DELETE ON public.__pbps_state FOR EACH ROW
+                EXECUTE FUNCTION public.pbps_mark();
+             CREATE TRIGGER t BEFORE DELETE ON public.__pbps_lock FOR EACH ROW
+                EXECUTE FUNCTION public.pbps_mark();",
+        )
+        .await
+        .unwrap();
+    let pruned = format!("{:?}", state::prune(&mut db.conn, 1).await.unwrap_err());
+    assert!(pruned.contains("trigger t"), "{pruned}");
+    let unlocked = format!("{:?}", state::unlock(&mut db.conn).await.unwrap_err());
+    assert!(unlocked.contains("trigger t"), "{unlocked}");
+    assert_eq!(
+        number(&mut db.conn, "SELECT count(*)::int FROM public.pbps_marker").await,
+        0,
+        "a DELETE trigger ran"
+    );
+    assert_eq!(
+        number(&mut db.conn, "SELECT count(*)::int FROM public.__pbps_lock").await,
+        1
+    );
+
+    // The negative control: the same ledger without the triggers prunes and
+    // unlocks.
+    db.conn
+        .execute("DROP TRIGGER t ON public.__pbps_state; DROP TRIGGER t ON public.__pbps_lock;")
+        .await
+        .unwrap();
+    assert_eq!(state::prune(&mut db.conn, 1).await.unwrap(), 1);
+    assert!(state::unlock(&mut db.conn).await.unwrap());
+    db.drop().await;
+}
+
+/// #900, #845: a table inheriting from `__pbps_state` is refused by the
+/// integrity check, and until something runs that check the reads still see
+/// only the ledger: a child row with a higher `id` is not the newest
+/// snapshot, and `prune` neither deletes it nor fires its trigger.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn an_inheriting_table_is_neither_read_nor_pruned_as_the_ledger() {
+    let mut db = TestDb::create("inherit900").await;
+    state::ensure_tables(&mut db.conn).await.unwrap();
+    let first = state::record(&mut db.conn, &snapshot(StateKind::Baseline))
+        .await
+        .unwrap();
+    db.conn
+        .execute(
+            "CREATE TABLE public.pbps_marker (n integer);
+             CREATE FUNCTION public.pbps_mark() RETURNS trigger LANGUAGE plpgsql AS
+               $$ BEGIN INSERT INTO public.pbps_marker VALUES (1); RETURN OLD; END $$;
+             CREATE TABLE public.state_child () INHERITS (public.__pbps_state);
+             INSERT INTO public.state_child (id, kind, state_json, operator)
+                  OVERRIDING SYSTEM VALUE VALUES (999, 'apply', '{\"forged\": true}', 'x');
+             CREATE TRIGGER t BEFORE DELETE ON public.state_child FOR EACH ROW
+                EXECUTE FUNCTION public.pbps_mark();",
+        )
+        .await
+        .expect("the inheriting table");
+
+    let latest = state::latest(&mut db.conn).await.unwrap().unwrap();
+    assert_eq!(latest.id, first, "the child's row read as the newest");
+    let history = state::history(&mut db.conn, 10).await.unwrap();
+    assert!(history.iter().all(|e| e.id != 999), "{history:?}");
+    let timeline = state::timeline(&mut db.conn, 10).await.unwrap();
+    assert!(timeline.iter().all(|e| e.id != 999), "{timeline:?}");
+
+    let pruned = format!("{:?}", state::prune(&mut db.conn, 0).await.unwrap_err());
+    assert!(pruned.contains("state_child"), "{pruned}");
+    assert_eq!(
+        number(&mut db.conn, "SELECT count(*)::int FROM public.state_child").await,
+        1
+    );
+    assert_eq!(
+        number(&mut db.conn, "SELECT count(*)::int FROM public.pbps_marker").await,
+        0
+    );
+    db.drop().await;
+}
+
+/// #841: a `__pbps_state` holding `state_version` and lacking another timeline
+/// column is migrated, not skipped, so `record` succeeds rather than failing
+/// on its INSERT.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_ledger_lacking_one_timeline_column_is_migrated_before_the_record() {
+    let mut db = TestDb::create("timeline841").await;
+    state::ensure_tables(&mut db.conn).await.unwrap();
+    db.conn
+        .execute("ALTER TABLE public.__pbps_state DROP COLUMN staged_total")
+        .await
+        .unwrap();
+    assert!(
+        state::ledger_problems(&mut db.conn)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a subset of the timeline columns is still the recipe"
+    );
+    state::record(&mut db.conn, &snapshot(StateKind::Baseline))
+        .await
+        .expect("the migration adds the missing column before the insert");
+    assert_eq!(
+        number(
+            &mut db.conn,
+            "SELECT count(*)::int FROM pg_catalog.pg_attribute
+              WHERE attrelid = 'public.__pbps_state'::regclass AND attname = 'staged_total'
+                AND NOT attisdropped"
+        )
+        .await,
+        1
+    );
+    db.drop().await;
 }
