@@ -514,6 +514,47 @@ mod tests {
     }
 
     #[test]
+    fn a_mapped_disk_candidate_keeps_the_engine_scope_unknown_on_either_side() {
+        let mut loaded = side("180006", "e1");
+        loaded.executables.libraries = vec![ExecutableIdentity {
+            role: ExecutableRole::Preloaded,
+            path: "/usr/lib/postgresql/18/lib/hstore.so".into(),
+            digest: Some("same-content".into()),
+            provenance: Provenance::LoadedContent,
+            disk_differs_from_loaded: Some(false),
+        }];
+        assert_eq!(compare(&loaded, &loaded, &[]).verdict(), Verdict::Verified);
+        let mut candidate = loaded.clone();
+        candidate.executables.libraries[0].provenance = Provenance::DiskCandidate;
+        for (target, resolver, side) in [
+            (&candidate, &loaded, Side::Target),
+            (&loaded, &candidate, Side::Resolver),
+        ] {
+            let report = compare(target, resolver, &[]);
+            assert_eq!(
+                report.facts["library:/usr/lib/postgresql/18/lib/hstore.so"],
+                FactStatus::Unknown {
+                    side,
+                    reason: "mapped content not readable, disk candidate only".into(),
+                }
+            );
+            assert_eq!(
+                report.verdict(),
+                Verdict::Unknown(vec!["library:/usr/lib/postgresql/18/lib/hstore.so".into()])
+            );
+        }
+        candidate.executables.libraries[0].role = ExecutableRole::LateLoaded;
+        assert_eq!(
+            compare(&loaded, &candidate, &[]).verdict(),
+            Verdict::Verified
+        );
+        assert_eq!(
+            compare(&candidate, &loaded, &[]).verdict(),
+            Verdict::Verified
+        );
+    }
+
+    #[test]
     fn identical_sides_verify_and_the_report_names_the_rule() {
         let report = compare(&side("180006", "e1"), &side("180006", "e1"), &[]);
         assert_eq!(report.verdict(), Verdict::Verified, "{report:?}");

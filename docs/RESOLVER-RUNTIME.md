@@ -238,6 +238,13 @@ body, or by an operator's `LD_PRELOAD`, is outside this proof domain; and a
 target whose recorded collation version has drifted from its provider's is
 recorded as a limitation, not a resolver mismatch.
 
+Both engine rules require loaded-content evidence for a library already mapped
+into the backend. If `map_files` cannot supply that content, a digest obtained
+from the disk path remains `Unknown` on that side, even when the digests match
+or a measured build mapping names them (#698). A required library not yet
+loaded may still qualify through its disk candidate; it can match the same
+content already loaded on the other side.
+
 SQL Server is qualified under its own rules, measured on 2025 (17.0) for Linux.
 Qualification is not a binding adapter: SQL Server binding stays unimplemented
 (#619, #620).
