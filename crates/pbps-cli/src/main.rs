@@ -1,5 +1,6 @@
 //! `pbps` — declarative database schema version control.
 
+mod adopt;
 mod baseline;
 mod cost;
 mod db;
@@ -1093,7 +1094,7 @@ fn cmd_pull(
     // plain-propagating command gets, and `introspect`'s own `DbError` cannot
     // hold that.
     let dialect = dialect(project)?;
-    let pulled = db::runtime()?.block_on(async {
+    let mut pulled = db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
         let mut pulled =
             crate::engine::introspect(&mut conn, crate::engine::Read::Snapshot).await?;
@@ -1164,6 +1165,10 @@ fn cmd_pull(
         }
         Ok::<_, anyhow::Error>(pulled)
     })?;
+    // Before anything is reported: what `validate` would refuse is reported
+    // as left out, beside what the reader could not express, rather than
+    // written into files the next command refuses (#902).
+    adopt::leave_out_what_validate_refuses(&mut pulled, dialect.as_ref());
 
     for w in pulled.onboarding_notices.iter().chain(&pulled.warnings) {
         eprintln!("warning: {w}");
@@ -1260,48 +1265,18 @@ fn cmd_pull(
     )
     .map_err(|b| anyhow::anyhow!("pull could not mint identities:\n{}", report::blockers(&b)))?;
 
-    // Before the first file: two declarations whose names differ only in case
-    // encode to filenames that differ only in case, and a filesystem that
-    // ignores case would keep one of each — the second silently written over
-    // the first, with the identity file naming both (DECISIONS 135).
-    declaration_file::refuse_folded_paths(&declaration_file::paths_of(&dir, &pulled.schema)?)?;
+    // Staged first, outside the project, and loaded back through the checks
+    // `validate` runs: an unforced pull into a fresh project and a forced one
+    // over an old one both have to end with files the next command accepts,
+    // and the only way to know that before touching the project is to have
+    // asked about the files themselves (#902).
+    let stage = adopt::Stage::new("pull")?;
+    adopt::write_declarations(stage.path(), &pulled.schema, &pulled.public_execute)?;
+    adopt::check_staged(stage.path(), dialect.as_ref()).context("pull wrote nothing")?;
+    drop(stage);
+
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot create `{}`", dir.display()))?;
-    let mut written: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
-    for (name, table) in &pulled.schema.tables {
-        let path = declaration_file::path(&dir, name, None)?;
-        std::fs::write(&path, pbps_load::render(name, table, &[], None))
-            .with_context(|| format!("cannot write `{}`", path.display()))?;
-        written.insert(path);
-    }
-    // Modules go into files of their own, named for the kind as well as the
-    // object: a view and a table cannot collide in the database, so they must
-    // not collide on disk either (ADR-0002).
-    for (id, module) in &pulled.schema.modules {
-        let path = declaration_file::module_path(&dir, id, module.kind)?;
-        std::fs::write(
-            &path,
-            pbps_load::render_module(
-                id,
-                module,
-                &Default::default(),
-                pulled.public_execute.contains(id),
-            ),
-        )
-        .with_context(|| format!("cannot write `{}`", path.display()))?;
-        written.insert(path);
-    }
-    // Roles (ADR-0005), one file each, with the grants the catalog holds on
-    // objects pbps can express.
-    for (name, role) in &pulled.schema.roles {
-        let path = declaration_file::role_path(&dir, name)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("cannot create `{}`", parent.display()))?;
-        }
-        std::fs::write(&path, pbps_load::render_role(name, role, &[]))
-            .with_context(|| format!("cannot write `{}`", path.display()))?;
-        written.insert(path);
-    }
+    let written = adopt::write_declarations(&dir, &pulled.schema, &pulled.public_execute)?;
 
     // What a forced pull did not write, it removes. Leaving it would be worse
     // than deleting it: a declaration for an object that is gone plans its
@@ -1327,7 +1302,8 @@ fn cmd_pull(
     }
     if !removed.is_empty() {
         eprintln!(
-            "removed {} declaration file(s) for objects this database does not have:",
+            "removed {} declaration file(s) this pull did not write — the object is gone from this \
+             database, or was left out above:",
             removed.len()
         );
         for p in &removed {

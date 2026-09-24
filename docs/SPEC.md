@@ -1191,6 +1191,13 @@ full state.
 "I already have a database". Without it, the cost of adoption is transcribing two
 hundred tables by hand.
 
+What `pull` and `init --from` write is what `validate` accepts. An object the
+reader can express but the validator refuses — an identity whose increment
+outruns its type, a table in a schema named `$user` — is left out and named with
+the validator's reason, as anything the model cannot express already is; what
+is written is staged, loaded back and validated before any file reaches the
+project (DEC-902.1).
+
 **The onboarding workflow**: `pull` designates one **source-of-truth environment**
 (usually prod — the one piece of reality that must not be broken) and generates
 the declarations and the ids file from it. Then diff against every other

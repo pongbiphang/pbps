@@ -1898,6 +1898,19 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
             "module `{id}` is declared in `{schema}`, which this dialect's pull never reads:              `pg_catalog`, `information_schema` and every schema whose name begins with `pg_`              are excluded from the managed set. The engine would create the module and no plan              could ever see it again — and `pg_temp` is worse than invisible, because it is              this engine's alias for the session's temporary schema: measured, `CREATE VIEW              \"pg_temp\".\"v\"` leaves a `pg_temp_4.v` that disappears with the connection.              Declare the module in a schema of the project's own"
         )));
     }
+    // The rule a table and a grant already have, for the same reason: every
+    // module statement is emitted through `scoped`, whose `write_path` refuses
+    // `$user` (`NOT_A_SCHEMA_A_PATH_CAN_NAME`), so a module there passed
+    // `validate` and stopped the plan instead — and `pull` wrote one, because
+    // it writes what `validate` accepts (#705, #902).
+    if schema == NOT_A_SCHEMA_A_PATH_CAN_NAME {
+        found.push(invalid(format!(
+            "module `{id}` is declared in a schema named `{schema}`, which this engine reads as \
+             the current role's own schema wherever a `search_path` names it — quoting does not \
+             make it literal. Every statement this dialect emits for a module sets the path \
+             first, so no plan can carry this one. Declare it under a name the path can carry"
+        )));
+    }
     match module.kind {
         ModuleKind::Function | ModuleKind::Procedure => match id.args() {
             // `signature` is the one that says what a routine without an
@@ -3643,6 +3656,46 @@ mod tests {
             let found =
                 Postgres::new().validate_module(&id(key), &module(ModuleKind::View, "SELECT 1"));
             assert!(found.is_empty(), "`{key}` is a project's own: {found:?}");
+        }
+    }
+
+    /// `$user` is refused for a module as it is for a table and a grant: the
+    /// emitter's `write_path` cannot scope a statement to it, so a module
+    /// there used to pass `validate` and stop the plan (#705).
+    #[test]
+    fn a_module_in_a_schema_named_dollar_user_is_refused_before_the_plan() {
+        for (key, kind, definition) in [
+            ("$user.v", ModuleKind::View, "SELECT 1 AS x"),
+            (
+                "$user.f(integer)",
+                ModuleKind::Function,
+                "(a integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "$user.t.audit",
+                ModuleKind::Trigger,
+                "AFTER INSERT ON \"$user\".t EXECUTE FUNCTION app.f()",
+            ),
+        ] {
+            let found = Postgres::new().validate_module(&id(key), &module(kind, definition));
+            assert!(
+                found
+                    .iter()
+                    .any(|e| e.to_string().contains("schema named `$user`")),
+                "`{key}` was accepted: {found:?}"
+            );
+        }
+        // The name is the whole rule: a schema that merely contains it, or
+        // spells it in another case, is an ordinary schema the path can name.
+        for key in ["user.v", "$user2.v", "$USER.v", "my$user.v"] {
+            let found =
+                Postgres::new().validate_module(&id(key), &module(ModuleKind::View, "SELECT 1"));
+            assert!(
+                !found
+                    .iter()
+                    .any(|e| e.to_string().contains("schema named `$user`")),
+                "`{key}` was refused: {found:?}"
+            );
         }
     }
 
