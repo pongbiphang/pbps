@@ -1,0 +1,427 @@
+[
+  {
+    "major": 16,
+    "setup": "CREATE SCHEMA app; CREATE TYPE app.pair AS (id integer,label text); CREATE TYPE app.wrapper AS (item app.pair,items app.pair[]); CREATE TABLE app.t(p app.pair); CREATE TABLE app.u(w app.wrapper); CREATE TABLE app.src(p app.pair); CREATE FUNCTION app.bump(integer) RETURNS integer LANGUAGE sql RETURN $1+1; CREATE FUNCTION app.label(text) RETURNS text LANGUAGE sql RETURN upper($1); CREATE FUNCTION app.doc() RETURNS jsonb LANGUAGE sql RETURN '{\"x\":1,\"arr\":[1,2]}'::jsonb; CREATE FUNCTION app.number() RETURNS integer LANGUAGE sql RETURN 1; CREATE TYPE app.intspan AS RANGE(SUBTYPE=integer,MULTIRANGE_TYPE_NAME=app.intspans); CREATE TYPE app.nestedspan AS RANGE(SUBTYPE=int4range); CREATE FUNCTION app.json_pair(jsonb) RETURNS app.pair LANGUAGE sql RETURN ROW(1,'json')::app.pair; CREATE CAST(jsonb AS app.pair) WITH FUNCTION app.json_pair(jsonb);",
+    "cases": {
+      "field_assignment": {
+        "kind": "routine",
+        "sql": "CREATE FUNCTION app.field_assignment() RETURNS void LANGUAGE sql BEGIN ATOMIC UPDATE app.t SET p.id=app.number(),p.label=app.label('x'); END",
+        "created": true,
+        "fixture_line": 0,
+        "tags": [
+          "ALIAS",
+          "CONST",
+          "FIELDSTORE",
+          "FROMEXPR",
+          "FUNCEXPR",
+          "QUERY",
+          "RANGETBLENTRY",
+          "RANGETBLREF",
+          "RTEPERMISSIONINFO",
+          "TARGETENTRY",
+          "VAR"
+        ]
+      },
+      "nested_assignment": {
+        "kind": "routine",
+        "sql": "CREATE FUNCTION app.nested_assignment() RETURNS void LANGUAGE sql BEGIN ATOMIC UPDATE app.u SET w.item.label=app.label('x'),w.items[1].id=app.number(); END",
+        "created": true,
+        "fixture_line": 1,
+        "tags": [
+          "ALIAS",
+          "CASETESTEXPR",
+          "CONST",
+          "FIELDSTORE",
+          "FROMEXPR",
+          "FUNCEXPR",
+          "QUERY",
+          "RANGETBLENTRY",
+          "RANGETBLREF",
+          "RTEPERMISSIONINFO",
+          "SUBSCRIPTINGREF",
+          "TARGETENTRY",
+          "VAR"
+        ]
+      },
+      "ranges": {
+        "kind": "view",
+        "sql": "SELECT '[1,2)'::int4range AS c_int4range, '[1,2)'::int8range AS c_int8range, '[1,2)'::numrange AS c_numrange, '[2020-01-01,2020-01-02)'::daterange AS c_daterange, '[2020-01-01,2020-01-02)'::tsrange AS c_tsrange, '[2020-01-01 00:00+00,2020-01-02 00:00+00)'::tstzrange AS c_tstzrange, '{[1,2)}'::int4multirange AS c_int4multirange, '{[1,2)}'::int8multirange AS c_int8multirange, '{[1,2)}'::nummultirange AS c_nummultirange, '{[2020-01-01,2020-01-02)}'::datemultirange AS c_datemultirange, '{[2020-01-01,2020-01-02)}'::tsmultirange AS c_tsmultirange, '{[2020-01-01 00:00+00,2020-01-02 00:00+00)}'::tstzmultirange AS c_tstzmultirange, '[1,2)'::app.intspan AS custom_range, '{[1,2)}'::app.intspans AS custom_multirange, '[\"[1,2)\",\"[3,4)\")'::app.nestedspan AS nested_range, 'empty'::int4range AS empty_range, '(,)'::int4range AS unbounded_range",
+        "created": true,
+        "fixture_line": 2,
+        "tags": [
+          "CONST",
+          "FROMEXPR",
+          "QUERY",
+          "TARGETENTRY"
+        ]
+      },
+      "json_object": {
+        "kind": "view",
+        "sql": "SELECT JSON_OBJECT('number' VALUE app.number() RETURNING jsonb) AS value",
+        "created": true,
+        "fixture_line": 3,
+        "tags": [
+          "CONST",
+          "FROMEXPR",
+          "FUNCEXPR",
+          "JSONCONSTRUCTOREXPR",
+          "JSONFORMAT",
+          "JSONRETURNING",
+          "QUERY",
+          "TARGETENTRY"
+        ]
+      },
+      "json_array": {
+        "kind": "view",
+        "sql": "SELECT JSON_ARRAY(app.number(),app.doc() RETURNING jsonb) AS value",
+        "created": true,
+        "fixture_line": 4,
+        "tags": [
+          "FROMEXPR",
+          "FUNCEXPR",
+          "JSONCONSTRUCTOREXPR",
+          "JSONFORMAT",
+          "JSONRETURNING",
+          "QUERY",
+          "TARGETENTRY"
+        ]
+      },
+      "json_predicate": {
+        "kind": "view",
+        "sql": "SELECT app.doc() IS JSON OBJECT WITH UNIQUE KEYS AS value",
+        "created": true,
+        "fixture_line": 5,
+        "tags": [
+          "FROMEXPR",
+          "FUNCEXPR",
+          "JSONISPREDICATE",
+          "QUERY",
+          "TARGETENTRY"
+        ]
+      },
+      "json_aggregate": {
+        "kind": "view",
+        "sql": "SELECT JSON_ARRAYAGG(app.label((p).label) RETURNING jsonb) AS value FROM app.t",
+        "created": true,
+        "fixture_line": 6,
+        "tags": [
+          "AGGREF",
+          "ALIAS",
+          "FIELDSELECT",
+          "FROMEXPR",
+          "FUNCEXPR",
+          "JSONCONSTRUCTOREXPR",
+          "JSONFORMAT",
+          "JSONRETURNING",
+          "QUERY",
+          "RANGETBLENTRY",
+          "RANGETBLREF",
+          "RTEPERMISSIONINFO",
+          "TARGETENTRY",
+          "VAR"
+        ]
+      }
+    }
+  },
+  {
+    "major": 18,
+    "setup": "CREATE SCHEMA app; CREATE TYPE app.pair AS (id integer,label text); CREATE TYPE app.wrapper AS (item app.pair,items app.pair[]); CREATE TABLE app.t(p app.pair); CREATE TABLE app.u(w app.wrapper); CREATE TABLE app.src(p app.pair); CREATE FUNCTION app.bump(integer) RETURNS integer LANGUAGE sql RETURN $1+1; CREATE FUNCTION app.label(text) RETURNS text LANGUAGE sql RETURN upper($1); CREATE FUNCTION app.doc() RETURNS jsonb LANGUAGE sql RETURN '{\"x\":1,\"arr\":[1,2]}'::jsonb; CREATE FUNCTION app.number() RETURNS integer LANGUAGE sql RETURN 1; CREATE TYPE app.intspan AS RANGE(SUBTYPE=integer,MULTIRANGE_TYPE_NAME=app.intspans); CREATE TYPE app.nestedspan AS RANGE(SUBTYPE=int4range); CREATE FUNCTION app.json_pair(jsonb) RETURNS app.pair LANGUAGE sql RETURN ROW(1,'json')::app.pair; CREATE CAST(jsonb AS app.pair) WITH FUNCTION app.json_pair(jsonb);",
+    "cases": {
+      "field_assignment": {
+        "kind": "routine",
+        "sql": "CREATE FUNCTION app.field_assignment() RETURNS void LANGUAGE sql BEGIN ATOMIC UPDATE app.t SET p.id=app.number(),p.label=app.label('x'); END",
+        "created": true,
+        "fixture_line": 0,
+        "tags": [
+          "ALIAS",
+          "CONST",
+          "FIELDSTORE",
+          "FROMEXPR",
+          "FUNCEXPR",
+          "QUERY",
+          "RANGETBLENTRY",
+          "RANGETBLREF",
+          "RTEPERMISSIONINFO",
+          "TARGETENTRY",
+          "VAR"
+        ]
+      },
+      "nested_assignment": {
+        "kind": "routine",
+        "sql": "CREATE FUNCTION app.nested_assignment() RETURNS void LANGUAGE sql BEGIN ATOMIC UPDATE app.u SET w.item.label=app.label('x'),w.items[1].id=app.number(); END",
+        "created": true,
+        "fixture_line": 1,
+        "tags": [
+          "ALIAS",
+          "CASETESTEXPR",
+          "CONST",
+          "FIELDSTORE",
+          "FROMEXPR",
+          "FUNCEXPR",
+          "QUERY",
+          "RANGETBLENTRY",
+          "RANGETBLREF",
+          "RTEPERMISSIONINFO",
+          "SUBSCRIPTINGREF",
+          "TARGETENTRY",
+          "VAR"
+        ]
+      },
+      "ranges": {
+        "kind": "view",
+        "sql": "SELECT '[1,2)'::int4range AS c_int4range, '[1,2)'::int8range AS c_int8range, '[1,2)'::numrange AS c_numrange, '[2020-01-01,2020-01-02)'::daterange AS c_daterange, '[2020-01-01,2020-01-02)'::tsrange AS c_tsrange, '[2020-01-01 00:00+00,2020-01-02 00:00+00)'::tstzrange AS c_tstzrange, '{[1,2)}'::int4multirange AS c_int4multirange, '{[1,2)}'::int8multirange AS c_int8multirange, '{[1,2)}'::nummultirange AS c_nummultirange, '{[2020-01-01,2020-01-02)}'::datemultirange AS c_datemultirange, '{[2020-01-01,2020-01-02)}'::tsmultirange AS c_tsmultirange, '{[2020-01-01 00:00+00,2020-01-02 00:00+00)}'::tstzmultirange AS c_tstzmultirange, '[1,2)'::app.intspan AS custom_range, '{[1,2)}'::app.intspans AS custom_multirange, '[\"[1,2)\",\"[3,4)\")'::app.nestedspan AS nested_range, 'empty'::int4range AS empty_range, '(,)'::int4range AS unbounded_range",
+        "created": true,
+        "fixture_line": 2,
+        "tags": [
+          "CONST",
+          "FROMEXPR",
+          "QUERY",
+          "TARGETENTRY"
+        ]
+      },
+      "json_object": {
+        "kind": "view",
+        "sql": "SELECT JSON_OBJECT('number' VALUE app.number() RETURNING jsonb) AS value",
+        "created": true,
+        "fixture_line": 3,
+        "tags": [
+          "CONST",
+          "FROMEXPR",
+          "FUNCEXPR",
+          "JSONCONSTRUCTOREXPR",
+          "JSONFORMAT",
+          "JSONRETURNING",
+          "QUERY",
+          "TARGETENTRY"
+        ]
+      },
+      "json_array": {
+        "kind": "view",
+        "sql": "SELECT JSON_ARRAY(app.number(),app.doc() RETURNING jsonb) AS value",
+        "created": true,
+        "fixture_line": 4,
+        "tags": [
+          "FROMEXPR",
+          "FUNCEXPR",
+          "JSONCONSTRUCTOREXPR",
+          "JSONFORMAT",
+          "JSONRETURNING",
+          "QUERY",
+          "TARGETENTRY"
+        ]
+      },
+      "json_predicate": {
+        "kind": "view",
+        "sql": "SELECT app.doc() IS JSON OBJECT WITH UNIQUE KEYS AS value",
+        "created": true,
+        "fixture_line": 5,
+        "tags": [
+          "FROMEXPR",
+          "FUNCEXPR",
+          "JSONISPREDICATE",
+          "QUERY",
+          "TARGETENTRY"
+        ]
+      },
+      "json_aggregate": {
+        "kind": "view",
+        "sql": "SELECT JSON_ARRAYAGG(app.label((p).label) RETURNING jsonb) AS value FROM app.t",
+        "created": true,
+        "fixture_line": 6,
+        "tags": [
+          "AGGREF",
+          "ALIAS",
+          "FIELDSELECT",
+          "FROMEXPR",
+          "FUNCEXPR",
+          "JSONCONSTRUCTOREXPR",
+          "JSONFORMAT",
+          "JSONRETURNING",
+          "QUERY",
+          "RANGETBLENTRY",
+          "RANGETBLREF",
+          "RTEPERMISSIONINFO",
+          "TARGETENTRY",
+          "VAR"
+        ]
+      },
+      "json_composite": {
+        "kind": "view",
+        "sql": "SELECT (JSON_QUERY(app.doc(), '$' RETURNING app.pair)).id AS value",
+        "created": true,
+        "fixture_line": 7,
+        "tags": [
+          "CONST",
+          "FIELDSELECT",
+          "FROMEXPR",
+          "FUNCEXPR",
+          "JSONBEHAVIOR",
+          "JSONEXPR",
+          "JSONFORMAT",
+          "JSONRETURNING",
+          "QUERY",
+          "TARGETENTRY"
+        ]
+      },
+      "json_siblings": {
+        "kind": "view",
+        "sql": "SELECT * FROM JSON_TABLE(app.doc(), '$' COLUMNS(NESTED PATH '$.arr[*]' COLUMNS(v integer PATH '$'), NESTED PATH '$.arr[*]' COLUMNS(w integer PATH '$'))) AS j",
+        "created": true,
+        "fixture_line": 8,
+        "tags": [
+          "ALIAS",
+          "CASETESTEXPR",
+          "CONST",
+          "FROMEXPR",
+          "FUNCEXPR",
+          "JSONBEHAVIOR",
+          "JSONEXPR",
+          "JSONFORMAT",
+          "JSONRETURNING",
+          "JSONTABLEPATH",
+          "JSONTABLEPATHSCAN",
+          "JSONTABLESIBLINGJOIN",
+          "QUERY",
+          "RANGETBLENTRY",
+          "RANGETBLREF",
+          "TABLEFUNC",
+          "TARGETENTRY",
+          "VAR"
+        ]
+      },
+      "json_value": {
+        "kind": "view",
+        "sql": "SELECT JSON_VALUE(app.doc(), '$.missing' RETURNING integer DEFAULT app.number() ON EMPTY) AS value",
+        "created": true,
+        "fixture_line": 9,
+        "tags": [
+          "CONST",
+          "FROMEXPR",
+          "FUNCEXPR",
+          "JSONBEHAVIOR",
+          "JSONEXPR",
+          "JSONFORMAT",
+          "JSONRETURNING",
+          "QUERY",
+          "TARGETENTRY"
+        ]
+      },
+      "json_query": {
+        "kind": "view",
+        "sql": "SELECT JSON_QUERY(app.doc(), '$.x' RETURNING jsonb WITH WRAPPER) AS value",
+        "created": true,
+        "fixture_line": 10,
+        "tags": [
+          "CONST",
+          "FROMEXPR",
+          "FUNCEXPR",
+          "JSONBEHAVIOR",
+          "JSONEXPR",
+          "JSONFORMAT",
+          "JSONRETURNING",
+          "QUERY",
+          "TARGETENTRY"
+        ]
+      },
+      "json_exists": {
+        "kind": "view",
+        "sql": "SELECT JSON_EXISTS(app.doc(), '$.x ? (@ > $v)' PASSING app.number() AS v) AS value",
+        "created": true,
+        "fixture_line": 11,
+        "tags": [
+          "CONST",
+          "FROMEXPR",
+          "FUNCEXPR",
+          "JSONBEHAVIOR",
+          "JSONEXPR",
+          "JSONFORMAT",
+          "JSONRETURNING",
+          "QUERY",
+          "TARGETENTRY"
+        ]
+      },
+      "json_serialize": {
+        "kind": "view",
+        "sql": "SELECT JSON_SERIALIZE(app.doc() RETURNING text) AS value",
+        "created": true,
+        "fixture_line": 12,
+        "tags": [
+          "CASETESTEXPR",
+          "COERCEVIAIO",
+          "FROMEXPR",
+          "FUNCEXPR",
+          "JSONCONSTRUCTOREXPR",
+          "JSONFORMAT",
+          "JSONRETURNING",
+          "QUERY",
+          "TARGETENTRY"
+        ]
+      },
+      "json_table": {
+        "kind": "view",
+        "sql": "SELECT * FROM JSON_TABLE(app.doc(), '$' COLUMNS(n integer PATH '$.x' DEFAULT app.number() ON EMPTY, NESTED PATH '$.arr[*]' COLUMNS(v integer PATH '$'))) AS j",
+        "created": true,
+        "fixture_line": 13,
+        "tags": [
+          "ALIAS",
+          "CASETESTEXPR",
+          "CONST",
+          "FROMEXPR",
+          "FUNCEXPR",
+          "JSONBEHAVIOR",
+          "JSONEXPR",
+          "JSONFORMAT",
+          "JSONRETURNING",
+          "JSONTABLEPATH",
+          "JSONTABLEPATHSCAN",
+          "QUERY",
+          "RANGETBLENTRY",
+          "RANGETBLREF",
+          "TABLEFUNC",
+          "TARGETENTRY",
+          "VAR"
+        ]
+      },
+      "returning_oldnew": {
+        "kind": "routine",
+        "sql": "CREATE FUNCTION app.returning_oldnew() RETURNS integer LANGUAGE sql BEGIN ATOMIC UPDATE app.t SET p.id=2 RETURNING (OLD.p).id; END",
+        "created": true,
+        "fixture_line": 14,
+        "tags": [
+          "ALIAS",
+          "CONST",
+          "FIELDSELECT",
+          "FIELDSTORE",
+          "FROMEXPR",
+          "QUERY",
+          "RANGETBLENTRY",
+          "RANGETBLREF",
+          "RTEPERMISSIONINFO",
+          "TARGETENTRY",
+          "VAR"
+        ]
+      },
+      "merge_action": {
+        "kind": "routine",
+        "sql": "CREATE FUNCTION app.merge_action() RETURNS SETOF text LANGUAGE sql BEGIN ATOMIC MERGE INTO app.t d USING app.src s ON (d.p).id=(s.p).id WHEN MATCHED THEN UPDATE SET p.id=(s.p).id RETURNING merge_action(); END",
+        "created": true,
+        "fixture_line": 15,
+        "tags": [
+          "ALIAS",
+          "FIELDSELECT",
+          "FIELDSTORE",
+          "FROMEXPR",
+          "MERGEACTION",
+          "MERGESUPPORTFUNC",
+          "OPEXPR",
+          "QUERY",
+          "RANGETBLENTRY",
+          "RANGETBLREF",
+          "RTEPERMISSIONINFO",
+          "TARGETENTRY",
+          "VAR"
+        ]
+      }
+    }
+  }
+]

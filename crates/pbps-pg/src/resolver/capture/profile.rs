@@ -154,6 +154,10 @@ pub(super) fn datum(catalog: &Catalog, oid: u32) -> Result<(), Uncovered> {
                 ("enum_out", "enum_out")
             } else if kind == "c" {
                 ("record_out", "record_out")
+            } else if kind == "r" {
+                ("range_out", "range_out")
+            } else if kind == "m" {
+                ("multirange_out", "multirange_out")
             } else if let Some(builtin) = builtin {
                 // int2vector/oidvector are category A but use their own
                 // exact builtin outputs, not generic array_out.
@@ -170,6 +174,9 @@ pub(super) fn datum(catalog: &Catalog, oid: u32) -> Result<(), Uncovered> {
                 || logical::string(function, "prosrc") != Ok(symbol)
             {
                 return Err(fail());
+            }
+            if matches!(kind, "r" | "m") {
+                output(catalog, range_output_child(catalog, oid, kind)?, visiting)?;
             }
             if symbol == "array_out" {
                 output(catalog, element, visiting)?;
@@ -194,6 +201,94 @@ pub(super) fn datum(catalog: &Catalog, oid: u32) -> Result<(), Uncovered> {
         Ok(())
     }
     output(catalog, oid, &mut BTreeSet::new())
+}
+
+// Range output initializes TYPECACHE_RANGE_INFO before printing its bounds.
+// Both supported majors prepare the comparator, canonicalizer and subdiff
+// with fmgr_info_cxt. C/PL callbacks can load arbitrary libraries at that point
+// even without a call; core internal/SQL dispatch needs no such loader.
+fn range_output_child(catalog: &Catalog, oid: u32, kind: &str) -> Result<u32, Uncovered> {
+    let fail = || Uncovered::class("pg_range", "unqualified range output metadata");
+    let key = if kind == "r" {
+        "rngtypid"
+    } else {
+        "rngmultitypid"
+    };
+    let mut selected = None;
+    for row in catalog.rows.get("pg_range").ok_or_else(fail)? {
+        if logical::number(row, key).map_err(|_| fail())? == oid {
+            if selected.is_some() {
+                return Err(fail());
+            }
+            selected = Some(row);
+        }
+    }
+    let row = selected.ok_or_else(fail)?;
+    if kind == "m" {
+        let range = logical::number(row, "rngtypid").map_err(|_| fail())?;
+        if range == 0 {
+            return Err(fail());
+        }
+        return Ok(range);
+    }
+    let opclass = catalog
+        .row(
+            "pg_opclass",
+            logical::number(row, "rngsubopc").map_err(|_| fail())?,
+        )
+        .map_err(|_| fail())?;
+    let method = catalog
+        .object(
+            "pg_am",
+            logical::number(opclass, "opcmethod").map_err(|_| fail())?,
+        )
+        .map_err(|_| fail())?;
+    if method.name != ["btree"] {
+        return Err(fail());
+    }
+    let family = logical::number(opclass, "opcfamily").map_err(|_| fail())?;
+    let input = logical::number(opclass, "opcintype").map_err(|_| fail())?;
+    let mut comparator = None;
+    for proc in catalog.rows.get("pg_amproc").ok_or_else(fail)? {
+        if logical::number(proc, "amprocfamily").map_err(|_| fail())? == family
+            && logical::number(proc, "amproclefttype").map_err(|_| fail())? == input
+            && logical::number(proc, "amprocrighttype").map_err(|_| fail())? == input
+            && logical::signed(proc, "amprocnum").map_err(|_| fail())? == 1
+        {
+            if comparator.is_some() {
+                return Err(fail());
+            }
+            comparator = Some(logical::number(proc, "amproc").map_err(|_| fail())?);
+        }
+    }
+    let comparator = comparator.filter(|id| *id != 0).ok_or_else(fail)?;
+    for callback in [
+        comparator,
+        logical::number(row, "rngcanonical").map_err(|_| fail())?,
+        logical::number(row, "rngsubdiff").map_err(|_| fail())?,
+    ] {
+        if callback == 0 {
+            continue;
+        }
+        let function = catalog.row("pg_proc", callback).map_err(|_| fail())?;
+        let language = catalog
+            .object(
+                "pg_language",
+                logical::number(function, "prolang").map_err(|_| fail())?,
+            )
+            .map_err(|_| fail())?;
+        if !matches!(language.name.as_slice(),[name] if matches!(name.as_str(),"internal"|"sql")) {
+            return Err(Uncovered::class(
+                "pg_range",
+                "unqualified range support-function loading",
+            ));
+        }
+    }
+    let child = logical::number(row, "rngsubtype").map_err(|_| fail())?;
+    if child == 0 {
+        return Err(fail());
+    }
+    Ok(child)
 }
 
 // Deparsers can invoke typmod output even when an expression has no Const,
@@ -312,3 +407,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "profile_range_tests.rs"]
+mod range_tests;

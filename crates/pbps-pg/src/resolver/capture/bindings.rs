@@ -110,6 +110,13 @@ fn subobjects<'a>(
                     path.push("column".into());
                     bindings.push(Binding { path, target });
                 }
+                "FIELDSTORE" => {
+                    for (index, target) in assigned_fields(catalog, node)?.into_iter().enumerate() {
+                        let mut path = path.clone();
+                        path.extend(["assigned_field".into(), index.to_string()]);
+                        bindings.push(Binding { path, target });
+                    }
+                }
                 "FIELDSELECT" => {
                     let argument = node.fields.get("arg").ok_or(Uncovered::Node)?;
                     let type_id = expression_type(argument)?;
@@ -323,6 +330,38 @@ fn derived_row_fields(range: &Node) -> Result<Vec<ObjectIdentity>> {
         .collect()
 }
 
+// Assignments bind the written composite fields even when the RHS reads no
+// field. Physical attribute slots become snapshot-local logical column names.
+fn assigned_fields(catalog: &Catalog, node: &Node) -> Result<Vec<ObjectIdentity>> {
+    let row = catalog.row("pg_type", node.number("resulttype")?)?;
+    let relation = logical::number(row, "typrelid")?;
+    let Some(Value::List(fields)) = node.fields.get("fieldnums") else {
+        return Err(Uncovered::Subobject);
+    };
+    let Some((Value::Atom(marker), fields)) = fields.split_first() else {
+        return Err(Uncovered::Subobject);
+    };
+    let Some(Value::List(values)) = node.fields.get("newvals") else {
+        return Err(Uncovered::Subobject);
+    };
+    if relation == 0 || marker != "i" || fields.is_empty() || fields.len() != values.len() {
+        return Err(Uncovered::Subobject);
+    }
+    fields
+        .iter()
+        .map(|field| {
+            let Value::Atom(number) = field else {
+                return Err(Uncovered::Subobject);
+            };
+            let number: i32 = number.parse().map_err(|_| Uncovered::Subobject)?;
+            if number <= 0 {
+                return Err(Uncovered::Subobject);
+            }
+            catalog.column(relation, number).map_err(Into::into)
+        })
+        .collect()
+}
+
 fn signed(node: &Node, field: &str) -> Result<i32> {
     let Some(Value::Atom(value)) = node.fields.get(field) else {
         return Err(Uncovered::Node);
@@ -343,6 +382,16 @@ fn expression_type(value: &Value) -> Result<u32> {
         "WINDOWFUNC" => "wintype",
         "OPEXPR" | "DISTINCTEXPR" | "NULLIFEXPR" => "opresulttype",
         "MINMAXEXPR" => "minmaxtype",
+        "FIELDSTORE" => "resulttype",
+        "JSONCONSTRUCTOREXPR" | "JSONEXPR" => {
+            let Some(Value::Node(returning)) = node.fields.get("returning") else {
+                return Err(Uncovered::Subobject);
+            };
+            if returning.tag != "JSONRETURNING" {
+                return Err(Uncovered::Subobject);
+            }
+            return returning.number("typid").map_err(Into::into);
+        }
         "SUBLINK" => {
             // A scalar subquery returns its sole non-junk projection, not
             // the input row type or the first type referenced by its tree.
@@ -612,5 +661,109 @@ mod tests {
             variable(&catalog, &node, Some(99), &[]),
             Err(Uncovered::Reference)
         );
+    }
+    #[test]
+    fn written_composite_fields_need_live_slots_and_matching_values() {
+        for (major, fixture) in [
+            (16, include_str!("fixtures/stored-surfaces-16.nodes")),
+            (18, include_str!("fixtures/stored-surfaces-18.nodes")),
+        ] {
+            let tree = nodes::decode(fixture.lines().next().unwrap(), major).unwrap();
+            let original = find_node(&tree, "FIELDSTORE").unwrap();
+            let oid = original.number("resulttype").unwrap();
+            let row = |v: serde_json::Value| v.as_object().unwrap().clone();
+            let catalog=Catalog::new(BTreeMap::from([
+                ("pg_namespace".into(),vec![row(json!({"oid":1,"nspname":"app"}))]),
+                ("pg_type".into(),vec![row(json!({"oid":oid,"typrelid":2}))]),
+                ("pg_class".into(),vec![row(json!({"oid":2,"relname":"pair","relnamespace":1}))]),
+                ("pg_attribute".into(),vec![row(json!({"attrelid":2,"attnum":1,"attname":"id","attisdropped":false})),row(json!({"attrelid":2,"attnum":2,"attname":"label","attisdropped":false})),row(json!({"attrelid":2,"attnum":3,"attname":"dropped","attisdropped":true}))]),
+            ])).unwrap();
+            assert_eq!(expression_type(&Value::Node(original.clone())), Ok(oid));
+            assert!(!assigned_fields(&catalog, original).unwrap().is_empty());
+            for case in [
+                "absent",
+                "null",
+                "bad_marker",
+                "empty",
+                "zero",
+                "negative",
+                "dropped",
+                "unreadable",
+                "absent_value",
+                "extra_value",
+            ] {
+                let mut node = original.clone();
+                match case {
+                    "absent" => {
+                        node.fields.remove("fieldnums");
+                    }
+                    "null" => {
+                        node.fields.insert("fieldnums".into(), Value::Null);
+                    }
+                    "absent_value" | "extra_value" => {
+                        let Some(Value::List(values)) = node.fields.get_mut("newvals") else {
+                            panic!()
+                        };
+                        if case == "absent_value" {
+                            values.pop();
+                        } else {
+                            values.push(Value::Null);
+                        }
+                    }
+                    _ => {
+                        let Some(Value::List(fields)) = node.fields.get_mut("fieldnums") else {
+                            panic!()
+                        };
+                        match case {
+                            "bad_marker" => fields[0] = Value::Atom("o".into()),
+                            "empty" => fields.truncate(1),
+                            "zero" => fields[1] = Value::Atom("0".into()),
+                            "negative" => fields[1] = Value::Atom("-1".into()),
+                            "dropped" => fields[1] = Value::Atom("3".into()),
+                            "unreadable" => fields[1] = Value::Null,
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                assert!(assigned_fields(&catalog, &node).is_err(), "{major}/{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn json_result_types_require_their_returning_descriptor() {
+        for tag in ["JSONCONSTRUCTOREXPR", "JSONEXPR"] {
+            let returning = Node {
+                tag: "JSONRETURNING".into(),
+                fields: BTreeMap::from([("typid".into(), Value::Atom("23".into()))]),
+            };
+            let original = Node {
+                tag: tag.into(),
+                fields: BTreeMap::from([("returning".into(), Value::Node(returning.clone()))]),
+            };
+            assert_eq!(expression_type(&Value::Node(original.clone())), Ok(23));
+            for case in ["missing", "unreadable", "wrong_tag", "missing_type"] {
+                let mut node = original.clone();
+                let mut child = returning.clone();
+                match case {
+                    "missing" => {
+                        node.fields.remove("returning");
+                    }
+                    "unreadable" => {
+                        node.fields.insert("returning".into(), Value::Null);
+                    }
+                    "wrong_tag" => {
+                        child.tag = "PARAM".into();
+                        node.fields.insert("returning".into(), Value::Node(child));
+                    }
+                    "missing_type" => {
+                        child.fields.remove("typid");
+                        node.fields.insert("returning".into(), Value::Node(child));
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(expression_type(&Value::Node(node)).is_err(), "{tag}/{case}");
+            }
+        }
     }
 }

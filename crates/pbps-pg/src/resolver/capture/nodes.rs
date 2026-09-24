@@ -748,4 +748,91 @@ mod tests {
         assert!(matches!(&names[0], Value::Atom(value) if value == "two words"));
         assert!(matches!(&names[1], Value::Atom(value) if value == "quote\"name"));
     }
+    #[test]
+    fn stored_assignment_and_json_nodes_require_readable_children() {
+        for (major, fixtures) in [
+            (16, include_str!("fixtures/stored-surfaces-16.nodes")),
+            (18, include_str!("fixtures/stored-surfaces-18.nodes")),
+        ] {
+            let mut seen = std::collections::BTreeSet::new();
+            for text in fixtures.lines() {
+                let tree = decode(text, major).unwrap();
+                assert!(!references(&tree, major).unwrap().is_empty());
+                for (tag, children) in [
+                    ("FIELDSTORE", &["arg", "newvals", "fieldnums"][..]),
+                    (
+                        "JSONCONSTRUCTOREXPR",
+                        &["args", "func", "coercion", "returning"],
+                    ),
+                    ("JSONFORMAT", &[]),
+                    ("JSONRETURNING", &["format"]),
+                    ("JSONISPREDICATE", &["expr", "format"]),
+                    ("JSONBEHAVIOR", &["expr"]),
+                    (
+                        "JSONEXPR",
+                        &[
+                            "formatted_expr",
+                            "format",
+                            "path_spec",
+                            "passing_names",
+                            "passing_values",
+                            "returning",
+                            "on_empty",
+                            "on_error",
+                        ],
+                    ),
+                    ("JSONTABLEPATH", &["value"]),
+                    ("JSONTABLEPATHSCAN", &["path", "child"]),
+                    ("JSONTABLESIBLINGJOIN", &["lplan", "rplan"]),
+                    ("MERGESUPPORTFUNC", &[]),
+                ] {
+                    let mut nodes = Vec::new();
+                    nodes_with_tag(&tree, tag, &mut nodes);
+                    for node in nodes {
+                        seen.insert(tag);
+                        for field in specification(tag, major).unwrap().fields {
+                            let mut missing = node.clone();
+                            missing.fields.remove(*field);
+                            assert!(
+                                references(&Value::Node(missing), major).is_err(),
+                                "{major}/{tag}/{field}"
+                            );
+                        }
+                        for field in children {
+                            assert!(node.fields.contains_key(*field), "{major}/{tag}/{field}");
+                            let mut unreadable = node.clone();
+                            unreadable
+                                .fields
+                                .insert((*field).into(), Value::Atom("unreadable".into()));
+                            assert!(
+                                references(&Value::Node(unreadable), major).is_err(),
+                                "{major}/{tag}/{field}"
+                            );
+                        }
+                    }
+                }
+            }
+            for tag in [
+                "FIELDSTORE",
+                "JSONCONSTRUCTOREXPR",
+                "JSONFORMAT",
+                "JSONRETURNING",
+                "JSONISPREDICATE",
+            ] {
+                assert!(seen.contains(tag), "{major}/{tag}");
+            }
+            if major == 18 {
+                for tag in [
+                    "JSONBEHAVIOR",
+                    "JSONEXPR",
+                    "JSONTABLEPATH",
+                    "JSONTABLEPATHSCAN",
+                    "JSONTABLESIBLINGJOIN",
+                    "MERGESUPPORTFUNC",
+                ] {
+                    assert!(seen.contains(tag), "{major}/{tag}");
+                }
+            }
+        }
+    }
 }

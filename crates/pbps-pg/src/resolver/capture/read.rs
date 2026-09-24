@@ -546,3 +546,6 @@ mod range_tests;
 
 #[cfg(test)]
 mod merge_scalar_tests;
+
+#[cfg(test)]
+mod stored_tests;

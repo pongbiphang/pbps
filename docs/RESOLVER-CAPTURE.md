@@ -79,7 +79,11 @@ Actual stored node trees supply creation-time bindings, including pinned
 builtins that `pg_depend` omits. Qualified surfaces include views, SQL-standard
 routine bodies and supported header/default/CHECK/index expressions. Unknown
 node fields, unsupported required object classes and unreadable definitions
-refuse coverage. Runtime-bound string, procedural and C bodies are explicitly
+refuse coverage. Composite assignments retain the written fields' logical
+identities, even when their right-hand expressions read no fields. Stored
+SQL/JSON constructors and predicates qualify on both majors; PostgreSQL 18's
+SQL/JSON query and table nodes retain returning types, defaults, passing
+expressions and nested paths. Runtime-bound string, procedural and C bodies are explicitly
 reported as limitations; header/default observations do not certify their
 whole-program dependencies.
 
@@ -90,7 +94,14 @@ array, domain and named-composite paths use known builtin routines. Scalar
 qualification checks both the SQL function identity and its implementation
 symbol, including builtin aliases and the specialized integer/OID vectors.
 Measured network, geometry, XML, text-search and snapshot constants qualify
-without permitting arbitrary type I/O. Unqualified custom output, OID-alias constants and unsupported node/type surfaces refuse
+without permitting arbitrary type I/O. Range and multirange constants qualify
+the exact generic wrappers and recursively qualify each subtype's output.
+Range type-cache initialization prepares comparator, canonicalizer and subtype
+difference callbacks before rendering bounds. Their dispatch must use internal
+or SQL functions; callbacks that can load C/PL code are an explicit coverage
+refusal, even though output does not execute those callbacks. Missing, ambiguous
+or recursive range metadata also refuses coverage. Unqualified custom output,
+OID-alias constants and unsupported node/type surfaces refuse
 rather than invoke arbitrary output code or hide an input as absent. Unrelated
 unqualified objects are lookup rows, not certified or rendered prerequisites.
 
