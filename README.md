@@ -74,9 +74,11 @@ dialect and connected it to the CLI, following the measured design in
 
 The next phase is **Phase 6**, the optional local UI
 ([ADR-0006](docs/ADR-0006-optional-ui.md),
-[ADR-0015](docs/ADR-0015-local-ui-implementation.md)). Its read-only viewer is
-already available as `pbps ui`; intent composition and the remaining steps are
-future work tracked in [#64](https://github.com/pongbiphang/pbps/issues/64).
+[ADR-0015](docs/ADR-0015-local-ui-implementation.md)). `pbps ui` serves the local
+read views and, on Linux, composes intent as a reviewed commit on a new branch
+([ADR-0017](docs/ADR-0017-isolated-compose.md)). Planning and applying from the
+page, and the remaining steps, are future work tracked in
+[#64](https://github.com/pongbiphang/pbps/issues/64).
 
 ### Starting a project
 

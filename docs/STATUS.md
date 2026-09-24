@@ -47,11 +47,12 @@ Phase 6 step 3: `pbps ui` serves local read views for environments, drift,
 saved plans, the ledger timeline and schema documentation/ERD. Open the complete
 printed URL, including its fragment. The viewer requires a per-launch token,
 exact bound Host and matching Origin, and calls the same binary for every read.
-Its page works offline. Compose and deployment actions remain later steps of
-#64; this viewer accepts no writes. #744 selects the isolated-candidate and
-new-output-branch contract in [ADR-0017](ADR-0017-isolated-compose.md). #745–#748
-implement and qualify it before compose is enabled; #494 remains the delivery
-item. See [UI.md](UI.md).
+Its page works offline. Phase 6 step 4 (#494) adds **Compose change**. It
+records a rename, a drop reason or annotations as a reviewed commit on a new
+output branch, following [ADR-0017](ADR-0017-isolated-compose.md) as qualified
+by #745–#748. Its fixed `POST /api/compose/<action>` requests are the viewer's
+only writes. It is Linux-only until #471 qualifies other platforms. Deployment
+actions remain step 5 of #64. See [UI.md](UI.md).
 
 ## Live tests
 

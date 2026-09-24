@@ -35,6 +35,36 @@ pub use refs::RefEvidence;
 pub use resources::{ResourceReport, ResourceState};
 pub use run::{DurableStage, PublicationBoundary, Publications};
 
+/// A refusal that reconfirming can never cure: the reviewed base,
+/// destination, signing policy or repository no longer holds.
+pub fn stale_refusal(problem: Option<Problem>) -> bool {
+    matches!(
+        problem,
+        Some(
+            Problem::RemoteBaseChanged
+                | Problem::DestinationChanged
+                | Problem::SigningChanged
+                | Problem::RepositoryChanged
+        )
+    )
+}
+
+/// The source checkout that contains `project`, found the way capture finds
+/// it: publication identity is the repository root, never a subdirectory.
+pub fn source_repository(project: &std::path::Path, deadline: Duration) -> Result<PathBuf> {
+    let selected = project
+        .canonicalize()
+        .map_err(|_| Error::new("Could not locate the selected project"))?;
+    let discovery = git::Git {
+        root: selected,
+        hooks: PathBuf::from("/dev/null"),
+        deadline,
+    };
+    Ok(PathBuf::from(
+        discovery.line(&["rev-parse", "--show-toplevel"])?,
+    ))
+}
+
 #[derive(Debug)]
 pub struct Error {
     message: String,
@@ -200,6 +230,9 @@ enum Stored {
         created: SystemTime,
     },
     Confirmed(Arc<Candidate>),
+    /// Refused for stale authority; its private retirement began but may
+    /// not have finished. Every later preview retries it first.
+    Releasing(Arc<Candidate>),
 }
 
 /// One browser workflow. Refresh invalidates the previous handle even when the
@@ -235,6 +268,18 @@ impl Candidates {
         now: SystemTime,
         observer: &dyn Fn(CaptureBoundary),
     ) -> Result<Preview> {
+        if let Some(Stored::Releasing(candidate)) = &self.current {
+            candidate
+                .workspace
+                .resources
+                .retire(&candidate.preview.operation_id, false)
+                .map_err(|error| {
+                    Error::new(&format!(
+                        "The refused candidate's private resources are still retiring: {error}; preserve them and preview again"
+                    ))
+                })?;
+            self.current = None;
+        }
         if matches!(self.current, Some(Stored::Confirmed(_))) {
             return Err(Error::new(
                 "This workflow already confirmed an operation; continue its result before starting another",
@@ -272,6 +317,50 @@ impl Candidates {
         Ok(preview)
     }
 
+    /// The operation behind a handle that is previewed but not yet
+    /// confirmed: only then can a caller that cannot publish say definitely
+    /// that nothing was attempted. A confirmed handle may already have a
+    /// receipt, which must be read, not assumed absent.
+    pub fn unconfirmed_operation(&self, candidate_id: &str) -> Option<&str> {
+        let Some(Stored::Previewed { candidate, .. }) = self.current.as_ref() else {
+            return None;
+        };
+        (candidate.preview.candidate_id == candidate_id)
+            .then_some(candidate.preview.operation_id.as_str())
+    }
+
+    /// Releases a confirmed candidate whose publication was refused before
+    /// any receipt because its reviewed authority went stale (a moved base,
+    /// changed destination, signing policy or repository). Reconfirming it
+    /// can never succeed, so its private resources retire through the
+    /// ordinary path and the workflow accepts a fresh preview.
+    pub fn release_stale(&mut self, candidate_id: &str, outcome: &Outcome) -> Result<()> {
+        let Some(Stored::Confirmed(candidate)) = &self.current else {
+            return Err(Error::new("No confirmed candidate to release"));
+        };
+        let stale = stale_refusal(outcome.problem);
+        if candidate.preview.candidate_id != candidate_id
+            || outcome.operation_id != candidate.preview.operation_id
+            || outcome.status != Status::Refused
+            || outcome.details.as_ref().is_some_and(|d| d.commit.is_some())
+            || !stale
+        {
+            return Err(Error::new(
+                "Only a stale pre-publication refusal releases its candidate",
+            ));
+        }
+        // Recorded before retiring, so a failed retirement is retried by the
+        // next preview instead of leaving a confirmed handle nothing clears.
+        let candidate = Arc::clone(candidate);
+        self.current = Some(Stored::Releasing(Arc::clone(&candidate)));
+        candidate
+            .workspace
+            .resources
+            .retire(&candidate.preview.operation_id, false)?;
+        self.current = None;
+        Ok(())
+    }
+
     pub fn confirm(&mut self, candidate_id: &str, now: SystemTime) -> Result<Arc<Candidate>> {
         let current = self
             .current
@@ -296,6 +385,11 @@ impl Candidates {
                 Arc::clone(candidate)
             }
             Stored::Confirmed(candidate) => Arc::clone(candidate),
+            Stored::Releasing(_) => {
+                return Err(Error::new(
+                    "This candidate was refused and released; preview again",
+                ));
+            }
         };
         if candidate.preview.candidate_id != candidate_id {
             return Err(Error::new(

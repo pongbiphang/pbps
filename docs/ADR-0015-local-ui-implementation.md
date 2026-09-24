@@ -49,15 +49,15 @@ envelope — the one SPEC §9.8 names beside the CI annotator and a team's own
 dashboard — so what it needs and what it breaks on is exactly what any
 third-party consumer needs and breaks on, and step 2 of #64 can test it as one.
 
-The read-only viewer consumes CLI output alone. The accepted future compose
-design in [ADR-0017](ADR-0017-isolated-compose.md) adds raw-byte orchestration:
+The read views consume CLI output alone. Compose, as implemented in
+[ADR-0017](ADR-0017-isolated-compose.md) (#494), adds raw-byte orchestration:
 the UI may capture contained regular files, build a private Git tree/index and
 store candidate/recovery metadata, while the same executable still resolves
 intent and validates the snapshot. It cannot parse YAML/project configuration,
 infer identity or render a model by linking workspace crates. Git output and opaque
 file bytes are not additional sources of schema semantics. The responsibility
-table in [ARCHITECTURE](ARCHITECTURE.md#planned-isolated-compose) states this
-boundary; it does not enable writes in the currently shipped viewer (#750).
+table in [ARCHITECTURE](ARCHITECTURE.md#isolated-compose) states this boundary
+(#750); compose's gated actions are the viewer's only writes (#494).
 
 The cost is a process per question and the JSON round trip. For one person on
 one machine, looking at one project, that is not a cost anyone can see.

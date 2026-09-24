@@ -1,6 +1,6 @@
 # ADR-0017: Compose an isolated candidate and publish a new branch
 
-- Status: candidate and publication backends implemented; HTTP writes remain disabled
+- Status: implemented and enabled in the local viewer on Linux (#494); other platforms refuse compose (#471)
 - Date: 2026-09-21
 - Supersedes: ADR-0015 decision 5's same-checkout publication protocol and
   PR #738's proposed DECISIONS 524 live-placement preview
@@ -413,8 +413,9 @@ its new filesystem/ref/durability behavior has its own qualification.
 The #745 candidate service and shipped form module are covered by
 `crates/pbps-cli/tests/compose_candidate.rs` (real Git and CLI) and
 `crates/pbps-ui/tests/browser.rs` (executes the shipped JavaScript with
-controlled DOM events and asynchronous responses). The viewer serves the
-module but does not mount it or expose write endpoints before #747–#748.
+controlled DOM events and asynchronous responses). #494 mounts the module and
+serves the fixed compose actions as token-, Origin- and JSON-gated POST requests;
+`compose_publication/viewer.rs` drives them end to end over HTTP.
 
 #746 adds the repository-scoped publication service, one prepared Git ref
 transaction, durable authorization receipts and shared live/restart result
@@ -589,7 +590,7 @@ kill actual processes, restart retirement twice, retain foreign locks/files, and
 exercise ordinary source `git add` after interruption. These checks do not prove
 arbitrary power-loss behavior on every filesystem or protection against an
 unrestricted malicious same-user process during private Git/CLI execution.
-Integrated #494 still gates enabling writes and mounting recovery actions.
+#494 enables writes and mounts the recovery actions in the local viewer.
 
 #### Acceptance coverage (#748)
 
