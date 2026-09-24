@@ -68,6 +68,15 @@ already edited in the declarations. It follows
    result in a separate checkout; the page prints the `git worktree add` and
    `pbps ui` commands.
 
+5. **Clean up private resources** retires a delivered operation's snapshot
+   and base root. The exact-commit root stays for its receipt. **Forget this
+   receipt** asks for a second confirmation, then retires the receipt and that
+   root; pushed branches are never cleanup targets. **Find private compose
+   resources** lists every operation's private evidence and state. It can
+   retire what an operation still owns, such as an expired preview left by a
+   closed viewer. An unresolved, foreign or unreadable record is refused and
+   preserved (#855).
+
 The page sends only the intent fields and opaque handles. Every tree, manifest,
 destination and commit stays on the server side. Compose actions are fixed
 `POST /api/compose/<action>` requests. They require the launch token, the

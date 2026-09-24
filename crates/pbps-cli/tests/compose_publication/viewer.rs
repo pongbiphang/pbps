@@ -451,3 +451,91 @@ fn a_receiptless_confirmed_handle_stays_definite_while_the_publisher_is_busy() {
     git(&f.repo.root, &["config", "--unset", "commit.gpgSign"]);
     assert_eq!(confirm().json()["status"], "delivered");
 }
+
+#[test]
+fn retirement_actions_clean_up_and_forget_only_what_their_state_allows() {
+    let f = Fixture::new("viewer-compose-retire");
+    let served = serve(&f);
+    let preview = served.action("preview", intent()).json();
+    let operation = preview["operation_id"].as_str().unwrap().to_owned();
+    let delivered = served
+        .action(
+            "confirm",
+            serde_json::json!({"candidate_id": preview["candidate_id"]}),
+        )
+        .json();
+    assert_eq!(delivered["status"], "delivered", "{delivered}");
+    assert_eq!(delivered["cleanup_pending"], true);
+    let store = f.repo.root.join(".git/pbps-compose-v2");
+    let snapshot = store.join(format!("snapshots/{operation}"));
+    let commit_root = format!("refs/pbps-compose/{operation}/commit");
+    let state = |id: &str| {
+        let reports = served.action("resources", serde_json::json!({})).json();
+        reports
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|report| report["operation_id"] == id)
+            .map(|report| report["state"].clone())
+    };
+    assert!(snapshot.exists());
+    assert_eq!(state(&operation), Some("confirmed".into()));
+    // Cleanup retires the snapshot and keeps the root the receipt needs.
+    let cleaned = served
+        .action("cleanup", serde_json::json!({"operation_id": operation}))
+        .json();
+    assert_eq!(cleaned["status"], "delivered", "{cleaned}");
+    assert_eq!(cleaned["cleanup_pending"], false);
+    assert!(!snapshot.exists());
+    git(&f.repo.root, &["rev-parse", "--verify", &commit_root]);
+    assert_eq!(state(&operation), Some("retained".into()));
+    // Forgetting needs its explicit acknowledgement.
+    for body in [
+        serde_json::json!({"operation_id": operation, "acknowledged": false}),
+        serde_json::json!({"operation_id": operation}),
+    ] {
+        assert_eq!(served.action("forget", body).status, 400);
+    }
+    assert!(f.record(&operation).exists());
+    let forgotten = served
+        .action(
+            "forget",
+            serde_json::json!({"operation_id": operation, "acknowledged": true}),
+        )
+        .json();
+    assert_eq!(forgotten["state"], "spent", "{forgotten}");
+    assert!(!f.record(&operation).exists());
+    assert!(
+        git(&f.repo.root, &["for-each-ref", &commit_root]).is_empty(),
+        "the commit root survived forget"
+    );
+    // The pushed branch is never a cleanup target.
+    assert_eq!(
+        f.remote_ref(preview["output_ref"].as_str().unwrap())
+            .as_deref(),
+        delivered["details"]["commit"].as_str()
+    );
+    // An unconfirmed preview has no receipt: cleanup and forget refuse and
+    // keep it, and resource recovery before expiry leaves it sealed.
+    let sealed = served.action("preview", intent()).json();
+    let pending = sealed["operation_id"].as_str().unwrap().to_owned();
+    let kept = store.join(format!("snapshots/{pending}"));
+    let refused = served
+        .action("cleanup", serde_json::json!({"operation_id": pending}))
+        .json();
+    assert_eq!(refused["problem"], "receipt_unavailable", "{refused}");
+    let not_forgotten = served.action(
+        "forget",
+        serde_json::json!({"operation_id": pending, "acknowledged": true}),
+    );
+    assert_eq!(not_forgotten.status, 409, "{}", not_forgotten.body);
+    let recovered = served
+        .action(
+            "recover-resources",
+            serde_json::json!({"operation_id": pending}),
+        )
+        .json();
+    assert_eq!(recovered["state"], "sealed");
+    assert!(kept.exists());
+    assert_eq!(state(&pending), Some("sealed".into()));
+}

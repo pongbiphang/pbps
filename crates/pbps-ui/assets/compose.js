@@ -62,7 +62,11 @@ globalThis.PbpsCompose = Object.freeze({
     const saved = make("button", "Find saved results");
     saved.type = "button";
     saved.dataset.action = "list";
-    root.replaceChildren(disclosure, remoteContract, form, activity, details, diff, saved, results);
+    const privateButton = make("button", "Find private compose resources");
+    privateButton.type = "button";
+    privateButton.dataset.action = "resources";
+    const privateList = make("section");
+    root.replaceChildren(disclosure, remoteContract, form, activity, details, diff, saved, results, privateButton, privateList);
     let generation = 0;
     let candidate = null;
     let confirming = false;
@@ -117,6 +121,9 @@ globalThis.PbpsCompose = Object.freeze({
       // A failed receipt read must not erase commit details already displayed.
       const evidence = result.details || old?.details;
       receipts.set(result.operation_id, {...result, details: evidence});
+      draw();
+    };
+    const draw = () => {
       results.replaceChildren();
       for (const receipt of receipts.values()) {
         const card = make("article");
@@ -194,9 +201,112 @@ globalThis.PbpsCompose = Object.freeze({
         if (receipt.local === "present") {
           action("alternative", "Start an alternative from the original base", {operation_id: receipt.operation_id});
         }
+        // Retirement (#855): only a delivered result has cleanup to run or a
+        // receipt to forget; every other state keeps its evidence.
+        if (receipt.status === "delivered" && receipt.cleanup_pending) {
+          action("cleanup", "Clean up private resources (keeps the commit root)", {operation_id: receipt.operation_id});
+        }
+        if (receipt.status === "delivered") {
+          const ask = make("button", "Forget this receipt…");
+          ask.type = "button";
+          ask.dataset.action = "forget-ask";
+          ask.addEventListener("click", () => {
+            if (ask.disabled) return;
+            ask.disabled = true;
+            const sure = make("button", "Confirm: forget the receipt and retire its commit root");
+            sure.type = "button";
+            sure.dataset.action = "forget";
+            sure.addEventListener("click", async () => {
+              if (sure.disabled) return;
+              sure.disabled = true;
+              try {
+                await send("forget", {operation_id: receipt.operation_id, acknowledged: true});
+                receipts.delete(receipt.operation_id);
+                draw();
+                if (receipt.operation_id === operation) releaseWorkflow();
+                activity.textContent = "The receipt was forgotten. Branches already pushed are unchanged.";
+              } catch (_) {
+                activity.textContent = "Forgetting did not complete. The receipt and its evidence are preserved.";
+                sure.disabled = false;
+              }
+            });
+            card.append(make("p", "Forgetting removes this receipt and the private root that keeps its commit reachable. Pushed branches are not touched."), sure);
+          });
+          card.append(ask);
+        }
         results.append(card);
       }
     };
+    const stateText = {
+      capturing: "Capture was interrupted; preserve it for manual recovery.",
+      sealed: "An unconfirmed preview; it expires after 24 hours.",
+      confirmed: "Confirmed for publication.",
+      retiring: "Retirement started and has not finished.",
+      retained: "Cleaned up; the commit root is kept for its receipt.",
+      spent: "Retired.",
+    };
+    // The server releases the workflow when its own operation is forgotten
+    // or retired; the page follows, so a fresh preview needs no reload.
+    const releaseWorkflow = () => {
+      confirming = false;
+      reconfirmable = false;
+      operation = null;
+      candidate = null;
+      refresh.disabled = false;
+      for (const field of Object.values(fields)) field.disabled = false;
+      invalidate();
+    };
+    const reports = new Map();
+    const drawReports = () => {
+      privateList.replaceChildren();
+      for (const report of reports.values()) {
+        const card = make("article");
+        card.append(make("p", `Operation: ${report.operation_id}`), make("p", stateText[report.state] || "Unknown state; preserve it."));
+        if (report.cleanup_pending) card.append(make("p", report.instruction));
+        // Only states that recover-resources can advance get a control: an
+        // interrupted retirement resumes, and a sealed preview retires once
+        // its 24-hour expiry has passed. Other states would just redraw.
+        const label = {retiring: "Finish this retirement", sealed: "Retire this preview if it has expired"}[report.state];
+        if (report.cleanup_pending && label) {
+          const retire = make("button", label);
+          retire.type = "button";
+          retire.dataset.action = "recover-resources";
+          retire.addEventListener("click", async () => {
+            if (retire.disabled) return;
+            retire.disabled = true;
+            try {
+              const next = await send("recover-resources", {operation_id: report.operation_id});
+              reports.set(next.operation_id, next);
+              drawReports();
+              if (next.state === "spent" && next.operation_id === operation) releaseWorkflow();
+              if (next.state === report.state) {
+                activity.textContent = report.state === "sealed"
+                  ? "This preview has not reached its 24-hour expiry; it is kept."
+                  : "The retirement did not advance; its evidence is preserved.";
+              }
+            } catch (_) {
+              activity.textContent = "These resources could not be retired now; their evidence is preserved.";
+              retire.disabled = false;
+            }
+          });
+          card.append(retire);
+        }
+        privateList.append(card);
+      }
+    };
+    privateButton.addEventListener("click", async () => {
+      if (privateButton.disabled) return;
+      privateButton.disabled = true;
+      try {
+        const list = await send("resources", {});
+        reports.clear();
+        for (const report of list) reports.set(report.operation_id, report);
+        drawReports();
+        if (!list.length) activity.textContent = "No private compose resources were found.";
+      } catch (_) {
+        activity.textContent = "Private resources could not be read. Existing evidence has been preserved.";
+      } finally { privateButton.disabled = false; }
+    });
     saved.addEventListener("click", async () => {
       if (saved.disabled) return;
       saved.disabled = true;

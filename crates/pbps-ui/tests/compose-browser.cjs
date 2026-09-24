@@ -175,6 +175,77 @@ async function staleRefusal() {
   a.calls[2].resolve(preview("fresh")); await p;
   assert.equal(a.confirm.disabled, false);
 }
+async function retirement() {
+  const a = setup();
+  const button = name => a.root.find(e => e.dataset.action === name);
+  const visible = text => a.root.find(e => e.textContent.includes(text));
+  const delivered = {status: "delivered", operation_id: "operation-retire", local: "present", remote: "delivered",
+    cleanup_pending: true, details: {commit: "e".repeat(40), output_ref: "refs/heads/pbps-compose/" + "f".repeat(64),
+      base: "base", tree: "tree", destination: {transport: "file", repository: "/srv/repo.git"},
+      source_project: "/source/project", project_suffix: "project", delivery_generation: "nonce"}};
+  let p = a.form.fire("submit"); a.calls[0].resolve(preview("retire")); await p;
+  p = a.confirm.fire("click"); a.calls[1].resolve(delivered); await p;
+  // Cleanup only while a delivered result still owns private resources.
+  p = button("cleanup").fire("click");
+  assert.deepEqual(a.calls[2].body, {operation_id: "operation-retire"});
+  a.calls[2].resolve({...delivered, cleanup_pending: false}); await p;
+  assert(!button("cleanup"), "nothing left to clean up");
+  // Forgetting takes two deliberate clicks and says what it retires.
+  assert(!button("forget"));
+  await button("forget-ask").fire("click");
+  assert(visible("retire its commit root"));
+  p = button("forget").fire("click");
+  assert.equal(a.calls[3].action, "forget");
+  assert.deepEqual(a.calls[3].body, {operation_id: "operation-retire", acknowledged: true});
+  a.calls[3].resolve({operation_id: "operation-retire", state: "spent", cleanup_pending: false}); await p;
+  assert(!visible("Operation: operation-retire"), "a forgotten receipt leaves the list");
+  // Forgetting this workflow's own result releases the form, as the server does.
+  assert(!button("preview").disabled, "Refresh is available after forgetting");
+  assert(!a.field("message").disabled, "inputs are editable after forgetting");
+  assert(a.confirm.disabled);
+  // Unresolved results offer neither action.
+  const b = setup();
+  p = b.root.find(e => e.dataset.action === "list").fire("click");
+  b.calls[0].resolve([{...delivered, status: "recovery_required", remote: "unknown"}]); await p;
+  assert(!b.root.find(e => e.dataset.action === "cleanup"));
+  assert(!b.root.find(e => e.dataset.action === "forget-ask"));
+  // Private resources are listed with their obligation and can be retired.
+  p = b.root.find(e => e.dataset.action === "resources").fire("click");
+  assert.equal(b.calls[1].action, "resources");
+  b.calls[1].resolve([
+    {operation_id: "sealed-one", state: "sealed", cleanup_pending: true, instruction: "Retry only the recorded retirement."},
+    {operation_id: "confirmed-one", state: "confirmed", cleanup_pending: true, instruction: "Clean up from its result."},
+    {operation_id: "spent-one", state: "spent", cleanup_pending: false, instruction: "none"},
+  ]); await p;
+  // Only a state recover-resources can advance offers the control.
+  const controls = () => {
+    const found = [];
+    const walk = e => { if (e.dataset.action === "recover-resources") found.push(e); e.children.forEach(walk); };
+    walk(b.root);
+    return found;
+  };
+  assert.equal(controls().length, 1, "confirmed and spent reports offer no retirement");
+  assert(controls()[0].textContent.includes("if it has expired"));
+  // An unexpired preview is kept and the page says why.
+  p = controls()[0].fire("click");
+  assert.deepEqual(b.calls[2].body, {operation_id: "sealed-one"});
+  b.calls[2].resolve({operation_id: "sealed-one", state: "sealed", cleanup_pending: true, instruction: "kept"}); await p;
+  assert(b.root.find(e => e.textContent.includes("not reached its 24-hour expiry")));
+  // An expired preview retires.
+  p = controls()[0].fire("click");
+  b.calls[3].resolve({operation_id: "sealed-one", state: "spent", cleanup_pending: false, instruction: "none"}); await p;
+  assert.equal(controls().length, 0);
+  // Retiring this workflow's own expired preview releases the page too.
+  const c = setup();
+  p = c.form.fire("submit"); c.calls[0].resolve(preview("expired")); await p;
+  assert.equal(c.confirm.disabled, false);
+  p = c.root.find(e => e.dataset.action === "resources").fire("click");
+  c.calls[1].resolve([{operation_id: "operation-expired", state: "sealed", cleanup_pending: true, instruction: "kept"}]); await p;
+  p = c.root.find(e => e.dataset.action === "recover-resources").fire("click");
+  c.calls[2].resolve({operation_id: "operation-expired", state: "spent", cleanup_pending: false, instruction: "none"}); await p;
+  assert(c.confirm.disabled, "a retired preview cannot be confirmed");
+  assert(!c.root.find(e => e.dataset.action === "preview").disabled);
+}
 async function definiteRefusals() {
   for (const problem of ["remote_unavailable", "signing_unavailable"]) {
     const a = setup();
@@ -207,4 +278,4 @@ async function definiteRefusals() {
     assert(a.root.find(e => e.dataset.action === "recover"));
   }
 }
-exercise().then(outcomes).then(definiteRefusals).then(staleRefusal).then(mergeRequests).then(() => process.stdout.write("compose browser behavior passed\n"), error => { console.error(error); process.exitCode = 1; });
+exercise().then(outcomes).then(definiteRefusals).then(staleRefusal).then(mergeRequests).then(retirement).then(() => process.stdout.write("compose browser behavior passed\n"), error => { console.error(error); process.exitCode = 1; });

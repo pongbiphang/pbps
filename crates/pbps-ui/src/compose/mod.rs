@@ -361,6 +361,24 @@ impl Candidates {
         Ok(())
     }
 
+    /// The workflow's own operation was retired outside it: its receipt
+    /// was forgotten, or its expired preview was retired. It has no result
+    /// to continue and no alternative to start from, so the workflow, and
+    /// any alternative-base pin it carried, accepts a fresh preview.
+    /// Another operation leaves the workflow untouched.
+    pub fn released(&mut self, operation_id: &str) {
+        let owns = match &self.current {
+            Some(Stored::Previewed { candidate, .. })
+            | Some(Stored::Confirmed(candidate))
+            | Some(Stored::Releasing(candidate)) => candidate.preview.operation_id == operation_id,
+            None => false,
+        };
+        if owns {
+            self.current = None;
+            self.alternative_base = None;
+        }
+    }
+
     pub fn confirm(&mut self, candidate_id: &str, now: SystemTime) -> Result<Arc<Candidate>> {
         let current = self
             .current

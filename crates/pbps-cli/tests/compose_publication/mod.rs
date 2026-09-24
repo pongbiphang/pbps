@@ -1244,3 +1244,49 @@ fn a_dangling_symbolic_local_destination_never_redirects_publication() {
         f.source_unchanged(&before);
     }
 }
+
+#[test]
+fn retiring_or_forgetting_the_workflows_own_operation_releases_it() {
+    // An expired preview of this workflow, retired through the resource
+    // recovery the viewer exposes (#855), no longer blocks a fresh preview.
+    let f = Fixture::new("released-expired");
+    let mut candidates = f.repo.store();
+    let expired = candidates.preview(request(), SystemTime::now()).unwrap();
+    let later = SystemTime::now() + Duration::from_secs(25 * 60 * 60);
+    let report = f
+        .publisher()
+        .recover_resources_at(&expired.operation_id, later)
+        .unwrap();
+    assert_eq!(report.state, pbps_ui::compose::ResourceState::Spent);
+    candidates.released(&expired.operation_id);
+    let fresh = candidates.preview(request(), SystemTime::now()).unwrap();
+    assert_ne!(fresh.operation_id, expired.operation_id);
+    assert!(
+        candidates
+            .confirm(&expired.candidate_id, SystemTime::now())
+            .is_err()
+    );
+
+    // Forgetting a delivered alternative also drops its base pin, so a
+    // source that moved on can be previewed again.
+    let f = Fixture::new("released-alternative");
+    let (mut candidates, preview, candidate) = f.ready();
+    let mut publisher = f.publisher();
+    assert_eq!(publisher.confirm(&candidate).status, Status::Delivered);
+    publisher
+        .start_alternative(&mut candidates, &preview.operation_id)
+        .unwrap();
+    let alternative = candidates.preview(request(), SystemTime::now()).unwrap();
+    let candidate = candidates
+        .confirm(&alternative.candidate_id, SystemTime::now())
+        .unwrap();
+    assert_eq!(publisher.confirm(&candidate).status, Status::Delivered);
+    publisher.forget(&alternative.operation_id).unwrap();
+    drop(publisher);
+    candidates.released(&alternative.operation_id);
+    fs::write(f.repo.root.join("unrelated"), "moved on").unwrap();
+    git(&f.repo.root, &["add", "unrelated"]);
+    git(&f.repo.root, &["commit", "-qm", "source moves on"]);
+    let moved = candidates.preview(request(), SystemTime::now()).unwrap();
+    assert_ne!(moved.base, alternative.base);
+}

@@ -41,6 +41,15 @@ struct Republish {
 #[serde(deny_unknown_fields)]
 struct Nothing {}
 
+/// Forgetting retires a delivered receipt and its commit root; the page
+/// must say so explicitly rather than reuse the ordinary operation body.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Forget {
+    operation_id: String,
+    acknowledged: bool,
+}
+
 pub(crate) struct Compose {
     candidates: Candidates,
     project: PathBuf,
@@ -180,6 +189,44 @@ impl Compose {
                     .start_alternative(&mut self.candidates, &operation_id)
                     .map_err(refused)?;
                 encode(&serde_json::json!({}))
+            }
+            // Retirement of private resources (#855). Each keeps the
+            // lifecycle validation of the service: an unresolved, foreign
+            // or impossible record refuses and its evidence is preserved.
+            "cleanup" => {
+                let Operation { operation_id } = parse(body)?;
+                encode(&self.publisher()?.cleanup(&operation_id))
+            }
+            "resources" => {
+                let Nothing {} = parse(body)?;
+                encode(&self.publisher()?.resource_reports().map_err(refused)?)
+            }
+            "recover-resources" => {
+                let Operation { operation_id } = parse(body)?;
+                let report = self
+                    .publisher()?
+                    .recover_resources(&operation_id)
+                    .map_err(refused)?;
+                // An expired preview of this very workflow is gone now.
+                if report.state == compose::ResourceState::Spent {
+                    self.candidates.released(&operation_id);
+                }
+                encode(&report)
+            }
+            "forget" => {
+                let Forget {
+                    operation_id,
+                    acknowledged,
+                } = parse(body)?;
+                if !acknowledged {
+                    return Err((
+                        400,
+                        "Forgetting requires explicit acknowledgement".to_owned(),
+                    ));
+                }
+                let report = self.publisher()?.forget(&operation_id).map_err(refused)?;
+                self.candidates.released(&operation_id);
+                encode(&report)
             }
             _ => Err((404, "Unknown compose action".to_owned())),
         }
