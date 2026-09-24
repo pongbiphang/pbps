@@ -159,6 +159,15 @@ impl Compose {
             }
             "confirm" => {
                 let Handle { candidate_id } = parse(body)?;
+                // A handle given up unpublished never needs the publisher:
+                // answer it before a busy owner lock could turn a known
+                // "nothing was published" into an unknown outcome (#892).
+                if self.candidates.is_recorded_unpublished(&candidate_id) {
+                    return Err((
+                        410,
+                        "The candidate is unknown or was replaced; refresh the preview".to_owned(),
+                    ));
+                }
                 // The publisher and its owner lock come first. If another
                 // compose holds it, the reviewed handle is not consumed and
                 // the page gets a definite refusal it may confirm again.
