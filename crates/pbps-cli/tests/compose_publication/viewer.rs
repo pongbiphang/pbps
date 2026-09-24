@@ -614,3 +614,42 @@ fn a_restarted_viewer_gates_new_previews_on_the_same_bases_receipts() {
     let moved = third.action("preview", intent()).json();
     assert_ne!(moved["base"], preview["base"]);
 }
+
+#[test]
+fn another_projects_receipt_never_blocks_a_preview_from_the_same_base() {
+    let f = Fixture::new("viewer-compose-two-projects");
+    // A second pbps project in the same checkout, committed and published
+    // so both projects share one base.
+    let other = f.repo.root.join("other");
+    fs::create_dir_all(other.join("schema")).unwrap();
+    for name in ["pbps.yml", "schema.ids.json", "schema/t.yml"] {
+        fs::copy(f.repo.project.join(name), other.join(name)).unwrap();
+    }
+    git(&f.repo.root, &["add", "other"]);
+    git(&f.repo.root, &["commit", "-qm", "second project"]);
+    git(&f.repo.root, &["push", "-q", "origin", "master"]);
+    let first = serve(&f);
+    let preview = first.action("preview", intent()).json();
+    let delivered = first
+        .action(
+            "confirm",
+            serde_json::json!({"candidate_id": preview["candidate_id"]}),
+        )
+        .json();
+    assert_eq!(delivered["status"], "delivered", "{delivered}");
+    let second = Fixture {
+        repo: Repository {
+            project: other.clone(),
+            root: f.repo.root.clone(),
+        },
+        remote: f.remote.clone(),
+    };
+    let viewer = serve(&second);
+    let admitted = viewer.action("preview", intent()).json();
+    assert_eq!(admitted["base"], preview["base"]);
+    // The same project is still gated.
+    let sibling = serve(&f).action("preview", intent());
+    assert_eq!(sibling.status, 409, "{}", sibling.body);
+    // `second` shares `f`'s checkout and remote; `f` alone cleans them up.
+    std::mem::forget(second);
+}

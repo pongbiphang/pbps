@@ -101,11 +101,17 @@ impl Compose {
     /// sibling. A receipt from another base does not block, so a receipt
     /// that can never resolve cannot close compose for good.
     fn admit_base(&self, preview: &compose::Preview) -> Result<(), Refusal> {
+        // Receipts are per source checkout, which can hold several projects;
+        // only this project's results can make a sibling of this preview.
+        let project = self
+            .project
+            .canonicalize()
+            .map_err(|_| (409, "Could not locate the selected project".to_owned()))?;
         for outcome in self.publisher()?.list().map_err(refused)? {
-            let same_base = outcome
-                .details
-                .as_ref()
-                .is_none_or(|details| details.base == preview.base);
+            let same_base = outcome.details.as_ref().is_none_or(|details| {
+                details.base == preview.base
+                    && std::path::Path::new(&details.source_project) == project
+            });
             if outcome.operation_id == preview.operation_id || !same_base {
                 continue;
             }
