@@ -234,7 +234,7 @@ fn occupants(init: &ProcessLease, profile: &ServerProfile) -> Result<(), Error> 
         // measured; its BPF contents cannot be read from `/proc`, so a
         // permissive operator policy allowing a non-IP channel such as
         // `AF_VSOCK` — which the loopback network checks do not contain — is
-        // the operator's provisioning responsibility, tracked in #684.
+        // the operator's provisioning responsibility, a documented limit (#684).
         security(occupant, profile.uid, profile.capabilities)?;
         let (gids, supplementary) = groups(occupant)?;
         if gids.iter().any(|value| *value != profile.gid)
@@ -271,7 +271,7 @@ fn accounted(init: &ProcessLease, forwarders: &[&ProcessLease]) -> Result<(), Er
     // does not claim to hold against. A foreign process joining the engine's
     // network namespace directly is what this refuses, and is the reachable
     // case. Narrowing the exception to the forwarder's exact task set is
-    // #681.
+    // not pursued, for that reason (#681).
     //
     // Censused capture-free, by PID-namespace identity: a forwarder shares
     // the engine's network namespace and reaps and respawns its `cat` pipes
