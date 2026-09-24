@@ -349,16 +349,23 @@ impl Resources {
                     "Compose resource record limit reached; retain existing recovery evidence",
                 ));
             }
-            if !identity(id)
-                || !oid(base)
-                || self
-                    .records
-                    .read(&format!("{id}.json"), 64 * 1024 * 1024)?
-                    .is_some()
-            {
+            if !identity(id) || !oid(base) {
                 return Err(Error::new(
                     "Compose operation resource identity already exists or is invalid",
                 ));
+            }
+            // A record that appeared after the admission pass is named too.
+            let path = self.records.path.join(format!("{id}.json"));
+            if self
+                .records
+                .read(&format!("{id}.json"), 64 * 1024 * 1024)
+                .map_err(|error| error.at(&path))?
+                .is_some()
+            {
+                return Err(Error::new(
+                    "Compose operation resource identity already exists; preserve its evidence",
+                )
+                .at(&path));
             }
             let mut r = Resource {
                 version: 1,

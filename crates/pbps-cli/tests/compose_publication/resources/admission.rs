@@ -348,3 +348,61 @@ fn admission_refuses_changed_unpinned_evidence_before_acquisition() {
         assert_eq!(f.repo.preserved(), before);
     }
 }
+
+#[test]
+fn a_record_created_after_the_admission_pass_is_named() {
+    for mode in ["file", "directory"] {
+        let f = Fixture::new(&format!("late-record-{mode}"));
+        let records = root(&f).join("resources");
+        let taken = Arc::new(std::sync::Mutex::new(None));
+        let late = taken.clone();
+        let directory = records.clone();
+        let observer = ResourceObserver::new(move |at| {
+            // The pass is done; an external writer claims the new identity
+            // just before admission's collision read opens it.
+            let fresh = at.operation == ResourceOperation::Read
+                && !at.after
+                && at.path.parent() == Some(directory.as_path())
+                && at.path.extension().is_some_and(|e| e == "json")
+                && !at.path.exists();
+            let mut late = late.lock().unwrap();
+            if fresh && late.is_none() {
+                if mode == "file" {
+                    fs::write(&at.path, b"late writer").unwrap();
+                } else {
+                    fs::create_dir(&at.path).unwrap();
+                }
+                *late = Some(at.path.clone());
+            }
+            true
+        });
+        // A fresh store may not have created its snapshot directory yet.
+        let snapshots = || {
+            fs::read_dir(root(&f).join("snapshots"))
+                .map(|entries| entries.count())
+                .unwrap_or(0)
+        };
+        let error = store(&f, observer)
+            .preview(request(), SystemTime::now())
+            .map(|preview| preview.operation_id)
+            .expect_err(mode)
+            .to_string();
+        let path = taken
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the collision read was reached");
+        assert!(
+            error.contains(&path.display().to_string()),
+            "{mode}: {error}"
+        );
+        if mode == "file" {
+            assert!(error.contains("preserve"), "{mode}: {error}");
+        }
+        assert_eq!(snapshots(), 0, "{mode}: acquired a snapshot");
+        assert_eq!(names(&records), vec![path.file_name().unwrap().to_owned()]);
+        if mode == "file" {
+            assert_eq!(fs::read(&path).unwrap(), b"late writer");
+        }
+    }
+}
