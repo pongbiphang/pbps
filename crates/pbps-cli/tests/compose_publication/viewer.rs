@@ -577,6 +577,15 @@ fn a_restarted_viewer_gates_new_previews_on_the_same_bases_receipts() {
         .filter(|report| report.state == ResourceState::Sealed)
         .count();
     assert_eq!(sealed, 0, "a refused preview kept its private snapshot");
+    // An alternative beside an unresolved result is refused up front, not
+    // accepted and then contradicted by the preview gate.
+    let early = second.action(
+        "alternative",
+        serde_json::json!({"operation_id": operation}),
+    );
+    assert_eq!(early.status, 409, "{}", early.body);
+    assert!(early.body.contains("not delivered"), "{}", early.body);
+    assert_eq!(second.action("preview", intent()).status, 409);
     // Resolve it: the destination accepts, and the result is republished.
     fs::remove_file(&hook).unwrap();
     let diagnosed = second

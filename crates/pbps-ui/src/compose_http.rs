@@ -237,7 +237,20 @@ impl Compose {
             }
             "alternative" => {
                 let Operation { operation_id } = parse(body)?;
-                self.publisher()?
+                let mut publisher = self.publisher()?;
+                // The preview gate admits a sibling only beside a delivered
+                // result, so an unresolved one refuses here, before the
+                // workflow is reset for a preview that could never pass.
+                let prior = publisher.recover(&operation_id);
+                if prior.status != Status::Delivered {
+                    return Err((
+                        409,
+                        format!(
+                            "Operation {operation_id} is not delivered; reconcile or republish it before starting an alternative"
+                        ),
+                    ));
+                }
+                publisher
                     .start_alternative(&mut self.candidates, &operation_id)
                     .map_err(refused)?;
                 encode(&serde_json::json!({}))

@@ -198,7 +198,8 @@ globalThis.PbpsCompose = Object.freeze({
           card.append(make("p", "Republish only after diagnosing the remote state: this explicitly authorizes recreating an absent output branch with the same commit at the same destination."));
           action("republish", "Authorize republishing this exact commit", {operation_id: receipt.operation_id, generation: d.delivery_generation});
         }
-        if (receipt.local === "present") {
+        // The server starts an alternative only beside a delivered result.
+        if (receipt.status === "delivered") {
           action("alternative", "Start an alternative from the original base", {operation_id: receipt.operation_id});
         }
         // Retirement (#855): only a delivered result has cleanup to run or a

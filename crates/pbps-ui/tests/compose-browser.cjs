@@ -209,6 +209,7 @@ async function retirement() {
   b.calls[0].resolve([{...delivered, status: "recovery_required", remote: "unknown"}]); await p;
   assert(!b.root.find(e => e.dataset.action === "cleanup"));
   assert(!b.root.find(e => e.dataset.action === "forget-ask"));
+  assert(!b.root.find(e => e.dataset.action === "alternative"), "no alternative beside an unresolved result");
   // Private resources are listed with their obligation and can be retired.
   p = b.root.find(e => e.dataset.action === "resources").fire("click");
   assert.equal(b.calls[1].action, "resources");
