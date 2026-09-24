@@ -599,3 +599,80 @@ is counted — a least-privileged account refuses while such a worker runs, and
 `pg_read_all_stats` lets it tell the two apart; a `NOLOGIN` group with no session of its own is still not one, so a
 group owner whose only login member is the deployment account keeps working.
 
+<a id="dec-868-1"></a>
+
+**DEC-868.1. A confidential record keeps its whole snapshot and checksum in a
+separate protected ledger table, and leaves nothing a pre-feature reader can
+project (#594, #868; chooses the layout ADR-0016 decision 5 left open).** A
+pre-feature binary cannot be changed, and it reads two places: its timeline
+query projects `__pbps_state.plan_checksum` for every row, whatever the state
+version, and `latest`, `history`, its fallback query and `status` parse
+`state_json`, which holds a second copy — `status` prints it literally in a
+staged-resume command. Any design that leaves a confidential verifier in either
+place is exposed by readers that will never learn a new flag, so versioned
+metadata, redaction in new clients, a warning or an operator assertion cannot
+be the boundary.
+
+*Chosen: protected storage.* For a confidential record the ordinary row in
+`__pbps_state` keeps its identity and non-verifier columns (`id`, `applied_at`,
+`kind`, `git_sha`, `operator`, `reason`), writes `plan_checksum` as NULL, and
+stores a stub `state_json` carrying only a new state-format version and the
+confidential classification, with the matching `state_version`. A pre-feature
+reader therefore sees a NULL checksum and an unsupported version; its `status`
+and `plan` refuse on the version instead of printing anything. The complete
+snapshot — not a list of fields thought to be sensitive, which would be the
+open set this project refuses to maintain — and the plan checksum are written
+to `__pbps_state_confidential` (`public` on PostgreSQL, `dbo` on SQL Server),
+keyed by the ordinary row's `id`, in the same transaction as the ordinary row,
+so neither exists without the other. Ordinary records, and every existing row,
+are unchanged: no migration touches them, and the protected table is created
+only when the first confidential record is written.
+
+*Rejected: qualifying readers of the existing ledger.* Proving that everyone
+who can read `__pbps_state` is authorized, and refusing otherwise, needs no
+new storage but requires revoking the human read-only access SPEC §8.1
+recommends before any confidential plan, and a later `SELECT` grant would
+expose every historical confidential checksum at once. Protected storage keeps
+the ordinary ledger readable by the people it serves today.
+
+*Who may read it.* Before a confidential plan is published and again before
+apply DDL, pbps qualifies the protected table from the catalog, read-only: every
+role that can read it — through ownership, `SELECT`, a predefined role such as
+`pg_read_all_data` or `db_datareader`, a server-level or ownership-chain path,
+or membership — must be able to become the deployment account or be a
+superuser/`sysadmin`, and the ledger-integrity rules (DEC-313.1, DEC-834.1)
+apply to it as to the other two tables. There is no database-owner exemption
+(#863). Statement and audit capture that would record the INSERT's values —
+PostgreSQL `log_statement` of `mod` or `all`, statement-duration logging,
+`auto_explain` with parameters, `pgaudit` object or write auditing; a SQL Server
+audit specification or extended-event session covering the table, its schema or
+the database — counts as a reader it cannot qualify. Anything it cannot
+establish, including a catalog it may not read, refuses the confidential
+operation; pbps never changes a grant or an audit policy to pass. A database
+backup is one of those authorized readers' reads: its storage is the operator's,
+as a downloaded plan file is (ADR-0016 decision 5), and is out of this boundary.
+
+*Readers.* New binaries join the two tables. A confidential row whose protected
+half is unreadable is reported `Denied`, never with a checksum; one whose
+protected half is missing is `Malformed` (absent, empty and unreadable stay
+three answers). `state list` and `status` show the classification and a
+non-executable placeholder, never the checksum, outside a qualified protected
+output. The UI calls the CLI of the same build, so a field added to its row
+contract ships with the parser that accepts it.
+
+*Failure and recovery.* Both halves of a record are one transaction on both
+engines, so an interrupted write leaves neither. The gate is re-established
+before a staged apply's first statement and on `--resume`; losing the
+qualification mid-run refuses the next statement, and the failed attempt is
+recorded as a confidential record or not at all.
+
+*The test contract for parts 2–4.* Live on both engines: an unqualified
+protected table (a stray reader, statement logging on) refuses before output,
+DDL or recording; the ordinary row of a confidential record has a NULL checksum
+and a stub `state_json`; removing the gate or writing the checksum to the
+ordinary row fails a negative control. And a pre-feature binary built from a
+pinned commit, run against ledgers holding ordinary and confidential records —
+human and JSON `state list`, `status` including a staged checkpoint, the
+unsupported-version and fallback paths, and direct `SELECT *` on the ordinary
+table — never outputs a confidential checksum, while ordinary records' history
+and approval by the same SHA-256 keep working.

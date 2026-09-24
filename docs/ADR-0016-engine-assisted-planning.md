@@ -523,7 +523,10 @@ those readers. [#594](https://github.com/pongbiphang/pbps/issues/594) must separ
 design, implement and test an enforceable ledger projection/storage or
 legacy-access compatibility boundary, including snapshot copies, fallback
 queries and direct readers on both engines. This ADR chooses no physical layout,
-migration protocol or credential transition. Until that follow-up is accepted,
+migration protocol or credential transition; *amended:* #594 chose protected
+storage — the whole confidential snapshot and checksum in a separate,
+reader-qualified ledger table, with nothing left in any pre-feature projection
+— recorded as [DEC-868.1](decisions/ledger.md#dec-868-1). Until that follow-up is accepted,
 implemented and passes its compatibility tests, confidential resolver-plan
 publication, application and recording remain disabled. A warning, operator
 assertion, format bump or installation of a newer client cannot waive the gate;
