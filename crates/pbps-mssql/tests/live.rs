@@ -2310,6 +2310,73 @@ async fn a_trigger_or_a_changed_shape_on_the_protected_table_refuses_it() {
     db.drop().await;
 }
 
+/// #878 on SQL Server: on a case-insensitive database the ledger's name
+/// resolves to a project's own `dbo.__PBPS_STATE_CONFIDENTIAL`, which the pull
+/// keeps and validation allows. Even built to the recipe's exact shape, it is
+/// refused by its spelling: nothing is written to it, and a prune neither
+/// deletes its rows nor the ordinary ones.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_project_table_the_collation_folds_onto_the_protected_name_is_refused() {
+    let mut db = TestDb::create("confidential_folded").await;
+    let schema = Schema::default();
+    let ids = IdsFile::default();
+    for _ in 0..2 {
+        pbps_mssql::state::record(
+            &mut db.conn,
+            &snapshot(pbps_model::StateKind::Apply, &schema, &ids),
+        )
+        .await
+        .unwrap();
+    }
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.__PBPS_STATE_CONFIDENTIAL (
+                 state_id BIGINT NOT NULL CONSTRAINT pk___pbps_state_confidential PRIMARY KEY,
+                 plan_checksum CHAR(64) NULL,
+                 reason NVARCHAR(1000) NULL,
+                 state_json NVARCHAR(MAX) NOT NULL
+             );
+             INSERT INTO dbo.__PBPS_STATE_CONFIDENTIAL (state_id, state_json) VALUES (1, N'mine');",
+        )
+        .await
+        .unwrap();
+    // The spelling is the only difference: the rest matches the recipe.
+    let problems = pbps_mssql::state::protected_table_problems(&mut db.conn)
+        .await
+        .unwrap();
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0].contains("__PBPS_STATE_CONFIDENTIAL"),
+        "{problems:?}"
+    );
+
+    let mut full = snapshot(pbps_model::StateKind::Apply, &schema, &ids);
+    full.plan_checksum = Some("e".repeat(64));
+    let stub = snapshot(pbps_model::StateKind::Apply, &schema, &ids);
+    let written = pbps_mssql::state::record_confidential(&mut db.conn, &stub, &full).await;
+    let pruned = pbps_mssql::state::prune(&mut db.conn, 1).await;
+    for result in [written.map(|_| 0), pruned.map(|n| n as i64)] {
+        let error = result.expect_err("a folded occupant").to_string();
+        assert!(error.contains("__PBPS_STATE_CONFIDENTIAL"), "{error}");
+    }
+    let theirs = db
+        .conn
+        .query("SELECT COUNT(*) AS n FROM dbo.__PBPS_STATE_CONFIDENTIAL;")
+        .await
+        .unwrap()[0]
+        .try_get::<i32>("n")
+        .unwrap()
+        .unwrap();
+    assert_eq!(theirs, 1, "the project's table was written to or pruned");
+    assert_eq!(
+        ordinary_rows(&mut db.conn).await,
+        2,
+        "the ordinary ledger was pruned"
+    );
+    db.drop().await;
+}
+
 /// SPEC §8.1: the whole state goes in and comes back out unchanged. Everything
 /// downstream — drift, the plan checksum, `status` — reads this row, so a
 /// serialization that lost a field would make every one of them quietly wrong.

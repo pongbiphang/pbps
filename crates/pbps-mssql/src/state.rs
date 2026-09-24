@@ -64,8 +64,18 @@ END;";
 /// known layout compared whole (DEC-313.1's method on this engine). Names are
 /// collated to the database default: `sys` names are in the server's
 /// collation, and concatenating the two otherwise fails (measured, Msg 451).
+///
+/// **The spelling is a fact too.** On a case-insensitive database `OBJECT_ID`
+/// resolves the ledger's name to a project's own `__PBPS_STATE_CONFIDENTIAL`,
+/// which the pull keeps and validation allows because neither reserves more
+/// than the exact spelling. A table of the recipe's shape under that name would
+/// otherwise be written to and pruned as the ledger, and a later plan could
+/// alter or drop it.
 const CONFIDENTIAL_FACTS: &str = "\
 DECLARE @o int = OBJECT_ID(N'dbo.__pbps_state_confidential', N'U');
+SELECT 'spelled ' + OBJECT_NAME(@o) COLLATE DATABASE_DEFAULT AS fact
+ WHERE OBJECT_NAME(@o) COLLATE Latin1_General_BIN2 <> N'__pbps_state_confidential'
+UNION ALL
 SELECT 'column ' + c.name COLLATE DATABASE_DEFAULT + ' '
        + TYPE_NAME(c.user_type_id) COLLATE DATABASE_DEFAULT + ' '
        + CONVERT(varchar(11), c.max_length) + ' ' + CONVERT(varchar(11), c.precision) + ' '
@@ -743,14 +753,18 @@ pub async fn protected_table_problems(conn: &mut Conn) -> Result<Vec<String>, Db
     let mut problems = Vec::new();
     for row in &rows {
         let fact = get::<&str>(row, "fact")?.to_owned();
-        match fact.strip_prefix("untrusted owner ") {
-            Some(owner) => problems.push(format!(
+        if let Some(owner) = fact.strip_prefix("untrusted owner ") {
+            problems.push(format!(
                 "{CONFIDENTIAL_TABLE} is owned by `{owner}`, which is neither dbo, this \
                  principal, nor a role it belongs to"
-            )),
-            None => {
-                held.insert(fact);
-            }
+            ));
+        } else if let Some(spelling) = fact.strip_prefix("spelled ") {
+            problems.push(format!(
+                "{CONFIDENTIAL_TABLE} resolves to `dbo.{spelling}`, a table the project names \
+                 itself, which this database's collation folds onto the ledger's name"
+            ));
+        } else {
+            held.insert(fact);
         }
     }
     if !held.is_empty() {
