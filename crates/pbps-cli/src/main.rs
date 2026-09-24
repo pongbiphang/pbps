@@ -660,7 +660,15 @@ fn run() -> anyhow::Result<()> {
             })?;
             println!("{}", viewer.url());
             std::io::stdout().flush()?;
-            eprintln!("Read-only viewer. Press Ctrl-C to stop.");
+            // Compose writes on Linux only (#494, #471); say so at launch.
+            eprintln!(
+                "{}",
+                if cfg!(target_os = "linux") {
+                    "Local viewer: read views, and Compose change can commit a reviewed change to a new branch and push it. Press Ctrl-C to stop."
+                } else {
+                    "Read-only viewer (compose requires Linux). Press Ctrl-C to stop."
+                }
+            );
             viewer.serve()?;
             Ok(())
         }

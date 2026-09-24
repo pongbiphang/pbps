@@ -256,3 +256,30 @@ fn compose_actions_keep_the_viewer_gate_and_accept_nothing_else() {
     );
     f.source_unchanged(&before);
 }
+
+#[test]
+fn a_busy_publisher_refuses_confirmation_without_consuming_the_reviewed_handle() {
+    let f = Fixture::new("viewer-compose-busy");
+    let served = serve(&f);
+    let preview = served.action("preview", intent()).json();
+    let candidate = preview["candidate_id"].as_str().unwrap();
+    let operation = preview["operation_id"].as_str().unwrap();
+    let confirm = || served.action("confirm", serde_json::json!({"candidate_id": candidate}));
+    // Another compose (a CLI or a second viewer) holds the owner lock.
+    let other = f.publisher();
+    let refused = confirm().json();
+    assert_eq!(refused["status"], "refused", "{refused}");
+    assert_eq!(refused["operation_id"], operation);
+    assert_eq!(refused["remote"], "not_attempted");
+    assert_eq!(refused["problem"], "repository_unavailable");
+    assert!(!f.record(operation).exists(), "a refusal wrote a receipt");
+    drop(other);
+    // The same frozen handle is still confirmable once the lock clears.
+    let delivered = confirm().json();
+    assert_eq!(delivered["status"], "delivered", "{delivered}");
+    assert_eq!(
+        f.remote_ref(preview["output_ref"].as_str().unwrap())
+            .as_deref(),
+        delivered["details"]["commit"].as_str()
+    );
+}

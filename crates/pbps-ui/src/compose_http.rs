@@ -8,7 +8,10 @@ use std::time::{Duration, SystemTime};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use crate::compose::{self, Candidates, Publications, Request};
+use crate::compose::{
+    self, Candidates, DeliveryState, LocalState, Outcome, Problem, Publications, RefEvidence,
+    Request, Status,
+};
 
 /// Bounds one compose action, including its Git and CLI subprocesses.
 const DEADLINE: Duration = Duration::from_secs(120);
@@ -91,11 +94,34 @@ impl Compose {
             }
             "confirm" => {
                 let Handle { candidate_id } = parse(body)?;
+                // The publisher and its owner lock come first. If another
+                // compose holds it, the reviewed handle is not consumed and
+                // the page gets a definite refusal it may confirm again.
+                let mut publisher = match self.publisher() {
+                    Ok(publisher) => publisher,
+                    Err(refusal) => {
+                        let Some(operation) = self.candidates.operation(&candidate_id) else {
+                            return Err(refusal);
+                        };
+                        return encode(&Outcome {
+                            status: Status::Refused,
+                            operation_id: operation.to_owned(),
+                            details: None,
+                            local: LocalState::NotAttempted,
+                            local_evidence: RefEvidence::Absent,
+                            remote: DeliveryState::NotAttempted,
+                            remote_evidence: None,
+                            problem: Some(Problem::RepositoryUnavailable),
+                            // The sealed preview still owns private resources.
+                            cleanup_pending: true,
+                        });
+                    }
+                };
                 let candidate = self
                     .candidates
                     .confirm(&candidate_id, SystemTime::now())
                     .map_err(refused)?;
-                encode(&self.publisher()?.confirm(&candidate))
+                encode(&publisher.confirm(&candidate))
             }
             "list" => {
                 let Nothing {} = parse(body)?;

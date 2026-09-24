@@ -279,6 +279,16 @@ impl Candidates {
         Ok(preview)
     }
 
+    /// The operation behind the current handle, without confirming it: a
+    /// caller that cannot publish yet refuses before consuming the handle.
+    pub fn operation(&self, candidate_id: &str) -> Option<&str> {
+        let candidate = match self.current.as_ref()? {
+            Stored::Previewed { candidate, .. } | Stored::Confirmed(candidate) => candidate,
+        };
+        (candidate.preview.candidate_id == candidate_id)
+            .then_some(candidate.preview.operation_id.as_str())
+    }
+
     pub fn confirm(&mut self, candidate_id: &str, now: SystemTime) -> Result<Arc<Candidate>> {
         let current = self
             .current

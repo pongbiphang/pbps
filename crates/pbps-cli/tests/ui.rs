@@ -9,6 +9,9 @@ struct Viewer {
     directory: PathBuf,
     address: String,
     token: String,
+    banner: String,
+    // Kept open: a closed pipe would make the viewer's next eprintln panic.
+    _stderr: BufReader<std::process::ChildStderr>,
 }
 
 impl Viewer {
@@ -46,6 +49,9 @@ impl Viewer {
             .strip_prefix("http://")
             .expect("the UI prints its launch URL");
         let (address, token) = line.split_once("/#").unwrap();
+        let mut banner = String::new();
+        let mut stderr = BufReader::new(child.stderr.take().unwrap());
+        stderr.read_line(&mut banner).unwrap();
         assert!(address.starts_with("127.0.0.1:"));
         assert_eq!(token.len(), 64);
         assert!(token.bytes().all(|b| b.is_ascii_hexdigit()));
@@ -54,6 +60,8 @@ impl Viewer {
             directory,
             address: address.into(),
             token: token.into(),
+            banner,
+            _stderr: stderr,
         }
     }
 
@@ -131,7 +139,7 @@ fn shell_reads_are_public_but_project_reads_require_the_launch_token() {
 }
 
 #[test]
-fn request_guards_precede_routing_and_no_write_route_exists() {
+fn request_guards_precede_routing_and_only_compose_actions_write() {
     let viewer = Viewer::start("guards");
     for path in ["/api/status", "/api/apply", "/"] {
         assert_eq!(
@@ -270,5 +278,22 @@ fn the_ui_has_no_host_or_write_option() {
             .unwrap();
         assert_eq!(output.status.code(), Some(2));
         assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
+    }
+}
+
+#[test]
+fn the_launch_banner_discloses_whether_the_viewer_can_write() {
+    let viewer = Viewer::start("banner");
+    // Compose commits and pushes on Linux (#494); the banner must not call
+    // that viewer read-only, and must say so where compose is refused.
+    if cfg!(target_os = "linux") {
+        assert!(!viewer.banner.contains("Read-only"), "{}", viewer.banner);
+        assert!(
+            viewer.banner.contains("commit a reviewed change"),
+            "{}",
+            viewer.banner
+        );
+    } else {
+        assert!(viewer.banner.contains("Read-only"), "{}", viewer.banner);
     }
 }
