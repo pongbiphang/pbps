@@ -61,12 +61,13 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
   framing. See [ADR-0014 §2](ADR-0014-driver-seam-tested.md#2-begin-holds-t-sql-in-the-crate-that-is-documented-to-hold-none)
   for the boundary correction.
 
-## Planned isolated compose
+## Isolated compose
 
-[ADR-0017](ADR-0017-isolated-compose.md) is accepted design for #494; the shipped
-viewer remains read-only until #745–#748 are implemented and qualified. Raw file
-capture is an explicit orchestration responsibility, not permission to
-move schema interpretation into the UI (#750).
+[ADR-0017](ADR-0017-isolated-compose.md) is implemented and qualified (#745–#748).
+The viewer enables it on Linux (#494) through fixed, gated `POST /api/compose/<action>`
+requests, which are its only writes. Raw file capture is an explicit
+orchestration responsibility, not permission to move schema interpretation into
+the UI (#750).
 
 | Responsibility | Owner and boundary |
 | --- | --- |

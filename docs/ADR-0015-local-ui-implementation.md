@@ -56,8 +56,8 @@ store candidate/recovery metadata, while the same executable still resolves
 intent and validates the snapshot. It cannot parse YAML/project configuration,
 infer identity or render a model by linking workspace crates. Git output and opaque
 file bytes are not additional sources of schema semantics. The responsibility
-table in [ARCHITECTURE](ARCHITECTURE.md#planned-isolated-compose) states this
-boundary; it does not enable writes in the currently shipped viewer (#750).
+table in [ARCHITECTURE](ARCHITECTURE.md#isolated-compose) states this boundary
+(#750); compose's gated actions are the viewer's only writes (#494).
 
 The cost is a process per question and the JSON round trip. For one person on
 one machine, looking at one project, that is not a cost anyone can see.
