@@ -319,8 +319,14 @@ const DELETE_UP_TO: &str = "DELETE FROM public.__pbps_state WHERE id <= $1";
 /// Both halves of every pruned record, in one statement: the protected rows go
 /// with the ordinary rows they belong to or not at all (DEC-868.1). The count
 /// returned is the ordinary rows', as [`DELETE_UP_TO`]'s is.
+///
+/// `ONLY`, here and in [`SELECT_PROTECTED`]: a table inheriting from the
+/// protected one is outside its recipe — the gate inspects the parent alone —
+/// yet a plain `DELETE` or `SELECT` expands to it, so a prune would delete its
+/// rows and fire its triggers, and a read could return its payload for the
+/// same `state_id`, which its own primary key does not keep unique.
 const DELETE_BOTH_UP_TO: &str = "\
-WITH protected AS (DELETE FROM public.__pbps_state_confidential WHERE state_id <= $1)
+WITH protected AS (DELETE FROM ONLY public.__pbps_state_confidential WHERE state_id <= $1)
 DELETE FROM public.__pbps_state WHERE id <= $1";
 
 /// Whether the protected table exists yet. It is created by the first
@@ -336,7 +342,7 @@ fn confidential_is_there() -> String {
 
 const SELECT_PROTECTED: &str = "\
 SELECT plan_checksum, reason, state_json
-  FROM public.__pbps_state_confidential WHERE state_id = $1";
+  FROM ONLY public.__pbps_state_confidential WHERE state_id = $1";
 
 fn select_lock() -> String {
     let locked_at = rendered("locked_at");

@@ -7458,6 +7458,63 @@ async fn a_trigger_on_the_protected_table_refuses_its_write_and_its_prune() {
     db.drop().await;
 }
 
+/// #878: a table inheriting from the protected one is outside its recipe, so
+/// the ledger never reaches it. A read returns the protected table's own half
+/// though the child holds another under the same `state_id`, and a prune
+/// neither deletes the child's rows nor fires its trigger.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn an_inheriting_table_is_neither_read_nor_pruned_as_the_protected_one() {
+    let mut db = TestDb::create("confidential_child").await;
+    let mut full = snapshot(StateKind::Apply);
+    full.plan_checksum = Some("e".repeat(64));
+    let stub = snapshot(StateKind::Apply);
+    let id = state::record_confidential(&mut db.conn, &stub, &full)
+        .await
+        .expect("the first confidential record");
+    // A newer record, so a prune keeping one has the confidential one to take.
+    state::record(&mut db.conn, &snapshot(StateKind::Apply))
+        .await
+        .unwrap();
+    db.conn
+        .execute(&format!(
+            "CREATE TABLE public.pbps_marker (n integer);
+             CREATE FUNCTION public.pbps_mark() RETURNS trigger LANGUAGE plpgsql AS
+               $$ BEGIN INSERT INTO public.pbps_marker VALUES (1); RETURN NULL; END $$;
+             CREATE TABLE public.pbps_child () INHERITS (public.__pbps_state_confidential);
+             CREATE TRIGGER t AFTER DELETE ON public.pbps_child
+               FOR EACH ROW EXECUTE FUNCTION public.pbps_mark();
+             INSERT INTO public.pbps_child (state_id, plan_checksum, state_json)
+               VALUES ({id}, repeat('c', 64), 'the child''s');"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        state::protected_half(&mut db.conn, id).await.unwrap(),
+        state::ProtectedHalf::Found {
+            plan_checksum: Some("e".repeat(64)),
+            reason: None,
+            state_json: serde_json::to_string(&full).unwrap(),
+        }
+    );
+    assert_eq!(state::prune(&mut db.conn, 1).await.unwrap(), 1);
+    let mut left = Vec::new();
+    for sql in [
+        "SELECT count(*)::int8 AS n FROM public.pbps_marker",
+        "SELECT count(*)::int8 AS n FROM ONLY public.pbps_child",
+        "SELECT count(*)::int8 AS n FROM ONLY public.__pbps_state_confidential",
+    ] {
+        left.push(
+            db.conn.query(sql).await.unwrap()[0]
+                .try_get::<i64>("n")
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    assert_eq!(left, [0, 1, 0], "marker, child, protected");
+    db.drop().await;
+}
+
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn doctor_requires_ownership_only_until_the_existing_ledger_is_migrated() {
