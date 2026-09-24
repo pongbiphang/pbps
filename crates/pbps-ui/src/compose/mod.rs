@@ -350,11 +350,17 @@ impl Candidates {
     /// that nothing was attempted. A confirmed handle may already have a
     /// receipt, which must be read, not assumed absent.
     pub fn unconfirmed_operation(&self, candidate_id: &str) -> Option<&str> {
+        self.unconfirmed_preview(candidate_id)
+            .map(|preview| preview.operation_id.as_str())
+    }
+
+    /// The workflow's issued, unconfirmed preview behind `candidate_id`,
+    /// so a caller can recheck its admission before confirming it.
+    pub fn unconfirmed_preview(&self, candidate_id: &str) -> Option<&Preview> {
         let Some(Stored::Previewed { candidate, .. }) = self.current.as_ref() else {
             return None;
         };
-        (candidate.preview.candidate_id == candidate_id)
-            .then_some(candidate.preview.operation_id.as_str())
+        (candidate.preview.candidate_id == candidate_id).then_some(&candidate.preview)
     }
 
     /// Releases a confirmed candidate whose publication was refused before

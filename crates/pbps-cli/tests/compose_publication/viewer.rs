@@ -728,3 +728,67 @@ fn a_replaced_handle_stays_definite_while_the_publisher_is_busy() {
         .json();
     assert_eq!(delivered["status"], "delivered", "{delivered}");
 }
+
+#[test]
+fn a_sibling_delivered_after_the_preview_refuses_its_confirmation() {
+    let f = Fixture::new("viewer-compose-confirm-recheck");
+    // Two viewers preview the same base before either publishes, so both
+    // pass the preview gate.
+    let first = serve(&f);
+    let second = serve(&f);
+    let a = first.action("preview", intent()).json();
+    let b = second.action("preview", intent()).json();
+    assert_eq!(a["base"], b["base"]);
+    let delivered = first
+        .action(
+            "confirm",
+            serde_json::json!({"candidate_id": a["candidate_id"]}),
+        )
+        .json();
+    assert_eq!(delivered["status"], "delivered", "{delivered}");
+    // Under the owner lock the gate is rerun: a definite refusal naming the
+    // delivered sibling, and nothing published for the refused handle.
+    let refused = second.action(
+        "confirm",
+        serde_json::json!({"candidate_id": b["candidate_id"]}),
+    );
+    assert_eq!(refused.status, 410, "{}", refused.body);
+    let sibling = a["operation_id"].as_str().unwrap();
+    assert!(
+        refused.body.contains(sibling) && refused.body.contains("start an alternative"),
+        "{}",
+        refused.body
+    );
+    assert!(!f.record(b["operation_id"].as_str().unwrap()).exists());
+    // The refused preview is withdrawn, not left sealed, and its handle
+    // stays refused.
+    let sealed = f
+        .publisher()
+        .resource_reports()
+        .unwrap()
+        .into_iter()
+        .filter(|report| report.state == ResourceState::Sealed)
+        .count();
+    assert_eq!(
+        sealed, 0,
+        "a refused confirmation kept its private snapshot"
+    );
+    let again = second.action(
+        "confirm",
+        serde_json::json!({"candidate_id": b["candidate_id"]}),
+    );
+    assert_eq!(again.status, 410, "{}", again.body);
+    assert!(!f.record(b["operation_id"].as_str().unwrap()).exists());
+    // An explicit alternative beside the delivered result proceeds.
+    second
+        .action("alternative", serde_json::json!({"operation_id": sibling}))
+        .json();
+    let alternative = second.action("preview", intent()).json();
+    let published = second
+        .action(
+            "confirm",
+            serde_json::json!({"candidate_id": alternative["candidate_id"]}),
+        )
+        .json();
+    assert_eq!(published["status"], "delivered", "{published}");
+}

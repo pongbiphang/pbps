@@ -84,6 +84,11 @@ opens. A preview from a base that already has an unresolved result is
 refused until that result is reconciled or retried. A base that already has
 a delivered result needs **Start an alternative** first. Receipts from other
 bases never block, so a result that cannot resolve does not close compose.
+Confirmation checks the same rules again under the publisher's lock. So if
+another viewer publishes from that base after this preview was shown,
+confirming it is refused, nothing is published, and the preview is retired
+(#874). The page shows the reason and lists the saved results, so the result
+from that base and its **Start an alternative** are in view.
 
 The page sends only the intent fields and opaque handles. Every tree, manifest,
 destination and commit stays on the server side. Compose actions are fixed
