@@ -346,3 +346,71 @@ fn a_receipt_removed_during_discovery_is_named() {
     assert!(!error.contains(&ids[0]), "{error}");
     assert!(first.exists() && preserved.exists());
 }
+
+#[test]
+fn a_record_removed_before_the_closing_pass_is_named() {
+    for kind in ["receipt", "resource"] {
+        let f = Fixture::new(&format!("closing-removal-{kind}"));
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let (_store, preview, candidate) = f.ready();
+            if kind == "receipt" {
+                assert_eq!(f.publisher().confirm(&candidate).status, Status::Delivered);
+            }
+            ids.push(preview.operation_id);
+        }
+        ids.sort();
+        let directory = if kind == "receipt" {
+            root(&f)
+        } else {
+            root(&f).join("resources")
+        };
+        let (first, second) = (
+            directory.join(format!("{}.json", ids[0])),
+            directory.join(format!("{}.json", ids[1])),
+        );
+        let preserved = f.repo.root.join("removed-record");
+        let (dir, moved, kept) = (directory.clone(), second.clone(), preserved.clone());
+        let fired = Arc::new(AtomicBool::new(false));
+        let flag = fired.clone();
+        let armed = Arc::new(AtomicBool::new(false));
+        let enabled = armed.clone();
+        let passes = AtomicUsize::new(0);
+        let observer = ResourceObserver::new(move |at| {
+            // Every record has been read; the closing namespace pass follows.
+            if enabled.load(Ordering::SeqCst)
+                && at.operation == ResourceOperation::Read
+                && !at.after
+                && at.path == dir
+                && passes.fetch_add(1, Ordering::SeqCst) == 1
+                && !flag.swap(true, Ordering::SeqCst)
+            {
+                fs::rename(&moved, &kept).unwrap();
+            }
+            true
+        });
+        let mut publisher = observed(&f, observer);
+        let mut discover = || {
+            if kind == "receipt" {
+                publisher.list().err().map(|e| e.to_string())
+            } else {
+                publisher.resource_reports().err().map(|e| e.to_string())
+            }
+        };
+        // Unchanged positive control through the same entry point.
+        assert_eq!(discover(), None, "{kind}");
+        armed.store(true, Ordering::SeqCst);
+        let error = discover().unwrap_or_else(|| panic!("{kind}: accepted a changed batch"));
+        assert!(fired.load(Ordering::SeqCst), "{kind}");
+        assert!(
+            error.contains("changed during discovery"),
+            "{kind}: {error}"
+        );
+        assert!(
+            error.contains(&second.display().to_string()),
+            "{kind}: {error}"
+        );
+        assert!(!error.contains(&ids[0]), "{kind}: {error}");
+        assert!(first.exists() && preserved.exists());
+    }
+}

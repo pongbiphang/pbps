@@ -302,10 +302,25 @@ impl Records {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        if self.names()? != names {
-            return Err(Error::new(
-                "Compose receipt evidence changed during discovery; preserve it",
-            ));
+        let closing = self.names()?;
+        if closing != names {
+            // Name each receipt that appeared or disappeared since the pass.
+            let changed = names
+                .iter()
+                .filter(|id| !closing.contains(id))
+                .chain(closing.iter().filter(|id| !names.contains(id)))
+                .map(|id| {
+                    self.directory
+                        .path
+                        .join(format!("{id}.json"))
+                        .display()
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            return Err(Error::new(&format!(
+                "Compose receipt evidence changed during discovery: {}; preserve it",
+                changed.join(", ")
+            )));
         }
         for (id, (_, revision)) in names.iter().zip(&records) {
             self.directory

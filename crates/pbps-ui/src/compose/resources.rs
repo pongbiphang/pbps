@@ -151,10 +151,17 @@ impl Resources {
         names: &BTreeSet<String>,
         revisions: &BTreeMap<String, ReadRevision>,
     ) -> Result<()> {
-        if &self.names()? != names {
-            return Err(Error::new(
-                "Compose resource evidence changed during discovery; preserve it",
-            ));
+        let closing = self.names()?;
+        if &closing != names {
+            // Name each record that appeared or disappeared since the pass.
+            let changed = names
+                .symmetric_difference(&closing)
+                .map(|name| self.records.path.join(name).display().to_string())
+                .collect::<Vec<_>>();
+            return Err(Error::new(&format!(
+                "Compose resource evidence changed during discovery: {}; preserve it",
+                changed.join(", ")
+            )));
         }
         for (id, revision) in revisions {
             self.records
