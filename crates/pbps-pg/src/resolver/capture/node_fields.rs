@@ -33,6 +33,8 @@ fn specification(tag: &str, major: u32) -> Option<Specification> {
         (16 | 18, "GROUPINGSET") => (&["kind", "content", "location"], &[], &[("content", true)]),
         (16 | 18, "INFERENCEELEM") => (&["expr", "infercollid", "inferopclass"], &[("infercollid", Collation, false), ("inferopclass", OperatorClass, false)], &[("expr", false)]),
         (16 | 18, "JOINEXPR") => (&["jointype", "isNatural", "larg", "rarg", "usingClause", "join_using_alias", "quals", "alias", "rtindex"], &[], &[("larg", false), ("rarg", false), ("usingClause", true), ("join_using_alias", false), ("quals", false), ("alias", false)]),
+        (16, "MERGEACTION") => (&["matched", "commandType", "override", "qual", "targetList", "updateColnos"], &[], &[("qual", false), ("targetList", true), ("updateColnos", true)]),
+        (18, "MERGEACTION") => (&["matchKind", "commandType", "override", "qual", "targetList", "updateColnos"], &[], &[("qual", false), ("targetList", true), ("updateColnos", true)]),
         (16 | 18, "MINMAXEXPR") => (&["minmaxtype", "minmaxcollid", "inputcollid", "op", "args", "location"], &[("minmaxtype", Type, false), ("minmaxcollid", Collation, false), ("inputcollid", Collation, false)], &[("args", true)]),
         (16 | 18, "NAMEDARGEXPR") => (&["arg", "name", "argnumber", "location"], &[], &[("arg", false)]),
         (16 | 18, "NEXTVALUEEXPR") => (&["seqid", "typeId"], &[("seqid", Relation, false), ("typeId", Type, false)], &[]),

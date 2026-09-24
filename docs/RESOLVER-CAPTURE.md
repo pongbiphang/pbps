@@ -86,8 +86,11 @@ whole-program dependencies.
 Engine rendering is restricted to selected rows. Non-null constants and
 missing-value arrays must have qualified output handlers before rendering;
 type-modifier output is qualified too. The measured scalar handlers, enum,
-array, domain and named-composite paths use known builtin routines. Unqualified
-custom output, OID-alias constants and unsupported node/type surfaces refuse
+array, domain and named-composite paths use known builtin routines. Scalar
+qualification checks both the SQL function identity and its implementation
+symbol, including builtin aliases and the specialized integer/OID vectors.
+Measured network, geometry, XML, text-search and snapshot constants qualify
+without permitting arbitrary type I/O. Unqualified custom output, OID-alias constants and unsupported node/type surfaces refuse
 rather than invoke arbitrary output code or hide an input as absent. Unrelated
 unqualified objects are lookup rows, not certified or rendered prerequisites.
 

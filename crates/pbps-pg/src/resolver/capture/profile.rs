@@ -45,6 +45,73 @@ pub(super) fn expression(catalog: &Catalog, text: &str, major: u32) -> Result<()
     walk(catalog, &tree)
 }
 
+// Exact output identities measured on both qualified majors. Some builtins
+// share implementations; the SQL function name and implementation symbol are
+// independently qualified. OID aliases and internal-only types stay refused.
+fn builtin_output(name: &str) -> Option<(&'static str, &'static str)> {
+    let function = match name {
+        "bit" => "bit_out",
+        "bool" => "boolout",
+        "box" => "box_out",
+        "bpchar" => "bpcharout",
+        "bytea" => "byteaout",
+        "char" => "charout",
+        "cid" => "cidout",
+        "cidr" => "cidr_out",
+        "circle" => "circle_out",
+        "date" => "date_out",
+        "float4" => "float4out",
+        "float8" => "float8out",
+        "inet" => "inet_out",
+        "int2" => "int2out",
+        "int2vector" => "int2vectorout",
+        "int4" => "int4out",
+        "int8" => "int8out",
+        "interval" => "interval_out",
+        "json" => "json_out",
+        "jsonb" => "jsonb_out",
+        "jsonpath" => "jsonpath_out",
+        "line" => "line_out",
+        "lseg" => "lseg_out",
+        "macaddr" => "macaddr_out",
+        "macaddr8" => "macaddr8_out",
+        "money" => "cash_out",
+        "name" => "nameout",
+        "numeric" => "numeric_out",
+        "oid" => "oidout",
+        "oidvector" => "oidvectorout",
+        "path" => "path_out",
+        "pg_lsn" => "pg_lsn_out",
+        "pg_snapshot" => "pg_snapshot_out",
+        "point" => "point_out",
+        "polygon" => "poly_out",
+        "refcursor" => "textout",
+        "text" => "textout",
+        "tid" => "tidout",
+        "time" => "time_out",
+        "timestamp" => "timestamp_out",
+        "timestamptz" => "timestamptz_out",
+        "timetz" => "timetz_out",
+        "tsquery" => "tsqueryout",
+        "tsvector" => "tsvectorout",
+        "txid_snapshot" => "txid_snapshot_out",
+        "unknown" => "unknownout",
+        "uuid" => "uuid_out",
+        "varbit" => "varbit_out",
+        "varchar" => "varcharout",
+        "xid" => "xidout",
+        "xid8" => "xid8out",
+        "xml" => "xml_out",
+        _ => return None,
+    };
+    let symbol = if function == "txid_snapshot_out" {
+        "pg_snapshot_out"
+    } else {
+        function
+    };
+    Some((function, symbol))
+}
+
 pub(super) fn datum(catalog: &Catalog, oid: u32) -> Result<(), Uncovered> {
     fn output(catalog: &Catalog, oid: u32, visiting: &mut BTreeSet<u32>) -> Result<(), Uncovered> {
         let id = catalog
@@ -78,48 +145,27 @@ pub(super) fn datum(catalog: &Catalog, oid: u32) -> Result<(), Uncovered> {
                 .map_err(|_| fail())?;
             let name = id.name.last().ok_or_else(fail)?;
             let element = logical::number(row, "typelem").map_err(|_| fail())?;
-            let symbol = if kind == "e" {
-                "enum_out"
+            let builtin = if id.name.first().map(String::as_str) == Some("pg_catalog") {
+                builtin_output(name)
+            } else {
+                None
+            };
+            let (function_name, symbol) = if kind == "e" {
+                ("enum_out", "enum_out")
             } else if kind == "c" {
-                "record_out"
+                ("record_out", "record_out")
+            } else if let Some(builtin) = builtin {
+                // int2vector/oidvector are category A but use their own
+                // exact builtin outputs, not generic array_out.
+                builtin
             } else if element != 0 && logical::string(row, "typcategory") == Ok("A") {
-                "array_out"
-            } else if id.name.first().map(String::as_str) == Some("pg_catalog") {
-                match name.as_str() {
-                    "bool" => "boolout",
-                    "bytea" => "byteaout",
-                    "char" => "charout",
-                    "name" => "nameout",
-                    "int2" => "int2out",
-                    "int4" => "int4out",
-                    "int8" => "int8out",
-                    "text" => "textout",
-                    "unknown" => "unknownout",
-                    "varchar" => "varcharout",
-                    "bpchar" => "bpcharout",
-                    "numeric" => "numeric_out",
-                    "float4" => "float4out",
-                    "float8" => "float8out",
-                    "date" => "date_out",
-                    "time" => "time_out",
-                    "timetz" => "timetz_out",
-                    "timestamp" => "timestamp_out",
-                    "timestamptz" => "timestamptz_out",
-                    "interval" => "interval_out",
-                    "uuid" => "uuid_out",
-                    "json" => "json_out",
-                    "jsonb" => "jsonb_out",
-                    "bit" => "bit_out",
-                    "varbit" => "varbit_out",
-                    "oid" => "oidout",
-                    _ => return Err(fail()),
-                }
+                ("array_out", "array_out")
             } else {
                 return Err(fail());
             };
             // A user alias to a builtin symbol is still an unqualified type.
             // Build/content qualification remains the native lifecycle's job.
-            if function_id.name != ["pg_catalog", symbol]
+            if function_id.name != ["pg_catalog", function_name]
                 || language.name != ["internal"]
                 || logical::string(function, "prosrc") != Ok(symbol)
             {
@@ -205,6 +251,49 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn measured_scalar_outputs_require_the_exact_function_namespace_language_and_symbol() {
+        let handlers: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("fixtures/scalar-outputs.json")).unwrap();
+        for handler in handlers {
+            let name = handler["name"].as_str().unwrap();
+            for variant in [
+                "builtin",
+                "function_name",
+                "function_namespace",
+                "symbol",
+                "language",
+                "type_namespace",
+            ] {
+                let row = |v: serde_json::Value| v.as_object().unwrap().clone();
+                let catalog = Catalog::new(BTreeMap::from([
+                    ("pg_namespace".into(),vec![row(json!({"oid":11,"nspname":"pg_catalog"})),row(json!({"oid":12,"nspname":"app"}))]),
+                    ("pg_language".into(),vec![row(json!({"oid":13,"lanname":if variant=="language" {"sql"} else {"internal"}}))]),
+                    ("pg_proc".into(),vec![row(json!({"oid":14,"proname":if variant=="function_name" {"wrong"} else {handler["proname"].as_str().unwrap()},"pronamespace":if variant=="function_namespace" {12} else {11},"proargtypes":[100],"prolang":13,"prosrc":if variant=="symbol" {"user_output"} else {handler["prosrc"].as_str().unwrap()}}))]),
+                    ("pg_type".into(),vec![row(json!({"oid":100,"typname":name,"typnamespace":if variant=="type_namespace" {12} else {11},"typtype":"b","typoutput":14,"typelem":0,"typcategory":"U"}))]),
+                ])).unwrap();
+                assert_eq!(
+                    datum(&catalog, 100).is_ok(),
+                    variant == "builtin",
+                    "{name}/{variant}"
+                );
+            }
+        }
+        // Rendering OID-bearing aliases needs an additional logical-binding
+        // proof. An output function allowlist cannot supply that proof.
+        for name in [
+            "regclass",
+            "regproc",
+            "regprocedure",
+            "regtype",
+            "regrole",
+            "aclitem",
+            "pg_node_tree",
+        ] {
+            assert!(builtin_output(name).is_none(), "{name}");
+        }
+    }
 
     #[test]
     fn an_unknown_literal_requires_the_exact_builtin_output_handler() {

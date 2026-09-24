@@ -543,3 +543,6 @@ mod expression_tests;
 
 #[cfg(test)]
 mod range_tests;
+
+#[cfg(test)]
+mod merge_scalar_tests;

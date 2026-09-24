@@ -1,0 +1,158 @@
+[
+  {
+    "name": "box",
+    "prosrc": "box_out",
+    "lanname": "internal",
+    "proname": "box_out"
+  },
+  {
+    "name": "cid",
+    "prosrc": "cidout",
+    "lanname": "internal",
+    "proname": "cidout"
+  },
+  {
+    "name": "cidr",
+    "prosrc": "cidr_out",
+    "lanname": "internal",
+    "proname": "cidr_out"
+  },
+  {
+    "name": "circle",
+    "prosrc": "circle_out",
+    "lanname": "internal",
+    "proname": "circle_out"
+  },
+  {
+    "name": "inet",
+    "prosrc": "inet_out",
+    "lanname": "internal",
+    "proname": "inet_out"
+  },
+  {
+    "name": "int2vector",
+    "prosrc": "int2vectorout",
+    "lanname": "internal",
+    "proname": "int2vectorout"
+  },
+  {
+    "name": "jsonpath",
+    "prosrc": "jsonpath_out",
+    "lanname": "internal",
+    "proname": "jsonpath_out"
+  },
+  {
+    "name": "line",
+    "prosrc": "line_out",
+    "lanname": "internal",
+    "proname": "line_out"
+  },
+  {
+    "name": "lseg",
+    "prosrc": "lseg_out",
+    "lanname": "internal",
+    "proname": "lseg_out"
+  },
+  {
+    "name": "macaddr",
+    "prosrc": "macaddr_out",
+    "lanname": "internal",
+    "proname": "macaddr_out"
+  },
+  {
+    "name": "macaddr8",
+    "prosrc": "macaddr8_out",
+    "lanname": "internal",
+    "proname": "macaddr8_out"
+  },
+  {
+    "name": "money",
+    "prosrc": "cash_out",
+    "lanname": "internal",
+    "proname": "cash_out"
+  },
+  {
+    "name": "oidvector",
+    "prosrc": "oidvectorout",
+    "lanname": "internal",
+    "proname": "oidvectorout"
+  },
+  {
+    "name": "path",
+    "prosrc": "path_out",
+    "lanname": "internal",
+    "proname": "path_out"
+  },
+  {
+    "name": "pg_lsn",
+    "prosrc": "pg_lsn_out",
+    "lanname": "internal",
+    "proname": "pg_lsn_out"
+  },
+  {
+    "name": "pg_snapshot",
+    "prosrc": "pg_snapshot_out",
+    "lanname": "internal",
+    "proname": "pg_snapshot_out"
+  },
+  {
+    "name": "point",
+    "prosrc": "point_out",
+    "lanname": "internal",
+    "proname": "point_out"
+  },
+  {
+    "name": "polygon",
+    "prosrc": "poly_out",
+    "lanname": "internal",
+    "proname": "poly_out"
+  },
+  {
+    "name": "refcursor",
+    "prosrc": "textout",
+    "lanname": "internal",
+    "proname": "textout"
+  },
+  {
+    "name": "tid",
+    "prosrc": "tidout",
+    "lanname": "internal",
+    "proname": "tidout"
+  },
+  {
+    "name": "tsquery",
+    "prosrc": "tsqueryout",
+    "lanname": "internal",
+    "proname": "tsqueryout"
+  },
+  {
+    "name": "tsvector",
+    "prosrc": "tsvectorout",
+    "lanname": "internal",
+    "proname": "tsvectorout"
+  },
+  {
+    "name": "txid_snapshot",
+    "prosrc": "pg_snapshot_out",
+    "lanname": "internal",
+    "proname": "txid_snapshot_out"
+  },
+  {
+    "name": "xid",
+    "prosrc": "xidout",
+    "lanname": "internal",
+    "proname": "xidout"
+  },
+  {
+    "name": "xid8",
+    "prosrc": "xid8out",
+    "lanname": "internal",
+    "proname": "xid8out"
+  },
+  {
+    "name": "xml",
+    "prosrc": "xml_out",
+    "lanname": "internal",
+    "proname": "xml_out"
+  }
+]

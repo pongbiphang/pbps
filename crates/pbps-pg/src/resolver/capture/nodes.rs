@@ -585,6 +585,48 @@ mod tests {
     }
 
     #[test]
+    fn merge_actions_require_complete_fields_and_traverse_both_expression_lists() {
+        for (major, fixtures) in [
+            (16, include_str!("fixtures/merge-16.nodes")),
+            (18, include_str!("fixtures/merge-18.nodes")),
+        ] {
+            for text in fixtures.lines() {
+                let tree = decode(text, major).unwrap();
+                let bound = references(&tree, major).unwrap();
+                for field in ["qual", "targetList"] {
+                    assert!(bound.iter().any(|b| b.class == ReferenceClass::Routine
+                        && b.path.iter().any(|p| p == "mergeActionList")
+                        && b.path.iter().any(|p| p == field)));
+                }
+                let mut actions = Vec::new();
+                nodes_with_tag(&tree, "MERGEACTION", &mut actions);
+                assert_eq!(actions.len(), 4);
+                for node in actions {
+                    let spec = specification("MERGEACTION", major).unwrap();
+                    for field in spec.fields {
+                        let mut missing = node.clone();
+                        missing.fields.remove(*field);
+                        assert!(references(&Value::Node(missing), major).is_err());
+                    }
+                    for field in ["qual", "targetList", "updateColnos"] {
+                        let mut unreadable = node.clone();
+                        unreadable
+                            .fields
+                            .insert(field.into(), Value::Atom("unreadable".into()));
+                        assert!(references(&Value::Node(unreadable), major).is_err());
+                    }
+                    let mut wrong_version = node.clone();
+                    let field = if major == 16 { "matchKind" } else { "matched" };
+                    wrong_version
+                        .fields
+                        .insert(field.into(), Value::Atom("0".into()));
+                    assert!(references(&Value::Node(wrong_version), major).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn query_range_nodes_require_every_reference_and_child_field() {
         for (major, fixtures) in [
             (16, include_str!("fixtures/query-ranges-16.nodes")),
