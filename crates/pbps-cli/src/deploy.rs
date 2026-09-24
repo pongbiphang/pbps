@@ -3752,12 +3752,23 @@ pub fn cmd_plan_db(
             // First, so that what it adds is held to every check after it: a
             // view this plan now drops and recreates takes `before_a_rebuild`
             // like one the declarations edit (#314, ADR-0009 §4).
+            let rediff = |also: &std::collections::BTreeSet<pbps_model::ModuleId>| {
+                pbps_diff::diff_rebuilding(
+                    pbps_diff::Side { schema: &base, ids: &recorded_ids },
+                    pbps_diff::Side { schema: &loaded.schema, ids: &resolved.ids },
+                    dialect.as_ref(),
+                    &hints,
+                    also,
+                )
+                .map_err(|errs| anyhow::anyhow!("{} change(s) cannot be expressed", errs.len()))
+            };
             let dependents = crate::engine::account_for_module_dependents(
                 &mut conn,
                 &mut cs,
                 &loaded.schema,
                 &[&resolved.ids, &recorded_ids],
                 dialect.as_ref(),
+                &rediff,
             )
             .await?;
             let rebuilds = crate::engine::check_module_rebuilds(&mut conn, &cs, false).await?;

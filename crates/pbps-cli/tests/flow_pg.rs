@@ -1246,9 +1246,20 @@ fn module_rebuilds_refuse_carried_state_before_planning_and_before_recording() {
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn module_dependents_are_dropped_and_restored_around_the_rebuild_or_refused_by_name() {
+    struct Role(String, String);
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
     let server = server();
+    let reader = Role(
+        server.clone(),
+        format!("pbps_dep_reader_{}", std::process::id()),
+    );
     let own = OwnDatabase::new(&server, "module-dependents");
     let connection = own.connection();
+    on_server(connection, &format!("CREATE ROLE {} NOSUPERUSER", reader.1));
     on_server(
         connection,
         "CREATE SCHEMA app; \
@@ -1259,6 +1270,16 @@ fn module_dependents_are_dropped_and_restored_around_the_rebuild_or_refused_by_n
          CREATE VIEW app.v1 AS SELECT id FROM app.v0; \
          CREATE VIEW app.v2 AS SELECT id FROM app.v1; \
          INSERT INTO app.t (id) VALUES (1), (2)",
+    );
+    // A declared grant on a view the rebuild of `v0` has to drop and create:
+    // the plan restates it only if the differ rebuilt the view, not if the
+    // pair were added after its permission passes had run.
+    on_server(
+        connection,
+        &format!(
+            "GRANT USAGE ON SCHEMA app TO {r}; GRANT SELECT ON app.v1 TO {r}",
+            r = reader.1
+        ),
     );
     let d = Demo::new("module-dependents");
     succeeds(d.run(&["pull", "--db", connection]));
@@ -1408,6 +1429,19 @@ fn module_dependents_are_dropped_and_restored_around_the_rebuild_or_refused_by_n
     succeeds(d.run(&["verify", "--db", connection]));
     let next = succeeds(d.run(&["plan", "--db", connection]));
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    // The rebuilt view still grants what its declaration grants.
+    assert_eq!(
+        scalar(
+            connection,
+            &format!(
+                "SELECT count(*) FROM information_schema.role_table_grants \
+                 WHERE grantee = '{}' AND table_schema = 'app' AND table_name = 'v1' \
+                 AND privilege_type = 'SELECT'",
+                reader.1
+            )
+        ),
+        1
+    );
 }
 
 /// #248, end to end: a rebuild forced by an ordinary view edit still lets a

@@ -1480,12 +1480,19 @@ async fn module_dependents(
 /// the approver sees (`dependents::weave`). Called inside the planning
 /// transaction, before `check_module_rebuilds`, so that a view the plan now
 /// drops and recreates is held to the same bar as one the declarations edit.
+///
+/// `rediff` plans the same revision again with the given unchanged modules
+/// rebuilt (`pbps_diff::diff_rebuilding`): a module dependent the plan does
+/// not touch has to be rebuilt around the module under it, and a rebuild is
+/// its grants and its `PUBLIC` execute as well as its two statements, which
+/// only the differ's own passes write.
 pub async fn account_for_module_dependents(
     conn: &mut Conn,
     changes: &mut ChangeSet,
     declared: &pbps_model::Schema,
     ids: &[&pbps_model::IdsFile],
     dialect: &dyn pbps_dialect::Dialect,
+    rediff: &dyn Fn(&BTreeSet<pbps_model::ModuleId>) -> anyhow::Result<ChangeSet>,
 ) -> anyhow::Result<ConnectedCheck> {
     if conn.driver() != Driver::Postgres {
         return Ok(ConnectedCheck {
@@ -1495,7 +1502,12 @@ pub async fn account_for_module_dependents(
             message: "SQL Server uses CREATE OR ALTER, so a module change drops nothing that depends on it".into(),
         });
     }
-    let found = module_dependents(conn, changes).await?;
+    let mut found = module_dependents(conn, changes).await?;
+    let untouched = crate::dependents::untouched_module_dependents(changes, &found, declared);
+    if !untouched.is_empty() {
+        *changes = rediff(&untouched)?;
+        found = module_dependents(conn, changes).await?;
+    }
     let added = crate::dependents::weave(changes, &found, declared, ids, dialect)
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
     let left = crate::dependents::unaccounted(changes, &found);

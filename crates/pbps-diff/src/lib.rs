@@ -17,7 +17,9 @@ pub use identity::{
     resolve_with_annotations,
 };
 pub use managed::{Scoped, observed_ids, scope};
-pub use schema_diff::{DiffError, Diffed, Side, diff, diff_partial, order_role_drops};
+pub use schema_diff::{
+    DiffError, Diffed, Side, diff, diff_partial, diff_rebuilding, order_role_drops,
+};
 
 #[cfg(test)]
 // In tests, a catch-all arm with a panic is the right way to say "this should be

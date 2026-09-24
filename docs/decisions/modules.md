@@ -1306,7 +1306,17 @@ declarations keep is restored after the create.
   added again: a view the declarations drop goes before the function under it,
   and a view they edit is split into its drop and its create, one on each side.
 - **Synthesized from the declarations.** What the plan lacks is built from the
-  declarations, the only place pbps can put an object back from.
+  declarations, the only place pbps can put an object back from. A declared
+  module the plan does not touch is handed back to the differ to rebuild
+  (`pbps_diff::diff_rebuilding`), as `rebound_modules` does (DECISIONS 422).
+  A rebuild is more than its two statements: the grants it takes with it and
+  the `PUBLIC` execute it gets back come from the differ's permission passes,
+  and a drop-and-create pair added after those passes ran would restore
+  neither. `before_a_rebuild` would then refuse the rebuild.
+- **Taken away with its owner.** A dependent whose table or column the plan
+  drops before the module's drop is already removed. The differ sorts
+  `DropColumn` and `DropTable` ahead of `AlterModule`. Nothing is synthesized
+  for it, because a `DropCheck` written after its table is gone would fail.
 - **Placed next to the module.** The changes are inserted beside the module
   rather than left to the differ's order. A `DropCheck` sorts after a
   `DropModule`, and an `AddCheck` sorts before a `CreateModule`, so the order

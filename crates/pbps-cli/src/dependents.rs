@@ -55,6 +55,34 @@ pub(crate) fn dropped_modules(changes: &ChangeSet) -> Vec<(ModuleId, ModuleKind)
     out
 }
 
+/// The declared modules among the dependents that this plan does not touch:
+/// the ones the plan has to rebuild around the module under them, and has to
+/// ask the differ to, so their grants and `PUBLIC` execute are restated with
+/// them (`pbps_diff::diff_rebuilding`).
+#[allow(clippy::wildcard_enum_match_arm)]
+pub(crate) fn untouched_module_dependents(
+    changes: &ChangeSet,
+    found: &BTreeMap<ModuleId, Vec<Dependent>>,
+    declared: &Schema,
+) -> std::collections::BTreeSet<ModuleId> {
+    let touched = |x: &ModuleId| {
+        changes.changes.iter().any(|p| match &p.change {
+            Change::AlterModule { id, .. }
+            | Change::DropModule { id, .. }
+            | Change::CreateModule { id, .. } => id == x,
+            _ => false,
+        })
+    };
+    found
+        .values()
+        .flatten()
+        .filter_map(|d| match &d.holds {
+            Holds::Module(x) if declared.modules.contains_key(x) && !touched(x) => Some(x.clone()),
+            Holds::Module(_) | Holds::TablePart { .. } | Holds::Unrepresentable(_) => None,
+        })
+        .collect()
+}
+
 /// Where a dropped module leaves the plan and where it comes back.
 struct Span {
     drop_at: usize,
@@ -417,6 +445,13 @@ pub(crate) fn weave(
             };
             // Removed before the module's drop: moved there if the plan
             // removes it later, synthesized there if it does not remove it.
+            // Taken away with its table or column before the module goes:
+            // already removed, and nothing to put back, since the
+            // declarations no longer have its owner. A removal synthesized
+            // here would name an object that is gone by then.
+            if find(&cs.changes, &d.holds, removes_with_its_owner).is_some_and(|i| i < at.drop_at) {
+                continue;
+            }
             let removal = find(&cs.changes, &d.holds, removes);
             let removed_at = match removal {
                 Some(i) if i < at.drop_at => i,
@@ -493,8 +528,9 @@ pub(crate) fn unaccounted(
             continue;
         };
         for d in deps {
-            let removed_first =
-                find(&cs.changes, &d.holds, removes).is_some_and(|i| i < at.drop_at);
+            let removed_first = find(&cs.changes, &d.holds, removes)
+                .or_else(|| find(&cs.changes, &d.holds, removes_with_its_owner))
+                .is_some_and(|i| i < at.drop_at);
             if !removed_first {
                 out.push(format!("{} depends on `{root}`", d.described));
             }
@@ -846,5 +882,58 @@ mod tests {
             weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).unwrap(),
             0
         );
+    }
+
+    /// A plan that drops the table owning a dependent before the module goes
+    /// (`DropTable` sorts before `AlterModule`) has already removed it: no
+    /// removal is synthesized for an object that is gone by then, and none is
+    /// restored.
+    #[test]
+    fn a_dependent_whose_table_the_plan_drops_first_is_already_accounted_for() {
+        let (mut s, ids) = declared();
+        s.tables.remove(&TableName::new("app", "t"));
+        let mut cs = plan(vec![
+            Change::DropTable {
+                uid: Uid::derived(UidKind::Table, "app.t", 0),
+                name: TableName::new("app", "t"),
+            },
+            alter(&s, "app.f(integer)"),
+        ]);
+        let found = BTreeMap::from([(
+            id("app.f(integer)"),
+            vec![part(
+                Part::Check("ck".into()),
+                "constraint ck on table app.t",
+            )],
+        )]);
+        assert_eq!(
+            weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).unwrap(),
+            0
+        );
+        assert_eq!(cs.changes.len(), 2, "{:?}", rendered(&cs));
+        assert!(unaccounted(&cs, &found).is_empty());
+    }
+
+    /// The declared views a rebuild meets and the plan does not touch are the
+    /// ones handed back to the differ to rebuild; one the plan already edits,
+    /// an undeclared one and a table part are not.
+    #[test]
+    fn only_untouched_declared_modules_are_handed_back_to_the_differ() {
+        let (s, _) = declared();
+        let cs = plan(vec![alter(&s, "app.v0"), alter(&s, "app.v1")]);
+        let found = BTreeMap::from([(
+            id("app.v0"),
+            vec![
+                view("app.v2"),
+                view("app.v1"),
+                view("public.late"),
+                part(Part::Check("ck".into()), "constraint ck on table app.t"),
+            ],
+        )]);
+        let back: Vec<String> = untouched_module_dependents(&cs, &found, &s)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(back, ["app.v2"]);
     }
 }

@@ -125,7 +125,31 @@ pub fn diff(
     dialect: &dyn Dialect,
     hints: &Hints,
 ) -> Result<ChangeSet, Vec<DiffError>> {
-    let d = diff_partial(base, declared, dialect, hints);
+    diff_rebuilding(base, declared, dialect, hints, &BTreeSet::new())
+}
+
+/// [`diff`], with these unchanged modules rebuilt as if the declarations had
+/// edited them.
+///
+/// For the engine fact the declarations cannot see: on PostgreSQL a module a
+/// rebuilt module's dependents include has to be dropped and created around
+/// it (#314, DEC-314.1), and only a connected read of `pg_depend` knows which.
+/// Rebuilt here, not synthesized by the caller, because a rebuild is more
+/// than its two statements: the grants it takes with it and the `PUBLIC`
+/// execute it gets back are written by the passes below, and a caller adding
+/// the pair after those passes had run would restore neither. It is the same
+/// place `rebound_modules` adds the rebuilds a dialect asks for (DECISIONS 422).
+///
+/// An id that the plan already changes, or that is not declared on both
+/// sides, is ignored: there is nothing unchanged to rebuild.
+pub fn diff_rebuilding(
+    base: Side<'_>,
+    declared: Side<'_>,
+    dialect: &dyn Dialect,
+    hints: &Hints,
+    also: &BTreeSet<ModuleId>,
+) -> Result<ChangeSet, Vec<DiffError>> {
+    let d = diff_partial_rebuilding(base, declared, dialect, hints, also);
     if d.errors.is_empty() {
         Ok(d.changes)
     } else {
@@ -151,6 +175,16 @@ pub fn diff_partial(
     declared: Side<'_>,
     dialect: &dyn Dialect,
     hints: &Hints,
+) -> Diffed {
+    diff_partial_rebuilding(base, declared, dialect, hints, &BTreeSet::new())
+}
+
+fn diff_partial_rebuilding(
+    base: Side<'_>,
+    declared: Side<'_>,
+    dialect: &dyn Dialect,
+    hints: &Hints,
+    also: &BTreeSet<ModuleId>,
 ) -> Diffed {
     let mut changes = Vec::new();
     let mut errs = Vec::new();
@@ -367,7 +401,14 @@ pub fn diff_partial(
             | Change::PublicExecution { .. } => None,
         })
         .collect();
-    for id in dialect.rebound_modules(declared.schema, &arriving, &changed) {
+    // One set, so a module both the dialect and the caller ask for is rebuilt
+    // once.
+    let rebound: BTreeSet<ModuleId> = dialect
+        .rebound_modules(declared.schema, &arriving, &changed)
+        .into_iter()
+        .chain(also.iter().cloned())
+        .collect();
+    for id in rebound {
         if !changed.contains(&id)
             && base.schema.modules.contains_key(&id)
             && let Some(module) = declared.schema.modules.get(&id)
@@ -7024,6 +7065,55 @@ mod tests {
             fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
                 MinimalDialect.probe_framing()
             }
+        }
+
+        /// #314: a module the declarations did not change, handed back to be
+        /// rebuilt because a connected read found it depends on one that is
+        /// rebuilt, is rebuilt with its grant restated — the same as one the
+        /// declarations edited. An id the plan already changes, or one the
+        /// declarations do not have, is not rebuilt a second time or at all.
+        #[test]
+        fn a_module_handed_back_to_be_rebuilt_is_rebuilt_with_its_grant() {
+            let grants = role(&[("app.v", &[Permission::Select])]);
+            let mut base = side(&[("r_aaaaaa", "app_reader", grants.clone())]);
+            let mut declared = side(&[("r_aaaaaa", "app_reader", grants)]);
+            for s in [&mut base.0, &mut declared.0] {
+                s.modules.insert(
+                    "app.v".parse().unwrap(),
+                    a_module(pbps_model::ModuleKind::View, "SELECT a FROM app.t"),
+                );
+            }
+            let run = |also: &[&str]| {
+                diff_rebuilding(
+                    Side {
+                        schema: &base.0,
+                        ids: &base.1,
+                    },
+                    Side {
+                        schema: &declared.0,
+                        ids: &declared.1,
+                    },
+                    &Rebuilds,
+                    &Hints::default(),
+                    &also.iter().map(|s| s.parse().unwrap()).collect(),
+                )
+                .unwrap()
+            };
+            let count = |cs: &ChangeSet, pred: &dyn Fn(&Change) -> bool| {
+                cs.changes.iter().filter(|p| pred(&p.change)).count()
+            };
+
+            let rebuilt = run(&["app.v"]);
+            assert_eq!(
+                count(&rebuilt, &|c| matches!(c, Change::AlterModule { .. })),
+                1
+            );
+            assert_eq!(count(&rebuilt, &|c| matches!(c, Change::Grant { .. })), 1);
+
+            // Nothing handed back: nothing changes.
+            assert!(run(&[]).changes.is_empty());
+            // Not declared: nothing to rebuild it from.
+            assert!(run(&["app.gone"]).changes.is_empty());
         }
 
         /// The whole point of #248: a module rebuild takes the object's ACL
