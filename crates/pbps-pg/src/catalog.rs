@@ -706,7 +706,7 @@ pub(crate) fn probe_set(token: &str) -> String {
 /// `lc_monetary` is deliberately absent: it belongs to the same class, and
 /// `SET` fails outright on a locale the server does not have, which would turn
 /// a readable database into an unreadable one.
-const CANONICAL_PATH: &str = "SELECT pg_catalog.set_config('search_path', '', true),
+pub(crate) const CANONICAL_PATH: &str = "SELECT pg_catalog.set_config('search_path', '', true),
        pg_catalog.set_config('quote_all_identifiers', 'off', true),
        pg_catalog.set_config('datestyle', 'ISO, MDY', true),
        pg_catalog.set_config('intervalstyle', 'postgres', true),

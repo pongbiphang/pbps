@@ -287,6 +287,8 @@ jobs:
       # purpose: a firewall that drops rather than refuses is a category of its
       # own, and what proves the wait is bounded is waiting it out.
       - run: cargo test -p pbps-pg --test live -- --ignored
+      # Private capture internals have live snapshot/rendering regressions.
+      - run: cargo test -p pbps-pg --lib -- --ignored --test-threads=1
       - run: python3 scripts/live-transport.py pg
       # The CLI's own PostgreSQL-dependent test, in the bin target rather than
       # in `tests/` because `deploy::run_probes` is private and what it asserts

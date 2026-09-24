@@ -17,6 +17,8 @@ pbps-db.workspace = true
 # `pbps_model::StateSnapshot`'s, and this is what serializes it.
 serde.workspace = true
 serde_json.workspace = true
+# Private versioned resolver input verifiers; never an ordinary report.
+sha2.workspace = true
 # `rows::RowsError`, which travels beside a `DbError` and a `DialectError` and
 # has to carry both (Phase 5 step 7).
 thiserror.workspace = true

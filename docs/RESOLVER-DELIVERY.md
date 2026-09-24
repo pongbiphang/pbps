@@ -96,6 +96,21 @@ declaration is transferred and no SQL surface is exposed. See
 #743's explicit trusted-provisioning assumption and non-exhaustive holder
 observations (DECISIONS 533).
 
+## PostgreSQL target input capture (#612)
+
+The private library captures actual target bindings, complete requested
+candidate/property closures, recorded identity/state and authorization on an
+owned PostgreSQL 16/18 snapshot. Fresh rendering/session checks and native
+executable qualification bound inputs outside that snapshot. Fresh recapture
+reports changed logical inputs without exposing source or guessing verifiers.
+See [the capture boundary](RESOLVER-CAPTURE.md) for supported surfaces, named
+refusals, confidentiality and verification.
+
+This is the target-input portion of ADR cases 3, 4, 9, 15, 16 and 23. Desired
+namespace reconstruction/compilation, complete planning and protected artifact
+integration remain subsequent steps; no resolver-backed CLI plan/apply path is
+enabled by this library.
+
 ## Ordered implementation issues
 
 Each issue describes its scope, ADR acceptance cases, positive/negative tests

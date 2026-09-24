@@ -1459,8 +1459,12 @@ the confidential path.
 (#597), followed by named profile selection/policy (#606) and the Docker
 (#608) and dedicated-server (#609) runtime profiles. Analysis-scope
 compatibility and deployment-context qualification is implemented for
-PostgreSQL (#610) and SQL Server (#611). Binding evidence and the remaining steps stay planned
-under #595; the requirements below still govern their delivery. See [delivery tracking](RESOLVER-DELIVERY.md).
+PostgreSQL (#610) and SQL Server (#611). PostgreSQL target-input capture and fresh
+comparison are available as a private library boundary (#612), including actual
+historical bindings and complete requested prerequisites; see
+[the capture contract](RESOLVER-CAPTURE.md). CLI resolution, saved binding evidence
+and the remaining steps stay planned under #595; the requirements below still
+govern their delivery. See [delivery tracking](RESOLVER-DELIVERY.md).
 
 `pbps doctor --env prod` (or `--db`, with optional `--format json`) now reports
 database locale/encoding and installed extension metadata on PostgreSQL;

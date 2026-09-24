@@ -4,6 +4,7 @@
 //! the queries and candidate rules. Discovery cannot construct a qualified
 //! resolver or authorize compilation, publication or apply.
 
+pub mod capture;
 pub mod environment;
 
 use std::collections::BTreeMap;

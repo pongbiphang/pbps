@@ -12,6 +12,10 @@ use std::sync::{Arc, Weak};
 #[path = "target_engine.rs"]
 mod engine;
 
+#[path = "target_capture.rs"]
+mod capture;
+pub use capture::{CaptureFailure, CapturedTargetInputs};
+
 #[cfg(test)]
 #[path = "target_tests.rs"]
 mod tests;
