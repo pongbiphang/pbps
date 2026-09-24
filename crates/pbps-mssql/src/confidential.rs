@@ -770,8 +770,12 @@ impl Graph {
             .map(|&id| (DATABASE_PRINCIPAL, id))
             .collect();
         let table = self.table_securables();
+        // `db_ddladmin` holds `ALTER` on the database's objects without a row
+        // for it, as `db_datareader` holds `SELECT`: it is the table `ALTER`
+        // below, and can move the rows out (`ALTER TABLE … SWITCH`).
         self.in_database_role(&c, "db_owner")
             || self.in_database_role(&c, "db_securityadmin")
+            || self.in_database_role(&c, "db_ddladmin")
             || self.database_grants(
                 &c,
                 &[
@@ -1394,7 +1398,7 @@ mod tests {
 
     #[test]
     fn grantors_and_backup_principals_must_qualify_too() {
-        let cases: [fn(&mut Graph); 7] = [
+        let cases: [fn(&mut Graph); 8] = [
             |g: &mut Graph| {
                 g.database_roles.push((U_ALICE, 16386));
                 g.database
@@ -1403,6 +1407,11 @@ mod tests {
             |g: &mut Graph| {
                 g.database_perms
                     .push(grant(DATABASE, 0, U_ALICE, "ALTER ANY ROLE"));
+            },
+            |g: &mut Graph| {
+                g.database_roles.push((U_ALICE, 16387));
+                g.database
+                    .insert(16387, principal("db_ddladmin", "R", None, true));
             },
             |g: &mut Graph| {
                 g.database_perms.push(Perm {

@@ -816,7 +816,8 @@ database, or else as `guest` when `guest` may connect.
 *Grantors and backup principals.* Grantors are:
 - server level: `securityadmin`, `ALTER ANY LOGIN`, `ALTER ANY SERVER ROLE`,
   and `ALTER`/`CONTROL` on a reader login;
-- database level: `db_owner`, `db_securityadmin`, `ALTER ANY ROLE`,
+- database level: `db_owner`, `db_securityadmin`, `db_ddladmin` (which holds
+  `ALTER` on the database's objects without a permission row), `ALTER ANY ROLE`,
   `ALTER ANY USER`, `ALTER ANY APPLICATION ROLE`, `ALTER`/`CONTROL`/
   `TAKE OWNERSHIP` on the table, schema `dbo` or the database, a grant option
   on `SELECT`/`CONTROL`, and `ALTER`/`CONTROL` on a reader principal.
