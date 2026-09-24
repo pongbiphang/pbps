@@ -815,7 +815,10 @@ principal is not an absent one. `doctor` asks for these grants (#881).
   a fixed point.
 
 A login enters as its mapped user, as `dbo` when it is `sysadmin` or owns the
-database, or else as `guest` when `guest` may connect.
+database, or else as `guest` when `guest` may connect. Failing that, it enters
+as `public` when `public` may connect. Measured: with `CONNECT` granted to
+`public` alone, a login with no user enters as principal 0 and holds `public`'s
+permissions.
 
 *Grantors and backup principals.* Grantors are:
 - server level: `securityadmin`, `ALTER ANY LOGIN`, `ALTER ANY SERVER ROLE`,
@@ -884,7 +887,11 @@ table before the first write (#870).
   code in another database of the same owner read the table with only
   `EXECUTE` there. The graph is this database's, so the setting is named as
   something the check cannot establish, rather than every other database
-  being read.
+  being read;
+- another database marked `TRUSTWORTHY`, whose `EXECUTE AS OWNER` code carries
+  its owner's login here. `msdb` is left out: it ships trustworthy (measured,
+  the only one on a new server), and only its `db_owner` can add code to it.
+  That is the method's stated limit.
 
 The event lists are known capture events, not every event. A session built
 only from events outside them is not named, and that is the method's stated

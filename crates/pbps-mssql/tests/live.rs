@@ -2689,6 +2689,42 @@ async fn code_and_users_that_cannot_reach_the_table_are_not_named() {
     drop_logins(db, &logins).await;
 }
 
+/// #880: a login with no user in the database enters it as principal 0
+/// (`public`) once `public` may connect, and reads with `public`'s grants
+/// (measured). Before that `CONNECT` it cannot enter, so it is not named.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_login_without_a_user_reads_as_public_once_public_may_connect() {
+    let mut db = TestDb::create("publicentry").await;
+    let schema = Schema::default();
+    let ids = IdsFile::default();
+    let mut full = snapshot(pbps_model::StateKind::Apply, &schema, &ids);
+    full.plan_checksum = Some("e".repeat(64));
+    let stub = snapshot(pbps_model::StateKind::Apply, &schema, &ids);
+    pbps_mssql::state::record_confidential(&mut db.conn, &stub, &full)
+        .await
+        .unwrap();
+    let stranger = format!("pbps880_stranger_{}", std::process::id());
+    db.conn
+        .execute(&format!(
+            "IF SUSER_ID('{stranger}') IS NOT NULL DROP LOGIN [{stranger}];
+             CREATE LOGIN [{stranger}] WITH PASSWORD = '{READER_PASSWORD}', CHECK_POLICY = OFF;
+             GRANT SELECT ON dbo.__pbps_state_confidential TO public;"
+        ))
+        .await
+        .unwrap();
+    let shut = pbps_mssql::confidential::protected_reader_problems(&mut db.conn)
+        .await
+        .unwrap();
+    assert!(!names(&shut, &stranger), "{shut:#?}");
+    db.conn.execute("GRANT CONNECT TO public;").await.unwrap();
+    let open = pbps_mssql::confidential::protected_reader_problems(&mut db.conn)
+        .await
+        .unwrap();
+    assert!(names(&open, &stranger), "{open:#?}");
+    drop_logins(db, &[stranger]).await;
+}
+
 /// #880: a session, trace, audit or tracking feature that would record the
 /// confidential write is named, and stops being named once it is gone.
 #[tokio::test]
@@ -2760,6 +2796,17 @@ async fn statement_capture_and_table_tracking_are_named_until_removed() {
             "cross-database ownership chaining is on".into(),
             format!("ALTER DATABASE [{dbn}] SET DB_CHAINING ON;"),
             format!("ALTER DATABASE [{dbn}] SET DB_CHAINING OFF;"),
+        ),
+        (
+            format!("database `pbps880_trusted_{pid}` is TRUSTWORTHY"),
+            format!(
+                "CREATE DATABASE [pbps880_trusted_{pid}];
+                 ALTER DATABASE [pbps880_trusted_{pid}] SET TRUSTWORTHY ON;"
+            ),
+            format!(
+                "ALTER DATABASE [pbps880_trusted_{pid}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+                 DROP DATABASE [pbps880_trusted_{pid}];"
+            ),
         ),
         (
             "change tracking tracks it".into(),

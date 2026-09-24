@@ -533,14 +533,18 @@ impl Graph {
     }
 
     fn guest_enabled(&self) -> bool {
+        self.connect_granted_to(GUEST)
+    }
+
+    fn connect_granted_to(&self, grantee: i32) -> bool {
         self.database_perms.iter().any(|p| {
-            p.granted() && p.grantee == GUEST && p.class == DATABASE && p.name == "CONNECT"
+            p.granted() && p.grantee == grantee && p.class == DATABASE && p.name == "CONNECT"
         })
     }
 
     /// The database principal a login enters this database as: `dbo` for
     /// `sysadmin` and the database's owner, its mapped user, else `guest`
-    /// when `guest` may connect.
+    /// when `guest` may connect, else `public` when `public` may.
     fn user_of(&self, login: i32) -> Option<i32> {
         let principal = self.server.get(&login)?;
         if self.controls_server(login)
@@ -553,9 +557,13 @@ impl Graph {
                 && u.sid.is_some()
                 && u.sid == principal.sid
         });
+        // Measured: with `CONNECT` granted to `public` and not to `guest`, a
+        // login with no user still enters, as principal 0 (`public`) with
+        // `public`'s permissions.
         match mapped {
             Some((&id, _)) => Some(id),
             None if self.guest_enabled() => Some(GUEST),
+            None if self.connect_granted_to(PUBLIC_DATABASE_ROLE) => Some(PUBLIC_DATABASE_ROLE),
             None => None,
         }
     }
@@ -1061,7 +1069,11 @@ const CAPTURING_GROUPS: &str =
 /// outside this database's graph. Cross-database ownership chaining is here:
 /// it lets code in another database of the same owner read the table with only
 /// `EXECUTE` there, and rather than read every other database, the check names
-/// the setting as something it cannot establish.
+/// the setting as something it cannot establish. So is another database marked
+/// `TRUSTWORTHY`: its `EXECUTE AS OWNER` code carries its owner's login here.
+/// `msdb` is left out — it ships trustworthy (measured, the only one on a new
+/// server) and only its `db_owner` can add code to it — and that is this
+/// method's stated limit.
 fn capture_query() -> String {
     format!(
         "DECLARE @t int = OBJECT_ID(N'dbo.__pbps_state_confidential', N'U');
@@ -1102,6 +1114,11 @@ chain this check cannot follow'
  WHERE EXISTS (SELECT 1 FROM sys.databases WHERE database_id = DB_ID() AND is_db_chaining_on = 1)
     OR EXISTS (SELECT 1 FROM sys.configurations
                 WHERE name = N'cross db ownership chaining' AND CONVERT(int, value_in_use) = 1)
+UNION
+SELECT N'database `' + d.name COLLATE DATABASE_DEFAULT + N'` is TRUSTWORTHY, so code running as its \
+owner there can read it through a path this check cannot follow'
+  FROM sys.databases d
+ WHERE d.is_trustworthy_on = 1 AND d.database_id <> DB_ID() AND d.name <> N'msdb'
 UNION
 SELECT N'replication publishes it' FROM sys.tables
  WHERE object_id = @t AND (is_replicated = 1 OR is_merge_published = 1)
@@ -1547,6 +1564,25 @@ mod tests {
         let problems = named(&g);
         assert!(mentions(&problems, "bob"), "{problems:?}");
         assert!(problems[0].contains("which this deployment would create"));
+    }
+
+    #[test]
+    fn a_login_without_a_user_enters_as_public_when_only_public_may_connect() {
+        let mut g = graph();
+        g.server
+            .insert(310, principal("stranger", "S", Some("0x31"), false));
+        g.database_perms
+            .push(grant(DATABASE, 0, PUBLIC_DATABASE_ROLE, "CONNECT"));
+        g.database_perms
+            .push(grant(OBJECT, TABLE, PUBLIC_DATABASE_ROLE, "SELECT"));
+        assert!(mentions(&named(&g), "stranger"));
+        // Negative: without that CONNECT it cannot enter at all.
+        let mut g = graph();
+        g.server
+            .insert(310, principal("stranger", "S", Some("0x31"), false));
+        g.database_perms
+            .push(grant(OBJECT, TABLE, PUBLIC_DATABASE_ROLE, "SELECT"));
+        assert!(!mentions(&named(&g), "stranger"));
     }
 
     #[test]
