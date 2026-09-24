@@ -437,6 +437,14 @@ impl Candidates {
         }
     }
 
+    /// Whether this workflow gave `candidate_id` up while it was provably
+    /// unpublished (replaced, withdrawn, expired or released). Such a handle
+    /// has no receipt anywhere, so a caller may refuse it definitely
+    /// without reading the publications.
+    pub fn is_recorded_unpublished(&self, candidate_id: &str) -> bool {
+        self.unpublished.contains(candidate_id)
+    }
+
     pub fn confirm(&mut self, candidate_id: &str, now: SystemTime) -> Result<Arc<Candidate>> {
         // A handle that is not the current one is definite only if this
         // workflow recorded giving it up unpublished; otherwise it may be an

@@ -691,3 +691,40 @@ fn a_replaced_handle_is_a_definite_refusal_not_an_unknown_outcome() {
         .json();
     assert_eq!(delivered["status"], "delivered", "{delivered}");
 }
+
+#[test]
+fn a_replaced_handle_stays_definite_while_the_publisher_is_busy() {
+    let f = Fixture::new("viewer-compose-replaced-busy");
+    let served = serve(&f);
+    let first = served.action("preview", intent()).json();
+    // Another tab's preview replaces the first handle, unpublished.
+    let second = served.action("preview", intent()).json();
+    // Another compose holds the owner lock: the replaced handle is still
+    // known to have no receipt, so the answer stays definite, not 409.
+    let other = f.publisher();
+    let stale = served.action(
+        "confirm",
+        serde_json::json!({"candidate_id": first["candidate_id"]}),
+    );
+    assert_eq!(stale.status, 410, "{}", stale.body);
+    assert!(stale.body.contains("replaced"), "{}", stale.body);
+    assert!(!f.record(first["operation_id"].as_str().unwrap()).exists());
+    // The current handle keeps the busy-publisher answer: not attempted,
+    // and still confirmable.
+    let busy = served
+        .action(
+            "confirm",
+            serde_json::json!({"candidate_id": second["candidate_id"]}),
+        )
+        .json();
+    assert_eq!(busy["status"], "refused", "{busy}");
+    assert_eq!(busy["problem"], "repository_unavailable");
+    drop(other);
+    let delivered = served
+        .action(
+            "confirm",
+            serde_json::json!({"candidate_id": second["candidate_id"]}),
+        )
+        .json();
+    assert_eq!(delivered["status"], "delivered", "{delivered}");
+}
