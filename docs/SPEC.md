@@ -1027,7 +1027,8 @@ make the ledger tables before pbps does, every command that writes the ledger
 first compares its two tables with the recipe pbps creates them from — the
 table's kind, persistence, access method, replica identity, type and
 inheritance, its columns and the identity sequence, defaults, constraints,
-indexes, triggers, rules and row-security policies — and checks that every
+foreign keys that reference it, indexes, triggers, rules and row-security
+policies — and checks that every
 login role able to add a trigger to them (as owner or through `TRIGGER`) could
 already become the deployment account; it refuses before its first write
 otherwise, `prune` and `unlock` ask the same before they delete, and `doctor`

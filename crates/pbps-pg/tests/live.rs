@@ -7555,6 +7555,55 @@ async fn a_foreign_key_onto_the_protected_table_refuses_the_prune() {
     db.drop().await;
 }
 
+/// #916: the same holds for the ordinary ledger. A foreign key onto
+/// `__pbps_state` with `ON DELETE CASCADE` would carry a prune into the
+/// project's rows, and it is no part of the recipe, so the gate refuses the
+/// prune by the constraint's name and the project's row stays. The same key
+/// onto `__pbps_lock` refuses `unlock`, whose DELETE it would cascade from too.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_foreign_key_onto_an_ordinary_ledger_table_refuses_prune_and_unlock() {
+    let mut db = TestDb::create("ordinary_inbound916").await;
+    let first = state::record(&mut db.conn, &snapshot(StateKind::Baseline))
+        .await
+        .unwrap();
+    state::record(&mut db.conn, &snapshot(StateKind::Apply))
+        .await
+        .unwrap();
+    state::lock(&mut db.conn, "live-test").await.unwrap();
+    db.conn
+        .execute(&format!(
+            "CREATE TABLE public.pbps_app (
+                 state_id bigint CONSTRAINT fk_app_state
+                   REFERENCES public.__pbps_state ON DELETE CASCADE,
+                 lock_id integer CONSTRAINT fk_app_lock
+                   REFERENCES public.__pbps_lock ON DELETE CASCADE);
+             INSERT INTO public.pbps_app VALUES ({first}, 1);"
+        ))
+        .await
+        .unwrap();
+    let pruned = state::prune(&mut db.conn, 1)
+        .await
+        .expect_err("a foreign key onto __pbps_state")
+        .to_string();
+    assert!(pruned.contains("fk_app_state"), "{pruned}");
+    let unlocked = state::unlock(&mut db.conn)
+        .await
+        .expect_err("a foreign key onto __pbps_lock")
+        .to_string();
+    assert!(unlocked.contains("fk_app_lock"), "{unlocked}");
+    assert_eq!(
+        number(&mut db.conn, "SELECT count(*)::int FROM public.pbps_app").await,
+        1,
+        "a delete cascaded into the project's rows"
+    );
+    // The negative control: without the keys both work again.
+    db.conn.execute("DROP TABLE public.pbps_app").await.unwrap();
+    assert_eq!(state::prune(&mut db.conn, 1).await.unwrap(), 1);
+    assert!(state::unlock(&mut db.conn).await.unwrap());
+    db.drop().await;
+}
+
 /// #878: a table inheriting from the protected one is outside its recipe, so
 /// the ledger never reaches it. A read returns the protected table's own half
 /// though the child holds another under the same `state_id`, and a prune is
