@@ -1,14 +1,20 @@
-//! Local, read-only presentation over CLI subprocesses (ADR-0015).
+//! Local presentation over CLI subprocesses (ADR-0015). Every route reads,
+//! except the fixed compose actions of ADR-0017 (#494).
 
 pub mod client;
 pub mod contract;
 
-// The backend is qualified before the viewer exposes compose endpoints (#748).
+// Qualified on Linux with the files ref backend only (#748); other platforms
+// refuse compose until #471 qualifies them.
 #[cfg(target_os = "linux")]
 pub mod compose;
+#[cfg(target_os = "linux")]
+mod compose_http;
 
+#[cfg(target_os = "linux")]
+use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::io;
+use std::io::{self, Read};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
 use tiny_http::{Header, Request, Response, Server, StatusCode};
@@ -36,6 +42,8 @@ pub struct Viewer {
     token: String,
     client: Client,
     policy: String,
+    #[cfg(target_os = "linux")]
+    compose: RefCell<compose_http::Compose>,
 }
 
 impl Viewer {
@@ -56,6 +64,11 @@ impl Viewer {
             server,
             address,
             token,
+            #[cfg(target_os = "linux")]
+            compose: RefCell::new(compose_http::Compose::new(
+                config.executable.clone(),
+                config.project.clone(),
+            )),
             client: Client {
                 executable: config.executable,
                 project: config.project,
@@ -73,8 +86,8 @@ impl Viewer {
 
     pub fn serve(self) -> io::Result<()> {
         loop {
-            let request = self.server.recv()?;
-            let (code, mime, body) = self.answer(&request);
+            let mut request = self.server.recv()?;
+            let (code, mime, body) = self.answer(&mut request);
             let response = Response::from_data(body)
                 .with_status_code(StatusCode(code))
                 .with_header(header("Content-Type", mime))
@@ -87,7 +100,7 @@ impl Viewer {
         }
     }
 
-    fn answer(&self, request: &Request) -> (u16, &'static str, Vec<u8>) {
+    fn answer(&self, request: &mut Request) -> (u16, &'static str, Vec<u8>) {
         let headers: Vec<_> = request
             .headers()
             .iter()
@@ -102,6 +115,9 @@ impl Viewer {
             &self.token,
         ) {
             return plain(403, "Request refused");
+        }
+        if let Some(action) = compose_action(request.url()) {
+            return self.compose(request, action);
         }
         if !matches!(request.method().as_str(), "GET" | "HEAD") {
             return plain(405, "This viewer accepts reads only");
@@ -136,6 +152,71 @@ impl Viewer {
             },
         }
     }
+}
+
+impl Viewer {
+    fn compose(&self, request: &mut Request, action: &str) -> (u16, &'static str, Vec<u8>) {
+        if request.method().as_str() != "POST" {
+            return plain(405, "Compose actions accept POST only");
+        }
+        let json = request
+            .headers()
+            .iter()
+            .filter(|h| h.field.equiv("Content-Type"));
+        if json.map(|h| h.value.as_str()).collect::<Vec<_>>() != ["application/json"] {
+            return plain(415, "Compose actions accept JSON only");
+        }
+        let mut body = Vec::new();
+        if request
+            .as_reader()
+            .take(COMPOSE_BODY_LIMIT + 1)
+            .read_to_end(&mut body)
+            .is_err()
+        {
+            return plain(400, "The compose request could not be read");
+        }
+        if body.len() as u64 > COMPOSE_BODY_LIMIT {
+            return plain(413, "The compose request is too large");
+        }
+        self.compose_answer(action, &body)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn compose_answer(&self, action: &str, body: &[u8]) -> (u16, &'static str, Vec<u8>) {
+        match self.compose.borrow_mut().answer(action, body) {
+            Ok(bytes) => (200, "application/json", bytes),
+            Err((code, message)) => plain(code, &message),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn compose_answer(&self, _action: &str, _body: &[u8]) -> (u16, &'static str, Vec<u8>) {
+        plain(
+            501,
+            "Compose is qualified on Linux only; use the CLI on this platform (#471)",
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+const COMPOSE_BODY_LIMIT: u64 = compose_http::BODY_LIMIT;
+#[cfg(not(target_os = "linux"))]
+const COMPOSE_BODY_LIMIT: u64 = 64 * 1024;
+const COMPOSE_ACTIONS: [&str; 7] = [
+    "preview",
+    "confirm",
+    "list",
+    "recover",
+    "retry",
+    "republish",
+    "alternative",
+];
+
+/// The complete write vocabulary: a fixed action name, no query, no path
+/// parameters. Anything else is an ordinary (read) route or refused.
+fn compose_action(url: &str) -> Option<&'static str> {
+    let action = url.strip_prefix("/api/compose/")?;
+    COMPOSE_ACTIONS.into_iter().find(|known| *known == action)
 }
 
 fn plain(code: u16, message: &str) -> (u16, &'static str, Vec<u8>) {
@@ -361,6 +442,32 @@ mod tests {
             "/../pbps.yml",
         ] {
             assert!(route(path).is_err(), "{path}");
+        }
+    }
+
+    #[test]
+    fn the_only_writes_are_the_fixed_compose_actions() {
+        for action in COMPOSE_ACTIONS {
+            assert_eq!(
+                compose_action(&format!("/api/compose/{action}")),
+                Some(action)
+            );
+            // A write is never a read view, so it cannot bypass the POST gate.
+            assert!(route(&format!("/api/compose/{action}")).is_err());
+        }
+        for url in [
+            "/api/compose",
+            "/api/compose/",
+            "/api/compose/apply",
+            "/api/compose/push",
+            "/api/compose/preview?remote=origin",
+            "/api/compose/preview/",
+            "/api/compose/PREVIEW",
+            "/api/compose/confirm%00",
+            "/api/apply",
+            "/api/plan?apply=1",
+        ] {
+            assert_eq!(compose_action(url), None, "{url}");
         }
     }
 

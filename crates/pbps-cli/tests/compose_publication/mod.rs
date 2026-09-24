@@ -5,6 +5,7 @@ mod push_signing;
 mod removed_states;
 mod resources;
 mod signing;
+mod viewer;
 
 use super::*;
 use pbps_ui::compose::{

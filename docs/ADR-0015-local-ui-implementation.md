@@ -49,8 +49,8 @@ envelope — the one SPEC §9.8 names beside the CI annotator and a team's own
 dashboard — so what it needs and what it breaks on is exactly what any
 third-party consumer needs and breaks on, and step 2 of #64 can test it as one.
 
-The read-only viewer consumes CLI output alone. The accepted future compose
-design in [ADR-0017](ADR-0017-isolated-compose.md) adds raw-byte orchestration:
+The read views consume CLI output alone. Compose, as implemented in
+[ADR-0017](ADR-0017-isolated-compose.md) (#494), adds raw-byte orchestration:
 the UI may capture contained regular files, build a private Git tree/index and
 store candidate/recovery metadata, while the same executable still resolves
 intent and validates the snapshot. It cannot parse YAML/project configuration,

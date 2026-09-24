@@ -8,9 +8,16 @@
     drift: ["Drift", "Compare a live environment with its recorded schema."],
     plan: ["Saved plan", "Read the changes and risks in an existing plan file."],
     timeline: ["Timeline", "Browse the deployment history recorded in an environment."],
-    docs: ["Schema & ERD", "Explore documentation and relationships from your declarations."]
+    docs: ["Schema & ERD", "Explore documentation and relationships from your declarations."],
+    compose: ["Compose change", "Record a rename, drop reason or annotation as a reviewed commit on a new branch."]
   };
-  let current = "status", generation = 0;
+  let current = "status", generation = 0, composeRoot = null;
+  // The only writes: fixed compose actions with an opaque JSON body.
+  async function send(action, body) {
+    const response = await fetch(`/api/compose/${action}`, {method:"POST", headers:{"X-Pbps-Token":token, "Content-Type":"application/json"}, body:JSON.stringify(body), cache:"no-store", credentials:"omit"});
+    if (!response.ok) throw new Error(await response.text());
+    return response.json();
+  }
   function node(tag, text, className) {
     const el = document.createElement(tag);
     if (text !== undefined) el.textContent = text;
@@ -107,6 +114,16 @@
     const own = ++generation, view = current;
     content.replaceChildren(); findings.replaceChildren(); activity.className = "";
     if (!token) { activity.textContent = "Open the complete URL printed by pbps ui, including its fragment."; return; }
+    if (view === "compose") {
+      // Mounted once and kept, so switching views never discards a candidate
+      // or a displayed result.
+      if (!composeRoot) {
+        composeRoot = node("section", undefined, "compose");
+        globalThis.PbpsCompose.mount(composeRoot, send, {remote: "origin"});
+      }
+      content.append(composeRoot);
+      return;
+    }
     let url = `/api/${view}`;
     if (["drift", "timeline", "plan"].includes(view)) {
       const value = byId("selection-value").value;
@@ -137,6 +154,7 @@
       if (button.dataset.view === view) button.setAttribute("aria-current", "page"); else button.removeAttribute("aria-current");
     }
     byId("selection").hidden = !["drift", "timeline", "plan"].includes(view);
+    byId("refresh").hidden = view === "compose";
     byId("input-label").textContent = view === "plan" ? "Saved plan path" : "Environment name";
     byId("selection-value").value = value;
     byId("selection-value").placeholder = view === "plan" ? "plans/release.json" : "production";

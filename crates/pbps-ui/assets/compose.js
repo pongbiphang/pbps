@@ -1,5 +1,5 @@
-/* Immutable candidate form. Mounted only after publication/recovery are
- * qualified (#748); tests execute this shipped module with a publisher stub. */
+/* Immutable candidate form, mounted by app.js over the fixed compose actions
+ * (#494). Tests execute this shipped module with a publisher stub. */
 "use strict";
 globalThis.PbpsCompose = Object.freeze({
   mount(root, send, defaults = {}) {
@@ -74,6 +74,23 @@ globalThis.PbpsCompose = Object.freeze({
       return JSON.stringify({transport, host, port, principal, repository});
     };
     const quote = value => "'" + value.replaceAll("'", "'\"'\"'") + "'";
+    // A merge-request link only where its URL shape is known. Any other host
+    // gets the branch name; a guessed URL could open someone else's page.
+    const mergeRequest = (destination, branch) => {
+      const {transport, host, port, repository} = destination || {};
+      // scp is `git@host:owner/repo.git`; an explicit port is some other service.
+      if (!["https", "ssh", "scp"].includes(transport) || port != null || typeof repository !== "string") return null;
+      const path = repository.replace(/^\//, "").replace(/\.git$/, "");
+      if (host === "github.com" && /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(path)) {
+        // The compare path keeps the branch's own slashes.
+        const name = branch.split("/").map(encodeURIComponent).join("/");
+        return `https://github.com/${path}/compare/${name}?expand=1`;
+      }
+      if (host === "gitlab.com" && /^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)+$/.test(path)) {
+        return `https://gitlab.com/${path}/-/merge_requests/new?merge_request%5Bsource_branch%5D=${encodeURIComponent(branch)}`;
+      }
+      return null;
+    };
     const statusText = {
       refused: "Publication refused before an attempt.",
       preparation_unknown: "Commit preparation is unresolved. Preserve the operation for recovery.",
@@ -113,6 +130,19 @@ globalThis.PbpsCompose = Object.freeze({
           if (receipt.local === "present" && /^[a-f0-9]{40}([a-f0-9]{24})?$/.test(d.commit) && /^refs\/heads\/pbps-compose\/[a-f0-9]{64}$/.test(d.output_ref)) {
             card.append(make("p", "Continue from this result in a separate checkout. Run from the source repository, replacing NEW_DIRECTORY with an unused path; then open its project directory shown below."));
             card.append(make("pre", `git worktree add NEW_DIRECTORY ${quote(d.output_ref.slice("refs/heads/".length))}\npbps --project ${quote("NEW_DIRECTORY" + (d.project_suffix ? "/" + d.project_suffix : ""))} ui`));
+          }
+          if (receipt.remote === "delivered" && /^refs\/heads\/pbps-compose\/[a-f0-9]{64}$/.test(d.output_ref)) {
+            const branch = d.output_ref.slice("refs/heads/".length);
+            const url = mergeRequest(d.destination, branch);
+            if (url) {
+              const link = make("a", "Open a merge request for this branch");
+              link.href = url;
+              link.rel = "noreferrer noopener";
+              link.target = "_blank";
+              card.append(link);
+            } else {
+              card.append(make("p", `Open a merge request for branch ${branch} on your hosting service; this viewer only links hosts whose request URL it knows.`));
+            }
           }
         }
         const action = (name, label, body) => {

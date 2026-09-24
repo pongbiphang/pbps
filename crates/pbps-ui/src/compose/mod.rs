@@ -35,6 +35,22 @@ pub use refs::RefEvidence;
 pub use resources::{ResourceReport, ResourceState};
 pub use run::{DurableStage, PublicationBoundary, Publications};
 
+/// The source checkout that contains `project`, found the way capture finds
+/// it: publication identity is the repository root, never a subdirectory.
+pub fn source_repository(project: &std::path::Path, deadline: Duration) -> Result<PathBuf> {
+    let selected = project
+        .canonicalize()
+        .map_err(|_| Error::new("Could not locate the selected project"))?;
+    let discovery = git::Git {
+        root: selected,
+        hooks: PathBuf::from("/dev/null"),
+        deadline,
+    };
+    Ok(PathBuf::from(
+        discovery.line(&["rev-parse", "--show-toplevel"])?,
+    ))
+}
+
 #[derive(Debug)]
 pub struct Error {
     message: String,

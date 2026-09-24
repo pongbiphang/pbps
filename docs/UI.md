@@ -28,9 +28,10 @@ script-free sandboxed frame. No assets are downloaded.
 
 The viewer invokes ordinary CLI reads with `--no-input`, including the
 project's existing `on_drift` hook when `verify` finds drift. It adds no polling
-or scheduler. It never runs `plan`, `apply`, intent commands, file edits or git
-writes. An explanation can show an approval command as text; it cannot execute
-it. Approval and deployment stay in the ordinary CLI/CI workflow.
+or scheduler. It never runs `plan` or `apply`. Its only writes are the compose
+workflow below, which records intent as a reviewed Git commit on a new branch.
+An explanation can show an approval command as text; it cannot execute it.
+Approval and deployment stay in the ordinary CLI/CI workflow.
 
 If the page says the launch token is missing, reopen the complete printed URL.
 A different Host, port, Origin or token is refused. An incompatible CLI response
@@ -43,18 +44,36 @@ credential and browser boundaries; [DECISIONS 457](decisions/compose-and-ui.md#d
 dependency and the initial size measurement.
 
 
-## Planned compose workflow
+## Compose workflow
 
-Compose is not available in this read-only viewer. The accepted design in
-[ADR-0017](ADR-0017-isolated-compose.md) captures the edited declarations,
-resolves human-supplied intent with the ordinary CLI, and shows an exact diff.
-Confirmation will publish that reviewed snapshot on a new output branch.
-Later editor changes require a refreshed preview; they are not silently added.
+**Compose change** records a rename, a drop reason, or `strategy:` annotations
+already edited in the declarations. It follows
+[ADR-0017](ADR-0017-isolated-compose.md) (#494):
 
-The current checkout will keep its existing declaration edits and ids. The
-result will show the commit, local branch and remote outcome, including a local
-commit when push fails. To continue the result, open a separate checkout of
-that branch in a Git client; the page will also provide copyable worktree/UI
-commands. Reusing the old checkout for another proposal requires an explicit
-alternative-from-the-old-base action. There is no automatic reset or copy-back.
-#494 and #745–#748 track implementation and qualification.
+1. **Preview / Refresh** captures the edited declarations and resolves the
+   intent with the ordinary CLI in a private snapshot. It then shows the exact
+   diff, parent, tree, destination and signing policy. Later editor changes are
+   excluded until you refresh.
+2. **Confirm this candidate** commits exactly that reviewed tree on a new
+   branch `pbps-compose/<operation>` and pushes it to the reviewed destination.
+   The current checkout keeps its declaration edits, ids, staged work and
+   branch. Nothing is reset or copied back.
+3. The result shows the commit, the local branch and the remote outcome. A
+   failed or uncertain push keeps the local commit. **Reconcile** re-reads the
+   saved result. **Republish** explicitly authorizes recreating an absent
+   branch with the same commit, after you have diagnosed the remote.
+4. A delivered result links to a new merge request when the destination is
+   `github.com` or `gitlab.com` over HTTPS or SSH without a custom port.
+   Elsewhere the page names the branch to open a request for. Continue from the
+   result in a separate checkout; the page prints the `git worktree add` and
+   `pbps ui` commands.
+
+The page sends only the intent fields and opaque handles. Every tree, manifest,
+destination and commit stays on the server side. Compose actions are fixed
+`POST /api/compose/<action>` requests. They require the launch token, the
+page's own Origin and a JSON body of at most 64 KiB; every other route stays
+read-only. HTTP and SSH destinations must use ordinary branches, as stated
+before confirmation ([DECISIONS 534](decisions/compose-and-ui.md#decision-534)).
+
+Compose is qualified on Linux with Git's files ref backend. On other platforms
+the viewer refuses compose actions, so use the CLI there (#471).
