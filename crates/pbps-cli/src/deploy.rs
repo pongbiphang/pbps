@@ -230,7 +230,11 @@ fn refuse_occupied_names(
         if scoped.unmanaged.contains(name) && !unmanaged_relations.contains(name) {
             return Some(format!("table `{name}`"));
         }
-        if let Some((_, why)) = unreadable.iter().find(|(t, _)| t.object_name() == *name) {
+        // Only a relation shares this namespace: an unreadable aggregate
+        // `app.x(integer)` or a trigger named `x` coexists with a table
+        // `app.x`, and refusing it would refuse a plan the engine takes.
+        let a_relation = |t: &pbps_db::catalog::LimitationTarget| matches!(t, pbps_db::catalog::LimitationTarget::Relation(n) if n == name);
+        if let Some((_, why)) = unreadable.iter().find(|(t, _)| a_relation(t)) {
             return Some(format!("`{name}`, which pbps cannot read ({why})"));
         }
         if unmanaged_relations.contains(name) {
@@ -5954,6 +5958,71 @@ fn dropped_referrer_names(changes: &pbps_model::ChangeSet) -> BTreeSet<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The name checks behind DEC-316.1, one occupant at a time. A relation
+    /// occupies a new table's or view's name; an unreadable routine of the
+    /// same bare name does not, because routines are not in the relation
+    /// namespace — refusing it would refuse a plan the engine takes.
+    #[test]
+    fn a_new_name_is_occupied_only_by_what_shares_its_namespace() {
+        use pbps_db::catalog::LimitationTarget;
+        use pbps_model::{Change, ChangeSet, PlannedChange};
+        let x = TableName::new("app", "x");
+        let create = ChangeSet {
+            changes: vec![PlannedChange::new(Change::CreateTable {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "app.x", 0),
+                name: x.clone(),
+                table: Box::default(),
+            })],
+        };
+        let empty = pbps_diff::Scoped {
+            schema: Schema::default(),
+            unmanaged: Vec::new(),
+            missing: Vec::new(),
+            unmanaged_modules: Vec::new(),
+            unmanaged_roles: Vec::new(),
+            unexpressible: Vec::new(),
+            missing_roles: Vec::new(),
+            public_execute: Default::default(),
+            owners: Default::default(),
+            session_role: String::new(),
+        };
+        let check = |scoped: &pbps_diff::Scoped,
+                     unreadable: &[(LimitationTarget, String)],
+                     relations: &[TableName]| {
+            refuse_occupied_names(&create, scoped, unreadable, relations, "prod")
+        };
+
+        // Nothing there: the name is free.
+        check(&empty, &[], &[]).expect("a free name");
+
+        // A readable table, a view, and a relation pbps cannot read.
+        let mut table = empty.clone();
+        table.unmanaged.push(x.clone());
+        let e = check(&table, &[], &[]).unwrap_err().to_string();
+        assert!(e.contains("already has table `app.x`"), "{e}");
+        let mut view = empty.clone();
+        view.unmanaged_modules.push(ModuleId::Named(x.clone()));
+        let e = check(&view, &[], &[]).unwrap_err().to_string();
+        assert!(e.contains("already has view `app.x`"), "{e}");
+        let e = check(&empty, &[], std::slice::from_ref(&x))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("a relation pbps cannot read"), "{e}");
+        let matview = (
+            LimitationTarget::Relation(x.clone()),
+            "a materialized view".to_owned(),
+        );
+        let e = check(&empty, &[matview], &[]).unwrap_err().to_string();
+        assert!(e.contains("which pbps cannot read"), "{e}");
+
+        // An unreadable aggregate of the same bare name is not a relation.
+        let aggregate = (
+            LimitationTarget::Module("app.x(integer)".parse().unwrap()),
+            "an aggregate".to_owned(),
+        );
+        check(&empty, &[aggregate], &[]).expect("a routine does not occupy a table's name");
+    }
 
     /// SPEC §7.6 promises the closing read holds the field the plan is itself
     /// changing to the value the plan promised. What `PUBLIC` holds is in no
