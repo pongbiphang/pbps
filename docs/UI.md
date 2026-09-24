@@ -76,7 +76,9 @@ already edited in the declarations. It follows
    resources** lists every operation's private evidence and state. It can
    retire what an operation still owns, such as an expired preview left by a
    closed viewer. An unresolved, foreign or unreadable record is refused and
-   preserved (#855).
+   preserved (#855). If another viewer retires this workflow's own preview,
+   the workflow is released the next time it is listed, refreshed or
+   confirmed. Confirming it is refused and nothing is published (#867).
 
 The saved receipts, not the page, decide whether a new preview may start
 (#854), so a restarted viewer keeps the rules. The page lists them when it

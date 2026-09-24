@@ -283,7 +283,14 @@ impl Compose {
             }
             "resources" => {
                 let Nothing {} = parse(body)?;
-                encode(&self.publisher()?.resource_reports().map_err(refused)?)
+                let reports = self.publisher()?.resource_reports().map_err(refused)?;
+                // Another viewer may have retired this workflow's operation.
+                for report in &reports {
+                    if report.state == compose::ResourceState::Spent {
+                        self.candidates.released(&report.operation_id);
+                    }
+                }
+                encode(&reports)
             }
             "recover-resources" => {
                 let Operation { operation_id } = parse(body)?;

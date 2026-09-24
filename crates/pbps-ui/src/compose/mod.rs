@@ -292,6 +292,7 @@ impl Candidates {
         now: SystemTime,
         observer: &dyn Fn(CaptureBoundary),
     ) -> Result<Preview> {
+        self.release_if_spent();
         if let Some(Stored::Releasing(candidate)) = &self.current {
             candidate
                 .workspace
@@ -445,7 +446,31 @@ impl Candidates {
         self.unpublished.contains(candidate_id)
     }
 
+    /// Another viewer over the same repository may have retired the held
+    /// operation's resources: an expired preview, or a forgotten receipt
+    /// (#867). Spent is terminal, so the workflow is released exactly as if
+    /// this viewer had retired it. An unreadable report changes nothing; the
+    /// ordinary path then refuses with the evidence preserved.
+    pub fn release_if_spent(&mut self) {
+        let held = match &self.current {
+            Some(Stored::Previewed { candidate, .. }) | Some(Stored::Confirmed(candidate)) => {
+                candidate
+            }
+            Some(Stored::Releasing(_)) | None => return,
+        };
+        let operation = held.preview.operation_id.clone();
+        let spent = held
+            .workspace
+            .resources
+            .report(&operation)
+            .is_ok_and(|report| report.state == ResourceState::Spent);
+        if spent {
+            self.released(&operation);
+        }
+    }
+
     pub fn confirm(&mut self, candidate_id: &str, now: SystemTime) -> Result<Arc<Candidate>> {
+        self.release_if_spent();
         // A handle that is not the current one is definite only if this
         // workflow recorded giving it up unpublished; otherwise it may be an
         // earlier confirmed result (for example before an alternative).

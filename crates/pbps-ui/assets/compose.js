@@ -308,6 +308,12 @@ globalThis.PbpsCompose = Object.freeze({
         for (const report of list) reports.set(report.operation_id, report);
         drawReports();
         if (!list.length) activity.textContent = "No private compose resources were found.";
+        // Another viewer retired this workflow's operation; the server has
+        // released it (#867), so the page follows before a confirm can fail.
+        if (!confirming && operation && list.some(report => report.operation_id === operation && report.state === "spent")) {
+          releaseWorkflow();
+          activity.textContent = "This workflow's preview was retired elsewhere, and nothing was published. Preview again.";
+        }
       } catch (_) {
         activity.textContent = "Private resources could not be read. Existing evidence has been preserved.";
       } finally { privateButton.disabled = false; }
