@@ -2504,6 +2504,9 @@ async fn every_unqualified_reader_grantor_and_backup_principal_is_named() {
             "CREATE SYNONYM dbo.s880 FOR {t}; GRANT SELECT ON dbo.s880 TO [{}];", login("synonym"))),
         ("securityadmin".into(), format!("ALTER ROLE db_securityadmin ADD MEMBER [{}];", login("securityadmin"))),
         ("anyrole".into(), format!("GRANT ALTER ANY ROLE TO [{}];", login("anyrole"))),
+        ("rolealter".into(), format!(
+            "CREATE ROLE [r880_exec_{pid}]; GRANT EXECUTE ON dbo.p880_chain TO [r880_exec_{pid}];
+             GRANT ALTER ON ROLE::[r880_exec_{pid}] TO [{}];", login("rolealter"))),
         ("ddladmin".into(), format!("ALTER ROLE db_ddladmin ADD MEMBER [{}];", login("ddladmin"))),
         ("grantoption".into(), format!("GRANT SELECT ON {t} TO [{}] WITH GRANT OPTION;", login("grantoption"))),
         ("alterschema".into(), format!("GRANT ALTER ON SCHEMA::dbo TO [{}];", login("alterschema"))),
@@ -3012,12 +3015,36 @@ async fn a_first_use_by_a_deployer_that_does_not_own_the_database_qualifies_dbos
         hidden.iter().any(|p| p.contains("DENY of VIEW DEFINITION")),
         "{hidden:#?}"
     );
+
+    // Since 2022 the security half of the metadata is deniable on its own
+    // beneath `VIEW ANY DEFINITION` (measured: permission rows vanish).
+    db.conn
+        .execute(&format!(
+            "USE master; DENY VIEW ANY SECURITY DEFINITION TO [{deployer}]; USE [{0}];",
+            db.name
+        ))
+        .await
+        .unwrap();
+    let secured = pbps_mssql::confidential::protected_reader_problems(&mut as_deployer)
+        .await
+        .unwrap();
+    assert!(
+        secured
+            .iter()
+            .any(|p| p.contains("VIEW ANY SECURITY DEFINITION")),
+        "{secured:#?}"
+    );
     drop(as_deployer);
-    drop_logins(db, &logins).await;
+    // The role goes first: the login its DENY names is recorded as the
+    // grantor, and SQL Server keeps a grantor until its grantee is gone.
     let mut conn = connect_live(&conn_str()).await.expect("connect");
     let _ = conn
-        .execute(&format!("DROP SERVER ROLE [pbps880_denied_{pid}];"))
+        .execute(&format!(
+            "ALTER SERVER ROLE [pbps880_denied_{pid}] DROP MEMBER [{deployer}];
+             DROP SERVER ROLE [pbps880_denied_{pid}];"
+        ))
         .await;
+    drop_logins(db, &logins).await;
 }
 
 /// SPEC §8.1: the whole state goes in and comes back out unchanged. Everything

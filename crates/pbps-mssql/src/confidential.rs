@@ -90,6 +90,14 @@ async fn qualify(conn: &mut Conn) -> Result<Vec<String>, DbError> {
 /// server-level `DENY` applies through anything in the session's login token —
 /// the login, its server roles and its Windows groups — which
 /// `IS_SRVROLEMEMBER` alone does not see (it names roles, not groups).
+///
+/// From SQL Server 2022 the security half of that metadata has permissions of
+/// its own, `VIEW ANY SECURITY DEFINITION` and `VIEW SECURITY DEFINITION`,
+/// covered by the broad ones but deniable beneath them. **Measured** on 2025:
+/// with `VIEW ANY DEFINITION` granted and `VIEW ANY SECURITY DEFINITION`
+/// denied, the broad probe answers 1 while no permission row and no other
+/// user's principal is shown. So both are asked for where the engine has them,
+/// and any `DENY` of either refuses.
 const VISIBILITY: &str = "\
 SELECT CONVERT(int, ISNULL(IS_SRVROLEMEMBER('sysadmin'), 0)) AS sysadmin,
        CONVERT(int, ISNULL(HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW ANY DEFINITION'), 0)) AS any_definition,
@@ -97,11 +105,23 @@ SELECT CONVERT(int, ISNULL(IS_SRVROLEMEMBER('sysadmin'), 0)) AS sysadmin,
        CONVERT(int, ISNULL(HAS_PERMS_BY_NAME(NULL, NULL, 'ALTER TRACE'), 0)) AS alter_trace,
        CONVERT(int, ISNULL(HAS_PERMS_BY_NAME(N'sys.sql_expression_dependencies', 'OBJECT',
                                              'SELECT'), 0)) AS dependencies,
+       CONVERT(int, CASE WHEN EXISTS (SELECT 1 FROM sys.fn_builtin_permissions(N'SERVER')
+                                       WHERE permission_name = N'VIEW ANY SECURITY DEFINITION')
+                         THEN ISNULL(HAS_PERMS_BY_NAME(NULL, NULL,
+                                                       'VIEW ANY SECURITY DEFINITION'), 0)
+                         ELSE 1 END) AS security_definition,
+       CONVERT(int, CASE WHEN EXISTS (SELECT 1 FROM sys.fn_builtin_permissions(N'DATABASE')
+                                       WHERE permission_name = N'VIEW SECURITY DEFINITION')
+                         THEN ISNULL(HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE',
+                                                       'VIEW SECURITY DEFINITION'), 0)
+                         ELSE 1 END) AS database_security_definition,
        (SELECT COUNT(*) FROM sys.database_permissions dp
-         WHERE dp.state = N'D' AND dp.permission_name IN (N'VIEW DEFINITION', N'CONTROL')
+         WHERE dp.state = N'D'
+           AND dp.permission_name IN (N'VIEW DEFINITION', N'CONTROL', N'VIEW SECURITY DEFINITION')
            AND (dp.grantee_principal_id = DATABASE_PRINCIPAL_ID()
                 OR IS_MEMBER(USER_NAME(dp.grantee_principal_id)) = 1)
-           AND ((dp.class = 1 AND COALESCE(HAS_PERMS_BY_NAME(
+           AND (dp.permission_name = N'VIEW SECURITY DEFINITION'
+             OR (dp.class = 1 AND COALESCE(HAS_PERMS_BY_NAME(
                     QUOTENAME(OBJECT_SCHEMA_NAME(dp.major_id)) + N'.' + QUOTENAME(OBJECT_NAME(dp.major_id)),
                     'OBJECT', 'VIEW DEFINITION'), 0) <> 1)
              OR (dp.class = 3 AND COALESCE(HAS_PERMS_BY_NAME(SCHEMA_NAME(dp.major_id),
@@ -111,7 +131,8 @@ SELECT CONVERT(int, ISNULL(IS_SRVROLEMEMBER('sysadmin'), 0)) AS sysadmin,
              OR dp.class NOT IN (0, 1, 3)))
        + (SELECT COUNT(*) FROM sys.server_permissions sp
            WHERE sp.state = N'D'
-             AND sp.permission_name IN (N'VIEW DEFINITION', N'CONTROL', N'VIEW ANY DEFINITION')
+             AND sp.permission_name IN (N'VIEW DEFINITION', N'CONTROL', N'VIEW ANY DEFINITION',
+                                        N'VIEW ANY SECURITY DEFINITION')
              AND sp.grantee_principal_id IN (SELECT principal_id FROM sys.login_token)) AS hidden;";
 
 async fn visibility_problems(conn: &mut Conn) -> Result<Vec<String>, DbError> {
@@ -125,6 +146,11 @@ async fn visibility_problems(conn: &mut Conn) -> Result<Vec<String>, DbError> {
     let mut problems = Vec::new();
     for (column, permission) in [
         ("any_definition", "VIEW ANY DEFINITION"),
+        ("security_definition", "VIEW ANY SECURITY DEFINITION"),
+        (
+            "database_security_definition",
+            "VIEW SECURITY DEFINITION on this database",
+        ),
         ("server_state", "VIEW SERVER STATE"),
         ("alter_trace", "ALTER TRACE"),
     ] {
@@ -839,11 +865,14 @@ impl Graph {
             return false;
         };
         let c = self.database_closure(user);
-        let reader_principals: Vec<(u8, i32)> = self
-            .database
-            .keys()
-            .filter(|&&id| self.user_reads(id))
-            .map(|&id| (DATABASE_PRINCIPAL, id))
+        // Every reader, code-derived ones included: `ALTER` on a role whose
+        // only path is executing reading code still lets its holder join it.
+        let reader_principals: Vec<(u8, i32)> = readers
+            .iter()
+            .filter_map(|r| match r {
+                Who::User(id) => Some((DATABASE_PRINCIPAL, *id)),
+                Who::Login(_) => None,
+            })
             .collect();
         let table = self.table_securables();
         // `db_ddladmin` holds `ALTER` on the database's objects without a row

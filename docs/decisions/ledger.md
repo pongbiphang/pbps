@@ -791,7 +791,13 @@ missing grant, unless the deployer is `sysadmin` or holds all four. It also
 refuses when a `DENY` of `VIEW DEFINITION` or `CONTROL` hides part of the
 catalog: an effective one on the database, a schema or an object, and any one
 on another class (a principal, a certificate, a key, a login), since those rows
-are the principal graph and the signatures themselves. An unseen
+are the principal graph and the signatures themselves. From SQL Server 2022
+the security half of that metadata has permissions of its own,
+`VIEW ANY SECURITY DEFINITION` and `VIEW SECURITY DEFINITION`. They are covered
+by the broad ones, but can be denied beneath them. Measured: with
+`VIEW ANY DEFINITION` granted and `VIEW ANY SECURITY DEFINITION` denied, the
+broad probe answers 1 while no permission row is shown. So both are asked for
+where the engine has them, and a `DENY` of either refuses. An unseen
 principal is not an absent one. `doctor` asks for these grants (#881).
 
 *Readers.* A principal reads the table through any of these paths:
