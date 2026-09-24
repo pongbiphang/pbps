@@ -609,7 +609,10 @@ async fn confirm_ledger_relations(conn: &mut Conn) -> Result<(), DbError> {
 /// (issues #834, #838; DEC-834.1). Login roles only, because a `NOLOGIN` role acts only
 /// through its members, and each of those is asked in its own right — which
 /// is what lets a group role own the ledger while only the deployment account
-/// logs in as a member of it.
+/// logs in as a member of it. And only in a role that also has `USAGE` on the
+/// ledger's schema: measured on 18.6, a role holding `TRIGGER` without it is
+/// refused `CREATE TRIGGER` with `permission denied for schema public`, so it
+/// cannot change the ledger and is no reason to refuse it.
 ///
 /// A `__pbps_state` missing any of issue #103's five timeline columns is the
 /// recipe too: [`migrate_timeline_columns`] adds whichever are missing.
@@ -767,7 +770,8 @@ const LOCK_RECIPE: [&str; 6] = [
 fn ledger_facts() -> String {
     format!(
         "WITH ledger AS (
-           SELECT c.oid, c.relname, c.relowner, c.relrowsecurity, c.relforcerowsecurity
+           SELECT c.oid, c.relname, c.relowner, c.relnamespace, c.relrowsecurity,
+                  c.relforcerowsecurity
              FROM pg_catalog.pg_class c
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
             WHERE n.nspname = '{LEDGER_SCHEMA}'
@@ -820,6 +824,7 @@ fn ledger_facts() -> String {
             AND EXISTS (
                 SELECT 1 FROM pg_catalog.pg_roles g
                  WHERE pg_catalog.pg_has_role(e.oid, g.oid, 'SET')
+                   AND pg_catalog.has_schema_privilege(g.oid, l.relnamespace, 'USAGE')
                    AND (pg_catalog.has_table_privilege(g.oid, l.oid, 'TRIGGER')
                         OR pg_catalog.pg_has_role(g.oid, l.relowner, 'USAGE')))"
     )

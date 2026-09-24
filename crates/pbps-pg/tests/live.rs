@@ -6985,6 +6985,34 @@ async fn a_ledger_pbps_did_not_create_is_refused_before_any_write() {
         ))
         .await
         .unwrap();
+    // A `TRIGGER` grant to a role that cannot reach the schema is not one it
+    // can use: with `USAGE` on `public` taken from `PUBLIC` and given back only
+    // to the deployment account, the attacker's grant is no finding.
+    db.conn
+        .execute(&format!(
+            "REVOKE USAGE ON SCHEMA public FROM PUBLIC;
+             GRANT USAGE ON SCHEMA public TO {deployer};
+             GRANT TRIGGER ON public.__pbps_lock TO {attacker};"
+        ))
+        .await
+        .unwrap();
+    {
+        let mut deploying = Conn::connect(Driver::Postgres, &as_role(&deployer))
+            .await
+            .unwrap();
+        let problems = state::ledger_problems(&mut deploying).await.unwrap();
+        assert!(
+            problems.is_empty(),
+            "an unusable TRIGGER grant: {problems:?}"
+        );
+    }
+    db.conn
+        .execute(&format!(
+            "REVOKE TRIGGER ON public.__pbps_lock FROM {attacker};
+             GRANT USAGE ON SCHEMA public TO PUBLIC;"
+        ))
+        .await
+        .unwrap();
     // (`TRIGGER` for the deployment account itself: it can do nothing with it
     // that it could not already do as itself, so it is not a finding. Nor is
     // a login role that holds a superuser role: it can become anyone.)

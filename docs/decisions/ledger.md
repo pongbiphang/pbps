@@ -564,7 +564,10 @@ account or to a superuser role, or to be the database owner. Such a role can
 add nothing that runs a privilege it lacked. The superuser path is asked on its
 own because `pg_has_role` does not follow it: measured, a login role granted
 `postgres` has `SET` on `postgres` and not on the deployment account, yet
-`SET ROLE postgres; SET ROLE <deployer>` reaches it. `NOLOGIN` roles are not actors
+`SET ROLE postgres; SET ROLE <deployer>` reaches it. And the role acted as must
+also have `USAGE` on the ledger's schema: without it `CREATE TRIGGER` is
+refused at the schema (`permission denied for schema public`, measured), so a
+`TRIGGER` grant it cannot use is no reason to refuse a ledger. `NOLOGIN` roles are not actors
 themselves: they act only through their members, each of whom is asked in its
 own right, so a group role can still own the ledger while the deployment
 account is its only login member. A login role that owns the ledger and cannot
