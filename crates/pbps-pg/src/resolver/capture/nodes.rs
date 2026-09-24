@@ -195,9 +195,9 @@ pub(super) fn decode(text: &str, major: u32) -> Result<Value, Uncovered> {
     if !matches!(major, 16 | 18) {
         return Err(Uncovered::Version);
     }
-    if text.len() > 16 * 1024 * 1024 {
-        return Err(Uncovered::Limit);
-    }
+    // Datum text can be large while its binding structure is small. Consume
+    // its bytes without retaining them in the AST; bound recursive structure
+    // in value() rather than refusing a valid literal by serialized size.
     let mut reader = Reader {
         bytes: text.as_bytes(),
         position: 0,
@@ -441,6 +441,8 @@ mod tests {
         for (major, fixtures) in [
             (16, include_str!("fixtures/surfaces-16.nodes")),
             (18, include_str!("fixtures/surfaces-18.nodes")),
+            (16, include_str!("fixtures/row-coercion-16.nodes")),
+            (18, include_str!("fixtures/row-coercion-18.nodes")),
         ] {
             for (case, text) in fixtures.lines().enumerate() {
                 let value = decode(text, major)
@@ -533,6 +535,21 @@ mod tests {
     }
 
     #[test]
+    fn row_coercion_cannot_hide_an_unknown_result_reference() {
+        for (major, fixtures) in [
+            (16, include_str!("fixtures/row-coercion-16.nodes")),
+            (18, include_str!("fixtures/row-coercion-18.nodes")),
+        ] {
+            let original = fixtures.lines().next().unwrap();
+            assert!(original.contains("CONVERTROWTYPEEXPR"));
+            let changed = original.replace(":resulttype ", ":unknown_resulttype ");
+            assert_ne!(changed, original);
+            let tree = decode(&changed, major).unwrap_or_else(|e| panic!("{e:?}"));
+            assert_eq!(references(&tree, major), Err(Uncovered::Field));
+        }
+    }
+
+    #[test]
     fn unknown_or_missing_binding_fields_cannot_certify_an_empty_set() {
         let original = actual_tree(18);
         for changed in [
@@ -554,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn absent_malformed_and_oversized_inputs_are_not_empty_evidence() {
+    fn absent_malformed_and_overly_nested_inputs_are_not_empty_evidence() {
         for text in [
             "",
             "<>",

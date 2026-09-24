@@ -241,9 +241,8 @@ fn expression_type(value: &Value) -> Result<u32> {
         "FUNCEXPR" => "funcresulttype",
         "SUBSCRIPTINGREF" => "refrestype",
         "ROWEXPR" => "row_typeid",
-        "FIELDSELECT" | "RELABELTYPE" | "COERCEVIAIO" | "ARRAYCOERCEEXPR" | "COERCETODOMAIN" => {
-            "resulttype"
-        }
+        "FIELDSELECT" | "RELABELTYPE" | "COERCEVIAIO" | "ARRAYCOERCEEXPR" | "COERCETODOMAIN"
+        | "CONVERTROWTYPEEXPR" => "resulttype",
         "CASEEXPR" => "casetype",
         "CASETESTEXPR" | "COERCETODOMAINVALUE" => "typeId",
         "COALESCEEXPR" => "coalescetype",

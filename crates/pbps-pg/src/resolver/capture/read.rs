@@ -534,3 +534,6 @@ mod large_tests;
 
 #[cfg(test)]
 mod subscripting_tests;
+
+#[cfg(test)]
+mod coverage_tests;
