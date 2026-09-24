@@ -154,7 +154,8 @@ async fn visibility_problems(conn: &mut Conn) -> Result<Vec<String>, DbError> {
 
 const SERVER_PRINCIPALS: &str = "\
 SELECT principal_id, name, CONVERT(nvarchar(2), type) AS kind,
-       CONVERT(varchar(172), sid, 1) AS sid, CONVERT(bit, is_fixed_role) AS fixed
+       CONVERT(varchar(172), sid, 1) AS sid, CONVERT(bit, is_fixed_role) AS fixed,
+       CONVERT(bit, is_disabled) AS disabled
   FROM sys.server_principals;";
 
 const SERVER_ROLE_MEMBERS: &str = "\
@@ -299,6 +300,9 @@ struct Principal {
     fixed: bool,
     /// `sys.database_principals.authentication_type`; 0 on the server side.
     authentication: i32,
+    /// `sys.server_principals.is_disabled`; a disabled login cannot sign in
+    /// (measured), though whoever can become it still reaches its access.
+    disabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -394,6 +398,7 @@ async fn principals(
                 } else {
                     0
                 },
+                disabled: !database && get::<bool>(row, "disabled")?,
             },
         );
     }
@@ -565,11 +570,20 @@ impl Graph {
         });
         // Measured: with `CONNECT` granted to `public` and not to `guest`, a
         // login with no user still enters, as principal 0 (`public`) with
-        // `public`'s permissions.
+        // `public`'s permissions — and so does one holding `CONNECT ANY
+        // DATABASE`, whatever the database grants.
         match mapped {
             Some((&id, _)) => Some(id),
             None if self.guest_enabled() => Some(GUEST),
-            None if self.connect_granted_to(PUBLIC_DATABASE_ROLE) => Some(PUBLIC_DATABASE_ROLE),
+            None if self.connect_granted_to(PUBLIC_DATABASE_ROLE)
+                || self.server_grants(
+                    &self.server_closure(login),
+                    &["CONNECT ANY DATABASE"],
+                    &[(SERVER, 0)],
+                ) =>
+            {
+                Some(PUBLIC_DATABASE_ROLE)
+            }
             None => None,
         }
     }
@@ -596,9 +610,8 @@ impl Graph {
         let c = self.server_closure(login);
         // `SELECT ALL USER SECURABLES` reads only a database the login can
         // enter: through a user, `guest` or `public`, or `CONNECT ANY
-        // DATABASE`, which is a permission of its own.
-        let enters = self.user_of(login).is_some()
-            || self.server_grants(&c, &["CONNECT ANY DATABASE"], &[(SERVER, 0)]);
+        // DATABASE`, which is a permission of its own and enters as `public`.
+        let enters = self.user_of(login).is_some();
         self.controls_server(login)
             || (enters && self.server_grants(&c, &["SELECT ALL USER SECURABLES"], &[(SERVER, 0)]))
             || self.user_of(login).is_some_and(|u| self.user_reads(u))
@@ -955,7 +968,9 @@ impl Graph {
             .server
             .iter()
             .filter(|(_, p)| {
-                ["S", "U", "G", "E", "X"].contains(&p.kind.as_str()) && !p.name.starts_with("##")
+                ["S", "U", "G", "E", "X"].contains(&p.kind.as_str())
+                    && !p.name.starts_with("##")
+                    && !p.disabled
             })
             .map(|(&id, _)| Who::Login(id));
         let login_sids: BTreeSet<&str> = self
@@ -1181,6 +1196,7 @@ mod tests {
             sid: sid.map(Into::into),
             fixed,
             authentication: 1,
+            disabled: false,
         }
     }
 
@@ -1594,6 +1610,28 @@ mod tests {
         g.database_perms
             .push(grant(OBJECT, TABLE, PUBLIC_DATABASE_ROLE, "SELECT"));
         assert!(!mentions(&named(&g), "stranger"));
+    }
+
+    #[test]
+    fn connect_any_database_enters_as_public_and_a_disabled_login_is_no_actor() {
+        let mut g = graph();
+        g.server
+            .insert(310, principal("stranger", "S", Some("0x31"), false));
+        g.server_perms
+            .push(grant(SERVER, 0, 310, "CONNECT ANY DATABASE"));
+        g.database_perms
+            .push(grant(OBJECT, TABLE, PUBLIC_DATABASE_ROLE, "SELECT"));
+        assert!(mentions(&named(&g), "stranger"));
+
+        let mut g = graph();
+        g.server.get_mut(&ALICE).unwrap().disabled = true;
+        g.database_perms
+            .push(grant(OBJECT, TABLE, U_ALICE, "SELECT"));
+        assert!(!mentions(&named(&g), "alice"));
+        // Negative: whoever can become the disabled login still reads.
+        g.server_perms
+            .push(grant(SERVER_PRINCIPAL, ALICE, BOB, "IMPERSONATE"));
+        assert!(mentions(&named(&g), "bob"));
     }
 
     #[test]

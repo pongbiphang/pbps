@@ -816,9 +816,9 @@ principal is not an absent one. `doctor` asks for these grants (#881).
 
 A login enters as its mapped user, as `dbo` when it is `sysadmin` or owns the
 database, or else as `guest` when `guest` may connect. Failing that, it enters
-as `public` when `public` may connect. Measured: with `CONNECT` granted to
-`public` alone, a login with no user enters as principal 0 and holds `public`'s
-permissions.
+as `public` when `public` may connect or the login holds `CONNECT ANY
+DATABASE`. Measured: in both cases a login with no user enters as principal 0
+and holds `public`'s permissions.
 
 *Grantors and backup principals.* Grantors are:
 - server level: `securityadmin`, `ALTER ANY LOGIN`, `ALTER ANY SERVER ROLE`,
@@ -833,8 +833,9 @@ Backup principals are `db_owner`, `db_backupoperator`, and holders of
 `BACKUP DATABASE`, `BACKUP LOG` or `CONTROL` on the database.
 
 *Actors and the rule.* The principals a person uses are:
-- logins, except those mapped to a certificate or key and the engine's `##`
-  principals;
+- logins, except those mapped to a certificate or key, the engine's `##`
+  principals, and disabled logins. Measured, a disabled login cannot sign in;
+  whoever can become one is still traced;
 - database principals entered without a login: contained users, application
   roles, and `guest` when it may connect.
 

@@ -2651,6 +2651,7 @@ async fn code_and_users_that_cannot_reach_the_table_are_not_named() {
         "orphan",
         "countersigned",
         "disabledtrigger",
+        "disabled",
     ] {
         reader_login(&mut db, &login(key)).await;
         logins.push(login(key));
@@ -2680,6 +2681,8 @@ async fn code_and_users_that_cannot_reach_the_table_are_not_named() {
              GRANT INSERT ON dbo.w880 TO [{disabledtrigger}];
              IF SUSER_ID('{outsider}') IS NOT NULL DROP LOGIN [{outsider}];
              CREATE LOGIN [{outsider}] WITH PASSWORD = '{READER_PASSWORD}', CHECK_POLICY = OFF;
+             GRANT SELECT ON dbo.__pbps_state_confidential TO [{disabled}];
+             ALTER LOGIN [{disabled}] DISABLE;
              USE master; GRANT SELECT ALL USER SECURABLES TO [{outsider}]; USE [{db}];",
             elsewhere = login("elsewhere"),
             schemaexec = login("schemaexec"),
@@ -2688,6 +2691,7 @@ async fn code_and_users_that_cannot_reach_the_table_are_not_named() {
             countersigned = login("countersigned"),
             disabledtrigger = login("disabledtrigger"),
             outsider = login("outsider"),
+            disabled = login("disabled"),
             db = db.name,
         ))
         .await
@@ -2704,6 +2708,7 @@ async fn code_and_users_that_cannot_reach_the_table_are_not_named() {
         "countersigned",
         "disabledtrigger",
         "outsider",
+        "disabled",
     ] {
         assert!(!names(&problems, &login(key)), "{key}: {problems:#?}");
     }
@@ -2738,6 +2743,26 @@ async fn a_login_without_a_user_reads_as_public_once_public_may_connect() {
         .await
         .unwrap();
     assert!(!names(&shut, &stranger), "{shut:#?}");
+    // `CONNECT ANY DATABASE` opens the same door for this login alone
+    // (measured: it enters as principal 0).
+    db.conn
+        .execute(&format!(
+            "USE master; GRANT CONNECT ANY DATABASE TO [{stranger}]; USE [{0}];",
+            db.name
+        ))
+        .await
+        .unwrap();
+    let any = pbps_mssql::confidential::protected_reader_problems(&mut db.conn)
+        .await
+        .unwrap();
+    assert!(names(&any, &stranger), "{any:#?}");
+    db.conn
+        .execute(&format!(
+            "USE master; REVOKE CONNECT ANY DATABASE FROM [{stranger}]; USE [{0}];",
+            db.name
+        ))
+        .await
+        .unwrap();
     db.conn.execute("GRANT CONNECT TO public;").await.unwrap();
     let open = pbps_mssql::confidential::protected_reader_problems(&mut db.conn)
         .await
