@@ -705,6 +705,13 @@ pub async fn ledger_problems(conn: &mut Conn) -> Result<Vec<String>, DbError> {
                 "{LEDGER_SCHEMA}.{relname} is {}, not an ordinary table",
                 relkind_name(relkind)
             ));
+        } else if let Some(editor) = fact.strip_prefix("untrusted sequence editor ") {
+            problems.push(format!(
+                "{LEDGER_SCHEMA}.{relname}'s id sequence can be reset by `{editor}`, a login role \
+                 that holds UPDATE on it (directly, through PUBLIC, or through a role it can act \
+                 as) and cannot SET ROLE to this account; a lower value would make newer records \
+                 sort under older ones"
+            ));
         } else if let Some(editor) = fact.strip_prefix("untrusted editor ") {
             problems.push(format!(
                 "{LEDGER_SCHEMA}.{relname} can be changed by `{editor}`, a login role that can \
@@ -1006,7 +1013,62 @@ fn ledger_facts() -> String {
            FROM ledger l
            CROSS JOIN pg_catalog.pg_roles e
            JOIN pg_catalog.pg_database db ON db.datname = pg_catalog.current_database()
-          WHERE (e.rolcanlogin
+          WHERE {UNTRUSTED_ACTOR}
+            AND EXISTS (
+                {TRIGGER_EDITOR})
+         UNION ALL
+         -- #912: `setval` needs only UPDATE on the identity sequence, and a
+         -- value set below the newest id makes the next records sort under
+         -- older ones, so `ORDER BY id DESC` stops meaning newest-first. No
+         -- schema USAGE clause here, unlike the trigger branch above:
+         -- measured on 18.6, `setval(<oid>, …)` succeeds for a role with
+         -- UPDATE and no USAGE on the schema, since an oid needs no name
+         -- lookup. `ALTER SEQUENCE` needs ownership, which follows the
+         -- table's owner and cannot be changed apart from it, so the branch
+         -- above already covers it.
+         SELECT l.relname, 'untrusted sequence editor ' || e.rolname
+           FROM ledger l
+           JOIN pg_catalog.pg_depend d
+             ON d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+            AND d.refobjid = l.oid AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+            AND d.deptype = 'i'
+           -- `deptype = 'i'` also holds the table's TOAST relation; only a
+           -- sequence has a `pg_sequence` row.
+           JOIN pg_catalog.pg_sequence s ON s.seqrelid = d.objid
+           CROSS JOIN pg_catalog.pg_roles e
+           JOIN pg_catalog.pg_database db ON db.datname = pg_catalog.current_database()
+          WHERE {UNTRUSTED_ACTOR}
+            -- Once per role: one the branch above already names is not named
+            -- twice. Only exactly that set is left out, so an owner without
+            -- USAGE on the schema, which the branch above skips, is still
+            -- named here.
+            AND NOT EXISTS (
+                {TRIGGER_EDITOR})
+            AND EXISTS (
+                SELECT 1 FROM pg_catalog.pg_roles g
+                 WHERE pg_catalog.pg_has_role(e.oid, g.oid, 'SET')
+                   AND pg_catalog.has_sequence_privilege(g.oid, d.objid, 'UPDATE'))"
+    )
+}
+
+/// Whether role `e` can act as a role that can add a trigger to ledger table
+/// `l`: its owner or a `TRIGGER` grantee, with `USAGE` on the schema, since
+/// `CREATE TRIGGER` resolves the table by name (DEC-834.1). Shared by the
+/// trigger branch of [`ledger_facts`] and the sequence branch that leaves the
+/// same roles out, so the two agree on exactly who the first one names.
+const TRIGGER_EDITOR: &str = "SELECT 1 FROM pg_catalog.pg_roles g
+                 WHERE pg_catalog.pg_has_role(e.oid, g.oid, 'SET')
+                   AND pg_catalog.has_schema_privilege(g.oid, l.relnamespace, 'USAGE')
+                   AND (pg_catalog.has_table_privilege(g.oid, l.oid, 'TRIGGER')
+                        OR pg_catalog.pg_has_role(g.oid, l.relowner, 'USAGE'))";
+
+/// Who counts as able to act against the deployment account, for both editor
+/// branches of [`ledger_facts`] (DEC-834.1, DEC-862.1): a login role, or one
+/// with a live client session in this database, that is not the database
+/// owner and cannot already become the deployment account or a superuser.
+/// One string, so the trigger and sequence branches cannot drift apart on it.
+/// Expects `e` (the role), `db` (this database) in scope.
+const UNTRUSTED_ACTOR: &str = "(e.rolcanlogin
                  OR EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity a
                              WHERE a.usesysid = e.oid AND a.datid = db.oid
                                AND (a.backend_type IS NULL
@@ -1015,15 +1077,7 @@ fn ledger_facts() -> String {
             AND NOT pg_catalog.pg_has_role(e.oid, current_user::regrole::oid, 'SET')
             AND NOT EXISTS (
                 SELECT 1 FROM pg_catalog.pg_roles su
-                 WHERE su.rolsuper AND pg_catalog.pg_has_role(e.oid, su.oid, 'SET'))
-            AND EXISTS (
-                SELECT 1 FROM pg_catalog.pg_roles g
-                 WHERE pg_catalog.pg_has_role(e.oid, g.oid, 'SET')
-                   AND pg_catalog.has_schema_privilege(g.oid, l.relnamespace, 'USAGE')
-                   AND (pg_catalog.has_table_privilege(g.oid, l.oid, 'TRIGGER')
-                        OR pg_catalog.pg_has_role(g.oid, l.relowner, 'USAGE')))"
-    )
-}
+                 WHERE su.rolsuper AND pg_catalog.pg_has_role(e.oid, su.oid, 'SET'))";
 
 /// The relations, if any, that keep either ledger name from naming an ordinary
 /// table. World-readable like [`ledger_is_there`], for the same reason: this

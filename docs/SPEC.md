@@ -1029,10 +1029,11 @@ table's kind, persistence, access method, replica identity, type and
 inheritance, its columns and the identity sequence, defaults, constraints,
 foreign keys that reference it, indexes, triggers, rules and row-security
 policies — and checks that every
-login role able to add a trigger to them (as owner or through `TRIGGER`) could
-already become the deployment account; it refuses before its first write
+login role able to add a trigger to them (as owner or through `TRIGGER`) or to
+reset the state table's id sequence (through `UPDATE` on it) could already
+become the deployment account; it refuses before its first write
 otherwise, `prune` and `unlock` ask the same before they delete, and `doctor`
-reports the same as `ledger.untrusted` (DEC-313.1, DEC-834.1, DEC-901.1).
+reports the same as `ledger.untrusted` (DEC-313.1, DEC-834.1, DEC-901.1, DEC-912.1).
 
 ### 8.2 The drift check
 

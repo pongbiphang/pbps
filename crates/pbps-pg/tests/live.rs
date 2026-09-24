@@ -6913,6 +6913,18 @@ async fn a_ledger_pbps_did_not_create_is_refused_before_any_write() {
             ),
             changed_by_attacker.clone(),
         ),
+        // #912: UPDATE on the identity sequence lets its holder `setval` it
+        // below the newest id, to one role or to every role.
+        (
+            None,
+            format!("GRANT UPDATE ON SEQUENCE public.__pbps_state_id_seq TO {attacker};"),
+            format!("id sequence can be reset by `{attacker}`"),
+        ),
+        (
+            None,
+            "GRANT UPDATE ON SEQUENCE public.__pbps_state_id_seq TO PUBLIC;".to_owned(),
+            format!("id sequence can be reset by `{attacker}`"),
+        ),
         // #901: the table's own row, not only what hangs off it. Each of
         // these kept every column, constraint and index of the recipe.
         (
@@ -7035,7 +7047,8 @@ async fn a_ledger_pbps_did_not_create_is_refused_before_any_write() {
     db.conn
         .execute(&format!(
             "GRANT SELECT, INSERT, DELETE ON public.__pbps_state, public.__pbps_lock TO {deployer};
-             GRANT TRIGGER ON public.__pbps_lock TO {deployer};"
+             GRANT TRIGGER ON public.__pbps_lock TO {deployer};
+             GRANT UPDATE ON SEQUENCE public.__pbps_state_id_seq TO {deployer};"
         ))
         .await
         .unwrap();
@@ -7060,9 +7073,30 @@ async fn a_ledger_pbps_did_not_create_is_refused_before_any_write() {
             "an unusable TRIGGER grant: {problems:?}"
         );
     }
+    // #912: UPDATE on the sequence is usable without the schema: measured,
+    // `setval(<oid>, …)` needs no name lookup, so it is a finding where the
+    // TRIGGER grant beside it was not.
     db.conn
         .execute(&format!(
-            "REVOKE TRIGGER ON public.__pbps_lock FROM {attacker};
+            "GRANT UPDATE ON SEQUENCE public.__pbps_state_id_seq TO {attacker};"
+        ))
+        .await
+        .unwrap();
+    {
+        let mut deploying = Conn::connect(Driver::Postgres, &as_role(&deployer))
+            .await
+            .unwrap();
+        let problems = state::ledger_problems(&mut deploying).await.unwrap();
+        let named = format!("id sequence can be reset by `{attacker}`");
+        assert!(
+            problems.iter().any(|p| p.contains(&named)),
+            "UPDATE on the sequence without USAGE on the schema: {problems:?}"
+        );
+    }
+    db.conn
+        .execute(&format!(
+            "REVOKE UPDATE ON SEQUENCE public.__pbps_state_id_seq FROM {attacker};
+             REVOKE TRIGGER ON public.__pbps_lock FROM {attacker};
              GRANT USAGE ON SCHEMA public TO PUBLIC;"
         ))
         .await

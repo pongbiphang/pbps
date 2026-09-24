@@ -768,3 +768,25 @@ created `USING heap` too. `prune`'s one gate now covers all three tables, so a
 view at the protected name is refused before the combined delete (#885). A
 table inheriting from the protected one is refused rather than deleted around
 with `ONLY`, as for the other two.
+
+<a id="dec-912-1"></a>
+
+**DEC-912.1. A login role that can reset the ledger's id sequence must be able
+to become the deployment account too (#912; extends DEC-834.1's editor rule).**
+DEC-901.1 compares the identity sequence's configuration, not who may use it.
+`setval` needs only `UPDATE` on the sequence, and a value set below the newest
+id makes the next records sort under older ones, so `latest`, `history` and
+`prune` read the wrong row as newest. Every login role, or role with a live
+session, that can act as a holder of that `UPDATE` (directly, through
+`PUBLIC`, or through a role it can `SET ROLE` to) and cannot become the
+deployment account or a superuser is now a problem, named as able to reset the
+sequence.
+
+Unlike the trigger rule, this one has no schema `USAGE` clause. `CREATE TRIGGER`
+resolves the table by name, so a grantee without `USAGE` cannot use its grant,
+but `setval` also takes an oid, which needs no name lookup: measured on 18.6, a
+role with `UPDATE` and no `USAGE` on the schema moved the sequence. `USAGE`
+alone allows only `nextval`, which moves forward and reorders nothing. `ALTER
+SEQUENCE` needs ownership, which follows the table's owner and cannot be
+changed apart from it, measured on 18.6 and 16.15, so the trigger rule's owner
+test already covers it. A role that rule names is not named twice.
