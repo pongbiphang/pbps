@@ -269,7 +269,10 @@ SELECT sn.object_id, OBJECT_ID(sn.base_object_name)
 
 /// A module signed by a certificate or asymmetric key runs with the
 /// permissions of the principals mapped to that key, in this database and, for
-/// a key also held in `master`, on the server.
+/// a key also held in `master`, on the server. A counter-signature (`CPVC`,
+/// `CPVA`; measured, beside `SPVC` for the signature itself) adds nothing when
+/// the module runs directly — it only vouches for calls from code signed the
+/// same way — so only the signatures proper are read.
 const SIGNERS: &str = "\
 SELECT cp.major_id AS module,
        COALESCE(dp.principal_id, 0) AS signer_user,
@@ -280,7 +283,7 @@ SELECT cp.major_id AS module,
     ON k.thumbprint = cp.thumbprint
   LEFT JOIN sys.database_principals dp ON dp.sid = k.sid
   LEFT JOIN sys.server_principals sp ON sp.sid = k.sid
- WHERE cp.class = 1;";
+ WHERE cp.class = 1 AND cp.crypt_type IN ('SPVC', 'SPVA');";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Principal {

@@ -2643,7 +2643,13 @@ async fn code_and_users_that_cannot_reach_the_table_are_not_named() {
     let pid = std::process::id();
     let login = |key: &str| format!("pbps880_{key}_{pid}");
     let mut logins = Vec::new();
-    for key in ["elsewhere", "schemaexec", "viewer", "orphan"] {
+    for key in [
+        "elsewhere",
+        "schemaexec",
+        "viewer",
+        "orphan",
+        "countersigned",
+    ] {
         reader_login(&mut db, &login(key)).await;
         logins.push(login(key));
     }
@@ -2656,11 +2662,20 @@ async fn code_and_users_that_cannot_reach_the_table_are_not_named() {
              GRANT EXECUTE ON SCHEMA::dbo TO [{schemaexec}];
              GRANT SELECT ON dbo.v880 TO [{viewer}];
              GRANT SELECT ON dbo.__pbps_state_confidential TO [{orphan}];
-             DROP LOGIN [{orphan}];",
+             DROP LOGIN [{orphan}];
+             CREATE CERTIFICATE c880_counter ENCRYPTION BY PASSWORD = '{READER_PASSWORD}'
+               WITH SUBJECT = 'pbps';
+             CREATE USER u880_counter FROM CERTIFICATE c880_counter;
+             GRANT SELECT ON dbo.__pbps_state_confidential TO u880_counter;
+             EXEC(N'CREATE PROCEDURE dbo.p880_countersigned AS EXEC(N''SELECT 1'');');
+             ADD COUNTER SIGNATURE TO dbo.p880_countersigned BY CERTIFICATE c880_counter
+               WITH PASSWORD = '{READER_PASSWORD}';
+             GRANT EXECUTE ON dbo.p880_countersigned TO [{countersigned}];",
             elsewhere = login("elsewhere"),
             schemaexec = login("schemaexec"),
             viewer = login("viewer"),
             orphan = login("orphan"),
+            countersigned = login("countersigned"),
         ))
         .await
         .unwrap();
@@ -2668,7 +2683,7 @@ async fn code_and_users_that_cannot_reach_the_table_are_not_named() {
         .await
         .unwrap();
     assert!(names(&problems, &login("viewer")), "{problems:#?}");
-    for key in ["elsewhere", "schemaexec", "orphan"] {
+    for key in ["elsewhere", "schemaexec", "orphan", "countersigned"] {
         assert!(!names(&problems, &login(key)), "{key}: {problems:#?}");
     }
     drop_logins(db, &logins).await;
