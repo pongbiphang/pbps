@@ -13,6 +13,7 @@
 #include <sys/prctl.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -36,6 +37,44 @@ static void *root_worker(void *unused) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "candidate-inodes")) {
+        // Each fresh inode64 tmpfs gives its first file inode 2. Keep the
+        // paths distinct so this exercises candidate-to-mapping correlation.
+        if (unshare(CLONE_NEWNS) || mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) return 1;
+        int files[2];
+        char content[65536];
+        for (int i = 0; i < 2; ++i) {
+            char directory[4096], path[4096];
+            int size = snprintf(directory, sizeof(directory), "%s/%c", argv[2], i ? 'z' : 'a');
+            if (size < 0 || (size_t)size >= sizeof(directory) || mkdir(directory, 0700)) return 1;
+            if (mount("tmpfs", directory, "tmpfs", 0, "size=1m,inode64,mode=0700")) return 1;
+            size = snprintf(path, sizeof(path), "%s/mapping.so", directory);
+            if (size < 0 || (size_t)size >= sizeof(path)) return 1;
+            files[i] = open(path, O_CREAT | O_EXCL | O_RDWR, 0600);
+            memset(content, 'a' + i, sizeof(content));
+            if (files[i] < 0 || write(files[i], content, sizeof(content)) != sizeof(content)) return 1;
+        }
+        long length = sysconf(_SC_PAGESIZE);
+        if (length <= 0 || length > 65536) return 1;
+        if (mmap(NULL, length, PROT_READ, MAP_PRIVATE, files[0], 0) == MAP_FAILED) return 1;
+        puts("ready");
+        fflush(stdout);
+        int byte;
+        while ((byte = getchar()) != EOF) {
+            if (byte == 'q') return 0;
+            if (byte == '2') {
+                if (mmap(NULL, length, PROT_READ, MAP_PRIVATE, files[1], 0) == MAP_FAILED) return 1;
+                puts("mapped");
+            } else if (byte == 'c' || byte == 's' || byte == 'r') {
+                size_t size = byte == 's' ? sizeof(content) / 2 : sizeof(content);
+                memset(content, byte == 'c' ? 'c' : 'b', sizeof(content));
+                if (ftruncate(files[1], size) || pwrite(files[1], content, size, 0) != (ssize_t)size) return 1;
+                puts("changed");
+            } else return 1;
+            fflush(stdout);
+        }
+        return 1;
+    }
     if (argc == 3 && !strcmp(argv[1], "mapping-devices")) {
         // Stacked private tmpfs mounts give the same rendered path and inode
         // on two devices without altering any mount visible to the observer.
