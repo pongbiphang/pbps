@@ -894,6 +894,12 @@ tests no guess, and neither does a checksum or snapshot derived from it.
 - An environment names its source exactly as it names its connection string:
   `fingerprint_key_env` (a variable) or `fingerprint_key_file` (a file readable
   by its owner only). Both is refused when `pbps.yml` is read.
+- Owner-only is proved from Unix permission bits. On a platform without them,
+  where pbps reads no ACLs, a key file is refused rather than trusted, and
+  `key generate --out` refuses to write one. The variable form works
+  everywhere.
+- A variable that is unset and one that is set but not valid text are
+  different faults, reported with different remedies.
 - It is base64 of at least 32 bytes, HMAC-SHA256's own output length.
   `pbps key generate` prints one, or writes a new mode-0600 file and never
   overwrites an existing one, because a replaced key voids every pending plan.

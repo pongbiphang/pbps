@@ -1447,6 +1447,8 @@ The key is configured per environment, never shared and never defaulted:
 
 - `fingerprint_key_env` names the variable that carries it, as `url_env` does
   for the connection string. `fingerprint_key_file` names an owner-only file.
+  Where owner-only access cannot be proved (platforms without Unix permission
+  bits), a key file is refused and the variable form is the one to use.
 - It is base64 of at least 32 bytes. `pbps key generate` makes one, and
   `pbps doctor` checks it and shows its key identifier.
 - A plan records the identifier (derived from the key, never the key) beside the

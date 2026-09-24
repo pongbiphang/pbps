@@ -5,10 +5,8 @@
 //! variable the CI secret store sets, or a file the platform mounts — named in
 //! `pbps.yml` by `fingerprint_key_env` or `fingerprint_key_file`.
 
-use std::io::Write as _;
 use std::path::Path;
 
-use anyhow::Context as _;
 use pbps_db::fingerprint::FingerprintKey;
 
 /// Prints a new key to stdout, or writes it to `out` readable by its owner
@@ -42,22 +40,36 @@ pub fn cmd_generate(out: Option<&Path>) -> anyhow::Result<()> {
 
 /// Creates `path` for its owner alone, and never over an existing file: a
 /// replaced key silently invalidates every plan made under the old one.
+#[cfg(unix)]
 fn write_owner_only(path: &Path, text: &str) -> anyhow::Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path).with_context(|| {
-        format!(
-            "cannot create `{}` (an existing key is never overwritten)",
-            path.display()
-        )
-    })?;
+    use anyhow::Context as _;
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| {
+            format!(
+                "cannot create `{}` (an existing key is never overwritten)",
+                path.display()
+            )
+        })?;
     writeln!(file, "{text}").with_context(|| format!("cannot write `{}`", path.display()))?;
     Ok(())
+}
+
+/// Where owner-only cannot be set it cannot be checked either, and `pbps.yml`
+/// would then refuse the very file this wrote.
+#[cfg(not(unix))]
+fn write_owner_only(path: &Path, _text: &str) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "cannot make `{}` readable by its owner only on this platform; run \
+         `pbps key generate` without --out and store the key in your secret store, named \
+         by `fingerprint_key_env`",
+        path.display()
+    )
 }
 
 #[cfg(test)]
@@ -74,17 +86,15 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_written_key_is_owner_only_and_loads_back() {
         let dir = dir();
         let path = dir.join("prod.key");
         cmd_generate(Some(&path)).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600);
-        }
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
         assert!(FingerprintKey::from_file(&path).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -96,6 +106,16 @@ mod tests {
         std::fs::write(&path, "kept").unwrap();
         assert!(cmd_generate(Some(&path)).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "kept");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn a_key_file_is_not_written_where_owner_only_cannot_be_set() {
+        let dir = dir();
+        let path = dir.join("prod.key");
+        assert!(cmd_generate(Some(&path)).is_err());
+        assert!(!path.exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

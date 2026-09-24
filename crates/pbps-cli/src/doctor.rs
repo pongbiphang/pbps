@@ -1259,6 +1259,7 @@ mod tests {
 
     /// DEC-952.1: a loaded key is named by its identifier, a configured key
     /// that fails is an error, and none configured is only a note.
+    #[cfg(unix)]
     #[test]
     fn each_environments_fingerprint_key_is_reported_by_id_error_or_note() {
         let dir = std::env::temp_dir().join(format!(
@@ -1269,11 +1270,8 @@ mod tests {
         let key = FingerprintKey::generate();
         let good = dir.join("good.key");
         std::fs::write(&good, &key).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o600)).unwrap();
         let yaml = format!(
             "dialect: postgres\nenvironments:\n  \
              good: {{ url_env: A, fingerprint_key_file: {} }}\n  \

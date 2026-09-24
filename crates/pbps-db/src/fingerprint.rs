@@ -73,6 +73,16 @@ impl fmt::Display for KeyId {
 pub enum KeyError {
     #[error("the fingerprint key variable `{0}` is not set")]
     MissingVariable(String),
+    #[error(
+        "the fingerprint key variable `{0}` is set but is not valid text; it must hold the \
+         base64 `pbps key generate` prints"
+    )]
+    UnreadableVariable(String),
+    #[error(
+        "the fingerprint key file `{0}` cannot be proved readable by its owner only on this \
+         platform; deliver the key through `fingerprint_key_env` instead"
+    )]
+    UnverifiableFile(PathBuf),
     #[error("the fingerprint key file `{path}` cannot be read: {reason}")]
     UnreadableFile { path: PathBuf, reason: String },
     #[error(
@@ -109,35 +119,55 @@ impl FingerprintKey {
 
     /// An environment's key from the variable `name`.
     pub fn from_env(name: &str) -> Result<Self, KeyError> {
-        let text = std::env::var(name).map_err(|_| KeyError::MissingVariable(name.to_owned()))?;
+        Self::from_variable(name, std::env::var(name))
+    }
+
+    /// Unset and set-but-unreadable are different faults with different
+    /// remedies; neither may read as the other. Split from [`Self::from_env`]
+    /// so the unreadable case is testable without mutating the process
+    /// environment.
+    fn from_variable(
+        name: &str,
+        value: Result<String, std::env::VarError>,
+    ) -> Result<Self, KeyError> {
+        let text = value.map_err(|e| match e {
+            std::env::VarError::NotPresent => KeyError::MissingVariable(name.to_owned()),
+            std::env::VarError::NotUnicode(_) => KeyError::UnreadableVariable(name.to_owned()),
+        })?;
         Self::parse(&text, &format!("`{name}`"))
     }
 
     /// An environment's key from the file at `path`, which must not be
     /// readable by group or others: a key in a world-readable file is a key
     /// everyone on the host holds.
+    #[cfg(unix)]
     pub fn from_file(path: &Path) -> Result<Self, KeyError> {
+        use std::os::unix::fs::PermissionsExt;
         let unreadable = |e: std::io::Error| KeyError::UnreadableFile {
             path: path.to_owned(),
             reason: e.to_string(),
         };
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(path)
-                .map_err(unreadable)?
-                .permissions()
-                .mode()
-                & 0o777;
-            if mode & 0o077 != 0 {
-                return Err(KeyError::OpenFile {
-                    path: path.to_owned(),
-                    mode,
-                });
-            }
+        let mode = std::fs::metadata(path)
+            .map_err(unreadable)?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(KeyError::OpenFile {
+                path: path.to_owned(),
+                mode,
+            });
         }
         let text = std::fs::read_to_string(path).map_err(unreadable)?;
         Self::parse(&text, &format!("`{}`", path.display()))
+    }
+
+    /// Where owner-only access cannot be proved — any platform without Unix
+    /// permission bits, whose ACLs this does not read — a key file is refused
+    /// rather than trusted; the variable form remains.
+    #[cfg(not(unix))]
+    pub fn from_file(path: &Path) -> Result<Self, KeyError> {
+        Err(KeyError::UnverifiableFile(path.to_owned()))
     }
 
     /// This process's key, random and made once: for fingerprints compared
@@ -285,6 +315,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_set_but_unreadable_variable_is_not_reported_as_unset() {
+        let unreadable = std::env::VarError::NotUnicode(std::ffi::OsString::from("x"));
+        assert_eq!(
+            FingerprintKey::from_variable("K", Err(unreadable)).unwrap_err(),
+            KeyError::UnreadableVariable("K".into())
+        );
+        assert_eq!(
+            FingerprintKey::from_variable("K", Err(std::env::VarError::NotPresent)).unwrap_err(),
+            KeyError::MissingVariable("K".into())
+        );
+        let key = FingerprintKey::generate();
+        assert!(FingerprintKey::from_variable("K", Ok(key)).is_ok());
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_key_file_must_be_owner_only() {
@@ -305,6 +350,16 @@ mod tests {
             Err(KeyError::UnreadableFile { .. })
         ));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn a_key_file_is_refused_where_owner_only_cannot_be_proved() {
+        let path = std::env::temp_dir().join("pbps-fp-unverifiable");
+        assert!(matches!(
+            FingerprintKey::from_file(&path),
+            Err(KeyError::UnverifiableFile(_))
+        ));
     }
 
     #[test]
