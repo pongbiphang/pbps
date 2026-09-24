@@ -229,8 +229,9 @@ mod tests {
 
     /// #878: the pull filters the three ledger tables out of `dbo`, so a
     /// declaration of one must be refused rather than read back as absent and
-    /// planned for creation. Case-insensitively, as the filter compares; the
-    /// same names in another schema stay the project's.
+    /// planned for creation. Only the exact spelling pbps creates: another
+    /// case is a different table on a case-sensitive database, and the same
+    /// names in another schema stay the project's.
     #[test]
     fn validating_a_table_refuses_the_ledger_names_in_dbo_only() {
         let mut table = Table::default();
@@ -247,11 +248,12 @@ mod tests {
             "dbo.__pbps_state",
             "dbo.__pbps_lock",
             "dbo.__pbps_state_confidential",
-            "DBO.__PBPS_STATE_CONFIDENTIAL",
         ] {
             assert!(refused(ours), "{ours}");
         }
         for theirs in [
+            "DBO.__PBPS_STATE_CONFIDENTIAL",
+            "dbo.__PBPS_State",
             "app.__pbps_state_confidential",
             "dbo.__pbps_statements",
             "dbo.__pbps_customers",

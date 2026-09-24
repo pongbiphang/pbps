@@ -32,17 +32,18 @@ use crate::introspect::{
 /// its ledger will live in is not decided until Phase 5 step 8 (#185).
 /// Whether `name` is one of this tool's ledger tables, which the pull filters
 /// out and validation therefore reserves (the PostgreSQL side's
-/// `catalog::is_ours`). Case-insensitively: the filter above compares under the
-/// database's collation, which is case-insensitive by default, so a declaration
-/// of `DBO.__PBPS_STATE` would be hidden the same way.
+/// `catalog::is_ours`). The exact spelling pbps creates, and no other:
+/// validation runs offline and cannot know the database's collation, and on a
+/// case-sensitive one `dbo.__PBPS_STATE_CONFIDENTIAL` is a different table the
+/// project may declare — the dialect's `fold_ident` preserves case for the
+/// same reason.
 pub(crate) fn is_ours(name: &pbps_model::TableName) -> bool {
     [
         crate::state::STATE_TABLE,
         crate::state::LOCK_TABLE,
         crate::state::CONFIDENTIAL_TABLE,
     ]
-    .iter()
-    .any(|ours| ours.eq_ignore_ascii_case(&format!("{}.{}", name.schema, name.name)))
+    .contains(&format!("{}.{}", name.schema, name.name).as_str())
 }
 
 const TABLES: &str = "\
