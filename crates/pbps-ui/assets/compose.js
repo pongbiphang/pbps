@@ -82,18 +82,22 @@ globalThis.PbpsCompose = Object.freeze({
     const quote = value => "'" + value.replaceAll("'", "'\"'\"'") + "'";
     // A merge-request link only where its URL shape is known. Any other host
     // gets the branch name; a guessed URL could open someone else's page.
-    const mergeRequest = (destination, branch) => {
+    const mergeRequest = (destination, branch, baseRef) => {
       const {transport, host, port, repository} = destination || {};
+      // The request targets the reviewed base, never the host's default
+      // branch; a base that is not an ordinary branch gets no link.
+      if (typeof baseRef !== "string" || !baseRef.startsWith("refs/heads/")) return null;
+      const base = baseRef.slice("refs/heads/".length);
       // scp is `git@host:owner/repo.git`; an explicit port is some other service.
       if (!["https", "ssh", "scp"].includes(transport) || port != null || typeof repository !== "string") return null;
       const path = repository.replace(/^\//, "").replace(/\.git$/, "");
       if (host === "github.com" && /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(path)) {
-        // The compare path keeps the branch's own slashes.
-        const name = branch.split("/").map(encodeURIComponent).join("/");
-        return `https://github.com/${path}/compare/${name}?expand=1`;
+        // The compare path keeps each branch's own slashes.
+        const segment = name => name.split("/").map(encodeURIComponent).join("/");
+        return `https://github.com/${path}/compare/${segment(base)}...${segment(branch)}?expand=1`;
       }
       if (host === "gitlab.com" && /^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)+$/.test(path)) {
-        return `https://gitlab.com/${path}/-/merge_requests/new?merge_request%5Bsource_branch%5D=${encodeURIComponent(branch)}`;
+        return `https://gitlab.com/${path}/-/merge_requests/new?merge_request%5Bsource_branch%5D=${encodeURIComponent(branch)}&merge_request%5Btarget_branch%5D=${encodeURIComponent(base)}`;
       }
       return null;
     };
@@ -144,7 +148,7 @@ globalThis.PbpsCompose = Object.freeze({
           }
           if (receipt.remote === "delivered" && /^refs\/heads\/pbps-compose\/[a-f0-9]{64}$/.test(d.output_ref)) {
             const branch = d.output_ref.slice("refs/heads/".length);
-            const url = mergeRequest(d.destination, branch);
+            const url = mergeRequest(d.destination, branch, d.remote_base_ref);
             if (url) {
               const link = make("a", "Open a merge request for this branch");
               link.href = url;

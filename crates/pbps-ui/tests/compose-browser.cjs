@@ -134,41 +134,65 @@ async function outcomes() {
   assert(b.root.find(e => e.textContent.includes("Commit: " + "a".repeat(40))));
 }
 async function mergeRequests() {
-  // A link only for a delivered result on a host whose request URL is known.
+  // A link only for a delivered result on a host whose request URL is known,
+  // targeting the reviewed base rather than the host's default branch.
   const branch = "pbps-compose/" + "c".repeat(64);
+  const main = "refs/heads/master";
+  const release = "refs/heads/release/1.0";
+  const github = {transport: "https", host: "github.com", port: null, repository: "/team/repo.git"};
+  const gitlab = {transport: "ssh", host: "gitlab.com", port: null, principal: "git", repository: "/group/sub/repo.git"};
+  const gitlabRequest = base => `https://gitlab.com/group/sub/repo/-/merge_requests/new?merge_request%5Bsource_branch%5D=${encodeURIComponent(branch)}&merge_request%5Btarget_branch%5D=${encodeURIComponent(base)}`;
   const cases = [
-    [{transport: "https", host: "github.com", port: null, repository: "/team/repo.git"}, "delivered",
-      `https://github.com/team/repo/compare/${branch}?expand=1`],
-    [{transport: "scp", host: "github.com", port: null, principal: "git", repository: "team/repo.git"}, "delivered",
-      `https://github.com/team/repo/compare/${branch}?expand=1`],
-    [{transport: "ssh", host: "gitlab.com", port: null, principal: "git", repository: "/group/sub/repo.git"}, "delivered",
-      `https://gitlab.com/group/sub/repo/-/merge_requests/new?merge_request%5Bsource_branch%5D=${encodeURIComponent(branch)}`],
-    [{transport: "https", host: "git.example.test", port: null, repository: "/team/repo.git"}, "delivered", null],
-    [{transport: "https", host: "github.com", port: 8443, repository: "/team/repo.git"}, "delivered", null],
-    [{transport: "https", host: "github.com", port: null, repository: "/team/../other/repo.git"}, "delivered", null],
-    [{transport: "file", host: null, port: null, repository: "/srv/repo.git"}, "delivered", null],
-    [{transport: "https", host: "github.com", port: null, repository: "/team/repo.git"}, "unknown", null],
+    [github, main, "delivered", `https://github.com/team/repo/compare/master...${branch}?expand=1`],
+    [{transport: "scp", host: "github.com", port: null, principal: "git", repository: "team/repo.git"}, main, "delivered",
+      `https://github.com/team/repo/compare/master...${branch}?expand=1`],
+    [github, release, "delivered", `https://github.com/team/repo/compare/release/1.0...${branch}?expand=1`],
+    [github, "refs/heads/fix#1", "delivered", `https://github.com/team/repo/compare/fix%231...${branch}?expand=1`],
+    [gitlab, main, "delivered", gitlabRequest("master")],
+    [gitlab, release, "delivered", gitlabRequest("release/1.0")],
+    [github, "refs/tags/v1", "delivered", null],
+    [github, undefined, "delivered", null],
+    [gitlab, "refs/remotes/origin/master", "delivered", null],
+    [{transport: "https", host: "git.example.test", port: null, repository: "/team/repo.git"}, main, "delivered", null],
+    [{transport: "https", host: "github.com", port: 8443, repository: "/team/repo.git"}, main, "delivered", null],
+    [{transport: "https", host: "github.com", port: null, repository: "/team/../other/repo.git"}, main, "delivered", null],
+    [{transport: "file", host: null, port: null, repository: "/srv/repo.git"}, main, "delivered", null],
+    [github, main, "unknown", null],
   ];
-  for (const [destination, remote, expected] of cases) {
-    const a = setup();
-    let p = a.form.fire("submit"); a.calls[0].resolve(preview("mr")); await p;
-    p = a.confirm.fire("click");
-    a.calls[1].resolve({status: "delivered", operation_id: "operation-mr", local: "present", remote, cleanup_pending: false,
-      details: {commit: "d".repeat(40), output_ref: `refs/heads/${branch}`, base: "base", tree: "tree", destination,
-        source_project: "/source/project", project_suffix: "project", delivery_generation: "nonce"}});
-    await p;
-    const link = a.root.find(e => e.tagName === "a");
-    const label = JSON.stringify([destination, remote]);
+  const result = (destination, base, remote) => ({status: "delivered", operation_id: "operation-mr", local: "present",
+    remote, cleanup_pending: false, details: {commit: "d".repeat(40), output_ref: `refs/heads/${branch}`,
+      remote_base_ref: base, base: "base", tree: "tree", destination, source_project: "/source/project",
+      project_suffix: "project", delivery_generation: "nonce"}});
+  const check = (root, expected, label, remote) => {
+    const link = root.find(e => e.tagName === "a");
     if (expected) {
       assert(link, label);
       assert.equal(link.href, expected, label);
       assert.equal(link.rel, "noreferrer noopener", label);
     } else {
       assert(!link, label);
-      const hint = a.root.find(e => e.textContent.includes(`merge request for branch ${branch}`));
+      const hint = root.find(e => e.textContent.includes(`merge request for branch ${branch}`));
       assert.equal(Boolean(hint), remote === "delivered", label);
     }
+  };
+  for (const [destination, base, remote, expected] of cases) {
+    const a = setup();
+    let p = a.form.fire("submit"); a.calls[0].resolve(preview("mr")); await p;
+    p = a.confirm.fire("click");
+    a.calls[1].resolve(result(destination, base, remote));
+    await p;
+    check(a.root, expected, JSON.stringify([destination, base, remote]), remote);
   }
+  // A result rediscovered after a restart links to its own reviewed base.
+  const doc = {createElement: tag => new Element(tag, doc)};
+  const root = new Element("section", doc);
+  const calls = [];
+  PbpsCompose.mount(root, (action, body) => new Promise((resolve, reject) => calls.push({action, body, resolve, reject})),
+    {remote: "origin", discover: true});
+  assert.equal(calls[0].action, "list");
+  calls[0].resolve([result(gitlab, release, "delivered")]);
+  await new Promise(resolve => setImmediate(resolve));
+  check(root, gitlabRequest("release/1.0"), "rediscovered", "delivered");
 }
 async function staleRefusal() {
   // A refusal no reconfirmation can cure reopens the form for a new preview.

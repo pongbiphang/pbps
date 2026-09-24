@@ -116,14 +116,19 @@ fn the_viewer_previews_confirms_and_reconciles_through_its_compose_actions() {
     let commit = delivered["details"]["commit"].as_str().unwrap();
     let output_ref = preview["output_ref"].as_str().unwrap();
     assert_eq!(f.remote_ref(output_ref).as_deref(), Some(commit));
-    let listed = served.action("list", serde_json::json!({})).json();
-    assert!(
-        listed
+    // The reviewed base travels with the result, so a merge request can
+    // target it; a restarted viewer rediscovers it from the receipt.
+    assert_eq!(delivered["details"]["remote_base_ref"], "refs/heads/master");
+    for viewer in [&served, &serve(&f)] {
+        let listed = viewer.action("list", serde_json::json!({})).json();
+        let saved = listed
             .as_array()
             .unwrap()
             .iter()
-            .any(|outcome| outcome["operation_id"] == operation)
-    );
+            .find(|outcome| outcome["operation_id"] == operation)
+            .expect("the delivered result is listed");
+        assert_eq!(saved["details"]["remote_base_ref"], "refs/heads/master");
+    }
     let recovered = served
         .action("recover", serde_json::json!({"operation_id": operation}))
         .json();

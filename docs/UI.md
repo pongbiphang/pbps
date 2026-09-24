@@ -64,7 +64,8 @@ already edited in the declarations. It follows
    branch with the same commit, after you have diagnosed the remote.
 4. A delivered result links to a new merge request when the destination is
    `github.com` or `gitlab.com` over HTTPS or SSH without a custom port.
-   Elsewhere the page names the branch to open a request for. Continue from the
+   The request targets the reviewed base branch, not the host's default
+   branch (#851). Elsewhere the page names the branch to open a request for. Continue from the
    result in a separate checkout; the page prints the `git worktree add` and
    `pbps ui` commands.
 
