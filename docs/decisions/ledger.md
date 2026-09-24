@@ -762,3 +762,9 @@ instead of taking `default_table_access_method`: a deployment account whose
 setting names another installed method would otherwise create a ledger that the
 check then refuses. `emit.rs` writes the clause on managed tables for the same
 reason. Measured on 18.6 with a second method built on the heap handler.
+
+The protected table DEC-878.1 added is held to the same table-level facts and
+created `USING heap` too. `prune`'s one gate now covers all three tables, so a
+view at the protected name is refused before the combined delete (#885). A
+table inheriting from the protected one is refused rather than deleted around
+with `ONLY`, as for the other two.

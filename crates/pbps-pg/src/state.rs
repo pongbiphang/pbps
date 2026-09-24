@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS public.__pbps_state_confidential (
     plan_checksum varchar(64)   NULL,
     reason        varchar(1000) NULL,
     state_json    text          NOT NULL
-)";
+) USING heap";
 
 /// `CREATE TABLE IF NOT EXISTS` rather than a catalog check and a branch:
 /// creating the ledger must be safe to run on every command that writes one,
@@ -337,7 +337,7 @@ const DELETE_UP_TO: &str = "DELETE FROM ONLY public.__pbps_state WHERE id <= $1"
 /// same `state_id`, which its own primary key does not keep unique.
 const DELETE_BOTH_UP_TO: &str = "\
 WITH protected AS (DELETE FROM ONLY public.__pbps_state_confidential WHERE state_id <= $1)
-DELETE FROM public.__pbps_state WHERE id <= $1";
+DELETE FROM ONLY public.__pbps_state WHERE id <= $1";
 
 /// Whether the protected table exists yet. It is created by the first
 /// confidential record, so a ledger without one is the ordinary case.
@@ -789,7 +789,8 @@ fn differences(
 
 /// Refuses, with [`untrusted_ledger_message`], when [`ledger_problems`] finds
 /// anything: the one gate in front of every statement that writes to the
-/// ledger. [`ensure_tables`] asks it for `record` and `lock`; [`prune`] and
+/// ledger. [`ensure_tables`] asks it for `record` and `lock`, and
+/// [`ensure_confidential_table`] for a confidential record; [`prune`] and
 /// [`unlock`] ask it before their DELETE (#396), because a DELETE fires a
 /// trigger and follows a view exactly as an INSERT does, and a stale lock is
 /// cleared under the same account that would run whatever is attached.
@@ -854,13 +855,16 @@ const STATE_RECIPE: [&str; 19] = [
 ];
 
 /// [`CREATE_CONFIDENTIAL`]'s catalog projection, measured on 18.6 and 16.15.
-const CONFIDENTIAL_RECIPE: [&str; 6] = [
+const CONFIDENTIAL_RECIPE: [&str; 9] = [
     "column state_id bigint NOT NULL",
     "column plan_checksum character varying(64)",
     "column reason character varying(1000)",
     "column state_json text NOT NULL",
     "constraint pk___pbps_state_confidential PRIMARY KEY (state_id)",
     "index CREATE UNIQUE INDEX pk___pbps_state_confidential ON public.__pbps_state_confidential USING btree (state_id)",
+    "table persistence permanent",
+    "table access method heap",
+    "table replica identity default",
 ];
 
 /// [`CREATE_LOCK`]'s catalog projection, measured the same way.
@@ -975,7 +979,7 @@ fn ledger_facts() -> String {
          -- A foreign key onto the protected table is recorded under the table
          -- that holds it, and its triggers are internal, so neither branch
          -- above sees it; an `ON DELETE CASCADE` one would carry the prune into
-         -- the project's rows. The ordinary tables are #900's.
+         -- the project's rows. The ordinary tables are #916's.
          SELECT l.relname, 'referencing constraint ' || con.conname || ' on '
                 || con.conrelid::pg_catalog.regclass::text
            FROM ledger l JOIN pg_catalog.pg_constraint con ON con.confrelid = l.oid
@@ -1546,11 +1550,7 @@ async fn ensure_confidential_table(conn: &mut Conn) -> Result<(), DbError> {
         }
     }
     confirm_ledger_relations(conn).await?;
-    let problems = ledger_problems(conn).await?;
-    if !problems.is_empty() {
-        return Err(DbError::Refused(untrusted_ledger_message(&problems)));
-    }
-    Ok(())
+    refuse_an_untrusted_ledger(conn).await
 }
 
 async fn confidential_present(conn: &mut Conn) -> Result<bool, DbError> {
@@ -1618,16 +1618,11 @@ pub async fn prune(conn: &mut Conn, keep: u32) -> Result<u64, LedgerError> {
     let Some(highest) = doomed.first().copied() else {
         return Ok(0);
     };
-    // A ledger that has confidential records prunes both halves together,
-    // after the same integrity gate a write takes: the delete reaches the
-    // protected table, and a trigger there would read the rows it removes.
+    // A ledger that has confidential records prunes both halves together.
+    // The integrity gate above already held the protected table to its recipe
+    // with the other two (DEC-901.1), so a trigger there, or a view at its
+    // name (#885), is refused before either delete.
     if confidential_present(conn).await? {
-        let problems = ledger_problems(conn).await?;
-        if !problems.is_empty() {
-            return Err(LedgerError::Db(DbError::Refused(untrusted_ledger_message(
-                &problems,
-            ))));
-        }
         return Ok(conn
             .execute_with(DELETE_BOTH_UP_TO, &[highest.into()])
             .await?);

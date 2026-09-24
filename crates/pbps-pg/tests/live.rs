@@ -7557,8 +7557,9 @@ async fn a_foreign_key_onto_the_protected_table_refuses_the_prune() {
 
 /// #878: a table inheriting from the protected one is outside its recipe, so
 /// the ledger never reaches it. A read returns the protected table's own half
-/// though the child holds another under the same `state_id`, and a prune
-/// neither deletes the child's rows nor fires its trigger.
+/// though the child holds another under the same `state_id`, and a prune is
+/// refused (DEC-901.1), so it neither deletes the child's rows nor fires its
+/// trigger.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn an_inheriting_table_is_neither_read_nor_pruned_as_the_protected_one() {
@@ -7594,7 +7595,14 @@ async fn an_inheriting_table_is_neither_read_nor_pruned_as_the_protected_one() {
             state_json: serde_json::to_string(&full).unwrap(),
         }
     );
-    assert_eq!(state::prune(&mut db.conn, 1).await.unwrap(), 1);
+    // Since DEC-901.1 the integrity gate refuses a ledger table in an
+    // inheritance tree outright, so the prune deletes nothing at all rather
+    // than deleting around the child with `ONLY`.
+    let refused = format!("{:?}", state::prune(&mut db.conn, 1).await.unwrap_err());
+    assert!(
+        refused.contains("inherited by public.pbps_child"),
+        "{refused}"
+    );
     let mut left = Vec::new();
     for sql in [
         "SELECT count(*)::int8 AS n FROM public.pbps_marker",
@@ -7608,7 +7616,7 @@ async fn an_inheriting_table_is_neither_read_nor_pruned_as_the_protected_one() {
                 .unwrap(),
         );
     }
-    assert_eq!(left, [0, 1, 0], "marker, child, protected");
+    assert_eq!(left, [0, 1, 1], "marker, child, protected");
     db.drop().await;
 }
 
@@ -27854,5 +27862,52 @@ async fn the_ledger_is_created_on_heap_whatever_the_default_access_method() {
         .execute("RESET default_table_access_method; DROP ACCESS METHOD pbps_heap2;")
         .await
         .unwrap();
+    db.drop().await;
+}
+
+/// #885: a view at the protected ledger name is refused by `prune`'s
+/// integrity gate, which now reads every relation at a ledger name. So nothing
+/// deletes through it, its `INSTEAD OF DELETE` trigger never runs, and the
+/// ordinary rows stay.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_view_at_the_protected_ledger_name_refuses_the_prune() {
+    let mut db = TestDb::create("protected_view885").await;
+    state::ensure_tables(&mut db.conn).await.unwrap();
+    for _ in 0..2 {
+        state::record(&mut db.conn, &snapshot(StateKind::Baseline))
+            .await
+            .unwrap();
+    }
+    db.conn
+        .execute(
+            "CREATE TABLE public.pbps_marker (n integer);
+             CREATE TABLE public.protected_base (state_id bigint, plan_checksum varchar(64),
+                 reason varchar(1000), state_json text);
+             CREATE VIEW public.__pbps_state_confidential AS SELECT * FROM public.protected_base;
+             CREATE FUNCTION public.pbps_mark() RETURNS trigger LANGUAGE plpgsql AS
+               $$ BEGIN INSERT INTO public.pbps_marker VALUES (1); RETURN OLD; END $$;
+             CREATE TRIGGER t INSTEAD OF DELETE ON public.__pbps_state_confidential
+                FOR EACH ROW EXECUTE FUNCTION public.pbps_mark();",
+        )
+        .await
+        .expect("the decoy view");
+    let refused = format!("{:?}", state::prune(&mut db.conn, 0).await.unwrap_err());
+    assert!(
+        refused.contains("__pbps_state_confidential is a view"),
+        "{refused}"
+    );
+    assert_eq!(
+        number(&mut db.conn, "SELECT count(*)::int FROM public.pbps_marker").await,
+        0
+    );
+    assert_eq!(
+        number(
+            &mut db.conn,
+            "SELECT count(*)::int FROM public.__pbps_state"
+        )
+        .await,
+        2
+    );
     db.drop().await;
 }
