@@ -836,3 +836,28 @@ Under `CONCAT_NULL_YIELDS_NULL OFF`, which a server's `user options` can make
 the default and pbps does not pin, `NULL + N'|'` is `N'|'` (measured), so an
 absent table would otherwise read as misspelt and refuse creating the ledger.
 The pull's filter compares `sys` names, which are never NULL.
+
+<a id="dec-372-1"></a>
+
+**DEC-372.1. A ledger row holding a value `record` never writes is refused for
+that row, and a negative `state_version` is such a value (#372).** `timeline()`
+reads the projected columns of every row in one batch. A negative or NULL
+`tables_count`/`modules_count`, a negative staged count, or a negative
+`state_version` was a `BadRow` that `?`d out of `projected_row`. So one
+hand-edited or foreign-written row failed the whole call, and every readable
+row went with it. That is the "thrown, not carried" shape DECISIONS 218 rules
+out, and #353 had already fixed it twice on this same function, for an
+unsupported version and for a half-populated staged pair. Each of these is now
+the row's `Unreadable::Malformed`, naming the column and the value. The NULL
+count is included, although it failed one step earlier, at the "must not be
+NULL" read, because it is another route into the same kind of bad row. Only a
+failure to read a column at all is still thrown.
+
+`state_version` was the open question. It is this crate's own monotonic
+marker, so a negative one could be read as evidence that the whole read is
+wrong: schema drift, or another writer sharing the table name. It is carried
+like the counts anyway. A query that had drifted from the table would show on
+every row and every column, not on one value in one row, and the version
+check that already refuses an unsupported version carries that row too.
+Making the one malformed marker a hard failure would recreate, for this
+column, the batch-wide outage the rest of this entry removes.

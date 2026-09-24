@@ -12523,6 +12523,72 @@ async fn a_half_populated_staged_pair_is_malformed_not_silently_unstaged() {
     db.drop().await;
 }
 
+/// #372: a value `record` never writes, in one row, is that row's
+/// `Unreadable::Malformed` — not a `BadRow` that `?`s out of `projected_row`
+/// and takes the whole `timeline()` batch with it (DECISIONS 218,
+/// DEC-372.1). One row per route into the failure: a negative count, a NULL
+/// count (which failed one step earlier, at the "must not be NULL" read), a
+/// negative staged count, and a negative `state_version`, which is carried
+/// like the counts. The well-formed row beside them is read as ever.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_malformed_timeline_row_is_refused_alone_and_the_rest_are_read() {
+    let mut db = TestDb::create("badrows372").await;
+    pbps_mssql::state::ensure_tables(&mut db.conn)
+        .await
+        .expect("migrate");
+
+    // Written by hand, not through `record()`, which never produces any of
+    // these shapes. The reason names each row, since `timeline` orders them.
+    for (reason, version, tables, modules, completed, total) in [
+        ("well-formed", "CUR", "2", "1", "NULL", "NULL"),
+        ("negative tables_count", "CUR", "-1", "1", "NULL", "NULL"),
+        ("null modules_count", "CUR", "2", "NULL", "NULL", "NULL"),
+        ("negative staged_completed", "CUR", "2", "1", "-1", "3"),
+        ("negative state_version", "-1", "2", "1", "NULL", "NULL"),
+    ] {
+        let version = if version == "CUR" {
+            (pbps_model::state::CURRENT_VERSION as i32).to_string()
+        } else {
+            version.to_owned()
+        };
+        db.conn
+            .execute_with(
+                &format!(
+                    "INSERT INTO dbo.__pbps_state \
+                     (kind, git_sha, plan_checksum, state_json, operator, reason, \
+                      state_version, tables_count, modules_count, staged_completed, staged_total) \
+                     VALUES ('apply', NULL, NULL, @P1, 'live-test', @P2, \
+                     {version}, {tables}, {modules}, {completed}, {total})"
+                ),
+                &["{}".into(), reason.into()],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("write the `{reason}` row by hand: {e}"));
+    }
+
+    let rows = pbps_mssql::state::timeline(&mut db.conn, 10)
+        .await
+        .expect("the whole call must still succeed — only the bad rows are refused");
+    assert_eq!(rows.len(), 5);
+    for row in &rows {
+        let reason = row.reason.as_deref().unwrap_or_default();
+        match (reason, &row.state) {
+            ("well-formed", Ok(state)) => {
+                assert_eq!((state.tables, state.modules), (2, 1), "{reason}");
+            }
+            ("well-formed", Err(e)) => panic!("the well-formed row was refused: {e:?}"),
+            (_, Err(pbps_model::Unreadable::Malformed(why))) => {
+                let column = reason.split(' ').nth(1).unwrap();
+                assert!(why.contains(column), "{reason}: {why}");
+            }
+            (_, other) => panic!("{reason}: expected Malformed, got {other:?}"),
+        }
+    }
+
+    db.drop().await;
+}
+
 /// Finding 4 from #353's round-1 review: `select_legacy_state_json` binds
 /// one parameter per legacy id, and SQL Server refuses more than
 /// [`pbps_mssql::doctor`]'s measured `MAX_PARAMETERS` (2,098) in one request.
