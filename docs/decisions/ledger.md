@@ -599,37 +599,6 @@ is counted — a least-privileged account refuses while such a worker runs, and
 `pg_read_all_stats` lets it tell the two apart; a `NOLOGIN` group with no session of its own is still not one, so a
 group owner whose only login member is the deployment account keeps working.
 
-<a id="dec-901-1"></a>
-
-**DEC-901.1. The ledger comparison reads the table's own row, the identity
-column's sequence and every relation at a ledger name, and `prune` and `unlock`
-ask it before they delete (#901; amends DEC-313.1).** DEC-313.1 compared what
-hangs off the two tables and called that projection closed. It was not: an
-`UNLOGGED` ledger (truncated after a crash), a typed one (`ALTER TYPE …
-CASCADE` changes it without owning it), one in an inheritance tree (reads reach
-a table never inspected), a descending identity (`ORDER BY id DESC` stops
-meaning newest-first) and a table with no columns (no facts, so skipped as
-absent) all kept every column, constraint and index of the recipe and passed.
-The facts now include persistence, access method, replica identity, a type the
-table was created `OF`, either end of `pg_inherits`, and the identity
-sequence's type, start, increment, bounds, cache and cycle. The recipe's
-values were measured identical on 18.6 and 16.15, and `pg_sequence` is
-world-readable there, so `doctor` can still ask this of the least-privileged
-account. A view or another kind at a ledger name is a problem in the words the
-write path's refusal already used (#217), so `doctor` names it rather than
-reading an absent ledger.
-
-`prune` and `unlock` run the same check before their DELETE, which fires a
-trigger and follows a view exactly as `lock`'s INSERT does (#396). Not through
-`ensure_tables`: a command that deletes should not create the ledger as a side
-effect, and an absent lock table still answers "not held". Every ordinary read
-and delete names the tables with `ONLY`, so a read that runs no check, such as
-`latest`, cannot take a descendant's row as the newest snapshot (#900).
-
-A subset of #103's timeline columns stays the recipe, but the migration now
-asks for all five rather than `state_version` alone, so a ledger lacking one of
-the others is migrated before `record` writes to it (#841).
-
 <a id="dec-868-1"></a>
 
 **DEC-868.1. A confidential record keeps its whole snapshot and checksum in a
@@ -756,3 +725,40 @@ Server batch takes an exclusive table lock *before* re-checking for a trigger,
 so none can be added between the check and the delete. The protected table is
 in both engines' ledger-name filters, so the pull never takes it for managed
 schema. Reader qualification is #879 and #880.
+
+<a id="dec-901-1"></a>
+
+**DEC-901.1. The ledger comparison reads the table's own row, the identity
+column's sequence and every relation at a ledger name, and `prune` and `unlock`
+ask it before they delete (#901; amends DEC-313.1).** DEC-313.1 compared what
+hangs off the two tables and called that projection closed. It was not: an
+`UNLOGGED` ledger (truncated after a crash), a typed one (`ALTER TYPE …
+CASCADE` changes it without owning it), one in an inheritance tree (reads reach
+a table never inspected), a descending identity (`ORDER BY id DESC` stops
+meaning newest-first) and a table with no columns (no facts, so skipped as
+absent) all kept every column, constraint and index of the recipe and passed.
+The facts now include persistence, access method, replica identity, a type the
+table was created `OF`, either end of `pg_inherits`, and the identity
+sequence's type, start, increment, bounds, cache and cycle. The recipe's
+values were measured identical on 18.6 and 16.15, and `pg_sequence` is
+world-readable there, so `doctor` can still ask this of the least-privileged
+account. A view or another kind at a ledger name is a problem in the words the
+write path's refusal already used (#217), so `doctor` names it rather than
+reading an absent ledger.
+
+`prune` and `unlock` run the same check before their DELETE, which fires a
+trigger and follows a view exactly as `lock`'s INSERT does (#396). Not through
+`ensure_tables`: a command that deletes should not create the ledger as a side
+effect, and an absent lock table still answers "not held". Every ordinary read
+and delete names the tables with `ONLY`, so a read that runs no check, such as
+`latest`, cannot take a descendant's row as the newest snapshot (#900).
+
+A subset of #103's timeline columns stays the recipe, but the migration now
+asks for all five rather than `state_version` alone, so a ledger lacking one of
+the others is migrated before `record` writes to it (#841).
+
+Because the recipe now requires `heap`, both `CREATE TABLE`s say `USING heap`
+instead of taking `default_table_access_method`: a deployment account whose
+setting names another installed method would otherwise create a ledger that the
+check then refuses. `emit.rs` writes the clause on managed tables for the same
+reason. Measured on 18.6 with a second method built on the heap handler.

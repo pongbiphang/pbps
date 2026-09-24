@@ -27819,3 +27819,40 @@ async fn a_ledger_lacking_one_timeline_column_is_migrated_before_the_record() {
     );
     db.drop().await;
 }
+
+/// Review of #911: the recipes require `heap`, so the ledger is created
+/// `USING heap` whatever `default_table_access_method` the deployment account
+/// carries. Otherwise the check refuses the tables pbps itself just created.
+/// A second method made from the heap handler stands in for an installed one.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_ledger_is_created_on_heap_whatever_the_default_access_method() {
+    let mut db = TestDb::create("ledger_am911").await;
+    db.conn
+        .execute(
+            "CREATE ACCESS METHOD pbps_heap2 TYPE TABLE HANDLER heap_tableam_handler;
+             SET default_table_access_method = pbps_heap2;",
+        )
+        .await
+        .expect("a second table access method");
+    state::ensure_tables(&mut db.conn)
+        .await
+        .expect("the ledger pbps creates passes its own check");
+    state::lock(&mut db.conn, "live-test").await.unwrap();
+    assert!(state::unlock(&mut db.conn).await.unwrap());
+    assert_eq!(
+        number(
+            &mut db.conn,
+            "SELECT count(*)::int FROM pg_catalog.pg_class c
+               JOIN pg_catalog.pg_am am ON am.oid = c.relam
+              WHERE c.relname IN ('__pbps_state', '__pbps_lock') AND am.amname = 'heap'"
+        )
+        .await,
+        2
+    );
+    db.conn
+        .execute("RESET default_table_access_method; DROP ACCESS METHOD pbps_heap2;")
+        .await
+        .unwrap();
+    db.drop().await;
+}

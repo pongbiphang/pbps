@@ -113,7 +113,7 @@ CREATE TABLE IF NOT EXISTS public.__pbps_state (
     modules_count    integer NULL,
     staged_completed integer NULL,
     staged_total     integer NULL
-)";
+) USING heap";
 
 /// Adds the five timeline columns to a `__pbps_state` created before issue
 /// #103, if they are not there yet.
@@ -181,7 +181,7 @@ CREATE TABLE IF NOT EXISTS public.__pbps_lock (
               CONSTRAINT ck___pbps_lock_single CHECK (id = 1),
     locked_by varchar(256) NOT NULL,
     locked_at timestamp(3) NOT NULL DEFAULT (clock_timestamp() AT TIME ZONE 'UTC')
-)";
+) USING heap";
 
 /// ISO 8601, rendered by the server and stored by the client as text — the
 /// driver is used without a date library here for the same reason the other one
@@ -864,6 +864,15 @@ const CONFIDENTIAL_RECIPE: [&str; 6] = [
 ];
 
 /// [`CREATE_LOCK`]'s catalog projection, measured the same way.
+///
+/// Both recipes require `heap`, so both `CREATE TABLE`s say `USING heap` rather
+/// than leaving it to `default_table_access_method`: otherwise a deployment
+/// account whose setting names another installed method creates the ledger
+/// under it, and the check then refuses the tables pbps itself just made. The
+/// same reason `emit.rs` writes the clause for managed tables. Measured on 18.6
+/// with a second method made from the heap handler (`CREATE ACCESS METHOD
+/// heap2 TYPE TABLE HANDLER heap_tableam_handler`): without the clause the
+/// table takes `heap2`, with it `heap`.
 const LOCK_RECIPE: [&str; 9] = [
     "column id integer NOT NULL",
     "column locked_by character varying(256) NOT NULL",
