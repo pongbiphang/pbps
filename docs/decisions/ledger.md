@@ -796,3 +796,22 @@ And the role must be able to call `setval`. `UPDATE` alone is not enough once
 and 16.15, each call is then refused, and naming such a role would refuse a
 ledger nobody can reorder. One role reached by `SET ROLE` must hold both the
 `UPDATE` and the `EXECUTE`, since the call runs with that role's privileges.
+
+<a id="dec-894-1"></a>
+
+**DEC-894.1. On SQL Server, a project table that the database collation folds
+onto an ordinary ledger name is refused before the ledger is written, not
+adopted (#894; extends DEC-878.1's spelling fact to `__pbps_state` and
+`__pbps_lock`).** `OBJECT_ID` compares names under the database collation, so
+on a case-insensitive database `dbo.__pbps_state` resolves to a project's own
+`dbo.__PBPS_STATE`. The pull and validation reserve only the exact spelling,
+and `CREATE_STATE`'s `IF OBJECT_ID(…) IS NULL` then skipped creating the ledger,
+so `record`, `lock`, `prune` and `unlock` wrote to the project's table.
+`ensure_tables`, `prune` and `unlock` now compare `OBJECT_NAME(OBJECT_ID(…))`
+with the exact spelling under `Latin1_General_BIN2`, and refuse by the found
+name when they differ. The table is the project's and stays the project's:
+reserving every folded spelling instead would take a name from projects on
+case-sensitive databases, where `dbo.__PBPS_STATE` is a different table and
+`OBJECT_ID` is exact (measured on the pinned server, both collations). Reads
+are not gated. A folded table without the ledger's columns fails them loudly,
+and the next write refuses by name.

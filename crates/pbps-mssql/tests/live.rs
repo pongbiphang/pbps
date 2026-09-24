@@ -2237,6 +2237,15 @@ async fn a_confidential_record_keeps_its_verifiers_out_of_the_ordinary_row() {
     db.drop().await;
 }
 
+async fn rows_in(conn: &mut Conn, table: &str) -> i32 {
+    conn.query(&format!("SELECT COUNT(*) AS n FROM {table};"))
+        .await
+        .unwrap()[0]
+        .try_get::<i32>("n")
+        .unwrap()
+        .unwrap()
+}
+
 async fn ordinary_rows(conn: &mut Conn) -> i32 {
     conn.query("SELECT COUNT(*) AS n FROM dbo.__pbps_state;")
         .await
@@ -2374,6 +2383,144 @@ async fn a_project_table_the_collation_folds_onto_the_protected_name_is_refused(
         2,
         "the ordinary ledger was pruned"
     );
+    db.drop().await;
+}
+
+/// #894: the same fold for the ordinary ledger. On a case-insensitive database
+/// `OBJECT_ID(N'dbo.__pbps_state')` resolves to a project's own
+/// `dbo.__PBPS_STATE`, so `ensure_tables` skipped creating the ledger and every
+/// write landed on the project's table. Each of the ledger's own tables built
+/// under a folded spelling, with the ledger's exact columns and a row, is now
+/// refused by name before `ensure_tables`, `record`, `lock`, `prune` or `unlock`
+/// writes anything, and the project's rows stay.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_project_table_the_collation_folds_onto_an_ordinary_ledger_name_is_refused() {
+    let schema = Schema::default();
+    let ids = IdsFile::default();
+    for (folded, create) in [
+        (
+            "__PBPS_STATE",
+            "CREATE TABLE dbo.__PBPS_STATE (
+                 id BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+                 applied_at DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+                 kind VARCHAR(16) NOT NULL, git_sha VARCHAR(40) NULL, plan_checksum CHAR(64) NULL,
+                 state_json NVARCHAR(MAX) NOT NULL, operator NVARCHAR(128) NOT NULL,
+                 reason NVARCHAR(1000) NULL, state_version INT NULL, tables_count INT NULL,
+                 modules_count INT NULL, staged_completed INT NULL, staged_total INT NULL);
+             INSERT INTO dbo.__PBPS_STATE (kind, state_json, operator)
+                  VALUES ('apply', N'mine', N'them');",
+        ),
+        (
+            "__PBPS_LOCK",
+            "CREATE TABLE dbo.__PBPS_LOCK (
+                 id INT NOT NULL PRIMARY KEY CHECK (id = 1),
+                 locked_by NVARCHAR(256) NOT NULL,
+                 locked_at DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME());
+             INSERT INTO dbo.__PBPS_LOCK (id, locked_by) VALUES (1, N'them');",
+        ),
+    ] {
+        let mut db = TestDb::create("ledger_folded894").await;
+        db.conn.execute(create).await.expect("the project's table");
+        let table = format!("dbo.{folded}");
+        let before = rows_in(&mut db.conn, &table).await;
+
+        let ensured = pbps_mssql::state::ensure_tables(&mut db.conn)
+            .await
+            .map(|()| 0)
+            .map_err(|e| e.to_string());
+        let recorded = pbps_mssql::state::record(
+            &mut db.conn,
+            &snapshot(pbps_model::StateKind::Apply, &schema, &ids),
+        )
+        .await
+        .map_err(|e| e.to_string());
+        let locked = pbps_mssql::state::lock(&mut db.conn, "live-test")
+            .await
+            .map(|()| 0)
+            .map_err(|e| e.to_string());
+        let unlocked = pbps_mssql::state::unlock(&mut db.conn)
+            .await
+            .map(|_| 0)
+            .map_err(|e| e.to_string());
+        for (what, result) in [
+            ("ensure_tables", ensured),
+            ("record", recorded),
+            ("lock", locked),
+            ("unlock", unlocked),
+        ] {
+            let error = result.expect_err(what);
+            assert!(error.contains(folded), "{what}: {error}");
+        }
+        assert_eq!(
+            rows_in(&mut db.conn, &table).await,
+            before,
+            "the project's {folded} was written to"
+        );
+        db.drop().await;
+    }
+
+    // `prune` answers `is_initialized` through the folded name as well, so it
+    // reaches its DELETE unless the same gate refuses first.
+    let mut db = TestDb::create("ledger_folded894p").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.__PBPS_STATE (
+                 id BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+                 applied_at DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+                 kind VARCHAR(16) NOT NULL, git_sha VARCHAR(40) NULL, plan_checksum CHAR(64) NULL,
+                 state_json NVARCHAR(MAX) NOT NULL, operator NVARCHAR(128) NOT NULL,
+                 reason NVARCHAR(1000) NULL, state_version INT NULL, tables_count INT NULL,
+                 modules_count INT NULL, staged_completed INT NULL, staged_total INT NULL);
+             INSERT INTO dbo.__PBPS_STATE (kind, state_json, operator)
+                  VALUES ('apply', N'a', N'them'), ('apply', N'b', N'them');",
+        )
+        .await
+        .unwrap();
+    let pruned = pbps_mssql::state::prune(&mut db.conn, 0)
+        .await
+        .expect_err("prune through a folded occupant")
+        .to_string();
+    assert!(pruned.contains("__PBPS_STATE"), "{pruned}");
+    assert_eq!(rows_in(&mut db.conn, "dbo.__PBPS_STATE").await, 2);
+    db.drop().await;
+}
+
+/// #894's negative control: on a case-sensitive database `dbo.__PBPS_STATE` is
+/// a different table, `OBJECT_ID` is exact, and the ledger is created and
+/// written beside it as usual.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_differently_cased_table_on_a_case_sensitive_database_is_not_the_ledger() {
+    let mut db = TestDb::create("ledger_cs894").await;
+    db.conn
+        .execute(&format!(
+            "USE master; ALTER DATABASE [{0}] COLLATE Latin1_General_CS_AS; USE [{0}];",
+            db.name
+        ))
+        .await
+        .expect("a case-sensitive database");
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.__PBPS_STATE (id int NOT NULL);
+             INSERT INTO dbo.__PBPS_STATE VALUES (7);",
+        )
+        .await
+        .unwrap();
+    let schema = Schema::default();
+    let ids = IdsFile::default();
+    pbps_mssql::state::record(
+        &mut db.conn,
+        &snapshot(pbps_model::StateKind::Apply, &schema, &ids),
+    )
+    .await
+    .expect("the ledger is created beside the project's table");
+    pbps_mssql::state::lock(&mut db.conn, "live-test")
+        .await
+        .unwrap();
+    assert!(pbps_mssql::state::unlock(&mut db.conn).await.unwrap());
+    assert_eq!(ordinary_rows(&mut db.conn).await, 1);
+    assert_eq!(rows_in(&mut db.conn, "dbo.__PBPS_STATE").await, 1);
     db.drop().await;
 }
 
