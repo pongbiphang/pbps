@@ -379,4 +379,24 @@ async function definiteRefusals() {
     assert(a.root.find(e => e.dataset.action === "recover"));
   }
 }
-exercise().then(outcomes).then(definiteRefusals).then(staleRefusal).then(mergeRequests).then(retirement).then(discoverOnMount).then(definiteHandleRefusal).then(() => process.stdout.write("compose browser behavior passed\n"), error => { console.error(error); process.exitCode = 1; });
+async function retiredElsewhere() {
+  // Another viewer retired this workflow's preview (#867): listing the
+  // private resources releases the form for a fresh preview.
+  const report = (id, state) => ({operation_id: id, state, cleanup_pending: false, location: "/private", instruction: ""});
+  const a = setup();
+  let p = a.form.fire("submit"); a.calls[0].resolve(preview("held")); await p;
+  assert.equal(a.confirm.disabled, false);
+  const list = a.root.find(e => e.dataset.action === "resources");
+  // A spent report for another operation leaves this candidate alone.
+  p = list.fire("click");
+  a.calls[1].resolve([report("operation-other", "spent"), report("operation-held", "sealed")]); await p;
+  assert.equal(a.confirm.disabled, false, "another operation's retirement keeps the candidate");
+  assert(a.root.find(e => e.textContent === "diff-held"), "the reviewed diff stays");
+  p = list.fire("click");
+  a.calls[2].resolve([report("operation-held", "spent")]); await p;
+  assert(a.confirm.disabled, "a retired preview cannot be confirmed");
+  assert(!a.root.find(e => e.dataset.action === "preview").disabled, "Refresh is available");
+  assert(!a.root.find(e => e.textContent === "diff-held"), "the retired diff is cleared");
+  assert(a.root.find(e => e.textContent.includes("retired elsewhere")));
+}
+exercise().then(outcomes).then(definiteRefusals).then(staleRefusal).then(mergeRequests).then(retirement).then(discoverOnMount).then(definiteHandleRefusal).then(retiredElsewhere).then(() => process.stdout.write("compose browser behavior passed\n"), error => { console.error(error); process.exitCode = 1; });

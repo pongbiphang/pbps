@@ -546,6 +546,66 @@ fn retirement_actions_clean_up_and_forget_only_what_their_state_allows() {
 }
 
 #[test]
+fn a_preview_retired_by_another_viewer_releases_this_workflow() {
+    let f = Fixture::new("viewer-compose-retired-elsewhere");
+    let served = serve(&f);
+    // Another viewer over the same repository retires this viewer's expired
+    // preview. The 25-hour instant is a synthetic clock standing in for the
+    // expiry, applied through that viewer's publisher.
+    let later = SystemTime::now() + Duration::from_secs(25 * 60 * 60);
+    let retire_elsewhere = |operation: &str| {
+        let report = f
+            .publisher()
+            .recover_resources_at(operation, later)
+            .unwrap();
+        assert_eq!(report.state, ResourceState::Spent);
+    };
+    let confirm = |preview: &serde_json::Value| {
+        served.action(
+            "confirm",
+            serde_json::json!({"candidate_id": preview["candidate_id"]}),
+        )
+    };
+
+    // Listing the resources shows it spent and releases the workflow: the
+    // next preview succeeds on the first try, and the retired handle is a
+    // definite refusal.
+    let held = served.action("preview", intent()).json();
+    let operation = held["operation_id"].as_str().unwrap();
+    retire_elsewhere(operation);
+    let reports = served.action("resources", serde_json::json!({})).json();
+    assert!(
+        reports
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|report| report["operation_id"] == operation && report["state"] == "spent"),
+        "{reports}"
+    );
+    let retired = confirm(&held);
+    assert_eq!(retired.status, 410, "{}", retired.body);
+    assert!(!f.record(operation).exists());
+    let fresh = served.action("preview", intent()).json();
+    assert_ne!(fresh["operation_id"], held["operation_id"]);
+
+    // Without a listing, the held handle is still checked before use: a
+    // confirmation is a definite refusal, never an unknown outcome.
+    retire_elsewhere(fresh["operation_id"].as_str().unwrap());
+    let retired = confirm(&fresh);
+    assert_eq!(retired.status, 410, "{}", retired.body);
+    assert!(!f.record(fresh["operation_id"].as_str().unwrap()).exists());
+
+    // And a Refresh replaces a retired preview on the first try.
+    let third = served.action("preview", intent()).json();
+    retire_elsewhere(third["operation_id"].as_str().unwrap());
+    let replaced = served.action("preview", intent()).json();
+    assert_ne!(replaced["operation_id"], third["operation_id"]);
+    // The replacement is live: it delivers.
+    let delivered = confirm(&replaced).json();
+    assert_eq!(delivered["status"], "delivered", "{delivered}");
+}
+
+#[test]
 fn a_restarted_viewer_gates_new_previews_on_the_same_bases_receipts() {
     use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new("viewer-compose-restart");
