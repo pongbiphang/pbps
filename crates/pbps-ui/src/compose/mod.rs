@@ -361,6 +361,17 @@ impl Candidates {
         Ok(())
     }
 
+    /// After its receipt was explicitly forgotten, the confirmed operation no
+    /// longer has a result to continue or an alternative to start from, so
+    /// the workflow accepts a fresh preview. Any other state is untouched.
+    pub fn forgotten(&mut self, operation_id: &str) {
+        if let Some(Stored::Confirmed(candidate)) = &self.current
+            && candidate.preview.operation_id == operation_id
+        {
+            self.current = None;
+        }
+    }
+
     pub fn confirm(&mut self, candidate_id: &str, now: SystemTime) -> Result<Arc<Candidate>> {
         let current = self
             .current

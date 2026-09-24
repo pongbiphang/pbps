@@ -202,7 +202,7 @@ impl Viewer {
 const COMPOSE_BODY_LIMIT: u64 = compose_http::BODY_LIMIT;
 #[cfg(not(target_os = "linux"))]
 const COMPOSE_BODY_LIMIT: u64 = 64 * 1024;
-const COMPOSE_ACTIONS: [&str; 7] = [
+const COMPOSE_ACTIONS: [&str; 11] = [
     "preview",
     "confirm",
     "list",
@@ -210,6 +210,10 @@ const COMPOSE_ACTIONS: [&str; 7] = [
     "retry",
     "republish",
     "alternative",
+    "cleanup",
+    "resources",
+    "recover-resources",
+    "forget",
 ];
 
 /// The complete write vocabulary: a fixed action name, no query, no path
