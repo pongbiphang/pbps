@@ -194,6 +194,96 @@ async fn managed_state_once(
     Ok(scoped)
 }
 
+/// Refuses a PostgreSQL plan that creates a name the database already uses
+/// outside the recorded scope (#316, #320, #323, DEC-316.1).
+///
+/// The recorded scope is the baseline's, and it has to stay that way (SPEC
+/// §8.2, DECISIONS 417): a table or module this project never recorded is
+/// outside it whether or not a declaration now names it. So a declaration
+/// that newly names an object already standing in the database plans a
+/// `CREATE`, and this engine has no `CREATE OR ALTER`: the statement is
+/// refused at apply, after everything ordered before it has run inside the
+/// transaction. Refused here instead, where the remedy is a decision:
+/// remove the declaration, move the object out of the way, or adopt it.
+///
+/// Three kinds of occupant, named as such, because the remedies differ: a
+/// readable table (#323) or module (#320) can be adopted as it stands, and an
+/// object pbps cannot read (#316) cannot. Tables, views and materialized
+/// views share one namespace per schema on this engine, so a table's name is
+/// occupied by a view of that name and the other way round; a routine or a
+/// trigger is occupied only by itself.
+///
+/// A `CreateModule` after a `DropModule` of the same id is a rebuild, not a
+/// creation. An unmanaged occupant is never dropped by a plan, so no other
+/// change in the plan can clear the name first.
+// The complement is every change that does not create a name.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn refuse_occupied_names(
+    cs: &pbps_model::ChangeSet,
+    scoped: &pbps_diff::Scoped,
+    unreadable: &[(pbps_db::catalog::LimitationTarget, String)],
+    unmanaged_relations: &[TableName],
+    label: &str,
+) -> anyhow::Result<()> {
+    use pbps_model::Change;
+    let relation = |name: &TableName| -> Option<String> {
+        if scoped.unmanaged.contains(name) && !unmanaged_relations.contains(name) {
+            return Some(format!("table `{name}`"));
+        }
+        if let Some((_, why)) = unreadable.iter().find(|(t, _)| t.object_name() == *name) {
+            return Some(format!("`{name}`, which pbps cannot read ({why})"));
+        }
+        if unmanaged_relations.contains(name) {
+            return Some(format!("`{name}`, a relation pbps cannot read"));
+        }
+        scoped
+            .unmanaged_modules
+            .contains(&ModuleId::Named(name.clone()))
+            .then(|| format!("view `{name}`"))
+    };
+    let dropped: BTreeSet<&ModuleId> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::DropModule { id, .. } => Some(id),
+            _ => None,
+        })
+        .collect();
+    let mut taken: Vec<String> = Vec::new();
+    for p in &cs.changes {
+        let (declared, occupant) = match &p.change {
+            Change::CreateTable { name, .. } => (format!("table `{name}`"), relation(name)),
+            Change::CreateModule { id, module } if !dropped.contains(id) => {
+                let occupant = match id {
+                    ModuleId::Named(name) => relation(name),
+                    ModuleId::Routine(_) | ModuleId::Trigger { .. } => scoped
+                        .unmanaged_modules
+                        .contains(id)
+                        .then(|| format!("{} `{id}`", module.kind)),
+                };
+                (format!("{} `{id}`", module.kind), occupant)
+            }
+            _ => continue,
+        };
+        if let Some(occupant) = occupant {
+            taken.push(format!("{declared}: the database already has {occupant}"));
+        }
+    }
+    if taken.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "`{label}` already uses {} name(s) this plan would create, outside what this project \
+         records:\n  {}\nThis engine has no `CREATE OR ALTER`, so each `CREATE` would be \
+         refused at apply. Remove or rename the declaration, drop or rename the object in the \
+         database, or — for a table or module pbps can read — adopt it as it stands with \
+         `pbps baseline --reason ...`, after which the declaration is compared with it rather \
+         than created.",
+        taken.len(),
+        taken.join("\n  ")
+    );
+}
+
 /// Refuses to use a catalog projection that omitted facts inside the managed
 /// set. Both recording and connected planning need the same guard: a partial
 /// schema is neither an honest snapshot nor a safe baseline for an artifact.
@@ -3744,6 +3834,18 @@ pub fn cmd_plan_db(
             anyhow::anyhow!("{} change(s) cannot be expressed", errs.len())
         })?;
 
+        // Before anything is checked against the plan: a name it creates that
+        // the database already uses, outside what this project records, is a
+        // `CREATE` the engine will refuse (#316, #320, #323).
+        if conn.driver() == pbps_db::Driver::Postgres {
+            refuse_occupied_names(
+                &cs,
+                &scoped,
+                &managed.unreadable,
+                &managed.unmanaged_relations,
+                &target.label,
+            )?;
+        }
         crate::engine::require_transactional_rebuilds(conn.driver(), &cs, staged)?;
         conn.begin(dialect.transaction_framing()).await?;
         let checks = async {

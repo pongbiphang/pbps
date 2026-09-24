@@ -1444,6 +1444,99 @@ fn module_dependents_are_dropped_and_restored_around_the_rebuild_or_refused_by_n
     );
 }
 
+/// #316, #320, #323. A name the declarations newly create that the
+/// database already uses, outside what this project records, is a `CREATE`
+/// this engine refuses at apply. `plan --db` now refuses it first, naming
+/// each occupant by kind — a readable table, a view, a routine, and a
+/// partitioned table pbps cannot read — with nothing written and no ledger
+/// entry. A name nobody uses plans as before; adopting the readable
+/// occupants with `baseline` clears the refusal; and a name taken after the
+/// plan was saved fails the apply inside its transaction, recording nothing.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_newly_declared_name_the_database_already_uses_is_refused_before_the_plan() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "occupied-names");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("occupied-names");
+    d.table(ONE_COLUMN);
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    let entries = || scalar(connection, "SELECT count(*) FROM public.__pbps_state");
+    let recorded = entries();
+
+    on_server(
+        connection,
+        "CREATE TABLE app.x (id integer PRIMARY KEY); \
+         CREATE VIEW app.v AS SELECT 1 AS n; \
+         CREATE FUNCTION app.g(integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$; \
+         CREATE TABLE app.p (id integer NOT NULL) PARTITION BY RANGE (id)",
+    );
+    let table = |name: &str| {
+        std::fs::write(
+            d.dir.join(format!("schema/{name}.yml")),
+            format!(
+                "table: {name}\ncolumns:\n  id: {{type: integer, nullable: false}}\n\
+                 primary_key: [id]\n"
+            ),
+        )
+        .unwrap();
+    };
+    for name in ["app.x", "app.p", "app.fresh"] {
+        table(name);
+    }
+    std::fs::write(
+        d.dir.join("schema/app.v.view.yml"),
+        "view: app.v\ndefinition: SELECT 1 AS n\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/app.g.function.yml"),
+        "function: app.g(integer)\ndefinition: |-\n  (integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    let err = stderr(&o);
+    for named in [
+        "table `app.x`: the database already has table `app.x`",
+        "view `app.v`: the database already has view `app.v`",
+        "function `app.g(integer)`: the database already has function `app.g(integer)`",
+        "table `app.p`: the database already has `app.p`",
+    ] {
+        assert!(err.contains(named), "`{named}` missing from: {err}");
+    }
+    // The name nobody uses is not among them.
+    assert!(!err.contains("app.fresh"), "{err}");
+    assert!(!plan.exists());
+    assert_eq!(entries(), recorded, "a refused plan touched the ledger");
+
+    // The partitioned table cannot be adopted; its declaration goes. The
+    // readable ones are adopted as they stand, and the refusal is gone.
+    // Its uid was only ever minted locally, never recorded, so the identity
+    // file is minted again rather than asked to drop a table no ledger has.
+    std::fs::remove_file(d.dir.join("schema/app.p.yml")).unwrap();
+    std::fs::remove_file(d.dir.join("schema.ids.json")).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt-existing"]));
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+
+    // Taken after the plan was saved: the `CREATE` fails at apply, inside the
+    // transaction, and the ledger records nothing.
+    let recorded = entries();
+    on_server(connection, "CREATE TABLE app.fresh (other text)");
+    let o = apply_plan(&d, connection, &plan, false);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(entries(), recorded, "a failed apply recorded an entry");
+}
+
 /// #248, end to end: a rebuild forced by an ordinary view edit still lets a
 /// declared, least-privilege role read the view afterwards.
 ///
