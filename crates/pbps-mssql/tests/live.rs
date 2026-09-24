@@ -2578,6 +2578,55 @@ async fn every_unqualified_reader_grantor_and_backup_principal_is_named() {
     drop_logins(db, &logins).await;
 }
 
+/// #880: what cannot reach the table names nobody. Code naming the ledger's
+/// table in another database, `EXECUTE` on the schema of a reading view, and a
+/// user whose login is gone are not readers; the view's own `SELECT` holder is.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn code_and_users_that_cannot_reach_the_table_are_not_named() {
+    let mut db = TestDb::create("unreached").await;
+    let schema = Schema::default();
+    let ids = IdsFile::default();
+    let mut full = snapshot(pbps_model::StateKind::Apply, &schema, &ids);
+    full.plan_checksum = Some("e".repeat(64));
+    let stub = snapshot(pbps_model::StateKind::Apply, &schema, &ids);
+    pbps_mssql::state::record_confidential(&mut db.conn, &stub, &full)
+        .await
+        .unwrap();
+    let pid = std::process::id();
+    let login = |key: &str| format!("pbps880_{key}_{pid}");
+    let mut logins = Vec::new();
+    for key in ["elsewhere", "schemaexec", "viewer", "orphan"] {
+        reader_login(&mut db, &login(key)).await;
+        logins.push(login(key));
+    }
+    db.conn
+        .execute(&format!(
+            "EXEC(N'CREATE PROCEDURE dbo.p880_elsewhere AS
+                    SELECT state_id FROM master.dbo.__pbps_state_confidential;');
+             GRANT EXECUTE ON dbo.p880_elsewhere TO [{elsewhere}];
+             EXEC(N'CREATE VIEW dbo.v880 AS SELECT state_id FROM dbo.__pbps_state_confidential;');
+             GRANT EXECUTE ON SCHEMA::dbo TO [{schemaexec}];
+             GRANT SELECT ON dbo.v880 TO [{viewer}];
+             GRANT SELECT ON dbo.__pbps_state_confidential TO [{orphan}];
+             DROP LOGIN [{orphan}];",
+            elsewhere = login("elsewhere"),
+            schemaexec = login("schemaexec"),
+            viewer = login("viewer"),
+            orphan = login("orphan"),
+        ))
+        .await
+        .unwrap();
+    let problems = pbps_mssql::confidential::protected_reader_problems(&mut db.conn)
+        .await
+        .unwrap();
+    assert!(names(&problems, &login("viewer")), "{problems:#?}");
+    for key in ["elsewhere", "schemaexec", "orphan"] {
+        assert!(!names(&problems, &login(key)), "{key}: {problems:#?}");
+    }
+    drop_logins(db, &logins).await;
+}
+
 /// #880: a session, trace, audit or tracking feature that would record the
 /// confidential write is named, and stops being named once it is gone.
 #[tokio::test]

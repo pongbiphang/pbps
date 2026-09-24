@@ -217,7 +217,9 @@ SELECT c.object_id AS id,
             WHERE d.referencing_id = c.object_id
               AND (d.referenced_id = @t
                    OR (d.referenced_entity_name = N'__pbps_state_confidential'
-                       AND ISNULL(d.referenced_schema_name, N'dbo') = N'dbo')))
+                       AND ISNULL(d.referenced_schema_name, N'dbo') = N'dbo'
+                       AND ISNULL(d.referenced_database_name, DB_NAME()) = DB_NAME()
+                       AND d.referenced_server_name IS NULL)))
          THEN 1 ELSE 0 END) AS names_table
   FROM code c
   LEFT JOIN sys.objects o ON o.object_id = c.object_id
@@ -605,11 +607,18 @@ impl Graph {
             // executed: `SELECT` on them is what runs their chain. A synonym
             // for a procedure is executed, so `EXECUTE` counts here too.
             "V" | "IF" | "TF" | "FT" | "SN" => {
+                // `EXECUTE` runs a synonym only for the procedure it may stand
+                // for; on a view or function it grants nothing.
+                let verbs: &[&str] = if m.kind == "SN" {
+                    &["SELECT", "EXECUTE", "CONTROL"]
+                } else {
+                    &["SELECT", "CONTROL"]
+                };
                 c.contains(&m.owner)
                     || self.in_database_role(&c, "db_datareader")
                     || self.database_grants(
                         &c,
-                        &["SELECT", "EXECUTE", "CONTROL"],
+                        verbs,
                         &[(OBJECT, m.id), (SCHEMA, m.schema), (DATABASE, 0)],
                     )
             }
@@ -894,7 +903,10 @@ impl Graph {
                 p.kind == "A"
                     || (id == GUEST && self.guest_enabled())
                     || (["S", "U", "G", "E", "X"].contains(&p.kind.as_str())
-                        && p.authentication != 0
+                        // NONE (0) signs nobody in, and INSTANCE (1) only
+                        // through its login: without a matching one it is an
+                        // orphan, reached only by becoming it.
+                        && p.authentication > 1
                         && id != DBO
                         && id != GUEST
                         && !p.sid.as_deref().is_some_and(|s| login_sids.contains(s)))
@@ -1330,6 +1342,32 @@ mod tests {
     fn the_dependency_read_keeps_edges_into_every_kind_of_code() {
         assert!(!DEPENDENCIES.contains("sql_modules"), "{DEPENDENCIES}");
         assert!(!DEPENDENCIES.contains("assembly_modules"), "{DEPENDENCIES}");
+    }
+
+    #[test]
+    fn execute_does_not_select_from_a_view_and_an_orphaned_user_is_no_actor() {
+        let mut g = graph();
+        g.modules.push(Module {
+            kind: "V".into(),
+            ..module(50, DBO, None, true)
+        });
+        g.database_perms
+            .push(grant(SCHEMA, DBO_SCHEMA, U_ALICE, "EXECUTE"));
+        assert!(!mentions(&named(&g), "alice"));
+
+        // An instance user whose login is gone is no actor; a contained one is.
+        for (authentication, named_it) in [(1, false), (2, true)] {
+            let mut g = graph();
+            g.database.insert(
+                41,
+                Principal {
+                    authentication,
+                    ..principal("orphan", "S", Some("0x41"), false)
+                },
+            );
+            g.database_perms.push(grant(OBJECT, TABLE, 41, "SELECT"));
+            assert_eq!(mentions(&named(&g), "orphan"), named_it, "{authentication}");
+        }
     }
 
     #[test]
