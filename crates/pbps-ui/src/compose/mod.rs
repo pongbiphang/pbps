@@ -75,7 +75,8 @@ pub struct Error {
 enum Failure {
     Uncertain,
     CompletedRejection,
-    /// Refused before any durable transition: nothing was written for it.
+    /// Refused with no publication or receipt for the handle. Its private
+    /// resources may have been retired, but nothing was committed or pushed.
     BeforeTransition,
 }
 
@@ -94,8 +95,10 @@ impl Error {
         }
     }
 
-    /// True only for a refusal known to precede every durable write, so a
-    /// caller may report "nothing happened" rather than an unknown outcome.
+    /// True only for a refusal known to precede publication: no receipt,
+    /// commit or pushed branch exists for the handle, so a caller may report
+    /// "nothing was published". Private resource retirement may already have
+    /// happened; a resource-persistence failure is never definite.
     pub fn is_definite(&self) -> bool {
         self.failure == Failure::BeforeTransition
     }

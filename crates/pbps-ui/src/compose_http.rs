@@ -194,11 +194,13 @@ impl Compose {
                         });
                     }
                 };
-                // An expired, replaced or unknown handle, a changed preview
-                // clock or a releasing candidate is refused before any write:
-                // 410 says "nothing was published; preview again". A resource
-                // failure may follow its durable confirmation, so it keeps the
-                // uncertain 409 and the page keeps the handle and recovery.
+                // A definite refusal (`Error::is_definite`) means no receipt
+                // or publication exists for the handle: an expired preview, a
+                // handle this workflow recorded as given up unpublished, or a
+                // releasing candidate. 410 says "nothing was published;
+                // preview again". Any other refusal, including an unknown
+                // handle or a resource failure after its durable confirmation,
+                // keeps the uncertain 409 and the page keeps recovery.
                 let candidate = self
                     .candidates
                     .confirm(&candidate_id, SystemTime::now())
