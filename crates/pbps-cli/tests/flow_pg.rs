@@ -2157,6 +2157,71 @@ fn pull_leaves_out_and_names_what_validate_would_refuse() {
     );
 }
 
+/// Issue #919. A pull into a project whose `pbps.yml` sets a declaration rule
+/// to `error` evaluated only `data.max-rows`, so it wrote a table the next
+/// `validate` refused for its name. Every declaration rule is evaluated now,
+/// as `validate` evaluates it: at `error` nothing is written; at `warning`
+/// the pull succeeds and says so; excused by name, it succeeds quietly.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn pull_draws_the_line_the_projects_own_rules_draw() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "pull-policies");
+    let connection = own.connection().to_owned();
+    on_server(
+        &connection,
+        "CREATE SCHEMA app; CREATE TABLE app.\"BadName\" (id integer PRIMARY KEY); \
+         CREATE TABLE app.good (id integer PRIMARY KEY)",
+    );
+    let rule = "dialect: postgres\npolicies:\n  rules:\n    naming.table: \
+                {severity: SEVERITY, pattern: \"^[a-z][a-z0-9_]*$\"}\n";
+
+    let d = Demo::new("pull-policy-error");
+    std::fs::write(d.dir.join("pbps.yml"), rule.replace("SEVERITY", "error")).unwrap();
+    let o = d.run(&["pull", "--db", &connection]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("naming.table") && stderr(&o).contains("app.BadName"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(stderr(&o).contains("Nothing was written"), "{}", stderr(&o));
+    assert!(
+        std::fs::read_dir(d.dir.join("schema"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "a refused pull wrote a file"
+    );
+    assert!(!d.dir.join("schema.ids.json").exists());
+
+    // At `warning` the pull writes, reports the finding, and `validate`
+    // accepts what it wrote.
+    let d = Demo::new("pull-policy-warning");
+    std::fs::write(d.dir.join("pbps.yml"), rule.replace("SEVERITY", "warning")).unwrap();
+    let o = d.run(&["pull", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("app.BadName"), "{}", stderr(&o));
+    let o = d.run(&["validate"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // Excused by name at `error`: the pull writes, and so does `validate` pass.
+    let d = Demo::new("pull-policy-suppressed");
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        format!(
+            "{}  suppress:\n    - rule: naming.table\n      on: app.BadName\n      reason: inherited\n",
+            rule.replace("SEVERITY", "error")
+        ),
+    )
+    .unwrap();
+    let o = d.run(&["pull", "--db", &connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(d.dir.join("schema/app.BadName.yml").is_file());
+    let o = d.run(&["validate"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+}
+
 /// Issue #261. A managed role that owns a managed object already holds every
 /// privilege on it, with no ACL entry at all; the pull reads that entry — when
 /// a `GRANT` forces the engine to write one — as the zero point rather than as

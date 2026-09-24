@@ -1196,7 +1196,8 @@ reader can express but the validator refuses — an identity whose increment
 outruns its type, a table in a schema named `$user` — is left out and named with
 the validator's reason, as anything the model cannot express already is; what
 is written is staged, loaded back and validated before any file reaches the
-project (DEC-902.1).
+project (DEC-902.1). The project's own declaration rules are evaluated over the
+same staged files; one at `error` means nothing is written (DEC-919.1).
 
 **The onboarding workflow**: `pull` designates one **source-of-truth environment**
 (usually prod — the one piece of reality that must not be broken) and generates
