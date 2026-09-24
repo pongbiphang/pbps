@@ -62,6 +62,15 @@ impl Error {
         }
     }
 
+    /// Names the evidence a refusal is about, keeping its failure kind, so a
+    /// caller holding several records can tell which one to preserve (#810).
+    fn at(self, path: &std::path::Path) -> Self {
+        Self {
+            message: format!("{} ({})", self.message, path.display()),
+            ..self
+        }
+    }
+
     fn rejection(self) -> Self {
         Self {
             failure: Failure::CompletedRejection,

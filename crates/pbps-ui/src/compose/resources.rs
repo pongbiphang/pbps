@@ -125,10 +125,15 @@ impl Resources {
 
     fn load(&self, id: &str) -> Result<Resource> {
         let r = self.read(id)?;
-        if !r.repository.source_scope(&self.repository)? {
-            return Err(Error::new(
-                "Compose resource belongs to another source worktree",
-            ));
+        let path = self.records.path.join(format!("{id}.json"));
+        if !r
+            .repository
+            .source_scope(&self.repository)
+            .map_err(|error| error.at(&path))?
+        {
+            return Err(
+                Error::new("Compose resource belongs to another source worktree").at(&path),
+            );
         }
         Ok(r)
     }
@@ -151,10 +156,17 @@ impl Resources {
         names: &BTreeSet<String>,
         revisions: &BTreeMap<String, ReadRevision>,
     ) -> Result<()> {
-        if &self.names()? != names {
-            return Err(Error::new(
-                "Compose resource evidence changed during discovery; preserve it",
-            ));
+        let closing = self.names()?;
+        if &closing != names {
+            // Name each record that appeared or disappeared since the pass.
+            let changed = names
+                .symmetric_difference(&closing)
+                .map(|name| self.records.path.join(name).display().to_string())
+                .collect::<Vec<_>>();
+            return Err(Error::new(&format!(
+                "Compose resource evidence changed during discovery: {}; preserve it",
+                changed.join(", ")
+            )));
         }
         for (id, revision) in revisions {
             self.records
@@ -185,16 +197,21 @@ impl Resources {
         if !identity(id) {
             return Err(Error::new("Invalid resource operation identity"));
         }
+        // Every read site, including discovery, names the record it refuses.
+        let path = self.records.path.join(format!("{id}.json"));
         let (bytes, revision) = self
             .records
-            .read_with_revision(&format!("{id}.json"), 64 * 1024 * 1024)?
+            .read_with_revision(&format!("{id}.json"), 64 * 1024 * 1024)
+            .map_err(|error| error.at(&path))?
             .ok_or_else(|| {
                 Error::new("Compose resource ownership is unavailable; preserve its evidence")
+                    .at(&path)
             })?;
         let r: Resource = serde_json::from_slice(&bytes).map_err(|_| {
             Error::new("Unknown compose resource evidence; preserve it for manual recovery")
+                .at(&path)
         })?;
-        self.validate(&r, id)?;
+        self.validate(&r, id).map_err(|error| error.at(&path))?;
         Ok((r, revision))
     }
 
@@ -323,10 +340,10 @@ impl Resources {
             for name in &names {
                 let id = name.trim_end_matches(".json");
                 if !owners.contains_key(id) {
+                    // The read names the record; admission adds only why.
                     self.read_in_pass(id, &mut revisions).map_err(|error| {
                         Error::new(&format!(
-                            "Cannot admit a compose acquisition while {} is unresolved: {error}; preserve it for manual recovery",
-                            self.records.path.join(name).display()
+                            "Cannot admit a compose acquisition while a prior record is unresolved: {error}; preserve it for manual recovery"
                         ))
                     })?;
                 }
@@ -337,16 +354,23 @@ impl Resources {
                     "Compose resource record limit reached; retain existing recovery evidence",
                 ));
             }
-            if !identity(id)
-                || !oid(base)
-                || self
-                    .records
-                    .read(&format!("{id}.json"), 64 * 1024 * 1024)?
-                    .is_some()
-            {
+            if !identity(id) || !oid(base) {
                 return Err(Error::new(
                     "Compose operation resource identity already exists or is invalid",
                 ));
+            }
+            // A record that appeared after the admission pass is named too.
+            let path = self.records.path.join(format!("{id}.json"));
+            if self
+                .records
+                .read(&format!("{id}.json"), 64 * 1024 * 1024)
+                .map_err(|error| error.at(&path))?
+                .is_some()
+            {
+                return Err(Error::new(
+                    "Compose operation resource identity already exists; preserve its evidence",
+                )
+                .at(&path));
             }
             let mut r = Resource {
                 version: 1,
@@ -980,8 +1004,12 @@ impl Resources {
                 }
                 records.insert(
                     id.to_owned(),
-                    self.read_in_pass(id, revisions)
-                        .map_err(|_| unavailable())?,
+                    // Keep the record's own refusal, which names its path.
+                    self.read_in_pass(id, revisions).map_err(|error| {
+                        Error::new(&format!(
+                            "Private compose ref {reference} has unavailable ownership: {error}; preserve it for manual recovery"
+                        ))
+                    })?,
                 );
             }
             let resource = &records[id];
@@ -1029,7 +1057,11 @@ impl Resources {
                 Some(record) => record,
                 None => self.read_in_pass(id, &mut revisions)?,
             };
-            if record.repository.source_scope(&self.repository)? {
+            if record
+                .repository
+                .source_scope(&self.repository)
+                .map_err(|error| error.at(&self.records.path.join(name)))?
+            {
                 result.push(self.report_resource(record)?);
             }
         }

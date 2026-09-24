@@ -274,15 +274,18 @@ impl Records {
         if !identity(id) {
             return Err(Error::new("Invalid compose operation identity"));
         }
+        let path = self.directory.path.join(format!("{id}.json"));
         let Some((bytes, revision)) = self
             .directory
-            .read_with_revision(&format!("{id}.json"), 1024 * 1024)?
+            .read_with_revision(&format!("{id}.json"), 1024 * 1024)
+            .map_err(|error| error.at(&path))?
         else {
             return Ok(None);
         };
-        let record: Record = serde_json::from_slice(&bytes)
-            .map_err(|_| Error::new("The compose receipt is invalid; preserve it for diagnosis"))?;
-        record.validate(id)?;
+        let record: Record = serde_json::from_slice(&bytes).map_err(|_| {
+            Error::new("The compose receipt is invalid; preserve it for diagnosis").at(&path)
+        })?;
+        record.validate(id).map_err(|error| error.at(&path))?;
         Ok(Some((record, revision)))
     }
 
@@ -291,14 +294,33 @@ impl Records {
         let records = names
             .iter()
             .map(|id| {
-                self.load_in_pass(id)?
-                    .ok_or_else(|| Error::new("A compose receipt disappeared during discovery"))
+                self.load_in_pass(id)?.ok_or_else(|| {
+                    Error::new(
+                        "A compose receipt disappeared during discovery; preserve its evidence",
+                    )
+                    .at(&self.directory.path.join(format!("{id}.json")))
+                })
             })
             .collect::<Result<Vec<_>>>()?;
-        if self.names()? != names {
-            return Err(Error::new(
-                "Compose receipt evidence changed during discovery; preserve it",
-            ));
+        let closing = self.names()?;
+        if closing != names {
+            // Name each receipt that appeared or disappeared since the pass.
+            let changed = names
+                .iter()
+                .filter(|id| !closing.contains(id))
+                .chain(closing.iter().filter(|id| !names.contains(id)))
+                .map(|id| {
+                    self.directory
+                        .path
+                        .join(format!("{id}.json"))
+                        .display()
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            return Err(Error::new(&format!(
+                "Compose receipt evidence changed during discovery: {}; preserve it",
+                changed.join(", ")
+            )));
         }
         for (id, (_, revision)) in names.iter().zip(&records) {
             self.directory
