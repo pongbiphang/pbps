@@ -28,6 +28,12 @@ use crate::introspect::{
 /// asks for the schema too, and a step that adds a third table adds it here,
 /// where a reader can see what the list is for.
 ///
+/// **By the exact spelling, under a binary collation.** `is_ours` reserves only
+/// the spelling pbps creates, so the filter must hide only that spelling too:
+/// compared under a case-insensitive database collation, a project's own
+/// `dbo.__PBPS_STATE_CONFIDENTIAL` read as the ledger, and the pull reported a
+/// declared table absent.
+///
 /// The PostgreSQL pull lists the same two names unqualified, because the schema
 /// its ledger will live in is not decided until Phase 5 step 8 (#185).
 /// Whether `name` is one of this tool's ledger tables, which the pull filters
@@ -53,7 +59,9 @@ SELECT t.object_id, s.name AS schema_name, t.name AS table_name, t.temporal_type
   JOIN sys.schemas s ON s.schema_id = t.schema_id
   LEFT JOIN sys.periods p ON p.object_id = t.object_id
  WHERE t.is_ms_shipped = 0
-   AND NOT (s.name = 'dbo' AND t.name IN ('__pbps_state', '__pbps_lock', '__pbps_state_confidential'))
+   AND NOT (s.name COLLATE Latin1_General_BIN2 = 'dbo'
+            AND t.name COLLATE Latin1_General_BIN2
+                IN ('__pbps_state', '__pbps_lock', '__pbps_state_confidential'))
  ORDER BY s.name, t.name;";
 
 // SQL Server added both `sys.tables.temporal_type` and `sys.periods` in 2016.
@@ -65,7 +73,9 @@ SELECT t.object_id, s.name AS schema_name, t.name AS table_name,
   FROM sys.tables t
   JOIN sys.schemas s ON s.schema_id = t.schema_id
  WHERE t.is_ms_shipped = 0
-   AND NOT (s.name = 'dbo' AND t.name IN ('__pbps_state', '__pbps_lock', '__pbps_state_confidential'))
+   AND NOT (s.name COLLATE Latin1_General_BIN2 = 'dbo'
+            AND t.name COLLATE Latin1_General_BIN2
+                IN ('__pbps_state', '__pbps_lock', '__pbps_state_confidential'))
  ORDER BY s.name, t.name;";
 
 fn tables_query(product_version: &str, edition: &str) -> String {
@@ -1022,10 +1032,17 @@ mod tests {
         ] {
             let (schema, name) = qualified.split_once('.').expect("a qualified name");
             assert!(
-                TABLES.contains(&format!("s.name = '{schema}'")),
+                TABLES.contains(&format!("s.name COLLATE Latin1_General_BIN2 = '{schema}'")),
                 "the schema is part of what this tool owns: {qualified}"
             );
             assert!(TABLES.contains(&format!("'{name}'")), "{qualified}");
+        }
+        // Both filters compare the spelling exactly, as `is_ours` reserves it.
+        for query in [TABLES, LEGACY_TABLES] {
+            assert!(
+                query.contains("t.name COLLATE Latin1_General_BIN2"),
+                "a collation-dependent filter hides a project's differently cased table"
+            );
         }
         assert!(
             !TABLES.contains("LIKE"),

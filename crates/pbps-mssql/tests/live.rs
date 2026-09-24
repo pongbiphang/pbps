@@ -11008,10 +11008,23 @@ async fn the_pull_hides_this_tools_two_tables_and_not_a_projects_own() {
             "CREATE TABLE dbo.__pbps_customers (id int NOT NULL);
              -- The ledger's own names, in a schema that is not the ledger's.
              CREATE TABLE app.__pbps_state (id int NOT NULL);
-             CREATE TABLE app.__pbps_lock (id int NOT NULL);",
+             CREATE TABLE app.__pbps_lock (id int NOT NULL);
+             -- A ledger name in another case, which validation accepts.
+             CREATE TABLE dbo.__PBPS_STATE_CONFIDENTIAL (id int NOT NULL);",
         )
         .await
         .expect("create a project's own tables");
+    // That table only proves the filter's spelling rule on a database whose
+    // collation would otherwise fold it onto the ledger's name.
+    let folds = db
+        .conn
+        .query(
+            "SELECT CONVERT(int, CASE WHEN N'A' = N'a' COLLATE DATABASE_DEFAULT \
+             THEN 1 ELSE 0 END) AS folds;",
+        )
+        .await
+        .expect("read the collation");
+    assert_eq!(folds[0].try_get::<i32>("folds").unwrap(), Some(1));
 
     let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
         .await
@@ -11023,6 +11036,7 @@ async fn the_pull_hides_this_tools_two_tables_and_not_a_projects_own() {
         TableName::new("dbo", "__pbps_customers"),
         TableName::new("app", "__pbps_state"),
         TableName::new("app", "__pbps_lock"),
+        TableName::new("dbo", "__PBPS_STATE_CONFIDENTIAL"),
     ] {
         assert!(
             names.contains(&theirs),
