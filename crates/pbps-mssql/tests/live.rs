@@ -2487,6 +2487,19 @@ async fn every_unqualified_reader_grantor_and_backup_principal_is_named() {
         ("function".into(), format!(
             "EXEC(N'CREATE FUNCTION dbo.f880() RETURNS TABLE AS RETURN SELECT state_id FROM {t};');
              GRANT SELECT ON dbo.f880 TO [{}];", login("function"))),
+        ("callerdependent".into(), format!(
+            "EXEC(N'CREATE PROCEDURE dbo.p880_cdreader AS SELECT state_id FROM {t};');
+             EXEC(N'CREATE PROCEDURE dbo.p880_cdwrapper AS EXEC p880_cdreader;');
+             GRANT EXECUTE ON dbo.p880_cdwrapper TO [{}];", login("callerdependent"))),
+        ("signedview".into(), format!(
+            "CREATE CERTIFICATE c880v ENCRYPTION BY PASSWORD = '{READER_PASSWORD}' WITH SUBJECT = 'pbps';
+             CREATE USER u880_viewcert FROM CERTIFICATE c880v;
+             GRANT SELECT ON dbo.v880 TO u880_viewcert;
+             CREATE USER u880_appowner WITHOUT LOGIN;
+             EXEC(N'CREATE SCHEMA app880 AUTHORIZATION u880_appowner;');
+             EXEC(N'CREATE PROCEDURE app880.p880_signedview AS SELECT state_id FROM dbo.v880;');
+             ADD SIGNATURE TO app880.p880_signedview BY CERTIFICATE c880v WITH PASSWORD = '{READER_PASSWORD}';
+             GRANT EXECUTE ON app880.p880_signedview TO [{}];", login("signedview"))),
         ("synonym".into(), format!(
             "CREATE SYNONYM dbo.s880 FOR {t}; GRANT SELECT ON dbo.s880 TO [{}];", login("synonym"))),
         ("securityadmin".into(), format!("ALTER ROLE db_securityadmin ADD MEMBER [{}];", login("securityadmin"))),
@@ -2575,6 +2588,11 @@ async fn every_unqualified_reader_grantor_and_backup_principal_is_named() {
     );
     for (name, _) in &controls {
         assert!(!names(&problems, name), "{name} is named: {problems:#?}");
+    }
+    // A certificate user that reads is named for itself: code signed with its
+    // certificate elsewhere is out of this database's sight.
+    for signer in ["u880_cert", "u880_viewcert"] {
+        assert!(names(&problems, signer), "{signer}: {problems:#?}");
     }
     drop_logins(db, &logins).await;
 }

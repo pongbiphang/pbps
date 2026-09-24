@@ -245,11 +245,23 @@ SELECT sn.object_id, CONVERT(nvarchar(2), N'SN'), sn.schema_id,
 /// reads it as surely as the first view does. Every edge is kept, and
 /// [`Graph::reading_modules`] follows only those whose target it already knows
 /// to read — a filter here on what counts as code dropped the edges into CLR
-/// modules, which `sys.sql_modules` does not list.
+/// modules, which `sys.sql_modules` does not list. A name the engine resolves
+/// only at run time, such as `EXEC reader` with no schema, is recorded with no
+/// `referenced_id` (measured: `is_caller_dependent = 1`); it is kept as an edge
+/// to every object of that name the caller could reach.
 const DEPENDENCIES: &str = "\
 SELECT d.referencing_id AS module, d.referenced_id AS target
   FROM sys.sql_expression_dependencies d
  WHERE d.referenced_id IS NOT NULL
+UNION ALL
+SELECT d.referencing_id, o.object_id
+  FROM sys.sql_expression_dependencies d
+  JOIN sys.objects o
+    ON o.name = d.referenced_entity_name
+   AND (d.referenced_schema_name IS NULL OR o.schema_id = SCHEMA_ID(d.referenced_schema_name))
+ WHERE d.referenced_id IS NULL
+   AND d.referenced_database_name IS NULL
+   AND d.referenced_server_name IS NULL
 UNION ALL
 SELECT sn.object_id, OBJECT_ID(sn.base_object_name)
   FROM sys.synonyms sn
@@ -646,7 +658,7 @@ impl Graph {
             .collect();
         let owner = |id: i32| self.modules.iter().find(|m| m.id == id).map(|m| m.owner);
         loop {
-            let more: Vec<i32> = self
+            let mut more: Vec<i32> = self
                 .dependencies
                 .iter()
                 .filter(|&&(m, target)| {
@@ -657,11 +669,39 @@ impl Graph {
                 })
                 .map(|&(m, _)| m)
                 .collect();
+            // A module's own context — its signer, or the principal it runs
+            // as — may read only through other code: a certificate user with
+            // `SELECT` on a chained view reads the table through it.
+            more.extend(
+                self.modules
+                    .iter()
+                    .filter(|m| !reading.contains(&m.id) && self.context_reads_through(m, &reading))
+                    .map(|m| m.id),
+            );
+            more.sort_unstable();
+            more.dedup();
             if more.is_empty() {
                 return reading;
             }
             reading.extend(more);
         }
+    }
+
+    fn context_reads_through(&self, m: &Module, reading: &BTreeSet<i32>) -> bool {
+        let runs_as = match m.execute_as {
+            Some(-2) => Some(m.owner),
+            Some(p) if p > 0 => Some(p),
+            _ => None,
+        };
+        runs_as.is_some_and(|u| self.user_reads_through_code(u, reading))
+            || self.signers.iter().any(|&(module, user, login)| {
+                module == m.id
+                    && ((user != 0 && self.user_reads_through_code(user, reading))
+                        || (login != 0
+                            && self
+                                .user_of(login)
+                                .is_some_and(|u| self.user_reads_through_code(u, reading))))
+            })
     }
 
     fn user_reads_through_code(&self, user: i32, reading: &BTreeSet<i32>) -> bool {
@@ -963,6 +1003,20 @@ impl Graph {
                 self.describe(who),
                 paths.join(", ")
             ));
+        }
+        // Code signed with the same certificate or key in another database
+        // runs with this user's access, and chaining need not be on for it;
+        // that code is outside this database's catalog, so a signer that
+        // reads cannot be qualified here at all.
+        for (&id, p) in &self.database {
+            if ["C", "K"].contains(&p.kind.as_str()) && readers.contains(&Who::User(id)) {
+                problems.push(format!(
+                    "certificate- or key-mapped user `{}` can read {subject}; code signed with its \
+                     certificate or key in any database runs with that access, which this check \
+                     cannot follow",
+                    p.name
+                ));
+            }
         }
         problems
     }

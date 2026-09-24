@@ -806,7 +806,11 @@ principal is not an absent one. `doctor` asks for these grants (#881).
   can execute it. A view, a table-valued function or a synonym counts for
   whoever can select from it: measured, `SELECT` on a `dbo` synonym for the
   table reads it with no grant on the table. A trigger counts for whoever can
-  write its table, and a database DDL trigger for everyone;
+  write its table, and a database DDL trigger for everyone. A name resolved
+  only at run time (`EXEC reader` with no schema; measured, recorded with no
+  `referenced_id`) is an edge to every object of that name. A module's signer
+  or execution context may itself read only through other code, and that
+  counts too;
 - becoming a reader: `IMPERSONATE` or `CONTROL` on a reader user or login, to
   a fixed point.
 
@@ -846,6 +850,11 @@ the deployer through others. The chain never steps through a principal with a
 
 So the database's owner qualifies by what it can do, and needs no exemption
 (#863). There is no allowance beyond this rule.
+
+*Signers.* A certificate or key signs code in any database, and that code
+runs with the mapped user's access here without cross-database chaining. So a
+certificate- or key-mapped user that reads the table is named as something the
+check cannot follow, whatever this database's own code does.
 
 *Where the approximations lean.* A `DENY` never removes a reader, because
 telling which grant it overrides would be a second implementation of the
