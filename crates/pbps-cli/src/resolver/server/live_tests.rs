@@ -117,7 +117,10 @@ async fn admit_when_exclusive(variable: &str, target: &mut NativeTarget) -> Dedi
     for _ in 0..60 {
         match DedicatedServer::admit(endpoint(variable), target).await {
             Ok(server) => return server,
-            Err(Error::Exclusivity(signal)) => {
+            Err(ServerFailure {
+                cause: Error::Exclusivity(signal),
+                recovery_names,
+            }) if recovery_names.is_empty() => {
                 refusals.push(signal);
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
@@ -255,7 +258,10 @@ async fn a_server_inside_the_target_instance_is_refused_before_any_scratch_resou
     };
     let mut target = native_target().await;
     match DedicatedServer::admit(endpoint("PBPS_SERVER_ALIAS_ENDPOINT"), &mut target).await {
-        Err(Error::TargetInstance) => (),
+        Err(ServerFailure {
+            cause: Error::TargetInstance,
+            recovery_names,
+        }) => assert!(recovery_names.is_empty()),
         Err(other) => panic!("refused, but not as the target instance: {other}"),
         Ok(_) => panic!("an alias of the target instance must be refused as the target"),
     }
@@ -277,7 +283,11 @@ async fn an_unimplemented_profile_or_an_exposed_runtime_is_refused_by_name() {
     let supported = std::env::var("PBPS_SERVER_ENDPOINT").unwrap();
     let unnamed = supported.replace("linux-dedicated-v1", "linux-dedicated-v2");
     match DedicatedServer::admit(ScratchEndpoint::parse(&unnamed).unwrap(), &mut target).await {
-        Err(Error::UnsupportedProfile { name, implemented }) => {
+        Err(ServerFailure {
+            cause: Error::UnsupportedProfile { name, implemented },
+            recovery_names,
+        }) => {
+            assert!(recovery_names.is_empty());
             assert_eq!(name, "linux-dedicated-v2");
             assert_eq!(implemented, "linux-dedicated-v1");
         }
@@ -288,7 +298,13 @@ async fn an_unimplemented_profile_or_an_exposed_runtime_is_refused_by_name() {
     // bridge network. A name is a claim; the daemon's record is the first
     // answer, and it names the key the recipe got wrong.
     match DedicatedServer::admit(endpoint("PBPS_SERVER_EXPOSED_ENDPOINT"), &mut target).await {
-        Err(Error::Configuration(key)) => assert_eq!(key, "NetworkMode"),
+        Err(ServerFailure {
+            cause: Error::Configuration(key),
+            recovery_names,
+        }) => {
+            assert!(recovery_names.is_empty());
+            assert_eq!(key, "NetworkMode");
+        }
         Err(other) => panic!("refused, but not for the configuration it names: {other}"),
         Ok(_) => panic!("a server whose runtime does not enforce the named profile must refuse"),
     }
@@ -447,7 +463,10 @@ async fn a_process_the_engine_did_not_start_refuses_its_namespaces() {
     fixture();
     let mut target = native_target().await;
     match DedicatedServer::admit(endpoint("PBPS_SERVER_ENDPOINT"), &mut target).await {
-        Err(Error::Containment(super::Premise::Occupants)) => (),
+        Err(ServerFailure {
+            cause: Error::Containment(super::Premise::Occupants),
+            recovery_names,
+        }) => assert!(recovery_names.is_empty()),
         Err(other) => panic!("refused, but not as a containment failure: {other}"),
         Ok(_) => panic!("a privileged sibling in the engine's namespaces must refuse"),
     }
@@ -464,7 +483,10 @@ async fn a_container_joined_to_the_engines_network_refuses_the_run() {
     fixture();
     let mut target = native_target().await;
     match DedicatedServer::admit(endpoint("PBPS_SERVER_ENDPOINT"), &mut target).await {
-        Err(Error::Containment(super::Premise::Accounting)) => (),
+        Err(ServerFailure {
+            cause: Error::Containment(super::Premise::Accounting),
+            recovery_names,
+        }) => assert!(recovery_names.is_empty()),
         Err(other) => panic!("refused, but not for the unaccounted namespace occupant: {other}"),
         Ok(_) => panic!("a container sharing the engine's network namespace must refuse"),
     }
@@ -609,8 +631,12 @@ async fn a_session_present_at_admission_is_refused_rather_than_counted() {
     // present intruder is refused either way, which is what this test is for:
     // it is refused, not absorbed into the baseline count.
     match DedicatedServer::admit(endpoint("PBPS_SERVER_ENDPOINT"), &mut target).await {
-        Err(Error::Containment(super::Premise::Accounting))
-        | Err(Error::Exclusivity(super::Signal::SessionList)) => (),
+        Err(ServerFailure {
+            cause:
+                Error::Containment(super::Premise::Accounting)
+                | Error::Exclusivity(super::Signal::SessionList),
+            recovery_names,
+        }) => assert!(recovery_names.is_empty()),
         Err(other) => panic!("refused, but not for the session the intruder opened: {other}"),
         Ok(_) => panic!("another client was connected while the baseline was read"),
     }
@@ -887,3 +913,6 @@ mod uts;
 
 #[path = "live_tests/pseudo.rs"]
 mod pseudo;
+
+#[path = "live_tests/admission_recovery.rs"]
+pub(super) mod admission_recovery;

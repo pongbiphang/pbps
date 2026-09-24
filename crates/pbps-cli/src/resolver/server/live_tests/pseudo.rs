@@ -23,7 +23,10 @@ async fn foreign_pseudo_roots_refuse_admission_and_discard_live_analysis() {
         changed.replace();
         let admission =
             match DedicatedServer::admit(endpoint("PBPS_SERVER_ENDPOINT"), &mut target).await {
-                Err(Error::Containment(Premise::Anchors)) => true,
+                Err(ServerFailure {
+                    cause: Error::Containment(Premise::Anchors),
+                    recovery_names,
+                }) if recovery_names.is_empty() => true,
                 Ok(mut server) => {
                     server.discard().await.unwrap();
                     false

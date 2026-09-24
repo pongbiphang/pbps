@@ -20,6 +20,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import shutil
 import subprocess
 import sys
 import time
@@ -35,6 +36,7 @@ ENGINE_UID = {"pg": 999, "mssql": 10001}
 EXECUTABLE = {"pg": "postgres", "mssql": "sqlservr"}
 QUIET = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
 TESTS = [
+    "admission_recovery::failed_admission_names_every_unconfirmed_forwarder",
     "host_files::host_file_loss_refuses_admission_and_discards_live_analysis",
     "uts::kernel_name_loss_refuses_admission_and_discards_each_live_view",
     "pseudo::foreign_pseudo_roots_refuse_admission_and_discard_live_analysis",
@@ -386,6 +388,11 @@ def fixture(args, binary, root, owned):
             # Only this test's observer view hides an owned guard's limits.
             command = ["/usr/bin/unshare", "--mount", "--propagation", "private", "--", *command]
             selected["PBPS_LIMITS_PRIVATE_PROC_FIXTURE"] = "1"
+        if test.startswith("admission_recovery::"):
+            # Socket unavailability is confined to this observer's mount view.
+            command = ["/usr/bin/unshare", "--mount", "--propagation", "private", "--", *command]
+            selected["PBPS_ADMISSION_RECOVERY_FIXTURE"] = "1"
+            selected["PBPS_ADMISSION_RECOVERY_DOCKER"] = str(Path(shutil.which("docker")).resolve())
         result = run(*command, env=selected, stdout=subprocess.PIPE,
                      stderr=subprocess.STDOUT, check=False)
         if test == intruding:

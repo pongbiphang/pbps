@@ -166,13 +166,19 @@ impl std::fmt::Display for Signal {
     }
 }
 
-/// Cleanup failures name the resources a human still has to remove. They are
-/// generated names, never the supplied credentials or any existing object.
+/// Failed operations name resources whose removal could not be confirmed.
+/// They are generated names, never supplied credentials or existing objects.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{cause}")]
 pub struct ServerFailure {
     pub cause: Error,
     pub recovery_names: Vec<String>,
+}
+
+impl From<Error> for ServerFailure {
+    fn from(cause: Error) -> Self {
+        failure(cause)
+    }
 }
 
 fn failure(cause: Error) -> ServerFailure {
@@ -381,6 +387,13 @@ struct Control {
 }
 
 impl Control {
+    /// Qualification returns its refusal immediately, but cleanup still owns
+    /// every forwarder whose failed opening could not confirm removal.
+    fn retain_failure(&mut self, failure: ServerFailure) -> Error {
+        self.unconfirmed.extend(failure.recovery_names);
+        failure.cause
+    }
+
     /// Ends a session without confirming its forwarder's removal yet.
     fn retire(&mut self, session: Session) {
         let Session {
@@ -461,7 +474,7 @@ impl Session {
         runtime: &ServerRuntime,
         login: StreamLogin,
         known: &[&TcpPair],
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, ServerFailure> {
         let (forwarder, mut connection) = Forwarder::open(
             channel.api,
             channel.image,
@@ -471,25 +484,19 @@ impl Session {
             channel.profile.lifetime.as_secs(),
         )
         .await
-        .map_err(|failure| {
-            Error::Channel(if failure.recovery_names.is_empty() {
-                failure.cause.to_string()
-            } else {
-                format!(
-                    "{}; unconfirmed removal of {}",
-                    failure.cause,
-                    failure.recovery_names.join(", ")
-                )
-            })
+        .map_err(|failure| ServerFailure {
+            cause: Error::Channel(failure.cause.to_string()),
+            recovery_names: failure.recovery_names,
         })?;
+        #[cfg(test)]
+        live_tests::admission_recovery::after_open(&forwarder);
         // The forwarder is a run-owned container from here on. Every step
         // below can fail, and dropping the forwarder would only request its
         // removal, not confirm it, leaving a container neither cleanup nor a
         // recovery name can identify (finding on #640). So it stays a local
         // through the fallible steps and is closed on failure; only complete
-        // success moves it into the returned session. The residual — naming
-        // a forwarder whose close *also* fails through the admission error —
-        // is #683.
+        // success moves it into the returned session. An unconfirmed close
+        // carries its generated name separately from the original refusal.
         let prepared = async {
             let guard = forwarder
                 .pid()
@@ -522,11 +529,7 @@ impl Session {
                 backend,
                 session_key,
             }),
-            Err(error) => {
-                drop(connection);
-                let _ = forwarder.close().await;
-                Err(error)
-            }
+            Err(error) => Err(close_failed_session(connection, forwarder, error).await),
         }
     }
 
@@ -705,13 +708,30 @@ impl Inner {
     }
 }
 
+/// A failed admission has no owner left to retain its forwarder. Close the
+/// protocol stream first, then confirm removal or return its generated name.
+async fn close_failed_session(
+    connection: StreamConn,
+    forwarder: Forwarder,
+    cause: Error,
+) -> ServerFailure {
+    drop(connection);
+    let name = forwarder.resource_name().to_owned();
+    let mut outcome = failure(cause);
+    if forwarder.close().await.is_err() {
+        outcome.recovery_names.push(name);
+    }
+    outcome
+}
+
 impl DedicatedServer {
     /// No database, DDL or declaration crosses this call: it ends with a
-    /// qualified control session on the supplied maintenance database.
+    /// qualified control session on the supplied maintenance database. A
+    /// refusal names any run-owned forwarder whose removal is unconfirmed.
     pub async fn admit(
         endpoint: ScratchEndpoint,
         target: &mut NativeTarget,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, ServerFailure> {
         // Captured before any forwarder is opened, so the analysis deadline is
         // no later than every forwarder's own root-guard deadline: a forwarder
         // is created after this instant and its guard lives `profile.lifetime`
@@ -771,38 +791,53 @@ impl DedicatedServer {
         };
         let login = endpoint.login(profile.maintenance_database);
         let mut session = Session::open(channel, &runtime, login, &[]).await?;
-        // The supplied credentials are the administrative ones, so this is
-        // where the privileged reads belong: the identity, and the inventory
-        // and counter the exclusion strategy compares against.
-        let identity = engine::identity(&mut session.connection)
-            .await
-            .map_err(|error| Error::Identity(error.to_string()))?;
-        let inventory = engine::client_sessions(&mut session.connection)
-            .await
-            .map_err(|error| Error::Exclusivity(signal(&error)))?;
-        if inventory.own != session.session_key {
-            return Err(Error::Unqualified(
-                "the engine does not report this run's own session",
-            ));
+        let prepared = async {
+            // The supplied credentials are the administrative ones, so this is
+            // where the privileged reads belong: the identity, and the inventory
+            // and counter the exclusion strategy compares against.
+            let identity = engine::identity(&mut session.connection)
+                .await
+                .map_err(|error| Error::Identity(error.to_string()))?;
+            let inventory = engine::client_sessions(&mut session.connection)
+                .await
+                .map_err(|error| Error::Exclusivity(signal(&error)))?;
+            if inventory.own != session.session_key {
+                return Err(Error::Unqualified(
+                    "the engine does not report this run's own session",
+                ));
+            }
+            // The first inventory is the baseline every later total is measured
+            // against, so a session this run did not open must be refused here
+            // rather than absorbed into it: one that disconnects before the next
+            // read would leave a clean list and an inflated baseline behind.
+            exclusivity::only_our_sessions(
+                &inventory.clients,
+                &BTreeSet::from([session.session_key.clone()]),
+            )?;
+            // A cloned cluster can report the target's identifier. It is compared
+            // in addition to the runtime separation above, never instead of it.
+            if identity.instance_key
+                == target
+                    .identity()
+                    .map_err(|_| Error::Unqualified("the target's identity is unreadable"))?
+                    .instance_key
+            {
+                return Err(Error::TargetInstance);
+            }
+            let witness = target
+                .witness()
+                .map_err(|_| Error::Unqualified("the target's witness is unreadable"))?;
+            Ok::<_, Error>((identity, inventory, witness))
         }
-        // The first inventory is the baseline every later total is measured
-        // against, so a session this run did not open must be refused here
-        // rather than absorbed into it: one that disconnects before the next
-        // read would leave a clean list and an inflated baseline behind.
-        exclusivity::only_our_sessions(
-            &inventory.clients,
-            &BTreeSet::from([session.session_key.clone()]),
-        )?;
-        // A cloned cluster can report the target's identifier. It is compared
-        // in addition to the runtime separation above, never instead of it.
-        if identity.instance_key
-            == target
-                .identity()
-                .map_err(|_| Error::Unqualified("the target's identity is unreadable"))?
-                .instance_key
-        {
-            return Err(Error::TargetInstance);
-        }
+        .await;
+        let (identity, inventory, witness) = match prepared {
+            Ok(prepared) => prepared,
+            Err(cause) => {
+                return Err(
+                    close_failed_session(session.connection, session.forwarder, cause).await,
+                );
+            }
+        };
         let mut inner = Inner {
             control: Control {
                 endpoint,
@@ -821,9 +856,7 @@ impl DedicatedServer {
             },
             analysis: Some(Analysis {
                 runtime,
-                target: target
-                    .witness()
-                    .map_err(|_| Error::Unqualified("the target's witness is unreadable"))?,
+                target: witness,
                 deadline: admitted + profile.lifetime,
                 accepted: inventory.counter.total,
                 opened: 0,
@@ -832,7 +865,14 @@ impl DedicatedServer {
             }),
             refusal: None,
         };
-        inner.check(None).await?;
+        #[cfg(test)]
+        live_tests::admission_recovery::after_admission(
+            &inner.control.session.as_ref().unwrap().forwarder,
+        );
+        if let Err(cause) = inner.check(None).await {
+            let names = close_control(&mut inner.control).await;
+            return Err(report(failure(cause), names));
+        }
         Ok(Self { inner: Some(inner) })
     }
 
@@ -942,7 +982,8 @@ impl DedicatedServer {
         .await;
         let scratch = match opened {
             Ok(scratch) => scratch,
-            Err(cause) => {
+            Err(failure) => {
+                let cause = inner.control.retain_failure(failure);
                 inner.refuse(cause.clone());
                 return Err(cleanup(&mut inner.control, &names, cause).await);
             }
@@ -1168,7 +1209,8 @@ impl ScratchRun {
                 admin_login,
                 &[control_pair, scratch_pair],
             )
-            .await?
+            .await
+            .map_err(|failure| self.inner.control.retain_failure(failure))?
         };
         // The admin session moved the engine's cumulative counter; it stays
         // moved after the session closes, so the run accounts for it.
@@ -1219,7 +1261,8 @@ impl ScratchRun {
                     },
                     &[control_pair],
                 )
-                .await?
+                .await
+                .map_err(|failure| self.inner.control.retain_failure(failure))?
             };
             if let Some(analysis) = self.inner.analysis.as_mut() {
                 analysis.opened += 1;
