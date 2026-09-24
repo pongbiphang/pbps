@@ -198,7 +198,8 @@ globalThis.PbpsCompose = Object.freeze({
           card.append(make("p", "Republish only after diagnosing the remote state: this explicitly authorizes recreating an absent output branch with the same commit at the same destination."));
           action("republish", "Authorize republishing this exact commit", {operation_id: receipt.operation_id, generation: d.delivery_generation});
         }
-        if (receipt.local === "present") {
+        // The server starts an alternative only beside a delivered result.
+        if (receipt.status === "delivered") {
           action("alternative", "Start an alternative from the original base", {operation_id: receipt.operation_id});
         }
         // Retirement (#855): only a delivered result has cleanup to run or a
@@ -307,7 +308,7 @@ globalThis.PbpsCompose = Object.freeze({
         activity.textContent = "Private resources could not be read. Existing evidence has been preserved.";
       } finally { privateButton.disabled = false; }
     });
-    saved.addEventListener("click", async () => {
+    const discover = async () => {
       if (saved.disabled) return;
       saved.disabled = true;
       try {
@@ -317,7 +318,8 @@ globalThis.PbpsCompose = Object.freeze({
       } catch (_) {
         activity.textContent = "Saved results could not be read. Existing evidence has been preserved.";
       } finally { saved.disabled = false; }
-    });
+    };
+    saved.addEventListener("click", discover);
     const intentFields = new Set(Object.values(kinds).flat());
     const updateFields = () => {
       for (const name of intentFields) {
@@ -398,5 +400,8 @@ globalThis.PbpsCompose = Object.freeze({
           remote: "unavailable", cleanup_pending: true});
       }
     });
+    // Mounted with {discover: true}, the page first shows the saved results
+    // the server gates a new preview on (#854).
+    if (defaults.discover) discover();
   },
 });

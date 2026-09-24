@@ -361,6 +361,26 @@ impl Candidates {
         Ok(())
     }
 
+    /// Whether this workflow was explicitly authorized to start another
+    /// candidate from `base` (the alternative action).
+    pub fn admits_sibling_of(&self, base: &str) -> bool {
+        self.alternative_base.as_deref() == Some(base)
+    }
+
+    /// Retires the workflow's just-sealed preview when a caller refuses to
+    /// hand it out; its handle never reached the page.
+    pub fn withdraw(&mut self, candidate_id: &str) -> Result<()> {
+        let Some(Stored::Previewed { candidate, .. }) = &self.current else {
+            return Err(Error::new("No unconfirmed preview to withdraw"));
+        };
+        if candidate.preview.candidate_id != candidate_id {
+            return Err(Error::new("The preview to withdraw was replaced"));
+        }
+        candidate.workspace.retire_preview()?;
+        self.current = None;
+        Ok(())
+    }
+
     /// The workflow's own operation was retired outside it: its receipt
     /// was forgotten, or its expired preview was retired. It has no result
     /// to continue and no alternative to start from, so the workflow, and

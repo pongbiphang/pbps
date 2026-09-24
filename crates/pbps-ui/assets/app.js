@@ -119,7 +119,7 @@
       // or a displayed result.
       if (!composeRoot) {
         composeRoot = node("section", undefined, "compose");
-        globalThis.PbpsCompose.mount(composeRoot, send, {remote: "origin"});
+        globalThis.PbpsCompose.mount(composeRoot, send, {remote: "origin", discover: true});
       }
       content.append(composeRoot);
       return;

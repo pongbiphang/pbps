@@ -209,6 +209,7 @@ async function retirement() {
   b.calls[0].resolve([{...delivered, status: "recovery_required", remote: "unknown"}]); await p;
   assert(!b.root.find(e => e.dataset.action === "cleanup"));
   assert(!b.root.find(e => e.dataset.action === "forget-ask"));
+  assert(!b.root.find(e => e.dataset.action === "alternative"), "no alternative beside an unresolved result");
   // Private resources are listed with their obligation and can be retired.
   p = b.root.find(e => e.dataset.action === "resources").fire("click");
   assert.equal(b.calls[1].action, "resources");
@@ -246,6 +247,24 @@ async function retirement() {
   assert(c.confirm.disabled, "a retired preview cannot be confirmed");
   assert(!c.root.find(e => e.dataset.action === "preview").disabled);
 }
+async function discoverOnMount() {
+  // Mounted with discover, saved results are listed before any preview.
+  const doc = {createElement: tag => new Element(tag, doc)};
+  const root = new Element("section", doc);
+  const calls = [];
+  PbpsCompose.mount(root, (action, body) => new Promise((resolve, reject) => calls.push({action, body, resolve, reject})),
+    {remote: "origin", discover: true});
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].action, "list");
+  calls[0].resolve([{status: "published", operation_id: "operation-saved", local: "present", remote: "unknown",
+    cleanup_pending: true, details: null}]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert(root.find(e => e.textContent === "Operation: operation-saved"));
+  // Without the option nothing is requested on mount.
+  const quiet = [];
+  PbpsCompose.mount(new Element("section", doc), (action) => { quiet.push(action); return new Promise(() => {}); }, {});
+  assert.equal(quiet.length, 0);
+}
 async function definiteRefusals() {
   for (const problem of ["remote_unavailable", "signing_unavailable"]) {
     const a = setup();
@@ -278,4 +297,4 @@ async function definiteRefusals() {
     assert(a.root.find(e => e.dataset.action === "recover"));
   }
 }
-exercise().then(outcomes).then(definiteRefusals).then(staleRefusal).then(mergeRequests).then(retirement).then(() => process.stdout.write("compose browser behavior passed\n"), error => { console.error(error); process.exitCode = 1; });
+exercise().then(outcomes).then(definiteRefusals).then(staleRefusal).then(mergeRequests).then(retirement).then(discoverOnMount).then(() => process.stdout.write("compose browser behavior passed\n"), error => { console.error(error); process.exitCode = 1; });
