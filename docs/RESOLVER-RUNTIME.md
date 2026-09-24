@@ -194,10 +194,10 @@ Admission connects through a **Docker-API daemon** (`dockerd`), the same peer-au
 | Network | The container's network namespace holds only a loopback device — a real one, by link type and flag — with no IPv4 or IPv6 route and no address but `::1` |
 | Anchors | PID 1 seen through the container's `/proc` is in its own PID namespace, and its `/sys` shows only that loopback device: a host procfs or sysfs bound in keeps the type and not these |
 | Mounts | Every row of the init's mount table, uncollapsed, is one the profile names: the read-only image root; `/proc`, `/sys`, `/dev`, `/dev/pts`, `/dev/mqueue` and `/sys/fs/cgroup` with their kinds and flags; the read-only `/proc` files on the same procfs; the masks Docker lays as empty tmpfs and Podman as binds of `/dev/null`; the tmpfs `/tmp`, `/dev/shm`, `/run` and `/var/tmp`; the runtime's `/etc` files bound read-only from an ordinary filesystem with the complete private contents described above; and the engine's storage as a fresh tmpfs. Two rows at one target are two mounts stacked, which no runtime lays out. Both runtimes' layouts were measured and are pinned by unit tests |
-| Privileges | Every task in the container's PID namespace — not only the ones the service started — at the profile's uid **and** group, with no-new-privileges, a seccomp filter and the capability ceiling, still in the container's network, mount, IPC and UTS namespaces, judged as found rather than against an earlier listing. That a seccomp filter is *loaded* is measured (`Seccomp: 2`); its BPF contents cannot be read from `/proc`, so attesting the exact policy — to exclude a non-IP channel such as `AF_VSOCK` that the loopback network checks do not contain — is the operator's provisioning responsibility, tracked in #684 |
+| Privileges | Every task in the container's PID namespace — not only the ones the service started — at the profile's uid **and** group, with no-new-privileges, a seccomp filter and the capability ceiling, still in the container's network, mount, IPC and UTS namespaces, judged as found rather than against an earlier listing. That a seccomp filter is *loaded* is measured (`Seccomp: 2`); its BPF contents cannot be read from `/proc`, so attesting the exact policy — to exclude a non-IP channel such as `AF_VSOCK` that the loopback network checks do not contain — is the operator's provisioning responsibility, a documented limit (#684) |
 | Resources | cgroup-v2 memory, swap, CPU and PID bounds on the init's cgroup that exist and are within the profile's ceilings; `max` is not a bound. Every task must be in that cgroup or below it |
-| Accounting | Nothing shares the container's mount or IPC namespace that is not in its PID namespace, and nothing shares its network namespace but those tasks and this run's own forwarders. A container joined with `--network container:` is in no process listing and is caught here. The forwarder exception is by PID namespace, not by an exact task set: a forwarder's `bash` reaps and respawns its `cat` pipes, so a captured task list races a legitimate child, and joining that namespace needs `--pid container:` on the same root daemon, whose socket also lists the container id — so what excludes it is not the name but that root daemon access is provisioning-administrator access, the boundary this profile does not claim to hold against. Narrowing the exception to the forwarder's exact tasks is #681 |
-| Lifetime | A bounded run deadline, which the forwarders' own root guards share: past it the next check refuses and the caller's exit path removes the resources. Not a watchdog — see #641 |
+| Accounting | Nothing shares the container's mount or IPC namespace that is not in its PID namespace, and nothing shares its network namespace but those tasks and this run's own forwarders. A container joined with `--network container:` is in no process listing and is caught here. The forwarder exception is by PID namespace, not by an exact task set: a forwarder's `bash` reaps and respawns its `cat` pipes, so a captured task list races a legitimate child, and joining that namespace needs `--pid container:` on the same root daemon, whose socket also lists the container id — so what excludes it is not the name but that root daemon access is provisioning-administrator access, the boundary this profile does not claim to hold against. Narrowing the exception to the forwarder's exact tasks is not pursued, for that reason (#681) |
+| Lifetime | A bounded run deadline, which the forwarders' own root guards share: past it the next check refuses and the caller's exit path removes the resources. Not a watchdog: a caller that never returns leaves the resources for a human, a documented limit (#641) |
 
 The Docker PostgreSQL recipe starts directly as `999:999` with `--cap-drop ALL`.
 The runtime creates its private storage with that ownership, so neither
@@ -424,9 +424,9 @@ held capabilities or constrain a provisioning administrator's runtime-exec
 entry point. Namespace task observations therefore remain, alongside mount,
 network, cgroup, endpoint and exclusivity checks. The factory and owned
 forwarders also require the fixed effective-policy
-probes below (#633). The supplied engine policy contract (#684), source
-handling (#617) and other delivery gates are
-not discharged by these launch measurements.
+probes below (#633). Source handling (#617) and other delivery gates are
+not discharged by these launch measurements, and the contents of a supplied
+engine's policy stay the operator's provisioning responsibility (#684).
 
 Scratch also retains a weak witness to the target's live binding and its actual
 socket. Dropping or cancelling the target invalidates scratch's next identity
@@ -475,7 +475,8 @@ or continuous task census.
 This is a fixed behavioral qualification under DECISIONS 533's trusted
 provisioning premise, not equivalence checking of arbitrary BPF or resistance
 to an administrator deliberately providing probe-specific rules. It does not
-certify the filter of an already running supplied engine: that remains #684.
+certify the filter of an already running supplied engine; that stays the
+operator's provisioning responsibility (#684).
 The alternative kernel-read route was measured: `PTRACE_SECCOMP_GET_FILTER`
 requires a privileged unfiltered tracer and a stopped tracee, and equivalent
 Docker policies can differ in architecture-dispatch instruction ordering.

@@ -41,7 +41,7 @@ pub(crate) struct ServerProfile {
     /// The bound the whole run may occupy on the supplied server. Past it
     /// the next check refuses and the caller's exit path removes the
     /// resources. It is not a watchdog: a caller that never returns at all
-    /// leaves them until a human removes them (#641).
+    /// leaves them until a human removes them, a documented limit (#641).
     pub lifetime: Duration,
     /// The administrative database the supplied credentials connect to.
     pub maintenance_database: &'static str,
