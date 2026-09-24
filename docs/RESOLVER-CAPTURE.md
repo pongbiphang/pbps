@@ -19,14 +19,20 @@ The adapter refuses a caller-owned transaction before opening an owned
 `REPEATABLE READ READ ONLY` transaction. It pins canonical rendering settings
 locally, reads the actual recorded state and identity map, public authorization
 catalogs, complete catalog descriptors and prerequisite rows on that snapshot,
-and derives the requested closure before rendering definitions. No old YAML is
+and derives the requested closure before rendering definitions. Catalog rows
+are fetched in bounded cursor batches on that same snapshot, with explicit
+empty-catalog markers. Lookup rows remain in memory through closure resolution
+and rendering, so total memory still scales with the catalogs read. Neither
+unrelated catalog volume nor a supported recorded snapshot inherits an aggregate
+JSON size ceiling. No old YAML is
 bootstrapped as a stand-in for target bindings. Absent and empty ledgers are
 separate inputs; unreadable, malformed or unsupported state is a refusal.
 
 The snapshot does not freeze PostgreSQL's catalog-rendering functions. A
 private, same-capture tuple witness covers the catalogs that can supply their
 names/properties. After rendering, the adapter commits and observes those
-witnesses with a **fresh** statement snapshot. A rename or change-and-restore
+witnesses with a **fresh** read-only snapshot. The witness cursor holds that
+new snapshot across all its fetches. A rename or change-and-restore
 invalidates the read. Witnesses are deliberately conservative: unrelated
 catalog writes can require another capture. These physical tuple coordinates
 never enter logical fingerprints, cross-database binding comparison or any

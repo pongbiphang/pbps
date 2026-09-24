@@ -97,14 +97,17 @@ pub(super) fn batch(major: u32, selection: Option<&Selection>) -> Result<String>
             "pg_catalog.jsonb_build_array(c.ctid::text, c.xmin::text)".to_owned()
         };
         let filter = filter(class);
-        parts.push(format!("SELECT '{class}' AS part, COALESCE(pg_catalog.jsonb_agg({row}), '[]'::jsonb)::text AS body, COALESCE(pg_catalog.jsonb_agg({witness} ORDER BY {witness}::text), '[]'::jsonb)::text AS witness FROM pg_catalog.{class} c {filter}"));
+        // A marker represents an empty but successfully read catalog. Each
+        // following row is fetched through the same snapshot cursor; a large
+        // unrelated catalog must not become one oversized JSON value.
+        parts.push(format!("SELECT '{class}' AS part, NULL::text AS body, NULL::text AS witness UNION ALL SELECT '{class}', {row}::text, {witness}::text FROM pg_catalog.{class} c {filter}"));
     }
     Ok(parts.join("\nUNION ALL\n"))
 }
 
 pub(super) fn witness() -> String {
     properties::CLASSES.iter().filter(|&&class| class != "pg_roles").map(|class| {
-        format!("SELECT '{class}' AS part, COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_array(c.ctid::text, c.xmin::text) ORDER BY pg_catalog.jsonb_build_array(c.ctid::text, c.xmin::text)::text), '[]'::jsonb)::text AS witness FROM pg_catalog.{class} c {}", filter(class))
+        format!("SELECT '{class}' AS part, NULL::text AS witness UNION ALL SELECT '{class}', pg_catalog.jsonb_build_array(c.ctid::text, c.xmin::text)::text FROM pg_catalog.{class} c {}", filter(class))
     }).collect::<Vec<_>>().join("\nUNION ALL\n")
 }
 

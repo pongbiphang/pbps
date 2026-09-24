@@ -5,7 +5,9 @@
 use super::logical::{Catalog, Row};
 use super::{properties, queries, render::Selection};
 use pbps_db::transport::QueryConnection;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+mod cursor;
 
 // Neither source-bearing rows nor physical witnesses implement Debug or
 // Serialize. The witness is discarded when this capture has closed.
@@ -80,26 +82,10 @@ pub(super) async fn owned(
             return Err(error);
         }
     };
-    // A fresh statement snapshot, after the owned transaction has ended.
-    // Re-reading xmin in that old REPEATABLE READ snapshot proves nothing.
-    let fresh = conn
-        .query(&queries::witness())
-        .await
-        .map_err(|_| Failure::Read)?;
-    let mut current = BTreeMap::new();
-    for row in fresh {
-        let class = row
-            .try_get::<&str>("part")
-            .map_err(|_| Failure::Incomplete)?
-            .ok_or(Failure::Incomplete)?;
-        let value = row
-            .try_get::<&str>("witness")
-            .map_err(|_| Failure::Incomplete)?
-            .ok_or(Failure::Incomplete)?;
-        if current.insert(class.to_owned(), value.to_owned()).is_some() {
-            return Err(Failure::Incomplete);
-        }
-    }
+    // The witness cursor gets its own fresh snapshot after rendering has
+    // closed. Its pages must never reuse the earlier snapshot or observe a
+    // different snapshot per fetch.
+    let current = fresh_witnesses(conn).await?;
     if !environment.unchanged(&super::session::observe(conn).await?) {
         return Err(Failure::EnvironmentChanged);
     }
@@ -109,7 +95,7 @@ pub(super) async fn owned(
     Ok(read)
 }
 
-type Witnesses = BTreeMap<String, String>;
+type Witnesses = BTreeMap<String, BTreeSet<String>>;
 
 async fn within(
     conn: &mut impl QueryConnection,
@@ -170,41 +156,96 @@ async fn batch(
     selection: Option<&Selection>,
 ) -> Result<(Catalog, Witnesses), Failure> {
     let sql = queries::batch(major, selection).map_err(|_| Failure::Incomplete)?;
-    let rows = conn.query(&sql).await.map_err(|_| Failure::Read)?;
-    let mut catalogs = BTreeMap::new();
-    let mut witnesses = BTreeMap::new();
-    for row in rows {
-        let class = row
-            .try_get::<&str>("part")
-            .map_err(|_| Failure::Incomplete)?
-            .ok_or(Failure::Incomplete)?;
-        if !properties::CLASSES.contains(&class) {
-            return Err(Failure::Incomplete);
+    let mut catalogs: BTreeMap<String, Vec<Row>> = properties::CLASSES
+        .iter()
+        .map(|class| ((*class).into(), Vec::new()))
+        .collect();
+    let mut witnesses = empty_witnesses();
+    let mut markers = BTreeSet::new();
+    cursor::read(conn, &sql, |row| {
+        let class = text(&row, "part")?.ok_or(Failure::Incomplete)?;
+        let members = catalogs.get_mut(class).ok_or(Failure::Incomplete)?;
+        let body = text(&row, "body")?;
+        let witness = text(&row, "witness")?;
+        let Some(body) = body else {
+            if witness.is_some() || !markers.insert(class.to_owned()) {
+                return Err(Failure::Incomplete);
+            }
+            return Ok(());
+        };
+        members.push(serde_json::from_str(body).map_err(|_| Failure::Incomplete)?);
+        if class == "pg_roles" {
+            if witness.is_some() {
+                return Err(Failure::Incomplete);
+            }
+        } else {
+            add_witness(&mut witnesses, class, witness)?;
         }
-        let body = row
-            .try_get::<&str>("body")
-            .map_err(|_| Failure::Incomplete)?
-            .ok_or(Failure::Incomplete)?;
-        let witness = row
-            .try_get::<&str>("witness")
-            .map_err(|_| Failure::Incomplete)?
-            .ok_or(Failure::Incomplete)?;
-        if body.len() > 32 * 1024 * 1024 || witness.len() > 32 * 1024 * 1024 {
-            return Err(Failure::Incomplete);
-        }
-        let members: Vec<Row> = serde_json::from_str(body).map_err(|_| Failure::Incomplete)?;
-        if catalogs.insert(class.to_owned(), members).is_some() {
-            return Err(Failure::Incomplete);
-        }
-        if class != "pg_roles" {
-            witnesses.insert(class.to_owned(), witness.to_owned());
-        }
-    }
-    if catalogs.len() != properties::CLASSES.len() {
+        Ok(())
+    })
+    .await?;
+    if markers.len() != properties::CLASSES.len() {
         return Err(Failure::Incomplete);
     }
     let catalog = Catalog::new(catalogs).map_err(|_| Failure::Incomplete)?;
     Ok((catalog, witnesses))
+}
+
+fn text<'a>(row: &'a pbps_db::Row, name: &str) -> Result<Option<&'a str>, Failure> {
+    row.try_get::<&str>(name).map_err(|_| Failure::Incomplete)
+}
+
+fn empty_witnesses() -> Witnesses {
+    properties::CLASSES
+        .iter()
+        .filter(|&&class| class != "pg_roles")
+        .map(|class| ((*class).into(), BTreeSet::new()))
+        .collect()
+}
+
+fn add_witness(witnesses: &mut Witnesses, class: &str, value: Option<&str>) -> Result<(), Failure> {
+    let values = witnesses.get_mut(class).ok_or(Failure::Incomplete)?;
+    if !values.insert(value.ok_or(Failure::Incomplete)?.to_owned()) {
+        return Err(Failure::Incomplete);
+    }
+    Ok(())
+}
+
+async fn fresh_witnesses(conn: &mut impl QueryConnection) -> Result<Witnesses, Failure> {
+    conn.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .await
+        .map_err(|_| Failure::Read)?;
+    let result = async {
+        conn.query(crate::catalog::CANONICAL_PATH)
+            .await
+            .map_err(|_| Failure::Read)?;
+        let mut witnesses = empty_witnesses();
+        let mut markers = BTreeSet::new();
+        cursor::read(conn, &queries::witness(), |row| {
+            let class = text(&row, "part")?.ok_or(Failure::Incomplete)?;
+            if !witnesses.contains_key(class) {
+                return Err(Failure::Incomplete);
+            }
+            match text(&row, "witness")? {
+                Some(value) => add_witness(&mut witnesses, class, Some(value))?,
+                None if markers.insert(class.to_owned()) => (),
+                None => return Err(Failure::Incomplete),
+            }
+            Ok(())
+        })
+        .await?;
+        if markers.len() != witnesses.len() {
+            return Err(Failure::Incomplete);
+        }
+        Ok(witnesses)
+    }
+    .await;
+    let end = if result.is_ok() { "COMMIT" } else { "ROLLBACK" };
+    if conn.query(end).await.is_err() {
+        let _ = conn.query("ROLLBACK").await;
+        return Err(Failure::Close);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -487,3 +528,6 @@ mod tests {
         restored(&mut conn).await;
     }
 }
+
+#[cfg(test)]
+mod large_tests;
