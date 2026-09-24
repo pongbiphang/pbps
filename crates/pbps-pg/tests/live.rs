@@ -7243,6 +7243,221 @@ async fn a_ledger_pbps_did_not_create_is_refused_before_any_write() {
     db.drop().await;
 }
 
+/// #878 (DEC-868.1): a confidential record's ordinary row carries no
+/// verifier — NULL checksum and reason — and its protected half holds the
+/// whole snapshot under the same id; the protected table is ledger, not
+/// managed schema; and pruning takes both halves together.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_confidential_record_keeps_its_verifiers_out_of_the_ordinary_row() {
+    let mut db = TestDb::create("confidential_record").await;
+    let ordinary_first = state::record(&mut db.conn, &snapshot(StateKind::Baseline))
+        .await
+        .expect("an ordinary record");
+
+    let mut full = snapshot(StateKind::Apply);
+    full.plan_checksum = Some("c".repeat(64));
+    full.reason = Some(format!("resume mismatch: {}", "c".repeat(64)));
+    let stub = snapshot(StateKind::Apply);
+
+    // The ordinary row may not carry a verifier: refused, nothing written.
+    let mut leaky = stub.clone();
+    leaky.plan_checksum = Some("c".repeat(64));
+    assert!(matches!(
+        state::record_confidential(&mut db.conn, &leaky, &full).await,
+        Err(LedgerError::BadEntry { .. })
+    ));
+
+    let id = state::record_confidential(&mut db.conn, &stub, &full)
+        .await
+        .expect("a confidential record");
+    let row = &db
+        .conn
+        .query(&format!(
+            "SELECT plan_checksum, reason, state_json FROM public.__pbps_state WHERE id = {id}"
+        ))
+        .await
+        .unwrap()[0];
+    assert_eq!(row.try_get::<&str>("plan_checksum").unwrap(), None);
+    assert_eq!(row.try_get::<&str>("reason").unwrap(), None);
+    let ordinary_json = row
+        .try_get::<&str>("state_json")
+        .unwrap()
+        .unwrap()
+        .to_owned();
+    assert!(!ordinary_json.contains(&"c".repeat(64)), "{ordinary_json}");
+
+    match state::protected_half(&mut db.conn, id).await.unwrap() {
+        state::ProtectedHalf::Found {
+            plan_checksum,
+            reason,
+            state_json,
+        } => {
+            assert_eq!(plan_checksum, full.plan_checksum);
+            assert_eq!(reason, full.reason);
+            assert!(state_json.contains(&"c".repeat(64)), "{state_json}");
+        }
+        other @ (state::ProtectedHalf::Missing | state::ProtectedHalf::Denied) => {
+            panic!("the protected half: {other:?}")
+        }
+    }
+    assert_eq!(
+        state::protected_half(&mut db.conn, ordinary_first)
+            .await
+            .unwrap(),
+        state::ProtectedHalf::Missing,
+        "an ordinary record has no protected half"
+    );
+
+    // Ledger, not managed schema: the pull does not see it, and a declaration
+    // of it is refused like the other two.
+    let pulled = pbps_pg::catalog::introspect(&mut db.conn).await.unwrap();
+    let name: pbps_model::TableName = "public.__pbps_state_confidential".parse().unwrap();
+    assert!(!pulled.schema.tables.contains_key(&name));
+    let mut table = pbps_model::Table::default();
+    table.columns.insert(
+        "id".into(),
+        pbps_model::Column::new("integer".parse().unwrap()),
+    );
+    assert!(!Postgres::new().validate_table(&name, &table).is_empty());
+
+    // Pruning to the newest record takes the older confidential one's halves
+    // together; the ordinary first record goes too.
+    let newest = state::record(&mut db.conn, &snapshot(StateKind::Apply))
+        .await
+        .unwrap();
+    assert_eq!(state::prune(&mut db.conn, 1).await.unwrap(), 2);
+    let left: i64 = db
+        .conn
+        .query("SELECT count(*)::int8 AS n FROM public.__pbps_state_confidential")
+        .await
+        .unwrap()[0]
+        .try_get::<i64>("n")
+        .unwrap()
+        .unwrap();
+    assert_eq!(left, 0, "the pruned record's protected half stayed");
+    assert_eq!(
+        state::protected_half(&mut db.conn, id).await.unwrap(),
+        state::ProtectedHalf::Missing
+    );
+    assert!(newest > id);
+    db.drop().await;
+}
+
+/// #878: the two halves are one statement. A deployment account that may
+/// write the ordinary ledger but not the protected table writes neither — no
+/// ordinary row without its protected half — and one that may not read the
+/// protected table gets `Denied`, never a checksum and never `Missing`.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_halves_of_a_confidential_record_are_written_together_or_not_at_all() {
+    let mut db = TestDb::create("confidential_atomic").await;
+    let role = least_privilege_role(&mut db, "conf").await;
+    let mut full = snapshot(StateKind::Apply);
+    full.plan_checksum = Some("d".repeat(64));
+    let stub = snapshot(StateKind::Apply);
+    let id = state::record_confidential(&mut db.conn, &stub, &full)
+        .await
+        .expect("the superuser creates both tables");
+    db.conn
+        .execute(&format!(
+            "GRANT SELECT, INSERT, DELETE ON public.__pbps_state, public.__pbps_lock TO {role};
+             GRANT SELECT ON public.__pbps_state_confidential TO {role};"
+        ))
+        .await
+        .unwrap();
+    let before = ordinary_rows(&mut db.conn).await;
+    let mut deploying = Conn::connect(Driver::Postgres, &conn_str_as(&role, "live-test", &db.name))
+        .await
+        .unwrap();
+    assert!(
+        state::record_confidential(&mut deploying, &stub, &full)
+            .await
+            .is_err(),
+        "no INSERT on the protected table"
+    );
+    drop(deploying);
+    assert_eq!(
+        ordinary_rows(&mut db.conn).await,
+        before,
+        "an ordinary row was left alone"
+    );
+
+    db.conn
+        .execute(&format!(
+            "REVOKE SELECT ON public.__pbps_state_confidential FROM {role}"
+        ))
+        .await
+        .unwrap();
+    let mut reading = Conn::connect(Driver::Postgres, &conn_str_as(&role, "live-test", &db.name))
+        .await
+        .unwrap();
+    assert_eq!(
+        state::protected_half(&mut reading, id).await.unwrap(),
+        state::ProtectedHalf::Denied
+    );
+    drop(reading);
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+}
+
+async fn ordinary_rows(conn: &mut Conn) -> i64 {
+    conn.query("SELECT count(*)::int8 AS n FROM public.__pbps_state")
+        .await
+        .unwrap()[0]
+        .try_get::<i64>("n")
+        .unwrap()
+        .unwrap()
+}
+
+/// #878: the protected table is held to its recipe and editors like the other
+/// two ledger tables. A trigger on it — which would read the snapshot and
+/// checksum as they are written or pruned — refuses the write and the prune
+/// before either runs; the marker it would insert stays absent.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_trigger_on_the_protected_table_refuses_its_write_and_its_prune() {
+    let mut db = TestDb::create("confidential_trigger").await;
+    let mut full = snapshot(StateKind::Apply);
+    full.plan_checksum = Some("e".repeat(64));
+    let stub = snapshot(StateKind::Apply);
+    state::record_confidential(&mut db.conn, &stub, &full)
+        .await
+        .expect("the first confidential record");
+    // A newer record, so a prune keeping one has the confidential one to take.
+    state::record(&mut db.conn, &snapshot(StateKind::Apply))
+        .await
+        .unwrap();
+    db.conn
+        .execute(
+            "CREATE TABLE public.pbps_marker (n integer);
+             CREATE FUNCTION public.pbps_mark() RETURNS trigger LANGUAGE plpgsql AS
+               $$ BEGIN INSERT INTO public.pbps_marker VALUES (1); RETURN NULL; END $$;
+             CREATE TRIGGER t AFTER INSERT OR DELETE ON public.__pbps_state_confidential
+               FOR EACH ROW EXECUTE FUNCTION public.pbps_mark();",
+        )
+        .await
+        .unwrap();
+    let written = state::record_confidential(&mut db.conn, &stub, &full).await;
+    let pruned = state::prune(&mut db.conn, 1).await;
+    let marks: i64 = db
+        .conn
+        .query("SELECT count(*)::int8 AS n FROM public.pbps_marker")
+        .await
+        .unwrap()[0]
+        .try_get::<i64>("n")
+        .unwrap()
+        .unwrap();
+    assert_eq!(marks, 0, "the trigger ran");
+    for result in [written.map(|_| 0), pruned.map(|n| n as i64)] {
+        let error = result
+            .expect_err("a trigger on the protected table")
+            .to_string();
+        assert!(error.contains("trigger t"), "{error}");
+    }
+    db.drop().await;
+}
+
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn doctor_requires_ownership_only_until_the_existing_ledger_is_migrated() {

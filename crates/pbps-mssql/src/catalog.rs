@@ -37,7 +37,7 @@ SELECT t.object_id, s.name AS schema_name, t.name AS table_name, t.temporal_type
   JOIN sys.schemas s ON s.schema_id = t.schema_id
   LEFT JOIN sys.periods p ON p.object_id = t.object_id
  WHERE t.is_ms_shipped = 0
-   AND NOT (s.name = 'dbo' AND t.name IN ('__pbps_state', '__pbps_lock'))
+   AND NOT (s.name = 'dbo' AND t.name IN ('__pbps_state', '__pbps_lock', '__pbps_state_confidential'))
  ORDER BY s.name, t.name;";
 
 // SQL Server added both `sys.tables.temporal_type` and `sys.periods` in 2016.
@@ -49,7 +49,7 @@ SELECT t.object_id, s.name AS schema_name, t.name AS table_name,
   FROM sys.tables t
   JOIN sys.schemas s ON s.schema_id = t.schema_id
  WHERE t.is_ms_shipped = 0
-   AND NOT (s.name = 'dbo' AND t.name IN ('__pbps_state', '__pbps_lock'))
+   AND NOT (s.name = 'dbo' AND t.name IN ('__pbps_state', '__pbps_lock', '__pbps_state_confidential'))
  ORDER BY s.name, t.name;";
 
 fn tables_query(product_version: &str, edition: &str) -> String {
@@ -999,7 +999,11 @@ mod tests {
     /// the filter behind.
     #[test]
     fn the_table_filter_names_the_ledgers_own_qualified_tables_and_matches_no_pattern() {
-        for qualified in [crate::state::STATE_TABLE, crate::state::LOCK_TABLE] {
+        for qualified in [
+            crate::state::STATE_TABLE,
+            crate::state::LOCK_TABLE,
+            crate::state::CONFIDENTIAL_TABLE,
+        ] {
             let (schema, name) = qualified.split_once('.').expect("a qualified name");
             assert!(
                 TABLES.contains(&format!("s.name = '{schema}'")),

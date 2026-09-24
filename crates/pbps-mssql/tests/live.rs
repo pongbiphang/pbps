@@ -2100,6 +2100,216 @@ fn snapshot(kind: pbps_model::StateKind, schema: &Schema, ids: &IdsFile) -> Stat
     StateSnapshot::new(kind, schema.clone(), ids.clone(), "live-test")
 }
 
+/// #878 (DEC-868.1) on SQL Server: a confidential record's ordinary row has no
+/// checksum or reason, its protected half holds the whole snapshot under the
+/// same id; the protected table is not managed schema; prune takes both
+/// halves; and an unreadable protected half is `Denied`, never `Missing`.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_confidential_record_keeps_its_verifiers_out_of_the_ordinary_row() {
+    let mut db = TestDb::create("confidential").await;
+    let schema = Schema::default();
+    let ids = IdsFile::default();
+    let first = pbps_mssql::state::record(
+        &mut db.conn,
+        &snapshot(pbps_model::StateKind::Baseline, &schema, &ids),
+    )
+    .await
+    .unwrap();
+    let mut full = snapshot(pbps_model::StateKind::Apply, &schema, &ids);
+    full.plan_checksum = Some("c".repeat(64));
+    full.reason = Some(format!("resume mismatch: {}", "c".repeat(64)));
+    let stub = snapshot(pbps_model::StateKind::Apply, &schema, &ids);
+
+    let mut leaky = stub.clone();
+    leaky.reason = Some("anything".into());
+    assert!(matches!(
+        pbps_mssql::state::record_confidential(&mut db.conn, &leaky, &full).await,
+        Err(pbps_db::LedgerError::BadEntry { .. })
+    ));
+
+    let id = pbps_mssql::state::record_confidential(&mut db.conn, &stub, &full)
+        .await
+        .expect("a confidential record");
+    let row = &db
+        .conn
+        .query(&format!(
+            "SELECT plan_checksum, reason, state_json FROM dbo.__pbps_state WHERE id = {id};"
+        ))
+        .await
+        .unwrap()[0];
+    assert_eq!(row.try_get::<&str>("plan_checksum").unwrap(), None);
+    assert_eq!(row.try_get::<&str>("reason").unwrap(), None);
+    let ordinary_json = row
+        .try_get::<&str>("state_json")
+        .unwrap()
+        .unwrap()
+        .to_owned();
+    assert!(!ordinary_json.contains(&"c".repeat(64)), "{ordinary_json}");
+    match pbps_mssql::state::protected_half(&mut db.conn, id)
+        .await
+        .unwrap()
+    {
+        pbps_mssql::state::ProtectedHalf::Found {
+            plan_checksum,
+            reason,
+            state_json,
+        } => {
+            assert_eq!(plan_checksum, full.plan_checksum);
+            assert_eq!(reason, full.reason);
+            assert!(state_json.contains(&"c".repeat(64)));
+        }
+        other @ (pbps_mssql::state::ProtectedHalf::Missing
+        | pbps_mssql::state::ProtectedHalf::Denied) => {
+            panic!("the protected half: {other:?}")
+        }
+    }
+    assert_eq!(
+        pbps_mssql::state::protected_half(&mut db.conn, first)
+            .await
+            .unwrap(),
+        pbps_mssql::state::ProtectedHalf::Missing
+    );
+
+    // Not managed schema.
+    let pulled = pbps_mssql::catalog::introspect(&mut db.conn).await.unwrap();
+    assert!(
+        !pulled
+            .schema
+            .tables
+            .contains_key(&"dbo.__pbps_state_confidential".parse().unwrap())
+    );
+
+    // A principal refused SELECT on the protected table reads `Denied`.
+    let login = format!("pbps_conf_{}", std::process::id());
+    let reader = least_privilege_login(&mut db, &login, "Pbps!Conf12345").await;
+    db.conn
+        .execute(&format!(
+            "DENY SELECT ON dbo.__pbps_state_confidential TO [{login}];"
+        ))
+        .await
+        .unwrap();
+    let mut reading = connect_live(&reader).await.expect("connect as the login");
+    assert_eq!(
+        pbps_mssql::state::protected_half(&mut reading, id)
+            .await
+            .unwrap(),
+        pbps_mssql::state::ProtectedHalf::Denied
+    );
+    // And one refused INSERT on it writes neither half.
+    db.conn
+        .execute(&format!(
+            "REVOKE SELECT ON dbo.__pbps_state_confidential TO [{login}]; \
+             DENY INSERT ON dbo.__pbps_state_confidential TO [{login}];"
+        ))
+        .await
+        .unwrap();
+    let before = ordinary_rows(&mut db.conn).await;
+    assert!(
+        pbps_mssql::state::record_confidential(&mut reading, &stub, &full)
+            .await
+            .is_err()
+    );
+    drop(reading);
+    assert_eq!(ordinary_rows(&mut db.conn).await, before, "half a record");
+
+    // Prune to the newest takes the confidential record's protected half.
+    pbps_mssql::state::record(
+        &mut db.conn,
+        &snapshot(pbps_model::StateKind::Apply, &schema, &ids),
+    )
+    .await
+    .unwrap();
+    assert_eq!(pbps_mssql::state::prune(&mut db.conn, 1).await.unwrap(), 2);
+    let left = db
+        .conn
+        .query("SELECT COUNT(*) AS n FROM dbo.__pbps_state_confidential;")
+        .await
+        .unwrap()[0]
+        .try_get::<i32>("n")
+        .unwrap()
+        .unwrap();
+    assert_eq!(left, 0, "the pruned record's protected half stayed");
+    let _ = db
+        .conn
+        .execute(&format!("USE master; DROP LOGIN [{login}];"))
+        .await;
+    db.drop().await;
+}
+
+async fn ordinary_rows(conn: &mut Conn) -> i32 {
+    conn.query("SELECT COUNT(*) AS n FROM dbo.__pbps_state;")
+        .await
+        .unwrap()[0]
+        .try_get::<i32>("n")
+        .unwrap()
+        .unwrap()
+}
+
+/// #878 on SQL Server: a trigger on the protected table refuses both the
+/// confidential write — the engine itself refuses `OUTPUT ... INTO` a table
+/// with an enabled trigger — and the prune, before either runs; the marker it
+/// would write stays absent. A changed shape is refused by name.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_trigger_or_a_changed_shape_on_the_protected_table_refuses_it() {
+    let mut db = TestDb::create("confidential_gate").await;
+    let schema = Schema::default();
+    let ids = IdsFile::default();
+    let mut full = snapshot(pbps_model::StateKind::Apply, &schema, &ids);
+    full.plan_checksum = Some("e".repeat(64));
+    let stub = snapshot(pbps_model::StateKind::Apply, &schema, &ids);
+    pbps_mssql::state::record_confidential(&mut db.conn, &stub, &full)
+        .await
+        .unwrap();
+    pbps_mssql::state::record(
+        &mut db.conn,
+        &snapshot(pbps_model::StateKind::Apply, &schema, &ids),
+    )
+    .await
+    .unwrap();
+    db.conn
+        .execute("CREATE TABLE dbo.pbps_marker (n INT);")
+        .await
+        .unwrap();
+    db.conn
+        .execute(
+            "EXEC(N'CREATE TRIGGER t ON dbo.__pbps_state_confidential AFTER INSERT, DELETE AS \
+             INSERT INTO dbo.pbps_marker VALUES (1);');",
+        )
+        .await
+        .unwrap();
+    let written = pbps_mssql::state::record_confidential(&mut db.conn, &stub, &full).await;
+    let pruned = pbps_mssql::state::prune(&mut db.conn, 1).await;
+    let marks = db
+        .conn
+        .query("SELECT COUNT(*) AS n FROM dbo.pbps_marker;")
+        .await
+        .unwrap()[0]
+        .try_get::<i32>("n")
+        .unwrap()
+        .unwrap();
+    assert_eq!(marks, 0, "the trigger ran");
+    for result in [written.map(|_| 0), pruned.map(|n| n as i64)] {
+        let error = result
+            .expect_err("a trigger on the protected table")
+            .to_string();
+        assert!(error.contains("trigger t"), "{error}");
+    }
+
+    db.conn.execute("DROP TRIGGER dbo.t;").await.unwrap();
+    db.conn
+        .execute("ALTER TABLE dbo.__pbps_state_confidential ADD extra INT NULL;")
+        .await
+        .unwrap();
+    let error = pbps_mssql::state::record_confidential(&mut db.conn, &stub, &full)
+        .await
+        .expect_err("a changed shape")
+        .to_string();
+    assert!(error.contains("column extra"), "{error}");
+    db.drop().await;
+}
+
 /// SPEC §8.1: the whole state goes in and comes back out unchanged. Everything
 /// downstream — drift, the plan checksum, `status` — reads this row, so a
 /// serialization that lost a field would make every one of them quietly wrong.

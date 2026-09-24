@@ -35,8 +35,8 @@
 //! visible to both the catalog and validation.
 
 use pbps_db::ledger::{
-    LOCK_TABLE_NAME, LedgerEntry, LedgerError, LockInfo, STATE_TABLE_NAME, TimelineEntry,
-    TimelineStaged, TimelineState, ids_to_prune,
+    CONFIDENTIAL_TABLE_NAME, LOCK_TABLE_NAME, LedgerEntry, LedgerError, LockInfo, STATE_TABLE_NAME,
+    TimelineEntry, TimelineStaged, TimelineState, ids_to_prune,
 };
 use pbps_db::{Conn, DbError, Param, Row};
 use pbps_model::{StateSnapshot, Unreadable};
@@ -52,6 +52,21 @@ pub const LEDGER_SCHEMA: &str = "public";
 /// permission questions — asks here rather than repeating the spelling.
 pub const STATE_TABLE: &str = "public.__pbps_state";
 pub const LOCK_TABLE: &str = "public.__pbps_lock";
+pub const CONFIDENTIAL_TABLE: &str = "public.__pbps_state_confidential";
+
+/// The protected half of a confidential record (DEC-868.1).
+///
+/// No foreign key to `__pbps_state`: one would need `REFERENCES` on the ledger
+/// from a least-privileged deployment account, and would add engine-created
+/// triggers to a table whose triggers are the thing checked. The two halves
+/// are kept together by being written — and pruned — in one statement each.
+const CREATE_CONFIDENTIAL: &str = "\
+CREATE TABLE IF NOT EXISTS public.__pbps_state_confidential (
+    state_id      bigint        NOT NULL CONSTRAINT pk___pbps_state_confidential PRIMARY KEY,
+    plan_checksum varchar(64)   NULL,
+    reason        varchar(1000) NULL,
+    state_json    text          NOT NULL
+)";
 
 /// `CREATE TABLE IF NOT EXISTS` rather than a catalog check and a branch:
 /// creating the ledger must be safe to run on every command that writes one,
@@ -300,6 +315,28 @@ RETURNING id";
 const SELECT_IDS: &str = "SELECT id FROM public.__pbps_state ORDER BY id DESC";
 
 const DELETE_UP_TO: &str = "DELETE FROM public.__pbps_state WHERE id <= $1";
+
+/// Both halves of every pruned record, in one statement: the protected rows go
+/// with the ordinary rows they belong to or not at all (DEC-868.1). The count
+/// returned is the ordinary rows', as [`DELETE_UP_TO`]'s is.
+const DELETE_BOTH_UP_TO: &str = "\
+WITH protected AS (DELETE FROM public.__pbps_state_confidential WHERE state_id <= $1)
+DELETE FROM public.__pbps_state WHERE id <= $1";
+
+/// Whether the protected table exists yet. It is created by the first
+/// confidential record, so a ledger without one is the ordinary case.
+fn confidential_is_there() -> String {
+    format!(
+        "SELECT count(*)::int8 AS present
+           FROM pg_catalog.pg_class c
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = '{LEDGER_SCHEMA}' AND c.relname = '{CONFIDENTIAL_TABLE_NAME}'"
+    )
+}
+
+const SELECT_PROTECTED: &str = "\
+SELECT plan_checksum, reason, state_json
+  FROM public.__pbps_state_confidential WHERE state_id = $1";
 
 fn select_lock() -> String {
     let locked_at = rendered("locked_at");
@@ -640,14 +677,15 @@ pub async fn ledger_problems(conn: &mut Conn) -> Result<Vec<String>, DbError> {
     let rows = crate::catalog::canonical_query(conn, &ledger_facts(), &[]).await?;
     let mut state = std::collections::BTreeSet::new();
     let mut lock = std::collections::BTreeSet::new();
+    let mut confidential = std::collections::BTreeSet::new();
     let mut problems = Vec::new();
     for row in &rows {
         let relname = text(row, "relname")?;
         let fact = text(row, "fact")?;
-        let table = if relname == STATE_TABLE_NAME {
-            &mut state
-        } else {
-            &mut lock
+        let table = match relname.as_str() {
+            STATE_TABLE_NAME => &mut state,
+            CONFIDENTIAL_TABLE_NAME => &mut confidential,
+            _ => &mut lock,
         };
         if let Some(editor) = fact.strip_prefix("untrusted editor ") {
             problems.push(format!(
@@ -698,6 +736,18 @@ pub async fn ledger_problems(conn: &mut Conn) -> Result<Vec<String>, DbError> {
             LOCK_RECIPE.iter().map(|f| (*f).to_owned()).collect();
         if lock != recipe {
             problems.extend(differences(LOCK_TABLE_NAME, &lock, &recipe));
+        }
+    }
+    // The protected table is held to its recipe and its editors exactly as the
+    // other two are (DEC-868.1): a trigger on it would read the snapshot and
+    // checksum as they are written.
+    if !confidential.is_empty() {
+        let recipe: std::collections::BTreeSet<String> = CONFIDENTIAL_RECIPE
+            .iter()
+            .map(|f| (*f).to_owned())
+            .collect();
+        if confidential != recipe {
+            problems.extend(differences(CONFIDENTIAL_TABLE_NAME, &confidential, &recipe));
         }
     }
     Ok(problems)
@@ -764,6 +814,16 @@ const STATE_RECIPE: [&str; 15] = [
     "index CREATE UNIQUE INDEX pk___pbps_state ON public.__pbps_state USING btree (id)",
 ];
 
+/// [`CREATE_CONFIDENTIAL`]'s catalog projection, measured on 18.6 and 16.15.
+const CONFIDENTIAL_RECIPE: [&str; 6] = [
+    "column state_id bigint NOT NULL",
+    "column plan_checksum character varying(64)",
+    "column reason character varying(1000)",
+    "column state_json text NOT NULL",
+    "constraint pk___pbps_state_confidential PRIMARY KEY (state_id)",
+    "index CREATE UNIQUE INDEX pk___pbps_state_confidential ON public.__pbps_state_confidential USING btree (state_id)",
+];
+
 /// [`CREATE_LOCK`]'s catalog projection, measured the same way.
 const LOCK_RECIPE: [&str; 6] = [
     "column id integer NOT NULL",
@@ -785,7 +845,8 @@ fn ledger_facts() -> String {
              FROM pg_catalog.pg_class c
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
             WHERE n.nspname = '{LEDGER_SCHEMA}'
-              AND c.relname IN ('{STATE_TABLE_NAME}', '{LOCK_TABLE_NAME}')
+              AND c.relname IN ('{STATE_TABLE_NAME}', '{LOCK_TABLE_NAME}',
+                                '{CONFIDENTIAL_TABLE_NAME}')
               AND c.relkind = 'r'
          )
          SELECT l.relname,
@@ -854,7 +915,8 @@ fn ledger_occupants() -> String {
            FROM pg_catalog.pg_class c
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
           WHERE n.nspname = '{LEDGER_SCHEMA}'
-            AND c.relname IN ('{STATE_TABLE_NAME}', '{LOCK_TABLE_NAME}')
+            AND c.relname IN ('{STATE_TABLE_NAME}', '{LOCK_TABLE_NAME}',
+                              '{CONFIDENTIAL_TABLE_NAME}')
             AND c.relkind <> 'r'"
     )
 }
@@ -1217,16 +1279,178 @@ pub async fn record(conn: &mut Conn, snapshot: &StateSnapshot) -> Result<i64, Le
         message: format!("the snapshot could not be serialized: {e}"),
     })?;
 
+    let (params, sql) = ordinary_insert(snapshot, &state_json);
+    let rows = conn.query_with(sql, &params).await?;
+    match rows.first() {
+        Some(row) => Ok(number(row, "id")?),
+        None => Err(LedgerError::Db(DbError::BadRow(
+            "the ledger insert returned no id".into(),
+        ))),
+    }
+}
+
+/// The protected half of a confidential record, as read back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProtectedHalf {
+    /// The row is there. `state_json` is the whole snapshot, checksum included.
+    Found {
+        plan_checksum: Option<String>,
+        reason: Option<String>,
+        state_json: String,
+    },
+    /// No protected row for this id, or no protected table at all: the ordinary
+    /// row claims a half that is not there, which is a malformed record.
+    Missing,
+    /// There, but this account may not read it. Never a checksum, and never
+    /// read as "missing" (absent, empty and unreadable are three answers).
+    Denied,
+}
+
+/// Records a confidential entry: `ordinary` becomes the row in
+/// `__pbps_state` that every reader, pre-feature ones included, can see, and
+/// `full` — the whole snapshot, its checksum and its reason — goes to the
+/// protected table under the same id (DEC-868.1).
+///
+/// **One statement**, so neither half exists without the other: an insert that
+/// fails for the protected half rolls back the ordinary row with it. The
+/// ordinary row must carry no verifier; one that does is refused here rather
+/// than written where a legacy reader would project it.
+///
+/// Before the write, the protected table is created if this is the first
+/// confidential record, and all three ledger tables are held to their recipes
+/// and editors ([`ledger_problems`]).
+pub async fn record_confidential(
+    conn: &mut Conn,
+    ordinary: &StateSnapshot,
+    full: &StateSnapshot,
+) -> Result<i64, LedgerError> {
+    if ordinary.plan_checksum.is_some() || ordinary.reason.is_some() {
+        return Err(LedgerError::BadEntry {
+            id: 0,
+            message: "the ordinary row of a confidential record would carry a plan checksum or a \
+                      reason, which pre-feature readers project; both belong to the protected \
+                      half only (DEC-868.1)"
+                .into(),
+        });
+    }
+    ensure_tables(conn).await?;
+    ensure_confidential_table(conn).await?;
+    let state_json = serde_json::to_string(ordinary).map_err(|e| LedgerError::BadEntry {
+        id: 0,
+        message: format!("the snapshot could not be serialized: {e}"),
+    })?;
+    let protected_json = serde_json::to_string(full).map_err(|e| LedgerError::BadEntry {
+        id: 0,
+        message: format!("the confidential snapshot could not be serialized: {e}"),
+    })?;
+    let (mut params, insert) = ordinary_insert(ordinary, &state_json);
+    let next = params.len();
+    params.push(full.plan_checksum.as_deref().into());
+    params.push(full.reason.as_deref().into());
+    params.push(protected_json.as_str().into());
+    let sql = format!(
+        "WITH ordinary AS ({insert})
+         INSERT INTO {CONFIDENTIAL_TABLE} (state_id, plan_checksum, reason, state_json)
+         SELECT id, ${}, ${}, ${} FROM ordinary
+         RETURNING state_id AS id",
+        next + 1,
+        next + 2,
+        next + 3,
+    );
+    let rows = conn.query_with(&sql, &params).await?;
+    match rows.first() {
+        Some(row) => Ok(number(row, "id")?),
+        None => Err(LedgerError::Db(DbError::BadRow(
+            "the confidential ledger insert returned no id".into(),
+        ))),
+    }
+}
+
+/// Reads the protected half of the record `id`.
+pub async fn protected_half(conn: &mut Conn, id: i64) -> Result<ProtectedHalf, DbError> {
+    let guard = Recoverable::take(conn).await?;
+    let rows = match conn.query_with(SELECT_PROTECTED, &[id.into()]).await {
+        Ok(rows) => {
+            guard.release(conn).await?;
+            rows
+        }
+        Err(e) if is_missing_table(&e) => {
+            guard.rewind(conn).await?;
+            return Ok(ProtectedHalf::Missing);
+        }
+        Err(e) if e.server_error_code().as_deref() == Some(INSUFFICIENT_PRIVILEGE) => {
+            guard.rewind(conn).await?;
+            return Ok(ProtectedHalf::Denied);
+        }
+        Err(e) => {
+            guard.rewind_quietly(conn).await;
+            return Err(e);
+        }
+    };
+    match rows.first() {
+        Some(row) => Ok(ProtectedHalf::Found {
+            plan_checksum: optional_text(row, "plan_checksum")?,
+            reason: optional_text(row, "reason")?,
+            state_json: text(row, "state_json")?,
+        }),
+        None => Ok(ProtectedHalf::Missing),
+    }
+}
+
+/// Creates the protected table on the first confidential record, then holds
+/// all three ledger tables to their recipes and editors before anything is
+/// written to it. The same race handling as [`ensure_tables`]: a concurrent
+/// creator's `42P07`/`23505` is success only if the table is then there.
+async fn ensure_confidential_table(conn: &mut Conn) -> Result<(), DbError> {
+    if !confidential_present(conn).await? {
+        let guard = Recoverable::take(conn).await?;
+        match conn.execute(CREATE_CONFIDENTIAL).await {
+            Ok(()) => guard.release(conn).await?,
+            Err(e) if made_by_someone_else(&e) => {
+                guard.rewind(conn).await?;
+                if !confidential_present(conn).await? {
+                    return Err(e);
+                }
+            }
+            Err(e) => {
+                guard.rewind_quietly(conn).await;
+                return Err(e);
+            }
+        }
+    }
+    confirm_ledger_relations(conn).await?;
+    let problems = ledger_problems(conn).await?;
+    if !problems.is_empty() {
+        return Err(DbError::Refused(untrusted_ledger_message(&problems)));
+    }
+    Ok(())
+}
+
+async fn confidential_present(conn: &mut Conn) -> Result<bool, DbError> {
+    let rows = conn.query(&confidential_is_there()).await?;
+    Ok(rows
+        .first()
+        .map(|row| number(row, "present"))
+        .transpose()?
+        .unwrap_or(0)
+        > 0)
+}
+
+/// The ordinary row's insert and its parameters, shared by [`record`] and
+/// [`record_confidential`] so the two cannot drift apart.
+fn ordinary_insert<'a>(
+    snapshot: &'a StateSnapshot,
+    state_json: &'a str,
+) -> (Vec<Param<'a>>, &'static str) {
     let kind = snapshot.kind.as_str();
     let state_version = saturating_i32(u64::from(snapshot.version));
     let tables_count = saturating_i32(snapshot.schema.tables.len() as u64);
     let modules_count = saturating_i32(snapshot.schema.modules.len() as u64);
-
-    let mut params: Vec<Param<'_>> = vec![
+    let mut params: Vec<Param<'a>> = vec![
         kind.into(),
         snapshot.git_sha.as_deref().into(),
         snapshot.plan_checksum.as_deref().into(),
-        state_json.as_str().into(),
+        state_json.into(),
         snapshot.operator.as_str().into(),
         snapshot.reason.as_deref().into(),
         state_version.into(),
@@ -1243,13 +1467,7 @@ pub async fn record(conn: &mut Conn, snapshot: &StateSnapshot) -> Result<i64, Le
         }
         None => INSERT_STATE_NOT_STAGED,
     };
-    let rows = conn.query_with(sql, &params).await?;
-    match rows.first() {
-        Some(row) => Ok(number(row, "id")?),
-        None => Err(LedgerError::Db(DbError::BadRow(
-            "the ledger insert returned no id".into(),
-        ))),
-    }
+    (params, sql)
 }
 
 /// Deletes all but the `keep` newest entries; returns how many went.
@@ -1272,6 +1490,20 @@ pub async fn prune(conn: &mut Conn, keep: u32) -> Result<u64, LedgerError> {
     let Some(highest) = doomed.first().copied() else {
         return Ok(0);
     };
+    // A ledger that has confidential records prunes both halves together,
+    // after the same integrity gate a write takes: the delete reaches the
+    // protected table, and a trigger there would read the rows it removes.
+    if confidential_present(conn).await? {
+        let problems = ledger_problems(conn).await?;
+        if !problems.is_empty() {
+            return Err(LedgerError::Db(DbError::Refused(untrusted_ledger_message(
+                &problems,
+            ))));
+        }
+        return Ok(conn
+            .execute_with(DELETE_BOTH_UP_TO, &[highest.into()])
+            .await?);
+    }
     Ok(conn.execute_with(DELETE_UP_TO, &[highest.into()]).await?)
 }
 
@@ -1719,6 +1951,10 @@ mod tests {
     fn the_statements_name_the_documented_tables() {
         assert_eq!(STATE_TABLE, format!("{LEDGER_SCHEMA}.{STATE_TABLE_NAME}"));
         assert_eq!(LOCK_TABLE, format!("{LEDGER_SCHEMA}.{LOCK_TABLE_NAME}"));
+        assert_eq!(
+            CONFIDENTIAL_TABLE,
+            format!("{LEDGER_SCHEMA}.{CONFIDENTIAL_TABLE_NAME}")
+        );
         for sql in state_statements() {
             assert!(sql.contains(STATE_TABLE), "{sql}");
         }
