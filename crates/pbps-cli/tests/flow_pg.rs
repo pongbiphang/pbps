@@ -1233,6 +1233,217 @@ fn module_rebuilds_refuse_carried_state_before_planning_and_before_recording() {
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
 }
 
+/// #314. Every PostgreSQL module change is a drop and a create, and the
+/// engine refuses the drop while anything depends on the module. The plan now
+/// accounts for each dependent where the approver sees it: a check, a default
+/// and a chain of views over a rebuilt module are dropped before it and put
+/// back after it, an undeclared dependent refuses the plan by name, and a
+/// dependent created after planning refuses the apply.
+///
+/// The objects are created on the server and adopted with `pull`, because a
+/// table whose check calls a function cannot be bootstrapped: tables are built
+/// before modules.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn module_dependents_are_dropped_and_restored_around_the_rebuild_or_refused_by_name() {
+    struct Role(String, String);
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
+    let server = server();
+    let reader = Role(
+        server.clone(),
+        format!("pbps_dep_reader_{}", std::process::id()),
+    );
+    let own = OwnDatabase::new(&server, "module-dependents");
+    let connection = own.connection();
+    on_server(connection, &format!("CREATE ROLE {} NOSUPERUSER", reader.1));
+    on_server(
+        connection,
+        "CREATE SCHEMA app; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE TABLE app.t (id integer PRIMARY KEY CONSTRAINT ck CHECK (app.f(id) >= 0), \
+                             n integer DEFAULT app.f(1)); \
+         CREATE VIEW app.v0 AS SELECT id FROM app.t; \
+         CREATE VIEW app.v1 AS SELECT id FROM app.v0; \
+         CREATE VIEW app.v2 AS SELECT id FROM app.v1; \
+         INSERT INTO app.t (id) VALUES (1), (2)",
+    );
+    // A declared grant on a view the rebuild of `v0` has to drop and create:
+    // the plan restates it only if the differ rebuilt the view, not if the
+    // pair were added after its permission passes had run.
+    on_server(
+        connection,
+        &format!(
+            "GRANT USAGE ON SCHEMA app TO {r}; GRANT SELECT ON app.v1 TO {r}",
+            r = reader.1
+        ),
+    );
+    let d = Demo::new("module-dependents");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+
+    // A function edit: the check and the default depend on it, and neither is
+    // in the diff.
+    let function = d.dir.join("schema/app.f%28integer%29.function.yml");
+    let text = std::fs::read_to_string(&function).unwrap();
+    std::fs::write(&function, text.replace("SELECT x", "SELECT x + 0")).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    let o = succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    // Removed before the function goes, restored after it is back.
+    assert!(
+        at("DROP CONSTRAINT \"ck\"") < at("DROP FUNCTION"),
+        "{script}"
+    );
+    assert!(at("DROP DEFAULT") < at("DROP FUNCTION"), "{script}");
+    assert!(
+        at("CREATE FUNCTION") < at("ADD CONSTRAINT \"ck\""),
+        "{script}"
+    );
+    assert!(at("CREATE FUNCTION") < at("SET DEFAULT"), "{script}");
+    let check = passed_connected_check_json(&d, connection, "module_dependents");
+    assert!(
+        check["message"]
+            .as_str()
+            .unwrap()
+            .contains("2 dependent(s)"),
+        "{check}"
+    );
+    assert!(stdout(&o).contains("ck"), "{}", stdout(&o));
+    // Restoring the check revalidates the table, which is the approver's to
+    // accept; the rebuild restates the engine's own `PUBLIC` execute.
+    let allow = ["--allow", "constraint", "--allow", "grant-widen"];
+    succeeds(approved_apply(&d, connection, &plan, &allow));
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    assert_eq!(
+        text_of(
+            connection,
+            "SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'app.t'::regclass"
+        ),
+        "app.f(1)"
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_constraint WHERE conrelid = 'app.t'::regclass AND conname = 'ck'"
+        ),
+        1
+    );
+    std::fs::remove_file(&plan).unwrap();
+
+    // A view edit under a chain of views: both are dropped deepest first and
+    // created back in reverse, each through `before_a_rebuild`.
+    let v0 = d.dir.join("schema/app.v0.view.yml");
+    let text = std::fs::read_to_string(&v0).unwrap();
+    std::fs::write(&v0, format!("{} WHERE id > 0\n", text.trim_end())).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    assert!(
+        at("DROP VIEW \"app\".\"v2\"") < at("DROP VIEW \"app\".\"v1\""),
+        "{script}"
+    );
+    assert!(
+        at("DROP VIEW \"app\".\"v1\"") < at("DROP VIEW \"app\".\"v0\""),
+        "{script}"
+    );
+    assert!(
+        at("CREATE VIEW \"app\".\"v0\"") < at("CREATE VIEW \"app\".\"v1\""),
+        "{script}"
+    );
+    assert!(
+        at("CREATE VIEW \"app\".\"v1\"") < at("CREATE VIEW \"app\".\"v2\""),
+        "{script}"
+    );
+
+    // Created after the plan was saved: the approver never saw it, so the
+    // apply refuses rather than extends the plan, and nothing changes.
+    on_server(
+        connection,
+        "CREATE VIEW public.late AS SELECT id FROM app.v0",
+    );
+    let approve = ["--allow", "destructive", "--allow", "grant-widen"];
+    let o = approved_apply(&d, connection, &plan, &approve);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("module_dependents"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("public.late"), "{}", stderr(&o));
+    on_server(
+        connection,
+        "DO $$ BEGIN IF pg_get_viewdef('app.v0'::regclass) LIKE '%>%' THEN RAISE EXCEPTION 'refused apply changed v0'; END IF; END $$",
+    );
+    // And planning again refuses it by name: this project does not declare
+    // it, so it cannot be put back, and `CASCADE` is not offered.
+    let o = d.run(&["plan", "--db", connection]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("public.late") && stderr(&o).contains("does not declare it"),
+        "{}",
+        stderr(&o)
+    );
+    on_server(connection, "DROP VIEW public.late");
+    std::fs::remove_file(&plan).unwrap();
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    // The views the plan drops to rebuild them carry a drop's own risk: the
+    // saved plan's risks are the dialect's answer for each change, and the
+    // approver is approving `DROP VIEW` statements.
+    let o = approved_apply(&d, connection, &plan, &allow);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("--allow destructive"), "{}", stderr(&o));
+    succeeds(approved_apply(&d, connection, &plan, &approve));
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    // The rebuilt view still grants what its declaration grants.
+    assert_eq!(
+        scalar(
+            connection,
+            &format!(
+                "SELECT count(*) FROM information_schema.role_table_grants \
+                 WHERE grantee = '{}' AND table_schema = 'app' AND table_name = 'v1' \
+                 AND privilege_type = 'SELECT'",
+                reader.1
+            )
+        ),
+        1
+    );
+}
+
 /// #248, end to end: a rebuild forced by an ordinary view edit still lets a
 /// declared, least-privilege role read the view afterwards.
 ///

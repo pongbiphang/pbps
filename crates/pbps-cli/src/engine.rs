@@ -1457,6 +1457,97 @@ pub async fn check_module_rebuilds(
     }
 }
 
+/// Every dependent of every module this plan drops, read inside the caller's
+/// transaction (`modules::dependents` refuses outside one). Empty on SQL
+/// Server, whose `CREATE OR ALTER` rebuilds nothing.
+async fn module_dependents(
+    conn: &mut Conn,
+    changes: &ChangeSet,
+) -> anyhow::Result<BTreeMap<pbps_model::ModuleId, Vec<pbps_pg::modules::Dependent>>> {
+    let mut found = BTreeMap::new();
+    if conn.driver() != Driver::Postgres {
+        return Ok(found);
+    }
+    for (id, kind) in crate::dependents::dropped_modules(changes) {
+        let deps = pbps_pg::modules::dependents(conn, &id, kind).await?;
+        found.insert(id, deps);
+    }
+    Ok(found)
+}
+
+/// The planner's half of #314: reads what depends on every module this plan
+/// drops and puts each dependent on the right side of that drop, in the plan
+/// the approver sees (`dependents::weave`). Called inside the planning
+/// transaction, before `check_module_rebuilds`, so that a view the plan now
+/// drops and recreates is held to the same bar as one the declarations edit.
+///
+/// `rediff` plans the same revision again with the given unchanged modules
+/// rebuilt (`pbps_diff::diff_rebuilding`): a module dependent the plan does
+/// not touch has to be rebuilt around the module under it, and a rebuild is
+/// its grants and its `PUBLIC` execute as well as its two statements, which
+/// only the differ's own passes write.
+pub async fn account_for_module_dependents(
+    conn: &mut Conn,
+    changes: &mut ChangeSet,
+    declared: &pbps_model::Schema,
+    ids: &[&pbps_model::IdsFile],
+    dialect: &dyn pbps_dialect::Dialect,
+    rediff: &dyn Fn(&BTreeSet<pbps_model::ModuleId>) -> anyhow::Result<ChangeSet>,
+) -> anyhow::Result<ConnectedCheck> {
+    if conn.driver() != Driver::Postgres {
+        return Ok(ConnectedCheck {
+            name: "module_dependents",
+            engine: "SQL Server",
+            status: "not_applicable",
+            message: "SQL Server uses CREATE OR ALTER, so a module change drops nothing that depends on it".into(),
+        });
+    }
+    let mut found = module_dependents(conn, changes).await?;
+    let untouched = crate::dependents::untouched_module_dependents(changes, &found, declared);
+    if !untouched.is_empty() {
+        *changes = rediff(&untouched)?;
+        found = module_dependents(conn, changes).await?;
+    }
+    let added = crate::dependents::weave(changes, &found, declared, ids, dialect)
+        .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
+    let left = crate::dependents::unaccounted(changes, &found);
+    if !left.is_empty() {
+        anyhow::bail!(
+            "module_dependents (PostgreSQL): the plan still drops a module before what depends \
+             on it; this is a bug in pbps, please report it:\n  {}",
+            left.join("\n  ")
+        );
+    }
+    let dependents: usize = found.values().map(Vec::len).sum();
+    Ok(ConnectedCheck {
+        name: "module_dependents",
+        engine: "PostgreSQL",
+        status: "passed",
+        message: format!(
+            "{dependents} dependent(s) of {} dropped or rebuilt module(s) removed before the drop; {added} change(s) added to the plan for them",
+            found.len()
+        ),
+    })
+}
+
+/// The apply's half of #314: the saved plan must still remove, before each
+/// module's drop, everything that depends on that module now. A dependent
+/// created after planning is one the approver never saw; the plan is refused
+/// rather than extended, and planning again shows it.
+pub async fn check_module_dependents(conn: &mut Conn, changes: &ChangeSet) -> anyhow::Result<()> {
+    let found = module_dependents(conn, changes).await?;
+    let left = crate::dependents::unaccounted(changes, &found);
+    if !left.is_empty() {
+        anyhow::bail!(
+            "module_dependents (PostgreSQL): the database now holds dependents this plan does not \
+             remove before dropping what they depend on, so the engine would refuse the drop:\n  {}\n\
+             Plan again, so the plan accounts for them where the approver can see it.",
+            left.join("\n  ")
+        );
+    }
+    Ok(())
+}
+
 /// Holds only trigger identities authenticated in the caller's open transaction.
 #[derive(Default)]
 pub struct DataWriteGuard {
