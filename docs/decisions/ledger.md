@@ -816,7 +816,8 @@ principal is not an absent one. `doctor` asks for these grants (#881).
   only at run time (`EXEC reader` with no schema; measured, recorded with no
   `referenced_id`) is an edge to every object of that name. A module's signer
   or execution context may itself read only through other code, and that
-  counts too;
+  counts too. A table whose computed column, default or check calls such code
+  counts for whoever reads or writes the table;
 - becoming a reader: `IMPERSONATE` or `CONTROL` on a reader user or login, to
   a fixed point.
 
@@ -855,7 +856,9 @@ deployment account, either its login or its database user, or else be
   can `EXECUTE AS USER` both `dbo` and the deployer.
 
 Becoming is followed to a fixed point, because nested `EXECUTE AS` reaches
-the deployer through others. The chain never steps through a principal with a
+the deployer through others. The same reach counts for granting and backing
+up. An actor that can become a `db_securityadmin` member without a login
+grants as that member does. The chain never steps through a principal with a
 `DENY` in its reach.
 
 So the database's owner qualifies by what it can do, and needs no exemption

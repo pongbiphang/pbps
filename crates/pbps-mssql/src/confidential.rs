@@ -228,7 +228,9 @@ SELECT @t AS table_id,
 /// A disabled trigger fires for nobody and is left out; enabling it again
 /// takes `ALTER` on its table or the database, which is a grantor's path.
 /// A synonym is no code, but it chains the same way: measured, `SELECT` on a
-/// `dbo` synonym for a `dbo` table reads the table with no grant on it.
+/// `dbo` synonym for a `dbo` table reads the table with no grant on it. So
+/// does a table whose computed column, default or check calls code: reading or
+/// writing the table runs that code under the table's owner.
 const MODULES: &str = "\
 DECLARE @t int = OBJECT_ID(N'dbo.__pbps_state_confidential', N'U');
 WITH code AS (
@@ -271,7 +273,14 @@ SELECT sn.object_id, CONVERT(nvarchar(2), N'SN'), sn.schema_id,
                                AND ISNULL(PARSENAME(sn.base_object_name, 3), DB_NAME()) = DB_NAME()
                                AND PARSENAME(sn.base_object_name, 4) IS NULL)
                          THEN 1 ELSE 0 END)
-  FROM sys.synonyms sn JOIN sys.schemas ss ON ss.schema_id = sn.schema_id;";
+  FROM sys.synonyms sn JOIN sys.schemas ss ON ss.schema_id = sn.schema_id
+UNION ALL
+SELECT t.object_id, CONVERT(nvarchar(2), N'U'), t.schema_id,
+       COALESCE(t.principal_id, ts.principal_id, 1), CONVERT(int, NULL), 0, 0, 0, 0
+  FROM sys.tables t JOIN sys.schemas ts ON ts.schema_id = t.schema_id
+ WHERE t.object_id <> ISNULL(@t, 0)
+   AND EXISTS (SELECT 1 FROM sys.sql_expression_dependencies d
+                WHERE d.referencing_id = t.object_id);";
 
 /// Which code names which other object. An ownership chain continues from one
 /// module to another of the same owner, so a view over a view over the table
@@ -298,7 +307,9 @@ SELECT d.referencing_id, o.object_id
 UNION ALL
 SELECT sn.object_id, OBJECT_ID(sn.base_object_name)
   FROM sys.synonyms sn
- WHERE OBJECT_ID(sn.base_object_name) IS NOT NULL;";
+ WHERE OBJECT_ID(sn.base_object_name) IS NOT NULL
+   AND ISNULL(PARSENAME(sn.base_object_name, 3), DB_NAME()) = DB_NAME()
+   AND PARSENAME(sn.base_object_name, 4) IS NULL;";
 
 /// A module signed by a certificate or asymmetric key runs with the
 /// permissions of the principals mapped to that key, in this database and, for
@@ -677,6 +688,18 @@ impl Graph {
                         &[(OBJECT, m.parent), (SCHEMA, m.parent_schema), (DATABASE, 0)],
                     )
             }
+            // A table runs the code its expressions call for whoever reads or
+            // writes it.
+            "U" => {
+                c.contains(&m.owner)
+                    || self.in_database_role(&c, "db_datareader")
+                    || self.in_database_role(&c, "db_datawriter")
+                    || self.database_grants(
+                        &c,
+                        &["SELECT", "INSERT", "UPDATE", "DELETE", "CONTROL"],
+                        &[(OBJECT, m.id), (SCHEMA, m.schema), (DATABASE, 0)],
+                    )
+            }
             // A view, a table-valued function and a synonym are read, not
             // executed: `SELECT` on them is what runs their chain. A synonym
             // for a procedure is executed, so `EXECUTE` counts here too.
@@ -980,6 +1003,22 @@ impl Graph {
         false
     }
 
+    /// `who` and everyone it can become, to a fixed point.
+    fn reach(&self, who: Who) -> BTreeSet<Who> {
+        let everyone = self.everyone();
+        let mut reached = BTreeSet::from([who]);
+        let mut todo = vec![who];
+        while let Some(x) = todo.pop() {
+            for &y in &everyone {
+                if !reached.contains(&y) && self.becomes(x, y) {
+                    reached.insert(y);
+                    todo.push(y);
+                }
+            }
+        }
+        reached
+    }
+
     fn everyone(&self) -> Vec<Who> {
         self.server
             .keys()
@@ -1056,10 +1095,13 @@ impl Graph {
             if readers.contains(&who) {
                 paths.push("can read");
             }
-            if self.grants_reading(who, &readers) {
+            // What someone can become, it can do: grant and back up as well
+            // as read.
+            let reach = self.reach(who);
+            if reach.iter().any(|&r| self.grants_reading(r, &readers)) {
                 paths.push("can grant reading");
             }
-            if self.backs_up(who) {
+            if reach.iter().any(|&r| self.backs_up(r)) {
                 paths.push("can back up");
             }
             if paths.is_empty() || self.qualified(who) {
@@ -1536,6 +1578,40 @@ mod tests {
         }
         // The module read fills in a CLR trigger's table as it does a T-SQL one's.
         assert!(MODULES.contains("o.type IN ('TR', 'TA')"), "{MODULES}");
+    }
+
+    #[test]
+    fn becoming_a_grantor_or_a_backup_principal_is_being_one() {
+        for role in ["db_securityadmin", "db_backupoperator"] {
+            let mut g = graph();
+            g.database
+                .insert(42, principal("nologin", "S", Some("0x42"), false));
+            g.database.insert(16500, principal(role, "R", None, true));
+            g.database_roles.push((42, 16500));
+            g.database_perms
+                .push(grant(DATABASE_PRINCIPAL, 42, U_ALICE, "IMPERSONATE"));
+            let problems = named(&g);
+            assert!(mentions(&problems, "alice"), "{role}: {problems:?}");
+            assert!(!mentions(&problems, "bob"), "{role}: {problems:?}");
+        }
+    }
+
+    #[test]
+    fn a_table_whose_expressions_call_reading_code_is_read_by_its_readers() {
+        let mut g = graph();
+        g.modules.push(Module {
+            kind: "FN".into(),
+            ..module(90, DBO, None, true)
+        });
+        g.modules.push(Module {
+            kind: "U".into(),
+            ..module(91, DBO, None, false)
+        });
+        g.dependencies.push((91, 90));
+        g.database_perms.push(grant(OBJECT, 91, U_ALICE, "SELECT"));
+        assert!(mentions(&named(&g), "alice"));
+        // The synonym arm keeps to this database's objects.
+        assert!(DEPENDENCIES.contains("PARSENAME(sn.base_object_name, 3)"));
     }
 
     #[test]

@@ -2500,6 +2500,15 @@ async fn every_unqualified_reader_grantor_and_backup_principal_is_named() {
              EXEC(N'CREATE PROCEDURE app880.p880_signedview AS SELECT state_id FROM dbo.v880;');
              ADD SIGNATURE TO app880.p880_signedview BY CERTIFICATE c880v WITH PASSWORD = '{READER_PASSWORD}';
              GRANT EXECUTE ON app880.p880_signedview TO [{}];", login("signedview"))),
+        ("computed".into(), format!(
+            "EXEC(N'CREATE FUNCTION dbo.f880_scalar() RETURNS BIGINT AS
+                    BEGIN RETURN (SELECT MAX(state_id) FROM {t}); END;');
+             CREATE TABLE dbo.t880_computed (n INT, c AS dbo.f880_scalar());
+             GRANT SELECT ON dbo.t880_computed TO [{}];", login("computed"))),
+        ("impersonatesadmin".into(), format!(
+            "CREATE USER u880_secadmin WITHOUT LOGIN;
+             ALTER ROLE db_securityadmin ADD MEMBER u880_secadmin;
+             GRANT IMPERSONATE ON USER::u880_secadmin TO [{}];", login("impersonatesadmin"))),
         ("synonym".into(), format!(
             "CREATE SYNONYM dbo.s880 FOR {t}; GRANT SELECT ON dbo.s880 TO [{}];", login("synonym"))),
         ("securityadmin".into(), format!("ALTER ROLE db_securityadmin ADD MEMBER [{}];", login("securityadmin"))),
