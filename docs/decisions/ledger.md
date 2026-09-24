@@ -589,7 +589,8 @@ through its members. `ALTER ROLE … NOLOGIN` does not end a session the role
 already has, so a role that connected while it could log in and was then made
 `NOLOGIN` keeps its ownership or `TRIGGER` grant in that session, and can add a
 trigger between the check and the write. An editor is now a login role or any
-role with a backend in `pg_stat_activity` (`usesysid`, which every role may
-read); a `NOLOGIN` group with no session of its own is still not one, so a
+role with a backend in `pg_stat_activity` connected to this database
+(`usesysid` and `datid`, which every role may read — a session cannot change
+database, so one elsewhere cannot use a grant here); a `NOLOGIN` group with no session of its own is still not one, so a
 group owner whose only login member is the deployment account keeps working.
 

@@ -612,7 +612,9 @@ async fn confirm_ledger_relations(conn: &mut Conn) -> Result<(), DbError> {
 /// the deployment account logs in as a member of it — *unless* it connected
 /// while it could still log in. `ALTER ROLE … NOLOGIN` ends no session, so a
 /// role with a backend in `pg_stat_activity` is an actor whatever its flag
-/// says now (issue #862; `usesysid` is visible to every role). And only in a role that also has `USAGE` on the
+/// says now (issue #862; `usesysid` is visible to every role). A backend in
+/// this database only: a session cannot change database, so one connected
+/// elsewhere cannot use a grant here. And only in a role that also has `USAGE` on the
 /// ledger's schema: measured on 18.6, a role holding `TRIGGER` without it is
 /// refused `CREATE TRIGGER` with `permission denied for schema public`, so it
 /// cannot change the ledger and is no reason to refuse it.
@@ -820,7 +822,7 @@ fn ledger_facts() -> String {
            JOIN pg_catalog.pg_database db ON db.datname = pg_catalog.current_database()
           WHERE (e.rolcanlogin
                  OR EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity a
-                             WHERE a.usesysid = e.oid))
+                             WHERE a.usesysid = e.oid AND a.datid = db.oid))
             AND e.oid <> db.datdba
             AND NOT pg_catalog.pg_has_role(e.oid, current_user::regrole::oid, 'SET')
             AND NOT EXISTS (

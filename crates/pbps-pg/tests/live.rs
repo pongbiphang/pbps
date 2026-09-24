@@ -7151,12 +7151,28 @@ async fn a_ledger_pbps_did_not_create_is_refused_before_any_write() {
         "a NOLOGIN attacker with a live session: {problems:?}"
     );
     drop(lingering);
+    // A session of the same role in another database is not one: it cannot
+    // change database, so it cannot use the grant here.
+    db.conn
+        .execute(&format!("ALTER ROLE {attacker} LOGIN"))
+        .await
+        .unwrap();
+    let elsewhere = Conn::connect(
+        Driver::Postgres,
+        &conn_str_as(&attacker, "live-test", "postgres"),
+    )
+    .await
+    .expect("the attacker in another database");
+    db.conn
+        .execute(&format!("ALTER ROLE {attacker} NOLOGIN"))
+        .await
+        .unwrap();
     let mut gone = false;
     for _ in 0..50 {
         let sessions: i64 = db
             .conn
             .query(&format!(
-                "SELECT count(*)::int8 AS n FROM pg_stat_activity WHERE usename = '{attacker}'"
+                "SELECT count(*)::int8 AS n FROM pg_stat_activity WHERE usename = '{attacker}' AND datname = current_database()"
             ))
             .await
             .unwrap()[0]
@@ -7173,8 +7189,9 @@ async fn a_ledger_pbps_did_not_create_is_refused_before_any_write() {
     let problems = state::ledger_problems(&mut deploying).await.unwrap();
     assert!(
         !problems.iter().any(|p| p.contains(&changed_by_attacker)),
-        "a NOLOGIN attacker with no session: {problems:?}"
+        "a NOLOGIN attacker with a session only in another database: {problems:?}"
     );
+    drop(elsewhere);
     drop(deploying);
     db.conn
         .execute(&format!("ALTER ROLE {attacker} LOGIN"))
