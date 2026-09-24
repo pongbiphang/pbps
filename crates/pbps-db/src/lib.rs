@@ -33,6 +33,7 @@
 use pbps_dialect::TransactionFraming;
 pub mod catalog;
 pub mod doctor;
+pub mod fingerprint;
 pub mod impact;
 pub mod ledger;
 mod mssql;

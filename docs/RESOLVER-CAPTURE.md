@@ -147,8 +147,8 @@ The capture closes before returning. A fresh recapture can invalidate it even
 when managed declarations and historical bindings remain unchanged. Producing
 an applyable plan still requires complete analysis scope selection, scratch
 reconstruction/compilation, ordering and environment qualification. Publication,
-explain, approval, apply and recording additionally require #594 and the
-protected-output integration. This library adds none of those bypasses.
+explain, approval, apply and recording additionally require sealing the
+evidence under the environment's fingerprint key (#614, DEC-952.1). This library adds none of those bypasses.
 
 ## Verification
 

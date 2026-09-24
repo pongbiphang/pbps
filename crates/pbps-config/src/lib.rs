@@ -45,6 +45,12 @@ pub enum ConfigError {
          Export it, or pass the connection string directly with --db."
     )]
     MissingConnection { name: String, var: String },
+
+    #[error(
+        "environment `{name}` sets both fingerprint_key_env and fingerprint_key_file; \
+         keep the one its key is delivered through"
+    )]
+    AmbiguousFingerprintKey { name: String },
 }
 
 /// The target database dialect.
@@ -127,6 +133,30 @@ pub struct Environment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(regex(pattern = "^[A-Za-z0-9][A-Za-z0-9_.-]*$"))]
     pub resolve_with: Option<String>,
+
+    /// The name of the environment variable holding this target's
+    /// fingerprint key, base64 as `pbps key generate` prints it (DEC-952.1).
+    /// Named, never inline, for the reason `url_env` is. Exclusive with
+    /// `fingerprint_key_file`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint_key_env: Option<String>,
+
+    /// A file holding this target's fingerprint key, readable by its owner
+    /// only; relative to the project root. Exclusive with
+    /// `fingerprint_key_env`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint_key_file: Option<PathBuf>,
+}
+
+/// Where an environment's fingerprint key is read from. Keys are never shared
+/// between environments and have no default: a key one environment's
+/// fingerprints were made under is no evidence for another's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FingerprintKeySource {
+    /// The environment variable of this name.
+    Env(String),
+    /// The file at this path, already resolved against the project root.
+    File(PathBuf),
 }
 
 impl Environment {
@@ -316,6 +346,11 @@ impl Config {
         {
             return Err(ConfigError::InvalidResolverName);
         }
+        if let Some((name, _)) = config.environments.iter().find(|(_, env)| {
+            env.fingerprint_key_env.is_some() && env.fingerprint_key_file.is_some()
+        }) {
+            return Err(ConfigError::AmbiguousFingerprintKey { name: name.clone() });
+        }
         Ok(config)
     }
 }
@@ -408,11 +443,68 @@ impl Project {
     pub fn connection_string(&self, name: &str) -> Result<String, ConfigError> {
         self.environment(name)?.connection_string(name)
     }
+
+    /// Where a named environment's fingerprint key is read from, or `None`
+    /// when it configures none. A relative file is the project root's.
+    pub fn fingerprint_key_source(
+        &self,
+        name: &str,
+    ) -> Result<Option<FingerprintKeySource>, ConfigError> {
+        let env = self.environment(name)?;
+        Ok(
+            match (&env.fingerprint_key_env, &env.fingerprint_key_file) {
+                (Some(_), Some(_)) => {
+                    return Err(ConfigError::AmbiguousFingerprintKey {
+                        name: name.to_owned(),
+                    });
+                }
+                (Some(var), None) => Some(FingerprintKeySource::Env(var.clone())),
+                (None, Some(file)) => Some(FingerprintKeySource::File(self.root.join(file))),
+                (None, None) => None,
+            },
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn project_with(environment: &str) -> Result<Project, ConfigError> {
+        let yaml = format!("dialect: postgres\nenvironments:\n  prod:\n{environment}");
+        Ok(Project {
+            root: PathBuf::from("/srv/app"),
+            config: Config::parse(&yaml, Path::new("pbps.yml"))?,
+        })
+    }
+
+    #[test]
+    fn a_fingerprint_key_comes_from_one_named_source_per_environment() {
+        let env = project_with("    url_env: PROD_DB\n    fingerprint_key_env: PROD_FP\n").unwrap();
+        assert_eq!(
+            env.fingerprint_key_source("prod").unwrap(),
+            Some(FingerprintKeySource::Env("PROD_FP".into()))
+        );
+        let file =
+            project_with("    url_env: PROD_DB\n    fingerprint_key_file: keys/prod\n").unwrap();
+        assert_eq!(
+            file.fingerprint_key_source("prod").unwrap(),
+            Some(FingerprintKeySource::File(PathBuf::from(
+                "/srv/app/keys/prod"
+            )))
+        );
+        // Negative: none configured is `None`, not a default.
+        let none = project_with("    url_env: PROD_DB\n").unwrap();
+        assert_eq!(none.fingerprint_key_source("prod").unwrap(), None);
+        // Negative: both is refused when the file is read, naming the environment.
+        let both = project_with(
+            "    url_env: PROD_DB\n    fingerprint_key_env: PROD_FP\n    fingerprint_key_file: k\n",
+        );
+        assert!(matches!(
+            both,
+            Err(ConfigError::AmbiguousFingerprintKey { ref name }) if name == "prod"
+        ));
+    }
 
     #[test]
     fn minimal_config_uses_defaults() {
@@ -544,6 +636,8 @@ mod tests {
             url_env: "PBPS_DEFINITELY_UNSET_9137".into(),
             description: None,
             resolve_with: None,
+            fingerprint_key_env: None,
+            fingerprint_key_file: None,
         };
         let err = env.connection_string("prod").unwrap_err();
         assert!(

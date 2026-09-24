@@ -22,6 +22,7 @@
 
 use pbps_config::Project;
 use pbps_db::Conn;
+use pbps_db::fingerprint::FingerprintKey;
 
 use crate::{db, output};
 
@@ -228,6 +229,51 @@ pub struct Requested {
     pub target: anyhow::Result<db::Target>,
 }
 
+/// One finding per environment about its fingerprint key (DEC-952.1): its
+/// identifier when it loads, an error naming the fault when a configured key
+/// does not, and a note when none is configured — nothing uses the key yet
+/// but engine-assisted planning, so its absence refuses nothing today.
+fn fingerprint_key_findings(project: &Project, names: &[String]) -> Vec<output::Finding> {
+    names
+        .iter()
+        .map(|name| {
+            let source = match project.fingerprint_key_source(name) {
+                Ok(source) => source,
+                Err(e) => {
+                    return output::Finding::error("environment.fingerprint-key", e.to_string());
+                }
+            };
+            let loaded = match &source {
+                None => {
+                    return output::Finding::note(
+                        "environment.no-fingerprint-key",
+                        format!(
+                            "environment `{name}` configures no fingerprint key;                              engine-assisted planning (--resolve-with) will need one"
+                        ),
+                    )
+                    .remedy(format!(
+                        "pbps key generate --out {name}.fingerprint.key   # then set                          `fingerprint_key_file` for `{name}` in pbps.yml"
+                    ));
+                }
+                Some(pbps_config::FingerprintKeySource::Env(var)) => FingerprintKey::from_env(var),
+                Some(pbps_config::FingerprintKeySource::File(path)) => {
+                    FingerprintKey::from_file(path)
+                }
+            };
+            match loaded {
+                Ok(key) => output::Finding::note(
+                    "environment.fingerprint-key",
+                    format!("environment `{name}` has fingerprint key {}", key.id()),
+                ),
+                Err(e) => output::Finding::error(
+                    "environment.fingerprint-key",
+                    format!("environment `{name}`: {e}"),
+                ),
+            }
+        })
+        .collect()
+}
+
 pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyhow::Result<()> {
     let dialect = output::or_unanswerable(
         "doctor",
@@ -295,6 +341,15 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
             .remedy("git add -A && git commit"),
         );
     }
+
+    // The fingerprint key is checked without a connection, for the requested
+    // environment or, with no target, for every configured one: a `--db`
+    // target names no environment and so no key.
+    let key_envs: Vec<String> = match &one {
+        Some(Requested { name, .. }) => name.iter().cloned().collect(),
+        None => project.config.environments.keys().cloned().collect(),
+    };
+    findings.extend(fingerprint_key_findings(project, &key_envs));
 
     let mut environments = Vec::new();
     if let Some(Requested { name, target }) = one {
@@ -1201,6 +1256,55 @@ fn render_resolver(out: &mut String, discovery: &pbps_db::resolver::Discovery) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// DEC-952.1: a loaded key is named by its identifier, a configured key
+    /// that fails is an error, and none configured is only a note.
+    #[test]
+    fn each_environments_fingerprint_key_is_reported_by_id_error_or_note() {
+        let dir = std::env::temp_dir().join(format!(
+            "pbps-doctor-key-{}",
+            pbps_model::Uid::generate(pbps_model::UidKind::Table)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let key = FingerprintKey::generate();
+        let good = dir.join("good.key");
+        std::fs::write(&good, &key).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let yaml = format!(
+            "dialect: postgres\nenvironments:\n  \
+             good: {{ url_env: A, fingerprint_key_file: {} }}\n  \
+             broken: {{ url_env: B, fingerprint_key_file: {} }}\n  \
+             bare: {{ url_env: C }}\n",
+            good.display(),
+            dir.join("absent.key").display()
+        );
+        let project = Project {
+            root: dir.clone(),
+            config: pbps_config::Config::parse(&yaml, std::path::Path::new("pbps.yml")).unwrap(),
+        };
+        let names: Vec<String> = ["good", "broken", "bare"].map(String::from).to_vec();
+        let findings = fingerprint_key_findings(&project, &names);
+        let id = FingerprintKey::parse(&key, "k").unwrap().id();
+        assert_eq!(findings[0].severity, output::Severity::Note);
+        assert!(
+            findings[0].message.contains(id.as_str()),
+            "{:?}",
+            findings[0]
+        );
+        assert!(
+            !findings[0].message.contains(&key),
+            "the key itself is never printed"
+        );
+        assert_eq!(findings[1].severity, output::Severity::Error);
+        assert!(findings[1].message.contains("broken"), "{:?}", findings[1]);
+        assert_eq!(findings[2].severity, output::Severity::Note);
+        assert_eq!(findings[2].id, "environment.no-fingerprint-key");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// A foreign-key target is somebody else's table when the declarations do
     /// not hold it, whatever schema it sits in (issues #510 and #315).

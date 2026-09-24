@@ -107,6 +107,12 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # Plan pinning (SPEC §7.3) needs a checksum an auditor recognizes. Pure Rust,
 # no C dependency, so the single static binary of §11.4 stays single.
 sha2       = "0.10"
+# Keyed fingerprints of captured target inputs (DEC-952.1): HMAC-SHA256. The
+# `hmac 0.13` / `sha2 0.11` pair `postgres-protocol` already resolves, named
+# here as direct edges to audited nodes rather than a new `hmac 0.12` for the
+# workspace's `sha2 0.10` (DECISIONS 434).
+hmac       = "0.13"
+sha2-hmac  = { package = "sha2", version = "0.11" }
 
 thiserror  = "2"
 # Naming rules in the `policies:` block take a regular expression

@@ -41,7 +41,9 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 14;
+pub const SCHEMA_VERSION: u32 = 15;
+// 15: an environment's `fingerprint_key_env` / `fingerprint_key_file`, where
+//     its fingerprint key is read from (issue #952, DEC-952.1).
 // 14: doctor's explicit paths-only projection, before declaration/identity or
 //     environment reads, for contained isolated compose capture (issue #745).
 // 2: the `data:` block (ADR-0004). An editor notices — it completes a block

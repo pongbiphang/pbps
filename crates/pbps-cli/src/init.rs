@@ -149,6 +149,8 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
                 url_env: var.clone(),
                 description: None,
                 resolve_with: None,
+                fingerprint_key_env: None,
+                fingerprint_key_file: None,
             },
         );
     }
@@ -702,6 +704,8 @@ mod tests {
                 url_env: "null".to_owned(),
                 description: None,
                 resolve_with: None,
+                fingerprint_key_env: None,
+                fingerprint_key_file: None,
             },
         );
         let config = Config {

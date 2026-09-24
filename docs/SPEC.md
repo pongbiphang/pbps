@@ -722,9 +722,9 @@ evidence and target preconditions join the approved plan's checksum. `apply`
 checks those preconditions and executes the fixed plan, without starting a
 resolver or choosing new changes. Unknown required bindings prevent artifact
 creation before deployment approval, not at an interactive production prompt.
-For confidential resolver evidence, the plan checksum remains the approval and
-audit identifier but requires the protected display, invocation and persistence
-paths in §9.3.2/ADR-0016. This does not replace explicit `--checksum` approval.
+The fingerprints that evidence carries are keyed to the target environment
+(§9.3.2, DEC-952.1), so the plan checksum stays an ordinary approval and audit
+identifier. This does not replace explicit `--checksum` approval.
 
 Because the change set is pinned by checksum, a coarse flag like `--allow` is
 safe: **what gets approved is exactly the plan approved at the deployment gate,
@@ -971,26 +971,14 @@ CREATE TABLE dbo.__pbps_lock (
 );
 ```
 
-**Planned confidential resolver artifacts (§9.3.2):** their `plan_checksum`,
-including copies inside snapshots, remains confidential. Resolver publication
-and pre-apply qualification must cover direct ledger readers, database audit/log
-destinations and state/history exports; masking CLI output alone is insufficient.
-Refuse unknown or overly broad access rather than changing grants silently.
-Persist classification in versioned ledger/snapshot metadata with the checksum
-so later readers do not depend on retaining the original plan file.
-Readers must propagate the classification or omit confidential verifiers from
-ordinary output; an unknown historical classification is not proof of publicity.
-Proven legacy formats without this evidence retain ordinary-plan handling.
-
-Pre-feature timeline readers can still expose the existing checksum projection
-without accepting a new state format. Versioned metadata alone is insufficient.
-[#594](https://github.com/pongbiphang/pbps/issues/594) must separately establish
-and test the ledger/legacy-access compatibility boundary before confidential
-resolver plans may be published, applied or recorded. This is a hard delivery
-prerequisite, not a warning or a claim that old readers already refuse. The
-layout is protected storage: a confidential record's snapshot and checksum live
-in a separate reader-qualified ledger table, and its ordinary row keeps a NULL
-checksum and a stub `state_json` (DEC-868.1).
+**Resolver evidence in the ledger (§9.3.2):** a resolver plan's fingerprints are
+HMAC-SHA256 under the target environment's fingerprint key (DEC-952.1). Without
+the key they test no guess of the literals they cover, and neither do the
+`plan_checksum` and snapshots derived from them. They are recorded as any plan's
+are: in `__pbps_state`, readable as the rest of the ledger is. No protected
+ledger table, reader qualification or legacy-reader boundary is needed, because
+nothing recorded is a verifier to hide. This supersedes the protected storage of
+DEC-868.1 (#594).
 
 The **whole snapshot** is stored rather than a delta or a checksum: drift
 detection can then compare in full, the snapshot doubles as a backup, and it can
@@ -1152,6 +1140,7 @@ each configured environment as well as the project.
 | Command | Purpose |
 |---|---|
 | `pbps doctor` | Whether this project — and each environment it can reach — is ready to deploy from (see 9.5) |
+| `pbps key generate [--out FILE]` | A new fingerprint key for one environment: base64 on stdout, or a new owner-only file. pbps does not keep it (see 9.3.2) |
 
 That `plan` needs no database is deliberate: **when production cannot be reached
 directly, a developer can still author intent and review a preview locally**.
@@ -1325,6 +1314,7 @@ environments:
   prod:
     url_env: PROD_DB
     resolve_with: scratch
+    fingerprint_key_env: PROD_FINGERPRINT_KEY   # or fingerprint_key_file:
 ```
 
 `pull: never` is the default and requires a preloaded image when acquisition
@@ -1445,29 +1435,29 @@ Existing unrelated connection defaults are unchanged; apply does not contact
 a resolver.
 
 The user's managed declarations and explicit deployment changes remain ordinary
-reviewable plan contents. Fingerprints can verify guesses of low-entropy
-confidential literals: omitting plaintext does not make an artifact secret-free.
-Plans with external-input fingerprints are conservatively classified
-confidential/secret-bearing, with a checksum-covered classification validated
-from their evidence. Publication requires qualified, access-controlled handling
-for recipients authorized for those inputs; public or unknown handling refuses.
-Those recipients can still review offline without production credentials.
-Ordinary diagnostics/logs/`explain` omit the digests and equivalent guessing
-verifiers; derived checksums inherit confidentiality where they expose the same
-oracle. Do not strip required evidence to produce a public applyable plan.
-ADR-0016 defines this boundary without a new approval or key-management service.
-The boundary includes the plan checksum's existing consumers: protected
-plan/explain/UI/CI output, a private launch environment for literal `--checksum`
-arguments, and qualified ledger/audit/history access. Ordinary explain output
-uses a placeholder rather than printing a confidential checksum or runnable
-approval command. The launch boundary must hold before process arguments or
-shell traces receive the checksum. Publication and pre-apply checks refuse
-unknown ledger/audit protection; no automatic grant changes or alternate
-approval token are introduced. These consumers must be qualified before enabling
-confidential resolver artifacts; existing ordinary plans keep their behavior.
-This includes the blocking legacy-reader design, implementation and compatibility
-tests tracked in §8.1/#594; a newer client or format label alone does not enable
-the confidential path.
+reviewable plan contents. A bare hash of a definition would be a guessing
+oracle: anyone knowing the rest of it could test candidate low-entropy literals
+against the digest. So every external-input fingerprint is **keyed**:
+HMAC-SHA256 under the target environment's fingerprint key (DEC-952.1). Without
+the key, a fingerprint, and the plan checksum and snapshots derived from it,
+tests no guess. Plans, `explain`, CI logs, `--checksum` arguments and the ledger
+therefore handle them as any plan's.
+
+The key is configured per environment, never shared and never defaulted:
+
+- `fingerprint_key_env` names the variable that carries it, as `url_env` does
+  for the connection string. `fingerprint_key_file` names an owner-only file.
+- It is base64 of at least 32 bytes. `pbps key generate` makes one, and
+  `pbps doctor` checks it and shows its key identifier.
+- A plan records the identifier (derived from the key, never the key) beside the
+  fingerprints it seals (#614). `apply` under a different key refuses with a
+  replan remedy (#616). Resolver planning without a key refuses.
+
+pbps generates and checks keys; it does not store, share or rotate them, so this
+is no key-management service (ADR-0016 decision 5, as amended). A leaked key
+restores the guessing exposure to whoever holds it and the ledger, and nothing
+more. The plaintext of retained definitions stays private during reconstruction,
+as above: keying the verifiers does not declassify the source.
 
 #### 9.3.3 Resolver environment discovery (partial delivery)
 
@@ -1653,6 +1643,12 @@ commits) and then each environment: reachability, server version, edition and
 therefore whether `strategy: online` can be honoured here, the database-scoped
 permissions the account is missing *and what each is for*, and whether the
 environment is uninitialized, locked or mid-deployment on a staged checkpoint.
+Without connecting, it also reads each environment's fingerprint key
+(§9.3.2):
+- a key that loads is reported by its identifier;
+- one that is configured but missing, short, malformed, or in a file others can
+  read is an error;
+- none configured is a note, since only engine-assisted planning needs one.
 
 Two rules hold it in place:
 
@@ -1808,11 +1804,8 @@ It answers, from the file alone:
 | What exactly do I type? | the `apply` command, with the target, `--checksum`, `--allow` and `--staged` filled in — or, for a preview, the `plan --db` that would produce an applyable artifact, since `apply` refuses a preview whatever it is given |
 | What am I approving? | the plan checksum `apply` will recompute and require to match the explicit `--checksum` supplied by the deployment gate |
 
-**Planned confidential resolver plans (§9.3.2):** the literal checksum and exact
-approval command above require qualified protected output. Ordinary output
-shows the confidential classification and a placeholder, not the verifier or a
-command ready to execute. Authorized offline review still supplies the same
-checksum through a protected launch path; `apply` does not choose the approval.
+A resolver plan's fingerprints are keyed (§9.3.2), so its checksum and approval
+command are shown as any plan's.
 
 A target is **optional**: `--db` / `--env` adds the one question no file can
 answer — whether that environment is mid-deployment on a staged checkpoint. It
