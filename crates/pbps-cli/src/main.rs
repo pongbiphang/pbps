@@ -1094,13 +1094,31 @@ fn cmd_pull(
     // plain-propagating command gets, and `introspect`'s own `DbError` cannot
     // hold that.
     let dialect = dialect(project)?;
-    let mut pulled = db::runtime()?.block_on(async {
+    let pulled = db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
         let mut pulled =
             crate::engine::introspect(&mut conn, crate::engine::Read::Snapshot).await?;
+        // Before the rows are read: a table `validate` would refuse is left
+        // out and named like any other object (DEC-902.1), whether or not
+        // `--data` asked for its rows — so the rows of a table that will not
+        // be declared are neither read nor able to stop the pull (DEC-921.1).
+        let read_before: std::collections::BTreeSet<TableName> =
+            pulled.schema.tables.keys().cloned().collect();
+        adopt::leave_out_what_validate_refuses(&mut pulled, dialect.as_ref());
         // `--data`: the table's rows become a `data: exact` block (ADR-0004),
         // in the engine's own spelling — which is the spelling a declaration
         // has to use to compare equal against this database from now on.
+        let mut data = data;
+        data.retain(|name| {
+            let left_out = read_before.contains(name) && !pulled.schema.tables.contains_key(name);
+            if left_out {
+                pulled.warnings.push(format!(
+                    "--data {name}: its rows were not read, because the table itself was left \
+                     out above"
+                ));
+            }
+            !left_out
+        });
         for name in &data {
             if !pulled.schema.tables.contains_key(name) {
                 anyhow::bail!("--data {name}: this database has no such table");
@@ -1165,10 +1183,6 @@ fn cmd_pull(
         }
         Ok::<_, anyhow::Error>(pulled)
     })?;
-    // Before anything is reported: what `validate` would refuse is reported
-    // as left out, beside what the reader could not express, rather than
-    // written into files the next command refuses (#902).
-    adopt::leave_out_what_validate_refuses(&mut pulled, dialect.as_ref());
 
     for w in pulled.onboarding_notices.iter().chain(&pulled.warnings) {
         eprintln!("warning: {w}");
