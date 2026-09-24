@@ -1182,55 +1182,6 @@ fn cmd_pull(
     for u in &pulled.unexpressible {
         eprintln!("warning: {}", u.what);
     }
-    // The same line `validate` draws, at the moment the block is written
-    // rather than on the next run: a table this size is somebody's business
-    // table, and every plan from here on compares it row by row.
-    //
-    // Drawn by `validate`'s own evaluation of the `data.max-rows` rule,
-    // narrowed to that rule, and not by a count of this command's own: the
-    // rule's severity and row count (DECISIONS 111) and the project's
-    // suppressions all apply here exactly as they do there, so a table the
-    // project has excused by name is not refused at the moment it is
-    // pulled and rejected on the next `validate` (DECISIONS 120). A block
-    // with problems contributes nothing here, as it contributes nothing to
-    // a plan: `validate` reports the problems, and evaluating half a block
-    // would refuse against rules the project did not manage to configure.
-    let policies = project.config.policies();
-    let over: Vec<pbps_model::Finding> = if policies.check().is_empty() {
-        pbps_policy::declarations(&pulled.schema, &policies, &policy_context(project, true))
-            .into_iter()
-            .filter(|f| f.id == pbps_policy::rules::DATA_MAX_ROWS)
-            .collect()
-    } else {
-        Vec::new()
-    };
-    if !over.is_empty() {
-        // At `error` the files are not written at all. `validate` would
-        // reject what this command had just produced, and a pull that
-        // leaves the project failing its own rules has handed over
-        // nothing usable — refusing before the write is the difference
-        // between "no files" and "files you must now delete by hand"
-        // (DECISIONS 114).
-        if over
-            .iter()
-            .any(|f| f.severity == pbps_model::Severity::Error)
-        {
-            anyhow::bail!(
-                "these tables hold more rows than `data.max-rows` allows, and the rule is \
-                 `error` in pbps.yml:\n  {}\n\
-                 Nothing was written. Pull without `--data`, raise the rule's `rows`, \
-                 suppress it for the table with a reason, or lower its severity.",
-                over.iter()
-                    .map(|f| f.message.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n  ")
-            );
-        }
-        for f in &over {
-            eprintln!("{}: {}", f.severity, f.message);
-        }
-    }
-
     // What pbps cannot manage it still names (ADR-0002): an encrypted module or
     // one whose shape the emitter cannot reproduce is left alone, and a pull
     // that stayed quiet about it would tell the user the database is fully
@@ -1272,7 +1223,14 @@ fn cmd_pull(
     // asked about the files themselves (#902).
     let stage = adopt::Stage::new("pull")?;
     adopt::write_declarations(stage.path(), &pulled.schema, &pulled.public_execute)?;
-    adopt::check_staged(stage.path(), dialect.as_ref()).context("pull wrote nothing")?;
+    let loaded =
+        adopt::check_staged(stage.path(), dialect.as_ref()).context("pull wrote nothing")?;
+    // And the project's own rules, as `validate` evaluates them: a pull into a
+    // project whose `pbps.yml` sets a rule to `error` must not leave behind
+    // files that rule refuses (DECISIONS 114, DEC-919.1).
+    for f in adopt::refuse_policy_errors(project, &loaded, dialect.as_ref())? {
+        eprintln!("{}: {}", f.severity, f.message);
+    }
     drop(stage);
 
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot create `{}`", dir.display()))?;

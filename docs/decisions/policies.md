@@ -179,3 +179,23 @@ here.
     per-rule schemas say which parameters, never what they are. A test ties
     every generated entry back to `rules::RULES` and fails if a parameter is
     added to the catalogue without a shape.
+
+<a id="dec-919-1"></a>
+
+**DEC-919.1. An adoption evaluates every declaration rule `validate` does, and
+refuses the write when one is at `error` (#919; amends DECISIONS 120).** 120
+narrowed `pull`'s evaluation to `data.max-rows` because that was the only rule
+the pull's own `--data` could break. But a pull writes names and types too, and a
+project whose `pbps.yml` sets `naming.table` to `error` got files the next
+`validate` refused. `pull` and `init --from` now run the project's rules over the
+staged declarations with `validate`'s type spelling, context and suppressions,
+after DEC-902.1's staged check.
+
+Refused, not left out, which is the opposite of DEC-902.1's answer for the
+validator. A rule is the project's own choice about names and sizes, not
+something the engine cannot do. Its remedy is a line in `pbps.yml` (a
+suppression with a reason, a severity, a parameter), and leaving the table out
+would quietly shrink the adoption to what the rules happen to like. This is
+DECISIONS 114's reason, extended from one rule to all of them. A finding below
+`error` is printed and the files are written. A `policies:` block that is itself
+invalid is not evaluated, as in `validate`, which reports the block.

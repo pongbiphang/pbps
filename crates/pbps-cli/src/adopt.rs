@@ -313,6 +313,51 @@ pub(crate) fn check_staged(dir: &Path, dialect: &dyn Dialect) -> anyhow::Result<
     Ok(loaded)
 }
 
+/// The project's declaration policies over what an adoption is about to
+/// write: every rule `validate` evaluates, with its type spelling, context and
+/// suppressions (ADR-0008). A finding at `error` refuses the write, since the
+/// next `validate` would refuse the project; the rest are returned for the
+/// caller to print.
+///
+/// Refused rather than left out, unlike [`leave_out_what_validate_refuses`]:
+/// a rule is the project's own choice about names and sizes, not something
+/// the engine cannot do, and its remedy — a suppression with a reason, a
+/// different severity — is a line in `pbps.yml` the operator writes, not an
+/// object to settle by hand. Leaving the table out would silently narrow the
+/// adoption to what the project's rules happen to like (DECISIONS 114).
+///
+/// A `policies:` block that is itself invalid is not evaluated, as in
+/// `validate`, which reports it: the block's problem is not the files'.
+pub(crate) fn refuse_policy_errors(
+    project: &pbps_config::Project,
+    loaded: &pbps_load::Loaded,
+    dialect: &dyn Dialect,
+) -> anyhow::Result<Vec<pbps_model::Finding>> {
+    let policies = project.config.policies();
+    if !policies.check().is_empty() {
+        return Ok(Vec::new());
+    }
+    let spelled = crate::types_as_the_dialect_spells_them(&loaded.schema, dialect);
+    let (errors, rest): (Vec<_>, Vec<_>) =
+        pbps_policy::declarations(&spelled, &policies, &crate::policy_context(project, false))
+            .into_iter()
+            .partition(|f| f.severity == pbps_model::Severity::Error);
+    if !errors.is_empty() {
+        anyhow::bail!(
+            "these declarations break a rule `pbps.yml` sets to `error`:\n  {}\n\
+             Nothing was written. Suppress the rule for the object with a reason, lower its \
+             severity, or change its parameters; a table over `data.max-rows` can also be \
+             pulled without `--data`.",
+            errors
+                .iter()
+                .map(|f| format!("{}: {}", f.id, f.message))
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        );
+    }
+    Ok(rest)
+}
+
 /// A scratch directory for staged declarations, removed when dropped.
 ///
 /// Under the system's temporary directory, not the project: a project whose
@@ -608,5 +653,62 @@ mod tests {
         write_declarations(stage.path(), &schema, &Default::default()).unwrap();
         let loaded = check_staged(stage.path(), pg().as_ref()).unwrap();
         assert_eq!(loaded.schema, schema);
+    }
+
+    /// The project's own rules are evaluated as `validate` evaluates them:
+    /// at `error` nothing is written, below it the finding is handed back,
+    /// and a suppression with a reason excuses the table by name (#919).
+    #[test]
+    fn a_rule_the_project_sets_to_error_refuses_the_adoption_and_a_suppression_excuses_it() {
+        let mut schema = Schema::default();
+        schema
+            .tables
+            .insert(TableName::new("app", "Bad"), table("integer", None));
+        schema
+            .tables
+            .insert(TableName::new("app", "good"), table("integer", None));
+        let stage = Stage::new("adopt-policy-test").unwrap();
+        write_declarations(stage.path(), &schema, &Default::default()).unwrap();
+        let loaded = check_staged(stage.path(), pg().as_ref()).unwrap();
+
+        let project_with = |policies: &str| {
+            let dir = Stage::new("adopt-policy-project").unwrap();
+            let config = dir.path().join("pbps.yml");
+            std::fs::write(&config, format!("dialect: postgres\n{policies}")).unwrap();
+            let project = pbps_config::Project::load(&config).unwrap();
+            (dir, project)
+        };
+        let rule = "policies:\n  rules:\n    naming.table: {severity: SEVERITY, pattern: \"^[a-z][a-z0-9_]*$\"}\n";
+
+        let (_d, strict) = project_with(&rule.replace("SEVERITY", "error"));
+        let e = refuse_policy_errors(&strict, &loaded, pg().as_ref())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("naming.table") && e.contains("app.Bad"), "{e}");
+        assert!(e.contains("Nothing was written"), "{e}");
+        assert!(!e.contains("app.good"), "{e}");
+
+        // Below `error` it is reported, not refused.
+        let (_d, lenient) = project_with(&rule.replace("SEVERITY", "warning"));
+        let found = refuse_policy_errors(&lenient, &loaded, pg().as_ref()).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].severity, pbps_model::Severity::Warning);
+
+        // Excused by name, with a reason: the same pull goes through quietly.
+        let excused = format!(
+            "{}  suppress:\n    - rule: naming.table\n      on: app.Bad\n      reason: inherited\n",
+            rule.replace("SEVERITY", "error")
+        );
+        let (_d, excused) = project_with(&excused);
+        let found = refuse_policy_errors(&excused, &loaded, pg().as_ref()).unwrap();
+        assert!(found.is_empty(), "{found:?}");
+
+        // A project with no rules of its own refuses nothing.
+        let (_d, plain) = project_with("");
+        assert!(
+            refuse_policy_errors(&plain, &loaded, pg().as_ref())
+                .unwrap()
+                .is_empty()
+        );
     }
 }
