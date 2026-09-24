@@ -790,3 +790,9 @@ alone allows only `nextval`, which moves forward and reorders nothing. `ALTER
 SEQUENCE` needs ownership, which follows the table's owner and cannot be
 changed apart from it, measured on 18.6 and 16.15, so the trigger rule's owner
 test already covers it. A role that rule names is not named twice.
+
+And the role must be able to call `setval`. `UPDATE` alone is not enough once
+`EXECUTE` on both of its overloads is revoked from `PUBLIC`: measured on 18.6
+and 16.15, each call is then refused, and naming such a role would refuse a
+ledger nobody can reorder. One role reached by `SET ROLE` must hold both the
+`UPDATE` and the `EXECUTE`, since the call runs with that role's privileges.

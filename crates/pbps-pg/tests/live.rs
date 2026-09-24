@@ -7093,6 +7093,51 @@ async fn a_ledger_pbps_did_not_create_is_refused_before_any_write() {
             "UPDATE on the sequence without USAGE on the schema: {problems:?}"
         );
     }
+    // Review of #935: UPDATE is not enough without a callable `setval`. With
+    // EXECUTE on both overloads revoked from PUBLIC the grant is no finding, and
+    // one overload given back makes it one again.
+    db.conn
+        .execute(
+            "REVOKE EXECUTE ON FUNCTION pg_catalog.setval(regclass, bigint) FROM PUBLIC;
+             REVOKE EXECUTE ON FUNCTION pg_catalog.setval(regclass, bigint, boolean) FROM PUBLIC;",
+        )
+        .await
+        .unwrap();
+    {
+        let mut deploying = Conn::connect(Driver::Postgres, &as_role(&deployer))
+            .await
+            .unwrap();
+        let problems = state::ledger_problems(&mut deploying).await.unwrap();
+        assert!(
+            problems.is_empty(),
+            "UPDATE on the sequence with no callable setval: {problems:?}"
+        );
+    }
+    db.conn
+        .execute(&format!(
+            "GRANT EXECUTE ON FUNCTION pg_catalog.setval(regclass, bigint, boolean) TO {attacker};"
+        ))
+        .await
+        .unwrap();
+    {
+        let mut deploying = Conn::connect(Driver::Postgres, &as_role(&deployer))
+            .await
+            .unwrap();
+        let problems = state::ledger_problems(&mut deploying).await.unwrap();
+        let named = format!("id sequence can be reset by `{attacker}`");
+        assert!(
+            problems.iter().any(|p| p.contains(&named)),
+            "UPDATE and one callable setval overload: {problems:?}"
+        );
+    }
+    db.conn
+        .execute(&format!(
+            "REVOKE EXECUTE ON FUNCTION pg_catalog.setval(regclass, bigint, boolean) FROM {attacker};
+             GRANT EXECUTE ON FUNCTION pg_catalog.setval(regclass, bigint) TO PUBLIC;
+             GRANT EXECUTE ON FUNCTION pg_catalog.setval(regclass, bigint, boolean) TO PUBLIC;"
+        ))
+        .await
+        .unwrap();
     db.conn
         .execute(&format!(
             "REVOKE UPDATE ON SEQUENCE public.__pbps_state_id_seq FROM {attacker};

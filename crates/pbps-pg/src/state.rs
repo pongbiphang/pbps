@@ -1047,7 +1047,18 @@ fn ledger_facts() -> String {
             AND EXISTS (
                 SELECT 1 FROM pg_catalog.pg_roles g
                  WHERE pg_catalog.pg_has_role(e.oid, g.oid, 'SET')
-                   AND pg_catalog.has_sequence_privilege(g.oid, d.objid, 'UPDATE'))"
+                   AND pg_catalog.has_sequence_privilege(g.oid, d.objid, 'UPDATE')
+                   -- And can call `setval` at all: measured on 18.6 and 16.15,
+                   -- with EXECUTE on both overloads revoked from PUBLIC, UPDATE
+                   -- alone is refused by either, so naming such a role would
+                   -- refuse a ledger nobody can reorder. The same role `g`
+                   -- must hold both: under `SET ROLE` the call runs with one
+                   -- role's privileges.
+                   AND (pg_catalog.has_function_privilege(
+                            g.oid, 'pg_catalog.setval(pg_catalog.regclass, bigint)', 'EXECUTE')
+                        OR pg_catalog.has_function_privilege(
+                            g.oid, 'pg_catalog.setval(pg_catalog.regclass, bigint, boolean)',
+                            'EXECUTE')))"
     )
 }
 
