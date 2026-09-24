@@ -3,12 +3,14 @@
 
 Build as the ordinary user first and pass the existing test binary. No Docker,
 host mount modification, binary copy, queue contents, or root Cargo is needed.
-A root invocation first drops to the build owner. The host must permit owned
-user namespaces; all mount operations occur inside those private namespaces.
+The caller opens the normally built executable before entering the private
+user namespace. A root caller retains permission to create that namespace on
+hosts that restrict unprivileged UID mappings; its mounts remain private.
 """
 
 import argparse
 import ctypes
+import fcntl
 import os
 from pathlib import Path
 import signal
@@ -23,6 +25,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--test-binary", required=True, type=Path)
     parser.add_argument("--inside", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--binary-fd", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
     binary = args.test_binary
     if sys.platform != "linux" or not binary.is_absolute() or not binary.is_file():
@@ -31,24 +34,33 @@ def main():
         owner = binary.stat()
         if os.geteuid() not in (0, owner.st_uid):
             parser.error("the fixture must run as the build owner or root")
-        if os.geteuid() == 0 and owner.st_uid != 0:
-            # The user namespace must map the build owner to read private
-            # build directories; never relax their permissions or copy them.
+        if args.binary_fd is not None:
+            parser.error("the inherited executable descriptor is internal to the fixture")
+        # Dropping root to the build owner makes UID-map creation depend on
+        # unprivileged-user-namespace policy (the CI runner refuses it).
+        # Open before mapping instead: the root-mapped child can execute this
+        # read-only descriptor even when the user's build directory is private.
+        # No binary copy, ownership change or host policy change is needed.
+        descriptor = os.open(binary, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            source = Path(__file__).read_text()
             return subprocess.run([
-                "setpriv", f"--reuid={owner.st_uid}", f"--regid={owner.st_gid}",
-                "--clear-groups", sys.executable, str(Path(__file__).resolve()),
-                "--test-binary", str(binary),
-            ], timeout=60).returncode
-        return subprocess.run([
-            "unshare", "--user", "--map-root-user", "--mount", "--ipc",
-            "--propagation", "private", "--", sys.executable, str(Path(__file__).resolve()),
-            "--inside", "--test-binary", str(binary),
-        ], timeout=60).returncode
+                "unshare", "--user", "--map-root-user", "--mount", "--ipc",
+                "--propagation", "private", "--", sys.executable, "-c", source,
+                "--inside", "--test-binary", f"/proc/self/fd/{descriptor}",
+                "--binary-fd", str(descriptor),
+            ], pass_fds=(descriptor,), timeout=60).returncode
+        finally:
+            os.close(descriptor)
 
     # The initial user namespace maps the full UID range, never just one UID.
     fields = Path("/proc/self/uid_map").read_text().split()
     assert len(fields) == 3 and fields[0] == "0" and fields[2] == "1"
     assert os.geteuid() == 0 and os.uname().machine == "x86_64"
+    descriptor = args.binary_fd
+    assert descriptor is not None and descriptor >= 3
+    assert binary == Path(f"/proc/self/fd/{descriptor}")
+    assert fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY
     signal.alarm(45)
     libc = ctypes.CDLL(None, use_errno=True)
     libc.syscall.restype = ctypes.c_long
@@ -94,7 +106,7 @@ def main():
                 child = subprocess.Popen(["/usr/bin/sleep", "40"])
                 env["PBPS_PSEUDO_TARGET_PID"] = str(child.pid)
             result = subprocess.run([str(binary), "--ignored", "--exact", TEST,
-                                     "--nocapture"], env=env, timeout=35)
+                                     "--nocapture"], env=env, pass_fds=(descriptor,), timeout=35)
             return result.returncode
         finally:
             if child is not None:
