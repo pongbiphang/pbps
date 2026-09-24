@@ -987,8 +987,10 @@ without accepting a new state format. Versioned metadata alone is insufficient.
 [#594](https://github.com/pongbiphang/pbps/issues/594) must separately establish
 and test the ledger/legacy-access compatibility boundary before confidential
 resolver plans may be published, applied or recorded. This is a hard delivery
-prerequisite, not a warning or a claim that old readers already refuse. No
-physical ledger layout or migration protocol is selected here (ADR-0016).
+prerequisite, not a warning or a claim that old readers already refuse. The
+layout is protected storage: a confidential record's snapshot and checksum live
+in a separate reader-qualified ledger table, and its ordinary row keeps a NULL
+checksum and a stub `state_json` (DEC-868.1).
 
 The **whole snapshot** is stored rather than a delta or a checksum: drift
 detection can then compare in full, the snapshot doubles as a backup, and it can
