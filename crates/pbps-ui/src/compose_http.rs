@@ -194,10 +194,15 @@ impl Compose {
                         });
                     }
                 };
+                // Every refusal here precedes publication: an expired,
+                // replaced or unknown handle, a changed preview clock or a
+                // releasing candidate. 410 says "nothing was published;
+                // preview again", which the page must not read as the
+                // uncertain 409 of a publisher that may hold a receipt.
                 let candidate = self
                     .candidates
                     .confirm(&candidate_id, SystemTime::now())
-                    .map_err(refused)?;
+                    .map_err(|error| (410, error.to_string()))?;
                 let mut outcome = publisher.confirm(&candidate);
                 // A refused confirmation persisted nothing (run.rs refuses
                 // only before the durable commit intent); any other status

@@ -232,7 +232,7 @@ fn compose_actions_keep_the_viewer_gate_and_accept_nothing_else() {
         ),
         (
             "handle never previewed",
-            409,
+            410,
             served
                 .action(
                     "confirm",
@@ -661,4 +661,28 @@ fn another_projects_receipt_never_blocks_a_preview_from_the_same_base() {
     assert_eq!(sibling.status, 409, "{}", sibling.body);
     // `second` shares `f`'s checkout and remote; `f` alone cleans them up.
     std::mem::forget(second);
+}
+
+#[test]
+fn a_replaced_handle_is_a_definite_refusal_not_an_unknown_outcome() {
+    let f = Fixture::new("viewer-compose-replaced");
+    let served = serve(&f);
+    let first = served.action("preview", intent()).json();
+    // A second preview (another tab, or Refresh) replaces the first handle.
+    let second = served.action("preview", intent()).json();
+    let stale = served.action(
+        "confirm",
+        serde_json::json!({"candidate_id": first["candidate_id"]}),
+    );
+    // Refused before publication: 410, never the uncertain 409.
+    assert_eq!(stale.status, 410, "{}", stale.body);
+    assert!(stale.body.contains("replaced"), "{}", stale.body);
+    assert!(!f.record(first["operation_id"].as_str().unwrap()).exists());
+    let delivered = served
+        .action(
+            "confirm",
+            serde_json::json!({"candidate_id": second["candidate_id"]}),
+        )
+        .json();
+    assert_eq!(delivered["status"], "delivered", "{delivered}");
 }

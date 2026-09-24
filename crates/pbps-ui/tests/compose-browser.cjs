@@ -265,6 +265,28 @@ async function discoverOnMount() {
   PbpsCompose.mount(new Element("section", doc), (action) => { quiet.push(action); return new Promise(() => {}); }, {});
   assert.equal(quiet.length, 0);
 }
+async function definiteHandleRefusal() {
+  // A 410 means the handle expired or was replaced before publication.
+  const a = setup();
+  let p = a.form.fire("submit"); a.calls[0].resolve(preview("gone")); await p;
+  p = a.confirm.fire("click");
+  const gone = new Error("The candidate is unknown or was replaced; refresh the preview");
+  gone.status = 410;
+  a.calls[1].reject(gone); await p;
+  assert(a.confirm.disabled);
+  assert(!a.root.find(e => e.dataset.action === "preview").disabled, "Refresh is available");
+  assert(!a.field("message").disabled);
+  assert(!a.root.find(e => e.dataset.action === "recover"), "nothing to recover");
+  assert(a.root.find(e => e.textContent.includes("nothing was published")));
+  // Any other failure stays an unknown outcome with recovery.
+  const b = setup();
+  p = b.form.fire("submit"); b.calls[0].resolve(preview("lost")); await p;
+  p = b.confirm.fire("click");
+  const lost = new Error("busy"); lost.status = 409;
+  b.calls[1].reject(lost); await p;
+  assert(b.root.find(e => e.dataset.action === "recover"));
+  assert(b.root.find(e => e.dataset.action === "preview").disabled);
+}
 async function definiteRefusals() {
   for (const problem of ["remote_unavailable", "signing_unavailable"]) {
     const a = setup();
@@ -297,4 +319,4 @@ async function definiteRefusals() {
     assert(a.root.find(e => e.dataset.action === "recover"));
   }
 }
-exercise().then(outcomes).then(definiteRefusals).then(staleRefusal).then(mergeRequests).then(retirement).then(discoverOnMount).then(() => process.stdout.write("compose browser behavior passed\n"), error => { console.error(error); process.exitCode = 1; });
+exercise().then(outcomes).then(definiteRefusals).then(staleRefusal).then(mergeRequests).then(retirement).then(discoverOnMount).then(definiteHandleRefusal).then(() => process.stdout.write("compose browser behavior passed\n"), error => { console.error(error); process.exitCode = 1; });
