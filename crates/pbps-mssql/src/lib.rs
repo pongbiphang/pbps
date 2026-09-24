@@ -29,6 +29,7 @@ use pbps_model::{
 };
 
 pub mod catalog;
+pub mod confidential;
 pub mod doctor;
 pub mod edition;
 pub mod emit;

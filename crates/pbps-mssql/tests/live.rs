@@ -2377,6 +2377,379 @@ async fn a_project_table_the_collation_folds_onto_the_protected_name_is_refused(
     db.drop().await;
 }
 
+/// Not a secret: the logins below exist for one test inside a throwaway
+/// container, and each test drops its own.
+const READER_PASSWORD: &str = "pbpsReader!880";
+
+/// A connection string for `login` into `database`, on the test server.
+fn conn_str_as(login: &str, database: &str) -> String {
+    let base = conn_str()
+        .split(';')
+        .filter(|p| {
+            let k = p
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            !matches!(
+                k.as_str(),
+                "user id" | "uid" | "password" | "pwd" | "database"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    format!("{base};User Id={login};Password={READER_PASSWORD};Database={database}")
+}
+
+/// Creates a login and its user in `db`, for the reader-qualification tests.
+async fn reader_login(db: &mut TestDb, login: &str) {
+    db.conn
+        .execute(&format!(
+            "IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];
+             CREATE LOGIN [{login}] WITH PASSWORD = '{READER_PASSWORD}', CHECK_POLICY = OFF;
+             CREATE USER [{login}] FOR LOGIN [{login}];"
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("create {login}: {e}"));
+}
+
+async fn drop_logins(db: TestDb, logins: &[String]) {
+    let mut conn = connect_live(&conn_str()).await.expect("connect");
+    db.drop().await;
+    for login in logins {
+        let _ = conn
+            .execute(&format!(
+                "IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"
+            ))
+            .await;
+    }
+}
+
+fn names(problems: &[String], who: &str) -> bool {
+    problems.iter().any(|p| p.contains(&format!("`{who}`")))
+}
+
+/// #880: every path DEC-868.1 lists makes its principal a reader, a grantor
+/// or a backup principal of the protected table, and each is named unless it
+/// can become the deployment account. The deployer here is `sysadmin`, so
+/// nobody below can; the controls are a login with no path, and a `db_owner`
+/// member, which can `EXECUTE AS` any user in the database (measured) and so
+/// qualifies by what it can do rather than by an exemption.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn every_unqualified_reader_grantor_and_backup_principal_is_named() {
+    let mut db = TestDb::create("readers").await;
+    let schema = Schema::default();
+    let ids = IdsFile::default();
+    let mut full = snapshot(pbps_model::StateKind::Apply, &schema, &ids);
+    full.plan_checksum = Some("e".repeat(64));
+    let stub = snapshot(pbps_model::StateKind::Apply, &schema, &ids);
+    pbps_mssql::state::record_confidential(&mut db.conn, &stub, &full)
+        .await
+        .unwrap();
+    let pid = std::process::id();
+    let login = |key: &str| format!("pbps880_{key}_{pid}");
+    let t = "dbo.__pbps_state_confidential";
+    let paths: Vec<(String, String)> = vec![
+        ("table".into(), format!("GRANT SELECT ON {t} TO [{}];", login("table"))),
+        ("column".into(), format!("GRANT SELECT ON {t} (state_id) TO [{}];", login("column"))),
+        ("schema".into(), format!("GRANT SELECT ON SCHEMA::dbo TO [{}];", login("schema"))),
+        ("database".into(), format!("GRANT SELECT TO [{}];", login("database"))),
+        ("datareader".into(), format!("ALTER ROLE db_datareader ADD MEMBER [{}];", login("datareader"))),
+        ("member".into(), format!(
+            "CREATE ROLE [r880_{pid}]; GRANT SELECT ON {t} TO [r880_{pid}];
+             ALTER ROLE [r880_{pid}] ADD MEMBER [{}];", login("member"))),
+        ("impersonator".into(), format!(
+            "GRANT IMPERSONATE ON USER::[{}] TO [{}];", login("table"), login("impersonator"))),
+        ("executeas".into(), format!(
+            "EXEC(N'CREATE PROCEDURE dbo.p880_executeas WITH EXECUTE AS OWNER AS SELECT 1;');
+             GRANT EXECUTE ON dbo.p880_executeas TO [{}];", login("executeas"))),
+        ("chain".into(), format!(
+            "EXEC(N'CREATE PROCEDURE dbo.p880_chain AS SELECT state_id FROM {t};');
+             GRANT EXECUTE ON dbo.p880_chain TO [{}];", login("chain"))),
+        ("signed".into(), format!(
+            "CREATE CERTIFICATE c880 ENCRYPTION BY PASSWORD = '{READER_PASSWORD}' WITH SUBJECT = 'pbps';
+             CREATE USER u880_cert FROM CERTIFICATE c880;
+             GRANT SELECT ON {t} TO u880_cert;
+             EXEC(N'CREATE PROCEDURE dbo.p880_signed AS EXEC(N''SELECT 1'');');
+             ADD SIGNATURE TO dbo.p880_signed BY CERTIFICATE c880 WITH PASSWORD = '{READER_PASSWORD}';
+             GRANT EXECUTE ON dbo.p880_signed TO [{}];", login("signed"))),
+        ("securityadmin".into(), format!("ALTER ROLE db_securityadmin ADD MEMBER [{}];", login("securityadmin"))),
+        ("anyrole".into(), format!("GRANT ALTER ANY ROLE TO [{}];", login("anyrole"))),
+        ("grantoption".into(), format!("GRANT SELECT ON {t} TO [{}] WITH GRANT OPTION;", login("grantoption"))),
+        ("alterschema".into(), format!("GRANT ALTER ON SCHEMA::dbo TO [{}];", login("alterschema"))),
+        ("backupoperator".into(), format!("ALTER ROLE db_backupoperator ADD MEMBER [{}];", login("backupoperator"))),
+        ("backup".into(), format!("GRANT BACKUP DATABASE TO [{}];", login("backup"))),
+        ("server".into(), format!(
+            "USE master; GRANT SELECT ALL USER SECURABLES TO [{}]; USE [{}];", login("server"), db.name)),
+        ("serversecurity".into(), format!(
+            "USE master; ALTER SERVER ROLE securityadmin ADD MEMBER [{}]; USE [{}];",
+            login("serversecurity"), db.name)),
+    ];
+    let controls = [
+        (login("none"), String::new()),
+        (
+            login("owner"),
+            format!("ALTER ROLE db_owner ADD MEMBER [{}];", login("owner")),
+        ),
+    ];
+    let mut logins = Vec::new();
+    for (key, _) in &paths {
+        reader_login(&mut db, &login(key)).await;
+        logins.push(login(key));
+    }
+    for (name, _) in &controls {
+        reader_login(&mut db, name).await;
+        logins.push(name.clone());
+    }
+    for sql in paths
+        .iter()
+        .map(|(_, s)| s)
+        .chain(controls.iter().map(|(_, s)| s))
+    {
+        if !sql.is_empty() {
+            db.conn
+                .execute(sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+    }
+    db.conn
+        .execute(&format!(
+            "CREATE APPLICATION ROLE [a880_{pid}] WITH PASSWORD = '{READER_PASSWORD}';
+             GRANT SELECT ON {t} TO [a880_{pid}];"
+        ))
+        .await
+        .unwrap();
+
+    let problems = pbps_mssql::confidential::protected_reader_problems(&mut db.conn)
+        .await
+        .expect("qualify");
+    for (key, _) in &paths {
+        assert!(
+            names(&problems, &login(key)),
+            "{key} is not named: {problems:#?}"
+        );
+    }
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.contains(&format!("application role `a880_{pid}`"))),
+        "{problems:#?}"
+    );
+    for (name, _) in &controls {
+        assert!(!names(&problems, name), "{name} is named: {problems:#?}");
+    }
+    drop_logins(db, &logins).await;
+}
+
+/// #880: a session, trace, audit or tracking feature that would record the
+/// confidential write is named, and stops being named once it is gone.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn statement_capture_and_table_tracking_are_named_until_removed() {
+    let mut db = TestDb::create("capture").await;
+    let schema = Schema::default();
+    let ids = IdsFile::default();
+    let mut full = snapshot(pbps_model::StateKind::Apply, &schema, &ids);
+    full.plan_checksum = Some("e".repeat(64));
+    let stub = snapshot(pbps_model::StateKind::Apply, &schema, &ids);
+    pbps_mssql::state::record_confidential(&mut db.conn, &stub, &full)
+        .await
+        .unwrap();
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dbn = db.name.clone();
+    // (what the problem says, how to set it up, how to take it down)
+    let cases: Vec<(String, String, String)> = vec![
+        (
+            format!("extended-event session `pbps880_{pid}` records rpc_completed"),
+            format!(
+                "CREATE EVENT SESSION [pbps880_{pid}] ON SERVER ADD EVENT sqlserver.rpc_completed
+                   ADD TARGET package0.ring_buffer;
+                 ALTER EVENT SESSION [pbps880_{pid}] ON SERVER STATE = START;"
+            ),
+            format!(
+                "ALTER EVENT SESSION [pbps880_{pid}] ON SERVER STATE = STOP;
+                 DROP EVENT SESSION [pbps880_{pid}] ON SERVER;"
+            ),
+        ),
+        (
+            "records event 10".into(),
+            format!(
+                "DECLARE @id int, @on bit = 1;
+                 EXEC sp_trace_create @id OUTPUT, 0, N'/var/opt/mssql/log/pbps880_{nanos}';
+                 EXEC sp_trace_setevent @id, 10, 1, @on;
+                 EXEC sp_trace_setstatus @id, 1;"
+            ),
+            format!(
+                "DECLARE @id int = (SELECT id FROM sys.traces
+                                     WHERE path LIKE N'%pbps880_{nanos}%');
+                 EXEC sp_trace_setstatus @id, 0; EXEC sp_trace_setstatus @id, 2;"
+            ),
+        ),
+        (
+            format!("database audit specification `pbps880_{pid}` records INSERT"),
+            format!(
+                "USE master;
+                 CREATE SERVER AUDIT [pbps880_{pid}] TO FILE (FILEPATH = '/var/opt/mssql/log/');
+                 ALTER SERVER AUDIT [pbps880_{pid}] WITH (STATE = ON);
+                 USE [{dbn}];
+                 CREATE DATABASE AUDIT SPECIFICATION [pbps880_{pid}] FOR SERVER AUDIT [pbps880_{pid}]
+                   ADD (INSERT ON OBJECT::dbo.__pbps_state_confidential BY public) WITH (STATE = ON);"
+            ),
+            format!(
+                "ALTER DATABASE AUDIT SPECIFICATION [pbps880_{pid}] WITH (STATE = OFF);
+                 DROP DATABASE AUDIT SPECIFICATION [pbps880_{pid}];
+                 USE master;
+                 ALTER SERVER AUDIT [pbps880_{pid}] WITH (STATE = OFF);
+                 DROP SERVER AUDIT [pbps880_{pid}];
+                 USE [{dbn}];"
+            ),
+        ),
+        (
+            "change tracking tracks it".into(),
+            format!(
+                "ALTER DATABASE [{dbn}] SET CHANGE_TRACKING = ON;
+                 ALTER TABLE dbo.__pbps_state_confidential ENABLE CHANGE_TRACKING;"
+            ),
+            format!(
+                "ALTER TABLE dbo.__pbps_state_confidential DISABLE CHANGE_TRACKING;
+                 ALTER DATABASE [{dbn}] SET CHANGE_TRACKING = OFF;"
+            ),
+        ),
+        (
+            "change data capture tracks it".into(),
+            "EXEC sys.sp_cdc_enable_db;
+             EXEC sys.sp_cdc_enable_table @source_schema = N'dbo',
+               @source_name = N'__pbps_state_confidential', @role_name = NULL;"
+                .into(),
+            "EXEC sys.sp_cdc_disable_db;".into(),
+        ),
+    ];
+    for (says, up, down) in &cases {
+        let before = pbps_mssql::confidential::protected_reader_problems(&mut db.conn)
+            .await
+            .unwrap();
+        assert!(
+            !before.iter().any(|p| p.contains(says)),
+            "{says}: {before:#?}"
+        );
+        db.conn
+            .execute(up)
+            .await
+            .unwrap_or_else(|e| panic!("{up}: {e}"));
+        let during = pbps_mssql::confidential::protected_reader_problems(&mut db.conn).await;
+        db.conn
+            .execute(down)
+            .await
+            .unwrap_or_else(|e| panic!("{down}: {e}"));
+        let during = during.unwrap();
+        assert!(
+            during.iter().any(|p| p.contains(says)),
+            "{says}: {during:#?}"
+        );
+        let after = pbps_mssql::confidential::protected_reader_problems(&mut db.conn)
+            .await
+            .unwrap();
+        assert!(
+            !after.iter().any(|p| p.contains(says)),
+            "{says}: {after:#?}"
+        );
+    }
+    db.drop().await;
+}
+
+/// #880 on first use by a deployer that is neither `sysadmin` nor the
+/// database's owner. Until it is shown the whole catalog it cannot establish
+/// anything, and says which grant is missing. Then the table it would create
+/// is qualified as `dbo`'s — the schema's owner, which cannot be changed
+/// (measured, Msg 15150) — so a `SELECT` on schema `dbo` names its holder, and
+/// the database's owner, which can become the deployer's user, is not named.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_first_use_by_a_deployer_that_does_not_own_the_database_qualifies_dbos_table() {
+    let mut db = TestDb::create("firstuse").await;
+    let pid = std::process::id();
+    let deployer = format!("pbps880_deployer_{pid}");
+    let owner = format!("pbps880_dbowner_{pid}");
+    let reader = format!("pbps880_schemareader_{pid}");
+    reader_login(&mut db, &deployer).await;
+    reader_login(&mut db, &reader).await;
+    db.conn
+        .execute(&format!(
+            "IF SUSER_ID('{owner}') IS NOT NULL DROP LOGIN [{owner}];
+             CREATE LOGIN [{owner}] WITH PASSWORD = '{READER_PASSWORD}', CHECK_POLICY = OFF;
+             ALTER AUTHORIZATION ON DATABASE::[{0}] TO [{owner}];
+             GRANT SELECT ON SCHEMA::dbo TO [{reader}];",
+            db.name
+        ))
+        .await
+        .unwrap();
+    let logins = vec![deployer.clone(), owner.clone(), reader.clone()];
+    let mut as_deployer = connect_live(&conn_str_as(&deployer, &db.name))
+        .await
+        .expect("connect as the deployer");
+
+    let blind = pbps_mssql::confidential::protected_reader_problems(&mut as_deployer)
+        .await
+        .unwrap();
+    for grant in [
+        "VIEW ANY DEFINITION",
+        "VIEW SERVER STATE",
+        "ALTER TRACE",
+        "sys.sql_expression_dependencies",
+    ] {
+        assert!(
+            blind.iter().any(|p| p.contains(grant)),
+            "{grant} not named: {blind:#?}"
+        );
+    }
+    assert!(!names(&blind, &reader), "{blind:#?}");
+
+    db.conn
+        .execute(&format!(
+            "USE master; GRANT VIEW ANY DEFINITION, VIEW SERVER STATE, ALTER TRACE TO [{deployer}];
+             USE [{0}]; GRANT SELECT ON sys.sql_expression_dependencies TO [{deployer}];",
+            db.name
+        ))
+        .await
+        .unwrap();
+    let seen = pbps_mssql::confidential::protected_reader_problems(&mut as_deployer)
+        .await
+        .unwrap();
+    assert!(
+        !seen.iter().any(|p| p.contains("cannot establish")),
+        "{seen:#?}"
+    );
+    let named = seen
+        .iter()
+        .find(|p| p.contains(&format!("`{reader}`")))
+        .unwrap_or_else(|| panic!("{reader} not named: {seen:#?}"));
+    assert!(
+        named.contains("which this deployment would create"),
+        "{named}"
+    );
+    for qualified in [&deployer, &owner] {
+        assert!(!names(&seen, qualified), "{qualified}: {seen:#?}");
+    }
+
+    db.conn
+        .execute(&format!("REVOKE SELECT ON SCHEMA::dbo FROM [{reader}];"))
+        .await
+        .unwrap();
+    let revoked = pbps_mssql::confidential::protected_reader_problems(&mut as_deployer)
+        .await
+        .unwrap();
+    assert!(!names(&revoked, &reader), "{revoked:#?}");
+    drop(as_deployer);
+    drop_logins(db, &logins).await;
+}
+
 /// SPEC §8.1: the whole state goes in and comes back out unchanged. Everything
 /// downstream — drift, the plan checksum, `status` — reads this row, so a
 /// serialization that lost a field would make every one of them quietly wrong.

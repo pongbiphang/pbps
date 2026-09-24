@@ -768,3 +768,97 @@ created `USING heap` too. `prune`'s one gate now covers all three tables, so a
 view at the protected name is refused before the combined delete (#885). A
 table inheriting from the protected one is refused rather than deleted around
 with `ONLY`, as for the other two.
+
+<a id="dec-880-1"></a>
+
+**DEC-880.1. SQL Server qualifies the protected table's readers from catalog
+rows it has first proved complete, and every approximation errs towards a
+reader (#880; implements DEC-868.1 "Who may read it" for SQL Server).** The
+engine answers "may I" only for the session's own principal
+(`HAS_PERMS_BY_NAME`). Asking it about anyone else means `EXECUTE AS`, which
+needs `IMPERSONATE` that a deployment account must not hold. So
+`confidential::protected_reader_problems` reads the server and database
+principals, their role memberships, their permissions, the code that runs in
+the database and its signatures, and combines them in Rust.
+
+*Completeness first.* Measured on SQL Server 2025, a login with no grants
+sees its own server principal and no other user's database principals,
+memberships or permissions. `VIEW ANY DEFINITION` and `VIEW SERVER STATE`
+show every row. `sys.traces` needs `ALTER TRACE`, and
+`sys.sql_expression_dependencies` needs `SELECT` on the view, which only
+`db_owner` holds by default. The qualification therefore refuses, naming the
+missing grant, unless the deployer is `sysadmin` or holds all four and no
+effective `DENY` of `VIEW DEFINITION` hides part of the database. An unseen
+principal is not an absent one. `doctor` asks for these grants (#881).
+
+*Readers.* A principal reads the table through any of these paths:
+- ownership, `dbo` or `db_owner`, or `db_datareader`;
+- `SELECT` or `CONTROL`, on the table (including a column), on schema `dbo` or
+  on the database, directly or through any role, `public` included;
+- `CONTROL SERVER`, `sysadmin` or `SELECT ALL USER SECURABLES`;
+- running code that reads the table: `EXECUTE AS` a reader, an ownership
+  chain (code owned by the table's owner that names the table), or a
+  signature by a certificate or key mapped to a reader. A trigger counts for
+  whoever can write its table, and a database DDL trigger for everyone;
+- becoming a reader: `IMPERSONATE` or `CONTROL` on a reader user or login, to
+  a fixed point.
+
+A login enters as its mapped user, as `dbo` when it is `sysadmin` or owns the
+database, or else as `guest` when `guest` may connect.
+
+*Grantors and backup principals.* Grantors are:
+- server level: `securityadmin`, `ALTER ANY LOGIN`, `ALTER ANY SERVER ROLE`,
+  and `ALTER`/`CONTROL` on a reader login;
+- database level: `db_owner`, `db_securityadmin`, `ALTER ANY ROLE`,
+  `ALTER ANY USER`, `ALTER ANY APPLICATION ROLE`, `ALTER`/`CONTROL`/
+  `TAKE OWNERSHIP` on the table, schema `dbo` or the database, a grant option
+  on `SELECT`/`CONTROL`, and `ALTER`/`CONTROL` on a reader principal.
+
+Backup principals are `db_owner`, `db_backupoperator`, and holders of
+`BACKUP DATABASE`, `BACKUP LOG` or `CONTROL` on the database.
+
+*Actors and the rule.* The principals a person uses are:
+- logins, except those mapped to a certificate or key and the engine's `##`
+  principals;
+- database principals entered without a login: contained users, application
+  roles, and `guest` when it may connect.
+
+Each actor that reads, grants or backs up must be able to become the
+deployment account, either its login or its database user, or else be
+`sysadmin`. Becoming is:
+- at the login: `IMPERSONATE`/`CONTROL` on the deployer's login,
+  `IMPERSONATE ANY LOGIN` or `CONTROL SERVER`;
+- at the user: `IMPERSONATE`/`CONTROL` on the deployer's user, or `CONTROL` of
+  the database, which `dbo` and `db_owner` hold. Measured: a `db_owner` member
+  can `EXECUTE AS USER` both `dbo` and the deployer.
+
+So the database's owner qualifies by what it can do, and needs no exemption
+(#863). There is no allowance beyond this rule.
+
+*Where the approximations lean.* A `DENY` never removes a reader, because
+telling which grant it overrides would be a second implementation of the
+engine's precedence. For the same reason, any `DENY` of `IMPERSONATE` or
+`CONTROL` in an actor's reach withdraws its qualification. Code is a reader
+path only through its execution context, an ownership chain on a name the
+dependency view records, or a signature. Dynamic SQL in caller-context code
+breaks the chain, as the engine does.
+
+*Before the table exists.* The schema `dbo` cannot change owner (measured,
+Msg 15150), so the prospective table is owned by `dbo`, whose login is the
+database owner. It is qualified with the schema and database permissions a new
+table inherits and no object-level ones. The caller re-qualifies the actual
+table before the first write (#870).
+
+*Capture.* The following are named as problems of their own:
+- a running extended-event session with a statement, RPC, batch, prepare or
+  showplan event;
+- a running trace with the matching SQL Trace events;
+- an enabled server or database audit specification that records
+  `SCHEMA_OBJECT_ACCESS_GROUP` or batches, or any database audit action on the
+  database, schema `dbo` or the table;
+- replication, change data capture or change tracking on the table.
+
+The event lists are known capture events, not every event. A session built
+only from events outside them is not named, and that is the method's stated
+limit. The plan cache and Query Store are left to #918, because
+they fall outside the list #880 was given.
