@@ -1,0 +1,723 @@
+//! What depends on a module a PostgreSQL plan drops, and where the plan
+//! accounts for it (#314, ADR-0009 §4, DEC-314.1).
+//!
+//! Every module change on this engine is a `DROP` and a `CREATE` (ADR-0009 §3),
+//! and the engine refuses the `DROP` while anything depends on the module: a
+//! view over a view, a check constraint or a column default calling a
+//! function, an index using one. `modules::dependents` has enumerated those
+//! from `pg_depend` since ADR-0009 §4 was written, and nothing called it — so a
+//! saved plan could omit an unchanged dependent and reach an engine-refused
+//! `DROP` at apply time, which is the applyable-and-predictably-fails outcome
+//! SPEC §7.5 exists to prevent.
+//!
+//! The planner's half is [`weave`]: every dependent the plan does not already
+//! remove before the module's drop is removed there, and every dependent the
+//! declarations keep is put back after the module's create, in the plan where
+//! the approver sees it. The apply's half is [`unaccounted`], which only asks
+//! whether the saved plan still removes everything that depends on what it
+//! drops — a dependent created after planning is one the approver never saw,
+//! and the plan is refused rather than extended.
+//!
+//! Pure over the dependents already read, so the ordering is testable without
+//! an engine; the reads are `engine::module_dependents`'.
+
+use std::collections::BTreeMap;
+
+use pbps_dialect::Dialect;
+use pbps_model::{
+    Change, ChangeSet, ColumnRef, IdsFile, ModuleId, ModuleKind, PlannedChange, Schema,
+};
+use pbps_pg::modules::{Dependent, Holds, Part};
+
+/// Every module this plan drops, rebuilt or not, in plan order: an
+/// `AlterModule` (emitted as a drop and a create in one step) and a
+/// `DropModule` (alone, or paired with a `CreateModule` of the same id).
+///
+/// A plain drop is here too, unlike `engine::rebuilt_modules`: a rebuild is
+/// what `before_a_rebuild` is about, but a dependent refuses the `DROP`
+/// whether or not a `CREATE` follows it.
+// The complement is every change that does not drop a module.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub(crate) fn dropped_modules(changes: &ChangeSet) -> Vec<(ModuleId, ModuleKind)> {
+    let mut out: Vec<(ModuleId, ModuleKind)> = Vec::new();
+    for p in &changes.changes {
+        let found = match &p.change {
+            Change::AlterModule { id, module } => Some((id.clone(), module.kind)),
+            Change::DropModule { id, kind } => Some((id.clone(), *kind)),
+            _ => None,
+        };
+        if let Some(found) = found
+            && !out.iter().any(|(id, _)| *id == found.0)
+        {
+            out.push(found);
+        }
+    }
+    out
+}
+
+/// Where a dropped module leaves the plan and where it comes back.
+struct Span {
+    drop_at: usize,
+    create_at: Option<usize>,
+}
+
+#[allow(clippy::wildcard_enum_match_arm)]
+fn span(changes: &[PlannedChange], root: &ModuleId) -> Option<Span> {
+    let mut drop_at = None;
+    let mut create_at = None;
+    for (i, p) in changes.iter().enumerate() {
+        match &p.change {
+            Change::AlterModule { id, .. } if id == root => {
+                drop_at = Some(i);
+                create_at = Some(i);
+            }
+            Change::DropModule { id, .. } if id == root => drop_at = Some(i),
+            Change::CreateModule { id, .. } if id == root => create_at = Some(i),
+            _ => {}
+        }
+    }
+    let drop_at = drop_at?;
+    Some(Span {
+        drop_at,
+        create_at: create_at.filter(|c| *c >= drop_at),
+    })
+}
+
+/// Whether `change` removes exactly this dependent.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn removes(change: &Change, holds: &Holds) -> bool {
+    match (holds, change) {
+        (Holds::Module(x), Change::DropModule { id, .. }) => id == x,
+        (Holds::TablePart { table, part }, change) => match (part, change) {
+            (Part::Check(n), Change::DropCheck { table: t, name }) => t == table && name == n,
+            (Part::Index(n), Change::DropIndex { table: t, name }) => t == table && name == n,
+            (
+                Part::Default(c),
+                Change::AlterColumnDefault {
+                    column, to: None, ..
+                },
+            ) => column.table == *table && column.name == *c,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Whether `change` creates exactly this dependent.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn restores(change: &Change, holds: &Holds) -> bool {
+    match (holds, change) {
+        (Holds::Module(x), Change::CreateModule { id, .. }) => id == x,
+        (Holds::TablePart { table, part }, change) => match (part, change) {
+            (Part::Check(n), Change::AddCheck { table: t, name, .. }) => t == table && name == n,
+            (Part::Index(n), Change::AddIndex { table: t, name, .. }) => t == table && name == n,
+            (
+                Part::Default(c),
+                Change::AlterColumnDefault {
+                    column,
+                    from: None,
+                    to: Some(_),
+                    ..
+                },
+            ) => column.table == *table && column.name == *c,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Whether `change` takes the dependent away with something larger: its
+/// table, or the column a default belongs to. The plan still needs the exact
+/// removal before the module's drop, but a dependent it takes away this way
+/// is one the declarations let go of, not one they fail to hold.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn removes_with_its_owner(change: &Change, holds: &Holds) -> bool {
+    match (holds, change) {
+        (Holds::TablePart { table, .. }, Change::DropTable { name, .. }) => name == table,
+        (
+            Holds::TablePart {
+                table,
+                part: Part::Default(c),
+            },
+            Change::DropColumn { column, .. },
+        ) => column.table == *table && column.name == *c,
+        _ => false,
+    }
+}
+
+/// Replaces one change that edits this dependent in place with its removal
+/// and its restoration, side by side, so each half can be put on its own side
+/// of the module: a view's `AlterModule` is one step that drops and creates,
+/// and a default changed from one expression to another is one statement.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn split_in_place_edit(changes: &mut Vec<PlannedChange>, holds: &Holds, dialect: &dyn Dialect) {
+    let Some(i) = changes.iter().position(|p| match (holds, &p.change) {
+        (Holds::Module(x), Change::AlterModule { id, .. }) => id == x,
+        (
+            Holds::TablePart {
+                table,
+                part: Part::Default(c),
+            },
+            Change::AlterColumnDefault {
+                column,
+                from: Some(_),
+                to: Some(_),
+                ..
+            },
+        ) => column.table == *table && column.name == *c,
+        _ => false,
+    }) else {
+        return;
+    };
+    let (removal, restoration) = match changes[i].change.clone() {
+        Change::AlterModule { id, module } => (
+            Change::DropModule {
+                id: id.clone(),
+                kind: module.kind,
+            },
+            Change::CreateModule { id, module },
+        ),
+        Change::AlterColumnDefault {
+            uid,
+            column,
+            from,
+            to,
+        } => (
+            Change::AlterColumnDefault {
+                uid: uid.clone(),
+                column: column.clone(),
+                from,
+                to: None,
+            },
+            Change::AlterColumnDefault {
+                uid,
+                column,
+                from: None,
+                to,
+            },
+        ),
+        _ => return,
+    };
+    changes.splice(
+        i..=i,
+        [planned(removal, dialect), planned(restoration, dialect)],
+    );
+}
+
+fn planned(change: Change, dialect: &dyn Dialect) -> PlannedChange {
+    let mut p = PlannedChange::new(change);
+    p.risks = dialect.change_risks(&p.change);
+    p
+}
+
+/// The change that removes a dependent the plan does not remove yet.
+fn removal_of(d: &Dependent, declared: &Schema, ids: &[&IdsFile]) -> Result<Change, String> {
+    match &d.holds {
+        Holds::Module(x) => {
+            // Only a declared module reaches here: an undeclared one the plan
+            // does not remove was refused above, and one it does remove is
+            // moved rather than synthesized.
+            let kind = declared
+                .modules
+                .get(x)
+                .map(|m| m.kind)
+                .ok_or_else(|| format!("{}: its kind is not declared", d.described))?;
+            Ok(Change::DropModule {
+                id: x.clone(),
+                kind,
+            })
+        }
+        Holds::TablePart { table, part } => Ok(match part {
+            Part::Check(name) => Change::DropCheck {
+                table: table.clone(),
+                name: name.clone(),
+            },
+            Part::Index(name) => Change::DropIndex {
+                table: table.clone(),
+                name: name.clone(),
+            },
+            Part::Default(column) => {
+                let column = ColumnRef::new(table.clone(), column.clone());
+                let uid = ids
+                    .iter()
+                    .find_map(|ids| ids.column_uid(&column))
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!("{}: no identity names column `{column}`", d.described)
+                    })?;
+                Change::AlterColumnDefault {
+                    uid,
+                    from: declared
+                        .tables
+                        .get(table)
+                        .and_then(|t| t.columns.get(&column.name))
+                        .and_then(|c| c.default.clone()),
+                    column,
+                    to: None,
+                }
+            }
+        }),
+        Holds::Unrepresentable(why) => Err(format!("{} — {why}", d.described)),
+    }
+}
+
+/// The change that puts a declared dependent back.
+fn restoration_of(d: &Dependent, declared: &Schema, ids: &[&IdsFile]) -> Option<Change> {
+    match &d.holds {
+        Holds::Module(x) => declared.modules.get(x).map(|m| Change::CreateModule {
+            id: x.clone(),
+            module: Box::new(m.clone()),
+        }),
+        Holds::TablePart { table, part } => {
+            let t = declared.tables.get(table)?;
+            match part {
+                Part::Check(name) => t.checks.get(name).map(|c| Change::AddCheck {
+                    table: table.clone(),
+                    name: name.clone(),
+                    constraint: c.clone(),
+                }),
+                Part::Index(name) => t.indexes.get(name).map(|i| Change::AddIndex {
+                    table: table.clone(),
+                    name: name.clone(),
+                    index: Box::new(i.clone()),
+                }),
+                Part::Default(column) => {
+                    let to = t.columns.get(column)?.default.clone()?;
+                    let column = ColumnRef::new(table.clone(), column.clone());
+                    let uid = ids.iter().find_map(|ids| ids.column_uid(&column))?.clone();
+                    Some(Change::AlterColumnDefault {
+                        uid,
+                        column,
+                        from: None,
+                        to: Some(to),
+                    })
+                }
+            }
+        }
+        Holds::Unrepresentable(_) => None,
+    }
+}
+
+/// Puts every dependent of every module this plan drops on the right side of
+/// that drop: removed before it, and — when the declarations keep it —
+/// restored after the module's create. Returns how many changes it added.
+///
+/// A change the plan already has is moved rather than duplicated: a view the
+/// declarations drop is dropped before the function under it, not after; a
+/// view the declarations edit is split into its drop and its create, one on
+/// each side. What the plan does not have is synthesized from the
+/// declarations, which is the only place pbps can put an object back from.
+///
+/// Refused, with every name, when a dependent cannot be accounted for: one
+/// the model cannot represent, one this project does not declare and the plan
+/// does not remove, and one the declarations keep on a module this plan
+/// drops for good (`DROP … CASCADE` is not offered, SPEC 14.3).
+///
+/// `found` is each dropped module's dependents in `modules::dependents`'
+/// order, deepest first; the removals go in that order and the restorations
+/// in its reverse, which is DECISIONS 311's topological order.
+pub(crate) fn weave(
+    cs: &mut ChangeSet,
+    found: &BTreeMap<ModuleId, Vec<Dependent>>,
+    declared: &Schema,
+    ids: &[&IdsFile],
+    dialect: &dyn Dialect,
+) -> Result<usize, String> {
+    let roots = dropped_modules(cs);
+    let mut refused: Vec<String> = Vec::new();
+    for (root, _) in &roots {
+        let Some(deps) = found.get(root) else {
+            continue;
+        };
+        let blocked: Vec<Dependent> = deps
+            .iter()
+            .filter(|d| {
+                let accounted = cs.changes.iter().any(|p| {
+                    removes(&p.change, &d.holds) || removes_with_its_owner(&p.change, &d.holds)
+                });
+                matches!(d.holds, Holds::Unrepresentable(_)) || (!d.managed(declared) && !accounted)
+            })
+            .cloned()
+            .collect();
+        if let Some(why) = pbps_pg::modules::unmanaged_refusal(root, &blocked, &Schema::default()) {
+            refused.push(why);
+        }
+    }
+    if !refused.is_empty() {
+        return Err(refused.join("\n\n"));
+    }
+
+    let before = cs.changes.len();
+    for (root, _) in &roots {
+        let Some(deps) = found.get(root) else {
+            continue;
+        };
+        for d in deps {
+            split_in_place_edit(&mut cs.changes, &d.holds, dialect);
+            let Some(at) = span(&cs.changes, root) else {
+                continue;
+            };
+            // Removed before the module's drop: moved there if the plan
+            // removes it later, synthesized there if it does not remove it.
+            let removal = cs.changes.iter().position(|p| removes(&p.change, &d.holds));
+            let removed_at = match removal {
+                Some(i) if i < at.drop_at => i,
+                Some(i) => {
+                    let moved = cs.changes.remove(i);
+                    cs.changes.insert(at.drop_at, moved);
+                    at.drop_at
+                }
+                None => {
+                    let change = removal_of(d, declared, ids)?;
+                    cs.changes.insert(at.drop_at, planned(change, dialect));
+                    at.drop_at
+                }
+            };
+            if !d.managed(declared) {
+                continue;
+            }
+            // Kept by the declarations: back after the module's create, or
+            // anywhere after its own removal when the module is gone for good.
+            let Some(at) = span(&cs.changes, root) else {
+                continue;
+            };
+            let after = at.create_at.unwrap_or(removed_at);
+            let restoration = cs
+                .changes
+                .iter()
+                .position(|p| restores(&p.change, &d.holds));
+            match restoration {
+                Some(j) if j > after => {}
+                Some(j) => {
+                    let moved = cs.changes.remove(j);
+                    // `after` moved down by one if the restoration was above it.
+                    let after = if j < after { after - 1 } else { after };
+                    cs.changes.insert(after + 1, moved);
+                }
+                None if at.create_at.is_some() => {
+                    let change = restoration_of(d, declared, ids).ok_or_else(|| {
+                        format!(
+                            "{}: the declarations hold it, but not in a form pbps can restore",
+                            d.described
+                        )
+                    })?;
+                    cs.changes.insert(after + 1, planned(change, dialect));
+                }
+                None => {
+                    return Err(format!(
+                        "`{root}` is dropped by this plan, and {} depends on it and is kept by \
+                         the declarations. Remove the dependency from its declaration, or keep \
+                         `{root}`, and plan again.",
+                        d.described
+                    ));
+                }
+            }
+        }
+    }
+    Ok(cs.changes.len() - before)
+}
+
+/// Every dependent of a module this plan drops that the plan does not remove
+/// before that drop, named: the apply's question, asked of the saved plan as
+/// it stands. Empty when the plan accounts for everything — which is what
+/// [`weave`] leaves it in.
+pub(crate) fn unaccounted(
+    cs: &ChangeSet,
+    found: &BTreeMap<ModuleId, Vec<Dependent>>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for (root, _) in dropped_modules(cs) {
+        let (Some(deps), Some(at)) = (found.get(&root), span(&cs.changes, &root)) else {
+            continue;
+        };
+        for d in deps {
+            let removed_first = cs.changes[..at.drop_at]
+                .iter()
+                .any(|p| removes(&p.change, &d.holds));
+            if !removed_first {
+                out.push(format!("{} depends on `{root}`", d.described));
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pbps_model::{CheckConstraint, Column, Module, Table, TableName, Uid, UidKind};
+
+    fn pg() -> Box<dyn Dialect> {
+        Box::new(pbps_pg::Postgres::new())
+    }
+
+    fn id(s: &str) -> ModuleId {
+        s.parse().unwrap()
+    }
+
+    fn module(kind: ModuleKind, definition: &str) -> Module {
+        Module {
+            kind,
+            description: None,
+            definition: definition.into(),
+        }
+    }
+
+    fn view(name: &str) -> Dependent {
+        Dependent {
+            described: format!("view {name}"),
+            holds: Holds::Module(id(name)),
+        }
+    }
+
+    fn part(part: Part, described: &str) -> Dependent {
+        Dependent {
+            described: described.into(),
+            holds: Holds::TablePart {
+                table: TableName::new("app", "t"),
+                part,
+            },
+        }
+    }
+
+    /// A function `app.f(integer)`, a table whose check and default call it,
+    /// and three views, each over the one before.
+    fn declared() -> (Schema, IdsFile) {
+        let mut s = Schema::default();
+        s.modules.insert(
+            id("app.f(integer)"),
+            module(
+                ModuleKind::Function,
+                "(x integer) RETURNS integer LANGUAGE sql AS $$ SELECT x $$",
+            ),
+        );
+        for (name, over) in [
+            ("app.v0", "app.t"),
+            ("app.v1", "app.v0"),
+            ("app.v2", "app.v1"),
+        ] {
+            s.modules.insert(
+                id(name),
+                module(ModuleKind::View, &format!("SELECT id FROM {over}")),
+            );
+        }
+        let mut t = Table::default();
+        t.columns.insert(
+            "id".into(),
+            Column::new("integer".parse().unwrap()).not_null(),
+        );
+        let mut n = Column::new("integer".parse().unwrap());
+        n.default = Some("app.f(1)".into());
+        t.columns.insert("n".into(), n);
+        t.checks.insert(
+            "ck".into(),
+            CheckConstraint {
+                expression: "app.f(id) >= 0".into(),
+            },
+        );
+        s.tables.insert(TableName::new("app", "t"), t);
+        let mut ids = IdsFile::default();
+        ids.columns.insert(
+            Uid::derived(UidKind::Column, "app.t.n", 0),
+            ColumnRef::new(TableName::new("app", "t"), "n"),
+        );
+        (s, ids)
+    }
+
+    fn plan(changes: Vec<Change>) -> ChangeSet {
+        ChangeSet {
+            changes: changes.into_iter().map(PlannedChange::new).collect(),
+        }
+    }
+
+    // A test rendering: every other change prints as itself.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    fn rendered(cs: &ChangeSet) -> Vec<String> {
+        cs.changes
+            .iter()
+            .map(|p| match &p.change {
+                Change::DropModule { id, .. } => format!("drop {id}"),
+                Change::CreateModule { id, .. } => format!("create {id}"),
+                Change::AlterModule { id, .. } => format!("alter {id}"),
+                Change::DropCheck { name, .. } => format!("drop check {name}"),
+                Change::AddCheck { name, .. } => format!("add check {name}"),
+                Change::AlterColumnDefault { column, to, .. } => {
+                    format!("default {} -> {to:?}", column.name)
+                }
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    fn alter(s: &Schema, name: &str) -> Change {
+        Change::AlterModule {
+            id: id(name),
+            module: Box::new(s.modules[&id(name)].clone()),
+        }
+    }
+
+    /// The case the issue names: a function edit, and a check and a default
+    /// the diff never mentioned. Removed before the rebuild, restored after.
+    #[test]
+    fn a_rebuilt_functions_check_and_default_go_before_it_and_come_back_after() {
+        let (s, ids) = declared();
+        let mut cs = plan(vec![alter(&s, "app.f(integer)")]);
+        let found = BTreeMap::from([(
+            id("app.f(integer)"),
+            vec![
+                part(Part::Check("ck".into()), "constraint ck on table app.t"),
+                part(
+                    Part::Default("n".into()),
+                    "default value for column n of table app.t",
+                ),
+            ],
+        )]);
+        let added = weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).unwrap();
+        assert_eq!(added, 4);
+        assert_eq!(
+            rendered(&cs),
+            [
+                "drop check ck",
+                "default n -> None",
+                "alter app.f(integer)",
+                "default n -> Some(\"app.f(1)\")",
+                "add check ck",
+            ]
+        );
+        assert!(unaccounted(&cs, &found).is_empty());
+        // Every change carries the dialect's own risks: saved-plan
+        // verification recomputes them and would refuse any other answer.
+        for p in &cs.changes {
+            assert_eq!(p.risks, pg().change_risks(&p.change), "{:?}", p.change);
+        }
+    }
+
+    /// A chain of views over a rebuilt view: dropped deepest first, created
+    /// back in reverse (DECISIONS 311).
+    #[test]
+    fn views_over_a_rebuilt_view_are_dropped_deepest_first_and_created_in_reverse() {
+        let (s, ids) = declared();
+        let mut cs = plan(vec![alter(&s, "app.v0")]);
+        let found = BTreeMap::from([(id("app.v0"), vec![view("app.v2"), view("app.v1")])]);
+        weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).unwrap();
+        assert_eq!(
+            rendered(&cs),
+            [
+                "drop app.v2",
+                "drop app.v1",
+                "alter app.v0",
+                "create app.v1",
+                "create app.v2"
+            ]
+        );
+    }
+
+    /// What the plan already does to a dependent is moved, not duplicated: a
+    /// view the declarations drop goes before the function under it, and a
+    /// view they edit is split into its drop and its create.
+    #[test]
+    fn a_dependent_the_plan_already_changes_is_moved_or_split_not_duplicated() {
+        let (mut s, ids) = declared();
+        s.modules.remove(&id("app.v2"));
+        let mut cs = plan(vec![
+            alter(&s, "app.v0"),
+            alter(&s, "app.v1"),
+            Change::DropModule {
+                id: id("app.v2"),
+                kind: ModuleKind::View,
+            },
+        ]);
+        let found = BTreeMap::from([(id("app.v0"), vec![view("app.v2"), view("app.v1")])]);
+        weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).unwrap();
+        assert_eq!(
+            rendered(&cs),
+            [
+                "drop app.v2",
+                "drop app.v1",
+                "alter app.v0",
+                "create app.v1"
+            ]
+        );
+    }
+
+    /// Weaving a woven plan changes nothing, which is what lets the apply ask
+    /// the same question of the saved plan.
+    #[test]
+    fn a_woven_plan_is_a_fixed_point() {
+        let (s, ids) = declared();
+        let mut cs = plan(vec![alter(&s, "app.f(integer)"), alter(&s, "app.v0")]);
+        let found = BTreeMap::from([
+            (
+                id("app.f(integer)"),
+                vec![part(
+                    Part::Check("ck".into()),
+                    "constraint ck on table app.t",
+                )],
+            ),
+            (id("app.v0"), vec![view("app.v2"), view("app.v1")]),
+        ]);
+        weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).unwrap();
+        let once = rendered(&cs);
+        assert_eq!(
+            weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).unwrap(),
+            0
+        );
+        assert_eq!(rendered(&cs), once);
+        assert!(unaccounted(&cs, &found).is_empty());
+    }
+
+    /// The refusals, each with its name: an object this project does not
+    /// declare, one the model cannot represent, and a declared dependent of a
+    /// module the plan drops for good.
+    #[test]
+    fn a_dependent_the_plan_cannot_account_for_refuses_it_by_name() {
+        let (s, ids) = declared();
+        let rebuild = || plan(vec![alter(&s, "app.v0")]);
+
+        let found = BTreeMap::from([(id("app.v0"), vec![view("public.late")])]);
+        let e = weave(&mut rebuild(), &found, &s, &[&ids], pg().as_ref()).unwrap_err();
+        assert!(
+            e.contains("view public.late") && e.contains("does not declare it"),
+            "{e}"
+        );
+
+        let odd = Dependent {
+            described: "index ix on table app.t".into(),
+            holds: Holds::Unrepresentable("an expression index".into()),
+        };
+        let found = BTreeMap::from([(id("app.v0"), vec![odd])]);
+        let e = weave(&mut rebuild(), &found, &s, &[&ids], pg().as_ref()).unwrap_err();
+        assert!(e.contains("index ix on table app.t"), "{e}");
+
+        let mut gone = plan(vec![Change::DropModule {
+            id: id("app.f(integer)"),
+            kind: ModuleKind::Function,
+        }]);
+        let found = BTreeMap::from([(
+            id("app.f(integer)"),
+            vec![part(
+                Part::Check("ck".into()),
+                "constraint ck on table app.t",
+            )],
+        )]);
+        let e = weave(&mut gone, &found, &s, &[&ids], pg().as_ref()).unwrap_err();
+        assert!(
+            e.contains("constraint ck") && e.contains("kept by the declarations"),
+            "{e}"
+        );
+    }
+
+    /// The apply's question, of a plan that does not remove a dependent before
+    /// the drop: it is named, and nothing is added.
+    #[test]
+    fn a_saved_plan_missing_a_removal_names_the_dependent() {
+        let (s, _) = declared();
+        let cs = plan(vec![alter(&s, "app.v0")]);
+        let found = BTreeMap::from([(id("app.v0"), vec![view("public.late")])]);
+        let left = unaccounted(&cs, &found);
+        assert_eq!(left, ["view public.late depends on `app.v0`"]);
+        // And a module with no dependents needs nothing.
+        let none = BTreeMap::from([(id("app.v0"), Vec::new())]);
+        assert!(unaccounted(&cs, &none).is_empty());
+    }
+}

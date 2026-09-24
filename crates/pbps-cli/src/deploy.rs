@@ -3749,15 +3749,29 @@ pub fn cmd_plan_db(
         let checks = async {
             let rename_evidence = crate::engine::external_role_renames(&mut conn, &recorded_snapshot.ids, &resolved.ids)
                 .await?.check;
+            // First, so that what it adds is held to every check after it: a
+            // view this plan now drops and recreates takes `before_a_rebuild`
+            // like one the declarations edit (#314, ADR-0009 §4).
+            let dependents = crate::engine::account_for_module_dependents(
+                &mut conn,
+                &mut cs,
+                &loaded.schema,
+                &[&resolved.ids, &recorded_ids],
+                dialect.as_ref(),
+            )
+            .await?;
             let rebuilds = crate::engine::check_module_rebuilds(&mut conn, &cs, false).await?;
             let drops = crate::engine::check_drop_blockers(&mut conn, &cs).await?;
             crate::engine::prepare_data_writes(&mut conn, &cs, &entry.snapshot, &resolved.ids).await?;
-            Ok::<_, anyhow::Error>((rename_evidence, rebuilds, drops))
+            Ok::<_, anyhow::Error>((rename_evidence, dependents, rebuilds, drops))
         }
         .await;
         let rollback = conn.rollback(dialect.transaction_framing()).await;
-        let (rename_evidence, rebuilds, drop_blockers) = checks?;
+        let (rename_evidence, dependents, rebuilds, drop_blockers) = checks?;
         rollback?;
+        // Again, over what the dependents added: a rebuild the plan now
+        // synthesizes needs the transaction as much as one it was given.
+        crate::engine::require_transactional_rebuilds(conn.driver(), &cs, staged)?;
 
         // The keys were matched to the rows under the type the key column has
         // now (71); a plan that changes that type would carry the mapping
@@ -3924,6 +3938,7 @@ pub fn cmd_plan_db(
                 drop_blockers,
                 missing_roles,
                 rename_evidence,
+                dependents,
                 rebuilds,
             ],
             findings,
@@ -4510,6 +4525,7 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
     let result = async {
         conn.begin(dialect.transaction_framing()).await?;
         crate::engine::external_role_renames(conn, &original_ids, &plan.ids).await?;
+        crate::engine::check_module_dependents(conn, &plan.changes).await?;
         crate::engine::check_module_rebuilds(conn, &plan.changes, false).await?;
         crate::engine::check_drop_blockers(conn, &plan.changes).await?;
         let data_guard =

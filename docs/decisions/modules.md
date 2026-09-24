@@ -1285,3 +1285,48 @@ the [decision record](../DECISIONS.md), which says how to add an entry here.
      pin releases its marker on both paths; the routine lock beside it rolls
      back to its own and does not, which is issue #534 and stays there. Two
      savepoint names, two owners.
+
+<a id="dec-314-1"></a>
+
+**DEC-314.1. A PostgreSQL plan puts every dependent of a module it drops on
+the right side of that drop, and the apply refuses a plan that no longer does
+(#314).** Every module change on this engine is a drop and a create (ADR-0009
+§3), and the engine refuses the `DROP` while anything depends on the module.
+ADR-0009 §4 said so, and `modules::dependents`, `unmanaged_refusal` and
+`to_rebuild` were written for it, but nothing called them. So a function edit
+with a check constraint on it was an applyable plan that predictably failed
+(SPEC §7.5).
+
+`plan --db` now reads the dependents of every module the plan drops, whether
+it is rebuilt or dropped for good, inside its planning transaction and before
+`before_a_rebuild`. Each dependent is removed before the drop, and one the
+declarations keep is restored after the create.
+
+- **Moved, not duplicated.** A change the plan already has is moved rather than
+  added again: a view the declarations drop goes before the function under it,
+  and a view they edit is split into its drop and its create, one on each side.
+- **Synthesized from the declarations.** What the plan lacks is built from the
+  declarations, the only place pbps can put an object back from.
+- **Placed next to the module.** The changes are inserted beside the module
+  rather than left to the differ's order. A `DropCheck` sorts after a
+  `DropModule`, and an `AddCheck` sorts before a `CreateModule`, so the order
+  that works everywhere else is exactly wrong here.
+- **Reversed for the creates.** Removals go in `dependents`' order, deepest
+  first, and restorations in its reverse (DECISIONS 311).
+- **Refused by name.** A dependent the model cannot represent, one the project
+  does not declare and the plan does not remove, and a declared dependent of a
+  module dropped for good all refuse the plan. `CASCADE` is not offered (SPEC
+  14.3).
+
+A synthesized change carries the dialect's own risks for its kind, so a view
+dropped to be rebuilt asks for `--allow destructive`. Saved-plan verification
+recomputes each change's risks from the change and would refuse any other
+answer, and the approver is in fact approving a `DROP VIEW`. Restoring a check
+asks for `constraint` for the same reason: it revalidates the table.
+
+The apply asks only whether the saved plan still removes, before each module's
+drop, everything that depends on it now. A dependent created after planning is
+one the approver never saw, so the plan is refused rather than extended. A
+staged apply runs outside a transaction and cannot ask this. It is covered at
+planning: staged plans already refuse rebuilds, and a plain drop's dependents
+are put in order before the plan is saved.

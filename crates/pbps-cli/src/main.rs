@@ -5,6 +5,7 @@ mod baseline;
 mod cost;
 mod db;
 mod declaration_file;
+mod dependents;
 mod deploy;
 mod dev;
 mod doctor;
