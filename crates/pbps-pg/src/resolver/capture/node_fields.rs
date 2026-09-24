@@ -58,6 +58,7 @@ fn specification(tag: &str, major: u32) -> Option<Specification> {
         (18, "SORTGROUPCLAUSE") => (&["tleSortGroupRef", "eqop", "sortop", "reverse_sort", "nulls_first", "hashable"], &[("eqop", Operator, false), ("sortop", Operator, false)], &[]),
         (16 | 18, "SQLVALUEFUNCTION") => (&["op", "type", "typmod", "location"], &[("type", Type, false)], &[]),
         (16 | 18, "SUBLINK") => (&["subLinkType", "subLinkId", "testexpr", "operName", "subselect", "location"], &[], &[("testexpr", false), ("operName", true), ("subselect", false)]),
+        (16 | 18, "SUBSCRIPTINGREF") => (&["refcontainertype", "refelemtype", "refrestype", "reftypmod", "refcollid", "refupperindexpr", "reflowerindexpr", "refexpr", "refassgnexpr"], &[("refcontainertype", Type, false), ("refelemtype", Type, false), ("refrestype", Type, false), ("refcollid", Collation, false)], &[("refupperindexpr", true), ("reflowerindexpr", true), ("refexpr", false), ("refassgnexpr", false)]),
         (16 | 18, "TABLESAMPLECLAUSE") => (&["tsmhandler", "args", "repeatable"], &[("tsmhandler", Routine, false)], &[("args", true), ("repeatable", false)]),
         (16 | 18, "TARGETENTRY") => (&["expr", "resno", "resname", "ressortgroupref", "resorigtbl", "resorigcol", "resjunk"], &[("resorigtbl", Relation, false)], &[("expr", false)]),
         (16, "VAR") => (&["varno", "varattno", "vartype", "vartypmod", "varcollid", "varnullingrels", "varlevelsup", "varnosyn", "varattnosyn", "location"], &[("vartype", Type, false), ("varcollid", Collation, false)], &[("varnullingrels", true)]),

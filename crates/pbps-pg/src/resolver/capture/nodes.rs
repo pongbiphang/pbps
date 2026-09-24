@@ -452,6 +452,86 @@ mod tests {
         }
     }
 
+    fn subscripts(value: &Value, found: &mut Vec<Node>) {
+        match value {
+            Value::Node(node) => {
+                if node.tag == "SUBSCRIPTINGREF" {
+                    found.push(node.clone());
+                }
+                for value in node.fields.values() {
+                    subscripts(value, found);
+                }
+            }
+            Value::List(values) => {
+                for value in values {
+                    subscripts(value, found);
+                }
+            }
+            Value::Null | Value::Atom(_) | Value::Datum => {}
+        }
+    }
+
+    #[test]
+    fn subscripting_keeps_container_element_result_and_child_bindings() {
+        for (major, fixtures) in [
+            (16, include_str!("fixtures/subscripting-16.nodes")),
+            (18, include_str!("fixtures/subscripting-18.nodes")),
+        ] {
+            for (case, text) in fixtures.lines().enumerate() {
+                let tree = decode(text, major).unwrap_or_else(|e| panic!("{e:?}"));
+                let bindings = references(&tree, major)
+                    .unwrap_or_else(|e| panic!("PG{major} subscript {case}: {e:?}"));
+                let mut nodes = Vec::new();
+                subscripts(&tree, &mut nodes);
+                assert!(!nodes.is_empty());
+                for node in nodes {
+                    for (field, class) in [
+                        ("refcontainertype", ReferenceClass::Type),
+                        ("refelemtype", ReferenceClass::Type),
+                        ("refrestype", ReferenceClass::Type),
+                        ("refcollid", ReferenceClass::Collation),
+                    ] {
+                        let oid = node.number(field).unwrap();
+                        if oid != 0 {
+                            assert!(bindings.iter().any(|binding| binding.oid == oid
+                                && binding.class == class
+                                && binding.path.last().is_some_and(|part| part == field)));
+                        }
+                        let mut missing = node.clone();
+                        missing.fields.remove(field);
+                        assert!(references(&Value::Node(missing), major).is_err());
+                    }
+                    for field in [
+                        "refupperindexpr",
+                        "reflowerindexpr",
+                        "refexpr",
+                        "refassgnexpr",
+                    ] {
+                        let mut malformed = node.clone();
+                        malformed
+                            .fields
+                            .insert(field.into(), Value::Atom("unreadable".into()));
+                        assert!(references(&Value::Node(malformed), major).is_err());
+                    }
+                }
+                let child_binding = |field: &str| {
+                    bindings.iter().any(|binding| {
+                        binding.class == ReferenceClass::Routine
+                            && binding.path.iter().any(|part| part == field)
+                    })
+                };
+                if case == 1 {
+                    assert!(child_binding("refupperindexpr"));
+                    assert!(child_binding("reflowerindexpr"));
+                }
+                if case == 6 {
+                    assert!(child_binding("refupperindexpr"));
+                    assert!(child_binding("refassgnexpr"));
+                }
+            }
+        }
+    }
+
     #[test]
     fn unknown_or_missing_binding_fields_cannot_certify_an_empty_set() {
         let original = actual_tree(18);
