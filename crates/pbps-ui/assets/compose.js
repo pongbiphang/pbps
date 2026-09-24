@@ -339,9 +339,15 @@ globalThis.PbpsCompose = Object.freeze({
     };
     form.addEventListener("input", invalidate);
     form.addEventListener("change", invalidate);
+    // One preview in flight at a time (#857): the server replaces its
+    // candidate in arrival order, so two overlapping requests could leave the
+    // page holding a handle the server already retired.
+    let previewing = false;
     form.addEventListener("submit", async event => {
       event.preventDefault();
-      if (confirming) return;
+      if (confirming || previewing) return;
+      previewing = true;
+      refresh.disabled = true;
       invalidate();
       const mine = generation;
       const kind = fields.kind.value;
@@ -363,6 +369,9 @@ globalThis.PbpsCompose = Object.freeze({
       } catch (_) {
         if (mine !== generation || confirming) return;
         activity.textContent = "Preview failed. Check the inputs with the CLI, then refresh.";
+      } finally {
+        previewing = false;
+        if (!confirming) refresh.disabled = false;
       }
     });
     confirm.addEventListener("click", async () => {
