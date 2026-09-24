@@ -122,18 +122,25 @@ pub(crate) async fn executables(
     };
 
     let mapped = mappings(&lease.read_proc("maps", 8 * 1024 * 1024)?, packages);
+    let mut observed = BTreeMap::new();
+    for (path, mapping) in &mapped {
+        observed.insert(path.clone(), mapped_library(lease, path, mapping).await);
+    }
     let libdir = library_directory(&engine_path);
     let cwd = lease.working_directory()?;
-    // The required libraries first, so that each can claim the mapping it is
-    // loaded through. A mapping is named by the file's resolved path, while
+    // Resolve required names before reporting mappings, so each can claim
+    // the mapping it is loaded through. A mapping is named by the file's
+    // resolved path, while
     // the candidates are spelled the way the engine names the library, and
     // the two differ when the library is installed through a symlink
     // (`$libdir/foo.so -> foo.so.1`): matched by path alone, the target
     // reported the mapped file under one name and the candidate under the
     // other, a fresh scratch backend reported the candidate only, and
     // identical builds were refused on the name (finding on #688). So the
-    // candidate the loader would open is correlated with the mappings by
-    // inode as well, and a mapping it claims is reported under the
+    // candidate the loader would open is correlated by inode, size and content:
+    // an inode alone can belong to an unrelated filesystem (#712). Each
+    // mapping is observed once, so correlation and reporting use the same
+    // evidence. A mapping it claims is reported under the
     // candidate's spelling, which both sides share — once per spelling, since
     // two required names can be two links to one loaded file, and a side
     // that has it loaded must still name both, as the side that has not
@@ -174,17 +181,24 @@ pub(crate) async fn executables(
             ));
             continue;
         };
-        let inode = file.metadata().map(|metadata| metadata.ino()).ok();
-        if let Some(path) = inode.and_then(|inode| {
+        let metadata = file.metadata().ok();
+        let digest = digest_of(&file).await;
+        if let Some(path) = metadata.and_then(|metadata| {
+            let digest = digest.as_ref().ok()?;
             mapped
                 .iter()
-                .find(|(_, mapping)| mapping.inode == inode)
+                .find(|(path, mapping)| {
+                    let loaded = &observed[*path];
+                    mapping.inode == metadata.ino()
+                        && loaded.size == Some(metadata.len())
+                        && loaded.identity.digest.as_ref() == Some(digest)
+                })
                 .map(|(path, _)| path.clone())
         }) {
             claimed.entry(path).or_default().push(candidate);
             continue;
         }
-        late.push(match digest_of(&file).await {
+        late.push(match digest {
             Ok(digest) => ExecutableIdentity {
                 role: ExecutableRole::LateLoaded,
                 path: candidate,
@@ -202,9 +216,9 @@ pub(crate) async fn executables(
         });
     }
     let mut libraries = Vec::new();
-    for (path, mapping) in &mapped {
-        let identity = mapped_library(lease, path, mapping).await;
-        match claimed.get(path) {
+    for (path, observation) in observed {
+        let identity = observation.identity;
+        match claimed.get(&path) {
             Some(spellings) => libraries.extend(spellings.iter().map(|spelling| {
                 let mut aliased = identity.clone();
                 aliased.path = spelling.clone();
@@ -304,7 +318,14 @@ fn is_engine_code(path: &str, packages: &[&str]) -> bool {
         || packages.iter().any(|suffix| name.ends_with(suffix))
 }
 
-async fn mapped_library(lease: &ProcessLease, path: &str, mapping: &Mapping) -> ExecutableIdentity {
+// Keep the measured size beside the identity from that same file handle.
+// A mapping's virtual range is only part of the file, not its content length.
+struct MappedLibrary {
+    identity: ExecutableIdentity,
+    size: Option<u64>,
+}
+
+async fn mapped_library(lease: &ProcessLease, path: &str, mapping: &Mapping) -> MappedLibrary {
     let differs = mapping.deleted || disk_differs(lease, Path::new(path), mapping.inode);
     // A package can acquire and retire individual mappings without changing
     // its content. Reading only its lowest range made a departed range turn
@@ -315,42 +336,58 @@ async fn mapped_library(lease: &ProcessLease, path: &str, mapping: &Mapping) -> 
         std::iter::once((mapping.start, mapping.end)).chain(mapping.alternatives.iter().copied())
     {
         if let Ok(file) = lease.open_proc(&format!("map_files/{start:x}-{end:x}"))
-            && file
-                .metadata()
-                .is_ok_and(|metadata| metadata.ino() == mapping.inode)
+            && let Ok(metadata) = file.metadata()
+            && metadata.ino() == mapping.inode
             && let Ok(digest) = digest_of(&file).await
         {
-            return ExecutableIdentity {
-                role: ExecutableRole::Preloaded,
-                path: path.to_owned(),
-                digest: Some(digest),
-                provenance: Provenance::LoadedContent,
-                disk_differs_from_loaded: Some(differs),
+            return MappedLibrary {
+                identity: ExecutableIdentity {
+                    role: ExecutableRole::Preloaded,
+                    path: path.to_owned(),
+                    digest: Some(digest),
+                    provenance: Provenance::LoadedContent,
+                    disk_differs_from_loaded: Some(differs),
+                },
+                size: Some(metadata.len()),
             };
         }
     }
     if differs {
         // The file on disk is not what is mapped, and the mapped content
         // cannot be read: there is nothing honest to hash.
-        return unreadable(
-            ExecutableRole::Preloaded,
-            path.to_owned(),
-            "the mapped library was replaced or removed on disk and its loaded content cannot be read",
-        );
+        return MappedLibrary {
+            identity: unreadable(
+                ExecutableRole::Preloaded,
+                path.to_owned(),
+                "the mapped library was replaced or removed on disk and its loaded content cannot be read",
+            ),
+            size: None,
+        };
     }
     let on_disk = match lease.open_in_root(path.trim_start_matches('/')) {
-        Ok(file) => digest_of(&file).await,
+        Ok(file) => match file.metadata() {
+            Ok(metadata) => digest_of(&file)
+                .await
+                .map(|digest| (digest, metadata.len())),
+            Err(_) => Err(UnqualifiedProcess),
+        },
         Err(error) => Err(error),
     };
     match on_disk {
-        Ok(digest) => ExecutableIdentity {
-            role: ExecutableRole::Preloaded,
-            path: path.to_owned(),
-            digest: Some(digest),
-            provenance: Provenance::DiskCandidate,
-            disk_differs_from_loaded: Some(false),
+        Ok((digest, size)) => MappedLibrary {
+            identity: ExecutableIdentity {
+                role: ExecutableRole::Preloaded,
+                path: path.to_owned(),
+                digest: Some(digest),
+                provenance: Provenance::DiskCandidate,
+                disk_differs_from_loaded: Some(false),
+            },
+            size: Some(size),
         },
-        Err(_) => unreadable(ExecutableRole::Preloaded, path.to_owned(), "unreadable"),
+        Err(_) => MappedLibrary {
+            identity: unreadable(ExecutableRole::Preloaded, path.to_owned(), "unreadable"),
+            size: None,
+        },
     }
 }
 
@@ -648,7 +685,7 @@ mod tests {
         let maps = lease.read_proc("maps", 8 * 1024 * 1024).unwrap();
         assert_eq!(maps.lines().filter(|line| line.ends_with(&path)).count(), 2);
         let mapping = mappings(&maps, &[]).remove(&path).unwrap();
-        let initial = mapped_library(&lease, &path, &mapping).await;
+        let initial = mapped_library(&lease, &path, &mapping).await.identity;
         assert_eq!(initial.provenance, Provenance::LoadedContent);
         assert_eq!(
             initial.digest,
@@ -699,7 +736,7 @@ mod tests {
                 .open_proc(&format!("map_files/{:x}-{:x}", mapping.start, mapping.end))
                 .is_err()
         );
-        let surviving = mapped_library(&lease, &path, &mapping).await;
+        let surviving = mapped_library(&lease, &path, &mapping).await.identity;
         assert_eq!(
             surviving.provenance,
             Provenance::LoadedContent,
@@ -710,7 +747,7 @@ mod tests {
 
         input.write_all(b"2").unwrap();
         acknowledge("none");
-        let gone = mapped_library(&lease, &path, &mapping).await;
+        let gone = mapped_library(&lease, &path, &mapping).await.identity;
         assert_eq!(gone.provenance, Provenance::DiskCandidate);
         assert_eq!(gone.digest, initial.digest);
         for (target, resolver) in [(&initial, &gone), (&gone, &initial)] {
@@ -721,7 +758,7 @@ mod tests {
             );
         }
         std::fs::remove_file(&path).unwrap();
-        let absent = mapped_library(&lease, &path, &mapping).await;
+        let absent = mapped_library(&lease, &path, &mapping).await.identity;
         assert!(matches!(absent.provenance, Provenance::Unreadable { .. }));
         assert!(absent.digest.is_none());
         input.write_all(b"q").unwrap();
@@ -769,7 +806,7 @@ mod tests {
         assert_eq!(rows[0][4], rows[1][4], "the fixture must reuse an inode");
         assert_ne!(rows[0][3], rows[1][3], "the fixture must use two devices");
         let mapping = mappings(&maps, &[]).remove(&path).unwrap();
-        let initial = mapped_library(&lease, &path, &mapping).await;
+        let initial = mapped_library(&lease, &path, &mapping).await.identity;
         assert_eq!(initial.provenance, Provenance::LoadedContent);
         let first_file = lease
             .open_proc(&format!("map_files/{}", rows[0][0]))
@@ -792,7 +829,7 @@ mod tests {
                 .open_proc(&format!("map_files/{}", rows[1][0]))
                 .is_ok()
         );
-        let departed = mapped_library(&lease, &path, &mapping).await;
+        let departed = mapped_library(&lease, &path, &mapping).await.identity;
         assert_eq!(
             departed.provenance,
             Provenance::DiskCandidate,
@@ -807,6 +844,158 @@ mod tests {
         assert!(child.0.wait().unwrap().success());
         // Both tmpfs mounts belonged only to the child's mount namespace.
         assert!(!Path::new(&path).exists());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the root-owned mapping helper from live-resolver-namespace.py"]
+    async fn an_inode_collision_cannot_lend_mapped_content_to_a_required_candidate() {
+        use pbps_db::resolver::environment::{
+            EnvironmentFacts, RuleVersion, ScopeReport, Verdict, compare_executables,
+        };
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Command, Stdio};
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let helper = std::env::var("PBPS_MAPPING_FIXTURE_HELPER").unwrap();
+        let directory = std::env::var("PBPS_MAPPING_FIXTURE_DIRECTORY").unwrap();
+        let unrelated = format!("{directory}/a/mapping.so");
+        let candidate = format!("{directory}/z/mapping.so");
+        let aliases = [
+            format!("{directory}/alias.so"),
+            format!("{directory}/other.so"),
+        ];
+        let mut child = OwnedChild(
+            Command::new(helper)
+                .args(["candidate-inodes", &directory])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut input = child.0.stdin.take().unwrap();
+        let mut output = BufReader::new(child.0.stdout.take().unwrap());
+        let mut acknowledge = |expected: &str| {
+            let mut line = String::new();
+            output.read_line(&mut line).unwrap();
+            assert_eq!(line.trim(), expected);
+        };
+        acknowledge("ready");
+        for alias in &aliases {
+            std::os::unix::fs::symlink(&candidate, alias).unwrap();
+        }
+        let lease = ProcessLease::capture(child.0.id()).unwrap();
+        let mapped = mappings(&lease.read_proc("maps", 8 * 1024 * 1024).unwrap(), &[]);
+        assert!(!mapped.contains_key(&candidate));
+        let mapping = &mapped[&unrelated];
+        let loaded = lease
+            .open_proc(&format!("map_files/{:x}-{:x}", mapping.start, mapping.end))
+            .unwrap();
+        let disk = lease
+            .open_in_root(aliases[0].trim_start_matches('/'))
+            .unwrap();
+        let loaded_meta = loaded.metadata().unwrap();
+        let disk_meta = disk.metadata().unwrap();
+        assert_eq!(mapping.inode, disk_meta.ino(), "a real inode collision");
+        assert_ne!(loaded_meta.dev(), disk_meta.dev(), "two actual filesystems");
+        assert_eq!(
+            loaded_meta.len(),
+            disk_meta.len(),
+            "size alone is insufficient"
+        );
+        assert_ne!(
+            digest_of(&loaded).await.unwrap(),
+            digest_of(&disk).await.unwrap()
+        );
+
+        let compare = |target: &ExecutableSet, resolver: &ExecutableSet| {
+            let facts = |executables: &ExecutableSet| EnvironmentFacts {
+                catalog: CatalogFacts {
+                    observations: BTreeMap::new(),
+                    extensions: vec![],
+                    available_extensions: BTreeMap::new(),
+                    collations: vec![],
+                    settings: BTreeMap::new(),
+                    visibility: BTreeMap::new(),
+                },
+                executables: executables.clone(),
+            };
+            let mut report = ScopeReport::new(RuleVersion::new("candidate-fixture-v1"));
+            compare_executables(
+                "candidate-fixture-v1",
+                &facts(target),
+                &facts(resolver),
+                &[],
+                &mut report,
+            );
+            report.verdict()
+        };
+        let required = &aliases[..1];
+        let first = executables(&lease, required, "$libdir", &[]).await.unwrap();
+        input.write_all(b"c").unwrap();
+        acknowledge("changed");
+        let changed = executables(&lease, required, "$libdir", &[]).await.unwrap();
+        assert_eq!(
+            compare(&first, &changed),
+            Verdict::Mismatch(vec![format!("library:{}", aliases[0])]),
+            "different required bytes must not verify through an unrelated mapping"
+        );
+        for (set, byte) in [(&first, b'b'), (&changed, b'c')] {
+            let identity = set.libraries.iter().find(|l| l.path == aliases[0]).unwrap();
+            assert_eq!(identity.role, ExecutableRole::LateLoaded);
+            assert_eq!(identity.provenance, Provenance::DiskCandidate);
+            assert_eq!(
+                identity.digest,
+                Some(format!("{:x}", Sha256::digest(vec![byte; 65536])))
+            );
+            assert!(set.libraries.iter().any(|l| l.path == unrelated));
+        }
+        input.write_all(b"s").unwrap();
+        acknowledge("changed");
+        let shorter = executables(&lease, required, "$libdir", &[]).await.unwrap();
+        let identity = shorter
+            .libraries
+            .iter()
+            .find(|l| l.path == aliases[0])
+            .unwrap();
+        assert_eq!(identity.role, ExecutableRole::LateLoaded);
+        assert_eq!(
+            identity.digest,
+            Some(format!("{:x}", Sha256::digest(vec![b'b'; 32768])))
+        );
+
+        // A genuine mapping sorts after the unrelated inode collision. Keep
+        // searching, and preserve both aliases and the direct-plus-alias case.
+        input.write_all(b"r").unwrap();
+        acknowledge("changed");
+        input.write_all(b"2").unwrap();
+        acknowledge("mapped");
+        let now_loaded = executables(&lease, required, "$libdir", &[]).await.unwrap();
+        assert_eq!(compare(&first, &now_loaded), Verdict::Verified);
+        for names in [
+            aliases.to_vec(),
+            vec![candidate.clone(), aliases[0].clone()],
+        ] {
+            let set = executables(&lease, &names, "$libdir", &[]).await.unwrap();
+            assert!(set.libraries.iter().any(|l| l.path == unrelated));
+            for name in &names {
+                let identities: Vec<_> = set.libraries.iter().filter(|l| l.path == *name).collect();
+                assert_eq!(identities.len(), 1);
+                assert_eq!(identities[0].role, ExecutableRole::Preloaded);
+                assert_eq!(identities[0].provenance, Provenance::LoadedContent);
+                assert_eq!(
+                    identities[0].digest,
+                    Some(format!("{:x}", Sha256::digest(vec![b'b'; 65536])))
+                );
+            }
+        }
+        input.write_all(b"q").unwrap();
+        assert!(child.0.wait().unwrap().success());
+        assert!(!Path::new(&unrelated).exists() && !Path::new(&candidate).exists());
     }
 
     #[test]
@@ -1107,7 +1296,7 @@ mod tests {
             .into_iter()
             .find(|(path, _)| path.contains("libc.so"))
             .expect("libc is mapped");
-        let intact = mapped_library(&lease, &libc_path, &libc).await;
+        let intact = mapped_library(&lease, &libc_path, &libc).await.identity;
         assert_eq!(intact.disk_differs_from_loaded, Some(false));
         assert!(intact.digest.is_some());
         // The same library with the inode the mapping would carry after a
@@ -1116,7 +1305,7 @@ mod tests {
             inode: libc.inode + 1,
             ..libc
         };
-        let replaced = mapped_library(&lease, &libc_path, &moved).await;
+        let replaced = mapped_library(&lease, &libc_path, &moved).await.identity;
         match replaced.provenance {
             Provenance::LoadedContent => {
                 // A root inspector read the mapped object itself and still

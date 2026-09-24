@@ -238,6 +238,13 @@ body, or by an operator's `LD_PRELOAD`, is outside this proof domain; and a
 target whose recorded collation version has drifted from its provider's is
 recorded as a limitation, not a resolver mismatch.
 
+Required library aliases are correlated with a mapped file only when its inode,
+measured file size and content digest agree with the candidate (#712). Equal
+inodes on different filesystems do not establish this association, and equal
+sizes alone are insufficient. Each mapping is observed once for both correlation
+and reporting; legitimate symlink spellings remain supported on native and
+overlay filesystems.
+
 Both engine rules require loaded-content evidence for a library already mapped
 into the backend. If `map_files` cannot supply that content, a digest obtained
 from the disk path remains `Unknown` on that side, even when the digests match

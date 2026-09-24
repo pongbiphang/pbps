@@ -34,6 +34,7 @@ NAME_TEST = PREFIX + "opaque_task_names_preserve_observation_identity_and_creden
 GROUP_TEST = PREFIX + "a_process_with_the_kernel_maximum_groups_can_be_captured"
 MAPPING_TEST = "resolver::native::executables::tests::a_surviving_mapping_keeps_loaded_content_after_the_first_range_exits"
 DEVICE_TEST = "resolver::native::executables::tests::a_departed_mapping_cannot_use_the_same_inode_on_another_device"
+CANDIDATE_TEST = "resolver::native::executables::tests::an_inode_collision_cannot_lend_mapped_content_to_a_required_candidate"
 
 
 def run(*args, **kwargs):
@@ -107,6 +108,11 @@ def main():
             test(binary, DEVICE_TEST, dict(os.environ,
                  PBPS_MAPPING_FIXTURE_HELPER=str(helper),
                  PBPS_MAPPING_FIXTURE_DIRECTORY=str(device_directory)), ignored=True)
+            candidate_directory = Path(temporary) / "candidates"
+            candidate_directory.mkdir()
+            test(binary, CANDIDATE_TEST, dict(os.environ,
+                 PBPS_MAPPING_FIXTURE_HELPER=str(helper),
+                 PBPS_MAPPING_FIXTURE_DIRECTORY=str(candidate_directory)), ignored=True)
             pids = []
             for _ in range(2):
                 name = "pbps-namespace-" + uuid.uuid4().hex
