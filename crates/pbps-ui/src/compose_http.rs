@@ -122,10 +122,11 @@ impl Compose {
                     .confirm(&candidate_id, SystemTime::now())
                     .map_err(refused)?;
                 let mut outcome = publisher.confirm(&candidate);
-                // Stale authority is never cured by reconfirming; release the
-                // handle so a fresh preview can be reviewed. A failed release
-                // keeps the workflow and reports its cleanup as pending.
+                // Stale authority is never cured by reconfirming, so release
+                // the handle for a fresh preview. A retirement that fails here
+                // is retried by that preview; the result stays pending.
                 if outcome.status == Status::Refused
+                    && compose::stale_refusal(outcome.problem)
                     && self
                         .candidates
                         .release_stale(&candidate_id, &outcome)

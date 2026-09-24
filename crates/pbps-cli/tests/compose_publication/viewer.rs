@@ -342,3 +342,74 @@ fn a_stale_base_refusal_releases_the_workflow_for_a_fresh_preview() {
         .json();
     assert_eq!(delivered["status"], "delivered", "{delivered}");
 }
+
+#[test]
+fn a_failed_stale_release_is_retried_by_the_next_preview() {
+    let f = Fixture::new("viewer-compose-stale-retry");
+    let served = serve(&f);
+    let first = served.action("preview", intent()).json();
+    let operation = first["operation_id"].as_str().unwrap();
+    // An entry nobody owns blocks the snapshot's retirement (#747).
+    let snapshot = f
+        .repo
+        .root
+        .join(format!(".git/pbps-compose-v2/snapshots/{operation}"));
+    let foreign = snapshot.join("foreign.lock");
+    fs::write(&foreign, "another owner").unwrap();
+    let old = String::from_utf8(git(&f.remote, &["rev-parse", "refs/heads/master"])).unwrap();
+    let old = old.trim();
+    let advanced = String::from_utf8(git(
+        &f.remote,
+        &[
+            "-c",
+            "user.name=Remote",
+            "-c",
+            "user.email=remote@example.test",
+            "commit-tree",
+            &format!("{old}^{{tree}}"),
+            "-p",
+            old,
+            "-m",
+            "advance",
+        ],
+    ))
+    .unwrap();
+    git(
+        &f.remote,
+        &["update-ref", "refs/heads/master", advanced.trim()],
+    );
+    let refused = served
+        .action(
+            "confirm",
+            serde_json::json!({"candidate_id": first["candidate_id"]}),
+        )
+        .json();
+    assert_eq!(refused["problem"], "remote_base_changed", "{refused}");
+    assert_eq!(refused["cleanup_pending"], true);
+    // The page reopens the form; the preview itself retries the release and
+    // says why it cannot proceed while the foreign entry remains.
+    let blocked = served.action("preview", intent());
+    assert_eq!(blocked.status, 409, "{}", blocked.body);
+    assert!(blocked.body.contains("still retiring"), "{}", blocked.body);
+    assert_eq!(fs::read_to_string(&foreign).unwrap(), "another owner");
+    fs::remove_file(&foreign).unwrap();
+    git(&f.remote, &["update-ref", "refs/heads/master", old]);
+    let second = served.action("preview", intent()).json();
+    assert_ne!(second["operation_id"], first["operation_id"]);
+    let released = f.publisher().resource_reports().unwrap();
+    assert_eq!(
+        released
+            .iter()
+            .find(|report| report.operation_id == operation)
+            .unwrap()
+            .state,
+        ResourceState::Spent
+    );
+    let delivered = served
+        .action(
+            "confirm",
+            serde_json::json!({"candidate_id": second["candidate_id"]}),
+        )
+        .json();
+    assert_eq!(delivered["status"], "delivered", "{delivered}");
+}
