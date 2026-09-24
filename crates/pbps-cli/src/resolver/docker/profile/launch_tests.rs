@@ -14,6 +14,9 @@ mod seccomp;
 #[path = "launch_tests/uts.rs"]
 mod uts;
 
+#[path = "launch_tests/pseudo.rs"]
+mod pseudo;
+
 async fn accepts_waiter(change: impl FnOnce(&mut Launch)) -> bool {
     inspect_waiter(change, |run, driver| {
         awaiting_engine(

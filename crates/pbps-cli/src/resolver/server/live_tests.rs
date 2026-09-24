@@ -884,3 +884,6 @@ mod host_files;
 
 #[path = "live_tests/uts.rs"]
 mod uts;
+
+#[path = "live_tests/pseudo.rs"]
+mod pseudo;

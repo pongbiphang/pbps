@@ -37,6 +37,7 @@ QUIET = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
 TESTS = [
     "host_files::host_file_loss_refuses_admission_and_discards_live_analysis",
     "uts::kernel_name_loss_refuses_admission_and_discards_each_live_view",
+    "pseudo::foreign_pseudo_roots_refuse_admission_and_discard_live_analysis",
     "a_supported_dedicated_server_compiles_declarations_and_removes_only_its_own_resources",
     "guard_limits::every_forwarder_guard_requires_effective_descriptor_evidence",
     # PostgreSQL analysis-scope qualification (#610); no-ops on SQL Server (#611).

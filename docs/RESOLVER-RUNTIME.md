@@ -112,7 +112,7 @@ exactly `pbps-resolver`; the complete NIS value must be empty, `(none)` or
 Each process lease retains its UTS namespace handle and identity; existing task
 observations require membership in that runtime's qualified UTS view.
 
-The observer enters only the held UTS namespace on a fresh short-lived thread,
+The UTS reader enters the held namespace on a fresh short-lived thread,
 reads `uname`, and joins the thread before returning. It requires permission to
 join that namespace; unavailable evidence refuses qualification. The ordinary
 observer thread never changes namespace, and no target state is written.
@@ -123,6 +123,40 @@ analysis, independently for the workload and both supplied forwarders. Replacing
 a UTS namespace or changing its names invalidates retained qualification;
 restoring a name cannot revive a discarded analysis. Trusted provisioning still
 owns excluding deliberate changes restored between observations.
+
+### Pseudo-filesystem provenance (#643)
+
+Filesystem type and mount flags do not identify the exposed kernel object.
+For the supplied-server profile, the visible `/sys/fs/cgroup` root must have
+both the device and inode of the held cgroup directory whose limits were
+measured. A host hierarchy root or sibling cgroup is a different root even
+though cgroup v2 uses the same device. The Docker factory and its forwarders
+instead require `/sys` to be actually empty; hidden underlying cgroup rows do
+not make host cgroup state reachable.
+
+Both profiles anchor `/dev/mqueue` to the held IPC namespace. A short-lived
+observer thread enters that namespace and creates a detached read-only mqueue
+view with `fsopen`/`fsconfig`/`fsmount`. Its root identity is retained and the
+visible root is compared on every recheck. The helper does not attach a mount,
+read or write messages, or move the ordinary observer thread. Unavailable
+namespace permission or mount API support refuses qualification. Replacing the
+IPC namespace also invalidates the process lease.
+
+**Named limit: devpts origin.** Creating a devpts filesystem produces a distinct
+instance, including two creations in the same namespaces. A device number distinguishes
+instances but does not identify which one trusted provisioning originally
+created for this runtime. Measured older devpts instances transferred into a
+new private mount namespace retain the same ordinary root, flags and optional
+propagation fields as newly created instances. A new probe produces another
+instance; an empty foreign-process census does not establish historical origin.
+The current kind/flag checks therefore do not certify private terminal origin.
+Trusted provisioning must create the private instance and exclude host or
+transferred foreign terminals; an unknown origin requires reprovisioning.
+
+Measurements cover the stock PostgreSQL and SQL Server image layouts on Docker
+rootful and Podman rootless, with separate owned-namespace counterexamples.
+Podman measurements qualify these filesystem observations only; they do not
+extend native daemon admission, which remains the separate #686 work.
 
 The host kernel, its administrators, the selected daemon and explicitly trusted
 image installation form the provisioning trust boundary. SQL privileges in
@@ -221,7 +255,7 @@ Admission connects through a **Docker-API daemon** (`dockerd`), the same peer-au
 | Record | The daemon's record of the container: running, not privileged, `NetworkMode: none`, a read-only root, a private PID, IPC, UTS and user namespace — Podman's default `shareable` IPC namespace is refused, since another container can join it — no binds, devices, ports, links or volumes, only tmpfs mounts, a memory and PID limit. Its id, init PID, start time and image are pinned, and re-read on every check: a restarted or replaced container is a different runtime |
 | Separation | The container's init and engine service are neither the target's service process nor in any of its PID, mount or network namespaces, and the engine's instance identity is not the target's. Decided **before** the record and containment measurements, so an alias of the target refuses as the target |
 | Network | The container's network namespace holds only a loopback device — a real one, by link type and flag — with no IPv4 or IPv6 route and no address but `::1` |
-| Anchors | PID 1 seen through the container's `/proc` is in its own PID namespace, and its `/sys` shows only that loopback device: a host procfs or sysfs bound in keeps the type and not these |
+| Anchors | PID 1 seen through the container's `/proc` is in its own PID namespace, and its `/sys` shows only that loopback device. The visible cgroup root is the held bounded cgroup; the visible mqueue root belongs to the held IPC namespace. devpts origin remains the named provisioning limit above |
 | Mounts | Every row of the init's mount table, uncollapsed, is one the profile names: the read-only image root; `/proc`, `/sys`, `/dev`, `/dev/pts`, `/dev/mqueue` and `/sys/fs/cgroup` with their kinds and flags; the read-only `/proc` files on the same procfs; the masks Docker lays as empty tmpfs and Podman as binds of `/dev/null`; the tmpfs `/tmp`, `/dev/shm`, `/run` and `/var/tmp`; the runtime's `/etc` files bound read-only from an ordinary filesystem with the complete private contents described above; and the engine's storage as a fresh tmpfs. Two rows at one target are two mounts stacked, which no runtime lays out. Both runtimes' layouts were measured and are pinned by unit tests |
 | Privileges | Every task in the container's PID namespace — not only the ones the service started — at the profile's uid **and** group, with no-new-privileges, a seccomp filter and the capability ceiling, still in the container's network, mount, IPC and UTS namespaces, judged as found rather than against an earlier listing. That a seccomp filter is *loaded* is measured (`Seccomp: 2`); its BPF contents cannot be read from `/proc`, so attesting the exact policy — to exclude a non-IP channel such as `AF_VSOCK` that the loopback network checks do not contain — is the operator's provisioning responsibility, a documented limit (#684) |
 | Resources | cgroup-v2 memory, swap, CPU and PID bounds on the init's cgroup that exist and are within the profile's ceilings; `max` is not a bound. Every task must be in that cgroup or below it |

@@ -273,9 +273,9 @@ const RUNTIME_FILES: &[&str] = &[
 /// The private tmpfs mounts a runtime lays out or the recipe asks for.
 const PRIVATE_TMPFS: &[&str] = &["/dev/shm", "/run", "/tmp", "/var/tmp"];
 
-/// The kinds a kernel keeps one instance of per container, or none at all.
-/// A file the runtime bound in can be on any ordinary filesystem, but never
-/// on one of these.
+/// Pseudo-filesystems are not ordinary backing stores for runtime files.
+/// Their type does not establish origin: cgroup2 shares one hierarchy,
+/// mqueue belongs to an IPC namespace, and devpts is per mount (DEC-643.1).
 const PSEUDO: &[&str] = &["cgroup2", "devpts", "devtmpfs", "mqueue", "proc", "sysfs"];
 
 /// Every row of the container's mount table must be one this profile names.

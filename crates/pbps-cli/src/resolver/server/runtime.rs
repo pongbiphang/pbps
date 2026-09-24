@@ -100,6 +100,7 @@ pub(crate) struct ServerRuntime {
     init: BoundedResourceLease,
     engine: ProcessLease,
     profile: &'static ServerProfile,
+    mqueue: crate::resolver::native::MqueueLease,
 }
 
 impl ServerRuntime {
@@ -107,11 +108,14 @@ impl ServerRuntime {
         processes: ServerProcesses,
         profile: &'static ServerProfile,
     ) -> Result<Self, Error> {
+        let mqueue = crate::resolver::native::MqueueLease::capture(&processes.init)
+            .map_err(Premise::Anchors.named())?;
         Ok(Self {
             init: BoundedResourceLease::capture(processes.init, profile.resources)
                 .map_err(Premise::Resources.named())?,
             engine: processes.engine,
             profile,
+            mqueue,
         })
     }
 
@@ -134,6 +138,10 @@ impl ServerRuntime {
         let init = self.init.process();
         private_endpoint(init).map_err(Premise::Network.named())?;
         anchors(init).map_err(Premise::Anchors.named())?;
+        self.init
+            .check_visible_cgroup()
+            .map_err(Premise::Anchors.named())?;
+        self.mqueue.check(init).map_err(Premise::Anchors.named())?;
         let rows = mount_rows(init).map_err(Premise::Mounts.named())?;
         profile::contained(&rows, self.profile).map_err(Error::Mount)?;
         crate::resolver::native::runtime_files::check(init).map_err(|_| {

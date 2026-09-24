@@ -531,6 +531,9 @@ pub(crate) mod file_fixture;
 pub(crate) mod uts_fixture;
 
 #[cfg(test)]
+pub(crate) mod pseudo_fixture;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;

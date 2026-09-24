@@ -18,6 +18,7 @@ pub(crate) mod executables;
 mod execution;
 mod namespace;
 mod private_channel;
+mod pseudo;
 pub(crate) mod runtime_files;
 mod target;
 mod task_metadata;
@@ -35,6 +36,7 @@ pub(crate) use private_channel::{
     FORWARDER_PRIVILEGES, PrivateChannelLease, PrivateChannelProfile, WorkloadPrivileges,
     awaiting_engine, guarded_tasks, private_network, security,
 };
+pub(crate) use pseudo::MqueueLease;
 pub(crate) use target::TargetWitness;
 pub use target::{
     CaptureFailure, CapturedTargetInputs, EnvironmentError, NativeTarget, NativeTargetError,
