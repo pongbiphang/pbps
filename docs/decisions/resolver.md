@@ -737,3 +737,29 @@ file prerequisites even without extension membership. A catalog read is not a
 native runtime qualification, a scope request is not proof of complete SQL
 analysis, and neither creates an applyable artifact. Reconstruction, compilation,
 ordering and #594's protected publication/apply/recording remain separate gates.
+
+
+<a id="dec-643-1"></a>
+
+**DEC-643.1. Resolver pseudo-filesystems need the identity of the exposed kernel
+object; devpts origin remains a provisioning premise (#643).** A cgroup v2
+filesystem device identifies the shared hierarchy, not the exposed subtree.
+The supplied profile compares its visible root's device and inode with the
+already-held bounded cgroup directory. The factory profile instead requires
+an actually empty `/sys`, making the underlying cgroup mount unreachable.
+Both profiles pin the mqueue root obtained through a detached read-only view
+of the held IPC namespace, and compare the visible root on every recheck.
+The view is created on a short-lived thread: the ordinary observer never
+moves namespaces, no mount is attached, and no target queue is read or written.
+Missing permission or kernel support refuses admission.
+
+Measurements on Docker rootful and Podman rootless stock-image layouts confirm
+the cgroup and mqueue identities; the latter is a filesystem measurement, not
+native Podman daemon admission. Owned namespace probes show that devpts creates
+a distinct instance for each filesystem creation even in the same namespaces. An older
+instance transferred into a new private mount namespace has the same ordinary
+root, flags and propagation fields as a fresh one. Neither a new probe nor
+absence of a live foreign holder establishes its origin. Trusted provisioning
+must supply the private devpts instance and exclude transferred foreign
+terminals; unknown origin requires reprovisioning. The profile's kind/flag
+checks do not certify that historical premise.

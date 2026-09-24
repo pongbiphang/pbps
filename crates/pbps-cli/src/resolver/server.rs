@@ -119,7 +119,7 @@ impl std::fmt::Display for Premise {
             Self::Resources => "the container's cgroup bounds are missing, unreadable or above the profile's ceilings",
             Self::Lease => "the engine service process changed or became unreadable",
             Self::Network => "the container's network namespace is not a lone loopback device with no route out",
-            Self::Anchors => "the container's /proc or /sys is not its own instance",
+            Self::Anchors => "the container's /proc, /sys, cgroup or mqueue does not match its private runtime",
             Self::Mounts => "the container's mount table is unreadable",
             Self::Device => "the container's /dev is not a root-owned tmpfs an unprivileged task cannot write to",
             Self::Occupants => "a task in the container's PID namespace is not at the profile's uid, group, privileges or cgroup",

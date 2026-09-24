@@ -21,6 +21,7 @@ TESTS = [
     for name in [
         "host_information_is_refused_before_engine_initialization",
         "uts::kernel_names_are_required_before_engine_initialization",
+        "pseudo::mqueue_origin_is_required_before_engine_initialization",
         "a_wrong_workload_identity_is_refused_before_initialization",
         "a_guard_without_termination_authority_is_refused_before_initialization",
         "the_launch_cannot_omit_inherited_no_new_privileges",
@@ -50,6 +51,8 @@ def main():
     binary = Path(args.test_binary)
     if not binary.is_absolute() or not binary.is_file() or not Path(args.socket).is_absolute():
         parser.error("requires an absolute existing test binary and absolute Docker socket")
+    subprocess.run([sys.executable, str(Path(__file__).with_name("live-resolver-pseudo.py")),
+                    "--test-binary", str(binary)], check=True)
     env = dict(os.environ, PBPS_RESOLVER_TEST_SOCKET=args.socket,
                PBPS_RESOLVER_TEST_DRIVER=args.engine,
                PBPS_RESOLVER_TEST_IMAGE=IMAGES[args.engine])

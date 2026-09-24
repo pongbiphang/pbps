@@ -56,6 +56,7 @@ pub(crate) struct ExecutionLease {
     cgroup: File,
     cgroup_path: PathBuf,
     profile: ExecutionProfile,
+    mqueue: super::MqueueLease,
 }
 
 impl ExecutionLease {
@@ -67,11 +68,13 @@ impl ExecutionLease {
         if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
             return Err(UnqualifiedProcess);
         }
+        let mqueue = super::MqueueLease::capture(&process)?;
         let lease = Self {
             process,
             cgroup,
             cgroup_path,
             profile,
+            mqueue,
         };
         lease.check()?;
         Ok(lease)
@@ -145,6 +148,9 @@ impl ExecutionLease {
         if sys.next().is_some() {
             return Err(UnqualifiedProcess);
         }
+        // /sys is proven empty above, so no underlying cgroup mount is
+        // reachable. The visible mqueue still needs its own positive anchor.
+        self.mqueue.check(&self.process)?;
         masks::check(&self.process, &parsed)?;
         super::runtime_files::check(&self.process)?;
         self.process.check()
@@ -368,6 +374,15 @@ impl BoundedResourceLease {
 
     pub(crate) fn process(&self) -> &ProcessLease {
         &self.process
+    }
+
+    /// A supplied server exposes cgroupfs, unlike the factory's empty /sys.
+    /// Compare the visible root with the already-held bounded cgroup, not
+    /// only its device or reader-relative mountinfo root (DEC-643.1).
+    pub(crate) fn check_visible_cgroup(&self) -> Result<(), UnqualifiedProcess> {
+        self.check()?;
+        super::pseudo::same_root(&self.cgroup, &self.process.open_in_root("sys/fs/cgroup")?)?;
+        self.check()
     }
 
     pub(crate) fn check(&self) -> Result<(), UnqualifiedProcess> {

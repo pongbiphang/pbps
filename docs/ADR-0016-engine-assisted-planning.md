@@ -330,6 +330,19 @@ Run containers on the pbps host or CI runner. Scratch connections and
 credentials are separate from the target, and a supplied server gets fresh,
 uniquely named scratch databases on a separate instance/cluster.
 
+**Named runtime provenance limit (#643).** cgroup2 device identity alone does
+not identify the exposed subtree, so the supplied-server profile compares its
+visible root with the held bounded cgroup directory. The factory instead proves
+its `/sys` empty. Both profiles anchor mqueue to a detached read-only view of
+the held IPC namespace; unavailable evidence refuses. Each new devpts filesystem has its own
+instance, independent of process namespaces. Measurements show that a transferred
+older instance can retain the expected root, flags and propagation fields;
+a new probe cannot identify the originally provisioned instance. Private devpts
+origin therefore remains a trusted-provisioning premise, with unknown origin
+requiring reprovisioning. This is not a promise of universal mount provenance.
+See [the runtime profile](RESOLVER-RUNTIME.md#pseudo-filesystem-provenance-643)
+and DEC-643.1 for the measured boundary.
+
 **Isolation is an instance/cluster boundary, not a database-name check.**
 Before any scratch DDL, including database creation, or transfer of retained
 external source, establish that the resolver is outside the target PostgreSQL
