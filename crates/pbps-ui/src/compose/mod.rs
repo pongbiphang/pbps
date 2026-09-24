@@ -75,6 +75,8 @@ pub struct Error {
 enum Failure {
     Uncertain,
     CompletedRejection,
+    /// Refused before any durable transition: nothing was written for it.
+    BeforeTransition,
 }
 
 impl Error {
@@ -83,6 +85,19 @@ impl Error {
             message: message.to_owned(),
             failure: Failure::Uncertain,
         }
+    }
+
+    fn definite(message: &str) -> Self {
+        Self {
+            message: message.to_owned(),
+            failure: Failure::BeforeTransition,
+        }
+    }
+
+    /// True only for a refusal known to precede every durable write, so a
+    /// caller may report "nothing happened" rather than an unknown outcome.
+    pub fn is_definite(&self) -> bool {
+        self.failure == Failure::BeforeTransition
     }
 
     fn rejected(message: &str) -> Self {
@@ -403,20 +418,20 @@ impl Candidates {
         let current = self
             .current
             .as_ref()
-            .ok_or_else(|| Error::new("Preview the candidate before confirming"))?;
+            .ok_or_else(|| Error::definite("Preview the candidate before confirming"))?;
         let candidate = match current {
             Stored::Previewed { candidate, created } => {
                 let Ok(age) = now.duration_since(*created) else {
                     candidate.workspace.retire_preview()?;
                     self.current = None;
-                    return Err(Error::new(
+                    return Err(Error::definite(
                         "The preview clock changed; refresh the candidate",
                     ));
                 };
                 if age >= Duration::from_secs(24 * 60 * 60) {
                     candidate.workspace.retire_preview()?;
                     self.current = None;
-                    return Err(Error::new(
+                    return Err(Error::definite(
                         "The preview expired; refresh it before confirming",
                     ));
                 }
@@ -424,16 +439,18 @@ impl Candidates {
             }
             Stored::Confirmed(candidate) => Arc::clone(candidate),
             Stored::Releasing(_) => {
-                return Err(Error::new(
+                return Err(Error::definite(
                     "This candidate was refused and released; preview again",
                 ));
             }
         };
         if candidate.preview.candidate_id != candidate_id {
-            return Err(Error::new(
+            return Err(Error::definite(
                 "The candidate is unknown or was replaced; refresh the preview",
             ));
         }
+        // A resource failure may follow its durable Confirmed write, so it
+        // stays uncertain: the handle and its evidence are preserved.
         candidate
             .workspace
             .resources
