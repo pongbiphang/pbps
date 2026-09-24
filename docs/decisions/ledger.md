@@ -652,6 +652,20 @@ operation; pbps never changes a grant or an audit policy to pass. A database
 backup is one of those authorized readers' reads: its storage is the operator's,
 as a downloaded plan file is (ADR-0016 decision 5), and is out of this boundary.
 
+*Before the table exists.* It is created on first use, so the first
+confidential plan meets no table to qualify — and neither refusing that plan
+nor reading absence as safety is acceptable. An absent table is qualified as
+the table the deployment account would create: its owner is that account; its
+initial readers are the grants the ledger schema's default privileges give a
+new table of that owner (`pg_default_acl` on PostgreSQL; on SQL Server the
+`SELECT`/`CONTROL` held on schema `dbo` or the database, which a new table
+inherits); plus the global readers (superusers/`sysadmin`, `pg_read_all_data`,
+`db_datareader`, `db_owner`) and the statement and audit capture above. Each
+must meet the same rule as for an existing table. The apply then creates the
+table inside its own transaction and qualifies the *actual* table again before
+the first confidential write, so a default privilege or grant added between the
+two checks still refuses.
+
 *Readers.* New binaries join the two tables. A confidential row whose protected
 half is unreadable is reported `Denied`, never with a checksum; one whose
 protected half is missing is `Malformed` (absent, empty and unreadable stay
