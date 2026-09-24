@@ -1169,8 +1169,8 @@ pub(crate) fn observe_incidental<T>(
 }
 
 pub(crate) fn open_process(pid: u32) -> std::io::Result<File> {
-    // The opt-in kernel fixture mounts only its two owned process trees into
-    // a private PID namespace. Production always uses the real proc mount.
+    // The opt-in kernel fixture mounts only its two owned process anchors
+    // into a private PID namespace. Production uses the real proc mount.
     #[cfg(test)]
     if std::env::var_os("PBPS_NATIVE_OWNED_PROC_FIXTURE").is_some() {
         return File::open(format!("/pbps-owned-proc/{pid}")).map_err(|error| {

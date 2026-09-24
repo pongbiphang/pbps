@@ -209,23 +209,54 @@ async fn inspect_pair(
     if !ready {
         return Err("the fixed forwarder did not connect".into());
     }
-    let mut pids = std::collections::BTreeSet::new();
-    for run in [workload, control] {
-        let top = command(host, &["top", run.container_id(), "-eo", "pid"])?;
-        for line in String::from_utf8_lossy(&top.stdout).lines().skip(1) {
-            pids.insert(
-                line.trim()
-                    .parse::<u32>()
-                    .map_err(|_| "invalid owned fixture PID")?,
-            );
+    // A process may finish between observation and inspector creation. Keep
+    // one owned task alive through mount selection, then release it before
+    // Docker resolves the selected paths, so this race is deterministic.
+    let mut transient = Command::new("docker")
+        .args([
+            "--host",
+            host,
+            "exec",
+            "--interactive",
+            control.container_id(),
+            "/usr/bin/timeout",
+            "30s",
+            "/bin/sh",
+            "-c",
+            "printf 'pbps-transient-ready\n'; IFS= read -r release || :",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|_| "cannot start the owned transient task")?;
+    let selected: Result<_, String> = (|| {
+        use std::io::BufRead as _;
+        let output = transient.stdout.take().ok_or("missing transient output")?;
+        let mut ready = String::new();
+        std::io::BufReader::new(output)
+            .read_line(&mut ready)
+            .map_err(|_| "cannot read transient readiness")?;
+        if ready != "pbps-transient-ready\n" {
+            return Err("the owned transient task did not become ready".into());
         }
+        // NamespaceProcfs reaches descendants through each held anchor's
+        // own proc view. Mounting a snapshot of every child instead races
+        // task exit and adds no evidence to these kernel checks.
+        let pids = [
+            workload.native_pid().map_err(|e| e.to_string())?,
+            control.native_pid().map_err(|e| e.to_string())?,
+        ];
+        Ok(pids)
+    })();
+    drop(transient.stdin.take());
+    let exited = transient
+        .wait()
+        .map_err(|_| "cannot reap the transient task")?;
+    if !exited.success() {
+        return Err("the owned transient task did not exit cleanly".into());
     }
-    if pids.len() > 1024
-        || !pids.contains(&workload.native_pid().map_err(|e| e.to_string())?)
-        || !pids.contains(&control.native_pid().map_err(|e| e.to_string())?)
-    {
-        return Err("invalid owned fixture process scope".into());
-    }
+    let pids = selected?;
     let name = format!("pbps-pair-reader-{}", token());
     let mut create = Command::new("docker");
     create.args([
@@ -259,9 +290,10 @@ async fn inspect_pair(
         "--pids-limit",
         "256",
     ]);
-    // Only proc directories belonging to these two freshly created resources
-    // are mounted. The inspector cannot enumerate host processes, see a host
-    // root, or access a runtime socket. It never writes these proc mounts.
+    // Only the anchors of these two freshly created resources are mounted.
+    // Descendants are read through their namespace-scoped procfs views, not a
+    // host process list. The inspector receives no runtime socket and never
+    // writes these proc mounts.
     for pid in pids {
         create.args([
             "--mount",

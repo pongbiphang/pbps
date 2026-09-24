@@ -2232,6 +2232,16 @@ Three traps sat inside the fix, and each of them is a measurement:
   go through one reporter now, which says which of the three it found: the
   log, `(the log is empty)`, or `(the log is unreadable: …)`. Shape 1, in the
   output rather than in the product.
+- **A PID list is not a set of mountable proc directories.** The private
+  channel fixture listed every task in its two owned runtimes, then bind-mounted
+  each `/proc/<pid>` into its inspector. An incidental task exited between
+  those operations and Docker refused inspector creation before the kernel
+  assertions ran (merge-group CI on #846). The current namespace reader needs
+  only the two owned anchors; it reads descendants through their scoped procfs
+  views. Mount those anchors, not a stale child snapshot. The regression holds
+  an owned transient task through selection, reaps it before mounting, and
+  still checks the real backend and controls on both engines. Restoring the
+  child census makes both fixtures fail again.
 - Find the service container by **published port**, never by
   `--filter ancestor=<image>`. That filter repeats the image reference, so the
   two spellings drift apart the moment one is pinned.

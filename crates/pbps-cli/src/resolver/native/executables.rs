@@ -655,6 +655,43 @@ mod tests {
             Some(format!("{:x}", Sha256::digest(&content)))
         );
 
+        // The same shared policy used by both engine adapters must distinguish
+        // a live map_files observation from equal bytes at a disk candidate.
+        let engine = executables(&lease, &[], "$libdir", &[])
+            .await
+            .unwrap()
+            .engine;
+        let compare = |target: &ExecutableIdentity, resolver: &ExecutableIdentity| {
+            use pbps_db::resolver::environment::{
+                CatalogFacts, EnvironmentFacts, RuleVersion, ScopeReport, compare_executables,
+            };
+            let facts = |library: &ExecutableIdentity| EnvironmentFacts {
+                catalog: CatalogFacts {
+                    observations: BTreeMap::new(),
+                    extensions: vec![],
+                    available_extensions: BTreeMap::new(),
+                    collations: vec![],
+                    settings: BTreeMap::new(),
+                    visibility: BTreeMap::new(),
+                },
+                executables: ExecutableSet {
+                    engine: engine.clone(),
+                    libraries: vec![library.clone()],
+                },
+            };
+            let mut report = ScopeReport::new(RuleVersion::new("mapping-fixture-v1"));
+            compare_executables(
+                "mapping-fixture-v1",
+                &facts(target),
+                &facts(resolver),
+                &[],
+                &mut report,
+            );
+            report.verdict()
+        };
+        use pbps_db::resolver::environment::Verdict;
+        assert_eq!(compare(&initial, &initial), Verdict::Verified);
+
         input.write_all(b"1").unwrap();
         acknowledge("one");
         assert!(
@@ -669,12 +706,20 @@ mod tests {
             "a surviving same-file mapping must preserve loaded-content evidence"
         );
         assert_eq!(surviving, initial);
+        assert_eq!(compare(&initial, &surviving), Verdict::Verified);
 
         input.write_all(b"2").unwrap();
         acknowledge("none");
         let gone = mapped_library(&lease, &path, &mapping).await;
         assert_eq!(gone.provenance, Provenance::DiskCandidate);
         assert_eq!(gone.digest, initial.digest);
+        for (target, resolver) in [(&initial, &gone), (&gone, &initial)] {
+            assert_eq!(
+                compare(target, resolver),
+                Verdict::Unknown(vec![format!("library:{path}")]),
+                "a retired mapping must not verify through equal disk bytes"
+            );
+        }
         std::fs::remove_file(&path).unwrap();
         let absent = mapped_library(&lease, &path, &mapping).await;
         assert!(matches!(absent.provenance, Provenance::Unreadable { .. }));

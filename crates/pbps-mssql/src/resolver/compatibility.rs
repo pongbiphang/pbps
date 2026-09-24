@@ -451,6 +451,47 @@ mod tests {
     }
 
     #[test]
+    fn a_mapped_disk_candidate_keeps_the_engine_scope_unknown_on_either_side() {
+        let mut loaded = side("17.0.4075.5", "e1");
+        loaded.executables.libraries = vec![ExecutableIdentity {
+            role: ExecutableRole::Preloaded,
+            path: "/opt/mssql/lib/engine.sfp".into(),
+            digest: Some("same-content".into()),
+            provenance: Provenance::LoadedContent,
+            disk_differs_from_loaded: Some(false),
+        }];
+        assert_eq!(compare(&loaded, &loaded, &[]).verdict(), Verdict::Verified);
+        let mut candidate = loaded.clone();
+        candidate.executables.libraries[0].provenance = Provenance::DiskCandidate;
+        for (target, resolver, side) in [
+            (&candidate, &loaded, Side::Target),
+            (&loaded, &candidate, Side::Resolver),
+        ] {
+            let report = compare(target, resolver, &[]);
+            assert_eq!(
+                report.facts["library:/opt/mssql/lib/engine.sfp"],
+                FactStatus::Unknown {
+                    side,
+                    reason: "mapped content not readable, disk candidate only".into(),
+                }
+            );
+            assert_eq!(
+                report.verdict(),
+                Verdict::Unknown(vec!["library:/opt/mssql/lib/engine.sfp".into()])
+            );
+        }
+        candidate.executables.libraries[0].role = ExecutableRole::LateLoaded;
+        assert_eq!(
+            compare(&loaded, &candidate, &[]).verdict(),
+            Verdict::Verified
+        );
+        assert_eq!(
+            compare(&candidate, &loaded, &[]).verdict(),
+            Verdict::Verified
+        );
+    }
+
+    #[test]
     fn identical_sides_verify_under_the_named_rule() {
         let report = compare(&side("17.0.4075.5", "e1"), &side("17.0.4075.5", "e1"), &[]);
         assert_eq!(report.rule.as_str(), RULE);

@@ -479,6 +479,17 @@ fn identity(
                 reason: reason.clone(),
             };
         }
+        // A disk digest cannot establish what an already mapped library runs,
+        // even when it matches a peer or a measured build mapping (#698).
+        // A required library not yet loaded still needs its disk candidate.
+        if identity.role == ExecutableRole::Preloaded
+            && identity.provenance == Provenance::DiskCandidate
+        {
+            return FactStatus::Unknown {
+                side,
+                reason: "mapped content not readable, disk candidate only".into(),
+            };
+        }
         if identity.disk_differs_from_loaded == Some(true) {
             return FactStatus::Mismatch {
                 target: describe(t),
@@ -731,6 +742,99 @@ mod tests {
             serde_json::to_value(FactStatus::Match).unwrap()["status"],
             "match"
         );
+    }
+
+    fn executable_facts(role: ExecutableRole, provenance: Provenance) -> EnvironmentFacts {
+        EnvironmentFacts {
+            catalog: catalog_with(&[]),
+            executables: ExecutableSet {
+                engine: ExecutableIdentity {
+                    role: ExecutableRole::Engine,
+                    path: "/engine".into(),
+                    digest: Some("engine-content".into()),
+                    provenance: Provenance::LoadedContent,
+                    disk_differs_from_loaded: Some(false),
+                },
+                libraries: vec![ExecutableIdentity {
+                    role,
+                    path: "/library.so".into(),
+                    digest: Some("library-content".into()),
+                    provenance,
+                    disk_differs_from_loaded: Some(false),
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn disk_candidates_cannot_prove_mapped_content_by_digest_or_build_mapping() {
+        for candidate_side in [Side::Target, Side::Resolver] {
+            for use_mapping in [false, true] {
+                let mut target =
+                    executable_facts(ExecutableRole::Preloaded, Provenance::LoadedContent);
+                let mut resolver = target.clone();
+                let candidate = match candidate_side {
+                    Side::Target => &mut target,
+                    Side::Resolver => &mut resolver,
+                    Side::Both => unreachable!(),
+                };
+                candidate.executables.libraries[0].provenance = Provenance::DiskCandidate;
+                let mappings = if use_mapping {
+                    resolver.executables.libraries[0].digest = Some("other-content".into());
+                    vec![BuildMapping {
+                        rule: RuleVersion::new("test-v1"),
+                        scope: "/library.so".into(),
+                        target: "library-content".into(),
+                        resolver: "other-content".into(),
+                        measured: "known loaded build pair".into(),
+                    }]
+                } else {
+                    vec![]
+                };
+                let mut report = ScopeReport::new(RuleVersion::new("test-v1"));
+                compare_executables("test-v1", &target, &resolver, &mappings, &mut report);
+                assert_eq!(
+                    report.facts["library:/library.so"],
+                    FactStatus::Unknown {
+                        side: candidate_side,
+                        reason: "mapped content not readable, disk candidate only".into(),
+                    },
+                    "candidate side {candidate_side:?}, build mapping {use_mapping}"
+                );
+                assert_eq!(
+                    report.verdict(),
+                    Verdict::Unknown(vec!["library:/library.so".into()])
+                );
+                assert!(
+                    report.limitations.is_empty(),
+                    "an unreadable mapping was not applied"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn readable_loaded_and_required_unloaded_content_can_match_in_either_direction() {
+        for target_loaded in [false, true] {
+            for resolver_loaded in [false, true] {
+                let side = |loaded| {
+                    if loaded {
+                        executable_facts(ExecutableRole::Preloaded, Provenance::LoadedContent)
+                    } else {
+                        executable_facts(ExecutableRole::LateLoaded, Provenance::DiskCandidate)
+                    }
+                };
+                let mut report = ScopeReport::new(RuleVersion::new("test-v1"));
+                compare_executables(
+                    "test-v1",
+                    &side(target_loaded),
+                    &side(resolver_loaded),
+                    &[],
+                    &mut report,
+                );
+                assert_eq!(report.verdict(), Verdict::Verified, "{report:?}");
+            }
+        }
     }
 
     #[test]
