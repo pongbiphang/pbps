@@ -283,26 +283,38 @@ SELECT t.object_id, CONVERT(nvarchar(2), N'U'), t.schema_id,
   FROM sys.tables t JOIN sys.schemas ts ON ts.schema_id = t.schema_id
  WHERE t.object_id <> ISNULL(@t, 0)
    AND EXISTS (SELECT 1 FROM sys.sql_expression_dependencies d
-                WHERE d.referencing_id = t.object_id);";
+                 LEFT JOIN sys.objects r ON r.object_id = d.referencing_id
+                WHERE d.referencing_id = t.object_id
+                   OR (r.type IN ('D', 'C') AND r.parent_object_id = t.object_id));";
 
 /// Which code names which other object. An ownership chain continues from one
 /// module to another of the same owner, so a view over a view over the table
 /// reads it as surely as the first view does. Every edge is kept, and
 /// [`Graph::reading_modules`] follows only those whose target it already knows
 /// to read — a filter here on what counts as code dropped the edges into CLR
-/// modules, which `sys.sql_modules` does not list. A name the engine resolves
+/// modules, which `sys.sql_modules` does not list. A default or check
+/// constraint's call is recorded against the constraint, not its table
+/// (measured; a computed column's is the table's), so it is moved to the table
+/// whose writes run it. A name the engine resolves
 /// only at run time, such as `EXEC reader` with no schema, is recorded with no
 /// `referenced_id` (measured: `is_caller_dependent = 1`); it is kept as an edge
 /// to every object of that name the caller could reach. A part left out
 /// between dots — `[db]..reader` — is recorded as an empty string, not NULL
 /// (measured), so each part is read through `NULLIF`.
 const DEPENDENCIES: &str = "\
-SELECT d.referencing_id AS module, d.referenced_id AS target
-  FROM sys.sql_expression_dependencies d
+WITH deps AS (
+  SELECT COALESCE(CASE WHEN r.type IN ('D', 'C') THEN r.parent_object_id END,
+                  d.referencing_id) AS module,
+         d.referenced_id, d.referenced_entity_name, d.referenced_schema_name,
+         d.referenced_database_name, d.referenced_server_name
+    FROM sys.sql_expression_dependencies d
+    LEFT JOIN sys.objects r ON r.object_id = d.referencing_id)
+SELECT d.module, d.referenced_id AS target
+  FROM deps d
  WHERE d.referenced_id IS NOT NULL
 UNION ALL
-SELECT d.referencing_id, o.object_id
-  FROM sys.sql_expression_dependencies d
+SELECT d.module, o.object_id
+  FROM deps d
   JOIN sys.objects o
     ON o.name = d.referenced_entity_name
    AND (NULLIF(d.referenced_schema_name, N'') IS NULL

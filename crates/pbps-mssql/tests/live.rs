@@ -2509,6 +2509,9 @@ async fn every_unqualified_reader_grantor_and_backup_principal_is_named() {
                     BEGIN RETURN (SELECT MAX(state_id) FROM {t}); END;');
              CREATE TABLE dbo.t880_computed (n INT, c AS dbo.f880_scalar());
              GRANT SELECT ON dbo.t880_computed TO [{}];", login("computed"))),
+        ("defaulted".into(), format!(
+            "CREATE TABLE dbo.t880_defaulted (n INT, d BIGINT CONSTRAINT df880 DEFAULT dbo.f880_scalar());
+             GRANT INSERT, SELECT ON dbo.t880_defaulted TO [{}];", login("defaulted"))),
         ("impersonatesadmin".into(), format!(
             "CREATE USER u880_secadmin WITHOUT LOGIN;
              ALTER ROLE db_securityadmin ADD MEMBER u880_secadmin;

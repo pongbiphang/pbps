@@ -823,7 +823,9 @@ principal is not an absent one. `doctor` asks for these grants (#881).
   (measured). A module's signer
   or execution context may itself read only through other code, and that
   counts too. A table whose computed column, default or check calls such code
-  counts for whoever reads or writes the table;
+  counts for whoever reads or writes the table. Measured: a default's or a
+  check's call is recorded against the constraint, not the table, so it is
+  moved to the table;
 - becoming a reader: `IMPERSONATE` or `CONTROL` on a reader user or login, to
   a fixed point.
 
