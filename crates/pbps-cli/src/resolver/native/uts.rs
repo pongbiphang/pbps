@@ -14,7 +14,7 @@ pub(crate) fn check(process: &ProcessLease) -> Result<(), UnqualifiedProcess> {
         .map(|(_, file, _)| file)
         .ok_or(UnqualifiedProcess)?;
     let (hostname, domainname) = read(namespace)?;
-    // DECISIONS 544: these complete literal defaults contain no operator-specific input.
+    // DEC-804.1: these complete literal defaults contain no operator-specific input.
     // Empty Docker configuration does not establish any particular kernel
     // value: the measured native host uses localdomain; Linux also uses
     // (none), and an explicitly cleared NIS name is harmless.

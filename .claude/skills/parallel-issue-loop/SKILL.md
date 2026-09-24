@@ -157,6 +157,8 @@ review reference.
 Workers run, before every push:
 
 ```bash
+python3 scripts/check_decisions_test.py
+python3 scripts/check-decisions.py
 cargo fmt --all --check
 cargo clippy --workspace --all-targets
 cargo test --workspace --all-targets

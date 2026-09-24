@@ -105,7 +105,7 @@ Image acquisition remains a separate explicitly trusted phase, and the fixed
 private connection needs no external name resolution or workload egress.
 
 The workload and each forwarder also qualify the actual kernel UTS hostname
-and NIS domain name (#804, DECISIONS 544). Empty files and empty Docker
+and NIS domain name (#804, DEC-804.1). Empty files and empty Docker
 `Config.Domainname` do not prove empty kernel values. The hostname must be
 exactly `pbps-resolver`; the complete NIS value must be empty, `(none)` or
 `localdomain`. These fixed generic literals carry no operator-specific input.
