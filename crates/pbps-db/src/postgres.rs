@@ -690,8 +690,6 @@ fn apply_socket_options(
     Ok(())
 }
 
-/// Whether this connection needs a TLS stack at all.
-///
 /// Whether the connection string chose its own `sslmode`.
 ///
 /// Asked of the driver's own parser rather than of a second one written here:
@@ -707,9 +705,10 @@ fn names_ssl_mode(connection_string: &str) -> bool {
     let is_url = connection_string.starts_with("postgres://")
         || connection_string.starts_with("postgresql://");
     let probe = if is_url {
-        match connection_string.split_once('?') {
-            Some((head, query)) => format!("{head}?sslmode=disable&{query}"),
-            None => format!("{connection_string}?sslmode=disable"),
+        let (head, query) = url_query_split(connection_string);
+        match query {
+            Some(query) => format!("{head}?sslmode=disable&{query}"),
+            None => format!("{head}?sslmode=disable"),
         }
     } else {
         format!("sslmode=disable {connection_string}")
@@ -720,6 +719,32 @@ fn names_ssl_mode(connection_string: &str) -> bool {
     }
 }
 
+/// A URL split where the driver's own parser starts its query, and not at the
+/// first `?` of the string (#830).
+///
+/// `tokio-postgres` reads the userinfo up to the **first** `@` before it looks
+/// for a query, so `postgres://u:p?x@host/db` is the password `p?x` and no
+/// query at all. Split at the string's first `?` instead, and the probe landed
+/// inside the password, both parses kept `prefer`, and the string read as
+/// having named its `sslmode` — the downgrade #311 closed, reopened for that
+/// spelling. After the userinfo, the host stops at `/` or `?` and the path at
+/// `?`, so the first `?` from there is the query's.
+fn url_query_split(url: &str) -> (&str, Option<&str>) {
+    let authority = url.find("://").map_or(0, |i| i + 3);
+    let after_userinfo = url[authority..]
+        .find('@')
+        .map_or(authority, |i| authority + i + 1);
+    match url[after_userinfo..].find('?') {
+        Some(i) => {
+            let at = after_userinfo + i;
+            (&url[..at], Some(&url[at + 1..]))
+        }
+        None => (url, None),
+    }
+}
+
+/// Whether this connection needs a TLS stack at all.
+///
 /// `sslmode=disable` is the one answer that needs none — and needing none is
 /// not the same as having one that goes unused, because building one reads the
 /// host's certificate store and fails where there is not one to read.
@@ -914,6 +939,9 @@ mod tests {
             "host=db.example user=u sslmode = disable",
             "postgres://u@db.example/app?sslmode=disable",
             "postgresql://u@db.example/app?connect_timeout=5&sslmode=prefer",
+            // #830's negative half: the query after such a password still counts.
+            "postgres://u:p?x@db.example/app?sslmode=disable",
+            "postgres://u:p?x@db.example?sslmode=prefer",
         ] {
             assert!(names_ssl_mode(named), "{named}");
         }
@@ -925,6 +953,10 @@ mod tests {
             "postgres://u@db.example/app",
             "postgres://u@db.example/app?connect_timeout=5",
             "postgres://u:sslmode%3Ddisable@db.example/app",
+            // #830: a `?` in the userinfo is the password's, not a query.
+            "postgres://u:p?x@db.example/app",
+            "postgres://u:p?sslmode=disable@db.example/app",
+            "postgresql://u:p?x@db.example",
         ] {
             assert!(!names_ssl_mode(unnamed), "{unnamed}");
         }
@@ -933,9 +965,26 @@ mod tests {
     /// #311, the downgrade itself: a server that answers "N" to the SSL
     /// request and would ask for a cleartext password is never sent one when
     /// the string names no `sslmode`. Under the old `prefer` default the
-    /// startup packet and the password followed the refusal.
+    /// startup packet and the password followed the refusal. Asked in both
+    /// forms, and in the URL form with a `?` in the password, which read as
+    /// having named its `sslmode` until #830.
     #[tokio::test]
     async fn an_unnamed_sslmode_cannot_be_downgraded_to_a_cleartext_login() {
+        for (password, connection) in [
+            (
+                "marker-311",
+                "host=localhost port={port} user=synthetic password=marker-311 dbname=d",
+            ),
+            (
+                "marker?830",
+                "postgres://synthetic:marker?830@localhost:{port}/d",
+            ),
+        ] {
+            refused_before_any_login(password, connection).await;
+        }
+    }
+
+    async fn refused_before_any_login(password: &str, connection: &str) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -969,22 +1018,26 @@ mod tests {
             }
             after
         });
-        let error = match Conn::connect_as(
-            &format!("host=localhost port={port} user=synthetic password=marker-311 dbname=d"),
-            false,
-        )
-        .await
-        {
-            Ok(_) => panic!("a server that refuses TLS must not be connected to"),
-            Err(error) => error,
-        };
+        let error =
+            match Conn::connect_as(&connection.replace("{port}", &port.to_string()), false).await {
+                Ok(_) => panic!("{connection}: a server that refuses TLS must not be connected to"),
+                Err(error) => error,
+            };
         let after = server.await.expect("the fake server");
         assert!(
-            !after.windows(10).any(|w| w == b"marker-311"),
-            "the password was sent after the TLS refusal: {after:?}"
+            !after
+                .windows(password.len())
+                .any(|w| w == password.as_bytes()),
+            "{connection}: the password was sent after the TLS refusal: {after:?}"
         );
-        assert!(after.is_empty(), "the client carried on after the refusal");
-        assert!(error.to_string().contains("sslmode=disable"), "{error}");
+        assert!(
+            after.is_empty(),
+            "{connection}: the client carried on after the refusal"
+        );
+        assert!(
+            error.to_string().contains("sslmode=disable"),
+            "{connection}: {error}"
+        );
     }
 
     /// The negative half: a string that names `sslmode=disable` is honoured —
