@@ -224,7 +224,7 @@ SELECT c.object_id AS id,
   FROM code c
   LEFT JOIN sys.objects o ON o.object_id = c.object_id
   LEFT JOIN sys.schemas s ON s.schema_id = o.schema_id
-  LEFT JOIN sys.objects p ON p.object_id = o.parent_object_id AND o.type = 'TR'
+  LEFT JOIN sys.objects p ON p.object_id = o.parent_object_id AND o.type IN ('TR', 'TA')
   LEFT JOIN sys.schemas ps ON ps.schema_id = p.schema_id
  WHERE o.object_id IS NOT NULL
     OR EXISTS (SELECT 1 FROM sys.triggers tr
@@ -609,7 +609,8 @@ impl Graph {
         }
         match m.kind.as_str() {
             "DT" => true,
-            "TR" => {
+            // A DML trigger, T-SQL or CLR, fires for whoever writes its table.
+            "TR" | "TA" => {
                 c.contains(&m.parent_owner)
                     || self.in_database_role(&c, "db_datawriter")
                     || self.database_grants(
@@ -1440,6 +1441,28 @@ mod tests {
             g.database_perms.push(grant(OBJECT, TABLE, 41, "SELECT"));
             assert_eq!(mentions(&named(&g), "orphan"), named_it, "{authentication}");
         }
+    }
+
+    #[test]
+    fn a_reading_dml_trigger_of_either_kind_counts_for_whoever_writes_its_table() {
+        for kind in ["TR", "TA"] {
+            let mut g = graph();
+            g.modules.push(Module {
+                kind: kind.into(),
+                parent: 70,
+                parent_schema: DBO_SCHEMA,
+                parent_owner: DBO,
+                ..module(71, DBO, Some(-2), false)
+            });
+            g.database_perms.push(grant(OBJECT, 70, U_ALICE, "INSERT"));
+            // Executing a trigger is not how it runs.
+            g.database_perms.push(grant(OBJECT, 71, U_BOB, "EXECUTE"));
+            let problems = named(&g);
+            assert!(mentions(&problems, "alice"), "{kind}: {problems:?}");
+            assert!(!mentions(&problems, "bob"), "{kind}: {problems:?}");
+        }
+        // The module read fills in a CLR trigger's table as it does a T-SQL one's.
+        assert!(MODULES.contains("o.type IN ('TR', 'TA')"), "{MODULES}");
     }
 
     #[test]
