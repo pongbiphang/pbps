@@ -85,6 +85,11 @@ impl Forwarder {
         self.run.native_pid()
     }
 
+    #[cfg(test)]
+    pub(crate) fn container_id(&self) -> &str {
+        self.run.container_id()
+    }
+
     pub(crate) fn resource_name(&self) -> &str {
         self.run.resource_name()
     }

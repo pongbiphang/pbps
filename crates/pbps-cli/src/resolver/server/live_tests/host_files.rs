@@ -31,7 +31,10 @@ async fn host_file_loss_refuses_admission_and_discards_live_analysis() {
         changed.replace(&text);
         let refused =
             match DedicatedServer::admit(endpoint("PBPS_SERVER_ENDPOINT"), &mut target).await {
-                Err(Error::Unqualified(reason)) => reason.contains("host and DNS files"),
+                Err(ServerFailure {
+                    cause: Error::Unqualified(reason),
+                    recovery_names,
+                }) if recovery_names.is_empty() => reason.contains("host and DNS files"),
                 Ok(mut server) => {
                     server.discard().await.unwrap();
                     false
