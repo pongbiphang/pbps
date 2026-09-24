@@ -129,6 +129,35 @@ image installation form the provisioning trust boundary. SQL privileges in
 scratch grant no authority over those external controls. This profile does not
 claim protection from a compromised kernel or provisioning administrator.
 
+## Private tmpfs provenance (#644)
+
+Both Linux profiles require private writable filesystems provisioned for the
+runtime. Their creation and initial contents belong to the trusted provisioning
+boundary: initialization must use the qualified engine/runtime inputs before
+analysis receives declarations. An operator must not transplant a prepopulated
+filesystem from an unrelated staging environment into a resolver runtime.
+
+A **prepopulated tmpfs transferred from a staging mount namespace that has
+since disappeared** is a named unsupported provenance case. The observer cannot
+reliably distinguish it from fresh runtime storage. In isolated namespace
+measurements, the staged contents survived at `/dev`, `/dev/shm`, `/tmp`, `/run`,
+`/var/tmp` and both engines' storage paths after the stager exited. Root `/`,
+mount flags, filesystem type and propagation fields matched fresh controls.
+Legacy mount IDs were reused; ordering them against the runtime root would
+accept the staged bind and refuse a genuinely fresh mount. None of these
+fields is a creation-history receipt.
+
+This limit applies to Docker-owned and supplied-server runtimes alike. A
+daemon record describes the requested configuration; mount layout and current
+namespace observations do not prove a filesystem's earlier history. Even a
+complete inventory of currently live namespaces could not recover a departed
+staging namespace. Trusted provisioning must exclude this arrangement; the
+profile does not claim that it will detect and reject every such transplant.
+Existing mount, mask, privilege and namespace checks retain their separate
+purposes. Uncertain provenance must be resolved by reprovisioning from the
+qualified inputs, not by treating an unobserved sharer as proof of freshness.
+See [the measurements and issue disposition](https://github.com/pongbiphang/pbps/issues/644#issuecomment-5817521020).
+
 ## Target identity and socket observation (#743)
 
 `observed_socket_holders` visits the pinned namespace procfs and each visible
