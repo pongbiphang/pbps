@@ -145,13 +145,12 @@ fn removes_with_its_owner(change: &Change, holds: &Holds) -> bool {
     }
 }
 
-/// Replaces one change that edits this dependent in place with its removal
-/// and its restoration, side by side, so each half can be put on its own side
-/// of the module: a view's `AlterModule` is one step that drops and creates,
-/// and a default changed from one expression to another is one statement.
+/// Whether `change` edits this dependent in one step that drops and creates
+/// it: a view's `AlterModule`, or a default changed from one expression to
+/// another.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn split_in_place_edit(changes: &mut Vec<PlannedChange>, holds: &Holds, dialect: &dyn Dialect) {
-    let Some(i) = changes.iter().position(|p| match (holds, &p.change) {
+fn edits_in_place(change: &Change, holds: &Holds) -> bool {
+    match (holds, change) {
         (Holds::Module(x), Change::AlterModule { id, .. }) => id == x,
         (
             Holds::TablePart {
@@ -166,7 +165,16 @@ fn split_in_place_edit(changes: &mut Vec<PlannedChange>, holds: &Holds, dialect:
             },
         ) => column.table == *table && column.name == *c,
         _ => false,
-    }) else {
+    }
+}
+
+/// Replaces one change that edits this dependent in place with its removal
+/// and its restoration, side by side, so each half can be put on its own side
+/// of the module: a view's `AlterModule` is one step that drops and creates,
+/// and a default changed from one expression to another is one statement.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn split_in_place_edit(changes: &mut Vec<PlannedChange>, holds: &Holds, dialect: &dyn Dialect) {
+    let Some(i) = find(changes, holds, edits_in_place) else {
         return;
     };
     let (removal, restoration) = match changes[i].change.clone() {
@@ -208,6 +216,56 @@ fn planned(change: Change, dialect: &dyn Dialect) -> PlannedChange {
     let mut p = PlannedChange::new(change);
     p.risks = dialect.change_risks(&p.change);
     p
+}
+
+/// The dependent as the plan names it just before change `i`.
+///
+/// The catalog names it as the database does now, and a plan that renames its
+/// table or column says the new name from the rename on: the differ sorts
+/// renames after a `DropModule` and before an `AlterModule`, so one dependent
+/// has two names in one plan, and each change must be matched, and each
+/// synthesized one written, with the name that holds at its own position.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn named_at(changes: &[PlannedChange], i: usize, holds: &Holds) -> Holds {
+    let Holds::TablePart { table, part } = holds else {
+        return holds.clone();
+    };
+    let (mut table, mut part) = (table.clone(), part.clone());
+    for p in &changes[..i] {
+        match &p.change {
+            Change::RenameTable { from, to, .. } if *from == table => table = to.clone(),
+            Change::RenameColumn {
+                table: t, from, to, ..
+            } if *t == table => {
+                if let Part::Default(c) = &mut part
+                    && c == from
+                {
+                    *c = to.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+    Holds::TablePart { table, part }
+}
+
+/// The first change matching `test` against the dependent's name at that
+/// change's own position.
+fn find(
+    changes: &[PlannedChange],
+    holds: &Holds,
+    test: fn(&Change, &Holds) -> bool,
+) -> Option<usize> {
+    (0..changes.len()).find(|&i| test(&changes[i].change, &named_at(changes, i, holds)))
+}
+
+/// The dependent under the name the declarations use: after every rename in
+/// the plan.
+fn as_declared(changes: &[PlannedChange], d: &Dependent) -> Dependent {
+    Dependent {
+        described: d.described.clone(),
+        holds: named_at(changes, changes.len(), &d.holds),
+    }
 }
 
 /// The change that removes a dependent the plan does not remove yet.
@@ -332,10 +390,10 @@ pub(crate) fn weave(
         let blocked: Vec<Dependent> = deps
             .iter()
             .filter(|d| {
-                let accounted = cs.changes.iter().any(|p| {
-                    removes(&p.change, &d.holds) || removes_with_its_owner(&p.change, &d.holds)
-                });
-                matches!(d.holds, Holds::Unrepresentable(_)) || (!d.managed(declared) && !accounted)
+                let accounted = find(&cs.changes, &d.holds, removes).is_some()
+                    || find(&cs.changes, &d.holds, removes_with_its_owner).is_some();
+                matches!(d.holds, Holds::Unrepresentable(_))
+                    || (!as_declared(&cs.changes, d).managed(declared) && !accounted)
             })
             .cloned()
             .collect();
@@ -359,7 +417,7 @@ pub(crate) fn weave(
             };
             // Removed before the module's drop: moved there if the plan
             // removes it later, synthesized there if it does not remove it.
-            let removal = cs.changes.iter().position(|p| removes(&p.change, &d.holds));
+            let removal = find(&cs.changes, &d.holds, removes);
             let removed_at = match removal {
                 Some(i) if i < at.drop_at => i,
                 Some(i) => {
@@ -368,12 +426,19 @@ pub(crate) fn weave(
                     at.drop_at
                 }
                 None => {
-                    let change = removal_of(d, declared, ids)?;
+                    // Named as it is where it goes: before the module's drop,
+                    // after any rename the plan makes ahead of that.
+                    let here = Dependent {
+                        described: d.described.clone(),
+                        holds: named_at(&cs.changes, at.drop_at, &d.holds),
+                    };
+                    let change = removal_of(&here, declared, ids)?;
                     cs.changes.insert(at.drop_at, planned(change, dialect));
                     at.drop_at
                 }
             };
-            if !d.managed(declared) {
+            let kept = as_declared(&cs.changes, d);
+            if !kept.managed(declared) {
                 continue;
             }
             // Kept by the declarations: back after the module's create, or
@@ -382,10 +447,7 @@ pub(crate) fn weave(
                 continue;
             };
             let after = at.create_at.unwrap_or(removed_at);
-            let restoration = cs
-                .changes
-                .iter()
-                .position(|p| restores(&p.change, &d.holds));
+            let restoration = find(&cs.changes, &d.holds, restores);
             match restoration {
                 Some(j) if j > after => {}
                 Some(j) => {
@@ -395,7 +457,7 @@ pub(crate) fn weave(
                     cs.changes.insert(after + 1, moved);
                 }
                 None if at.create_at.is_some() => {
-                    let change = restoration_of(d, declared, ids).ok_or_else(|| {
+                    let change = restoration_of(&kept, declared, ids).ok_or_else(|| {
                         format!(
                             "{}: the declarations hold it, but not in a form pbps can restore",
                             d.described
@@ -431,9 +493,8 @@ pub(crate) fn unaccounted(
             continue;
         };
         for d in deps {
-            let removed_first = cs.changes[..at.drop_at]
-                .iter()
-                .any(|p| removes(&p.change, &d.holds));
+            let removed_first =
+                find(&cs.changes, &d.holds, removes).is_some_and(|i| i < at.drop_at);
             if !removed_first {
                 out.push(format!("{} depends on `{root}`", d.described));
             }
@@ -719,5 +780,71 @@ mod tests {
         // And a module with no dependents needs nothing.
         let none = BTreeMap::from([(id("app.v0"), Vec::new())]);
         assert!(unaccounted(&cs, &none).is_empty());
+    }
+
+    /// A plan that renames the table and the column while rebuilding the
+    /// function their check and default call. The catalog names them as the
+    /// database does now; the declarations and every change after the renames
+    /// name them as the plan leaves them. Matched and written in the name that
+    /// holds at each position, the dependents are still the declared ones.
+    #[test]
+    // Every other change is simply not one this test reads a name from.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    fn a_dependent_is_named_through_the_plans_own_renames() {
+        let (mut s, mut ids) = declared();
+        let mut t = s.tables.remove(&TableName::new("app", "t")).unwrap();
+        let n = t.columns.shift_remove("n").unwrap();
+        t.columns.insert("m".into(), n);
+        s.tables.insert(TableName::new("app", "u"), t);
+        let uid = ids.columns.keys().next().unwrap().clone();
+        ids.columns
+            .insert(uid.clone(), ColumnRef::new(TableName::new("app", "u"), "m"));
+        let mut cs = plan(vec![
+            Change::RenameTable {
+                uid: Uid::derived(UidKind::Table, "app.t", 0),
+                from: TableName::new("app", "t"),
+                to: TableName::new("app", "u"),
+            },
+            Change::RenameColumn {
+                uid,
+                table: TableName::new("app", "u"),
+                from: "n".into(),
+                to: "m".into(),
+            },
+            alter(&s, "app.f(integer)"),
+        ]);
+        let found = BTreeMap::from([(
+            id("app.f(integer)"),
+            vec![
+                part(Part::Check("ck".into()), "constraint ck on table app.t"),
+                part(
+                    Part::Default("n".into()),
+                    "default value for column n of table app.t",
+                ),
+            ],
+        )]);
+        weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).unwrap();
+        let tables: Vec<String> = cs
+            .changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::DropCheck { table, .. } | Change::AddCheck { table, .. } => {
+                    Some(table.to_string())
+                }
+                Change::AlterColumnDefault { column, .. } => Some(column.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tables,
+            ["app.u", "app.u.m", "app.u.m", "app.u"],
+            "{:?}",
+            rendered(&cs)
+        );
+        assert!(unaccounted(&cs, &found).is_empty());
+        assert_eq!(
+            weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).unwrap(),
+            0
+        );
     }
 }
