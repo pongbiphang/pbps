@@ -227,7 +227,7 @@ impl Dialect for Mssql {
 mod tests {
     use super::*;
 
-    /// #878: the pull filters the three ledger tables out of `dbo`, so a
+    /// #878: the pull filters the two ledger tables out of `dbo`, so a
     /// declaration of one must be refused rather than read back as absent and
     /// planned for creation. Only the exact spelling pbps creates: another
     /// case is a different table on a case-sensitive database, and the same
@@ -244,17 +244,13 @@ mod tests {
                 .validate_table(&name.parse().unwrap(), &table)
                 .is_empty()
         };
-        for ours in [
-            "dbo.__pbps_state",
-            "dbo.__pbps_lock",
-            "dbo.__pbps_state_confidential",
-        ] {
+        for ours in ["dbo.__pbps_state", "dbo.__pbps_lock"] {
             assert!(refused(ours), "{ours}");
         }
         for theirs in [
-            "DBO.__PBPS_STATE_CONFIDENTIAL",
             "dbo.__PBPS_State",
-            "app.__pbps_state_confidential",
+            "DBO.__PBPS_STATE",
+            "app.__pbps_state",
             "dbo.__pbps_statements",
             "dbo.__pbps_customers",
         ] {

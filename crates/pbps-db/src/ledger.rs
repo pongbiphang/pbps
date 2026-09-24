@@ -43,11 +43,6 @@ use crate::DbError;
 /// dialect-free crate was the shape that could not survive a second engine.
 pub const STATE_TABLE_NAME: &str = "__pbps_state";
 pub const LOCK_TABLE_NAME: &str = "__pbps_lock";
-/// The protected half of a confidential record (DEC-868.1): the whole snapshot,
-/// the plan checksum and the reason, keyed by the ordinary row's id, where no
-/// pre-feature reader looks. Created only when the first confidential record is
-/// written.
-pub const CONFIDENTIAL_TABLE_NAME: &str = "__pbps_state_confidential";
 
 /// One row of the ledger.
 #[derive(Debug, Clone, PartialEq, Eq)]
