@@ -30,6 +30,21 @@ use crate::introspect::{
 ///
 /// The PostgreSQL pull lists the same two names unqualified, because the schema
 /// its ledger will live in is not decided until Phase 5 step 8 (#185).
+/// Whether `name` is one of this tool's ledger tables, which the pull filters
+/// out and validation therefore reserves (the PostgreSQL side's
+/// `catalog::is_ours`). Case-insensitively: the filter above compares under the
+/// database's collation, which is case-insensitive by default, so a declaration
+/// of `DBO.__PBPS_STATE` would be hidden the same way.
+pub(crate) fn is_ours(name: &pbps_model::TableName) -> bool {
+    [
+        crate::state::STATE_TABLE,
+        crate::state::LOCK_TABLE,
+        crate::state::CONFIDENTIAL_TABLE,
+    ]
+    .iter()
+    .any(|ours| ours.eq_ignore_ascii_case(&format!("{}.{}", name.schema, name.name)))
+}
+
 const TABLES: &str = "\
 SELECT t.object_id, s.name AS schema_name, t.name AS table_name, t.temporal_type,
        CONVERT(bit, CASE WHEN p.object_id IS NULL THEN 0 ELSE 1 END) AS has_period

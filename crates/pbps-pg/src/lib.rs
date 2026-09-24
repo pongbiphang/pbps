@@ -610,7 +610,7 @@ impl Dialect for Postgres {
             found.push(DialectError::Invalid {
                 dialect: types::DIALECT,
                 message: format!(
-                    "table `{name}` is one of the two this tool owns (SPEC §8.1). \
+                    "table `{name}` is one of the ledger tables this tool owns (SPEC §8.1). \
                      Only those names in schema `{}` are reserved; the same table name in \
                      another project schema is read back normally.",
                     crate::state::LEDGER_SCHEMA

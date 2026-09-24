@@ -146,7 +146,23 @@ impl Dialect for Mssql {
     }
 
     fn validate_table(&self, name: &TableName, table: &Table) -> Vec<DialectError> {
-        validate::table(name, table)
+        let mut found = validate::table(name, table);
+        // The pull filters the ledger tables out by their qualified names, so a
+        // declaration of one would read back as absent and be planned for
+        // creation over the table that is there: refused here instead, as the
+        // PostgreSQL dialect does. Same-named tables in another schema are the
+        // project's.
+        if catalog::is_ours(name) {
+            found.push(DialectError::Invalid {
+                dialect: types::DIALECT,
+                message: format!(
+                    "table `{name}` is one of the ledger tables this tool owns (SPEC §8.1). \
+                     Only those names in schema `dbo` are reserved; the same table name in \
+                     another schema is read back normally."
+                ),
+            });
+        }
+        found
     }
 
     fn declaration_notes(&self, schema: &Schema) -> Vec<String> {
@@ -210,6 +226,39 @@ impl Dialect for Mssql {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #878: the pull filters the three ledger tables out of `dbo`, so a
+    /// declaration of one must be refused rather than read back as absent and
+    /// planned for creation. Case-insensitively, as the filter compares; the
+    /// same names in another schema stay the project's.
+    #[test]
+    fn validating_a_table_refuses_the_ledger_names_in_dbo_only() {
+        let mut table = Table::default();
+        table.columns.insert(
+            "id".into(),
+            pbps_model::Column::new("int".parse().expect("a type")),
+        );
+        let refused = |name: &str| {
+            !Mssql
+                .validate_table(&name.parse().unwrap(), &table)
+                .is_empty()
+        };
+        for ours in [
+            "dbo.__pbps_state",
+            "dbo.__pbps_lock",
+            "dbo.__pbps_state_confidential",
+            "DBO.__PBPS_STATE_CONFIDENTIAL",
+        ] {
+            assert!(refused(ours), "{ours}");
+        }
+        for theirs in [
+            "app.__pbps_state_confidential",
+            "dbo.__pbps_statements",
+            "dbo.__pbps_customers",
+        ] {
+            assert!(!refused(theirs), "{theirs}");
+        }
+    }
 
     /// A bare name resolves in the module's own schema first and then in
     /// `dbo`, compared the way this engine compares names, and nowhere else.
