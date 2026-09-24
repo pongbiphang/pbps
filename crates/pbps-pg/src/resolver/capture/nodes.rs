@@ -443,6 +443,8 @@ mod tests {
             (18, include_str!("fixtures/surfaces-18.nodes")),
             (16, include_str!("fixtures/row-coercion-16.nodes")),
             (18, include_str!("fixtures/row-coercion-18.nodes")),
+            (16, include_str!("fixtures/expression-results-16.nodes")),
+            (18, include_str!("fixtures/expression-results-18.nodes")),
         ] {
             for (case, text) in fixtures.lines().enumerate() {
                 let value = decode(text, major)
@@ -454,19 +456,19 @@ mod tests {
         }
     }
 
-    fn subscripts(value: &Value, found: &mut Vec<Node>) {
+    fn nodes_with_tag(value: &Value, tag: &str, found: &mut Vec<Node>) {
         match value {
             Value::Node(node) => {
-                if node.tag == "SUBSCRIPTINGREF" {
+                if node.tag == tag {
                     found.push(node.clone());
                 }
                 for value in node.fields.values() {
-                    subscripts(value, found);
+                    nodes_with_tag(value, tag, found);
                 }
             }
             Value::List(values) => {
                 for value in values {
-                    subscripts(value, found);
+                    nodes_with_tag(value, tag, found);
                 }
             }
             Value::Null | Value::Atom(_) | Value::Datum => {}
@@ -484,7 +486,7 @@ mod tests {
                 let bindings = references(&tree, major)
                     .unwrap_or_else(|e| panic!("PG{major} subscript {case}: {e:?}"));
                 let mut nodes = Vec::new();
-                subscripts(&tree, &mut nodes);
+                nodes_with_tag(&tree, "SUBSCRIPTINGREF", &mut nodes);
                 assert!(!nodes.is_empty());
                 for node in nodes {
                     for (field, class) in [
@@ -530,6 +532,52 @@ mod tests {
                     assert!(child_binding("refupperindexpr"));
                     assert!(child_binding("refassgnexpr"));
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn xml_binding_fields_and_child_lists_cannot_be_missing_or_unreadable() {
+        for (major, fixtures) in [
+            (16, include_str!("fixtures/expression-results-16.nodes")),
+            (18, include_str!("fixtures/expression-results-18.nodes")),
+        ] {
+            let original = fixtures.lines().next().unwrap();
+            let tree = decode(original, major).unwrap_or_else(|e| panic!("{e:?}"));
+            let bound = references(&tree, major).unwrap();
+            for child in ["named_args", "args"] {
+                assert!(
+                    bound
+                        .iter()
+                        .any(|binding| binding.class == ReferenceClass::Routine
+                            && binding.path.iter().any(|part| part == child))
+                );
+            }
+            assert!(
+                bound
+                    .iter()
+                    .any(|binding| binding.class == ReferenceClass::Type
+                        && binding.path.last().is_some_and(|part| part == "type"))
+            );
+            let mut nodes = Vec::new();
+            nodes_with_tag(&tree, "XMLEXPR", &mut nodes);
+            assert!(!nodes.is_empty());
+            for node in nodes {
+                for field in ["type", "named_args", "arg_names", "args"] {
+                    let mut missing = node.clone();
+                    missing.fields.remove(field);
+                    assert!(references(&Value::Node(missing), major).is_err());
+                    let mut unreadable = node.clone();
+                    unreadable
+                        .fields
+                        .insert(field.into(), Value::Atom("unreadable".into()));
+                    assert!(references(&Value::Node(unreadable), major).is_err());
+                }
+                let mut unknown = node;
+                unknown
+                    .fields
+                    .insert("unknown_binding".into(), Value::Atom("23".into()));
+                assert!(references(&Value::Node(unknown), major).is_err());
             }
         }
     }

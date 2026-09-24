@@ -239,6 +239,48 @@ fn expression_type(value: &Value) -> Result<u32> {
         "CONST" => "consttype",
         "PARAM" => "paramtype",
         "FUNCEXPR" => "funcresulttype",
+        "AGGREF" => "aggtype",
+        "WINDOWFUNC" => "wintype",
+        "OPEXPR" | "DISTINCTEXPR" | "NULLIFEXPR" => "opresulttype",
+        "MINMAXEXPR" => "minmaxtype",
+        "SUBLINK" => {
+            // A scalar subquery returns its sole non-junk projection, not
+            // the input row type or the first type referenced by its tree.
+            // EXPR_SUBLINK is 4 in both qualified engine versions.
+            if node.number("subLinkType")? != 4 {
+                return Err(Uncovered::Subobject);
+            }
+            let Some(Value::Node(query)) = node.fields.get("subselect") else {
+                return Err(Uncovered::Subobject);
+            };
+            if query.tag != "QUERY" {
+                return Err(Uncovered::Subobject);
+            }
+            let Some(Value::List(targets)) = query.fields.get("targetList") else {
+                return Err(Uncovered::Subobject);
+            };
+            let mut result = None;
+            for target in targets {
+                let Value::Node(target) = target else {
+                    return Err(Uncovered::Subobject);
+                };
+                if target.tag != "TARGETENTRY" {
+                    return Err(Uncovered::Subobject);
+                }
+                match target.fields.get("resjunk") {
+                    Some(Value::Atom(value)) if value == "true" => continue,
+                    Some(Value::Atom(value)) if value == "false" => {}
+                    _ => return Err(Uncovered::Subobject),
+                }
+                if result.is_some() {
+                    return Err(Uncovered::Subobject);
+                }
+                result = Some(expression_type(
+                    target.fields.get("expr").ok_or(Uncovered::Node)?,
+                )?);
+            }
+            return result.ok_or(Uncovered::Subobject);
+        }
         "SUBSCRIPTINGREF" => "refrestype",
         "ROWEXPR" => "row_typeid",
         "FIELDSELECT" | "RELABELTYPE" | "COERCEVIAIO" | "ARRAYCOERCEEXPR" | "COERCETODOMAIN"
@@ -256,6 +298,95 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::BTreeMap;
+
+    fn find_node<'a>(value: &'a Value, tag: &str) -> Option<&'a Node> {
+        match value {
+            Value::Node(node) if node.tag == tag => Some(node),
+            Value::Node(node) => node.fields.values().find_map(|v| find_node(v, tag)),
+            Value::List(values) => values.iter().find_map(|v| find_node(v, tag)),
+            Value::Null | Value::Atom(_) | Value::Datum => None,
+        }
+    }
+
+    #[test]
+    fn a_scalar_subquery_needs_exactly_one_readable_output() {
+        for (major, fixtures) in [
+            (16, include_str!("fixtures/expression-results-16.nodes")),
+            (18, include_str!("fixtures/expression-results-18.nodes")),
+        ] {
+            let tree = nodes::decode(fixtures.lines().last().unwrap(), major)
+                .unwrap_or_else(|e| panic!("{e:?}"));
+            let original = find_node(&tree, "SUBLINK").unwrap();
+            let expected = expression_type(&Value::Node(original.clone())).unwrap();
+            assert_ne!(expected, 0);
+            for case in [
+                "not_scalar",
+                "absent",
+                "unreadable",
+                "empty",
+                "multiple",
+                "junk_only",
+                "unknown_junk",
+                "extra_junk",
+            ] {
+                let mut changed = original.clone();
+                if case == "not_scalar" {
+                    changed
+                        .fields
+                        .insert("subLinkType".into(), Value::Atom("0".into()));
+                } else {
+                    let Some(Value::Node(query)) = changed.fields.get_mut("subselect") else {
+                        panic!("query fixture")
+                    };
+                    let Some(Value::List(targets)) = query.fields.get_mut("targetList") else {
+                        panic!("target fixture")
+                    };
+                    assert_eq!(targets.len(), 1);
+                    match case {
+                        "absent" => {
+                            query.fields.remove("targetList");
+                        }
+                        "unreadable" => {
+                            query
+                                .fields
+                                .insert("targetList".into(), Value::Atom("unreadable".into()));
+                        }
+                        "empty" => targets.clear(),
+                        "multiple" => targets.push(targets[0].clone()),
+                        "junk_only" | "unknown_junk" | "extra_junk" => {
+                            let Value::Node(target) = &targets[0] else {
+                                panic!("target fixture")
+                            };
+                            let mut target = target.clone();
+                            target.fields.insert(
+                                "resjunk".into(),
+                                Value::Atom(
+                                    if case == "unknown_junk" {
+                                        "unreadable"
+                                    } else {
+                                        "true"
+                                    }
+                                    .into(),
+                                ),
+                            );
+                            if case == "extra_junk" {
+                                targets.insert(0, Value::Node(target));
+                            } else {
+                                targets[0] = Value::Node(target);
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                let result = expression_type(&Value::Node(changed));
+                if case == "extra_junk" {
+                    assert_eq!(result, Ok(expected));
+                } else {
+                    assert!(result.is_err(), "{case}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn a_column_reference_needs_its_actual_relation_and_live_name() {

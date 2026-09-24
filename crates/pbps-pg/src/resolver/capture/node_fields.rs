@@ -68,6 +68,7 @@ fn specification(tag: &str, major: u32) -> Option<Specification> {
         (18, "WINDOWCLAUSE") => (&["name", "refname", "partitionClause", "orderClause", "frameOptions", "startOffset", "endOffset", "startInRangeFunc", "endInRangeFunc", "inRangeColl", "inRangeAsc", "inRangeNullsFirst", "winref", "copiedOrder"], &[("startInRangeFunc", Routine, false), ("endInRangeFunc", Routine, false), ("inRangeColl", Collation, false)], &[("partitionClause", true), ("orderClause", true), ("startOffset", false), ("endOffset", false)]),
         (16, "WINDOWFUNC") => (&["winfnoid", "wintype", "wincollid", "inputcollid", "args", "aggfilter", "winref", "winstar", "winagg", "location"], &[("winfnoid", Routine, false), ("wintype", Type, false), ("wincollid", Collation, false), ("inputcollid", Collation, false)], &[("args", true), ("aggfilter", false)]),
         (18, "WINDOWFUNC") => (&["winfnoid", "wintype", "wincollid", "inputcollid", "args", "aggfilter", "runCondition", "winref", "winstar", "winagg", "location"], &[("winfnoid", Routine, false), ("wintype", Type, false), ("wincollid", Collation, false), ("inputcollid", Collation, false)], &[("args", true), ("aggfilter", false), ("runCondition", true)]),
+        (16 | 18, "XMLEXPR") => (&["op", "name", "named_args", "arg_names", "args", "xmloption", "indent", "type", "typmod", "location"], &[("type", Type, false)], &[("named_args", true), ("arg_names", true), ("args", true)]),
         _ => return None,
     };
     Some(Specification { fields, references, children })

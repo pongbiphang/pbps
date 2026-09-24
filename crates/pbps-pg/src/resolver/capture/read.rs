@@ -537,3 +537,6 @@ mod subscripting_tests;
 
 #[cfg(test)]
 mod coverage_tests;
+
+#[cfg(test)]
+mod expression_tests;
