@@ -203,12 +203,15 @@ impl Compose {
             }
             "recover-resources" => {
                 let Operation { operation_id } = parse(body)?;
-                encode(
-                    &self
-                        .publisher()?
-                        .recover_resources(&operation_id)
-                        .map_err(refused)?,
-                )
+                let report = self
+                    .publisher()?
+                    .recover_resources(&operation_id)
+                    .map_err(refused)?;
+                // An expired preview of this very workflow is gone now.
+                if report.state == compose::ResourceState::Spent {
+                    self.candidates.released(&operation_id);
+                }
+                encode(&report)
             }
             "forget" => {
                 let Forget {
@@ -222,7 +225,7 @@ impl Compose {
                     ));
                 }
                 let report = self.publisher()?.forget(&operation_id).map_err(refused)?;
-                self.candidates.forgotten(&operation_id);
+                self.candidates.released(&operation_id);
                 encode(&report)
             }
             _ => Err((404, "Unknown compose action".to_owned())),

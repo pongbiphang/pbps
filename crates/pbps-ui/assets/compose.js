@@ -223,16 +223,7 @@ globalThis.PbpsCompose = Object.freeze({
                 await send("forget", {operation_id: receipt.operation_id, acknowledged: true});
                 receipts.delete(receipt.operation_id);
                 draw();
-                if (receipt.operation_id === operation) {
-                  // The server released this workflow; so does the page.
-                  confirming = false;
-                  reconfirmable = false;
-                  operation = null;
-                  candidate = null;
-                  refresh.disabled = false;
-                  for (const field of Object.values(fields)) field.disabled = false;
-                  invalidate();
-                }
+                if (receipt.operation_id === operation) releaseWorkflow();
                 activity.textContent = "The receipt was forgotten. Branches already pushed are unchanged.";
               } catch (_) {
                 activity.textContent = "Forgetting did not complete. The receipt and its evidence are preserved.";
@@ -253,6 +244,17 @@ globalThis.PbpsCompose = Object.freeze({
       retiring: "Retirement started and has not finished.",
       retained: "Cleaned up; the commit root is kept for its receipt.",
       spent: "Retired.",
+    };
+    // The server releases the workflow when its own operation is forgotten
+    // or retired; the page follows, so a fresh preview needs no reload.
+    const releaseWorkflow = () => {
+      confirming = false;
+      reconfirmable = false;
+      operation = null;
+      candidate = null;
+      refresh.disabled = false;
+      for (const field of Object.values(fields)) field.disabled = false;
+      invalidate();
     };
     const reports = new Map();
     const drawReports = () => {
@@ -276,6 +278,7 @@ globalThis.PbpsCompose = Object.freeze({
               const next = await send("recover-resources", {operation_id: report.operation_id});
               reports.set(next.operation_id, next);
               drawReports();
+              if (next.state === "spent" && next.operation_id === operation) releaseWorkflow();
               if (next.state === report.state) {
                 activity.textContent = report.state === "sealed"
                   ? "This preview has not reached its 24-hour expiry; it is kept."

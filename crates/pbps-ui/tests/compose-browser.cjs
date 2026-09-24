@@ -235,6 +235,16 @@ async function retirement() {
   p = controls()[0].fire("click");
   b.calls[3].resolve({operation_id: "sealed-one", state: "spent", cleanup_pending: false, instruction: "none"}); await p;
   assert.equal(controls().length, 0);
+  // Retiring this workflow's own expired preview releases the page too.
+  const c = setup();
+  p = c.form.fire("submit"); c.calls[0].resolve(preview("expired")); await p;
+  assert.equal(c.confirm.disabled, false);
+  p = c.root.find(e => e.dataset.action === "resources").fire("click");
+  c.calls[1].resolve([{operation_id: "operation-expired", state: "sealed", cleanup_pending: true, instruction: "kept"}]); await p;
+  p = c.root.find(e => e.dataset.action === "recover-resources").fire("click");
+  c.calls[2].resolve({operation_id: "operation-expired", state: "spent", cleanup_pending: false, instruction: "none"}); await p;
+  assert(c.confirm.disabled, "a retired preview cannot be confirmed");
+  assert(!c.root.find(e => e.dataset.action === "preview").disabled);
 }
 async function definiteRefusals() {
   for (const problem of ["remote_unavailable", "signing_unavailable"]) {
