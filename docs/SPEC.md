@@ -1017,6 +1017,16 @@ ever needed, apply / baseline can additionally emit each ledger entry to an
 append-only destination outside the database (a CI artifact, a webhook), and the
 two records must agree.
 
+What the trust model does **not** concede is the deployment account's own
+privileges. Tampering with the ledger's *contents* is a record problem; a
+ledger that runs someone else's code when the deployment account writes to it
+is an escalation. So on PostgreSQL, where a role with `CREATE` on `public` can
+make the ledger tables before pbps does, every command that writes the ledger
+first compares its two tables with the recipe pbps creates them from — owner,
+columns, defaults, constraints, indexes, triggers, rules and row-security
+policies — and refuses before its first write when they differ; `doctor`
+reports the same as `ledger.untrusted` (DEC-313.1).
+
 ### 8.2 The drift check
 
 Before `apply`: query `sys.columns` / `INFORMATION_SCHEMA`, compare against the

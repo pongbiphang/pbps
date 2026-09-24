@@ -503,6 +503,15 @@ pub async fn ensure_tables(conn: &mut Conn) -> Result<(), DbError> {
     // there, or (issue #217) a decoy the DDL above skipped rather than
     // replaced. Only the last of those is not yet ruled out.
     confirm_ledger_relations(conn).await?;
+    // Ordinary tables of the right names are not yet the ledger pbps made: an
+    // untrusted role with CREATE on the schema could have made them first and
+    // attached code the deployment account would run on its next write
+    // (issue #313). Refused before `migrate_timeline_columns`' ALTER and
+    // before any caller's INSERT or DELETE.
+    let problems = ledger_problems(conn).await?;
+    if !problems.is_empty() {
+        return Err(DbError::Refused(untrusted_ledger_message(&problems)));
+    }
     // Both tables exist by this point, freshly created or already there —
     // either way a `__pbps_state` from before issue #103 still needs its
     // five timeline columns, and one just created by [`CREATE_STATE`] above
@@ -570,6 +579,236 @@ async fn confirm_ledger_relations(conn: &mut Conn) -> Result<(), DbError> {
          database where {STATE_TABLE} and {LOCK_TABLE} are free.",
         occupants.join("; ")
     )))
+}
+
+/// What the ledger's two tables hold beyond, or short of, the recipe pbps
+/// creates them from — each difference as one line naming its table.
+///
+/// **A known layout, compared whole, rather than a list of dangers.** Every
+/// way the deployment account can be made to run someone else's code on an
+/// `INSERT` or `DELETE` is a catalog row this compares: a trigger, a rule, a
+/// row-security policy, a column default, a CHECK expression, an index
+/// expression or predicate, a column of a type with its own input function.
+/// Enumerating those would be the open set this project keeps refusing to
+/// maintain; the recipe is two `CREATE TABLE` statements, so its catalog
+/// projection is small and closed, and anything else is a difference
+/// (DEC-313.1).
+///
+/// **And the owner.** A table of exactly the right shape owned by a role the
+/// deployment account cannot vouch for can still be given a trigger after
+/// this check passes; only an owner the account trusts closes that window.
+/// Trusted is the account itself, a role whose privileges it inherits or
+/// that it can `SET ROLE` to, the database owner, or a superuser — owners
+/// whose powers the deployment account already has. Both membership tests,
+/// because `USAGE` alone is false for a `NOINHERIT` membership: measured on
+/// 18.6 and 16.15, a deployer granted the owner role `NOINHERIT` has `SET`
+/// but not `USAGE`, and a ledger it could always use was refused.
+///
+/// A `__pbps_state` missing any of issue #103's five timeline columns is the
+/// recipe too: [`migrate_timeline_columns`] adds whichever are missing.
+///
+/// Read-only and world-readable catalogs only, so `doctor` can ask it of the
+/// least-privileged account SPEC §8.1 describes. A ledger that is not there
+/// yet has no problems: absent is [`ensure_tables`]' business.
+pub async fn ledger_problems(conn: &mut Conn) -> Result<Vec<String>, DbError> {
+    // Under the catalog reader's canonical settings, not the session's: the
+    // facts are deparsed text, and a setting the deployment role carries —
+    // measured, `quote_all_identifiers = on` renders `PRIMARY KEY ("id")` —
+    // would make the ledger pbps itself created read as someone else's, and
+    // refuse every lock and record. `canonical_query` scopes the settings to
+    // its own read-only transaction, or to a savepoint inside the caller's.
+    let rows = crate::catalog::canonical_query(conn, &ledger_facts(), &[]).await?;
+    let mut state = std::collections::BTreeSet::new();
+    let mut lock = std::collections::BTreeSet::new();
+    let mut problems = Vec::new();
+    for row in &rows {
+        let relname = text(row, "relname")?;
+        let fact = text(row, "fact")?;
+        let table = if relname == STATE_TABLE_NAME {
+            &mut state
+        } else {
+            &mut lock
+        };
+        if let Some(owner) = fact.strip_prefix("untrusted owner ") {
+            problems.push(format!(
+                "{LEDGER_SCHEMA}.{relname} is owned by `{owner}`, a role this account neither \
+                 inherits nor can SET ROLE to, and that is neither the database owner nor a \
+                 superuser"
+            ));
+        } else {
+            table.insert(fact);
+        }
+    }
+    if !state.is_empty() {
+        let full: std::collections::BTreeSet<String> =
+            STATE_RECIPE.iter().map(|f| (*f).to_owned()).collect();
+        let before_103: std::collections::BTreeSet<String> = STATE_RECIPE
+            .iter()
+            .filter(|f| {
+                !STATE_TIMELINE_COLUMNS
+                    .iter()
+                    .any(|c| f.starts_with(&format!("column {c} ")))
+            })
+            .map(|f| (*f).to_owned())
+            .collect();
+        // Every fact of the pre-#103 recipe, and nothing outside the full
+        // one. Any subset of the five timeline columns passes: each is a
+        // plain nullable integer with no default, so none can run code, and
+        // `migrate_timeline_columns` adds whichever are missing
+        // (`ADD COLUMN IF NOT EXISTS`).
+        if !(state.is_subset(&full) && before_103.is_subset(&state)) {
+            let extra: std::collections::BTreeSet<String> =
+                state.difference(&full).cloned().collect();
+            let lacking: std::collections::BTreeSet<String> =
+                before_103.difference(&state).cloned().collect();
+            problems.extend(differences(
+                STATE_TABLE_NAME,
+                &extra,
+                &std::collections::BTreeSet::new(),
+            ));
+            problems.extend(
+                lacking
+                    .iter()
+                    .map(|f| format!("{LEDGER_SCHEMA}.{STATE_TABLE_NAME} lacks {f}")),
+            );
+        }
+    }
+    if !lock.is_empty() {
+        let recipe: std::collections::BTreeSet<String> =
+            LOCK_RECIPE.iter().map(|f| (*f).to_owned()).collect();
+        if lock != recipe {
+            problems.extend(differences(LOCK_TABLE_NAME, &lock, &recipe));
+        }
+    }
+    Ok(problems)
+}
+
+/// One line per fact the table holds that the recipe does not, and per recipe
+/// fact the table lacks.
+fn differences(
+    relname: &str,
+    held: &std::collections::BTreeSet<String>,
+    recipe: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    let extra = held
+        .difference(recipe)
+        .map(|f| format!("{LEDGER_SCHEMA}.{relname} has {f}, which pbps did not create"));
+    let missing = recipe
+        .difference(held)
+        .map(|f| format!("{LEDGER_SCHEMA}.{relname} lacks {f}"));
+    extra.chain(missing).collect()
+}
+
+/// The refusal [`ensure_tables`] gives, and the text `doctor` reports.
+pub fn untrusted_ledger_message(problems: &[String]) -> String {
+    format!(
+        "{}.\n\
+         The ledger tables are not the ones pbps creates, so this account will not write to \
+         them: a trigger, rule, policy or expression on them would run with its privileges. \
+         If they were made by pbps and changed by hand, restore them; otherwise drop them and \
+         let pbps create its own, and keep CREATE on schema {LEDGER_SCHEMA} away from \
+         untrusted roles.",
+        problems.join(";\n")
+    )
+}
+
+/// The five columns issue #103 added to `__pbps_state`, which a ledger from
+/// before it may still lack.
+const STATE_TIMELINE_COLUMNS: [&str; 5] = [
+    "state_version",
+    "tables_count",
+    "modules_count",
+    "staged_completed",
+    "staged_total",
+];
+
+/// [`CREATE_STATE`]'s catalog projection, as [`ledger_facts`] spells it.
+/// Measured on 18.6 and 16.15: identical on both, apart from the `NOT NULL`
+/// constraints 18 records as `contype = 'n'`, which the facts leave out
+/// because `attnotnull` already carries them.
+const STATE_RECIPE: [&str; 15] = [
+    "column id bigint NOT NULL GENERATED ALWAYS AS IDENTITY",
+    "column applied_at timestamp(3) without time zone NOT NULL DEFAULT (clock_timestamp() AT TIME ZONE 'UTC'::text)",
+    "column kind character varying(16) NOT NULL",
+    "column git_sha character varying(40)",
+    "column plan_checksum character varying(64)",
+    "column state_json text NOT NULL",
+    "column operator character varying(128) NOT NULL",
+    "column reason character varying(1000)",
+    "column state_version integer",
+    "column tables_count integer",
+    "column modules_count integer",
+    "column staged_completed integer",
+    "column staged_total integer",
+    "constraint pk___pbps_state PRIMARY KEY (id)",
+    "index CREATE UNIQUE INDEX pk___pbps_state ON public.__pbps_state USING btree (id)",
+];
+
+/// [`CREATE_LOCK`]'s catalog projection, measured the same way.
+const LOCK_RECIPE: [&str; 6] = [
+    "column id integer NOT NULL",
+    "column locked_by character varying(256) NOT NULL",
+    "column locked_at timestamp(3) without time zone NOT NULL DEFAULT (clock_timestamp() AT TIME ZONE 'UTC'::text)",
+    "constraint ck___pbps_lock_single CHECK ((id = 1))",
+    "constraint pk___pbps_lock PRIMARY KEY (id)",
+    "index CREATE UNIQUE INDEX pk___pbps_lock ON public.__pbps_lock USING btree (id)",
+];
+
+/// Every catalog fact about the two ledger tables that decides what a write to
+/// them does, one row each, in [`STATE_RECIPE`]'s spelling. Ordinary tables
+/// only: another kind is [`confirm_ledger_relations`]' refusal.
+fn ledger_facts() -> String {
+    format!(
+        "WITH ledger AS (
+           SELECT c.oid, c.relname, c.relowner, c.relrowsecurity, c.relforcerowsecurity
+             FROM pg_catalog.pg_class c
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = '{LEDGER_SCHEMA}'
+              AND c.relname IN ('{STATE_TABLE_NAME}', '{LOCK_TABLE_NAME}')
+              AND c.relkind = 'r'
+         )
+         SELECT l.relname,
+                'column ' || a.attname || ' ' || pg_catalog.format_type(a.atttypid, a.atttypmod)
+                || CASE WHEN a.attnotnull THEN ' NOT NULL' ELSE '' END
+                || CASE a.attidentity WHEN 'a' THEN ' GENERATED ALWAYS AS IDENTITY'
+                                      WHEN 'd' THEN ' GENERATED BY DEFAULT AS IDENTITY'
+                                      ELSE '' END
+                || CASE WHEN a.attgenerated <> '' THEN ' GENERATED ' || a.attgenerated::text ELSE '' END
+                || COALESCE(' DEFAULT ' || pg_catalog.pg_get_expr(d.adbin, d.adrelid), '') AS fact
+           FROM ledger l
+           JOIN pg_catalog.pg_attribute a
+             ON a.attrelid = l.oid AND a.attnum > 0 AND NOT a.attisdropped
+           LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = l.oid AND d.adnum = a.attnum
+         UNION ALL
+         SELECT l.relname, 'constraint ' || con.conname || ' ' || pg_catalog.pg_get_constraintdef(con.oid)
+           FROM ledger l JOIN pg_catalog.pg_constraint con ON con.conrelid = l.oid
+          WHERE con.contype <> 'n'
+         UNION ALL
+         SELECT l.relname, 'index ' || pg_catalog.pg_get_indexdef(i.indexrelid)
+           FROM ledger l JOIN pg_catalog.pg_index i ON i.indrelid = l.oid
+         UNION ALL
+         SELECT l.relname, 'trigger ' || t.tgname
+           FROM ledger l JOIN pg_catalog.pg_trigger t ON t.tgrelid = l.oid
+          WHERE NOT t.tgisinternal
+         UNION ALL
+         SELECT l.relname, 'rule ' || r.rulename
+           FROM ledger l JOIN pg_catalog.pg_rewrite r ON r.ev_class = l.oid
+         UNION ALL
+         SELECT l.relname, 'policy ' || p.polname
+           FROM ledger l JOIN pg_catalog.pg_policy p ON p.polrelid = l.oid
+         UNION ALL
+         SELECT l.relname, 'row level security enabled'
+           FROM ledger l WHERE l.relrowsecurity OR l.relforcerowsecurity
+         UNION ALL
+         SELECT l.relname, 'untrusted owner ' || o.rolname
+           FROM ledger l
+           JOIN pg_catalog.pg_roles o ON o.oid = l.relowner
+           JOIN pg_catalog.pg_database db ON db.datname = pg_catalog.current_database()
+          WHERE NOT pg_catalog.pg_has_role(current_user, l.relowner, 'USAGE')
+            AND NOT pg_catalog.pg_has_role(current_user, l.relowner, 'SET')
+            AND l.relowner <> db.datdba
+            AND NOT o.rolsuper"
+    )
 }
 
 /// The relations, if any, that keep either ledger name from naming an ordinary
