@@ -289,6 +289,42 @@ impl Candidates {
             .then_some(candidate.preview.operation_id.as_str())
     }
 
+    /// Releases a confirmed candidate whose publication was refused before
+    /// any receipt because its reviewed authority went stale (a moved base,
+    /// changed destination, signing policy or repository). Reconfirming it
+    /// can never succeed, so its private resources retire through the
+    /// ordinary path and the workflow accepts a fresh preview.
+    pub fn release_stale(&mut self, candidate_id: &str, outcome: &Outcome) -> Result<()> {
+        let Some(Stored::Confirmed(candidate)) = &self.current else {
+            return Err(Error::new("No confirmed candidate to release"));
+        };
+        let stale = matches!(
+            outcome.problem,
+            Some(
+                Problem::RemoteBaseChanged
+                    | Problem::DestinationChanged
+                    | Problem::SigningChanged
+                    | Problem::RepositoryChanged
+            )
+        );
+        if candidate.preview.candidate_id != candidate_id
+            || outcome.operation_id != candidate.preview.operation_id
+            || outcome.status != Status::Refused
+            || outcome.details.as_ref().is_some_and(|d| d.commit.is_some())
+            || !stale
+        {
+            return Err(Error::new(
+                "Only a stale pre-publication refusal releases its candidate",
+            ));
+        }
+        candidate
+            .workspace
+            .resources
+            .retire(&candidate.preview.operation_id, false)?;
+        self.current = None;
+        Ok(())
+    }
+
     pub fn confirm(&mut self, candidate_id: &str, now: SystemTime) -> Result<Arc<Candidate>> {
         let current = self
             .current

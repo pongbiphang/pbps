@@ -121,7 +121,19 @@ impl Compose {
                     .candidates
                     .confirm(&candidate_id, SystemTime::now())
                     .map_err(refused)?;
-                encode(&publisher.confirm(&candidate))
+                let mut outcome = publisher.confirm(&candidate);
+                // Stale authority is never cured by reconfirming; release the
+                // handle so a fresh preview can be reviewed. A failed release
+                // keeps the workflow and reports its cleanup as pending.
+                if outcome.status == Status::Refused
+                    && self
+                        .candidates
+                        .release_stale(&candidate_id, &outcome)
+                        .is_err()
+                {
+                    outcome.cleanup_pending = true;
+                }
+                encode(&outcome)
             }
             "list" => {
                 let Nothing {} = parse(body)?;

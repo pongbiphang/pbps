@@ -158,6 +158,23 @@ async function mergeRequests() {
     }
   }
 }
+async function staleRefusal() {
+  // A refusal no reconfirmation can cure reopens the form for a new preview.
+  const a = setup();
+  let p = a.form.fire("submit"); a.calls[0].resolve(preview("stale")); await p;
+  p = a.confirm.fire("click");
+  a.calls[1].resolve({status: "refused", operation_id: "operation-stale", local: "not_attempted",
+    remote: "not_attempted", problem: "remote_base_changed", cleanup_pending: false, details: null});
+  await p;
+  assert(a.confirm.disabled, "a released candidate cannot be reconfirmed");
+  assert(!a.root.find(e => e.dataset.action === "preview").disabled, "Refresh is available again");
+  assert(!a.field("message").disabled, "inputs are editable again");
+  assert(a.root.find(e => e.textContent.includes("preview a new candidate")));
+  p = a.form.fire("submit");
+  assert.equal(a.calls[2].action, "preview");
+  a.calls[2].resolve(preview("fresh")); await p;
+  assert.equal(a.confirm.disabled, false);
+}
 async function definiteRefusals() {
   for (const problem of ["remote_unavailable", "signing_unavailable"]) {
     const a = setup();
@@ -190,4 +207,4 @@ async function definiteRefusals() {
     assert(a.root.find(e => e.dataset.action === "recover"));
   }
 }
-exercise().then(outcomes).then(definiteRefusals).then(mergeRequests).then(() => process.stdout.write("compose browser behavior passed\n"), error => { console.error(error); process.exitCode = 1; });
+exercise().then(outcomes).then(definiteRefusals).then(staleRefusal).then(mergeRequests).then(() => process.stdout.write("compose browser behavior passed\n"), error => { console.error(error); process.exitCode = 1; });

@@ -69,6 +69,8 @@ globalThis.PbpsCompose = Object.freeze({
     let reconfirmable = false;
     let operation = null;
     const receipts = new Map();
+    // Refusals no reconfirmation can cure; the server releases the handle.
+    const stale = ["remote_base_changed", "destination_changed", "signing_changed", "repository_changed"];
     const destinationText = destination => {
       const {transport, host, port, principal, repository} = destination;
       return JSON.stringify({transport, host, port, principal, repository});
@@ -120,9 +122,11 @@ globalThis.PbpsCompose = Object.freeze({
         const card = make("article");
         card.append(make("p", statusText[receipt.status]), make("p", `Operation: ${receipt.operation_id}`));
         card.append(make("p", remoteText[receipt.remote] || "Remote state is unavailable."));
-        if (receipt.problem) card.append(make("p", receipt.status === "refused"
-          ? "No publication was attempted. Restore the unavailable prerequisite, then confirm this same frozen candidate again."
-          : "An operation check failed. Reconcile the saved result before proceeding."));
+        if (receipt.problem) card.append(make("p", receipt.status !== "refused"
+          ? "An operation check failed. Reconcile the saved result before proceeding."
+          : stale.includes(receipt.problem)
+            ? "No publication was attempted. The reviewed base, destination, signing policy or repository changed; preview a new candidate."
+            : "No publication was attempted. Restore the unavailable prerequisite, then confirm this same frozen candidate again."));
         if (receipt.cleanup_pending) card.append(make("p", "Private cleanup remains pending; keep this receipt."));
         const d = receipt.details;
         if (d) {
@@ -263,7 +267,16 @@ globalThis.PbpsCompose = Object.freeze({
         const result = await send("confirm", {candidate_id: candidate});
         render(result);
         activity.textContent = statusText[result.status];
-        if (result.status === "refused" && result.operation_id === operation) {
+        if (result.status === "refused" && result.operation_id === operation && stale.includes(result.problem)) {
+          // The reviewed base, destination, signing policy or repository
+          // changed: the server released this candidate, so review a new one.
+          confirming = false;
+          candidate = null;
+          refresh.disabled = false;
+          for (const field of Object.values(fields)) field.disabled = false;
+          confirm.disabled = true;
+          activity.textContent = "What this candidate was reviewed against has changed. Preview again to review a new candidate.";
+        } else if (result.status === "refused" && result.operation_id === operation) {
           // A definite refusal has no receipt to recover. Keep the inputs and
           // preview frozen; only reconfirmation of this same handle is enabled.
           reconfirmable = true;

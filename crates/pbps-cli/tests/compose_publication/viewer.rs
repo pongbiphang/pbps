@@ -3,6 +3,7 @@
 //! outside the fixed actions can write.
 
 use super::*;
+use pbps_ui::compose::ResourceState;
 use std::io::Read;
 use std::net::TcpStream;
 
@@ -282,4 +283,62 @@ fn a_busy_publisher_refuses_confirmation_without_consuming_the_reviewed_handle()
             .as_deref(),
         delivered["details"]["commit"].as_str()
     );
+}
+
+#[test]
+fn a_stale_base_refusal_releases_the_workflow_for_a_fresh_preview() {
+    let f = Fixture::new("viewer-compose-stale");
+    let served = serve(&f);
+    let first = served.action("preview", intent()).json();
+    let operation = first["operation_id"].as_str().unwrap();
+    // The remote base branch advances after the preview was reviewed.
+    let old = String::from_utf8(git(&f.remote, &["rev-parse", "refs/heads/master"])).unwrap();
+    let old = old.trim();
+    let advanced = String::from_utf8(git(
+        &f.remote,
+        &[
+            "-c",
+            "user.name=Remote",
+            "-c",
+            "user.email=remote@example.test",
+            "commit-tree",
+            &format!("{old}^{{tree}}"),
+            "-p",
+            old,
+            "-m",
+            "advance",
+        ],
+    ))
+    .unwrap();
+    git(
+        &f.remote,
+        &["update-ref", "refs/heads/master", advanced.trim()],
+    );
+    let refused = served
+        .action(
+            "confirm",
+            serde_json::json!({"candidate_id": first["candidate_id"]}),
+        )
+        .json();
+    assert_eq!(refused["status"], "refused", "{refused}");
+    assert_eq!(refused["problem"], "remote_base_changed");
+    assert!(!f.record(operation).exists(), "a refusal wrote a receipt");
+    // Reconfirming cannot cure a moved base; the workflow is released and
+    // the refused operation's private resources are retired.
+    let reports = f.publisher().resource_reports().unwrap();
+    let released = reports
+        .iter()
+        .find(|report| report.operation_id == operation)
+        .unwrap();
+    assert_eq!(released.state, ResourceState::Spent);
+    git(&f.remote, &["update-ref", "refs/heads/master", old]);
+    let second = served.action("preview", intent()).json();
+    assert_ne!(second["operation_id"], first["operation_id"]);
+    let delivered = served
+        .action(
+            "confirm",
+            serde_json::json!({"candidate_id": second["candidate_id"]}),
+        )
+        .json();
+    assert_eq!(delivered["status"], "delivered", "{delivered}");
 }
