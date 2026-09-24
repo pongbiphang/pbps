@@ -263,6 +263,17 @@ fn admission_validates_healthy_foreign_records_without_granting_cleanup_authorit
             .discard_preview(&foreign.operation_id)
             .is_err()
     );
+    // A direct action on the other source's record names the record (#810).
+    let refused = f
+        .publisher()
+        .recover_resources(&foreign.operation_id)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("another source worktree")
+            && refused.contains(&old[1].0.display().to_string()),
+        "{refused}"
+    );
     f.publisher()
         .discard_preview(&preview.operation_id)
         .unwrap();

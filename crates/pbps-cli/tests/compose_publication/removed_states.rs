@@ -66,3 +66,22 @@ fn receipts_in_removed_or_unknown_states_refuse_without_mutation() {
         assert_eq!(f.repo.preserved(), before, "{label}");
     }
 }
+
+#[test]
+fn a_receipt_from_a_replaced_source_checkout_is_named() {
+    // Same source path, different inode: not another worktree, and not this
+    // one either. Discovery refuses and names the receipt (#810).
+    let f = Fixture::new("removed-replaced-source");
+    let (_store, preview, candidate) = f.ready();
+    assert_eq!(f.publisher().confirm(&candidate).status, Status::Delivered);
+    let path = f.record(&preview.operation_id);
+    let mut receipt: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let inode = &mut receipt["description"]["repository"]["source_inode"];
+    *inode = (inode.as_u64().unwrap() + 1).into();
+    let bytes = serde_json::to_vec(&receipt).unwrap();
+    fs::write(&path, &bytes).unwrap();
+    let listed = f.publisher().list().unwrap_err().to_string();
+    assert!(listed.contains("source identity changed"), "{listed}");
+    assert!(listed.contains(&path.display().to_string()), "{listed}");
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+}

@@ -659,10 +659,17 @@ impl Publications {
     pub fn list(&mut self) -> Result<Vec<Outcome>> {
         let mut outcomes = Vec::new();
         for record in self.records.list()? {
+            // A receipt outside every source scope is named, like a bad read.
+            let path = self
+                .records
+                .directory
+                .path
+                .join(format!("{}.json", record.description.operation_id));
             if record
                 .description
                 .repository
-                .source_scope(&self.repository)?
+                .source_scope(&self.repository)
+                .map_err(|error| error.at(&path))?
             {
                 outcomes.push(self.reconcile(record, None, &|_| true));
             }

@@ -125,10 +125,15 @@ impl Resources {
 
     fn load(&self, id: &str) -> Result<Resource> {
         let r = self.read(id)?;
-        if !r.repository.source_scope(&self.repository)? {
-            return Err(Error::new(
-                "Compose resource belongs to another source worktree",
-            ));
+        let path = self.records.path.join(format!("{id}.json"));
+        if !r
+            .repository
+            .source_scope(&self.repository)
+            .map_err(|error| error.at(&path))?
+        {
+            return Err(
+                Error::new("Compose resource belongs to another source worktree").at(&path),
+            );
         }
         Ok(r)
     }
@@ -1052,7 +1057,11 @@ impl Resources {
                 Some(record) => record,
                 None => self.read_in_pass(id, &mut revisions)?,
             };
-            if record.repository.source_scope(&self.repository)? {
+            if record
+                .repository
+                .source_scope(&self.repository)
+                .map_err(|error| error.at(&self.records.path.join(name)))?
+            {
                 result.push(self.report_resource(record)?);
             }
         }
