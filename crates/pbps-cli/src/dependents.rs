@@ -472,6 +472,14 @@ pub(crate) fn weave(
                     at.drop_at
                 }
             };
+            // Its owner dropped by this plan, even after the module: then
+            // what the declarations hold under the same name is the part of a
+            // new table or column, created with it, and not this dependent
+            // kept. The old one is removed before the drop above; the new one
+            // is its own creation's business.
+            if find(&cs.changes, &d.holds, removes_with_its_owner).is_some() {
+                continue;
+            }
             let kept = as_declared(&cs.changes, d);
             if !kept.managed(declared) {
                 continue;
@@ -935,5 +943,43 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         assert_eq!(back, ["app.v2"]);
+    }
+
+    /// A plan that drops a function and replaces the table its check lives on
+    /// (a new uid under the same name) does not keep the old check: the
+    /// declared `ck` belongs to the new table and comes with its creation.
+    /// The old one is removed before the function goes; nothing is restored,
+    /// and the plan is not refused.
+    #[test]
+    fn a_dependent_whose_owner_the_plan_replaces_is_not_kept() {
+        let (s, ids) = declared();
+        let mut cs = plan(vec![
+            Change::DropModule {
+                id: id("app.f(integer)"),
+                kind: ModuleKind::Function,
+            },
+            Change::DropTable {
+                uid: Uid::derived(UidKind::Table, "app.t", 0),
+                name: TableName::new("app", "t"),
+            },
+            Change::CreateTable {
+                uid: Uid::derived(UidKind::Table, "app.t", 1),
+                name: TableName::new("app", "t"),
+                table: Box::new(s.tables[&TableName::new("app", "t")].clone()),
+            },
+        ]);
+        let found = BTreeMap::from([(
+            id("app.f(integer)"),
+            vec![part(
+                Part::Check("ck".into()),
+                "constraint ck on table app.t",
+            )],
+        )]);
+        weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).unwrap();
+        let shape = rendered(&cs);
+        assert_eq!(shape[0], "drop check ck", "{shape:?}");
+        assert_eq!(shape[1], "drop app.f(integer)", "{shape:?}");
+        assert!(!shape.iter().any(|c| c == "add check ck"), "{shape:?}");
+        assert!(unaccounted(&cs, &found).is_empty());
     }
 }
