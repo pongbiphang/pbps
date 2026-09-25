@@ -118,7 +118,9 @@ step 5). Each is one `pbps` child with `--no-input`, started from typed fields:
 - **The plan file must be new.** The viewer claims the path before the plan
   runs and refuses one that already names anything, so a plan someone approved
   is never replaced by a new one. Its directory must exist. A plan that fails
-  gives the empty file back (DEC-1025.2). Read the new plan with **Read the plan**, which opens the Saved
+  gives the empty file back, even with the page closed. If the viewer itself
+  was stopped mid-plan, the refusal says the file is empty; delete it and plan
+  again (DEC-1025.2). Read the new plan with **Read the plan**, which opens the Saved
   plan view on it.
 - **The checksum is typed, never filled in.** The field starts empty, and
   nothing the viewer reads fills it. Enter the SHA-256 your deployment gate

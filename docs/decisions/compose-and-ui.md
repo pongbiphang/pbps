@@ -368,8 +368,15 @@ starts the child.
 - The claim is atomic. Two runs naming one file, however the path is spelled,
   cannot both pass it; an existence check followed by the child's write could
   let both through.
-- A run that fails gives its claim back. The file is removed only while it is
-  still empty, since anything else holds bytes the viewer did not write.
+- A run that fails gives its claim back. A thread that waits for the child
+  does this when the child exits, so it does not depend on the page asking. The
+  file is removed only while it is still empty, since anything else holds bytes
+  the viewer did not write.
+- A viewer stopped together with its child, by Ctrl-C or a kill, can leave the
+  empty file behind. Nothing can clean up after a process that is gone, and
+  deleting an empty file on the next launch could remove a claim another
+  viewer still holds. So the refusal names the case instead: the file exists
+  and is empty, perhaps from an interrupted plan, and a person deletes it.
 - A private directory owned by the viewer was the alternative. It was rejected
   because a plan is meant to be passed on to the reviewer who approves it, and
   a file under a temporary directory is the wrong place for that.

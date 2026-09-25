@@ -181,13 +181,14 @@ struct Captured {
     closed: bool,
 }
 
+/// The child's exit as its watcher saw it: `Err` when waiting failed, so the
+/// outcome is unknown rather than a success or a failure.
+type Exit = Option<Result<Option<i32>, ()>>;
+
 struct Run {
     action: &'static str,
     arguments: Vec<String>,
-    child: Child,
-    /// The plan file this run claimed, released again if the run fails.
-    reserved: Option<PathBuf>,
-    exited: Option<Option<i32>>,
+    exited: Arc<Mutex<Exit>>,
     ended: Option<Option<i32>>,
     stdout: Arc<Mutex<Captured>>,
     stderr: Arc<Mutex<Captured>>,
@@ -199,28 +200,37 @@ impl Run {
     /// child wrote last, and the page stops asking about an ended run, so
     /// ending on the exit alone could lose a refusal's own words for good.
     fn poll(&mut self) -> Result<(), String> {
-        if self.exited.is_none() {
-            match self.child.try_wait() {
-                Ok(Some(status)) => self.exited = Some(status.code()),
-                Ok(None) => {}
-                // Unknown is not ended: the run stays reported as running.
-                Err(_) => return Err("The run's state could not be read".into()),
-            }
-        }
+        let exited = *self.exited.lock().unwrap_or_else(|e| e.into_inner());
+        let code = match exited {
+            None => return Ok(()),
+            Some(Ok(code)) => code,
+            // Unknown is not ended: the run stays reported as running.
+            Some(Err(())) => return Err("The run's state could not be read".into()),
+        };
         let closed = |captured: &Arc<Mutex<Captured>>| {
             captured.lock().unwrap_or_else(|e| e.into_inner()).closed
         };
         if self.ended.is_none() && closed(&self.stdout) && closed(&self.stderr) {
-            self.ended = self.exited;
-            if let Some(path) = self
-                .reserved
-                .take_if(|_| self.ended.is_some_and(|code| code != Some(0)))
-            {
-                release(&path);
-            }
+            self.ended = Some(code);
         }
         Ok(())
     }
+}
+
+/// Waits for the child on its own thread, so what must follow its exit does
+/// not depend on anyone asking: a failed plan's claim on its file is released
+/// even when the page was closed (DEC-1025.2).
+fn watch(mut child: Child, reserved: Option<PathBuf>) -> Arc<Mutex<Exit>> {
+    let exited = Arc::new(Mutex::new(None));
+    let record = Arc::clone(&exited);
+    std::thread::spawn(move || {
+        let outcome = child.wait().map(|status| status.code()).map_err(|_| ());
+        if let Some(path) = reserved.filter(|_| outcome != Ok(Some(0))) {
+            release(&path);
+        }
+        *record.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
+    });
+    exited
 }
 
 /// What the page is told about one run. `code` is absent while it runs, and
@@ -313,9 +323,7 @@ impl Trigger {
             Run {
                 action: invocation.action(),
                 arguments,
-                child,
-                reserved,
-                exited: None,
+                exited: watch(child, reserved),
                 ended: None,
                 stdout,
                 stderr,
@@ -365,10 +373,23 @@ fn reserve(path: &Path) -> Result<(), String> {
         .open(path)
     {
         Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(format!(
-            "`{}` already exists; choose a new plan file",
-            path.display()
-        )),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let empty = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.len() == 0);
+            Err(if empty {
+                // Left by a plan that was stopped with its viewer, or held by
+                // one still running: only a person can tell which.
+                format!(
+                    "`{}` already exists and is empty, perhaps left by an interrupted plan; \
+                     delete it if no plan is writing it, or choose a new plan file",
+                    path.display()
+                )
+            } else {
+                format!(
+                    "`{}` already exists; choose a new plan file",
+                    path.display()
+                )
+            })
+        }
         Err(e) => Err(format!("`{}` could not be created: {e}", path.display())),
     }
 }
@@ -675,14 +696,20 @@ mod tests {
         assert_eq!(refused.0, 409, "{}", refused.1);
         assert!(directory.join("shared.json").exists());
 
+        assert!(refused.1.contains("is empty"), "{}", refused.1);
+        // The stand-in exits 3 without writing, and the empty claim is
+        // released with nobody asking for the run's outcome, as when the page
+        // was closed.
         std::fs::write(directory.join("release"), "").unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while runs(&mut trigger).iter().any(|run| run["ended"] == false) {
-            assert!(std::time::Instant::now() < deadline, "the run never ended");
+        while directory.join("shared.json").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the claim was never released"
+            );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        // The stand-in exits 3 without writing: the empty claim is released.
-        assert!(!directory.join("shared.json").exists());
+        assert_eq!(runs(&mut trigger)[0]["code"], 3);
         let _ = std::fs::remove_dir_all(&directory);
     }
 
