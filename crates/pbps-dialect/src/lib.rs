@@ -1925,6 +1925,18 @@ pub trait Dialect {
         true
     }
 
+    /// The constraint names this dialect's emitter gives `table` on its own,
+    /// each with what it is for, so that [`check_constraint_names`] can hold
+    /// them to the same namespace as the declared ones (#969). SQL Server names
+    /// every default it creates (`DF_pbps_…`); the default is "none".
+    fn generated_constraint_names(
+        &self,
+        _name: &TableName,
+        _table: &Table,
+    ) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
     /// Where `to` sits on the path a bare name in a definition in `from` is
     /// looked up along, or `None` where it is not on that path at all
     /// (DECISIONS 317).
@@ -2485,6 +2497,26 @@ pub fn check_constraint_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<Str
                     "{} and {descriptor} are both named `{claim_name}`; {} keeps tables, views, \
                      routines, triggers and constraints in one namespace per schema, so it can \
                      hold only one of them",
+                    existing.descriptor,
+                    dialect.name()
+                ));
+            }
+        }
+    }
+    // The names the emitter chooses itself, after every declared one, and never
+    // left to the table-local rule: that rule does not know them (#969).
+    for (table_name, table) in &schema.tables {
+        for (name, what) in dialect.generated_constraint_names(table_name, table) {
+            let claim_name = ObjectName::new(table_name.schema.clone(), name);
+            let descriptor = format!("the name `{}` gives {what}", dialect.name());
+            let claim = Claim {
+                descriptor: descriptor.clone(),
+                constraint_of: None,
+            };
+            if let Some(existing) = claimed.insert(claim_name.clone(), claim) {
+                problems.push(format!(
+                    "{} and {descriptor} are both `{claim_name}`; {} keeps constraints in one \
+                     namespace per schema, so rename the declared one",
                     existing.descriptor,
                     dialect.name()
                 ));

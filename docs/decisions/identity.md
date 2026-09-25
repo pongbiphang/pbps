@@ -518,3 +518,18 @@ Names are compared exactly, because validation is offline and cannot know the
 collation. A pair differing only in case is refused by a case-insensitive
 engine loudly, before anything else of the statement runs, and is a legal pair
 on a case-sensitive one, both pinned live.
+
+The default constraints the emitter names itself are in that namespace too
+(#969), and `DF_{table}_{column}` did not say where the table ended:
+`dbo.a_b.c` and `dbo.a.b_c` both spelled `DF_a_b_c`, and the second
+`CREATE TABLE` was refused. The emitter sees one change at a time, so it cannot
+keep a short name only where nothing collides. So the name is now
+`DF_pbps_{table}_{column}` when the table's name has no underscore, which makes
+the first `_` after the prefix the boundary. Otherwise it is
+`DF_pbps_{table}_{column}_{digest}`, with the digest of the qualified column
+that a name too long to fit already carried. `pbps_` marks the name as this
+tool's, apart from the `DF_<table>_<column>` many teams write by hand. No
+environment had been deployed under the old shape, and nothing reads a
+generated name back: a drop looks the name up in the catalog. The dialect also
+lists these names (`Dialect::generated_constraint_names`), so a declared
+constraint spelled like one is refused by `check_constraint_names` too.

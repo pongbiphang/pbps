@@ -2719,6 +2719,60 @@ async fn constraints_share_a_schemas_namespace_with_tables_and_routines() {
     db.drop().await;
 }
 
+/// #969: the default names `pbps` generates are in the schema's constraint
+/// namespace (DEC-496.1), and `dbo.a_b.c` and `dbo.a.b_c` once both spelled
+/// `DF_a_b_c`, so the second `CREATE TABLE` was refused (Msg 1750). Both are
+/// now created from what the emitter writes, and each default carries the
+/// `DF_pbps_` name it was given.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn two_columns_whose_names_join_to_one_string_both_get_their_defaults() {
+    let mut db = TestDb::create("defaultnames969").await;
+    let with_default = |column: &str| {
+        let mut t = Table::default();
+        let mut c = Column::new(ty("int")).not_null();
+        c.default = Some("0".into());
+        t.columns.insert(column.to_owned(), c);
+        t
+    };
+    let cs = pbps_model::ChangeSet {
+        changes: vec![
+            pbps_model::PlannedChange::new(pbps_model::Change::CreateTable {
+                uid: "t_ab0001".parse().unwrap(),
+                name: TableName::new("dbo", "a_b"),
+                table: Box::new(with_default("c")),
+            }),
+            pbps_model::PlannedChange::new(pbps_model::Change::CreateTable {
+                uid: "t_ab0002".parse().unwrap(),
+                name: TableName::new("dbo", "a"),
+                table: Box::new(with_default("b_c")),
+            }),
+        ],
+    };
+    apply(&mut db.conn, &cs).await;
+    let rows = db
+        .conn
+        .query(
+            "SELECT OBJECT_NAME(parent_object_id) AS t, name FROM sys.default_constraints \
+             ORDER BY t;",
+        )
+        .await
+        .unwrap();
+    let names: Vec<(String, String)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.try_get::<&str>("t").unwrap().unwrap().to_owned(),
+                r.try_get::<&str>("name").unwrap().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert_eq!(names[0], ("a".to_owned(), "DF_pbps_a_b_c".to_owned()));
+    assert!(names[1].1.starts_with("DF_pbps_a_b_c_"), "{names:?}");
+    db.drop().await;
+}
+
 /// SPEC §8.1: the whole state goes in and comes back out unchanged. Everything
 /// downstream — drift, the plan checksum, `status` — reads this row, so a
 /// serialization that lost a field would make every one of them quietly wrong.
