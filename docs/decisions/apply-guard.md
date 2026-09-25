@@ -1130,6 +1130,18 @@ plan's pins in three places:
 - after the read-back and before `record`, so a replacement during the DDL
   rolls the apply back.
 
+The two checks inside the transaction need a fresh snapshot for each
+statement, so the apply transaction opens with `BEGIN ISOLATION LEVEL READ
+COMMITTED` rather than a bare `BEGIN`. A bare `BEGIN` inherits
+`default_transaction_isolation`. Measured on 18.6 with that set to `repeatable
+read` on the database: a transaction's second `SELECT` of a routine's
+`pg_proc` row still returned the old `prosrc` after another session's `CREATE
+OR REPLACE`. A call in that same transaction ran the new body, because the
+engine looks routines up in its catalog snapshot, not the transaction's. A
+closing check under such a snapshot would compare the stale row and pass.
+The explicit level makes the check see what the DDL ran. A staged step opens
+its transaction the same way.
+
 *Managed routines are not pinned.* A routine in the plan's managed set is the
 drift check's and the read-back's (SPEC §7.6), and a pin over it would have to
 predict what the plan's own statements do to its row: a grant, a rebuild, a
