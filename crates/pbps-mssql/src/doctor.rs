@@ -1505,6 +1505,11 @@ pub async fn permissions(
             .filter(|table| moved_to(table, project_ids, &recorded_ids).is_none())
             .map(|table| table.schema.as_str()),
     );
+    // Recorded modules too (#355): a view, procedure or function removed from
+    // the declarations is a pending `DROP` in its schema just as a table is,
+    // and the drop needs `ALTER` there. A module has no uid to move under, so
+    // every recorded one keeps its schema managed until its drop is recorded.
+    managed.extend(recorded.modules.keys().map(pbps_model::ModuleId::schema));
 
     // The ledger's schema is queried alongside the managed ones because it is
     // the fallback for the ledger requirements before those tables exist — but
