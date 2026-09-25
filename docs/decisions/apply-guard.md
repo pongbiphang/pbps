@@ -1022,6 +1022,18 @@ both conditions:
   for it, but the member's `CREATE OR REPLACE` fails with "must be owner",
   measured on 18.6.
 
+  The roles tested are the *actors*, as the ledger editor rule defines them.
+  An actor is a role that can log in, or any role with a backend connected to
+  this database in `pg_stat_activity` (DEC-862.1). A role that is neither
+  acts only through its members, and they are tested in their own right. A
+  `NOLOGIN` owner with no member and no session therefore makes nothing
+  replaceable. An actor that is a superuser, or that can become the deployment
+  account (DEC-834.1's trust), is not counted: nothing pbps checks restrains
+  the first, and the second is the deployer. The extension-owner test below
+  uses the same actors. A role that gains `LOGIN`, a session or a membership
+  between plan and apply brings its routines into the recomputed set, and that
+  refuses like any other change.
+
 No schema is exempt by name. The built-in routines in `pg_catalog` and
 `information_schema` belong to the bootstrap superuser and fall out of the set
 by the second condition. A routine that an administrator created or re-owned
