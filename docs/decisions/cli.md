@@ -677,8 +677,11 @@ Two tests in `integration` hold the part a reviewer cannot see.
   wire version. The archive must still accept what the object now describes.
   A property may be dropped or become required. A property may not be added,
   stop being required or change its own schema, and no other keyword may
-  change. Descriptions are ignored where they annotate a schema, but not where
-  `description` names a property. Archives never change, so a change the old
+  change. The current object is found by its pointer even when it is no
+  longer constrained, so an object that opens is compared too. Descriptions
+  are ignored where they annotate a schema, but not where `description` names
+  a property or sits inside a `const`, `enum`, `default` or `examples`
+  literal. Archives never change, so a change the old
   document would refuse fails until `output::SCHEMA_VERSION` moves. A
   property's own schema is compared by equality, so a narrowing inside it is
   refused conservatively. Deciding JSON Schema containment in general is not
