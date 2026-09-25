@@ -4683,6 +4683,16 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
     // the environment down without it. Refused before statement one, where a
     // refusal still costs nothing.
     refuse_unexpressible(&scoped, &target.label, "apply again")?;
+    // Ownership is beside the checksum too (DECISIONS 371), so an `ALTER ...
+    // OWNER TO` the grantee after planning reaches here as a clean baseline.
+    // The same question `plan` asked, of the database as it stands now
+    // (#692): a grant to a target's owner is a no-op no `REVOKE` undoes.
+    crate::engine::owned_targets(
+        conn.driver(),
+        &plan.changes,
+        &scoped.owners,
+        &scoped.session_role,
+    )?;
 
     // Before the probes, which run declared expressions and so the routines
     // they call (DEC-319.1). Every module the plan holds at any point of its
@@ -5010,6 +5020,14 @@ async fn apply_staged_under_lock(
         // resume that ran on would close the deployment with a snapshot
         // written without it.
         refuse_unexpressible(&scoped, &target.label, "resume again")?;
+        // And ownership, which is beside the checksum for the same reason
+        // (#692).
+        crate::engine::owned_targets(
+            conn.driver(),
+            &plan.changes,
+            &scoped.owners,
+            &scoped.session_role,
+        )?;
         // The role a `DROP ROLE` will meet is the role as the plan left it:
         // the members whose `DROP MEMBER` has not run yet, and nothing
         // owned. Membership and ownership are outside the checksum on
@@ -5086,6 +5104,13 @@ async fn apply_staged_under_lock(
             );
         }
         refuse_unexpressible(&scoped, &target.label, "apply again")?;
+        // Ownership, as in the transactional apply (#692).
+        crate::engine::owned_targets(
+            conn.driver(),
+            &plan.changes,
+            &scoped.owners,
+            &scoped.session_role,
+        )?;
         // Before the probes, as in the transactional apply (DEC-319.1).
         crate::pins::check(
             conn,
