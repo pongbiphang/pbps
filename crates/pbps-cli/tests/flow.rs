@@ -3720,8 +3720,113 @@ fn explain_json_carries_the_checksum_and_the_risk_detail() {
     assert_eq!(v["data"]["risks"][0]["class"], "destructive");
     assert!(!v["data"]["risks"][0]["why"].as_str().unwrap().is_empty());
     assert_eq!(v["data"]["probes"].as_array().unwrap().len(), 2);
+    // Both of this plan's checks can be asked, so nothing is left unchecked;
+    // the list is present and empty rather than missing (#478).
+    assert_eq!(v["data"]["unchecked"], serde_json::json!([]));
     // No target was given, so the field must be absent rather than a guess.
     assert!(v["data"].get("target").is_none(), "{v}");
+}
+
+/// A check the plan implies but cannot ask beforehand — here a filtered unique
+/// index over a row the same plan writes — is named in both review formats
+/// with its reason, apart from the probes that do run. `apply` already said
+/// so as it ran; the reviewer approving the plan must see it first (#478).
+#[test]
+fn explain_names_a_check_that_cannot_run_before_the_plan() {
+    let declaration = concat!(
+        "table: dbo.unbuilt\n",
+        "columns:\n",
+        "  code: {type: varchar(20), nullable: false}\n",
+        "primary_key: {name: pk_unbuilt, columns: [code]}\n",
+    );
+    for skipped in [true, false] {
+        let d = Demo::new(if skipped {
+            "explainskip"
+        } else {
+            "explainnoskip"
+        });
+        d.table(&format!(
+            "{declaration}data:\n  mode: ensure\n  rows: {{}}\n"
+        ));
+        assert_eq!(code(&d.run(&["plan"])), 0);
+        d.commit();
+        // The negative keeps the ordinary unique index, which is probed, and
+        // drops only what makes the filtered one unanswerable.
+        let (indexes, rows) = if skipped {
+            (
+                "indexes:\n  ix_ordinary: {columns: [code], unique: true}\n  \
+                 ix_unchecked: {columns: [code], unique: true, where: 'code IS NOT NULL'}\n",
+                "    next: {}\n",
+            )
+        } else {
+            (
+                "indexes:\n  ix_ordinary: {columns: [code], unique: true}\n",
+                "    {}\n",
+            )
+        };
+        d.table(&format!(
+            "{declaration}{indexes}data:\n  mode: ensure\n  rows:\n{rows}"
+        ));
+        let path = d.dir.join("plan.json");
+        let made = d.run(&["plan", "--out", path.to_str().unwrap()]);
+        assert_eq!(code(&made), 0, "{}", stderr(&made));
+
+        let human = d.run(&["explain", "--plan", path.to_str().unwrap()]);
+        assert_eq!(code(&human), 0, "{}", stderr(&human));
+        let out = stdout(&human);
+        assert!(out.contains("ix_ordinary"), "the probe still runs: {out}");
+        assert_eq!(
+            out.contains("Checks that cannot run before the plan"),
+            skipped,
+            "{out}"
+        );
+        assert_eq!(
+            out.contains(
+                "new unique index ix_unchecked on dbo.unbuilt: the planned index values or \
+                 predicate cannot be evaluated before apply"
+            ),
+            skipped,
+            "{out}"
+        );
+
+        let json = d.run(&[
+            "explain",
+            "--plan",
+            path.to_str().unwrap(),
+            "--format",
+            "json",
+        ]);
+        assert_eq!(code(&json), 0, "{}", stderr(&json));
+        let v: serde_json::Value = serde_json::from_str(&stdout(&json)).unwrap();
+        let unchecked = v["data"]["unchecked"].as_array().expect("always present");
+        let probes = v["data"]["probes"].as_array().unwrap();
+        assert!(
+            probes
+                .iter()
+                .any(|p| p.as_str().unwrap().contains("ix_ordinary")),
+            "{v}"
+        );
+        // Never in both lists: an unasked check is not a probe that runs.
+        assert!(
+            !probes
+                .iter()
+                .any(|p| p.as_str().unwrap().contains("ix_unchecked")),
+            "{v}"
+        );
+        if skipped {
+            assert_eq!(unchecked.len(), 1, "{v}");
+            assert_eq!(
+                unchecked[0]["check"],
+                "new unique index ix_unchecked on dbo.unbuilt"
+            );
+            assert_eq!(
+                unchecked[0]["reason"],
+                "the planned index values or predicate cannot be evaluated before apply"
+            );
+        } else {
+            assert!(unchecked.is_empty(), "{v}");
+        }
+    }
 }
 
 /// Explaining is not gating. A plan full of destructive changes is exactly what
