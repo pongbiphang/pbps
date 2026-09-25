@@ -184,6 +184,15 @@ pub enum Change {
         uid: Uid,
         from: TableName,
         to: TableName,
+        /// The columns that carry a default when the table is renamed, by the
+        /// names they have then (a column rename runs after the table's).
+        /// SQL Server names each default it creates after its table and column
+        /// (`DF_pbps_…`, DEC-496.1), and a rename leaves that name behind: a
+        /// new table declared under the old name then generates it again and
+        /// is refused (#975). The emitter renames each generated default with
+        /// its table. Empty on a plan written before this field existed.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        defaults: Vec<String>,
     },
 
     AddColumn {
@@ -201,6 +210,12 @@ pub enum Change {
         table: TableName,
         from: String,
         to: String,
+        /// The table's name before this plan renamed it, when it did. The
+        /// table rename leaves a generated default under the name built from
+        /// this one when the name it would move to is taken, so the column
+        /// rename looks for both (#975).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        table_was: Option<TableName>,
     },
     AlterColumnType {
         uid: Uid,
@@ -2549,6 +2564,7 @@ mod tests {
                 table: "dbo.customer".parse().unwrap(),
                 from: "mobile".into(),
                 to: "phone".into(),
+                table_was: None,
             }
             .columns_promised()
             .is_empty()

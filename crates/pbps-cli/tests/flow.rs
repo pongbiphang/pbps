@@ -2909,6 +2909,7 @@ fn staged_cardinality_plan(dialect: &str, count: usize, staged: bool) -> pbps_mo
             uid,
             from: from.parse().unwrap(),
             to,
+            defaults: Vec::new(),
         })
     })
     .collect();

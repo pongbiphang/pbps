@@ -423,7 +423,9 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             ),
         }),
 
-        Change::RenameTable { from, to, .. } => rename_table(from, to),
+        Change::RenameTable {
+            from, to, defaults, ..
+        } => rename_table(from, to, defaults),
 
         Change::AddColumn {
             table,
@@ -455,16 +457,38 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             .own_batch(),
         ]),
 
+        // The column's generated default is renamed in the same batch, when it
+        // still has the name built from the old column (#975). A plan does not
+        // say whether the column has a default, so the batch asks, and does
+        // nothing for a column without one or with a name `pbps` did not give.
+        // When the plan also renamed the table, the default has the name built
+        // from the new table, or — if the table rename found its target taken
+        // and left it — the one built from the old table. Both are tried; the
+        // second finds nothing once the first has renamed it.
         Change::RenameColumn {
-            table, from, to, ..
-        } => Ok(vec![
-            Statement::new(format!(
+            table,
+            from,
+            to,
+            table_was,
+            ..
+        } => {
+            let mut sql = format!(
                 "EXEC sp_rename {}, {}, 'COLUMN';",
                 literal(&format!("{}.{}", qualified(table)?, quote(from)?)),
                 literal(to)
-            ))
-            .own_batch(),
-        ]),
+            );
+            let new = default_constraint_name(table, to);
+            let olds = std::iter::once(table)
+                .chain(table_was)
+                .map(|t| default_constraint_name(t, from));
+            for old in olds {
+                if let Some(rename) = rename_generated_default(table, &old, &new)? {
+                    sql.push('\n');
+                    sql.push_str(&rename);
+                }
+            }
+            Ok(vec![Statement::new(sql).own_batch()])
+        }
 
         Change::AlterColumnType {
             column,
@@ -1548,7 +1572,39 @@ fn create_table(name: &TableName, table: &Table) -> Sql {
     Ok(out)
 }
 
-fn rename_table(from: &TableName, to: &TableName) -> Sql {
+/// Renames the default constraint `pbps` generated as `old` on `table` (by the
+/// name `table` has now) to `new`, if it still has that name: an adopted
+/// default under a name `pbps` never chose keeps it (#975). `None` when the
+/// two names are the same. The `|` keeps padding out of the comparison
+/// (DEC-954.1). A target name something else in the schema already holds is
+/// left alone too, and the default keeps its old name: renaming onto it would
+/// fail the whole table or column rename it follows (review of #988).
+fn rename_generated_default(
+    table: &TableName,
+    old: &str,
+    new: &str,
+) -> Result<Option<String>, DialectError> {
+    if old == new {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "IF EXISTS (SELECT 1 FROM sys.default_constraints \
+         WHERE parent_object_id = OBJECT_ID({}, N'U') \
+         AND (name + N'|') COLLATE Latin1_General_BIN2 = {}) \
+         AND OBJECT_ID({}) IS NULL\n    \
+         EXEC sp_rename {}, {}, 'OBJECT';",
+        literal(&qualified(table)?),
+        literal(&format!("{old}|")),
+        literal(&format!("{}.{}", quote(&table.schema)?, quote(new)?)),
+        literal(&format!("{}.{}", quote(&table.schema)?, quote(old)?)),
+        literal(new)
+    )))
+}
+
+/// Renames a table, then each default `pbps` generated for it to the name the
+/// new table would generate (#975). `defaults` are the columns that carry one,
+/// by the names they have at this point in the plan.
+fn rename_table(from: &TableName, to: &TableName, defaults: &[String]) -> Sql {
     let mut out = Vec::new();
     // `sp_rename` cannot move a table between schemas, and `ALTER SCHEMA
     // TRANSFER` cannot rename it. A rename that does both therefore needs both,
@@ -1582,6 +1638,25 @@ fn rename_table(from: &TableName, to: &TableName) -> Sql {
             .own_batch()
             .renaming(current.clone(), to.clone()),
         );
+    }
+    // After both steps, so each generated default is found on the table under
+    // the name it now has, and gets the name `to` would give it. A default
+    // whose old and new names agree needs nothing.
+    let renames: Vec<String> = defaults
+        .iter()
+        .map(|column| {
+            rename_generated_default(
+                to,
+                &default_constraint_name(from, column),
+                &default_constraint_name(to, column),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    if !renames.is_empty() {
+        out.push(Statement::new(renames.join("\n")).own_batch());
     }
     Ok(out)
 }
@@ -1845,11 +1920,82 @@ mod tests {
             table: tname("dbo.customer"),
             from: "customer_name".into(),
             to: "full_name".into(),
+            table_was: None,
         });
-        assert_eq!(
-            sql,
-            ["EXEC sp_rename N'[dbo].[customer].[customer_name]', N'full_name', 'COLUMN';"]
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        assert!(
+            sql[0].starts_with(
+                "EXEC sp_rename N'[dbo].[customer].[customer_name]', N'full_name', 'COLUMN';"
+            ),
+            "{sql:?}"
         );
+        // #975: its generated default follows it, if it has one by that name.
+        assert!(
+            sql[0].contains("= N'DF_pbps_customer_customer_name|')")
+                && sql[0].contains(
+                    "EXEC sp_rename N'[dbo].[DF_pbps_customer_customer_name]', \
+                     N'DF_pbps_customer_full_name', 'OBJECT';"
+                ),
+            "{sql:?}"
+        );
+    }
+
+    /// #975: a renamed table's generated defaults take the names the new table
+    /// would give them, after the rename, each only if it still has the name
+    /// `pbps` gave it. A table renamed with no defaults gets no such batch.
+    #[test]
+    fn a_renamed_tables_generated_defaults_follow_it() {
+        let sql = sql_of(&Change::RenameTable {
+            uid: uid("t_k7x2mq"),
+            from: tname("dbo.t"),
+            to: tname("app.u"),
+            defaults: vec!["c".into()],
+        });
+        assert_eq!(sql.len(), 3, "transfer, rename, defaults: {sql:?}");
+        assert!(sql[2].contains("OBJECT_ID(N'[app].[u]', N'U')"), "{sql:?}");
+        assert!(
+            sql[2].contains("EXEC sp_rename N'[app].[DF_pbps_t_c]', N'DF_pbps_u_c', 'OBJECT';"),
+            "{sql:?}"
+        );
+        let bare = sql_of(&Change::RenameTable {
+            uid: uid("t_k7x2mq"),
+            from: tname("dbo.t"),
+            to: tname("dbo.u"),
+            defaults: Vec::new(),
+        });
+        assert_eq!(bare.len(), 1, "{bare:?}");
+    }
+
+    /// A column renamed in a plan that also renamed its table looks for its
+    /// generated default under the new table's name and then under the old
+    /// one's, which the table rename leaves when its target is taken (#975).
+    #[test]
+    fn a_renamed_columns_default_is_sought_under_both_table_names() {
+        let sql = sql_of(&Change::RenameColumn {
+            uid: uid("c_k7x2mq"),
+            table: tname("dbo.u"),
+            from: "a".into(),
+            to: "b".into(),
+            table_was: Some(tname("dbo.t")),
+        });
+        assert_eq!(sql.len(), 1, "one batch: {sql:?}");
+        for old in ["DF_pbps_u_a", "DF_pbps_t_a"] {
+            assert!(
+                sql[0].contains(&format!(
+                    "EXEC sp_rename N'[dbo].[{old}]', N'DF_pbps_u_b', 'OBJECT';"
+                )),
+                "{old}: {sql:?}"
+            );
+        }
+        let alone = sql_of(&Change::RenameColumn {
+            uid: uid("c_k7x2mq"),
+            table: tname("dbo.u"),
+            from: "a".into(),
+            to: "b".into(),
+            table_was: None,
+        });
+        assert!(!alone[0].contains("DF_pbps_t_a"), "{alone:?}");
+        assert_eq!(alone[0].matches("sp_rename").count(), 2, "{alone:?}");
     }
 
     /// The new name must be bare: qualifying it makes SQL Server store the
@@ -1860,6 +2006,7 @@ mod tests {
             uid: uid("t_k7x2mq"),
             from: tname("dbo.old_name"),
             to: tname("dbo.new_name"),
+            defaults: Vec::new(),
         });
         assert_eq!(
             sql,
@@ -1875,6 +2022,7 @@ mod tests {
             uid: uid("t_k7x2mq"),
             from: tname("dbo.old_name"),
             to: tname("app.new_name"),
+            defaults: Vec::new(),
         });
         assert_eq!(
             sql,
@@ -1896,6 +2044,7 @@ mod tests {
                 uid: uid("t_k7x2mq"),
                 from: tname("dbo.old_name"),
                 to: tname("app.new_name"),
+                defaults: Vec::new(),
             },
             Strategy::default(),
         )
@@ -1915,6 +2064,7 @@ mod tests {
                 uid: uid("t_k7x2mq"),
                 from: tname("dbo.old_name"),
                 to: tname("dbo.new_name"),
+                defaults: Vec::new(),
             },
             Strategy::default(),
         )

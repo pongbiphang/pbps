@@ -4444,6 +4444,7 @@ async fn a_rename_across_schemas_is_two_statements_that_each_say_where_the_table
                 uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
                 from: from.clone(),
                 to: to.clone(),
+                defaults: Vec::new(),
             },
             Strategy::default(),
         )
@@ -15879,12 +15880,14 @@ async fn narrowing_projection_keeps_added_foreign_key_checks_for_fitting_rows() 
                 uid: "t_aaaaaa".parse().unwrap(),
                 from: TableName::new("public", "child"),
                 to: child.clone(),
+                defaults: Vec::new(),
             });
             changes.push(Change::RenameColumn {
                 uid: "c_aaaaaa".parse().unwrap(),
                 table: child.clone(),
                 from: "v".into(),
                 to: child_column.into(),
+                table_was: None,
             });
         }
         let column = if side == "child" {
@@ -19751,12 +19754,14 @@ async fn planned_key_collation_guards_use_renamed_added_created_and_retyped_colu
                         uid: "t_aaaaaa".parse().unwrap(),
                         from: TableName::new(&s, "child"),
                         to: child.clone(),
+                        defaults: Vec::new(),
                     });
                     changes.push(Change::RenameColumn {
                         uid: "c_aaaaaa".parse().unwrap(),
                         table: child.clone(),
                         from: "ref".into(),
                         to: column.into(),
+                        table_was: None,
                     });
                 }
                 "add" | "add_default" => {
@@ -24654,18 +24659,21 @@ async fn estimate_provenance_follows_renamed_columns_for_indexes_and_checks() {
                 uid: "t_aaaaaa".parse().unwrap(),
                 from: old,
                 to: new.clone(),
+                defaults: Vec::new(),
             }),
             PlannedChange::new(Change::RenameColumn {
                 uid: "c_aaaaaa".parse().unwrap(),
                 table: new.clone(),
                 from: "v".into(),
                 to: "amount".into(),
+                table_was: None,
             }),
             PlannedChange::new(Change::RenameColumn {
                 uid: "c_bbbbbb".parse().unwrap(),
                 table: new.clone(),
                 from: "n".into(),
                 to: "required".into(),
+                table_was: None,
             }),
             PlannedChange::new(Change::AlterColumnType {
                 uid: "c_aaaaaa".parse().unwrap(),
@@ -24870,6 +24878,7 @@ async fn an_estimate_for_a_renamed_table_is_measured_against_the_one_that_exists
                 uid: "t_aaaaaa".parse().expect("a uid"),
                 from: TableName::new(&s, "client"),
                 to: TableName::new(&s, "customer"),
+                defaults: Vec::new(),
             }),
             PlannedChange::new(Change::AlterColumnType {
                 uid: "c_aaaaaa".parse().expect("a uid"),
@@ -25867,12 +25876,14 @@ async fn drop_blockers_follow_prior_renames_and_refuse_missing_existing_targets(
             uid: "t_aaaaaa".parse().unwrap(),
             from: TableName::new(&s, "t"),
             to: TableName::new(&s, "renamed"),
+            defaults: Vec::new(),
         },
         Change::RenameColumn {
             uid: "c_aaaaaa".parse().unwrap(),
             table: TableName::new(&s, "renamed"),
             from: "id".into(),
             to: "ident".into(),
+            table_was: None,
         },
         Change::DropColumn {
             uid: "c_aaaaaa".parse().unwrap(),
@@ -26801,11 +26812,13 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
             uid: "t_aaaaaa".parse().unwrap(),
             from: parent.clone(),
             to: renamed_parent.clone(),
+            defaults: Vec::new(),
         },
         Change::RenameTable {
             uid: "t_bbbbbb".parse().unwrap(),
             from: child.clone(),
             to: renamed_child.clone(),
+            defaults: Vec::new(),
         },
         Change::DropForeignKey {
             table: renamed_child,
@@ -27540,6 +27553,7 @@ async fn doctor_data_column_acl_follows_recorded_identity_not_a_reused_name() {
             table: "public.t".parse().unwrap(),
             from: "old_label".into(),
             to: "label".into(),
+            table_was: None,
         },
     )
     .await;
@@ -27600,6 +27614,7 @@ async fn doctor_data_table_acl_follows_recorded_identity_and_retains_missing_obj
             uid,
             from: "public.old_name".parse().unwrap(),
             to: "public.new_name".parse().unwrap(),
+            defaults: Vec::new(),
         },
     )
     .await;

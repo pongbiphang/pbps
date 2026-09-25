@@ -3162,6 +3162,7 @@ mod tests {
                     table: tname("dbo.customer"),
                     from: "removed_at".into(),
                     to: "deleted_at".into(),
+                    table_was: None,
                 },
                 filtered.clone(),
             ]),
@@ -3220,6 +3221,7 @@ mod tests {
                     table: tname("dbo.customer"),
                     from: "removed_at".into(),
                     to: "deleted_at".into(),
+                    table_was: None,
                 },
                 index(&["email"], true, None),
             ]),
@@ -3627,6 +3629,7 @@ mod tests {
                 table: tname("dbo.customer"),
                 from: "email".into(),
                 to: "contact_email".into(),
+                table_was: None,
             },
             Change::SetPrimaryKey {
                 table: tname("dbo.customer"),
@@ -4088,6 +4091,7 @@ mod tests {
                 uid: uid("t_aaaaaa"),
                 from: tname("dbo.state"),
                 to: tname("dbo.status"),
+                defaults: Vec::new(),
             },
             Change::DeleteRow {
                 table: tname("dbo.status"),
@@ -4186,6 +4190,7 @@ mod tests {
                 table: tname("dbo.customer"),
                 from: "email".into(),
                 to: "contact_email".into(),
+                table_was: None,
             },
             Change::AlterColumnNullability {
                 uid: uid("c_aaaaaa"),
@@ -4210,6 +4215,7 @@ mod tests {
                 uid: uid("t_aaaaaa"),
                 from: tname("dbo.client"),
                 to: tname("dbo.customer"),
+                defaults: Vec::new(),
             },
             Change::AddCheck {
                 table: tname("dbo.customer"),

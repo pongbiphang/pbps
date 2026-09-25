@@ -701,12 +701,14 @@ mod tests {
                     uid: "t_aaaaaa".parse().unwrap(),
                     from: t.clone(),
                     to: u.clone(),
+                    defaults: Vec::new(),
                 }),
                 PlannedChange::new(Change::RenameColumn {
                     uid: "c_aaaaaa".parse().unwrap(),
                     table: u.clone(),
                     from: "old".into(),
                     to: "new".into(),
+                    table_was: None,
                 }),
                 PlannedChange::new(Change::CreateTable {
                     uid: "t_bbbbbb".parse().unwrap(),

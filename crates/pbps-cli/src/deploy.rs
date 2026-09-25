@@ -6858,6 +6858,7 @@ mod tests {
                 uid: uid.parse().unwrap(),
                 from: from.parse().unwrap(),
                 to: to.parse().unwrap(),
+                defaults: Vec::new(),
             })
         };
         let mut changes = ChangeSet {
@@ -7135,6 +7136,7 @@ mod tests {
                     uid: "t_aaaaaa".parse().unwrap(),
                     from: "dbo.f".parse().unwrap(),
                     to: "dbo.g".parse().unwrap(),
+                    defaults: Vec::new(),
                 },
             )],
         };
@@ -7300,11 +7302,13 @@ mod tests {
                     uid: "t_aaaaaa".parse().unwrap(),
                     from: "dbo.one".parse().unwrap(),
                     to: "dbo.one_x".parse().unwrap(),
+                    defaults: Vec::new(),
                 }),
                 PlannedChange::new(Change::RenameTable {
                     uid: "t_bbbbbb".parse().unwrap(),
                     from: "dbo.two".parse().unwrap(),
                     to: "dbo.two_x".parse().unwrap(),
+                    defaults: Vec::new(),
                 }),
             ],
         };
@@ -7416,12 +7420,14 @@ mod tests {
                     table: "dbo.t".parse().unwrap(),
                     from: "a".into(),
                     to: "a2".into(),
+                    table_was: None,
                 }),
                 PlannedChange::new(Change::RenameColumn {
                     uid: "c_bbbbbb".parse().unwrap(),
                     table: "dbo.t".parse().unwrap(),
                     from: "b".into(),
                     to: "b2".into(),
+                    table_was: None,
                 }),
             ],
         };
@@ -7632,6 +7638,7 @@ mod tests {
                     table: named.clone(),
                     from: "label".to_owned(),
                     to: "note".to_owned(),
+                    table_was: None,
                 }),
             ],
         };
@@ -9343,6 +9350,7 @@ mod tests {
                             uid: "t_aaaaaa".parse().unwrap(),
                             from: source,
                             to: destination.clone(),
+                            defaults: Vec::new(),
                         }),
                     ],
                 };
@@ -9641,6 +9649,7 @@ mod tests {
                     uid: "t_aaaaaa".parse().unwrap(),
                     from: "dbo.old".parse().unwrap(),
                     to: "dbo.new".parse().unwrap(),
+                    defaults: Vec::new(),
                 },
             )],
         };
@@ -9712,6 +9721,7 @@ mod tests {
                     table: "dbo.t".parse().unwrap(),
                     from: "old".to_owned(),
                     to: "new".to_owned(),
+                    table_was: None,
                 },
             )],
         };
@@ -9842,6 +9852,7 @@ mod tests {
                     uid: uid.clone(),
                     from: "dbo.old".parse().unwrap(),
                     to: "dbo.new".parse().unwrap(),
+                    defaults: Vec::new(),
                 },
                 pbps_model::Change::RenameRole {
                     uid,
@@ -10718,6 +10729,7 @@ mod tests {
                     table: dbo_t.clone(),
                     from: "a".to_owned(),
                     to: "b".to_owned(),
+                    table_was: None,
                 },
             )],
         };
@@ -10794,6 +10806,7 @@ mod tests {
                     table: dbo_t.clone(),
                     from: "a".to_owned(),
                     to: "b".to_owned(),
+                    table_was: None,
                 }),
                 pbps_model::PlannedChange::new(pbps_model::Change::AlterColumnType {
                     uid: "c_aaaaaa".parse().unwrap(),

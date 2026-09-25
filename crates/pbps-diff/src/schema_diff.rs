@@ -272,10 +272,23 @@ fn diff_partial_rebuilding(
             continue;
         };
         if base_name != declared_name {
+            let defaults = base
+                .schema
+                .tables
+                .get(base_name)
+                .map(|t| {
+                    t.columns
+                        .iter()
+                        .filter(|(_, c)| c.default.is_some())
+                        .map(|(name, _)| name.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
             changes.push(Change::RenameTable {
                 uid: uid.clone(),
                 from: base_name.clone(),
                 to: declared_name.clone(),
+                defaults,
             });
         }
         let (Some(base_table), Some(declared_table)) = (
@@ -676,6 +689,8 @@ fn diff_columns(
                 table: declared_table_name.clone(),
                 from: base_ref.name.clone(),
                 to: declared_ref.name.clone(),
+                table_was: (base_table_name != declared_table_name)
+                    .then(|| base_table_name.clone()),
             });
         }
 
@@ -5796,6 +5811,94 @@ mod tests {
             "s2.other".parse().unwrap(),
             "{cs:?}"
         );
+    }
+
+    /// #975: a rename carries the columns that have a default when it runs, by
+    /// the names they have then, so the emitter can move each generated default
+    /// with its table. A column the same plan renames is listed by its old name,
+    /// since the table's rename runs first.
+    #[test]
+    fn a_table_rename_lists_the_columns_that_carry_a_default_by_their_names_then() {
+        let mut with_default = Column::new(ty("int"));
+        with_default.default = Some("0".into());
+        let base = two_tables(
+            (
+                "app.old",
+                table(&[("a", with_default.clone()), ("b", Column::new(ty("int")))]),
+            ),
+            ("app.other", table(&[("n", Column::new(ty("int")))])),
+        );
+        let declared = two_tables(
+            (
+                "app.new",
+                table(&[("a", with_default), ("b", Column::new(ty("int")))]),
+            ),
+            ("app.other", table(&[("n", Column::new(ty("int")))])),
+        );
+        let cs = run_with(
+            &MinimalDialect,
+            &base,
+            &declared,
+            &[Intent::RenameTable {
+                from: "app.old".parse().unwrap(),
+                to: "app.new".parse().unwrap(),
+            }],
+        );
+        let Change::RenameTable { defaults, .. } = &cs.changes[0].change else {
+            panic!("{cs:?}");
+        };
+        assert_eq!(defaults, &["a".to_owned()]);
+    }
+
+    /// A column rename in a plan that also renames its table names the old
+    /// table, so the emitter can find a generated default the table rename
+    /// had to leave under the old table's name (#975). Without a table rename
+    /// it names none.
+    #[test]
+    fn a_column_rename_names_the_old_table_only_when_the_table_is_renamed_too() {
+        let other = ("app.other", table(&[("n", Column::new(ty("int")))]));
+        let base = two_tables(
+            ("app.old", table(&[("a", Column::new(ty("int")))])),
+            other.clone(),
+        );
+        let renamed =
+            |t: &str| two_tables((t, table(&[("b", Column::new(ty("int")))])), other.clone());
+        let column = |t: &str| Intent::RenameColumn {
+            table: t.parse().unwrap(),
+            from: "a".into(),
+            to: "b".into(),
+        };
+        let table_was = |cs: &ChangeSet| {
+            cs.changes
+                .iter()
+                .find_map(|p| match &p.change {
+                    Change::RenameColumn { table_was, .. } => Some(table_was.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{cs:?}"))
+        };
+
+        let both = run_with(
+            &MinimalDialect,
+            &base,
+            &renamed("app.new"),
+            &[
+                Intent::RenameTable {
+                    from: "app.old".parse().unwrap(),
+                    to: "app.new".parse().unwrap(),
+                },
+                column("app.new"),
+            ],
+        );
+        assert_eq!(table_was(&both), Some("app.old".parse().unwrap()));
+
+        let alone = run_with(
+            &MinimalDialect,
+            &base,
+            &renamed("app.old"),
+            &[column("app.old")],
+        );
+        assert_eq!(table_was(&alone), None);
     }
 
     /// The same for a foreign key, the other constraint no index backs.

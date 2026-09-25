@@ -577,3 +577,31 @@ generated relation names. Measured on PostgreSQL 16 and 18: short, 60-byte and
 multibyte table names generate exactly the predicted names, the declared index
 created afterwards fails with `42P07`, and a name taken first yields
 `taken_pkey1`.
+
+<a id="dec-975-1"></a>
+
+**DEC-975.1. A generated SQL Server default is renamed with its table and its
+column (#975; follows DEC-496.1's naming).** `sp_rename` renames a table or a
+column and leaves its default constraints as they are, so a default keeps the
+name built from the old table or column. A new table declared under the old
+name, or a new column under the old column name, then generates that name again
+and is refused (Msg 1750, measured on 17.0.4075.5). The name is `pbps`'s own,
+so it follows:
+
+- `RenameTable` carries the columns that have a default when it runs, by their
+  names then (`defaults`). The emitter renames each default after the table's
+  rename, to the name the new table would give it.
+- `RenameColumn` renames its column's default in the same batch. When the
+  plan also renamed the table, it carries the old table name (`table_was`) and
+  looks for the default under both tables' names, since a table rename whose
+  target was taken leaves it under the old one.
+
+Each rename happens only if the constraint still has the name `pbps` generated
+(compared past padding, DEC-954.1), so an adopted default under a name `pbps`
+never chose keeps it. A target name another object in the schema already
+holds is left alone as well, and the default keeps its old name, so the table
+or column rename it follows still runs (review of #988). Deriving the name from
+a uid instead would have left
+names that no longer say which table and column they belong to, which is the
+reason `pbps` names defaults at all. Both fields are `#[serde(default)]`; per
+DECISIONS 145 no plan format bump is needed before the first release.

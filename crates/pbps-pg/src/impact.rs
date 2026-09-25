@@ -526,12 +526,14 @@ mod tests {
                     uid: "t_aaaaaa".parse().expect("a uid"),
                     from: tname("app.client"),
                     to: tname("app.customer"),
+                    defaults: Vec::new(),
                 }),
                 PlannedChange::new(Change::RenameColumn {
                     uid: "c_aaaaaa".parse().expect("a uid"),
                     table: tname("app.customer"),
                     from: "email".into(),
                     to: "contact_email".into(),
+                    table_was: None,
                 }),
                 PlannedChange::new(Change::DropTable {
                     uid: "t_bbbbbb".parse().expect("a uid"),
@@ -562,12 +564,14 @@ mod tests {
                     uid: "t_aaaaaa".parse().expect("a uid"),
                     from: tname("app.order"),
                     to: tname("app.purchase"),
+                    defaults: Vec::new(),
                 }),
                 PlannedChange::new(Change::RenameColumn {
                     uid: "c_aaaaaa".parse().expect("a uid"),
                     table: tname("app.customer"),
                     from: "email".into(),
                     to: "contact_email".into(),
+                    table_was: None,
                 }),
             ],
         };

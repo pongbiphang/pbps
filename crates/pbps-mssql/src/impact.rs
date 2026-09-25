@@ -834,12 +834,14 @@ mod tests {
                     uid: "t_aaaaaa".parse().unwrap(),
                     from: tname("dbo.client"),
                     to: tname("dbo.customer"),
+                    defaults: Vec::new(),
                 }),
                 PlannedChange::new(Change::RenameColumn {
                     uid: "c_aaaaaa".parse().unwrap(),
                     table: tname("dbo.customer"),
                     from: "email".into(),
                     to: "contact_email".into(),
+                    table_was: None,
                 }),
                 PlannedChange::new(Change::DropTable {
                     uid: "t_bbbbbb".parse().unwrap(),
@@ -868,6 +870,7 @@ mod tests {
                 table: tname("dbo.customer"),
                 from: "email".into(),
                 to: "contact_email".into(),
+                table_was: None,
             })],
         };
 

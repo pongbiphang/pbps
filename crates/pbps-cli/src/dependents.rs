@@ -883,12 +883,14 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, "app.t", 0),
                 from: TableName::new("app", "t"),
                 to: TableName::new("app", "u"),
+                defaults: Vec::new(),
             },
             Change::RenameColumn {
                 uid,
                 table: TableName::new("app", "u"),
                 from: "n".into(),
                 to: "m".into(),
+                table_was: None,
             },
             alter(&s, "app.f(integer)"),
         ]);
@@ -1047,6 +1049,7 @@ mod tests {
                 uid: Uid::derived(UidKind::Table, "app.t", 0),
                 from: TableName::new("app", "t"),
                 to: TableName::new("app", "u"),
+                defaults: Vec::new(),
             },
             Change::DropCheck {
                 table: TableName::new("app", "u"),

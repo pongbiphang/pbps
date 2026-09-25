@@ -1012,6 +1012,7 @@ mod tests {
                 uid: uid(UidKind::Table, "dbo.old"),
                 from: "dbo.old".parse().unwrap(),
                 to: "dbo.new".parse().unwrap(),
+                defaults: Vec::new(),
             },
             Change::AddColumn {
                 uid: uid(UidKind::Column, "dbo.new.extra"),
