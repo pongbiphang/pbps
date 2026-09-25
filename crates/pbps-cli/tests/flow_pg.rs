@@ -3921,6 +3921,105 @@ fn a_declared_grant_to_the_targets_own_owner_is_refused_before_a_statement_runs(
     succeeds(d.run(&["verify", "--db", connection]));
 }
 
+/// #692: ownership is beside the checksum (DECISIONS 371), so a saved plan
+/// whose target is handed to its grantee after planning still passes the
+/// baseline. `apply` asks `owned_targets` again of the database as it stands,
+/// on the transactional and on the staged path, and refuses before a
+/// statement runs: no grant made, and no apply entry or checkpoint written.
+/// The one entry the ledger gains is the failed-apply record every refusal
+/// under the deployment lock leaves.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_target_handed_to_its_grantee_after_planning_is_refused_at_apply() {
+    for staged in [false, true] {
+        let slug = if staged {
+            "owned-staged"
+        } else {
+            "owned-apply"
+        };
+        let server = server();
+        let grantee = format!("pbps_own_late_{}_{}", std::process::id(), u8::from(staged));
+        let _roles = ClusterRoles {
+            server: server.clone(),
+            names: vec![grantee.clone()],
+        };
+        on_server(&server, &format!("CREATE ROLE {grantee} NOSUPERUSER"));
+        let own = OwnDatabase::new(&server, slug);
+        let connection = own.connection();
+        on_server(connection, "CREATE SCHEMA app");
+
+        let d = Demo::new(slug);
+        d.table(ONE_COLUMN);
+        let file = d.dir.join("schema/grantee.yml");
+        // Usage from the start, so the plan below is one logical change, which
+        // is all a staged apply takes.
+        std::fs::write(
+            &file,
+            format!("role: {grantee}\ngrants:\n  schema::app: [usage]\n"),
+        )
+        .unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", connection]));
+
+        std::fs::write(
+            &file,
+            format!("role: {grantee}\ngrants:\n  schema::app: [usage]\n  app.t: [select]\n"),
+        )
+        .unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let plan = d.dir.join("plan.json");
+        let mut args = vec!["plan", "--db", connection, "--out", plan.to_str().unwrap()];
+        if staged {
+            args.push("--staged");
+        }
+        succeeds(d.run(&args));
+
+        // After the plan was made, out of band: the only way ownership moves.
+        on_server(connection, &format!("ALTER TABLE app.t OWNER TO {grantee}"));
+        let entries = |kind: &str| {
+            scalar(
+                connection,
+                &format!("SELECT count(*) FROM public.__pbps_state WHERE kind {kind}"),
+            )
+        };
+        let (recorded, failed) = (entries("<> 'failed'"), entries("= 'failed'"));
+
+        let refused = apply_plan(&d, connection, &plan, staged);
+        assert_eq!(
+            code(&refused),
+            1,
+            "{}{}",
+            stdout(&refused),
+            stderr(&refused)
+        );
+        assert!(
+            stderr(&refused).contains("owned_targets")
+                && stderr(&refused).contains("app.t")
+                && stderr(&refused).contains(&grantee),
+            "{}",
+            stderr(&refused)
+        );
+        assert_eq!(
+            entries("<> 'failed'"),
+            recorded,
+            "no apply entry or checkpoint was written"
+        );
+        assert_eq!(entries("= 'failed'"), failed + 1, "the refusal is audited");
+        // Any `GRANT`, to the owner too, would have materialized the ACL.
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT CASE WHEN relacl IS NULL THEN 1 ELSE 0 END::bigint \
+                 FROM pg_class WHERE oid = 'app.t'::regclass"
+            ),
+            1,
+            "no statement ran"
+        );
+    }
+}
+
 /// SPEC §7.6, the case it names and the read it names it at.
 ///
 /// A staged run commits each statement on its own, so another session can
