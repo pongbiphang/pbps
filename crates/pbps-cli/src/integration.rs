@@ -683,9 +683,10 @@ mod tests {
         );
     }
 
-    /// Keywords whose value is an instance literal that validation compares
-    /// against: nothing beneath them is a keyword, so it is kept verbatim.
-    const LITERALS: [&str; 2] = ["const", "enum"];
+    /// Keywords whose value is instance data that validation compares
+    /// against, literals or property names: nothing beneath them is a
+    /// keyword, so it is kept verbatim.
+    const LITERALS: [&str; 3] = ["const", "enum", "dependentRequired"];
     /// Annotation keywords: they change no validation, so a change to one
     /// never needs the wire version to move.
     const ANNOTATIONS: [&str; 8] = [
@@ -855,7 +856,8 @@ mod tests {
             "closed": {
                 "type": "object",
                 "additionalProperties": false,
-                "properties": { "tag": { "const": { "description": "old" } } }
+                "properties": { "tag": { "const": { "description": "old" } } },
+                "dependentRequired": { "title": ["tag"] }
             }
         } } } });
         assert_eq!(refused_changes(&archived, &archived), (2, Vec::new()));
@@ -876,6 +878,15 @@ mod tests {
             "new".into();
         let (_, refused) = refused_changes(&archived, &relabelled);
         assert_eq!(refused, ["`D/properties/closed` changes property `tag`"]);
+
+        let mut dependent = archived.clone();
+        dependent["$defs"]["D"]["properties"]["closed"]["dependentRequired"]["default"] =
+            serde_json::json!(["tag"]);
+        let (_, refused) = refused_changes(&archived, &dependent);
+        assert_eq!(
+            refused,
+            ["`D/properties/closed` changes a keyword other than its properties"]
+        );
 
         let mut annotated = archived.clone();
         annotated["$defs"]["D"]["properties"]["closed"]["description"] = "reworded".into();

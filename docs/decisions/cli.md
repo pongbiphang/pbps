@@ -682,8 +682,8 @@ Two tests in `integration` hold the part a reviewer cannot see.
   longer constrained, so an object that opens is compared too. Annotation
   keywords (`description`, `title`, `$comment`, `default`, `examples`,
   `deprecated`, `readOnly`, `writeOnly`) are ignored, because they change no
-  validation. A property named like one is kept, and so is a `const` or
-  `enum` literal that holds one. Archives never change, so a change the old
+  validation. A property named like one is kept, and so is a `const`,
+  `enum` or `dependentRequired` value that holds one. Archives never change, so a change the old
   document would refuse fails until `output::SCHEMA_VERSION` moves. A
   property's own schema is compared by equality, so a narrowing inside it is
   refused conservatively. Deciding JSON Schema containment in general is not
