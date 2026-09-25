@@ -16,16 +16,82 @@ fn scratch(name: &str) -> PathBuf {
     directory
 }
 
-/// A value from the browser may reach a child only as the value of one
-/// `--flag=` option of the route's fixed vocabulary, never as an argument of
-/// its own, where the CLI could read it as a command, a flag or a statement.
-fn carried_only_as_an_option_value(arguments: &[String], value: &str) -> bool {
-    arguments.iter().all(|argument| {
-        !argument.contains(value)
-            || argument
-                .split_once('=')
-                .is_some_and(|(flag, rest)| flag.starts_with("--") && rest == value)
-    })
+/// The commands a route may run and the options it may pass, by name. A
+/// browser value reaches a child only as the value of one of these options,
+/// or as an operand after `--`, never as an argument of its own, where the
+/// CLI could read it as a command, a flag or a statement. `--db` and anything
+/// SQL-shaped are absent by construction.
+const COMMANDS: [&str; 12] = [
+    "status",
+    "verify",
+    "explain",
+    "state",
+    "docs",
+    "plan",
+    "rename",
+    "rename-table",
+    "rename-role",
+    "drop",
+    "drop-table",
+    "drop-role",
+];
+const OPTIONS: [&str; 5] = ["--env", "--plan", "--reason", "--since", "--format"];
+const FLAGS: [&str; 4] = ["list", "--no-dev", "--format=json", "--format=html"];
+
+/// Whether `arguments` are one known command followed only by known flags,
+/// known options, and operands after a single `--`, with `value` appearing
+/// only as a whole option value or operand.
+fn within_the_vocabulary(arguments: &[String], value: &str) -> Result<(), String> {
+    let command = arguments.first().ok_or("no command")?;
+    if !COMMANDS.contains(&command.as_str()) {
+        return Err(format!("command {command:?}"));
+    }
+    let separator = arguments.iter().position(|a| a == "--");
+    for (index, argument) in arguments.iter().enumerate().skip(1) {
+        if separator.is_some_and(|at| index > at) {
+            // An operand: the CLI reads nothing after `--` as an option.
+            continue;
+        }
+        if argument == "--" || FLAGS.contains(&argument.as_str()) {
+            continue;
+        }
+        match argument.split_once('=') {
+            Some((flag, _)) if OPTIONS.contains(&flag) => {}
+            _ => return Err(format!("argument {argument:?}")),
+        }
+        if argument.contains(value) && argument.split_once('=').map(|(_, v)| v) != Some(value) {
+            return Err(format!("{value:?} is not the whole value of {argument:?}"));
+        }
+    }
+    if arguments.iter().filter(|a| *a == "--").count() > 1 {
+        return Err("more than one `--`".into());
+    }
+    Ok(())
+}
+
+#[test]
+fn an_argument_outside_the_vocabulary_is_refused() {
+    let args = |list: &[&str]| list.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
+    assert_eq!(
+        within_the_vocabulary(&args(&["verify", "--env=x", "--format=json"]), "x"),
+        Ok(())
+    );
+    assert_eq!(
+        within_the_vocabulary(&args(&["rename", "--", "x", "--db=y"]), "x"),
+        Ok(())
+    );
+    for bad in [
+        &["verify", "--db=x"][..],
+        &["verify", "--sql=x"],
+        &["verify", "--env=x", "x"],
+        &["verify", "--env=prefix x"],
+        &["sql", "--env=x"],
+        &["apply", "--env=x"],
+        &["rename", "--", "x", "--", "y"],
+        &[],
+    ] {
+        assert!(within_the_vocabulary(&args(bad), "x").is_err(), "{bad:?}");
+    }
 }
 
 #[test]
@@ -43,11 +109,11 @@ fn no_read_route_accepts_sql_as_a_parameter_or_carries_it_as_an_argument() {
         if let Some(parameter) = parameter {
             let view = route(&format!("{path}?{parameter}={escaped}")).unwrap();
             let arguments = view.arguments();
-            assert!(
-                carried_only_as_an_option_value(&arguments, SQL),
+            assert_eq!(
+                within_the_vocabulary(&arguments, SQL),
+                Ok(()),
                 "{path}: {arguments:?}"
             );
-            assert!(arguments[0].chars().all(|c| c.is_ascii_lowercase()));
         }
     }
 }
@@ -121,24 +187,11 @@ fn compose_intent_fields_reach_the_cli_only_as_operands_or_one_option_value() {
         let intent: Intent = serde_json::from_value(body).unwrap();
         kinds.push(kind(&intent));
         let arguments = intent.arguments(SQL);
-        assert!(
-            arguments[0]
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c == '-'),
+        assert_eq!(
+            within_the_vocabulary(&arguments, SQL),
+            Ok(()),
             "{arguments:?}"
         );
-        let separator = arguments.iter().position(|a| a == "--");
-        for (index, argument) in arguments.iter().enumerate() {
-            let operand = separator.is_some_and(|at| index > at);
-            let option = argument
-                .split_once('=')
-                .is_some_and(|(flag, rest)| flag.starts_with("--") && rest == SQL);
-            assert!(
-                !argument.contains(SQL) || operand || option,
-                "{argument:?} in {arguments:?}"
-            );
-        }
-        assert!(arguments.iter().filter(|a| *a == "--").count() <= 1);
     }
     let mut unique = kinds.clone();
     unique.dedup();
