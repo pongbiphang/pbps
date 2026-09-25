@@ -191,8 +191,22 @@ async fn read_lock(conn: &mut Conn) -> (Option<String>, Option<String>) {
             held.map(|l| format!("{} since {}", l.locked_by, l.locked_at)),
             None,
         ),
-        Err(e) => (None, Some(e.to_string())),
+        Err(e) => (None, Some(operator_detail(e))),
     }
+}
+
+/// An error as the operator reading `status` needs it: every frame of its
+/// chain, joined, the way `main.rs` prints a command's own failure.
+///
+/// `{e}` alone is not that. A [`pbps_db::DbError::Context`] renders only this
+/// tool's guidance and keeps the server's own sentence in `source()`, so that
+/// ledger redaction can treat the two frames apart (DECISIONS 455, 456). That
+/// split is for the ledger; `status` redacts nothing, and reading only the top
+/// frame here dropped a catalog `40P01`'s diagnosis while keeping its retry
+/// advice (#489). A frame is never repeated: only `Context` carries a source,
+/// and its own text does not interpolate it.
+fn operator_detail(e: impl std::error::Error + Send + Sync + 'static) -> String {
+    format!("{:#}", anyhow::Error::new(e))
 }
 
 async fn one(
@@ -204,7 +218,7 @@ async fn one(
 ) -> EnvStatus {
     let mut conn = match Conn::connect(driver, connection).await {
         Ok(c) => c,
-        Err(e) => return EnvStatus::failed(name, "unreachable", e.to_string(), checked_at),
+        Err(e) => return EnvStatus::failed(name, "unreachable", operator_detail(e), checked_at),
     };
 
     let entry = match crate::engine::latest(&mut conn).await {
@@ -247,7 +261,7 @@ async fn one(
             (row.locked_by, row.lock_unknown) = read_lock(&mut conn).await;
             return row;
         }
-        Err(e) => return EnvStatus::failed(name, "unreachable", e.to_string(), checked_at),
+        Err(e) => return EnvStatus::failed(name, "unreachable", operator_detail(e), checked_at),
     };
 
     let (locked_by, lock_unknown) = read_lock(&mut conn).await;
@@ -297,7 +311,7 @@ async fn one(
     let pulled = match crate::engine::introspect(&mut conn, crate::engine::Read::Snapshot).await {
         Ok(p) => p,
         Err(e) => {
-            record_unreachable(&mut row, e.to_string());
+            record_unreachable(&mut row, operator_detail(e));
             return row;
         }
     };
@@ -756,6 +770,56 @@ mod tests {
             "an operator running `status` is not the redaction `ledger_safe_reason` \
              guards against, and still needs the driver's own sentence: {rendered}"
         );
+    }
+
+    /// A catalog failure wrapped in this tool's own guidance keeps the
+    /// server's sentence in both the human and the JSON detail, and the row
+    /// stays unreachable (#489). Controls: an unwrapped driver failure and a
+    /// refusal in the tool's own words render exactly as before, one frame.
+    #[test]
+    fn an_unreachable_catalog_keeps_the_servers_sentence_under_its_context() {
+        let driver = || pbps_db::DbError::Driver {
+            message: "deadlock detected: process 4711 waits for ShareLock".to_owned(),
+            code: Some("40P01".to_owned()),
+        };
+        let cases = [
+            (
+                driver().context("the catalog read was chosen as a deadlock victim; retry"),
+                vec![
+                    "the catalog read was chosen as a deadlock victim; retry",
+                    "deadlock detected: process 4711 waits for ShareLock",
+                ],
+            ),
+            (
+                driver(),
+                vec!["deadlock detected: process 4711 waits for ShareLock"],
+            ),
+            (
+                pbps_db::DbError::Refused("the catalog row vanished".to_owned()),
+                vec!["the catalog row vanished"],
+            ),
+        ];
+        for (error, frames) in cases {
+            let mut r = row("prod", "ok");
+            r.detail = None;
+            record_unreachable(&mut r, operator_detail(error));
+            assert_eq!(r.state, "unreachable");
+            let detail = r.detail.clone().unwrap();
+            // Every frame, once each, in order: nothing dropped, nothing
+            // echoed by a wrapper that also printed its source.
+            assert_eq!(detail, frames.join(": "));
+            let human = render(std::slice::from_ref(&r));
+            let json = serde_json::to_string(&output::Report::new(
+                "status",
+                findings(std::slice::from_ref(&r)),
+                Some(&[&r]),
+            ))
+            .unwrap();
+            for frame in &frames {
+                assert!(human.contains(frame), "{frame} in {human}");
+                assert!(json.contains(frame), "{frame} in {json}");
+            }
+        }
     }
 
     fn row(environment: &str, state: &'static str) -> EnvStatus {
