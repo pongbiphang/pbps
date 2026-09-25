@@ -473,6 +473,428 @@ mod tests {
         assert!(!new_validator.is_valid(&envelope));
     }
 
+    /// An additive `data` field keeps the envelope's wire version only where
+    /// the published schema leaves an object open: a consumer validating
+    /// against the older document still accepts the envelope that carries it
+    /// (DEC-997.1). An object that constrains the properties it does not name
+    /// (through `additionalProperties`, `unevaluatedProperties`,
+    /// `patternProperties`, `propertyNames` or `maxProperties`) refuses some
+    /// additions, so each one is named here on purpose.
+    ///
+    /// `ResolverProfile` is the configuration's own type, echoed by a connected
+    /// plan's resolver selection, and stays closed so `pbps.yml` refuses a
+    /// misspelt key. `Discovery`'s two maps accept new keys whose values are
+    /// `Observation`s, and nothing else.
+    #[test]
+    fn only_the_named_envelope_objects_constrain_unnamed_properties() {
+        let constrained = constrained_objects(&schema(SchemaKind::Envelope));
+        let names: Vec<&str> = constrained.keys().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            [
+                "Discovery/properties/observations",
+                "Discovery/properties/qualification",
+                "ResolverProfile/oneOf/0",
+                "ResolverProfile/oneOf/1",
+            ]
+        );
+    }
+
+    /// Naming the constrained objects says where an addition is breaking; this
+    /// says that such a change moves the wire version. Every archived envelope
+    /// document stamped with the current `output::SCHEMA_VERSION` must still
+    /// accept each constrained object this build publishes (`still_accepted`,
+    /// annotations aside). The archives never change (DECISIONS 465), so a
+    /// change the old document would refuse fails here until the wire version
+    /// and the schema's `const` move with it (DECISIONS 224, DEC-997.1).
+    #[test]
+    fn a_constrained_object_changes_only_with_the_wire_version() {
+        let current = schema(SchemaKind::Envelope);
+        let archives = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/published-schemas");
+        let mut compared = 0;
+        for entry in std::fs::read_dir(&archives).unwrap() {
+            let name = entry.unwrap().file_name().into_string().unwrap();
+            let Ok(version) = name.parse::<u32>() else {
+                continue;
+            };
+            let archived = archived_schema(version, "envelope.schema.json");
+            let wire =
+                &archived["$defs"]["envelope.status"]["properties"]["schema_version"]["const"];
+            if *wire != serde_json::json!(crate::output::SCHEMA_VERSION) {
+                continue;
+            }
+            let (count, refused) = refused_changes(&archived, &current);
+            assert!(
+                refused.is_empty(),
+                "schema set {version} refuses under the same envelope wire version: {}; \
+                 move output::SCHEMA_VERSION (DEC-997.1)",
+                refused.join(", ")
+            );
+            compared += count;
+        }
+        assert!(
+            compared > 0,
+            "no archive under this wire version was compared"
+        );
+    }
+
+    /// Whether every value `now` describes is accepted by `then`, for one
+    /// constrained object. A property may be dropped and a property may become
+    /// required; a property may not appear, stop being required, or change its
+    /// own schema, and nothing else about the object may change. Comparing a
+    /// property's schema by equality is conservative: deciding JSON Schema
+    /// containment in general is not attempted (DECISIONS 465).
+    fn still_accepted(then: &serde_json::Value, now: &serde_json::Value) -> Result<(), String> {
+        let empty = serde_json::Map::new();
+        let properties = |schema: &serde_json::Value| {
+            schema
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let required = |schema: &serde_json::Value| -> std::collections::BTreeSet<String> {
+            schema
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|name| name.as_str().map(str::to_owned))
+                .collect()
+        };
+        let (was, is) = (properties(then), properties(now));
+        for (name, schema) in &is {
+            match was.get(name) {
+                None => return Err(format!("adds property `{name}`")),
+                Some(old) if old != schema => return Err(format!("changes property `{name}`")),
+                Some(_) => {}
+            }
+        }
+        if let Some(name) = required(then).difference(&required(now)).next() {
+            return Err(format!("no longer requires `{name}`"));
+        }
+        let rest = |schema: &serde_json::Value| -> serde_json::Map<String, serde_json::Value> {
+            schema
+                .as_object()
+                .unwrap_or(&empty)
+                .iter()
+                .filter(|(key, _)| !matches!(key.as_str(), "properties" | "required"))
+                .map(|(key, v)| (key.clone(), v.clone()))
+                .collect()
+        };
+        if rest(then) != rest(now) {
+            return Err("changes a keyword other than its properties".to_owned());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_constrained_object_may_drop_an_optional_property_and_nothing_looser() {
+        let then = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "kind": { "const": "docker" }, "pull": { "type": "string" } },
+            "required": ["kind"],
+        });
+        let mut dropped = then.clone();
+        dropped["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pull");
+        assert_eq!(still_accepted(&then, &dropped), Ok(()));
+        let mut tightened = then.clone();
+        tightened["required"] = serde_json::json!(["kind", "pull"]);
+        assert_eq!(still_accepted(&then, &tightened), Ok(()));
+
+        let mut added = then.clone();
+        added["properties"]["platform"] = serde_json::json!({ "type": "string" });
+        assert!(
+            still_accepted(&then, &added)
+                .unwrap_err()
+                .contains("adds property `platform`")
+        );
+        let mut loosened = then.clone();
+        loosened["required"] = serde_json::json!([]);
+        assert!(
+            still_accepted(&then, &loosened)
+                .unwrap_err()
+                .contains("no longer requires `kind`")
+        );
+        let mut retyped = then.clone();
+        retyped["properties"]["pull"] = serde_json::json!({ "type": "integer" });
+        assert!(
+            still_accepted(&then, &retyped)
+                .unwrap_err()
+                .contains("changes property `pull`")
+        );
+        let mut opened = then.clone();
+        opened["additionalProperties"] = serde_json::json!({ "type": "string" });
+        assert!(still_accepted(&then, &opened).is_err());
+    }
+
+    #[test]
+    fn a_closed_or_schema_valued_object_is_constrained_and_an_open_one_is_not() {
+        let document = serde_json::json!({
+            "oneOf": [{ "additionalProperties": false }],
+            "$defs": {
+                "Open": { "type": "object", "additionalProperties": true },
+                "Empty": { "type": "object", "additionalProperties": {} },
+                "Unset": { "type": "object", "properties": { "a": {} } },
+                "Map": { "type": "object", "additionalProperties": { "type": "string" } },
+                "Named": { "type": "object", "propertyNames": { "pattern": "^a" } },
+                "Bounded": { "type": "object", "maxProperties": 2 },
+                "Patterned": {
+                    "type": "object",
+                    "patternProperties": { "^x": { "type": "string" } }
+                },
+                "Unevaluated": { "type": "object", "unevaluatedProperties": false },
+                "Nested": { "oneOf": [{ "properties": {
+                    "inner": {
+                        "description": "dropped before comparison",
+                        "title": "dropped too",
+                        "type": "object",
+                        "properties": { "description": { "type": "string" } },
+                        "additionalProperties": false
+                    }
+                } }] },
+            }
+        });
+        let constrained = constrained_objects(&document);
+        let names: Vec<&str> = constrained.keys().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            [
+                "Bounded",
+                "Map",
+                "Named",
+                "Nested/oneOf/0/properties/inner",
+                "Patterned",
+                "Unevaluated"
+            ]
+        );
+        assert_eq!(
+            constrained["Nested/oneOf/0/properties/inner"],
+            serde_json::json!({
+                "type": "object",
+                "properties": { "description": { "type": "string" } },
+                "additionalProperties": false
+            })
+        );
+    }
+
+    /// Keywords whose value is instance data that validation compares
+    /// against, literals or property names: nothing beneath them is a
+    /// keyword, so it is kept verbatim.
+    const LITERALS: [&str; 3] = ["const", "enum", "dependentRequired"];
+    /// Annotation keywords: they change no validation, so a change to one
+    /// never needs the wire version to move.
+    const ANNOTATIONS: [&str; 8] = [
+        "description",
+        "title",
+        "$comment",
+        "default",
+        "examples",
+        "deprecated",
+        "readOnly",
+        "writeOnly",
+    ];
+    /// Keywords whose value maps names to schemas: the keys are names, never
+    /// keywords, and each value is a schema of its own.
+    const NAME_MAPS: [&str; 4] = [
+        "properties",
+        "patternProperties",
+        "$defs",
+        "dependentSchemas",
+    ];
+
+    /// Each schema directly beneath one keyword's value, with its pointer
+    /// segment: a name map's entries, an array's items, or the value itself.
+    fn subschemas<'a>(
+        key: &'a str,
+        value: &'a serde_json::Value,
+    ) -> Vec<(String, &'a serde_json::Value)> {
+        let escape = |segment: &str| segment.replace('~', "~0").replace('/', "~1");
+        match value {
+            _ if LITERALS.contains(&key) || ANNOTATIONS.contains(&key) => Vec::new(),
+            serde_json::Value::Object(named) if NAME_MAPS.contains(&key) => named
+                .iter()
+                .map(|(name, schema)| (format!("{}/{}", escape(key), escape(name)), schema))
+                .collect(),
+            serde_json::Value::Object(_) => vec![(escape(key), value)],
+            serde_json::Value::Array(items) => items
+                .iter()
+                .enumerate()
+                .map(|(i, schema)| (format!("{}/{i}", escape(key)), schema))
+                .collect(),
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_) => Vec::new(),
+        }
+    }
+
+    /// A schema with its annotation keywords removed. A property named like
+    /// one, and a `const` or `enum` literal holding one, are kept.
+    fn without_annotations(schema: &serde_json::Value) -> serde_json::Value {
+        let serde_json::Value::Object(map) = schema else {
+            return schema.clone();
+        };
+        map.iter()
+            .filter(|(key, _)| !ANNOTATIONS.contains(&key.as_str()))
+            .map(|(key, value)| {
+                let value = match value {
+                    _ if LITERALS.contains(&key.as_str()) => value.clone(),
+                    serde_json::Value::Object(named) if NAME_MAPS.contains(&key.as_str()) => named
+                        .iter()
+                        .map(|(name, s)| (name.clone(), without_annotations(s)))
+                        .collect(),
+                    serde_json::Value::Array(items) => {
+                        items.iter().map(without_annotations).collect()
+                    }
+                    serde_json::Value::Object(_) => without_annotations(value),
+                    serde_json::Value::Null
+                    | serde_json::Value::Bool(_)
+                    | serde_json::Value::Number(_)
+                    | serde_json::Value::String(_) => value.clone(),
+                };
+                (key.clone(), value)
+            })
+            .collect()
+    }
+
+    /// Every object under `$defs` that constrains the properties it does not
+    /// name, keyed by its JSON pointer below `$defs`, without annotations.
+    fn constrained_objects(
+        document: &serde_json::Value,
+    ) -> std::collections::BTreeMap<String, serde_json::Value> {
+        // A keyword constrains unnamed properties unless it is absent,
+        // `true` or `{}`, the three spellings of "anything".
+        fn restricts(value: Option<&serde_json::Value>) -> bool {
+            match value {
+                Some(serde_json::Value::Bool(allowed)) => !allowed,
+                Some(serde_json::Value::Object(schema)) => !schema.is_empty(),
+                Some(_) => true,
+                None => false,
+            }
+        }
+        fn constrains(map: &serde_json::Map<String, serde_json::Value>) -> bool {
+            restricts(map.get("additionalProperties"))
+                || restricts(map.get("unevaluatedProperties"))
+                || restricts(map.get("propertyNames"))
+                || map.contains_key("maxProperties")
+                || map
+                    .get("patternProperties")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|patterns| !patterns.is_empty())
+        }
+        fn walk(
+            schema: &serde_json::Value,
+            path: String,
+            found: &mut std::collections::BTreeMap<String, serde_json::Value>,
+        ) {
+            let serde_json::Value::Object(map) = schema else {
+                return;
+            };
+            if constrains(map) {
+                found.insert(path, without_annotations(schema));
+                return;
+            }
+            for (key, value) in map {
+                for (segment, sub) in subschemas(key, value) {
+                    walk(sub, format!("{path}/{segment}"), found);
+                }
+            }
+        }
+        let mut found = std::collections::BTreeMap::new();
+        let defs = &document["$defs"];
+        assert!(
+            defs.is_object(),
+            "a published schema keeps its definitions in `$defs`"
+        );
+        for (segment, body) in subschemas("$defs", defs) {
+            let path = segment
+                .strip_prefix("$defs/")
+                .expect("a `$defs` segment")
+                .to_owned();
+            walk(body, path, &mut found);
+        }
+        found
+    }
+
+    /// For every object `archived` constrains, whether `current` still
+    /// describes only values `archived` accepts. The current object is found
+    /// by its pointer whether or not it is still constrained, so one that
+    /// opened is compared too. A pointer that no longer resolves is a removed
+    /// property of an enclosing open object, which #1038 covers. Returns how
+    /// many objects were compared, and what each refused change was.
+    fn refused_changes(
+        archived: &serde_json::Value,
+        current: &serde_json::Value,
+    ) -> (usize, Vec<String>) {
+        let mut compared = 0;
+        let mut refused = Vec::new();
+        for (path, then) in constrained_objects(archived) {
+            let Some(now) = current["$defs"].pointer(&format!("/{path}")) else {
+                continue;
+            };
+            compared += 1;
+            if let Err(why) = still_accepted(&then, &without_annotations(now)) {
+                refused.push(format!("`{path}` {why}"));
+            }
+        }
+        (compared, refused)
+    }
+
+    #[test]
+    fn an_object_that_opens_or_changes_a_literal_is_refused_and_an_unchanged_one_is_not() {
+        let archived = serde_json::json!({ "$defs": { "D": { "properties": {
+            "map": {
+                "type": "object",
+                "additionalProperties": { "$ref": "#/$defs/Observation" }
+            },
+            "closed": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": { "tag": { "const": { "description": "old" } } },
+                "dependentRequired": { "title": ["tag"] }
+            }
+        } } } });
+        assert_eq!(refused_changes(&archived, &archived), (2, Vec::new()));
+
+        let mut opened = archived.clone();
+        opened["$defs"]["D"]["properties"]["map"]
+            .as_object_mut()
+            .unwrap()
+            .remove("additionalProperties");
+        let (_, refused) = refused_changes(&archived, &opened);
+        assert_eq!(
+            refused,
+            ["`D/properties/map` changes a keyword other than its properties"]
+        );
+
+        let mut relabelled = archived.clone();
+        relabelled["$defs"]["D"]["properties"]["closed"]["properties"]["tag"]["const"]["description"] =
+            "new".into();
+        let (_, refused) = refused_changes(&archived, &relabelled);
+        assert_eq!(refused, ["`D/properties/closed` changes property `tag`"]);
+
+        let mut dependent = archived.clone();
+        dependent["$defs"]["D"]["properties"]["closed"]["dependentRequired"]["default"] =
+            serde_json::json!(["tag"]);
+        let (_, refused) = refused_changes(&archived, &dependent);
+        assert_eq!(
+            refused,
+            ["`D/properties/closed` changes a keyword other than its properties"]
+        );
+
+        let mut annotated = archived.clone();
+        annotated["$defs"]["D"]["properties"]["closed"]["description"] = "reworded".into();
+        annotated["$defs"]["D"]["properties"]["closed"]["properties"]["tag"]["default"] =
+            "another default".into();
+        assert_eq!(refused_changes(&archived, &annotated), (2, Vec::new()));
+    }
+
     /// `deny_unknown_fields` is what turns a typo into an error rather than a
     /// silent no-op (ADR-0003), and it only reaches the editor as
     /// `additionalProperties: false`. Losing it would make the schema accept

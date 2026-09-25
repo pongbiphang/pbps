@@ -1938,6 +1938,24 @@ change, which the tool version does not. The published schema pins it with a
 `const`, so an envelope from a version that document does not describe fails
 validation rather than being read as one it does (DECISIONS 224).
 
+A consumer "would have to change" exactly when an envelope the new build emits
+could fail validation against the envelope schema published before it
+(DEC-997.1). That test decides, not the kind of change:
+
+- These keep the wire version: a field added to an open object, an optional
+  field removed from one, and a type narrowed so that every value it now
+  allows was allowed before (`number` to `integer`, a string to an enum). The
+  schema-set version records them (DECISIONS 465).
+- These move it: a required field removed or renamed, a type widened or
+  changed so that a value the old schema refused can be emitted, a new enum
+  value, or a field added to one of the few objects that constrain the
+  properties they do not name. Those objects are the ones that restrict
+  `additionalProperties`, `unevaluatedProperties` or `propertyNames`, or set
+  `patternProperties` or `maxProperties`.
+
+A consumer that parses `data` strictly accepts that it must update with the
+tool.
+
 `result` is `ok`, `findings` or **`unanswerable`** — the same three-way split as
 the exit codes below, and for the same reason. A pipe loses the producer's
 status, so `scripts/findings-to-github.py` maps this field straight to its own
