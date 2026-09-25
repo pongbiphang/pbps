@@ -22,6 +22,16 @@ name: CI
 # request's run is retried with `gh run rerun <run-id>`, which keeps the
 # association because it is the same run.
 #
+# A pull-request run waits for approval before it runs anything (DEC-1017.1).
+# The `approve` job below names the `ci-approval` environment, whose required
+# reviewer must approve the run ("Review deployments") before any job starts,
+# so a push during a review round queues a run that costs nothing, and a newer
+# push cancels it through the concurrency group. The run on the head that
+# qualified in review is approved; the merge group, `master` and a dispatched
+# run name no environment and start by themselves. The environment must exist
+# with its reviewer set before this file names it: a workflow that names a
+# missing environment creates it with no protection at all.
+#
 # Do not add `paths` or `paths-ignore` here. `ci-gate` is a required check, and
 # a required check that never reports leaves a pull request blocked with
 # nothing that can clear it.
@@ -52,12 +62,24 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  # Every other job waits on this one, through `quick`. On a pull request it
+  # is held by the `ci-approval` environment until approved; everywhere else
+  # the expression yields no environment and it passes at once. A rejected
+  # approval fails it, which skips everything after it and shuts `ci-gate`.
+  approve:
+    name: approval
+    runs-on: ubuntu-latest
+    environment: ${{ github.event_name == 'pull_request' && 'ci-approval' || '' }}
+    steps:
+      - run: echo "approved to run $GITHUB_EVENT_NAME"
+
   # Keep the short checks in one job: one toolchain and one cache restore
   # rather than three. Every other job waits on this one, so nothing expensive
   # starts for a commit that does not even compile — a fan-in the engine-backed
   # jobs below want for their own sake, not only for the minutes it once saved.
   quick:
     name: test and lint (ubuntu-latest)
+    needs: approve
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -436,7 +458,7 @@ jobs:
   # quietly qualify a pull request that nothing ran on.
   gate:
     name: ci-gate
-    needs: [quick, windows, live, live-editions, live-pg, dev-rehearsal, resolver, msrv]
+    needs: [approve, quick, windows, live, live-editions, live-pg, dev-rehearsal, resolver, msrv]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:

@@ -100,8 +100,13 @@ do not reset the no-P1 count solely because of that lower-priority finding.
 
 ## 5. CI and base changes
 
-CI runs itself on every push, so by the time the ready gate qualifies there is
-a run on the head already; wait for `ci-gate` on it. Retry a transient failure
+A pull request's CI runs only when approved (DEC-1017.1): every push starts a
+run that stops at the `approval` job, held by the `ci-approval` environment,
+and runs nothing. Do not approve during the review loop. When the ready gate
+qualifies the head — or the resulting-head review of a rebase does — report
+it to the primary agent, which approves the run on that head through
+`POST .../actions/runs/<run-id>/pending_deployments`; a worker never approves.
+Then wait for `ci-gate` on the approved run. Retry a transient failure
 with `gh run rerun <run-id>` (`--failed` for the failed jobs alone), which keeps
 the run's pull-request association. Never use `gh workflow run ci.yml` for that
 — it raises a `workflow_dispatch` event whose check suite belongs to no pull

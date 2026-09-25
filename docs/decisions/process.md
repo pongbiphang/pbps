@@ -399,3 +399,37 @@ end. That conflict is resolved by keeping both, with no renumbering. A
 both sides of two concurrent edits to one existing entry as a silently spliced
 paragraph. That is the silent failure this change exists to remove, so the
 attribute is not set.
+
+<a id="dec-1017-1"></a>
+
+**DEC-1017.1. A pull request's CI runs once, when the head it will merge has
+qualified in review, not on every push.** Every push to a pull request used to
+run the whole matrix, and a review round pushes several times: every run but
+the one on the qualifying head was discarded, and the matrix only grows. The
+merge group runs the matrix again on the exact tree that merges, so the
+per-push runs decided nothing the merge group does not decide again.
+
+Dropping the `pull_request` trigger was not an option. The merge queue admits a
+pull request only once `ci-gate` is green on its own head, and a required check
+that never reports blocks it with nothing that can clear it. Nor was a
+`pull_request` run that skips the matrix and passes the gate: that reopens the
+hole DECISIONS 206 closed, a green `ci-gate` for a matrix that did not run. A
+label that starts the run was the other candidate; it leaves the label on the
+pull request, where the next push, cancelling nothing it can see, reads as
+already approved.
+
+So every push still starts a run, and its first job, `approval`, names the
+`ci-approval` environment, whose required reviewer must approve before any job
+starts. An unapproved run is pending, so `ci-gate` is pending and the merge box
+shut; a rejected one fails `approval`, which skips everything after it and
+fails the gate, which treats `skipped` as failure. A newer push cancels the
+waiting run through the pull-request concurrency group. The merge group,
+`master` and dispatched runs name no environment and start by themselves, so
+the queue's own run needs no one.
+
+The cost is where a failure surfaces. Windows, the MSRV build, the resolver
+fixtures and the dev rehearsal are not in the local checks, so a failure there
+now appears on the approved run rather than on the push that caused it, after
+review has qualified the head. That run is a single run on a head that is about
+to be queued, which is where a failure is cheapest to act on; the local checks
+remain the per-push gate.
