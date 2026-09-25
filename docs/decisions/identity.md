@@ -463,3 +463,34 @@ record](../DECISIONS.md), which says how to add an entry here.
      because no table-local rule can see across tables — while a check or
      foreign key sharing a name was never in that namespace and stays the
      table-local rule's alone (ADR-0009 §1, 459).
+
+<a id="dec-403-1"></a>
+
+**DEC-403.1. An intent's provenance is either a declaration's annotation or a
+current decision, and `resolve` hands every intent in as a current decision
+(#403).** `resolve_with_provenance` answers several questions by provenance:
+the absorption sweep, and the occupied-target guards for tables and columns. An
+annotation of a rename that already happened is expected to sit in a file until
+`fmt` removes it, so it may be quiet. A command or a prompt answer this run is
+a decision, so one that changed nothing is an `UnusedIntent`, and one that names
+an occupied target is refused. `resolve` passed `annotation_count: None`, an
+unknown provenance. Every gate read `None` as "not a current decision" and "not
+a stale annotation", which is the lenient answer twice. So a library caller
+that handed `resolve` an explicit `RenameColumn { from: a, to: b }`, with both
+names still declared and identified, got `Ok` and nothing recorded. Before #350
+it had got `UnusedIntent`.
+
+The convention is settled in one place, not gate by gate (DECISIONS 246, and
+PITFALLS' "one rule, spelled in three places"). `resolve` is
+`resolve_with_provenance(…, 0)`: no annotations, so every intent is a current
+decision. `annotation_count` is a plain `usize`, so no gate can be handed an
+unknown provenance to read its own way. Callers whose intents are annotations
+say how many through `resolve_with_annotations`, as `plan`, `validate` and
+`deploy` already do.
+
+No command changes behaviour. `pull`, `init` and the dialect helpers pass no
+intents at all, so no gate has anything to judge. The tests that described
+annotation cases through `resolve` now say so through
+`resolve_with_annotations`, so they pin the provenance they mean, not the
+lenient default. Pinned by
+`a_rename_handed_to_resolve_is_a_current_decision_and_an_annotation_is_not`.

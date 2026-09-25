@@ -165,21 +165,32 @@ pub struct Resolution {
     pub renamed_roles: Vec<(Uid, String, String)>,
 }
 
+/// Resolves identities with every intent read as a **current decision**: a
+/// command or a prompt answer this run, not a declaration's `renamed_from:`
+/// annotation. Such a decision that changed nothing is an `UnusedIntent`,
+/// and one that names an occupied target is refused.
+///
+/// There is no third, unknown provenance any more (#403, DEC-403.1). The
+/// `None` this passed used to read as "neither current nor an annotation",
+/// so each gate in [`resolve_with_provenance`] took whichever answer was more
+/// lenient for it, and a library caller got `Ok` for a rename that recorded
+/// nothing. A caller whose intents came from annotations says how many with
+/// [`resolve_with_annotations`].
 pub fn resolve(
     declared: &Schema,
     ids: &IdsFile,
     intents: &[Intent],
     ctx: &Context,
 ) -> Result<Resolution, Vec<Blocker>> {
-    resolve_with_provenance(declared, ids, intents, None, ctx)
+    resolve_with_provenance(declared, ids, intents, 0, ctx)
 }
 
 /// Resolve intents while preserving which leading entries came from declaration
 /// annotations. `pbps` appends CLI and prompt decisions after the annotations;
 /// only an annotation that is now absorbed by a matching drop may be ignored
 /// when its reused source name is removed. Explicit decisions must still report
-/// an occupied target. The ordinary [`resolve`] entry point retains the legacy
-/// unknown-provenance behavior used by dialect tests and library consumers.
+/// an occupied target. [`resolve`] is this with no annotations: every intent a
+/// current decision (DEC-403.1).
 pub fn resolve_with_annotations(
     declared: &Schema,
     ids: &IdsFile,
@@ -191,14 +202,18 @@ pub fn resolve_with_annotations(
         annotation_count <= intents.len(),
         "annotation count cannot exceed the intent count"
     );
-    resolve_with_provenance(declared, ids, intents, Some(annotation_count), ctx)
+    resolve_with_provenance(declared, ids, intents, annotation_count, ctx)
 }
 
+/// `annotation_count` is how many leading `intents` came from declaration
+/// annotations; every later one is a current decision. A plain count, not an
+/// `Option`: an unknown provenance is the state #403 found each gate reading
+/// its own way, so it is not one this function can be handed.
 fn resolve_with_provenance(
     declared: &Schema,
     ids: &IdsFile,
     intents: &[Intent],
-    annotation_count: Option<usize>,
+    annotation_count: usize,
     ctx: &Context,
 ) -> Result<Resolution, Vec<Blocker>> {
     let mut r = Resolution {
@@ -299,7 +314,7 @@ fn resolve_with_provenance(
         // annotation whose scope moved with its declaration -- and not one the
         // declarations may excuse either: its author has to hear that it
         // matched nothing.
-        let current_decision = annotation_count.is_some_and(|count| i >= count);
+        let current_decision = i >= annotation_count;
         // Column annotations use the declared table name. A table rename moves
         // their scope, but does not make newly added columns prior identities.
         let original_intent = match intent {
@@ -597,7 +612,7 @@ impl RenameSource {
 fn resolve_roles(
     declared: &Schema,
     intents: &[Intent],
-    annotation_count: Option<usize>,
+    annotation_count: usize,
     ctx: &Context,
     r: &mut Resolution,
     blockers: &mut Vec<Blocker>,
@@ -654,8 +669,8 @@ fn resolve_roles(
         let Intent::RenameRole { from, to } = intent else {
             continue;
         };
-        let current_decision = annotation_count.is_some_and(|count| i >= count);
-        let stale_annotation = annotation_count.is_some_and(|count| i < count)
+        let current_decision = i >= annotation_count;
+        let stale_annotation = i < annotation_count
             && intents.iter().any(
                 |candidate| matches!(candidate, Intent::DropRole { role, .. } if role == from),
             );
@@ -736,7 +751,7 @@ fn resolve_roles(
 fn resolve_tables(
     declared: &Schema,
     intents: &[Intent],
-    annotation_count: Option<usize>,
+    annotation_count: usize,
     ctx: &Context,
     r: &mut Resolution,
     blockers: &mut Vec<Blocker>,
@@ -794,8 +809,8 @@ fn resolve_tables(
         let Intent::RenameTable { from, to } = intent else {
             continue;
         };
-        let current_decision = annotation_count.is_some_and(|count| i >= count);
-        let stale_annotation = annotation_count.is_some_and(|count| i < count)
+        let current_decision = i >= annotation_count;
+        let stale_annotation = i < annotation_count
             && intents.iter().any(
                 |candidate| matches!(candidate, Intent::DropTable { table, .. } if table == from),
             );
@@ -888,7 +903,7 @@ fn resolve_tables(
 fn resolve_columns(
     declared: &Schema,
     intents: &[Intent],
-    annotation_count: Option<usize>,
+    annotation_count: usize,
     ctx: &Context,
     r: &mut Resolution,
     blockers: &mut Vec<Blocker>,
@@ -955,8 +970,8 @@ fn resolve_columns(
             let Intent::RenameColumn { table, from, to } = intent else {
                 continue;
             };
-            let current_decision = annotation_count.is_some_and(|count| i >= count);
-            let stale_annotation = annotation_count.is_some_and(|count| i < count)
+            let current_decision = i >= annotation_count;
+            let stale_annotation = i < annotation_count
                 && intents.iter().any(|candidate| {
                     matches!(candidate, Intent::DropColumn { column, .. }
                         if &column.table == table_name && column.name == *from)
@@ -1205,6 +1220,18 @@ fn sort_resolution(r: &mut Resolution) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Resolves as `plan` does when every intent came from a declaration's
+    /// `renamed_from:` annotation: the provenance these tests describe.
+    /// `resolve` alone now reads every intent as a current decision (#403).
+    fn annotated(
+        declared: &Schema,
+        ids: &IdsFile,
+        intents: &[Intent],
+        ctx: &Context,
+    ) -> Result<Resolution, Vec<Blocker>> {
+        resolve_with_annotations(declared, ids, intents, intents.len(), ctx)
+    }
     use pbps_model::{Column, Table};
 
     fn schema(columns: &[&str]) -> Schema {
@@ -1267,9 +1294,41 @@ mod tests {
         assert_eq!(errors, vec![Blocker::UnusedIntent { intent }]);
     }
 
+    /// #403: one provenance rule, in one place. A rename handed to `resolve`
+    /// is a current decision, so a `RenameColumn { from: a, to: b }` whose
+    /// source and target are both still declared and identified did nothing
+    /// and says so. The same statement as a declaration's annotation is one
+    /// a rename already absorbed, and stays quiet — two provenances, two
+    /// answers, and no unknown one that reads as either.
+    #[test]
+    fn a_rename_handed_to_resolve_is_a_current_decision_and_an_annotation_is_not() {
+        let declared = schema(&["id", "a", "b"]);
+        let ids = resolve(&declared, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let intent = Intent::RenameColumn {
+            table: "dbo.customer".parse().unwrap(),
+            from: "a".into(),
+            to: "b".into(),
+        };
+
+        let errors = resolve(&declared, &ids, std::slice::from_ref(&intent), &ctx()).unwrap_err();
+        assert_eq!(
+            errors,
+            vec![Blocker::UnusedIntent {
+                intent: intent.clone()
+            }]
+        );
+
+        let absorbed = annotated(&declared, &ids, std::slice::from_ref(&intent), &ctx())
+            .expect("an annotation of a rename already absorbed is not an error");
+        assert!(absorbed.renamed_columns.is_empty());
+        assert_eq!(absorbed.ids, ids, "nothing is recorded for either");
+    }
+
     #[test]
     fn a_table_rename_preserves_absorbed_column_intents_without_absorbing_typos() {
-        let before = resolve(&schema(&["code_v1"]), &IdsFile::default(), &[], &ctx())
+        let before = annotated(&schema(&["code_v1"]), &IdsFile::default(), &[], &ctx())
             .unwrap()
             .ids;
         let old_table: TableName = "dbo.customer".parse().unwrap();
@@ -1286,7 +1345,7 @@ mod tests {
             from: "code".into(),
             to: "code_v1".into(),
         };
-        let result = resolve(
+        let result = annotated(
             &declared,
             &before,
             &[rename_table.clone(), annotation],
@@ -1307,7 +1366,7 @@ mod tests {
             to: "code".into(),
         };
         let errors =
-            resolve(&declared, &before, &[rename_table, typo.clone()], &ctx()).unwrap_err();
+            annotated(&declared, &before, &[rename_table, typo.clone()], &ctx()).unwrap_err();
         assert_eq!(errors, vec![Blocker::UnusedIntent { intent: typo }]);
     }
 
@@ -1317,7 +1376,7 @@ mod tests {
     /// next one is refused.
     #[test]
     fn a_reused_source_name_stays_absorbed_on_the_following_run() {
-        let before = resolve(&schema(&["code_v1"]), &IdsFile::default(), &[], &ctx())
+        let before = annotated(&schema(&["code_v1"]), &IdsFile::default(), &[], &ctx())
             .unwrap()
             .ids;
         let table: TableName = "dbo.customer".parse().unwrap();
@@ -1327,7 +1386,7 @@ mod tests {
             from: "code".into(),
             to: "code_v1".into(),
         };
-        let after = resolve(
+        let after = annotated(
             &declared,
             &before,
             std::slice::from_ref(&annotation),
@@ -1335,7 +1394,7 @@ mod tests {
         )
         .unwrap()
         .ids;
-        let again = resolve(&declared, &after, std::slice::from_ref(&annotation), &ctx())
+        let again = annotated(&declared, &after, std::slice::from_ref(&annotation), &ctx())
             .expect("the annotation the first run absorbed cannot refuse the next plan");
         assert!(again.renamed_columns.is_empty());
         assert!(again.added_columns.is_empty());
@@ -1385,7 +1444,7 @@ mod tests {
     fn a_reused_source_name_stays_absorbed_while_its_table_is_renamed() {
         let old_table: TableName = "dbo.customer".parse().unwrap();
         let new_table: TableName = "dbo.clients".parse().unwrap();
-        let before = resolve(&schema(&["code_v1"]), &IdsFile::default(), &[], &ctx())
+        let before = annotated(&schema(&["code_v1"]), &IdsFile::default(), &[], &ctx())
             .unwrap()
             .ids;
         let annotation = Intent::RenameColumn {
@@ -1393,7 +1452,7 @@ mod tests {
             from: "code".into(),
             to: "code_v1".into(),
         };
-        let after = resolve(
+        let after = annotated(
             &schema(&["code_v1", "code"]),
             &before,
             std::slice::from_ref(&annotation),
@@ -1416,7 +1475,7 @@ mod tests {
                 to: "code_v1".into(),
             },
         ];
-        let r = resolve(&declared, &after, &intents, &ctx())
+        let r = annotated(&declared, &after, &intents, &ctx())
             .expect("a retained annotation whose source was reused survives its table moving");
         assert_eq!(r.renamed_tables.len(), 1);
         assert!(r.renamed_columns.is_empty());
