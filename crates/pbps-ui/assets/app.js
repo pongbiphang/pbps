@@ -9,12 +9,13 @@
     plan: ["Saved plan", "Read the changes and risks in an existing plan file."],
     timeline: ["Timeline", "Browse the deployment history recorded in an environment."],
     docs: ["Schema & ERD", "Explore documentation and relationships from your declarations."],
-    compose: ["Compose change", "Record a rename, drop reason or annotation as a reviewed commit on a new branch."]
+    compose: ["Compose change", "Record a rename, drop reason or annotation as a reviewed commit on a new branch."],
+    deploy: ["Plan & apply", "Write a saved plan for an environment, or apply one with the checksum your deployment gate approved."]
   };
-  let current = "status", generation = 0, composeRoot = null;
+  let current = "status", generation = 0, composeRoot = null, deployRoot = null;
   // The only writes: fixed compose actions with an opaque JSON body.
-  async function send(action, body) {
-    const response = await fetch(`/api/compose/${action}`, {method:"POST", headers:{"X-Pbps-Token":token, "Content-Type":"application/json"}, body:JSON.stringify(body), cache:"no-store", credentials:"omit"});
+  async function send(action, body, kind = "compose") {
+    const response = await fetch(`/api/${kind}/${action}`, {method:"POST", headers:{"X-Pbps-Token":token, "Content-Type":"application/json"}, body:JSON.stringify(body), cache:"no-store", credentials:"omit"});
     if (!response.ok) {
       // The status tells a definite refusal (410) from an uncertain one.
       const error = new Error(await response.text());
@@ -129,6 +130,15 @@
       content.append(composeRoot);
       return;
     }
+    if (view === "deploy") {
+      // Kept like compose, so a running apply's output survives a view switch.
+      if (!deployRoot) {
+        deployRoot = node("section", undefined, "deploy");
+        globalThis.PbpsTrigger.mount(deployRoot, (action, body) => send(action, body, "trigger"), select);
+      }
+      content.append(deployRoot);
+      return;
+    }
     let url = `/api/${view}`;
     if (["drift", "timeline", "plan"].includes(view)) {
       const value = byId("selection-value").value;
@@ -159,7 +169,7 @@
       if (button.dataset.view === view) button.setAttribute("aria-current", "page"); else button.removeAttribute("aria-current");
     }
     byId("selection").hidden = !["drift", "timeline", "plan"].includes(view);
-    byId("refresh").hidden = view === "compose";
+    byId("refresh").hidden = ["compose", "deploy"].includes(view);
     byId("input-label").textContent = view === "plan" ? "Saved plan path" : "Environment name";
     byId("selection-value").value = value;
     byId("selection-value").placeholder = view === "plan" ? "plans/release.json" : "production";

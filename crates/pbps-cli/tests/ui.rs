@@ -16,12 +16,20 @@ struct Viewer {
 
 impl Viewer {
     fn start(name: &str) -> Self {
+        Self::start_with(name, "", &[])
+    }
+
+    /// `environments` is appended to the project's environment list, and
+    /// `variables` is set in the viewer's (and so its children's) environment.
+    fn start_with(name: &str, environments: &str, variables: &[(&str, &str)]) -> Self {
         let directory = std::env::temp_dir().join(format!("pbps-ui-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(directory.join("schema")).unwrap();
         std::fs::write(
             directory.join("pbps.yml"),
-            "dialect: mssql\nenvironments:\n  unconfigured:\n    url_env: PBPS_UI_TEST_UNSET\n",
+            format!(
+                "dialect: mssql\nenvironments:\n  unconfigured:\n    url_env: PBPS_UI_TEST_UNSET\n{environments}"
+            ),
         )
         .unwrap();
         std::fs::write(
@@ -35,6 +43,7 @@ impl Viewer {
             .arg(directory.file_name().unwrap())
             .arg("ui")
             .env_remove("PBPS_UI_TEST_UNSET")
+            .envs(variables.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -89,6 +98,69 @@ impl Viewer {
 
     fn read(&self, path: &str) -> (u16, String, String) {
         self.request("GET", path, &[("X-Pbps-Token", &self.token)])
+    }
+
+    /// A write as the page sends it: token, matching origin, JSON body.
+    fn post(&self, path: &str, body: &str) -> (u16, String, String) {
+        let origin = format!("http://{}", self.address);
+        let length = body.len().to_string();
+        self.request_with_body(
+            "POST",
+            path,
+            &[
+                ("X-Pbps-Token", &self.token),
+                ("Origin", &origin),
+                ("Content-Type", "application/json"),
+                ("Content-Length", &length),
+            ],
+            body,
+        )
+    }
+
+    fn request_with_body(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> (u16, String, String) {
+        let mut socket = TcpStream::connect(&self.address).unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+            .unwrap();
+        write!(
+            socket,
+            "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
+            self.address
+        )
+        .unwrap();
+        for (name, value) in headers {
+            write!(socket, "{name}: {value}\r\n").unwrap();
+        }
+        write!(socket, "\r\n{body}").unwrap();
+        let mut response = String::new();
+        socket.read_to_string(&mut response).unwrap();
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+        (status, head.into(), body.into())
+    }
+
+    /// Asks for the runs until every one has ended, and returns every body
+    /// the viewer sent on the way.
+    fn wait_for_runs(&self) -> (Vec<serde_json::Value>, Vec<String>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let mut bodies = Vec::new();
+        loop {
+            let (status, _, body) = self.post("/api/trigger/runs", "{}");
+            assert_eq!(status, 200, "{body}");
+            let runs: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+            bodies.push(body);
+            if runs.iter().all(|run| run["ended"] == true) {
+                return (runs, bodies);
+            }
+            assert!(std::time::Instant::now() < deadline, "a run never ended");
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
     }
 }
 
@@ -282,18 +354,166 @@ fn the_ui_has_no_host_or_write_option() {
 }
 
 #[test]
+fn a_trigger_request_failing_a_guard_starts_nothing() {
+    let viewer = Viewer::start("trigger-guards");
+    let body = r#"{"environment":"unconfigured","out":"guarded.json"}"#;
+    let origin = format!("http://{}", viewer.address);
+    let length = body.len().to_string();
+    for headers in [
+        // No token.
+        vec![
+            ("Origin", origin.as_str()),
+            ("Content-Type", "application/json"),
+            ("Content-Length", length.as_str()),
+        ],
+        // A foreign origin.
+        vec![
+            ("X-Pbps-Token", viewer.token.as_str()),
+            ("Origin", "https://foreign.invalid"),
+            ("Content-Type", "application/json"),
+            ("Content-Length", length.as_str()),
+        ],
+        // No origin on a write.
+        vec![
+            ("X-Pbps-Token", viewer.token.as_str()),
+            ("Content-Type", "application/json"),
+            ("Content-Length", length.as_str()),
+        ],
+    ] {
+        let (status, _, answer) =
+            viewer.request_with_body("POST", "/api/trigger/plan", &headers, body);
+        assert_eq!(status, 403, "{answer}");
+    }
+    // Not JSON, and not a POST.
+    let (status, _, _) = viewer.request_with_body(
+        "POST",
+        "/api/trigger/plan",
+        &[
+            ("X-Pbps-Token", viewer.token.as_str()),
+            ("Origin", origin.as_str()),
+            ("Content-Type", "text/plain"),
+            ("Content-Length", length.as_str()),
+        ],
+        body,
+    );
+    assert_eq!(status, 415);
+    assert_eq!(viewer.read("/api/trigger/plan").0, 405);
+    let (status, _, runs) = viewer.post("/api/trigger/runs", "{}");
+    assert_eq!((status, runs.as_str()), (200, "[]"));
+    assert!(!viewer.directory.join("guarded.json").exists());
+}
+
+/// ADR-0015 decision 4 for the trigger: the connection string is read by the
+/// child from its environment and appears in no request, response or page,
+/// including when the child fails to connect and reports why.
+#[test]
+fn a_connection_string_never_reaches_a_trigger_response() {
+    const SECRET: &str = "Sup3rS3cretPbpsUiPassword";
+    let connection = format!(
+        "Server=127.0.0.1,1;Database=d;User Id=u;Password={SECRET};TrustServerCertificate=true;Connect Timeout=2"
+    );
+    let viewer = Viewer::start_with(
+        "trigger-secret",
+        "  guarded:\n    url_env: PBPS_UI_TEST_SECRET\n",
+        &[("PBPS_UI_TEST_SECRET", &connection)],
+    );
+    // A committed project with a current identity file, so the connected plan
+    // gets as far as connecting, and fails there.
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .current_dir(&viewer.directory)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "declarations"]);
+    let offline = Command::new(env!("CARGO_BIN_EXE_pbps"))
+        .current_dir(&viewer.directory)
+        .args(["--no-input", "plan"])
+        .output()
+        .unwrap();
+    assert!(offline.status.success(), "{offline:?}");
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "identities"]);
+
+    let (status, _, started) = viewer.post(
+        "/api/trigger/plan",
+        r#"{"environment":"guarded","out":"plans/new.json"}"#,
+    );
+    assert_eq!(status, 200, "{started}");
+    let (runs, bodies) = viewer.wait_for_runs();
+    let plan = &runs[0];
+    assert_eq!(plan["action"], "plan");
+    assert_ne!(plan["code"], 0, "{plan}");
+    assert!(
+        plan["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("cannot connect to the database"),
+        "the child reached the connection and its refusal is relayed: {plan}"
+    );
+    assert!(!viewer.directory.join("plans/new.json").exists());
+
+    // The checksum is the CLI's to judge; its refusal reaches the page as the
+    // CLI wrote it.
+    std::fs::write(viewer.directory.join("saved.json"), "{}").unwrap();
+    let (status, _, started) = viewer.post(
+        "/api/trigger/apply",
+        r#"{"environment":"guarded","plan":"saved.json","checksum":"0000","allow":[],"staged":false,"resume":false}"#,
+    );
+    assert_eq!(status, 200, "{started}");
+    let (runs, more) = viewer.wait_for_runs();
+    assert_eq!(runs[0]["action"], "apply");
+    assert_eq!(runs[0]["code"], 2);
+    assert!(
+        runs[0]["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("a plan checksum must be exactly 64 hexadecimal characters"),
+        "{}",
+        runs[0]
+    );
+    for body in bodies.iter().chain(&more).chain([&started]) {
+        assert!(!body.contains(SECRET), "{body}");
+        assert!(!body.contains("127.0.0.1,1"), "{body}");
+    }
+    for asset in ["/", "/app.js", "/trigger.js"] {
+        assert!(!viewer.request("GET", asset, &[]).2.contains(SECRET));
+    }
+}
+
+#[test]
 fn the_launch_banner_discloses_whether_the_viewer_can_write() {
     let viewer = Viewer::start("banner");
-    // Compose commits and pushes on Linux (#494); the banner must not call
-    // that viewer read-only, and must say so where compose is refused.
+    // The viewer can run plan and apply everywhere (#1025), and compose
+    // commits and pushes on Linux (#494). The banner says both, and never
+    // calls the viewer read-only.
+    assert!(!viewer.banner.contains("Read-only"), "{}", viewer.banner);
+    assert!(
+        viewer.banner.contains("plan and apply"),
+        "{}",
+        viewer.banner
+    );
+    assert!(
+        viewer.banner.contains("interrupts a running plan or apply"),
+        "{}",
+        viewer.banner
+    );
     if cfg!(target_os = "linux") {
-        assert!(!viewer.banner.contains("Read-only"), "{}", viewer.banner);
         assert!(
             viewer.banner.contains("commit a reviewed change"),
             "{}",
             viewer.banner
         );
     } else {
-        assert!(viewer.banner.contains("Read-only"), "{}", viewer.banner);
+        assert!(
+            viewer.banner.contains("compose requires Linux"),
+            "{}",
+            viewer.banner
+        );
     }
 }

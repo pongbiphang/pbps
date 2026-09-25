@@ -32,6 +32,39 @@ fn compose_form_keeps_confirmation_bound_to_the_latest_reviewed_generation() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("compose browser behavior passed"));
 }
 
+/// The shipped trigger script never supplies an approval (DEC-1025.1): the
+/// checksum field starts empty and a finished plan fills nothing, and the
+/// apply request carries exactly what was typed.
+#[test]
+fn the_trigger_form_sends_only_the_typed_checksum_and_never_fills_one() {
+    let node = std::env::var_os("PBPS_TEST_NODE").unwrap_or_else(|| "node".into());
+    let mut child = Command::new(node)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect(
+            "Node.js is required for the shipped browser behavior tests (or set PBPS_TEST_NODE)",
+        );
+    let mut stdin = child.stdin.take().unwrap();
+    stdin
+        .write_all(include_bytes!("../assets/trigger.js"))
+        .unwrap();
+    stdin.write_all(b"\n").unwrap();
+    stdin
+        .write_all(include_bytes!("trigger-browser.cjs"))
+        .unwrap();
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("trigger browser behavior passed"));
+}
+
 /// Ledger identifiers reach the page as the CLI wrote them, every digit (#492).
 ///
 /// The bytes are the viewer's own: CLI envelopes run through

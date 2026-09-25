@@ -319,3 +319,80 @@ entry here.
      for the same identity proceeds under the ordinary retry rules. The
      regressions for fake credential markers, endpoint drift and refresh
      belong to #745–#747.
+
+<a id="dec-1025-1"></a>
+
+**DEC-1025.1. The viewer triggers `plan` and `apply` through fixed actions with
+typed fields, and shows the CLI's own outcome. No approval and no new envelope
+are added.** ADR-0006 admits the trigger on one condition: the UI never holds
+the approval. The apply form therefore takes the checksum and the allowed risk
+classes as a person types them.
+- The field starts empty. Nothing the viewer reads fills it, not even the
+  plan it has just shown, because a checksum filled in from that plan would
+  turn the deployment gate into a click.
+- `POST /api/trigger/plan` and `/apply` take a JSON body that refuses unknown
+  fields. Each value becomes one joined `--flag=value` argument. The
+  environment is passed as `--env`, never `--db`, and a risk class must be a
+  lowercase hyphenated word, so no value can become another option, a second
+  command or SQL.
+- `apply` speaks no envelope. ADR-0015 left open whether step 2 should add one,
+  or whether the page should re-read `status` after the fact. What the page
+  renders after an apply is the exit code, the CLI's own words (why a checksum
+  or an allow list was refused) and the recorded entry. The first two are the
+  child's exit status and output, relayed as text and truncated past 64 KiB per
+  stream. The third is the ledger, which the Timeline view already reads with
+  `state list`. An `apply --format json` would carry a second description of
+  what the ledger records, so it is not built.
+- The output channel is new for the viewer: its reads relay only a typed
+  envelope and drop stderr. A command that speaks no envelope has no other way
+  to say why it refused, and the CLI already keeps connection strings out of
+  what it prints (ADR-0015 decision 4).
+- Tests: `trigger` pins the argument vectors and the refusals.
+  `ui.rs`'s `a_connection_string_never_reaches_a_trigger_response` runs a
+  connected plan that fails to connect and a malformed apply, and searches
+  every response for the password. `browser.rs`'s
+  `the_trigger_form_sends_only_the_typed_checksum_and_never_fills_one` runs
+  the shipped script.
+
+<a id="dec-1025-2"></a>
+
+**DEC-1025.2. The viewer's `plan --out` must name a path that does not exist.**
+`plan --out` replaces whatever is at its path. A saved plan is the artifact a
+checksum is approved for, so replacing one from a browser form could put
+different bytes behind an approval that is still pending. The viewer refuses
+any path that already names something, a dangling link included, and one it
+cannot inspect. The check runs before the child starts.
+
+Another process on the same machine could create the file between the check
+and the write. That race needs a concurrent writer of the same path under the
+same user, which a single-user local tool does not defend against, and the CLI
+would still write a complete plan whose checksum `explain` shows. The
+alternative was a private directory the viewer owns. It was rejected because a
+plan is meant to be passed on to the reviewer who approves it, and a file under
+a temporary directory is the wrong place for that.
+
+<a id="dec-1025-3"></a>
+
+**DEC-1025.3. A triggered run is not tied to the request that started it: one
+run per environment, polled for its outcome.** The viewer's server answers one
+request at a time, and an apply can run for minutes. The child is therefore
+spawned, its output drained by two threads, and the request answered at once.
+The page asks `POST /api/trigger/runs` every two seconds while a run is going.
+- Closing the tab or dropping the connection cannot stop the child, because
+  nothing ties it to them.
+- A second run against an environment is refused with 409 until the first
+  ends. The ledger's lock still decides between this viewer and a terminal or
+  CI job, as it does for two terminals.
+- The child is an ordinary member of the viewer's process group. Ctrl-C in
+  the viewer's terminal therefore reaches it exactly as it would reach
+  `pbps apply` run in that terminal, and the CLI's own interruption behavior
+  applies. Detaching it instead would leave an apply running with nobody able
+  to see its outcome, and would need platform-specific process code, which
+  #1025 keeps out of the trigger.
+- Only `std::process` is used, so the trigger is the same on every platform
+  and #471 has nothing to port for it.
+- The viewer keeps each environment's latest run in memory, with the
+  arguments it ran, so the page can show what happened. Nothing is written,
+  and it is gone when the viewer exits. A remembered checksum is only a
+  record of what ran, and it cannot authorize the next run.
+

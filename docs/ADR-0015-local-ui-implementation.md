@@ -275,8 +275,9 @@ What this ADR reasons about and has not measured, in the order the steps of
   3 measures it against the binary without the crate, and a number that
   surprises reopens decision 6, not decision 1.
 - **What the page needs from `apply`.** The Placement section names two
-  answers; step 2 picks one after listing what the page actually renders after
-  an apply.
+  answers. Step 5 (#1025) took neither as a new envelope: the page shows the
+  exit code and the CLI's own output, and the recorded result is the ledger
+  that `state list` already reads (DEC-1025.1).
 - **A declaration reached through a symbolic link.** `pbps_load` follows
   one; decision 5's snapshots cannot hold one without either dropping a
   declaration or inventing one, so a project whose subtree holds a

@@ -17,7 +17,7 @@ class Element {
   *walk() { yield this; for (const child of this.children) yield* child.walk(); }
 }
 const elements = {};
-const nav = ["status", "drift", "plan", "timeline", "docs", "compose"].map(view => {
+const nav = ["status", "drift", "plan", "timeline", "docs", "compose", "deploy"].map(view => {
   const button = new Element("button"); button.dataset.view = view; return button;
 });
 globalThis.location = {hash: "#token"};

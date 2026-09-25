@@ -690,13 +690,16 @@ fn run() -> anyhow::Result<()> {
             })?;
             println!("{}", viewer.url());
             std::io::stdout().flush()?;
-            // Compose writes on Linux only (#494, #471); say so at launch.
+            // Say at launch what the viewer can change: plan and apply
+            // everywhere (#1025), compose on Linux only (#494, #471). A plan
+            // or apply it started shares this terminal, so Ctrl-C reaches it
+            // too, exactly as it would reach `pbps apply` (DEC-1025.3).
             eprintln!(
                 "{}",
                 if cfg!(target_os = "linux") {
-                    "Local viewer: read views, and Compose change can commit a reviewed change to a new branch and push it. Press Ctrl-C to stop."
+                    "Local viewer: read views; Compose change can commit a reviewed change to a new branch and push it; Plan & apply can run plan and apply with the checksum your deployment gate approved. Press Ctrl-C to stop; it also interrupts a running plan or apply."
                 } else {
-                    "Read-only viewer (compose requires Linux). Press Ctrl-C to stop."
+                    "Local viewer: read views; Plan & apply can run plan and apply with the checksum your deployment gate approved (compose requires Linux). Press Ctrl-C to stop; it also interrupts a running plan or apply."
                 }
             );
             viewer.serve()?;
