@@ -525,7 +525,15 @@ fn the_ui_reads_no_environment_value() {
         if file.ends_with("guardrails.rs") {
             continue;
         }
-        let name = file.strip_prefix(&root).unwrap().display().to_string();
+        // Joined with `/` on every platform: `display()` gives `compose\git.rs`
+        // on Windows, which would never match the scrub's file.
+        let name = file
+            .strip_prefix(&root)
+            .unwrap()
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
         let text = normalized(&std::fs::read_to_string(&file).unwrap());
         let without = if name == "compose/git.rs" {
             scrubs += text.matches(NAMES_ONLY_SCRUB).count();
