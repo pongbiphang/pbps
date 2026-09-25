@@ -607,8 +607,8 @@ async fn confirm_ledger_relations(conn: &mut Conn) -> Result<(), DbError> {
 /// login role that can act as a role owning the table, or holding `TRIGGER`
 /// on it — directly, through `PUBLIC`, by inheritance, or by `SET ROLE` —
 /// must itself be able to `SET ROLE` to the deployment account, or to a
-/// superuser role, or be the database owner: then a trigger it adds runs no
-/// privilege it lacked. The superuser path is asked separately because
+/// superuser role: then a trigger it adds runs no privilege it lacked. The
+/// database owner is asked like any other role (DEC-863.1). The superuser path is asked separately because
 /// `pg_has_role` does not follow it — measured on 18.6, a login role granted
 /// `postgres` has `SET` on `postgres` but not on the deployment account,
 /// though `SET ROLE postgres; SET ROLE deployer` reaches it. This is the all-effective-editors rule
@@ -645,6 +645,12 @@ pub async fn ledger_problems(conn: &mut Conn) -> Result<Vec<String>, DbError> {
     // refuse every lock and record. `canonical_query` scopes the settings to
     // its own read-only transaction, or to a savepoint inside the caller's.
     let rows = crate::catalog::canonical_query(conn, &ledger_facts(), &[]).await?;
+    // The account every remedy below hands the table to or grants.
+    let me = match conn.query("SELECT current_user::text AS me").await?.first() {
+        Some(row) => text(row, "me")?,
+        None => return Err(DbError::BadRow("current_user returned no row".into())),
+    };
+    let me = quoted_ident(&me);
     let mut state = std::collections::BTreeSet::new();
     let mut lock = std::collections::BTreeSet::new();
     let mut problems = Vec::new();
@@ -666,13 +672,21 @@ pub async fn ledger_problems(conn: &mut Conn) -> Result<Vec<String>, DbError> {
                 "{LEDGER_SCHEMA}.{relname}'s id sequence can be reset by `{editor}`, a login role \
                  that holds UPDATE on it (directly, through PUBLIC, or through a role it can act \
                  as) and cannot SET ROLE to this account; a lower value would make newer records \
-                 sort under older ones"
+                 sort under older ones. The database owner is no exception (DEC-863.1). To \
+                 allow it, one statement: GRANT {me} TO {editor_q}; or revoke the UPDATE it \
+                 holds on the sequence",
+                editor_q = quoted_ident(editor)
             ));
         } else if let Some(editor) = fact.strip_prefix("untrusted editor ") {
             problems.push(format!(
                 "{LEDGER_SCHEMA}.{relname} can be changed by `{editor}`, a login role that can \
                  create triggers on it (as its owner, through a TRIGGER grant, or through a \
-                 role it can act as) and cannot SET ROLE to this account"
+                 role it can act as) and cannot SET ROLE to this account. The database owner is \
+                 no exception (DEC-863.1). One statement resolves it: GRANT {me} TO {editor_q}; \
+                 so that it can, or, when it acts as the table's owner, ALTER TABLE \
+                 {LEDGER_SCHEMA}.{relname} OWNER TO {me}; or revoke the TRIGGER grant it \
+                 reaches the table through",
+                editor_q = quoted_ident(editor)
             ));
         } else {
             table.insert(fact);
@@ -751,6 +765,13 @@ async fn refuse_an_untrusted_ledger(conn: &mut Conn) -> Result<(), DbError> {
     } else {
         Err(DbError::Refused(untrusted_ledger_message(&problems)))
     }
+}
+
+/// `name` as a PostgreSQL identifier, always quoted: a remedy is copied and run
+/// as printed, and an unquoted mixed-case or reserved role name would name
+/// another role or fail to parse.
+fn quoted_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// The refusal [`ensure_tables`], [`prune`] and [`unlock`] give, and the text
@@ -1003,8 +1024,10 @@ const TRIGGER_EDITOR: &str = "SELECT 1 FROM pg_catalog.pg_roles g
 
 /// Who counts as able to act against the deployment account, for both editor
 /// branches of [`ledger_facts`] (DEC-834.1, DEC-862.1): a login role, or one
-/// with a live client session in this database, that is not the database
-/// owner and cannot already become the deployment account or a superuser.
+/// with a live client session in this database, that cannot already become the
+/// deployment account or a superuser. The database owner is not exempt
+/// (DEC-863.1): owning the database confers none of the deployer's privileges,
+/// and a security-invoker trigger it adds runs with them.
 /// One string, so the trigger and sequence branches cannot drift apart on it.
 /// Expects `e` (the role), `db` (this database) in scope.
 const UNTRUSTED_ACTOR: &str = "(e.rolcanlogin
@@ -1012,7 +1035,6 @@ const UNTRUSTED_ACTOR: &str = "(e.rolcanlogin
                              WHERE a.usesysid = e.oid AND a.datid = db.oid
                                AND (a.backend_type IS NULL
                                     OR a.backend_type = 'client backend')))
-            AND e.oid <> db.datdba
             AND NOT pg_catalog.pg_has_role(e.oid, current_user::regrole::oid, 'SET')
             AND NOT EXISTS (
                 SELECT 1 FROM pg_catalog.pg_roles su

@@ -544,6 +544,9 @@ that no schema version moves for a finding. `prune` and `unlock` do not
 take the `ensure_tables` path and are #396's; SQL Server's ledger is not
 this decision's.
 
+*Amended by [DEC-863.1](#dec-863-1): the database owner is no longer trusted
+for owning the database.*
+
 <a id="dec-834-1"></a>
 
 **DEC-834.1. Every login role that can add a trigger to the ledger must be
@@ -579,6 +582,9 @@ a `TRIGGER` grant to the attacker, a `TRIGGER` grant to `PUBLIC`, and a group
 owner the attacker also inherits are each refused naming the attacker, while
 a `TRIGGER` grant to the deployment account and a `NOLOGIN` group owner the
 deployment account holds `NOINHERIT` are accepted.
+
+*Amended by [DEC-863.1](#dec-863-1): "or to be the database owner" no longer
+holds.*
 
 <a id="dec-862-1"></a>
 
@@ -933,3 +939,33 @@ the message.
 reconstructed (#617). Keying the verifiers does not declassify the definitions
 they cover. A leaked key restores the guessing exposure to its holders, who
 already hold the credentials that read the definitions.
+
+<a id="dec-863-1"></a>
+
+**DEC-863.1. The database owner is an editor like any other: it must be able to
+become the deployment account or a superuser, or the ledger is refused (#863;
+amends DEC-313.1 and DEC-834.1).** Both entries exempted the database owner from
+the editor rule. The reasoning was that its powers were ones the account
+already had. They are not. Owning the database gives a non-superuser owner no
+privilege of the deployment account's. If it reaches `TRIGGER` on a ledger
+table (through `PUBLIC`, a grant, or the table's ownership) and has `USAGE` on
+the schema, it can attach a security-invoker trigger. That trigger then runs
+with the deployment account's privileges on its next `lock` or `record`.
+Measured on the pinned 18.x server: with the database owned by a non-superuser
+login role and `TRIGGER` on `__pbps_lock` granted to `PUBLIC`, the owner is now
+named. Once that role is granted the deployment account, it is not.
+
+*The behaviour change.* One layout that used to pass is now refused before
+any write: a non-superuser database owner that owns the ledger tables, or
+holds `TRIGGER` on them, while the deployment account holds DML only. Each
+refusal, and the same text in `doctor`, names the role and gives the remedies
+as statements to run, with both role names quoted:
+- `GRANT "<deployer>" TO "<owner>";`, so that the owner can `SET ROLE` to the
+  deployment account;
+- `ALTER TABLE public.<table> OWNER TO "<deployer>";`, when the owner acts
+  through the table's ownership;
+- or revoke the `TRIGGER` (for the sequence, `UPDATE`) grant it reaches the
+  table through.
+
+A `NOLOGIN` group owner whose only login member is the deployment account
+remains accepted (DEC-834.1).

@@ -6804,6 +6804,68 @@ async fn doctor_grant_authority_preserves_overloads_and_inherited_rights() {
     db.drop().await;
 }
 
+/// #863 (DEC-863.1): the database owner is an editor like any other. A
+/// non-superuser owner that reaches `TRIGGER` on a ledger table (here through
+/// `PUBLIC`) and cannot `SET ROLE` to the deployment account is named, with the
+/// one-statement remedy; granted the deployment account, it is not.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_database_owner_is_no_exception_to_the_ledger_editor_rule() {
+    let mut db = TestDb::create("ledger_dbowner").await;
+    let deployer = least_privilege_role(&mut db, "dbown_dep").await;
+    let owner = least_privilege_role(&mut db, "dbown_own").await;
+    db.conn
+        .execute(&format!(
+            "ALTER DATABASE {0} OWNER TO {owner};
+             GRANT CREATE ON SCHEMA public TO {deployer};",
+            db.name
+        ))
+        .await
+        .unwrap();
+    let mut deploying = Conn::connect(
+        Driver::Postgres,
+        &conn_str_as(&deployer, "live-test", &db.name),
+    )
+    .await
+    .unwrap();
+    state::ensure_tables(&mut deploying).await.unwrap();
+    deploying
+        .execute("GRANT TRIGGER ON public.__pbps_lock TO PUBLIC")
+        .await
+        .unwrap();
+    let problems = state::ledger_problems(&mut deploying).await.unwrap();
+    let named = problems
+        .iter()
+        .find(|p| p.contains(&format!("can be changed by `{owner}`")))
+        .unwrap_or_else(|| panic!("the database owner is not named: {problems:#?}"));
+    assert!(
+        named.contains(&format!("GRANT \"{deployer}\" TO \"{owner}\";")),
+        "{named}"
+    );
+    assert!(
+        state::lock(&mut deploying, "live-test").await.is_err(),
+        "a lock over an untrusted editor"
+    );
+
+    // The remedy works: once the owner can become the deployment account, it
+    // is no longer named (every other login still is, through PUBLIC).
+    db.conn
+        .execute(&format!("GRANT {deployer} TO {owner}"))
+        .await
+        .unwrap();
+    let problems = state::ledger_problems(&mut deploying).await.unwrap();
+    assert!(
+        !problems.iter().any(|p| p.contains(&format!("`{owner}`"))),
+        "{problems:#?}"
+    );
+    drop(deploying);
+    db.drop().await;
+    for role in [&owner, &deployer] {
+        let mut admin = Conn::connect(Driver::Postgres, &conn_str()).await.unwrap();
+        let _ = admin.execute(&format!("DROP ROLE IF EXISTS {role}")).await;
+    }
+}
+
 /// Issue #313: a role with `CREATE` on `public` makes the ledger tables before
 /// pbps does and attaches a trigger. The deployment account must refuse
 /// before its first write, so the trigger never runs — the marker it would
