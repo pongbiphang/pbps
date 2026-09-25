@@ -1035,8 +1035,14 @@ function with `CREATE OR REPLACE`, measured on 18.6, while `rolsuper` stayed
 false for it. Extension members are included on
 the same terms. A trusted extension that a non-superuser installs still creates
 its routines owned by the bootstrap superuser: pgcrypto's 37, installed by a
-plain role with `CREATE` on the database, measured on 18.6. So an extension
-routine is excluded unless someone has re-owned it. A routine that changes owner,
+plain role with `CREATE` on the database, measured on 18.6. Owning the
+member routines is not the only way to change them, though. The extension's
+owner, here the plain role, can run `ALTER EXTENSION … UPDATE`, whose trusted
+script replaces member routines and leaves their owner alone, or it can drop
+the extension and create it at another version. So an extension member is also
+in the set when a non-superuser holds its extension's owner's rights, by the
+same `USAGE` or `SET` test. Its pin input then carries the extension's name and
+`extversion` beside the routine. A routine that changes owner,
 or whose owner's membership changes, can enter or leave the set, and that is a
 change like any other.
 
