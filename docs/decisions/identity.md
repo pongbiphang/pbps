@@ -533,3 +533,7 @@ environment had been deployed under the old shape, and nothing reads a
 generated name back: a drop looks the name up in the catalog. The dialect also
 lists these names (`Dialect::generated_constraint_names`), so a declared
 constraint spelled like one is refused by `check_constraint_names` too.
+A short name never ends like a digested one (`_` and sixteen hex digits, in
+either case, since a case-insensitive database folds them). A name that would
+is digested as well, so that `dbo.a.b_c_<the digest of dbo.a_b.c>` cannot
+spell the digested name of `dbo.a_b.c`.

@@ -64,7 +64,8 @@ pub(crate) fn qualified(t: &TableName) -> Result<String, DialectError> {
 /// the second `CREATE TABLE` is refused (Msg 1750), after the first has run.
 /// The emitter sees one change at a time, so it cannot keep the short name
 /// only where no other table collides. Instead the short name is kept exactly
-/// when the table's name has no underscore. The first `_` after the prefix is then
+/// when the table's name has no underscore and the name does not end the way a
+/// digested one does ([`ends_like_a_digest`]). The first `_` after the prefix is then
 /// the boundary, so no two such names are equal. Every other name carries
 /// the digest of the qualified column, as a name too long to fit already did.
 /// The table side, not the column side, because the columns that carry
@@ -72,7 +73,10 @@ pub(crate) fn qualified(t: &TableName) -> Result<String, DialectError> {
 /// `is_active`). No environment was deployed under the old shape.
 pub(crate) fn default_constraint_name(table: &TableName, column: &str) -> String {
     let full = format!("{DEFAULT_NAME_PREFIX}{}_{}", table.name, column);
-    if !table.name.contains('_') && utf16_units(&full) <= MAX_IDENT_CHARS {
+    if !table.name.contains('_')
+        && !ends_like_a_digest(&full)
+        && utf16_units(&full) <= MAX_IDENT_CHARS
+    {
         return full;
     }
     digested_default_constraint_name(table, column)
@@ -126,6 +130,22 @@ const DEFAULT_NAME_PREFIX: &str = "DF_pbps_";
 /// that looked fine to its reviewer. The four characters this costs come out
 /// of parts that are already truncated.
 const DEFAULT_NAME_DIGEST_CHARS: usize = 16;
+
+/// Whether `name` ends the way every digested name does: `_` and
+/// [`DEFAULT_NAME_DIGEST_CHARS`] hex digits, in either case, since a
+/// case-insensitive database reads `…_EE88…` and `…_ee88…` as one name. A
+/// short name that did
+/// would be spelled like some digested one. `dbo.a.b_c_<the digest of
+/// dbo.a_b.c>` and `dbo.a_b.c` gave one name (review of #969), so such a name
+/// takes the digested form too, and the two forms never meet.
+fn ends_like_a_digest(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() > DEFAULT_NAME_DIGEST_CHARS
+        && bytes[bytes.len() - DEFAULT_NAME_DIGEST_CHARS - 1] == b'_'
+        && bytes[bytes.len() - DEFAULT_NAME_DIGEST_CHARS..]
+            .iter()
+            .all(u8::is_ascii_hexdigit)
+}
 
 /// `DF_pbps_<table>_<column>_<digest>`, cut to fit where it must, and stable across
 /// runs.
@@ -2079,6 +2099,25 @@ mod tests {
             "the table without an underscore keeps its short form"
         );
         assert!(a.starts_with("DF_pbps_a_b_c_"), "{a}");
+    }
+
+    /// Review of #969: a column spelled like a digested name. `dbo.a.b_c_<the
+    /// digest of dbo.a_b.c>` took the short form and spelled exactly the
+    /// digested name of `dbo.a_b.c`. A name that ends like a digest is
+    /// digested itself, so the two forms never meet.
+    #[test]
+    fn a_column_spelled_like_a_digest_does_not_take_a_digested_name() {
+        let digested = default_constraint_name(&tname("dbo.a_b"), "c");
+        let suffix = &digested["DF_pbps_a_b_c_".len()..];
+        let impostor = default_constraint_name(&tname("dbo.a"), &format!("b_c_{suffix}"));
+        assert_ne!(digested, impostor);
+        assert!(ends_like_a_digest(&digested), "{digested}");
+        assert!(!ends_like_a_digest("DF_pbps_customer_status"));
+        assert!(
+            ends_like_a_digest("DF_pbps_t_c_0123456789ABCDEF"),
+            "a case-insensitive database folds an uppercase suffix onto a digest"
+        );
+        assert!(!ends_like_a_digest("DF_pbps_t_c_0123456789abcdeg"));
     }
 
     /// The rule behind that test, over every short name: no two columns of one
