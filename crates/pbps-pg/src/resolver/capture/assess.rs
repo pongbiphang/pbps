@@ -140,16 +140,39 @@ impl Managed {
     }
 }
 
-/// Where an unqualified name in a surface of `schema` is looked up: the
-/// write path the emitter gives every statement, after `pg_catalog`.
-fn path(schema: &str, extras: &[String]) -> Vec<String> {
-    let mut path = vec!["pg_catalog".to_owned(), schema.to_owned()];
-    for extra in extras {
-        if extra != "pg_temp" && !path.contains(extra) {
-            path.push(extra.clone());
-        }
+/// Where an unqualified name in each schema's surfaces is looked up.
+///
+/// The deployer's effective path, as the analysis scope measured and verified
+/// it (DECISIONS 520): `pg_catalog`, then each schema of the write path the
+/// deployer may use. A configured extra it has no `USAGE` on is not searched,
+/// so an object there is no candidate. A schema whose effective path is not
+/// known falls back to the whole configured write path, which only adds
+/// candidates.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Paths {
+    extras: Vec<String>,
+    effective: BTreeMap<String, Vec<String>>,
+}
+
+impl Paths {
+    /// `extras` is the write path after an object's own schema; `effective`
+    /// the measured path per in-scope schema, `pg_catalog` first.
+    pub fn new(extras: Vec<String>, effective: BTreeMap<String, Vec<String>>) -> Self {
+        Self { extras, effective }
     }
-    path
+
+    fn of(&self, schema: &str) -> Vec<String> {
+        if let Some(path) = self.effective.get(schema) {
+            return path.clone();
+        }
+        let mut path = vec!["pg_catalog".to_owned(), schema.to_owned()];
+        for extra in &self.extras {
+            if extra != "pg_temp" && !path.contains(extra) {
+                path.push(extra.clone());
+            }
+        }
+        path
+    }
 }
 
 fn candidate_class(class: &str) -> Option<CandidateClass> {
@@ -204,7 +227,7 @@ fn surfaces(
 fn derived(
     object: &ObjectIdentity,
     input: &super::manifest::Input,
-    extras: &[String],
+    paths: &Paths,
 ) -> BTreeSet<CandidateSet> {
     let mut sets = BTreeSet::from([CandidateSet {
         class: CandidateClass::Cast,
@@ -221,7 +244,7 @@ fn derived(
         else {
             continue;
         };
-        for space in path(schema, extras).into_iter().chain([namespace.clone()]) {
+        for space in paths.of(schema).into_iter().chain([namespace.clone()]) {
             sets.insert(CandidateSet {
                 class,
                 namespace: Some(space),
@@ -234,10 +257,10 @@ fn derived(
 
 /// What to capture on each side: the managed objects of both and every
 /// candidate their scratch bindings depend on.
-pub fn scope(desired: &CapturedInputs, managed: &[&Managed], extras: &[String]) -> CaptureScope {
+pub fn scope(desired: &CapturedInputs, managed: &[&Managed], paths: &Paths) -> CaptureScope {
     let mut candidates: BTreeSet<CandidateSet> = managed.iter().flat_map(|m| m.scope()).collect();
     for (object, input) in surfaces(desired) {
-        candidates.extend(derived(object, input, extras));
+        candidates.extend(derived(object, input, paths));
     }
     CaptureScope {
         retained: BTreeSet::new(),
@@ -277,7 +300,7 @@ pub fn assess(
     target: &CapturedInputs,
     desired: &CapturedInputs,
     managed: &Managed,
-    extras: &[String],
+    paths: &Paths,
     order: &crate::resolver::reconstruct::Reconstruction,
 ) -> Assessment {
     let empty = BTreeSet::new();
@@ -328,7 +351,7 @@ pub fn assess(
             Verdict::Unresolved {
                 condition: "a binding names a role, which scratch reproduces under another name",
             }
-        } else if !derived(object, input, extras).iter().all(&faithful) {
+        } else if !derived(object, input, paths).iter().all(&faithful) {
             Verdict::Unresolved {
                 condition: "a same-named candidate on the target was not reconstructed on scratch",
             }
@@ -517,8 +540,11 @@ mod tests {
                 )),
             ],
         };
-        let extras = ["shared".to_owned(), "pg_temp".to_owned()];
-        let sets = derived(&view, &input, &extras);
+        let paths = Paths::new(
+            vec!["shared".to_owned(), "pg_temp".to_owned()],
+            BTreeMap::new(),
+        );
+        let sets = derived(&view, &input, &paths);
         let set = |class, namespace: Option<&str>, name: Option<&str>| CandidateSet {
             class,
             namespace: namespace.map(str::to_owned),
@@ -534,6 +560,22 @@ mod tests {
                 set(CandidateClass::Routine, Some("util"), Some("f")),
             ])
         );
+        // An extra the deployer cannot use is not on its measured path, so
+        // nothing in it is a candidate.
+        let measured = Paths::new(
+            vec!["shared".to_owned()],
+            BTreeMap::from([(
+                "app".to_owned(),
+                vec!["pg_catalog".to_owned(), "app".to_owned()],
+            )]),
+        );
+        let visible = derived(&view, &input, &measured);
+        assert!(
+            !visible
+                .iter()
+                .any(|set| set.namespace.as_deref() == Some("shared"))
+        );
+        assert!(visible.contains(&set(CandidateClass::Routine, Some("util"), Some("f"))));
         assert_eq!(owner(&view).name, ["app", "v"]);
         let default = id(
             "pg_attrdef",

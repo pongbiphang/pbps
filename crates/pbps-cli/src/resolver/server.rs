@@ -1617,9 +1617,15 @@ impl ScratchRun {
         // Scratch is read through an administrative session: the capture
         // reads settings a least-privilege deployer need not see, and which
         // role reads a catalog row does not change what was bound.
+        // The deployer's effective path per schema, as `qualify` sealed it:
+        // a configured extra it cannot use holds no candidate.
+        let paths = {
+            let sealed = self.scope.as_ref().ok_or(Error::Cancelled)?;
+            engine::paths(extras, &sealed.target.catalog.visibility)
+        };
         let mut admin = self.admin_session().await?;
         let captured =
-            engine::capture_desired(&mut admin.connection, &base, &desired, extras).await;
+            engine::capture_desired(&mut admin.connection, &base, &desired, &paths).await;
         self.inner.control.retire(admin);
         let (compiled, scope) = captured.map_err(Error::Binding)?;
         self.check(target).await?;
@@ -1632,7 +1638,7 @@ impl ScratchRun {
             current.catalog(),
             &compiled,
             &base,
-            extras,
+            &paths,
             reconstruction,
         ))
     }

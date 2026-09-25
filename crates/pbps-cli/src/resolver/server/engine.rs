@@ -75,7 +75,7 @@ pub(super) async fn drop_scratch(
 // designed and built separately (#619, #620). The reconstruction, the
 // managed-name inventory and both captures are that adapter's private state,
 // as the target capture's are.
-pub(super) use pbps_pg::resolver::capture::{CaptureScope, CapturedInputs, Managed};
+pub(super) use pbps_pg::resolver::capture::{CaptureScope, CapturedInputs, Managed, Paths};
 pub(super) use pbps_pg::resolver::reconstruct::Reconstruction;
 
 const NO_BINDING_ADAPTER: &str =
@@ -121,7 +121,7 @@ pub(super) async fn capture_desired(
     connection: &mut StreamConn,
     base: &Managed,
     desired: &Managed,
-    extras: &[String],
+    paths: &Paths,
 ) -> Result<(CapturedInputs, CaptureScope), String> {
     use pbps_pg::resolver::capture;
     match connection.driver() {
@@ -129,7 +129,7 @@ pub(super) async fn capture_desired(
             let first = capture::capture(connection, &capture::managed_scope(desired))
                 .await
                 .map_err(|error| error.to_string())?;
-            let scope = capture::scope(&first, &[base, desired], extras);
+            let scope = capture::scope(&first, &[base, desired], paths);
             let captured = capture::capture(connection, &scope)
                 .await
                 .map_err(|error| error.to_string())?;
@@ -143,8 +143,25 @@ pub(super) fn assess(
     target: &CapturedInputs,
     desired: &CapturedInputs,
     base: &Managed,
-    extras: &[String],
+    paths: &Paths,
     reconstruction: &Reconstruction,
 ) -> pbps_db::resolver::capture::Assessment {
-    pbps_pg::resolver::capture::assess(target, desired, base, extras, reconstruction)
+    pbps_pg::resolver::capture::assess(target, desired, base, paths, reconstruction)
+}
+
+/// Each in-scope schema's effective path as the qualified scope measured it,
+/// with the configured extras for any schema it did not. An unreadable
+/// measurement is left out, which falls back to the whole write path.
+pub(super) fn paths(
+    extras: &[String],
+    visibility: &std::collections::BTreeMap<String, pbps_db::resolver::Observation>,
+) -> Paths {
+    let effective = visibility
+        .iter()
+        .filter_map(|(schema, observed)| {
+            let path: Vec<String> = serde_json::from_str(observed.value()?).ok()?;
+            Some((schema.clone(), path))
+        })
+        .collect();
+    Paths::new(extras.to_vec(), effective)
 }

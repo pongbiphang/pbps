@@ -162,6 +162,17 @@ fn dialect(extras: &[&str]) -> Postgres {
 
 /// Runs one case on one server. `Err` is a refusal before any verdict.
 async fn analyze(server: &str, tag: &str, case: Case<'_>) -> Result<Assessment, String> {
+    analyze_on(server, tag, case, capture::Paths::default()).await
+}
+
+/// [`analyze`] with a measured path per schema, as a qualified scope
+/// supplies it; without one, each schema falls back to the write path.
+async fn analyze_on(
+    server: &str,
+    tag: &str,
+    case: Case<'_>,
+    measured: capture::Paths,
+) -> Result<Assessment, String> {
     let mut databases = Databases {
         server: server.to_owned(),
         names: Vec::new(),
@@ -195,8 +206,15 @@ async fn analyze(server: &str, tag: &str, case: Case<'_>) -> Result<Assessment, 
         let first = capture::capture(&mut scratch, &capture::managed_scope(&desired_managed))
             .await
             .map_err(|e| e.to_string())?;
-        let extras: Vec<String> = case.extras.iter().map(|&e| e.to_owned()).collect();
-        let scope = capture::scope(&first, &[&base_managed, &desired_managed], &extras);
+        let paths = if measured == capture::Paths::default() {
+            capture::Paths::new(
+                case.extras.iter().map(|&e| e.to_owned()).collect(),
+                Default::default(),
+            )
+        } else {
+            measured
+        };
+        let scope = capture::scope(&first, &[&base_managed, &desired_managed], &paths);
         let desired = capture::capture(&mut scratch, &scope)
             .await
             .map_err(|e| e.to_string())?;
@@ -207,7 +225,7 @@ async fn analyze(server: &str, tag: &str, case: Case<'_>) -> Result<Assessment, 
             &current,
             &desired,
             &base_managed,
-            &extras,
+            &paths,
             &reconstruction,
         ))
     }
@@ -949,6 +967,51 @@ async fn an_object_a_declaration_creates_is_reproduced_with_it() {
             only(&assessment, "app", "v"),
             Verdict::Unaffected,
             "{variable}"
+        );
+    }
+}
+
+/// A configured extra the deployer has no USAGE on is not on its measured
+/// path, so an unmanaged overload there cannot win and leaves the view's
+/// verdict standing. Measured by the analysis scope, not read from the
+/// configuration: the same extra on the path is unresolved.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_schema_the_deployer_cannot_use_holds_no_candidate() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let declared = || numeric_f().view("app.v", "SELECT f(1) AS x");
+        let case = || {
+            Case {
+            schemas: &["app", "util"],
+            extras: &["util"],
+            target: "CREATE FUNCTION app.f(numeric) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;
+                     CREATE FUNCTION util.f(integer) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;
+                     SET search_path = app;
+                     CREATE VIEW app.v AS SELECT f(1) AS x;",
+            base: declared(),
+            desired: declared(),
+        }
+        };
+        let hidden = capture::Paths::new(
+            vec!["util".into()],
+            [(
+                "app".to_owned(),
+                vec!["pg_catalog".to_owned(), "app".to_owned()],
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let assessment = analyze_on(&server, "hidden", case(), hidden).await.unwrap();
+        assert_eq!(
+            only(&assessment, "app", "v"),
+            Verdict::Unaffected,
+            "{variable}"
+        );
+        let visible = analyze(&server, "visible", case()).await.unwrap();
+        assert!(
+            matches!(only(&visible, "app", "v"), Verdict::Unresolved { .. }),
+            "{variable}: {visible:#?}"
         );
     }
 }

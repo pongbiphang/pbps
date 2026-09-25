@@ -71,7 +71,7 @@ mod manifest;
 pub use manifest::CapturedInputs;
 
 mod assess;
-pub use assess::{Managed, assess, managed_scope, scope};
+pub use assess::{Managed, Paths, assess, managed_scope, scope};
 pub use pbps_db::resolver::capture::{Assessment, Verdict};
 
 /// Read coherent catalog inputs and release the transaction before returning.

@@ -934,8 +934,9 @@ rather than guessed (#613).** Equal bindings prove nothing if the target has a
 candidate scratch lacks: the target would pick it on the next creation. The
 candidate sets are derived from what scratch bound — each bound relation,
 routine, type, operator, collation or operator class/family name, looked up in
-every schema of the surface's write path after `pg_catalog` and in the schema
-it bound into — plus every cast, which resolution consults with no name. A
+every schema of the deployer's effective path as the analysis scope measured it
+(`pg_catalog`, then the write path's schemas it may use; an extra without
+`USAGE` is not searched) and in the schema it bound into — plus every cast, which resolution consults with no name. A
 declaration the plan leaves unchanged has the same text on both sides and
 resolves the same names; only the selected objects can differ, and that is
 what the bindings carry. On the target each member must be an engine object
