@@ -205,27 +205,12 @@ async fn read_lock(conn: &mut Conn) -> (Option<String>, Option<String>) {
 /// frame here dropped a catalog `40P01`'s diagnosis while keeping its retry
 /// advice (#489).
 ///
-/// Walked here rather than with `{:#}`, which prints every frame even when a
-/// parent has already spelled its source out: `DbError::Connect` renders as
-/// "cannot reach `host`: {source}" *and* exposes that same I/O error through
-/// `source()`, so a refused socket read "…: connection refused: connection
-/// refused" (#1003). A frame whose text its parent already ends with adds
-/// nothing and is skipped; every other frame, `Context`'s driver sentence
-/// among them, is kept.
+/// No frame repeats: an error whose text already carries a source does not
+/// also expose it through `source()` (`DbError::Connect` among them, #1018).
+/// This once walked the chain itself to skip such a repeat (#1003); the error
+/// types stopped repeating instead, which fixed every chain renderer at once.
 fn operator_detail(e: impl std::error::Error + Send + Sync + 'static) -> String {
-    let mut out = e.to_string();
-    let mut parent = out.clone();
-    let mut next = e.source();
-    while let Some(frame) = next {
-        let text = frame.to_string();
-        if !parent.ends_with(&text) {
-            out.push_str(": ");
-            out.push_str(&text);
-        }
-        parent = text;
-        next = frame.source();
-    }
-    out
+    format!("{:#}", anyhow::Error::new(e))
 }
 
 async fn one(
@@ -822,7 +807,7 @@ mod tests {
             (
                 pbps_db::DbError::Connect {
                     addr: "db.test:5432".to_owned(),
-                    source: std::io::Error::new(
+                    reason: std::io::Error::new(
                         std::io::ErrorKind::ConnectionRefused,
                         "connection refused",
                     ),
@@ -834,7 +819,7 @@ mod tests {
             (
                 pbps_db::DbError::Connect {
                     addr: "db.test:5432".to_owned(),
-                    source: std::io::Error::new(
+                    reason: std::io::Error::new(
                         std::io::ErrorKind::ConnectionRefused,
                         "connection refused",
                     ),

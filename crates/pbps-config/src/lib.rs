@@ -17,11 +17,12 @@ pub enum ConfigError {
     #[error("no {CONFIG_FILE} found (searched upwards from `{start}` to the filesystem root)")]
     NotFound { start: PathBuf },
 
-    #[error("cannot read `{path}`: {source}")]
+    /// `reason`, not `source`: the text already ends with it, and a chain
+    /// renderer would print it twice (#1018; see `DbError::Connect`).
+    #[error("cannot read `{path}`: {reason}")]
     Read {
         path: PathBuf,
-        #[source]
-        source: std::io::Error,
+        reason: std::io::Error,
     },
 
     #[error("`{path}` is malformed: {message}")]
@@ -380,9 +381,9 @@ impl Project {
 
     /// Loads a specific config file directly.
     pub fn load(config_path: &Path) -> Result<Self, ConfigError> {
-        let text = std::fs::read_to_string(config_path).map_err(|source| ConfigError::Read {
+        let text = std::fs::read_to_string(config_path).map_err(|reason| ConfigError::Read {
             path: config_path.to_owned(),
-            source,
+            reason,
         })?;
         let config = Config::parse(&text, config_path)?;
         // A config file is always inside some directory; the only way to have no
@@ -469,6 +470,18 @@ impl Project {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unreadable file is named with its reason once: inside the error's
+    /// own text, not again as its source, which a chain renderer would print
+    /// twice (#1018).
+    #[test]
+    fn an_unreadable_config_names_its_reason_once() {
+        let missing = std::env::temp_dir().join("pbps-1018-no-such-dir/pbps.yml");
+        let error = Project::load(&missing).unwrap_err();
+        assert!(matches!(error, ConfigError::Read { .. }), "{error:?}");
+        assert!(std::error::Error::source(&error).is_none(), "{error:?}");
+        assert!(error.to_string().starts_with("cannot read `"), "{error}");
+    }
 
     fn project_with(environment: &str) -> Result<Project, ConfigError> {
         let yaml = format!("dialect: postgres\nenvironments:\n  prod:\n{environment}");

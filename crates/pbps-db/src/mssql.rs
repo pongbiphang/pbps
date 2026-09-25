@@ -106,14 +106,14 @@ impl Conn {
         // `false` for the same reason — no `load_balance_hosts` equivalent
         // either, so resolution order is never reshuffled here.
         let tcp = crate::open_socket(&addr, crate::CONNECT_TIMEOUT, false).await?;
-        tcp.set_nodelay(true).map_err(|source| DbError::Connect {
+        tcp.set_nodelay(true).map_err(|reason| DbError::Connect {
             addr: config.get_addr().to_owned(),
-            source,
+            reason,
         })?;
         let endpoints =
-            crate::transport::TcpEndpoints::capture(&tcp).map_err(|source| DbError::Connect {
+            crate::transport::TcpEndpoints::capture(&tcp).map_err(|reason| DbError::Connect {
                 addr: config.get_addr().to_owned(),
-                source,
+                reason,
             })?;
         let stream: crate::transport::BoxedStream = Box::new(tcp);
         let client = Client::connect(config, stream.compat_write()).await?;

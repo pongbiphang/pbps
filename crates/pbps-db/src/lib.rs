@@ -50,11 +50,17 @@ pub enum DbError {
     #[error("the connection string is malformed: {0}")]
     BadConnectionString(String),
 
-    #[error("cannot reach `{addr}`: {source}")]
+    /// `reason` and not `source`: its text already ends with the I/O error, so
+    /// it is not also exposed as `source()`. A chain renderer (`main.rs`'s
+    /// `{e:#}`, `ledger_safe_reason`'s walk) printed it twice otherwise:
+    /// "Connection refused (os error 111): Connection refused (os error 111)"
+    /// (#1018). thiserror treats a field *named* `source` as the source even
+    /// without `#[source]`, which is why the name changed and not only the
+    /// attribute.
+    #[error("cannot reach `{addr}`: {reason}")]
     Connect {
         addr: String,
-        #[source]
-        source: std::io::Error,
+        reason: std::io::Error,
     },
 
     #[error(
@@ -238,7 +244,7 @@ pub(crate) async fn open_socket(
             Ok(Err(source)) => {
                 return Err(DbError::Connect {
                     addr: addr.to_owned(),
-                    source,
+                    reason: source,
                 });
             }
             Err(_elapsed) => {
@@ -253,7 +259,7 @@ pub(crate) async fn open_socket(
     if addresses.is_empty() {
         return Err(DbError::Connect {
             addr: addr.to_owned(),
-            source: std::io::Error::new(
+            reason: std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "the name resolved to no address",
             ),
@@ -355,7 +361,7 @@ async fn connect_any(
     match last {
         Some(source) => Err(DbError::Connect {
             addr: addr.to_owned(),
-            source,
+            reason: source,
         }),
         None => Err(DbError::ConnectTimeout {
             addr: addr.to_owned(),
@@ -699,6 +705,35 @@ impl Conn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every frame of a chain once, as a chain renderer joins them (`{:#}`).
+    fn chain(error: &dyn std::error::Error) -> Vec<String> {
+        let mut frames = vec![error.to_string()];
+        let mut next = error.source();
+        while let Some(frame) = next {
+            frames.push(frame.to_string());
+            next = frame.source();
+        }
+        frames
+    }
+
+    /// A socket failure is named once in the chain, inside `Connect`'s own
+    /// text, not again as its source (#1018). Control: a `Context` over a
+    /// driver error keeps both frames.
+    #[test]
+    fn a_connection_failure_names_its_reason_once() {
+        let error = DbError::Connect {
+            addr: "db.test:5432".into(),
+            reason: std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"),
+        };
+        assert_eq!(chain(&error), ["cannot reach `db.test:5432`: refused"]);
+        let wrapped = DbError::Driver {
+            message: "server sentence".into(),
+            code: None,
+        }
+        .context("guidance");
+        assert_eq!(chain(&wrapped), ["guidance", "server sentence"]);
+    }
 
     #[test]
     fn context_keeps_the_original_code_and_source_separate_from_its_message() {

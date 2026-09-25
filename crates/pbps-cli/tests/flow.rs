@@ -4615,6 +4615,32 @@ fn the_declaration_schema_describes_what_the_loader_accepts() {
 /// The command's one promise: a reviewer holding nothing but plan.json, in a
 /// directory with no project, still gets the whole of the file's answer. The
 /// plan names its own dialect, so there is nothing left to discover.
+/// A command that cannot connect names the socket's reason once (#1018).
+/// `DbError::Connect` spelled the I/O error into its own text *and* exposed it
+/// as its source, so `main.rs`'s `{e:#}` printed it twice. Asserted as "no
+/// frame repeats the one before it", which holds whatever words the platform
+/// uses for a refused connection.
+#[test]
+fn a_refused_connection_is_named_once() {
+    let d = Demo::new("refused-once");
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+    let o = d.run(&[
+        "verify",
+        "--db",
+        "host=127.0.0.1 port=1 user=x dbname=x sslmode=disable connect_timeout=5",
+    ]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let err = stderr(&o);
+    let line = err
+        .lines()
+        .find(|l| l.contains("cannot reach `127.0.0.1:1`"))
+        .unwrap_or_else(|| panic!("{err}"));
+    let frames: Vec<&str> = line.split(": ").collect();
+    for pair in frames.windows(2) {
+        assert_ne!(pair[0], pair[1], "a frame repeats: {line}");
+    }
+}
+
 #[test]
 fn explain_works_in_a_directory_with_no_project() {
     let d = Demo::new("explainbare");
