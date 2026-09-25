@@ -5442,6 +5442,80 @@ fn doctor_reports_data_and_role_grant_gaps_from_the_declarations() {
     );
 }
 
+/// #566: doctor keys a declared routine the way the dialect spells it, as
+/// the planner does. A managed `app.f(integer)` whose ACL grants `EXECUTE` to
+/// a declared role, granted by somebody this deployer cannot act for, needs
+/// the grant option to be managed. Declared as `app.f(int)`, the file's
+/// spelling matched nothing the catalog reads back, the adopted ACL was set
+/// aside as unmanaged, and doctor reported no gap at all. Both spellings now
+/// report the same one.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn doctor_reports_an_adopted_routine_grant_whatever_the_argument_spelling() {
+    for spelling in ["int", "integer"] {
+        let server = server();
+        let deployer = format!("pbps_d566_dep_{}_{spelling}", std::process::id());
+        let reader = format!("pbps_d566_read_{}_{spelling}", std::process::id());
+        let _roles = ClusterRoles {
+            server: server.clone(),
+            names: vec![deployer.clone(), reader.clone()],
+        };
+        let own = OwnDatabase::new(&server, &format!("doctor-566-{spelling}"));
+        let connection = own.connection();
+        on_server(
+            connection,
+            &format!(
+                "CREATE ROLE {deployer} LOGIN PASSWORD 'doctor-test'; CREATE ROLE {reader}; \
+                 CREATE SCHEMA app AUTHORIZATION {deployer}; \
+                 GRANT CREATE ON SCHEMA public TO {deployer}; \
+                 CREATE FUNCTION app.f(integer) RETURNS integer LANGUAGE sql AS 'SELECT $1'; \
+                 GRANT EXECUTE ON FUNCTION app.f(integer) TO {reader}"
+            ),
+        );
+        let login = format!(
+            "{} user={deployer} password=doctor-test",
+            connection
+                .split_whitespace()
+                .filter(|word| !word.starts_with("user=") && !word.starts_with("password="))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let d = Demo::new(&format!("doctor-566-{spelling}"));
+        std::fs::write(
+            d.dir.join("pbps.yml"),
+            "dialect: postgres\nenvironments:\n  dev:\n    url_env: PBPS_FLOW_PG_DEV\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.dir.join("schema/f.yml"),
+            format!(
+                "function: app.f({spelling})\n\
+                 definition: (n {spelling}) RETURNS integer LANGUAGE sql AS 'SELECT n'\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(d.dir.join("schema/reader.yml"), format!("role: {reader}\n")).unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let output = d.run_with_env(
+            &["doctor", "--format", "json"],
+            &[("PBPS_FLOW_PG_DEV", login.as_str())],
+        );
+        let json: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+        assert_eq!(code(&output), 2, "{spelling}: {json}");
+        let gaps = json["data"]["environments"][0]["missing_permissions"]
+            .as_array()
+            .unwrap();
+        assert!(
+            gaps.iter().any(|g| g
+                .as_str()
+                .unwrap()
+                .starts_with("EXECUTE WITH GRANT OPTION on ROUTINE \"app\".\"f\"(integer)")),
+            "{spelling}: {json}"
+        );
+    }
+}
+
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn arriving_overloads_rebind_unchanged_callers_in_the_approved_plan() {

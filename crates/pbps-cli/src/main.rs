@@ -1561,9 +1561,10 @@ pub(crate) fn routine_ids_as_the_dialect_spells_them(
 /// spelled keys a routine as its file wrote it, and the same object read back
 /// from the engine would not match (ADR-0009 §1). The offline `plan` and the
 /// git baseline run the same pass on their own, because each needs the
-/// declarations before it knows the dialect; the three `load_quiet` callers in
-/// `doctor` skip it deliberately — they ask which schemas and which object
-/// names a project mentions, and an argument list is part of neither answer.
+/// declarations before it knows the dialect. `doctor`'s `load_quiet` callers
+/// that ask only which schemas and object names a project mentions skip it,
+/// since an argument list is part of neither answer; its grant scope, which
+/// is keyed by routine identity, runs it (#566).
 fn load(project: &Project, dialect: &dyn Dialect) -> anyhow::Result<pbps_load::Loaded> {
     let mut loaded = load_quiet(project).map_err(|errs| {
         for e in &errs {
