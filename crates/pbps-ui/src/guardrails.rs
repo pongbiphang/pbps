@@ -250,76 +250,88 @@ fn the_route_tables_are_the_whole_router() {
     }
 }
 
-/// Whether a source line could read an environment variable's value.
-/// Conservative on purpose: any path through `env` counts, however it is
-/// imported or aliased (`use std::env::var;`, `use std::{env, ..}`), and only
-/// `env::temp_dir()`, which yields a path, passes.
-fn reaches_environment(line: &str) -> bool {
-    let words: Vec<&str> = line
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .collect();
-    let import = line.trim_start().starts_with("use ");
-    // A name that reads the environment by itself, or any import of `env`.
-    // The compile-time macros embed a variable's value in the binary; only
-    // Cargo's own manifest directory, a build path, is allowed.
-    // Each invocation on its own: an allowed one beside another on the same
-    // line must not excuse it. `option_env!(` ends in `env!(` and is split
-    // the same way.
-    let embedded = line
-        .split("env!(")
-        .skip(1)
-        .any(|rest| !rest.starts_with("\"CARGO_MANIFEST_DIR\")"));
-    let direct = embedded
-        || (import && words.contains(&"env"))
-        || words
-            .iter()
-            .any(|w| matches!(*w, "getenv" | "environ" | "vars_os" | "var_os"));
-    // A path through `env`, which passes only when every one is `temp_dir()`.
-    let path = (line.contains("env::") || line.contains("::env"))
-        && !line
-            .split("env::")
-            .skip(1)
-            .all(|rest| rest.starts_with("temp_dir("));
-    direct || path
+/// The one environment read the UI makes: compose removing inherited
+/// `GIT_*` overrides from Git's environment by name, discarding each value.
+const NAMES_ONLY_SCRUB: &str = "for(name,_)instd::env::vars_os()";
+
+/// Every place in `source` that could read an environment variable's value.
+/// The source is compared with all whitespace removed, since Rust accepts
+/// `env ! ("X")` and `std :: env :: var` split across lines. Conservative on
+/// purpose: any path through `env` counts however it is imported or aliased,
+/// and only `env::temp_dir()` (a path) and `env!("CARGO_MANIFEST_DIR")` (a
+/// build path) pass.
+fn environment_reads(source: &str) -> Vec<String> {
+    let text: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut found = Vec::new();
+    let mut each = |pattern: &str, allowed: &dyn Fn(&str) -> bool| {
+        for (at, _) in text.match_indices(pattern) {
+            let rest = &text[at + pattern.len()..];
+            if !allowed(rest) {
+                found.push(text[at..].chars().take(40).collect::<String>());
+            }
+        }
+    };
+    // `env!(` also ends `option_env!(`.
+    each("env!(", &|rest| rest.starts_with("\"CARGO_MANIFEST_DIR\")"));
+    each("env::", &|rest| rest.starts_with("temp_dir("));
+    // `std::env` as a module in a `use`, not followed by a path.
+    each("::env", &|rest| rest.starts_with("::"));
+    // `use std::{env, ..}` and `use std::{.., env}`. A bare `{env}` is a
+    // format placeholder, so the group has to follow `::`.
+    for pattern in ["::{env,", "::{env}", ",env,", ",env}"] {
+        each(pattern, &|_| false);
+    }
+    for word in ["getenv", "environ(", "var_os", "vars_os"] {
+        each(word, &|_| false);
+    }
+    found
 }
 
 #[test]
-fn an_aliased_or_imported_environment_read_is_still_seen() {
-    for line in [
+fn an_aliased_imported_or_spaced_environment_read_is_still_seen() {
+    for source in [
         "use std::env::var;",
         "use std::env;",
         "use std::{env, fs};",
+        "use std::{fs, env};",
         "use std::{fs, env::var_os};",
-        "use std::env::temp_dir;",
+        "use std::env::temp_dir;\nlet x = temp_dir();",
         "let url = std::env::var(\"PBPS_DB\");",
+        "let url = std :: env :: var(\"PBPS_DB\");",
+        "let url = std::env\n    ::var(\"PBPS_DB\");",
         "let url = env::var_os(name);",
         "for (k, v) in std::env::vars() {",
         "let p = libc::getenv(name);",
+        "let p = std::env::temp_dir().join(std::env::var(\"X\").unwrap());",
         "const URL: &str = env!(\"PBPS_DB\");",
+        "const URL: &str = env ! (\"PBPS_DB\");",
+        "const URL: &str = env\n!\n(\"PBPS_DB\");",
         "let url = option_env!(\"PBPS_DB\");",
         "let url = core::env!(\"PBPS_DB\");",
         "let _ = (env!(\"CARGO_MANIFEST_DIR\"), env!(\"PBPS_DB\"));",
-        "let _ = (env!(\"CARGO_MANIFEST_DIR\"), option_env!(\"PBPS_DB\"));",
-        "let p = std::env::temp_dir().join(std::env::var(\"X\").unwrap());",
     ] {
-        assert!(reaches_environment(line), "{line}");
+        assert!(!environment_reads(source).is_empty(), "{source}");
     }
-    for line in [
+    for source in [
         "let path = std::env::temp_dir().join(\"x\");",
+        "let path = std :: env :: temp_dir();",
         "command.env_remove(name);",
         ".env_clear()",
-        "let root = std::path::Path::new(env!(\"CARGO_MANIFEST_DIR\"));",
         "let environment = run.environment.clone();",
         "(\"/api/drift\", Some(\"env\"), View::Drift),",
+        "format!(\"--env={env}\")",
+        "let root = std::path::Path::new(env!(\"CARGO_MANIFEST_DIR\"));",
+        "for (name, _) in std::env::vars_os() {",
     ] {
-        assert!(!reaches_environment(line), "{line}");
+        let source = source.replace("for (name, _) in std::env::vars_os()", "");
+        assert!(environment_reads(&source).is_empty(), "{source}");
     }
 }
 
 /// ADR-0015 decision 4: the UI process never holds a connection string. The
 /// child reads `url_env` itself, and the UI must not read any environment
-/// value. The one read is compose removing inherited `GIT_*` overrides from
-/// Git's environment, which takes the names and discards the values.
+/// value. The one read is compose's names-only scrub, removed by its exact
+/// text before the scan and required to be where it is.
 #[test]
 fn the_ui_reads_no_environment_value() {
     fn sources(directory: &std::path::Path, found: &mut Vec<PathBuf>) {
@@ -337,23 +349,27 @@ fn the_ui_reads_no_environment_value() {
     sources(&root, &mut files);
     assert!(files.len() > 10, "the source walk found {files:?}");
     let mut reads = Vec::new();
+    let mut scrubs = 0;
     for file in files {
         if file.ends_with("guardrails.rs") {
             continue;
         }
-        let text = std::fs::read_to_string(&file).unwrap();
-        for line in text.lines() {
-            if reaches_environment(line) {
-                let name = file.strip_prefix(&root).unwrap().display().to_string();
-                reads.push((name, line.trim().to_owned()));
-            }
+        let name = file.strip_prefix(&root).unwrap().display().to_string();
+        let text: String = std::fs::read_to_string(&file)
+            .unwrap()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let without = if name == "compose/git.rs" {
+            scrubs += text.matches(NAMES_ONLY_SCRUB).count();
+            text.replace(NAMES_ONLY_SCRUB, "")
+        } else {
+            text
+        };
+        for read in environment_reads(&without) {
+            reads.push((name.clone(), read));
         }
     }
-    assert_eq!(
-        reads,
-        [(
-            "compose/git.rs".to_owned(),
-            "for (name, _) in std::env::vars_os() {".to_owned()
-        )]
-    );
+    assert_eq!(scrubs, 1, "the names-only scrub is where it is expected");
+    assert_eq!(reads, Vec::<(String, String)>::new());
 }
