@@ -1005,10 +1005,14 @@ changes.
 - *Roots.* Collection starts from three kinds of text, all scanned with literal
   contents kept, so that `EXECUTE 'SELECT helper()'` is a call:
   - the plan's statements and the probe SQL derived from it;
-  - the functions of triggers on every table the plan writes rows to, extending
-    DECISIONS 445/450's direct trigger-function check to transitive calls;
-  - the stored expressions the engine evaluates on those tables and on every
-    table the plan alters, none of which appears in a DML statement's text.
+  - the functions of triggers on every table in each row operation's
+    write-producing closure, which follows the foreign-key actions that write
+    for it (DECISIONS 451). This extends DECISIONS 445/450's direct
+    trigger-function check to transitive calls;
+  - the stored expressions the engine evaluates on the same tables and on
+    every table the plan alters, none of which appears in a DML statement's
+    text. A cascade two foreign keys away evaluates the CHECKs of the table it
+    writes, just as the named table does.
     That means every CHECK (`pg_get_constraintdef`), every default and
     generated column (`pg_get_expr` over `adbin`), every index expression and
     predicate (`pg_get_indexdef`), and the CHECKs of every domain a column
@@ -1031,8 +1035,9 @@ changes.
   row, and each support function comes by `regprocedure`: transition, final,
   combine, serial, deserial, the moving-aggregate ones, and the sort
   operator's. Those functions join the closure, because they are what runs. A
-  window function (`prokind = 'w'`) deparses like any other routine. A plan
-  that reaches an aggregate is therefore still accepted.
+  window function (`prokind = 'w'`) deparses like any other routine: all 15
+  built-in ones return a definition on 18.6 and on 16.15, measured for this
+  entry. A plan that reaches an aggregate is therefore still accepted.
 
 *What a pin holds.* One entry per name. Each is an HMAC under the
 environment's key (DEC-952.1), with rule `pbps/external-routine-pin/v1` and the
@@ -1068,8 +1073,10 @@ A digest mismatch, a name that gained or lost a routine, an unreadable
 definition and a key identifier that is not the plan's all refuse. None of them
 reads as "nothing changed" (AGENTS.md: absent, empty and unreadable differ).
 Each refusal names the routine name and the remedy, which is to replan. A
-staged plan gets the first check, plus one before its first statement. As SPEC
-§7.6's binding-evidence guard says of itself, this adds no guarantee between stages.
+staged plan is checked under the lock before pre-flight, and again before each
+step's statements and before each checkpoint it records. It gets no transaction
+that spans its steps, so a replacement is caught at the next step boundary, not
+rolled back past it.
 
 *What it does not cover.*
 - Routines reached with no call syntax: operators, casts, a type's I/O

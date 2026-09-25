@@ -939,7 +939,8 @@ the last observation. Plans without resolver evidence retain the existing guard.
 pins, under the environment's fingerprint key, each unmanaged routine that its
 statements, probes and fired triggers can call by name. `apply` refuses a
 changed pin under the lock before pre-flight, again inside the transaction
-before the first statement, and again before recording. This detects a
+before the first statement, and again before recording. A staged plan is
+checked before each step and before each checkpoint it records. This detects a
 replaced helper; it does not lock one, and it does not cover routines reached
 without call syntax.
 
