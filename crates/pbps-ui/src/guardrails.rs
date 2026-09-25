@@ -209,8 +209,13 @@ fn reaches_environment(line: &str) -> bool {
     // A name that reads the environment by itself, or any import of `env`.
     // The compile-time macros embed a variable's value in the binary; only
     // Cargo's own manifest directory, a build path, is allowed.
-    let embedded = (line.contains("env!(") && !line.contains("env!(\"CARGO_MANIFEST_DIR\")"))
-        || line.contains("option_env!(");
+    // Each invocation on its own: an allowed one beside another on the same
+    // line must not excuse it. `option_env!(` ends in `env!(` and is split
+    // the same way.
+    let embedded = line
+        .split("env!(")
+        .skip(1)
+        .any(|rest| !rest.starts_with("\"CARGO_MANIFEST_DIR\")"));
     let direct = embedded
         || (import && words.contains(&"env"))
         || words
@@ -240,6 +245,8 @@ fn an_aliased_or_imported_environment_read_is_still_seen() {
         "const URL: &str = env!(\"PBPS_DB\");",
         "let url = option_env!(\"PBPS_DB\");",
         "let url = core::env!(\"PBPS_DB\");",
+        "let _ = (env!(\"CARGO_MANIFEST_DIR\"), env!(\"PBPS_DB\"));",
+        "let _ = (env!(\"CARGO_MANIFEST_DIR\"), option_env!(\"PBPS_DB\"));",
         "let p = std::env::temp_dir().join(std::env::var(\"X\").unwrap());",
     ] {
         assert!(reaches_environment(line), "{line}");

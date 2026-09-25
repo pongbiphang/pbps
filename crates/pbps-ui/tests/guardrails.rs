@@ -68,17 +68,18 @@ impl Viewer {
     }
 }
 
-/// Logs each invocation as one line, arguments separated by U+001F, then
-/// fails without output, as a CLI that answered nothing.
+/// Logs each invocation to a file of its own, arguments separated by U+001F,
+/// then fails without output, as a CLI that answered nothing. Triggered runs
+/// overlap, so a shared log could interleave their arguments.
 fn stand_in(directory: &Path) -> (PathBuf, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
-    let log = directory.join("invocations.log");
+    let log = directory.join("invocations");
+    std::fs::create_dir_all(&log).unwrap();
     let script = directory.join("pbps-stand-in");
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\037' \"$a\"; done >> '{}'\necho >> '{}'\nexit 1\n",
-            log.display(),
+            "#!/bin/sh\nrecord=$(mktemp '{}/run.XXXXXX')\nfor a in \"$@\"; do printf '%s\\037' \"$a\"; done > \"$record\"\nexit 1\n",
             log.display()
         ),
     )
@@ -183,10 +184,13 @@ fn every_route_keeps_sql_out_of_the_cli_and_stores_no_approval() {
 
     // Every child's arguments: the fixed prefix, one command of the route
     // vocabulary, and options whose values carry SQL only as themselves.
-    let invocations = std::fs::read_to_string(&log).unwrap();
-    let invocations: Vec<Vec<&str>> = invocations
-        .lines()
-        .map(|line| line.trim_end_matches('\u{1f}').split('\u{1f}').collect())
+    let records: Vec<String> = std::fs::read_dir(&log)
+        .unwrap()
+        .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect();
+    let invocations: Vec<Vec<&str>> = records
+        .iter()
+        .map(|record| record.trim_end_matches('\u{1f}').split('\u{1f}').collect())
         .collect();
     // Three parameterized reads, two plans and three applies; every refused
     // request started nothing.
