@@ -1287,6 +1287,75 @@ fn module_rebuilds_refuse_carried_state_before_planning_and_before_recording() {
 /// The objects are created on the server and adopted with `pull`, because a
 /// table whose check calls a function cannot be bootstrapped: tables are built
 /// before modules.
+/// A procedure that becomes a function, and a check added in the same revision
+/// that calls the new function: the check follows `CREATE FUNCTION` and the
+/// plan applies (#1024). The kind change is a `DropModule` of the procedure and
+/// a `CreateModule` of the function, so "is a function rebuilt" has to be read
+/// from the create.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_check_calling_a_procedure_turned_function_follows_its_create() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "procedure-to-function");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; \
+         CREATE PROCEDURE app.f(x integer) LANGUAGE sql AS $$ SELECT 1 $$; \
+         CREATE TABLE app.t (id integer PRIMARY KEY)",
+    );
+    let d = Demo::new("procedure-to-function");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    std::fs::remove_file(d.dir.join("schema/app.f%28integer%29.procedure.yml")).unwrap();
+    std::fs::write(
+        d.dir.join("schema/app.f%28integer%29.function.yml"),
+        "function: app.f(integer)\npublic_execute: true\n\ndefinition: |-\n  \
+         (x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$\n",
+    )
+    .unwrap();
+    let table = d.dir.join("schema/app.t.yml");
+    let text = std::fs::read_to_string(&table).unwrap();
+    std::fs::write(&table, format!("{text}checks:\n  ck_f: 'app.f(id) >= 0'\n")).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    assert!(at("DROP PROCEDURE") < at("CREATE FUNCTION"), "{script}");
+    assert!(
+        at("CREATE FUNCTION") < at("ADD CONSTRAINT \"ck_f\""),
+        "{script}"
+    );
+    let allow = [
+        "--allow",
+        "constraint",
+        "--allow",
+        "destructive",
+        "--allow",
+        "grant-widen",
+    ];
+    succeeds(approved_apply(&d, connection, &plan, &allow));
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
 /// A check, a filtered index and a default the same revision adds, each calling
 /// a function that revision rebuilds, are created after the rebuild (#942,
 /// DEC-942.1). `modules::dependents` reads the catalog, where none of them

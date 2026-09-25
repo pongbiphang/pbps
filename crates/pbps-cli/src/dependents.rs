@@ -587,12 +587,19 @@ pub(crate) fn weave(
 /// has to exist before the modules that may read it.
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(crate) fn after_the_rebuilds(cs: &mut ChangeSet) -> usize {
-    let rebuilt = dropped_modules(cs).into_iter().any(|(id, kind)| {
-        kind == ModuleKind::Function
-            && cs.changes.iter().any(|p| match &p.change {
-                Change::AlterModule { id: x, .. } | Change::CreateModule { id: x, .. } => *x == id,
-                _ => false,
-            })
+    // Judged by the kind the plan creates, not the kind it drops: a routine
+    // changing from a procedure to a function is emitted as a `DropModule` of
+    // the procedure and a `CreateModule` of the function under one id, and an
+    // addition calling that new function has to follow its create just the
+    // same (#1024). The reverse change leaves no function to call, so it moves
+    // nothing.
+    let rebuilt = dropped_modules(cs).into_iter().any(|(id, _)| {
+        cs.changes.iter().any(|p| match &p.change {
+            Change::AlterModule { id: x, module } | Change::CreateModule { id: x, module } => {
+                *x == id && module.kind == ModuleKind::Function
+            }
+            _ => false,
+        })
     });
     if !rebuilt {
         return 0;
@@ -859,6 +866,55 @@ mod tests {
                 "alter app.v0",
             ]
         );
+    }
+
+    /// #1024: a procedure that becomes a function is dropped as a procedure
+    /// and created as a function, and what calls the new function follows its
+    /// create. The reverse leaves no function behind and moves nothing.
+    #[test]
+    fn a_procedure_becoming_a_function_counts_as_a_function_rebuild() {
+        let routine = id("app.f(integer)");
+        let as_kind = |kind| {
+            Box::new(module(
+                kind,
+                "(x integer) RETURNS integer LANGUAGE sql AS $$ SELECT x $$",
+            ))
+        };
+        let mut cs = plan(vec![
+            Change::DropModule {
+                id: routine.clone(),
+                kind: ModuleKind::Procedure,
+            },
+            add_check("ck"),
+            Change::CreateModule {
+                id: routine.clone(),
+                module: as_kind(ModuleKind::Function),
+            },
+        ]);
+        assert_eq!(after_the_rebuilds(&mut cs), 1);
+        assert_eq!(
+            names(&cs),
+            [
+                "drop app.f(integer)",
+                "create app.f(integer)",
+                "add check ck"
+            ]
+        );
+
+        let mut cs = plan(vec![
+            Change::DropModule {
+                id: routine.clone(),
+                kind: ModuleKind::Function,
+            },
+            add_check("ck"),
+            Change::CreateModule {
+                id: routine,
+                module: as_kind(ModuleKind::Procedure),
+            },
+        ]);
+        let before = names(&cs);
+        assert_eq!(after_the_rebuilds(&mut cs), 0);
+        assert_eq!(names(&cs), before);
     }
 
     /// Negatives: no function rebuilt (a view rebuilt, or nothing), and a
