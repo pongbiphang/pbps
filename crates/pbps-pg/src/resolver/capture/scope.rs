@@ -92,15 +92,17 @@ pub(super) fn prepare(
             builder.add_row(class, row)?;
         }
     }
-    // The baseline data and its table definition are one input. Its identity
-    // sequence and other internally owned objects join the closure below.
+    // Both ledger recipes are qualified before baseline acceptance. Include
+    // their source/type closure before either recipe may invoke rendering;
+    // identity sequences and internally owned objects join the closure below.
     for row in &catalog.rows["pg_class"] {
         if catalog.identity("pg_class", row).is_ok_and(|id| {
-            id.name
-                == [
-                    crate::state::LEDGER_SCHEMA,
-                    pbps_db::ledger::STATE_TABLE_NAME,
-                ]
+            [
+                pbps_db::ledger::STATE_TABLE_NAME,
+                pbps_db::ledger::LOCK_TABLE_NAME,
+            ]
+            .iter()
+            .any(|name| id.name == [crate::state::LEDGER_SCHEMA, *name])
         }) {
             builder.add_row("pg_class", row)?;
         }

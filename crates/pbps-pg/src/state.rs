@@ -650,11 +650,21 @@ pub async fn ledger_problems(conn: &mut Conn) -> Result<Vec<String>, DbError> {
         Some(row) => text(row, "me")?,
         None => return Err(DbError::BadRow("current_user returned no row".into())),
     };
-    let me = quoted_ident(&me);
+    ledger_problems_from_facts(&rows, &me)
+}
+
+/// Compare the same complete recipe for ordinary writes and resolver reads.
+/// Callers own the snapshot and canonical rendering scope; this comparison
+/// performs no transaction, migration, grant or other database operation.
+pub(crate) fn ledger_problems_from_facts(
+    rows: &[Row],
+    account: &str,
+) -> Result<Vec<String>, DbError> {
+    let me = quoted_ident(account);
     let mut state = std::collections::BTreeSet::new();
     let mut lock = std::collections::BTreeSet::new();
     let mut problems = Vec::new();
-    for row in &rows {
+    for row in rows {
         let relname = text(row, "relname")?;
         let fact = text(row, "fact")?;
         let table = if relname == STATE_TABLE_NAME {
@@ -866,7 +876,7 @@ const LOCK_RECIPE: [&str; 9] = [
 /// sequence (#843): a descending or cycling one makes `ORDER BY id DESC` stop
 /// meaning newest-first. `pg_sequence` is world-readable, measured on 18.6 and
 /// 16.15, like the rest of this.
-fn ledger_facts() -> String {
+pub(crate) fn ledger_facts() -> String {
     format!(
         "WITH occupant AS (
            SELECT c.oid, c.relname, c.relkind, c.relowner, c.relnamespace, c.relrowsecurity,

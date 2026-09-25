@@ -131,9 +131,11 @@ async fn within(
     }
     let (raw, witnesses) = batch(conn, major, None).await?;
     properties::qualify_layout(&raw, major).map_err(|_| Failure::Incomplete)?;
-    let baseline = super::baseline::read(conn, &raw).await?;
     let session = environment.logical(&raw)?;
     let selected = qualify(&raw, major)?;
+    // Ledger recipe facts deparse defaults/constraints too. They share the
+    // qualified rendering boundary and cannot run before source/type coverage.
+    let baseline = super::baseline::read(conn, &raw).await?;
     let (rendered, held) = batch(conn, major, Some(&selected)).await?;
     if held != witnesses {
         return Err(Failure::Changed);

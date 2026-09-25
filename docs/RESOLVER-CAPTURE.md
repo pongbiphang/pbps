@@ -28,6 +28,15 @@ JSON size ceiling. No old YAML is
 bootstrapped as a stand-in for target bindings. Absent and empty ledgers are
 separate inputs; unreadable, malformed or unsupported state is a refusal.
 
+Before accepting either an empty or recorded ledger, capture reuses the
+ordinary write path's complete recipe and effective-editor qualification
+(SPEC §8.1, DEC-313.1 and its amendments). Both ledger tables and their
+source/type closures qualify before recipe rendering, inside the capture's
+owned canonical snapshot and rendering-stability boundary. No table creation,
+migration or grant runs: supported older timeline-column subsets remain
+unchanged. The baseline row comes from `ONLY public.__pbps_state`. A refusal
+names ledger qualification without exposing private defaults or role details.
+
 The snapshot does not freeze PostgreSQL's catalog-rendering functions. A
 private, same-capture tuple witness covers the catalogs that can supply their
 names/properties. After rendering, the adapter commits and observes those
