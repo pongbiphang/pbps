@@ -105,6 +105,16 @@ fn no_read_route_accepts_sql_as_a_parameter_or_carries_it_as_an_argument() {
                 "{path} {key}"
             );
         }
+        // A route without a parameter still runs only its fixed vocabulary.
+        if parameter.is_none() {
+            let view = route(path).unwrap();
+            let arguments = view.arguments();
+            assert_eq!(
+                within_the_vocabulary(&arguments, SQL),
+                Ok(()),
+                "{path}: {arguments:?}"
+            );
+        }
         // The parameter a route takes carries SQL only as its own value.
         if let Some(parameter) = parameter {
             let view = route(&format!("{path}?{parameter}={escaped}")).unwrap();
@@ -292,8 +302,12 @@ fn normalized(source: &str) -> String {
                 while at(j) == Some('#') {
                     j += 1;
                 }
-                at(j) == Some('"')
-                    && !at(i.wrapping_sub(1)).is_some_and(|p| p.is_alphanumeric() || p == '_')
+                // `r"`, and the raw byte and C strings `br"` and `cr"`: the
+                // `r` starts a literal unless it ends an identifier.
+                let word = |k: usize| at(k).is_some_and(|p| p.is_alphanumeric() || p == '_');
+                let prefixed =
+                    matches!(at(i.wrapping_sub(1)), Some('b' | 'c')) && !word(i.wrapping_sub(2));
+                at(j) == Some('"') && (!word(i.wrapping_sub(1)) || prefixed)
             } =>
             {
                 let mut hashes = 0;
@@ -365,6 +379,12 @@ fn normalizing_drops_comments_and_whitespace_but_keeps_literals() {
     assert_eq!(normalized("a /* outer /* inner */ still */ b"), "ab");
     assert_eq!(normalized("f(\"http://x\"); g()"), "f(\"http://x\");g()");
     assert_eq!(normalized("r#\"a // b\"# c"), "\"a//b\"c");
+    assert_eq!(
+        normalized("let x = br#\"\"//\"#; let y = std::env::var(z);"),
+        "letx=b\"\"//\";lety=std::env::var(z);"
+    );
+    assert_eq!(normalized("c r\"//\" z"), "c\"//\"z");
+    assert_eq!(normalized("cr#\"//\"# z"), "c\"//\"z");
     assert_eq!(normalized("let q = '\"'; env!(x)"), "letq='\"';env!(x)");
     assert_eq!(normalized("let e = '\\''; /* c */ x"), "lete='\\'';x");
     assert_eq!(normalized("fn f<'a>(x: &'a str) {}"), "fnf<'a>(x:&'astr){}");
