@@ -631,3 +631,34 @@ how to add an entry here.
     any new execution authority. CLI regressions compare human and JSON paths,
     warning/error and unresolved/resolved cases, refused artifact preservation,
     operational errors, and real SQL Server edition warnings (#338–#341).
+
+<a id="dec-997-1"></a>
+
+**DEC-997.1. The envelope's wire version moves when an envelope could fail the
+previously published schema, and an added field in an open `data` object does
+not.** SPEC §9.8 says `schema_version` "moves when a consumer would have to
+change". It did not say whether an added field is such a change, and #996's
+review read it as one. The test chosen is the published document itself: a
+consumer validating against it is the consumer the envelope schema serves. It
+leaves `data` objects open, so it accepts a newly added field. A removed or
+renamed field, a changed type or a new enum value fails it, and those move the
+version together with the schema's `const` (DECISIONS 224). The schema-set
+version still moves for every content change (DECISIONS 465), so an addition
+is never unrecorded.
+
+Moving the wire version for every addition was the alternative. It would make
+every `data` addition a breaking change for consumers that only validate, and
+it contradicts the practice DECISIONS 465 records: many fields have been added
+under version 1. Some past changes would move the version under this rule, for
+example the timeline's `denied` variant (DECISIONS 435). They are not
+renumbered.
+
+The rule holds only while the definitions stay open. A closed definition turns
+every later addition into a breaking one. `integration`'s
+`only_the_named_envelope_definitions_refuse_an_added_field` therefore names
+the closed ones and fails when another appears. Today that is only
+`ResolverProfile`, the configuration's own type echoed by a connected plan. It
+stays closed so `pbps.yml` refuses a misspelt key, and a field added to it
+moves the wire version. `pbps-ui`'s contract types use `deny_unknown_fields` on
+purpose: they ship in the same binary as the CLI they read (ADR-0015 decision
+6), and each addition updates them in the same change.

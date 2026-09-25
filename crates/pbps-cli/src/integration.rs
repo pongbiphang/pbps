@@ -473,6 +473,64 @@ mod tests {
         assert!(!new_validator.is_valid(&envelope));
     }
 
+    /// An additive `data` field keeps the envelope's wire version only because
+    /// the published definitions are open: a consumer validating against the
+    /// older document still accepts the envelope that carries it (DEC-997.1).
+    /// A definition that closes itself turns every later addition into a
+    /// breaking change, so a new one must be named here on purpose.
+    ///
+    /// `ResolverProfile` is the configuration's own type, echoed by a connected
+    /// plan's resolver selection. It stays closed so `pbps.yml` refuses a
+    /// misspelt key, and a field added to it moves `output::SCHEMA_VERSION`.
+    #[test]
+    fn only_the_named_envelope_definitions_refuse_an_added_field() {
+        let closed = closed_definitions(&schema(SchemaKind::Envelope));
+        assert_eq!(closed, ["ResolverProfile"].map(str::to_owned).into());
+    }
+
+    #[test]
+    fn a_nested_closed_object_marks_its_definition_closed() {
+        let document = serde_json::json!({
+            "oneOf": [{ "additionalProperties": false }],
+            "$defs": {
+                "Open": { "type": "object", "additionalProperties": true },
+                "Unset": { "type": "object", "properties": { "a": {} } },
+                "Map": { "type": "object", "additionalProperties": { "type": "string" } },
+                "Nested": { "oneOf": [{ "properties": {
+                    "inner": { "type": "object", "additionalProperties": false }
+                } }] },
+            }
+        });
+        assert_eq!(
+            closed_definitions(&document),
+            ["Nested"].map(str::to_owned).into()
+        );
+    }
+
+    /// The `$defs` whose body, at any depth, sets `additionalProperties: false`.
+    fn closed_definitions(document: &serde_json::Value) -> std::collections::BTreeSet<String> {
+        fn closes(value: &serde_json::Value) -> bool {
+            match value {
+                serde_json::Value::Object(map) => {
+                    map.get("additionalProperties") == Some(&serde_json::Value::Bool(false))
+                        || map.values().any(closes)
+                }
+                serde_json::Value::Array(items) => items.iter().any(closes),
+                serde_json::Value::Null
+                | serde_json::Value::Bool(_)
+                | serde_json::Value::Number(_)
+                | serde_json::Value::String(_) => false,
+            }
+        }
+        document["$defs"]
+            .as_object()
+            .expect("a published schema keeps its definitions in `$defs`")
+            .iter()
+            .filter(|(_, body)| closes(body))
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     /// `deny_unknown_fields` is what turns a typo into an error rather than a
     /// silent no-op (ADR-0003), and it only reaches the editor as
     /// `additionalProperties: false`. Losing it would make the schema accept
