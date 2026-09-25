@@ -1754,7 +1754,7 @@ fn a_created_routine_refuses_a_low_privilege_caller_unless_the_declaration_opens
     std::fs::write(
         d.dir.join("schema/mark.yml"),
         "function: app.mark()\ndefinition: |-\n  () RETURNS bigint LANGUAGE sql SECURITY DEFINER \
-         AS $$ INSERT INTO app.t (id) VALUES (1) RETURNING id $$\n",
+         SET search_path = app, pg_temp AS $$ INSERT INTO app.t (id) VALUES (1) RETURNING id $$\n",
     )
     .unwrap();
     // An ordinary invoker routine. Closed too, under the policy this issue
@@ -1774,7 +1774,7 @@ fn a_created_routine_refuses_a_low_privilege_caller_unless_the_declaration_opens
     std::fs::write(
         d.dir.join("schema/touch.yml"),
         "procedure: app.touch()\ndefinition: |-\n  () LANGUAGE sql SECURITY DEFINER \
-         AS $$ INSERT INTO app.t (id) VALUES (2) $$\n",
+         SET search_path = app, pg_temp AS $$ INSERT INTO app.t (id) VALUES (2) $$\n",
     )
     .unwrap();
     // The one line that says otherwise.
@@ -1901,7 +1901,7 @@ fn routine_rebuilds_do_not_restore_revoked_public_execute() {
     let file = d.dir.join("schema/secret.yml");
     let declaration = |value| {
         format!(
-            "function: app.secret()\ndefinition: () RETURNS integer LANGUAGE sql SECURITY DEFINER AS $$ SELECT {value} $$\n"
+            "function: app.secret()\ndefinition: () RETURNS integer LANGUAGE sql SECURITY DEFINER SET search_path = app, pg_temp AS $$ SELECT {value} $$\n"
         )
     };
     std::fs::write(&file, declaration(1)).unwrap();
@@ -2108,7 +2108,7 @@ fn bootstrap_refuses_to_record_a_routine_a_trigger_reopened_to_public() {
     d.table(ONE_COLUMN);
     std::fs::write(
         d.dir.join("schema/shut.yml"),
-        "function: app.shut()\ndefinition: () RETURNS integer LANGUAGE sql SECURITY DEFINER AS $$ SELECT 1 $$\n",
+        "function: app.shut()\ndefinition: () RETURNS integer LANGUAGE sql SECURITY DEFINER SET search_path = app, pg_temp AS $$ SELECT 1 $$\n",
     )
     .unwrap();
     succeeds(d.run(&["plan"]));
@@ -11869,4 +11869,145 @@ fn another_sessions_temporary_routine_is_not_pinned() {
     drop(d);
     drop(db);
     let _ = try_on_server(&server(), &format!("DROP ROLE IF EXISTS {role}"));
+}
+
+fn routine_exists(connection: &str, signature: &str) -> bool {
+    scalar(
+        connection,
+        &format!("SELECT count(*) FROM pg_proc WHERE oid = to_regprocedure('{signature}')"),
+    ) == 1
+}
+
+/// #322, DEC-322.1. A SECURITY DEFINER routine binds its unqualified names
+/// when a caller runs it, through the caller's `search_path` unless it pins
+/// its own. A routine a plan writes must pin one with `pg_temp` last,
+/// PostgreSQL's documented safe form, or the apply rolls it back.
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn a_definer_routine_a_plan_writes_must_pin_search_path_with_pg_temp_last() {
+    let own = OwnDatabase::new(&server(), "definer_path");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "definer-path", ONE_COLUMN);
+    for (name, clauses, accepted, why) in [
+        ("bare", "SECURITY DEFINER", false, "sets no search_path"),
+        (
+            "no_temp",
+            "SECURITY DEFINER SET search_path = app",
+            false,
+            "does not name pg_temp last",
+        ),
+        (
+            "temp_first",
+            "SECURITY DEFINER SET search_path = pg_temp, app",
+            false,
+            "does not name pg_temp last",
+        ),
+        ("invoker", "", true, ""),
+        (
+            "safe",
+            "SECURITY DEFINER SET search_path = app, pg_temp",
+            true,
+            "",
+        ),
+    ] {
+        let file = d.dir.join(format!("schema/{name}.yml"));
+        std::fs::write(
+            &file,
+            format!(
+                "function: app.{name}()\ndefinition: () RETURNS integer LANGUAGE sql {clauses} \
+                 AS $$ SELECT 1 $$\n"
+            ),
+        )
+        .unwrap();
+        let plan = connected_artifact(&d, connection, false);
+        let applied = approved_apply(&d, connection, &plan, &[]);
+        let signature = format!("app.{name}()");
+        if accepted {
+            succeeds(applied);
+            assert!(routine_exists(connection, &signature), "{name}");
+        } else {
+            assert_ne!(code(&applied), 0, "{name}: {}", stdout(&applied));
+            assert!(
+                stderr(&applied).contains(&signature)
+                    && stderr(&applied).contains(why)
+                    && stderr(&applied).contains("rolled back"),
+                "{name}: {}",
+                stderr(&applied)
+            );
+            assert!(
+                !routine_exists(connection, &signature),
+                "{name} rolled back"
+            );
+            std::fs::remove_file(&file).unwrap();
+            d.commit();
+        }
+    }
+    // A definer routine the plan does not write is not its to judge: one
+    // already there in the unsafe form stays, and an unrelated plan applies.
+    on_server(
+        connection,
+        "CREATE FUNCTION app.untouched() RETURNS integer LANGUAGE sql SECURITY DEFINER \
+         AS $$ SELECT 1 $$",
+    );
+    d.table(TWO_COLUMNS);
+    let plan = connected_artifact(&d, connection, false);
+    succeeds(approved_apply(&d, connection, &plan, &[]));
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn a_staged_or_bootstrapped_definer_routine_without_a_pinned_path_is_refused_before_it_commits() {
+    let own = OwnDatabase::new(&server(), "definer_staged");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "definer-staged", ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("schema/staged.yml"),
+        // Open to PUBLIC, because a staged run cannot close a routine it
+        // creates in the same step (DECISIONS 517).
+        "function: app.staged()\npublic_execute: true\ndefinition: () RETURNS integer LANGUAGE sql \
+         SECURITY DEFINER AS $$ SELECT 1 $$\n",
+    )
+    .unwrap();
+    let plan = connected_artifact(&d, connection, true);
+    let refused = approved_apply(&d, connection, &plan, &["--staged"]);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        stderr(&refused).contains("sets no search_path"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(
+        !routine_exists(connection, "app.staged()"),
+        "the step's transaction rolled the routine back"
+    );
+
+    // Bootstrap builds routines too.
+    let fresh = OwnDatabase::new(&server(), "definer_bootstrap");
+    on_server(fresh.connection(), "CREATE SCHEMA app");
+    let b = Demo::new("definer-bootstrap");
+    b.table(ONE_COLUMN);
+    std::fs::write(
+        b.dir.join("schema/boot.yml"),
+        "function: app.boot()\ndefinition: () RETURNS integer LANGUAGE sql SECURITY DEFINER \
+         AS $$ SELECT 1 $$\n",
+    )
+    .unwrap();
+    succeeds(b.run(&["plan"]));
+    b.commit();
+    let refused = b.run(&["bootstrap", "--db", fresh.connection()]);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        stderr(&refused).contains("sets no search_path"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!routine_exists(fresh.connection(), "app.boot()"));
+    assert_eq!(
+        scalar(
+            fresh.connection(),
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'app'"
+        ),
+        0,
+        "the bootstrap left the database empty"
+    );
 }

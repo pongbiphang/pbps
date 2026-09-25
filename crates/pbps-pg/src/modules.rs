@@ -2854,3 +2854,139 @@ mod tests {
         );
     }
 }
+
+/// Whether a `SECURITY DEFINER` routine this plan created or replaced is in
+/// PostgreSQL's documented safe form (#322).
+///
+/// A definer routine runs with its owner's privileges, and an unqualified name
+/// in its body binds when a caller invokes it, through whatever `search_path`
+/// is in force then. With no `SET search_path` of its own that is the
+/// caller's, and a caller who can create in any schema on it, or in
+/// `pg_temp`, which is searched first unless it is named, supplies the helper
+/// the owner's privileges then run. PostgreSQL's manual prescribes the remedy
+/// ("Writing SECURITY DEFINER Functions Safely"): a `SET search_path` on the
+/// routine, with `pg_temp` named and last. Only that form is accepted, read
+/// from the stored `proconfig` rather than the declaration's text, because the
+/// catalog is what the engine will use.
+///
+/// Whether another role can create in a schema that the path names is not
+/// judged here. That would re-derive the engine's authorization (DECISIONS
+/// 521). It stays a recorded limitation (DEC-322.1).
+pub async fn definer_path(
+    conn: &mut Conn,
+    id: &ModuleId,
+    kind: ModuleKind,
+) -> Result<DefinerPath, DbError> {
+    require_the_callers_transaction(conn).await?;
+    conn.query(CANONICAL_PATH).await?;
+    let Some(oid) = module_oid(conn, id, kind).await? else {
+        return Ok(DefinerPath::Absent);
+    };
+    let rows = conn
+        .query_with(
+            "SELECT p.prosecdef,
+                    (SELECT pg_catalog.substr(c, pg_catalog.length('search_path=') + 1)
+                       FROM pg_catalog.unnest(p.proconfig) AS c
+                      WHERE c LIKE 'search\\_path=%') AS search_path
+               FROM pg_catalog.pg_proc p
+              WHERE p.oid = $1::int8::oid",
+            &[Param::I64(oid)],
+        )
+        .await?;
+    let row = rows.first().ok_or_else(|| vanished(oid))?;
+    let definer = row
+        .try_get::<bool>("prosecdef")?
+        .ok_or_else(|| DbError::BadRow("`prosecdef` is unexpectedly NULL".to_owned()))?;
+    if !definer {
+        return Ok(DefinerPath::Safe);
+    }
+    Ok(
+        match definer_path_problem(row.try_get::<&str>("search_path")?) {
+            None => DefinerPath::Safe,
+            Some(why) => DefinerPath::Unsafe(why),
+        },
+    )
+}
+
+/// What [`definer_path`] found.
+///
+/// `Absent` is its own answer, not a safe one. A staged run asks before the
+/// step that creates the routine, where absence is expected. Everywhere else
+/// the caller refuses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefinerPath {
+    /// No routine by this identity is in the catalog.
+    Absent,
+    /// Not `SECURITY DEFINER`, or a definer in the safe form.
+    Safe,
+    /// A definer outside the safe form, and why.
+    Unsafe(String),
+}
+
+/// The rule [`definer_path`] applies to a definer's stored `search_path`
+/// setting: present, and naming `pg_temp` last.
+fn definer_path_problem(search_path: Option<&str>) -> Option<String> {
+    let Some(path) = search_path else {
+        return Some(
+            "it is SECURITY DEFINER and sets no search_path, so an unqualified name in its \
+             body resolves through the caller's path"
+                .to_owned(),
+        );
+    };
+    let entries = path_entries(path);
+    if entries.last().map(String::as_str) == Some("pg_temp") {
+        return None;
+    }
+    Some(format!(
+        "it is SECURITY DEFINER with search_path `{path}`, which does not name pg_temp last, \
+         so a caller's temporary objects are searched before it ends"
+    ))
+}
+
+/// The schema names in a stored `search_path` value, unquoted: the engine
+/// writes `app, "pg_temp"` or `app, pg_temp` for the same path.
+fn path_entries(path: &str) -> Vec<String> {
+    let mut entries = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut chars = path.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                current.push('"');
+                chars.next();
+            }
+            '"' => quoted = !quoted,
+            ',' if !quoted => entries.push(std::mem::take(&mut current).trim().to_owned()),
+            _ => current.push(c),
+        }
+    }
+    entries.push(current.trim().to_owned());
+    entries
+}
+
+#[cfg(test)]
+mod definer_path_tests {
+    use super::*;
+
+    #[test]
+    fn a_definer_path_is_safe_only_when_it_names_pg_temp_last() {
+        assert_eq!(definer_path_problem(Some("app, pg_temp")), None);
+        assert_eq!(definer_path_problem(Some("app, \"pg_temp\"")), None);
+        assert_eq!(definer_path_problem(Some("pg_temp")), None);
+        assert!(definer_path_problem(None).is_some());
+        assert!(definer_path_problem(Some("app")).is_some());
+        assert!(definer_path_problem(Some("pg_temp, app")).is_some());
+        assert!(definer_path_problem(Some("")).is_some());
+    }
+
+    #[test]
+    fn a_quoted_schema_holding_a_comma_or_a_quote_is_one_entry() {
+        assert_eq!(
+            path_entries("\"a,b\", \"q\"\"t\", pg_temp"),
+            vec!["a,b", "q\"t", "pg_temp"]
+        );
+        // A schema literally named "pg_temp, x" is not pg_temp.
+        assert!(definer_path_problem(Some("\"x, pg_temp\"")).is_some());
+    }
+}

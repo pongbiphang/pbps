@@ -1356,6 +1356,77 @@ fn rebuilt_modules(
         .collect()
 }
 
+/// The routines a set of changes creates or replaces, with the kind each
+/// will have: what [`refuse_unsafe_definers`] reads back.
+pub fn written_routines(
+    changes: &ChangeSet,
+) -> Vec<(pbps_model::ModuleId, pbps_model::ModuleKind)> {
+    use pbps_model::{ModuleAfter, ModuleKind};
+    // Through `Change::module`, which is exhaustive: a change added later that
+    // leaves a routine standing is counted without a wildcard to hide it.
+    changes
+        .changes
+        .iter()
+        .filter_map(|p| match p.change.module()? {
+            (id, ModuleAfter::Standing(module))
+                if matches!(module.kind, ModuleKind::Function | ModuleKind::Procedure) =>
+            {
+                Some((id.clone(), module.kind))
+            }
+            (_, ModuleAfter::Standing(_) | ModuleAfter::Gone) => None,
+        })
+        .collect()
+}
+
+/// What an absent routine means to [`refuse_unsafe_definers`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Absent {
+    /// Every statement has run, so the routine must be there.
+    Refused,
+    /// A staged step before the one that creates it.
+    NotYetCreated,
+}
+
+/// Refuses a `SECURITY DEFINER` routine this plan created or replaced that
+/// does not set `search_path` with `pg_temp` last (#322, DEC-322.1).
+///
+/// Runs inside the transaction that wrote the routines, after the statements,
+/// so that the refusal rolls them back. It reads the stored `proconfig`, which
+/// is what the engine will use when the routine is called, rather than
+/// guessing from the declaration's text.
+pub async fn refuse_unsafe_definers(
+    conn: &mut Conn,
+    routines: &[(pbps_model::ModuleId, pbps_model::ModuleKind)],
+    absent: Absent,
+) -> anyhow::Result<()> {
+    use pbps_pg::modules::DefinerPath;
+    if conn.driver() != Driver::Postgres || routines.is_empty() {
+        return Ok(());
+    }
+    let mut unsafe_ = Vec::new();
+    for (id, kind) in routines {
+        match pbps_pg::modules::definer_path(conn, id, *kind).await? {
+            DefinerPath::Safe => {}
+            DefinerPath::Absent if absent == Absent::NotYetCreated => {}
+            DefinerPath::Absent => anyhow::bail!(
+                "{id}: this plan writes the routine, and the catalog holds no routine by that \
+                 identity after its statements ran"
+            ),
+            DefinerPath::Unsafe(why) => unsafe_.push(format!("{id}: {why}")),
+        }
+    }
+    if !unsafe_.is_empty() {
+        anyhow::bail!(
+            "a SECURITY DEFINER routine this plan writes is not in PostgreSQL's safe form:\n  {}\n\
+             Give each one `SET search_path = <its schemas>, pg_temp` in its declaration, with \
+             pg_temp last, and plan again (DEC-322.1). Nothing has been applied; the \
+             transaction was rolled back.",
+            unsafe_.join("\n  ")
+        );
+    }
+    Ok(())
+}
+
 /// PostgreSQL rebuilds must keep their locks, checks and DDL in one
 /// transaction — and so must the revoke that closes a routine this plan
 /// creates.
