@@ -169,21 +169,34 @@ fn later_names_are_what_became_nameable_after_the_module() {
 
 /// A later object could only have taken a binding it can be resolved as:
 /// an index never a routine call, a routine never a relation, while a
-/// relation's row type can take a call.
+/// relation's row type can take a one-argument call.
 #[test]
 fn a_later_object_shadows_only_what_it_could_be_resolved_as() {
-    assert!(Nameable::Index.shadows("pg_class"));
-    assert!(!Nameable::Index.shadows("pg_proc"));
-    assert!(!Nameable::Index.shadows("pg_type"));
-    assert!(Nameable::Routine.shadows("pg_proc"));
-    assert!(Nameable::Routine.shadows("pg_type"));
-    assert!(!Nameable::Routine.shadows("pg_class"));
-    assert!(Nameable::Relation.shadows("pg_class"));
-    assert!(Nameable::Relation.shadows("pg_type"));
-    // A relation's row type can turn a call without an exact match into a
-    // cast to it.
-    assert!(Nameable::Relation.shadows("pg_proc"));
-    assert!(!Nameable::Relation.shadows("column"));
+    let target = |class: &str, arguments: usize| ObjectIdentity {
+        class: class.into(),
+        name: vec!["app".into(), "f".into()],
+        signature: (0..arguments)
+            .map(|_| ObjectIdentity {
+                class: "pg_type".into(),
+                name: vec!["pg_catalog".into(), "text".into()],
+                signature: Vec::new(),
+            })
+            .collect(),
+    };
+    assert!(Nameable::Index.shadows(&target("pg_class", 0)));
+    assert!(!Nameable::Index.shadows(&target("pg_proc", 1)));
+    assert!(!Nameable::Index.shadows(&target("pg_type", 0)));
+    assert!(Nameable::Routine.shadows(&target("pg_proc", 0)));
+    assert!(Nameable::Routine.shadows(&target("pg_type", 0)));
+    assert!(!Nameable::Routine.shadows(&target("pg_class", 0)));
+    assert!(Nameable::Relation.shadows(&target("pg_class", 0)));
+    assert!(Nameable::Relation.shadows(&target("pg_type", 0)));
+    // A relation's row type can take a one-argument call as a cast, never a
+    // call of another arity.
+    assert!(Nameable::Relation.shadows(&target("pg_proc", 1)));
+    assert!(!Nameable::Relation.shadows(&target("pg_proc", 0)));
+    assert!(!Nameable::Relation.shadows(&target("pg_proc", 2)));
+    assert!(!Nameable::Relation.shadows(&target("column", 0)));
 }
 
 /// A plan that drops, renames or alters is not a bootstrap, and building a

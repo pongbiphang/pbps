@@ -249,11 +249,15 @@ fn derived(
         // call to the best-matching routine otherwise. So a type binding may
         // be a call a same-named routine would now take, and a routine
         // binding one a same-named type would now take (measured on 16 and
-        // 18: `foo('x')` calls foo(text) until a type `foo` exists).
+        // 18: `foo('x')` calls foo(text) until a type `foo` exists). A cast
+        // takes exactly one argument, so only a one-argument routine can be
+        // displaced by a type.
         let classes: &[CandidateClass] = match class {
-            CandidateClass::Type | CandidateClass::Routine => {
+            CandidateClass::Type => &[CandidateClass::Type, CandidateClass::Routine],
+            CandidateClass::Routine if target.signature.len() == 1 => {
                 &[CandidateClass::Type, CandidateClass::Routine]
             }
+            CandidateClass::Routine => &[CandidateClass::Routine],
             CandidateClass::Relation
             | CandidateClass::Operator
             | CandidateClass::Collation
@@ -424,7 +428,7 @@ fn compiled_early(
         binding.target.name.last().is_some_and(|bound| {
             later
                 .iter()
-                .any(|(kind, name)| *name == bound && kind.shadows(&binding.target.class))
+                .any(|(kind, name)| *name == bound && kind.shadows(&binding.target))
         })
     })
 }
@@ -552,7 +556,11 @@ mod tests {
         let input = Input {
             properties: BTreeMap::new(),
             bindings: vec![
-                bound(id("pg_proc", &["util", "f"], Vec::new())),
+                bound(id(
+                    "pg_proc",
+                    &["util", "f"],
+                    vec![id("pg_type", &["pg_catalog", "text"], Vec::new())],
+                )),
                 bound(id(
                     "column",
                     &["x"],
@@ -583,6 +591,17 @@ mod tests {
                 set(CandidateClass::Type, Some("shared"), Some("f")),
                 set(CandidateClass::Type, Some("util"), Some("f")),
             ])
+        );
+        // A call of any other arity cannot be a cast, so a routine bound
+        // with no argument derives no type sets.
+        let nullary = Input {
+            properties: BTreeMap::new(),
+            bindings: vec![bound(id("pg_proc", &["util", "f"], Vec::new()))],
+        };
+        assert!(
+            !derived(&view, &nullary, &paths)
+                .iter()
+                .any(|set| set.class == CandidateClass::Type)
         );
         // An extra the deployer cannot use is not on its measured path, so
         // nothing in it is a candidate.

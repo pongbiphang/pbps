@@ -1145,3 +1145,44 @@ async fn a_type_that_would_take_a_routine_call_is_a_candidate() {
         );
     }
 }
+
+/// A cast takes one argument, so a type cannot take a call of any other
+/// arity: an unmanaged type named like a zero-argument routine is no
+/// candidate for `foo()`, and the view's verdict stands.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_type_cannot_take_a_call_that_is_not_a_cast() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let declared = || {
+            Declared::default()
+                .function(
+                    "app.foo()",
+                    "() RETURNS text LANGUAGE sql IMMUTABLE RETURN 'routine'",
+                )
+                .view("app.v", "SELECT foo() AS x")
+        };
+        let assessment = analyze(
+            &server,
+            "arity",
+            Case {
+                schemas: &["app"],
+                extras: &[],
+                target: "
+                    SET search_path = app;
+                    CREATE FUNCTION foo() RETURNS text LANGUAGE sql IMMUTABLE RETURN 'routine';
+                    CREATE VIEW app.v AS SELECT foo() AS x;
+                    CREATE TYPE app.foo AS ENUM ('x');",
+                base: declared(),
+                desired: declared(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            only(&assessment, "app", "v"),
+            Verdict::Unaffected,
+            "{variable}"
+        );
+    }
+}

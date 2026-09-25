@@ -67,15 +67,16 @@ pub enum Nameable {
 }
 
 impl Nameable {
-    /// Whether an object of this kind could be what a binding of the
-    /// captured catalog `class` resolves to instead.
-    pub fn shadows(self, class: &str) -> bool {
-        matches!(
-            (self, class),
-            (Self::Relation, "pg_class" | "pg_type" | "pg_proc")
-                | (Self::Index, "pg_class")
-                | (Self::Routine, "pg_proc" | "pg_type")
-        )
+    /// Whether an object of this kind could be what a binding of `target`
+    /// resolves to instead. A row type takes a call only as a cast, which
+    /// has exactly one argument.
+    pub fn shadows(self, target: &ObjectIdentity) -> bool {
+        match (self, target.class.as_str()) {
+            (Self::Relation, "pg_proc") => target.signature.len() == 1,
+            (Self::Relation, class) => matches!(class, "pg_class" | "pg_type"),
+            (Self::Index, class) => class == "pg_class",
+            (Self::Routine, class) => matches!(class, "pg_proc" | "pg_type"),
+        }
     }
 }
 
