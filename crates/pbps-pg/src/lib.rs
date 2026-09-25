@@ -62,6 +62,7 @@ pub mod estimate;
 pub mod impact;
 pub mod introspect;
 pub mod modules;
+pub mod pins;
 mod preflight;
 pub mod roles;
 pub mod rows;
@@ -429,9 +430,17 @@ impl Dialect for Postgres {
     /// prevent. Inside the transaction this opens they are undone by the
     /// rollback, and outside one they are on the connection pbps opened for
     /// this deployment.
+    ///
+    /// The isolation level is named, not inherited. The routine-pin checks
+    /// inside the transaction read `pg_proc` with a plain `SELECT`, and under a
+    /// `default_transaction_isolation` of `repeatable read` that `SELECT` kept
+    /// returning the row as the transaction first saw it, while a call in the
+    /// same transaction ran the body another session had just replaced
+    /// (measured on 18.6, DEC-319.1). `READ COMMITTED` gives each check a fresh
+    /// snapshot, so it sees what the statements ran.
     fn transaction_framing(&self) -> TransactionFraming {
         TransactionFraming {
-            begin: concat!(session_pins!(), " BEGIN;"),
+            begin: concat!(session_pins!(), " BEGIN ISOLATION LEVEL READ COMMITTED;"),
             commit: "COMMIT;",
             // Tolerates a transaction the server has already killed, so that
             // this statement's own error cannot replace the real failure.

@@ -3627,7 +3627,15 @@ pub fn cmd_plan_db(
         );
     }
 
-    let (cs, baseline_checksum, baseline_description, connected_checks, findings, cost) = db::runtime()?.block_on(async {
+    let (
+        cs,
+        baseline_checksum,
+        baseline_description,
+        connected_checks,
+        findings,
+        cost,
+        routine_pins,
+    ) = db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
         let mut findings = Vec::new();
 
@@ -3641,7 +3649,8 @@ pub fn cmd_plan_db(
         refuse_mid_deployment(&entry, &target.label)?;
         let role_renames =
             crate::engine::external_role_renames(&mut conn, &entry.snapshot.ids, &resolved.ids)
-                .await?.renames;
+                .await?
+                .renames;
         let recorded_snapshot = entry.snapshot.clone();
         rename_snapshot_roles(&mut entry.snapshot, &role_renames);
         let recorded_ids = role_scope(&entry.snapshot.ids, &resolved.ids, dialect.as_ref());
@@ -3707,13 +3716,7 @@ pub fn cmd_plan_db(
         let colliding: Vec<&str> = managed
             .unreadable
             .iter()
-            .filter(|(n, _)| {
-                loaded
-                    .schema
-                    .modules
-                    .keys()
-                    .any(|id| n.matches_module(id))
-            })
+            .filter(|(n, _)| loaded.schema.modules.keys().any(|id| n.matches_module(id)))
             .map(|(_, why)| why.as_str())
             .collect();
         if !colliding.is_empty() {
@@ -3758,8 +3761,12 @@ pub fn cmd_plan_db(
         // Newly managed roles also start from their actual grants. Both sets
         // remain in the pinned baseline and the differ's input (421).
         let missing_roles = crate::engine::reconcile_cluster_roles(
-            conn.driver(), &recorded_snapshot.ids, &recorded_ids, &role_renames,
-            &as_recorded, &mut expected,
+            conn.driver(),
+            &recorded_snapshot.ids,
+            &recorded_ids,
+            &role_renames,
+            &as_recorded,
+            &mut expected,
         )?;
         let recorded = pbps_model::state_checksum(&expected, &recorded_ids);
         if live != recorded {
@@ -3792,7 +3799,9 @@ pub fn cmd_plan_db(
                     "Reference data: {name} does not exist yet; its declared rows go in with it."
                 ),
             };
-            if !json { println!("{message}"); }
+            if !json {
+                println!("{message}");
+            }
             findings.push(crate::output::Finding::note("data.adoption", message));
         }
         let base = pbps_model::data::plan_base(
@@ -3853,15 +3862,26 @@ pub fn cmd_plan_db(
         crate::engine::require_transactional_rebuilds(conn.driver(), &cs, staged)?;
         conn.begin(dialect.transaction_framing()).await?;
         let checks = async {
-            let rename_evidence = crate::engine::external_role_renames(&mut conn, &recorded_snapshot.ids, &resolved.ids)
-                .await?.check;
+            let rename_evidence = crate::engine::external_role_renames(
+                &mut conn,
+                &recorded_snapshot.ids,
+                &resolved.ids,
+            )
+            .await?
+            .check;
             // First, so that what it adds is held to every check after it: a
             // view this plan now drops and recreates takes `before_a_rebuild`
             // like one the declarations edit (#314, ADR-0009 §4).
             let rediff = |also: &std::collections::BTreeSet<pbps_model::ModuleId>| {
                 pbps_diff::diff_rebuilding(
-                    pbps_diff::Side { schema: &base, ids: &recorded_ids },
-                    pbps_diff::Side { schema: &loaded.schema, ids: &resolved.ids },
+                    pbps_diff::Side {
+                        schema: &base,
+                        ids: &recorded_ids,
+                    },
+                    pbps_diff::Side {
+                        schema: &loaded.schema,
+                        ids: &resolved.ids,
+                    },
                     dialect.as_ref(),
                     &hints,
                     also,
@@ -3879,7 +3899,8 @@ pub fn cmd_plan_db(
             .await?;
             let rebuilds = crate::engine::check_module_rebuilds(&mut conn, &cs, false).await?;
             let drops = crate::engine::check_drop_blockers(&mut conn, &cs).await?;
-            crate::engine::prepare_data_writes(&mut conn, &cs, &entry.snapshot, &resolved.ids).await?;
+            crate::engine::prepare_data_writes(&mut conn, &cs, &entry.snapshot, &resolved.ids)
+                .await?;
             Ok::<_, anyhow::Error>((rename_evidence, dependents, rebuilds, drops))
         }
         .await;
@@ -3999,7 +4020,7 @@ pub fn cmd_plan_db(
         // again: the owners came out of the same statement snapshot as the
         // schema, so the two cannot disagree (DECISIONS 174).
         let owned_targets =
-        crate::engine::owned_targets(conn.driver(), &cs, &scoped.owners, &scoped.session_role)?;
+            crate::engine::owned_targets(conn.driver(), &cs, &scoped.owners, &scoped.session_role)?;
         // The other half of the same read, and the other direction: a grant
         // this connection could see and could not take away is refused only
         // when the plan actually revokes it (#251).
@@ -4044,6 +4065,16 @@ pub fn cmd_plan_db(
         )?;
         let baseline = pbps_model::state_checksum(&pinned, &recorded_ids);
         let cost = crate::engine::operational_cost(&mut conn, &cs).await;
+        // Last, so that the routines are sealed as close to the gate as the
+        // plan can get them. The managed set is the one `apply` rebuilds from
+        // the ledger and the plan: what was recorded, and what is declared.
+        let routine_pins = crate::pins::seal(
+            &mut conn,
+            project,
+            target,
+            &managed_modules(Some(&entry.snapshot), Some(&loaded.schema)),
+        )
+        .await?;
         Ok((
             cs,
             baseline,
@@ -4060,6 +4091,7 @@ pub fn cmd_plan_db(
             ],
             findings,
             cost,
+            routine_pins,
         ))
     })?;
 
@@ -4132,6 +4164,7 @@ pub fn cmd_plan_db(
     // The rows the state recorded after the apply has to cover: the
     // declarations' scope, carried so that `apply` needs no checkout.
     plan.data = loaded.schema.data_scopes();
+    plan.routine_pins = routine_pins;
     if staged {
         plan = plan.staged();
         if !json {
@@ -4636,6 +4669,21 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
     // refusal still costs nothing.
     refuse_unexpressible(&scoped, &target.label, "apply again")?;
 
+    // Before the probes, which run declared expressions and so the routines
+    // they call (DEC-319.1). Every module the plan holds at any point of its
+    // run is managed here, so its own creates, rebuilds and drops are the
+    // read-back's to compare, not the pins'.
+    let pinned_managed = pinned_managed(&entry.snapshot, &plan.changes);
+    crate::pins::check(
+        conn,
+        project,
+        target,
+        plan.routine_pins.as_ref(),
+        &pinned_managed,
+        crate::pins::Check::BeforeProbes,
+    )
+    .await?;
+
     preflight(conn, dialect, plan, rename_targets).await?;
 
     println!("Applying {} statement(s)...", statements.len());
@@ -4648,6 +4696,17 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         let data_guard =
             crate::engine::prepare_data_writes(conn, &plan.changes, &entry.snapshot, &plan.ids)
                 .await?;
+        // Again, because the probes ran in transactions of their own and a
+        // routine could be replaced after them.
+        crate::pins::check(
+            conn,
+            project,
+            target,
+            plan.routine_pins.as_ref(),
+            &pinned_managed,
+            crate::pins::Check::BeforeStatements,
+        )
+        .await?;
         execute_statements(conn, statements, &data_guard).await?;
         crate::engine::check_module_rebuilds(conn, &plan.changes, true).await?;
         crate::engine::external_role_renames(conn, &original_ids, &plan.ids).await?;
@@ -4729,6 +4788,20 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
             )
         })?;
         refuse_unexpressible(&after, &target.label, "apply again")?;
+        // And a last time before recording: a routine replaced while the
+        // statements ran was run by them, and the rollback is still available.
+        crate::pins::check(
+            conn,
+            project,
+            target,
+            plan.routine_pins.as_ref(),
+            &pinned_managed,
+            crate::pins::Check::BeforeRecording,
+        )
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("{e:#}\n\nNothing has been applied — the transaction was rolled back.")
+        })?;
         let mut snapshot = pbps_model::StateSnapshot::new(
             pbps_model::StateKind::Apply,
             after.schema,
@@ -4749,6 +4822,20 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
     }
     .await;
     finish_transaction(conn, dialect, result).await.map(Some)
+}
+
+/// Every module the plan holds at some point of its run: what the ledger
+/// recorded, and what the plan leaves or passes through.
+///
+/// The routine pins leave these to the drift check and the read-back
+/// (DEC-319.1). The union is what makes the set stable across a run: a routine
+/// the plan creates is in it before it exists, and one it drops stays in it
+/// after it is gone, so neither reads as an unmanaged routine arriving or
+/// leaving.
+fn pinned_managed(recorded: &StateSnapshot, changes: &pbps_model::ChangeSet) -> BTreeSet<ModuleId> {
+    let mut set = managed_modules(Some(recorded), None);
+    set.extend(modules_after(recorded, changes, Settled::SoFar));
+    set
 }
 
 /// The cluster already moved these identities. Both the planner and the
@@ -4978,6 +5065,16 @@ async fn apply_staged_under_lock(
             );
         }
         refuse_unexpressible(&scoped, &target.label, "apply again")?;
+        // Before the probes, as in the transactional apply (DEC-319.1).
+        crate::pins::check(
+            conn,
+            project,
+            target,
+            plan.routine_pins.as_ref(),
+            &pinned_managed(&entry.snapshot, &plan.changes),
+            crate::pins::Check::BeforeProbes,
+        )
+        .await?;
         // Only on a fresh start. The probes name objects as the catalog had
         // them before the first statement, and after a partial run some of
         // those names have already moved — a probe answered about the wrong
@@ -5026,7 +5123,21 @@ async fn apply_staged_under_lock(
         "Applying {} statement(s) with per-statement commits...",
         total - start
     );
+    // A resume starts from a checkpoint, whose modules include what earlier
+    // steps created; the union keeps those managed too.
+    let pinned_managed = pinned_managed(&entry.snapshot, &plan.changes);
     for (i, stmt) in statements.iter().enumerate().skip(start) {
+        // Before each step, including the first after a resume, which skips
+        // the check before the probes along with the probes.
+        crate::pins::check(
+            conn,
+            project,
+            target,
+            plan.routine_pins.as_ref(),
+            &pinned_managed,
+            crate::pins::Check::BeforeStep { step: i + 1, total },
+        )
+        .await?;
         let executed = if stmt.row_write.is_some() {
             // A staged row is still one atomic statement. Hold its trigger
             // locks through the write, then commit before the checkpoint;
@@ -5128,8 +5239,31 @@ async fn apply_staged_under_lock(
             last_statement: stmt.sql.clone(),
         });
         let recorded = checkpoint.schema.clone();
+        // After the step, and before its checkpoint, so that a routine
+        // replaced while the step ran is caught at that step — the last one
+        // included. The statement has committed, so a mismatch is a
+        // post-commit guard failure: the checkpoint is written first and the
+        // run stops after it (DECISIONS 159).
+        let pins_after_step = crate::pins::check(
+            conn,
+            project,
+            target,
+            plan.routine_pins.as_ref(),
+            &pinned_managed,
+            crate::pins::Check::AfterStep { step: i + 1, total },
+        )
+        .await;
         let id = crate::engine::record(conn, &checkpoint).await?;
         println!("  statement {} of {total} done (checkpoint #{id})", i + 1);
+        pins_after_step.map_err(|e| {
+            e.context(format!(
+                "statement {} of {total} committed, and checkpoint #{id} records it; nothing \
+                 was rolled back. A resume checks the same pins, so either put the routine back \
+                 as it was and run `pbps apply --staged --resume`, or accept the database with \
+                 `pbps baseline --reason ...` and plan from there",
+                i + 1
+            ))
+        })?;
         // The checkpoint is written *first*, and then the run stops. It says
         // what the database holds, which is the one thing a resume needs to be
         // true — refusing before writing it would lose the record of a
@@ -5199,6 +5333,25 @@ async fn apply_staged_under_lock(
              moved and run `pbps apply --staged --resume`, or accept the database with \
              `pbps baseline --reason ...` and plan from there."
         )
+    })?;
+    // The pins once more, because a `--resume` after the last checkpoint runs
+    // no step and so reaches no other check (DEC-319.1).
+    crate::pins::check(
+        conn,
+        project,
+        target,
+        plan.routine_pins.as_ref(),
+        &pinned_managed,
+        crate::pins::Check::BeforeClosing,
+    )
+    .await
+    .map_err(|e| {
+        e.context(format!(
+            "all {total} statement(s) completed, but the staged deployment cannot close; \
+             nothing was rolled back and the ledger retains the last checkpoint. Either put \
+             the routine back as it was and run `pbps apply --staged --resume`, or accept the \
+             database with `pbps baseline --reason ...` and plan from there"
+        ))
     })?;
     let mut snapshot = pbps_model::StateSnapshot::new(
         pbps_model::StateKind::Apply,

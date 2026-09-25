@@ -187,6 +187,15 @@ qualification (the design of #594, now superseded). `pbps key generate` makes a
 key, and `pbps doctor` checks each environment's. Sealing the key identifier
 into a plan and refusing `apply` under another key are part of #614 and #616.
 
+Every PostgreSQL plan pins the routines outside its managed set that a role
+short of a superuser can replace (DEC-319.1, #319). The pins are one HMAC per
+schema under the environment's key, sealed into the plan with the key
+identifier. `apply` refuses a changed pin before the probes, before the first
+statement and before recording, and a staged run checks before and after each
+step. Open follow-ups: #984 (SQL Server), #989 (narrower pin sets for keyless
+environments), #994 (managed routines' owner and ACL) and #995 (NULL versus
+empty ACLs).
+
 Neither a suggested Docker image nor a successful preview is deployment proof.
 Runtime/dynamic-SQL analysis, automatic custom-image synthesis, snapshot-derived
 deployable plans and resolver-backed staged apply remain outside this scope.

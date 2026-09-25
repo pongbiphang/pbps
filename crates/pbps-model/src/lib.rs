@@ -60,7 +60,10 @@ pub use module::{
     RoutineArg, RoutineArgError, RoutineId,
 };
 pub use name::{ColumnRef, NameError, TableName, check_segment};
-pub use plan::{PlanBaseline, PlanMode, PlanOrigin, SavedPlan, plan_checksum, state_checksum};
+pub use plan::{
+    PlanBaseline, PlanMode, PlanOrigin, RoutinePins, SavedPlan, SchemaPin, plan_checksum,
+    state_checksum,
+};
 pub use rename::Renames;
 pub use role::{GrantTarget, Permission, Role};
 pub use schema::{
