@@ -916,3 +916,6 @@ mod pseudo;
 
 #[path = "live_tests/admission_recovery.rs"]
 pub(super) mod admission_recovery;
+
+#[path = "live_tests/forwarder_mqueue.rs"]
+pub(super) mod forwarder_mqueue;

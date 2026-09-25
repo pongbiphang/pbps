@@ -196,9 +196,7 @@ async fn every_forwarder_guard_requires_effective_descriptor_evidence() {
                 // This is the same kernel admission routine Session::open uses,
                 // before publishing a qualified session; no test-only bypass.
                 let init = run.inner.analysis.as_ref().unwrap().runtime.init();
-                let refused =
-                    check_kernel_parts(init, &session.guard, &session.pair, &session.backend)
-                        .is_err();
+                let refused = session.check_kernel(init).is_err();
                 (changed, refused)
             };
             let recheck_refused = run.check(&mut target).await.is_err();

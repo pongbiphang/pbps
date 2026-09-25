@@ -142,6 +142,14 @@ read or write messages, or move the ordinary observer thread. Unavailable
 namespace permission or mount API support refuses qualification. Replacing the
 IPC namespace also invalidates the process lease.
 
+Each supplied-server analysis session retains its own forwarder mqueue lease
+(#944): the control, scratch, administrative reconstruction and reopened scratch
+sessions qualify before return and recheck with kernel continuity. Synchronous
+identity access checks the control session too. A refused constructor or live
+view ends that analysis permanently; restoring the mount only permits cleanup.
+The cleanup capability and its source-free janitor remain independent of lost
+analysis qualification, bound to the same pinned container and engine identity.
+
 **Named limit: devpts origin.** Creating a devpts filesystem produces a distinct
 instance, including two creations in the same namespaces. A device number distinguishes
 instances but does not identify which one trusted provisioning originally

@@ -65,15 +65,9 @@ async fn host_file_loss_refuses_admission_and_discards_live_analysis() {
             .runtime
             .check(&[&control.guard, &scratch.guard])
             .is_err();
-        let forwarders_refused = [control, scratch].iter().all(|session| {
-            check_kernel_parts(
-                analysis.runtime.init(),
-                &session.guard,
-                &session.pair,
-                &session.backend,
-            )
-            .is_err()
-        });
+        let forwarders_refused = [control, scratch]
+            .iter()
+            .all(|session| session.check_kernel(analysis.runtime.init()).is_err());
         let recheck_refused = run.check(&mut target).await.is_err();
         changed.restore();
         let terminal = run.check(&mut target).await.is_err() && run.inner.live().is_err();

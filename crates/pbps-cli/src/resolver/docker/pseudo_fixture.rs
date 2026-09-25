@@ -94,6 +94,32 @@ impl ChangedPseudo {
     pub(crate) fn restore(&self) {
         assert_eq!(Some(self.change("restore").unwrap()), self.original);
     }
+
+    /// Refusing a scratch session drops its attach stream, so its owned
+    /// forwarder may auto-remove before the test can restore the view.
+    /// Only confirmed absence of that immutable container ID permits this
+    /// alternative; an unreadable API or surviving container still fails.
+    pub(crate) async fn restore_or_confirm_removed(&self, api: &mut LocalApi) {
+        let error = match self.change("restore") {
+            Ok(identity) => {
+                assert_eq!(Some(identity), self.original);
+                return;
+            }
+            Err(error) => error,
+        };
+        for _ in 0..100 {
+            if api
+                .inspect_container(&self.container)
+                .await
+                .unwrap()
+                .is_none()
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the owned view was neither restored nor removed: {error}");
+    }
 }
 
 impl Drop for ChangedPseudo {
