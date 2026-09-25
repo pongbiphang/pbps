@@ -115,9 +115,10 @@ step 5). Each is one `pbps` child with `--no-input`, started from typed fields:
 
 - **The environment is a name.** The child reads its connection string from
   the `url_env` variable, as the CLI does. No field holds a connection string.
-- **The plan file must be new.** The viewer refuses a path that already names
-  anything, so a plan someone approved is never replaced by a new one
-  (DEC-1025.2). Read the new plan with **Read the plan**, which opens the Saved
+- **The plan file must be new.** The viewer claims the path before the plan
+  runs and refuses one that already names anything, so a plan someone approved
+  is never replaced by a new one. Its directory must exist. A plan that fails
+  gives the empty file back (DEC-1025.2). Read the new plan with **Read the plan**, which opens the Saved
   plan view on it.
 - **The checksum is typed, never filled in.** The field starts empty, and
   nothing the viewer reads fills it. Enter the SHA-256 your deployment gate

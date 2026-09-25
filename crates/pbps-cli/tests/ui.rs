@@ -442,7 +442,7 @@ fn a_connection_string_never_reaches_a_trigger_response() {
 
     let (status, _, started) = viewer.post(
         "/api/trigger/plan",
-        r#"{"environment":"guarded","out":"plans/new.json"}"#,
+        r#"{"environment":"guarded","out":"new.json"}"#,
     );
     assert_eq!(status, 200, "{started}");
     let (runs, bodies) = viewer.wait_for_runs();
@@ -456,7 +456,8 @@ fn a_connection_string_never_reaches_a_trigger_response() {
             .contains("cannot connect to the database"),
         "the child reached the connection and its refusal is relayed: {plan}"
     );
-    assert!(!viewer.directory.join("plans/new.json").exists());
+    // The failed plan wrote nothing, and its claim on the file was released.
+    assert!(!viewer.directory.join("new.json").exists());
 
     // The checksum is the CLI's to judge; its refusal reaches the page as the
     // CLI wrote it.

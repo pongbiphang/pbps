@@ -356,20 +356,23 @@ classes as a person types them.
 
 <a id="dec-1025-2"></a>
 
-**DEC-1025.2. The viewer's `plan --out` must name a path that does not exist.**
-`plan --out` replaces whatever is at its path. A saved plan is the artifact a
-checksum is approved for, so replacing one from a browser form could put
-different bytes behind an approval that is still pending. The viewer refuses
-any path that already names something, a dangling link included, and one it
-cannot inspect. The check runs before the child starts.
-
-Another process on the same machine could create the file between the check
-and the write. That race needs a concurrent writer of the same path under the
-same user, which a single-user local tool does not defend against, and the CLI
-would still write a complete plan whose checksum `explain` shows. The
-alternative was a private directory the viewer owns. It was rejected because a
-plan is meant to be passed on to the reviewer who approves it, and a file under
-a temporary directory is the wrong place for that.
+**DEC-1025.2. The viewer's `plan --out` claims a new path before the child
+starts.** `plan --out` replaces whatever is at its path. A saved plan is the
+artifact a checksum is approved for, so replacing one from a browser form could
+put different bytes behind an approval that is still pending. The viewer
+therefore creates the file empty and exclusively (`create_new`) before it
+starts the child.
+- A path that already names anything is refused, a dangling link included.
+  So is one that cannot be created, for example because its directory is
+  missing, which the CLI would refuse too.
+- The claim is atomic. Two runs naming one file, however the path is spelled,
+  cannot both pass it; an existence check followed by the child's write could
+  let both through.
+- A run that fails gives its claim back. The file is removed only while it is
+  still empty, since anything else holds bytes the viewer did not write.
+- A private directory owned by the viewer was the alternative. It was rejected
+  because a plan is meant to be passed on to the reviewer who approves it, and
+  a file under a temporary directory is the wrong place for that.
 
 <a id="dec-1025-3"></a>
 

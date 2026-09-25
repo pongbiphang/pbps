@@ -185,6 +185,8 @@ struct Run {
     action: &'static str,
     arguments: Vec<String>,
     child: Child,
+    /// The plan file this run claimed, released again if the run fails.
+    reserved: Option<PathBuf>,
     exited: Option<Option<i32>>,
     ended: Option<Option<i32>>,
     stdout: Arc<Mutex<Captured>>,
@@ -210,6 +212,12 @@ impl Run {
         };
         if self.ended.is_none() && closed(&self.stdout) && closed(&self.stderr) {
             self.ended = self.exited;
+            if let Some(path) = self
+                .reserved
+                .take_if(|_| self.ended.is_some_and(|code| code != Some(0)))
+            {
+                release(&path);
+            }
         }
         Ok(())
     }
@@ -269,11 +277,16 @@ impl Trigger {
                 ));
             }
         }
-        if let Invocation::Plan { out, .. } = &invocation {
-            unused_path(&self.project.join(out)).map_err(|message| (409, message))?;
-        }
+        let reserved = match &invocation {
+            Invocation::Plan { out, .. } => {
+                let path = self.project.join(out);
+                reserve(&path).map_err(|message| (409, message))?;
+                Some(path)
+            }
+            Invocation::Apply { .. } => None,
+        };
         let arguments = invocation.arguments();
-        let mut child = Command::new(&self.executable)
+        let spawned = Command::new(&self.executable)
             .current_dir(&self.project)
             .arg("--project")
             // The child is already inside the selected project; see client.rs.
@@ -283,8 +296,16 @@ impl Trigger {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|_| (502, "Could not start the pbps command".to_owned()))?;
+            .spawn();
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(_) => {
+                if let Some(path) = &reserved {
+                    release(path);
+                }
+                return Err((502, "Could not start the pbps command".to_owned()));
+            }
+        };
         let stdout = capture(child.stdout.take().expect("piped"));
         let stderr = capture(child.stderr.take().expect("piped"));
         self.runs.insert(
@@ -293,6 +314,7 @@ impl Trigger {
                 action: invocation.action(),
                 arguments,
                 child,
+                reserved,
                 exited: None,
                 ended: None,
                 stdout,
@@ -331,17 +353,31 @@ impl Trigger {
 }
 
 /// `plan --out` replaces whatever is at its path. A saved plan is the
-/// artifact a checksum was approved for, so the viewer refuses a path that
-/// already names anything, a dangling link included, and one it cannot
-/// inspect (DEC-1025.2).
-fn unused_path(path: &Path) -> Result<(), String> {
-    match std::fs::symlink_metadata(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Ok(_) => Err(format!(
+/// artifact a checksum was approved for, so the viewer claims the path by
+/// creating it empty and exclusively before the child starts (DEC-1025.2). A
+/// path that already names anything, a dangling link included, is refused.
+/// The claim is atomic, so two runs naming one file, however spelled, cannot
+/// both pass it.
+fn reserve(path: &Path) -> Result<(), String> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(format!(
             "`{}` already exists; choose a new plan file",
             path.display()
         )),
-        Err(_) => Err(format!("`{}` could not be inspected", path.display())),
+        Err(e) => Err(format!("`{}` could not be created: {e}", path.display())),
+    }
+}
+
+/// Gives back a claim whose run wrote no plan. Only a file still empty is
+/// removed: anything else holds bytes this viewer did not write.
+fn release(path: &Path) {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.len() == 0) {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -465,15 +501,23 @@ mod tests {
             std::env::temp_dir().join(format!("pbps-ui-trigger-path-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();
-        assert!(unused_path(&directory.join("fresh.json")).is_ok());
+        assert!(reserve(&directory.join("fresh.json")).is_ok());
+        // A claimed path is taken, whichever spelling names it.
+        assert!(reserve(&directory.join("fresh.json")).is_err());
+        assert!(reserve(&directory.join(".").join("fresh.json")).is_err());
         std::fs::write(directory.join("plan.json"), "{}").unwrap();
-        assert!(unused_path(&directory.join("plan.json")).is_err());
-        assert!(unused_path(&directory).is_err());
+        assert!(reserve(&directory.join("plan.json")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(directory.join("plan.json")).unwrap(),
+            "{}"
+        );
+        assert!(reserve(&directory).is_err());
+        assert!(reserve(&directory.join("missing-directory/plan.json")).is_err());
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(directory.join("nowhere"), directory.join("dangling"))
                 .unwrap();
-            assert!(unused_path(&directory.join("dangling")).is_err());
+            assert!(reserve(&directory.join("dangling")).is_err());
         }
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -493,6 +537,23 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         script
+    }
+
+    /// Starts a run that is expected to start. A stand-in script was just
+    /// written, and another test thread's child forked in the meantime can
+    /// hold it open for writing until that child execs, so the kernel may
+    /// briefly refuse to execute it (ETXTBSY). That is the test's own race,
+    /// not the viewer's: the viewer runs `pbps`, which nothing is writing.
+    #[cfg(unix)]
+    fn start(trigger: &mut Trigger, action: &str, body: &[u8]) -> Vec<u8> {
+        for _ in 0..200 {
+            match trigger.answer(action, body) {
+                Ok(bytes) => return bytes,
+                Err((502, _)) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(refused) => panic!("{refused:?}"),
+            }
+        }
+        panic!("the stand-in never started")
     }
 
     #[cfg(unix)]
@@ -517,13 +578,13 @@ mod tests {
 
         // The request returns while the child is still running.
         let started: Vec<serde_json::Value> =
-            serde_json::from_slice(&trigger.answer("apply", &body("prod")).unwrap()).unwrap();
+            serde_json::from_slice(&start(&mut trigger, "apply", &body("prod"))).unwrap();
         assert_eq!(started[0]["ended"], false);
         assert_eq!(started[0]["code"], serde_json::Value::Null);
 
         let refused = trigger.answer("apply", &body("prod")).unwrap_err();
         assert_eq!(refused.0, 409, "{}", refused.1);
-        assert!(trigger.answer("apply", &body("test")).is_ok());
+        start(&mut trigger, "apply", &body("test"));
 
         std::fs::write(directory.join("release"), "").unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -551,7 +612,7 @@ mod tests {
         );
         assert_eq!(prod["stderr"], "diagnostics\n");
         // Once the run has ended, the environment takes another.
-        assert!(trigger.answer("apply", &body("prod")).is_ok());
+        start(&mut trigger, "apply", &body("prod"));
         let _ = std::fs::remove_dir_all(&directory);
     }
 
@@ -574,12 +635,11 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut trigger = Trigger::new(script, directory.clone());
-        trigger
-            .answer(
-                "apply",
-                br#"{"environment":"prod","plan":"p.json","checksum":"c","allow":[],"staged":false,"resume":false}"#,
-            )
-            .unwrap();
+        start(
+            &mut trigger,
+            "apply",
+            br#"{"environment":"prod","plan":"p.json","checksum":"c","allow":[],"staged":false,"resume":false}"#,
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         let run = loop {
             let run = runs(&mut trigger).remove(0);
@@ -591,6 +651,38 @@ mod tests {
         };
         assert_eq!(run["code"], 2);
         assert_eq!(run["stderr"], "the last words\n");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Two environments naming one plan file: the second is refused while the
+    /// first holds it, and a plan that fails gives its empty claim back.
+    #[cfg(unix)]
+    #[test]
+    fn one_plan_file_is_claimed_by_one_run_and_released_if_it_fails() {
+        let directory =
+            std::env::temp_dir().join(format!("pbps-ui-trigger-claim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut trigger = Trigger::new(stand_in(&directory), directory.clone());
+        start(
+            &mut trigger,
+            "plan",
+            br#"{"environment":"prod","out":"shared.json"}"#,
+        );
+        let refused = trigger
+            .answer("plan", br#"{"environment":"test","out":"./shared.json"}"#)
+            .unwrap_err();
+        assert_eq!(refused.0, 409, "{}", refused.1);
+        assert!(directory.join("shared.json").exists());
+
+        std::fs::write(directory.join("release"), "").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while runs(&mut trigger).iter().any(|run| run["ended"] == false) {
+            assert!(std::time::Instant::now() < deadline, "the run never ended");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // The stand-in exits 3 without writing: the empty claim is released.
+        assert!(!directory.join("shared.json").exists());
         let _ = std::fs::remove_dir_all(&directory);
     }
 
@@ -613,10 +705,10 @@ mod tests {
             std::fs::read_to_string(directory.join("taken.json")).unwrap(),
             "approved bytes"
         );
-        assert!(
-            trigger
-                .answer("plan", br#"{"environment":"prod","out":"new.json"}"#)
-                .is_ok()
+        start(
+            &mut trigger,
+            "plan",
+            br#"{"environment":"prod","out":"new.json"}"#,
         );
         let _ = std::fs::remove_dir_all(&directory);
     }
