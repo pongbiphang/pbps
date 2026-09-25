@@ -531,7 +531,10 @@ fn a_connection_string_never_reaches_a_response_or_a_file() {
             if path.is_dir() {
                 walk(&path, found);
             } else {
-                found.push((path.clone(), std::fs::read(&path).unwrap_or_default()));
+                // Unreadable is not empty: it could hold what is searched for.
+                let bytes = std::fs::read(&path)
+                    .unwrap_or_else(|e| panic!("{} could not be read: {e}", path.display()));
+                found.push((path.clone(), bytes));
             }
         }
     }

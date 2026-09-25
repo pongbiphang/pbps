@@ -131,6 +131,56 @@ fn the_route_tables_are_the_whole_router() {
     }
 }
 
+/// Whether a source line could read an environment variable's value.
+/// Conservative on purpose: any path through `env` counts, however it is
+/// imported or aliased (`use std::env::var;`, `use std::{env, ..}`), and only
+/// `env::temp_dir()`, which yields a path, passes.
+fn reaches_environment(line: &str) -> bool {
+    let words: Vec<&str> = line
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .collect();
+    let import = line.trim_start().starts_with("use ");
+    // A name that reads the environment by itself, or any import of `env`.
+    let direct = (import && words.contains(&"env"))
+        || words
+            .iter()
+            .any(|w| matches!(*w, "getenv" | "environ" | "vars_os" | "var_os"));
+    // A path through `env`, which passes only when every one is `temp_dir()`.
+    let path = (line.contains("env::") || line.contains("::env"))
+        && !line
+            .split("env::")
+            .skip(1)
+            .all(|rest| rest.starts_with("temp_dir("));
+    direct || path
+}
+
+#[test]
+fn an_aliased_or_imported_environment_read_is_still_seen() {
+    for line in [
+        "use std::env::var;",
+        "use std::env;",
+        "use std::{env, fs};",
+        "use std::{fs, env::var_os};",
+        "use std::env::temp_dir;",
+        "let url = std::env::var(\"PBPS_DB\");",
+        "let url = env::var_os(name);",
+        "for (k, v) in std::env::vars() {",
+        "let p = libc::getenv(name);",
+        "let p = std::env::temp_dir().join(std::env::var(\"X\").unwrap());",
+    ] {
+        assert!(reaches_environment(line), "{line}");
+    }
+    for line in [
+        "let path = std::env::temp_dir().join(\"x\");",
+        "command.env_remove(name);",
+        ".env_clear()",
+        "let environment = run.environment.clone();",
+        "(\"/api/drift\", Some(\"env\"), View::Drift),",
+    ] {
+        assert!(!reaches_environment(line), "{line}");
+    }
+}
+
 /// ADR-0015 decision 4: the UI process never holds a connection string. The
 /// child reads `url_env` itself, and the UI must not read any environment
 /// value. The one read is compose removing inherited `GIT_*` overrides from
@@ -158,16 +208,7 @@ fn the_ui_reads_no_environment_value() {
         }
         let text = std::fs::read_to_string(&file).unwrap();
         for line in text.lines() {
-            if [
-                "env::var(",
-                "env::var_os(",
-                "env::vars(",
-                "env::vars_os(",
-                "getenv",
-            ]
-            .iter()
-            .any(|call| line.contains(call))
-            {
+            if reaches_environment(line) {
                 let name = file.strip_prefix(&root).unwrap().display().to_string();
                 reads.push((name, line.trim().to_owned()));
             }

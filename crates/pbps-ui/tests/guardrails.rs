@@ -102,7 +102,10 @@ fn files(root: &Path, skip: &[&Path], found: &mut Vec<(PathBuf, Vec<u8>)>) {
         if path.is_dir() {
             files(&path, skip, found);
         } else {
-            found.push((path.clone(), std::fs::read(&path).unwrap_or_default()));
+            // Unreadable is not empty: it could hold what is searched for.
+            let bytes = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("{} could not be read: {e}", path.display()));
+            found.push((path.clone(), bytes));
         }
     }
 }
