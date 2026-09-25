@@ -1614,3 +1614,43 @@ entry records that the gap is closed. Pinned by
 `crates/pbps-pg/src/lib.rs` (planning), and by
 `saved_add_column_risks_use_the_selected_dialect_and_reject_edits` in
 `crates/pbps-cli/src/main.rs` (saved-plan validation).
+
+<a id="dec-415-1"></a>
+
+**DEC-415.1. A PostgreSQL temporal type's precision change is estimated as a
+rebuild only when the precision narrows, and an omitted precision is the
+engine's 6 (#415).** Admitting temporal precision (#130, #414) made
+`timestamp(3) -> timestamp(6)` and its family reachable. The estimator's
+`rewrites` had no arm for them, so every such change fell through to
+`Rewrite::Yes`, an answer nobody had measured. ADR-0012 §3–4 ask for the
+engine's own answer.
+
+Measured on 18.6 and 16.15, with `pg_class.relfilenode` compared before and
+after each `ALTER COLUMN … TYPE`:
+
+- the four types are `time`, `timetz`, `timestamp` and `timestamptz`;
+- every ordered pair of an omitted precision and `(0)`..`(6)` was tried;
+- each pair ran on an empty table and on a populated one;
+- that is 512 statements, all accepted, and the two engines answered
+  identically.
+
+The rule has no exception. The table is rebuilt exactly when the target
+precision is below the source's, counting an omitted precision as 6. So
+`timestamp -> timestamp(6)` is free in both directions, and
+`timestamp -> timestamp(5)` rebuilds. Populated and empty tables agree: the
+rewrite is a property of the statement.
+
+The column's indexes were measured with it. The altered column carried both
+a plain index and a primary key's. Each index's `relfilenode` moved in exactly
+the 216 narrowing statements, and in none of the 296 that hold or widen the
+precision, on both engines. So the index side of ADR-0012's boundary needs no
+new answer. `against` takes an indexed column's estimate back to unknown only
+where the table is rebuilt, which drags the index along. A widening that
+rebuilds nothing rebuilds no index either, and its `No` stands.
+
+The estimator now answers this family by that rule, for the same base only. A
+change into another base keeps its existing answer, including the
+session-dependent `timestamp -> timestamptz`. `TypeChangeRisk` is untouched,
+because cost stays apart from correctness (DECISIONS 399). The live suite
+re-measures the whole matrix and holds the estimate to every statement, so
+the rule cannot go stale without a red build.

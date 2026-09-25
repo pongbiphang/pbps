@@ -211,6 +211,8 @@ impl Estimate {
 /// numeric(10,2)         -> numeric                 no rewrite
 /// numeric(10,2)         -> numeric(12,2)           no rewrite
 /// timestamp             -> timestamptz             the session's TimeZone decides
+/// timestamp(3)          -> timestamp(6)            no rewrite (and any temporal
+///                                                  precision that holds or widens)
 /// ```
 ///
 /// and everything else rewrites, including the ones that look free:
@@ -267,10 +269,34 @@ fn rewrites(from: &ColumnType, to: &ColumnType) -> Rewrite {
             arg(&from, 1).unwrap_or(0) == arg(&to, 1).unwrap_or(0)
                 && unbounded_or_at_least(&from, &to)
         }
+        // A temporal type keeps its stored form while its fractional-second
+        // precision holds or widens, and rounds every row when it narrows.
+        // Measured on 18.6 and 16.15, every ordered pair of omitted and
+        // (0)..(6) for all four types, on an empty and a populated table
+        // alike — 512 statements, not one exception: `relfilenode` moves
+        // exactly when the precision drops. An omitted precision is the
+        // engine's 6, so `timestamp -> timestamp(6)` is free both ways and
+        // `timestamp -> timestamp(5)` rebuilds (#415, DEC-415.1).
+        (a, b) if a == b && TEMPORAL.contains(&a) => {
+            arg(&to, 0).unwrap_or(TEMPORAL_DEFAULT_PRECISION)
+                >= arg(&from, 0).unwrap_or(TEMPORAL_DEFAULT_PRECISION)
+        }
         _ => false,
     };
     if free { Rewrite::No } else { Rewrite::Yes }
 }
+
+/// The four types whose one argument is a fractional-second precision, as
+/// `types::normalize` spells them.
+const TEMPORAL: [&str; 4] = [
+    "time without time zone",
+    "time with time zone",
+    "timestamp without time zone",
+    "timestamp with time zone",
+];
+
+/// What the engine stores for a temporal column declared with no precision.
+const TEMPORAL_DEFAULT_PRECISION: i64 = 6;
 
 fn arg(ty: &ColumnType, i: usize) -> Option<i64> {
     match ty.args.get(i) {
@@ -1091,6 +1117,49 @@ mod tests {
                 "{from} -> {to} rebuilds the table"
             );
         }
+    }
+
+    /// #415: a temporal type rewrites only when its fractional-second
+    /// precision narrows, and an omitted precision is the engine's 6 — the
+    /// rule the live matrix measured over all four types. The other temporal
+    /// changes keep the answers they had: into another base is a rebuild,
+    /// and `timestamp -> timestamptz` stays the session's question.
+    #[test]
+    fn a_temporal_precision_rewrites_only_when_it_narrows() {
+        for (from, to) in [
+            ("timestamp(3)", "timestamp(6)"),
+            ("timestamp(0)", "timestamp"),
+            ("timestamp", "timestamp(6)"),
+            ("timestamp(6)", "timestamp"),
+            ("timestamptz(2)", "timestamptz(5)"),
+            ("time(1)", "time"),
+            ("timetz(4)", "timetz(4)"),
+        ] {
+            assert_eq!(
+                rewrites(&ty(from), &ty(to)),
+                Rewrite::No,
+                "{from} -> {to} rewrites nothing"
+            );
+        }
+        for (from, to) in [
+            ("timestamp(6)", "timestamp(3)"),
+            ("timestamp", "timestamp(5)"),
+            ("timestamptz", "timestamptz(0)"),
+            ("time(2)", "time(1)"),
+            ("timetz", "timetz(3)"),
+            // A different base is not a precision change at all.
+            ("time(3)", "timestamp(3)"),
+        ] {
+            assert_eq!(
+                rewrites(&ty(from), &ty(to)),
+                Rewrite::Yes,
+                "{from} -> {to} rebuilds the table"
+            );
+        }
+        assert!(matches!(
+            rewrites(&ty("timestamp(3)"), &ty("timestamptz(6)")),
+            Rewrite::Unknown(_)
+        ));
     }
 
     /// A change whose cost the applying session decides is never answered from
