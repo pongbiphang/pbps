@@ -1087,12 +1087,34 @@ struct ProjectedRow {
 /// [`saturating_i32`] produces — so it is reported rather than clamped: a
 /// negative here means the row and this reader have gone out of step, not
 /// that the count was merely large.
-fn as_count(n: i32, column: &str) -> Result<usize, DbError> {
-    usize::try_from(n).map_err(|_| DbError::BadRow(format!("`{column}` is {n}, not a count")))
+///
+/// Reported **for that row**, as `Unreadable::Malformed`, and not thrown: a
+/// `BadRow` here used to `?` out of [`projected_row`] and take every other row
+/// of the `timeline()` batch with it, which is the "thrown, not carried"
+/// shape DECISIONS 218 rules out (#372, DEC-372.1).
+fn as_count(n: i32, column: &str) -> Result<usize, Unreadable> {
+    usize::try_from(n).map_err(|_| Unreadable::Malformed(format!("`{column}` is {n}, not a count")))
 }
 
-fn as_version(n: i32, column: &str) -> Result<u32, DbError> {
-    u32::try_from(n).map_err(|_| DbError::BadRow(format!("`{column}` is {n}, not a version")))
+/// The version's counterpart of [`as_count`], carried the same way: a
+/// negative `state_version` is a malformed row like a negative count, not
+/// evidence the whole read is wrong — a query that had drifted from the table
+/// would show on every row and every column, not on one value (DEC-372.1).
+fn as_version(n: i32, column: &str) -> Result<u32, Unreadable> {
+    u32::try_from(n).map_err(|_| Unreadable::Malformed(format!("`{column}` is {n}, not a version")))
+}
+
+/// A count column of a migrated row: NULL beside a non-NULL `state_version`
+/// is a row `record` never writes, and is carried as malformed with the same
+/// disposition as a negative count — two routes into one kind of bad row
+/// (#372). Only a failure to read the column at all is thrown.
+fn count(row: &pbps_db::Row, column: &str) -> Result<Result<usize, Unreadable>, DbError> {
+    Ok(match opt::<i32>(row, column)? {
+        Some(n) => as_count(n, column),
+        None => Err(Unreadable::Malformed(format!(
+            "`{column}` is NULL beside a `state_version`"
+        ))),
+    })
 }
 
 fn projected_row(row: &pbps_db::Row) -> Result<ProjectedRow, LedgerError> {
@@ -1106,75 +1128,86 @@ fn projected_row(row: &pbps_db::Row) -> Result<ProjectedRow, LedgerError> {
     // rule; `state_version` has only one meaning either way.
     let state = match opt::<i32>(row, "state_version")? {
         None => None,
-        Some(version) => {
-            let version = as_version(version, "state_version")?;
-            // The version is checked before any other projected column is
-            // even read, not only before `TimelineState` is built from them
-            // (a round-3 review finding on #103's own PR): `from_projected`
-            // already refuses an unsupported version, but `tables`/`modules`
-            // below were decoded *before* that call, so a newer pbps that
-            // wrote both an unsupported version and a count this build
-            // cannot parse would fail the whole `timeline()` call rather
-            // than refusing just that row — the one ordering the JSON
-            // fallback never got wrong (`read_json` checks the version
-            // before it touches the rest of the document at all). This is a
-            // second call to the same `check_readable_version` `from_projected`
-            // already calls, not a second check that could disagree with
-            // it — `from_projected` stays the only constructor, so `.expect`
-            // below documents a call that cannot fail rather than skips one.
-            Some(match pbps_model::check_readable_version(version) {
-                Err(e) => Err(e),
-                Ok(()) => {
-                    let tables = as_count(get(row, "tables_count")?, "tables_count")?;
-                    let modules = as_count(get(row, "modules_count")?, "modules_count")?;
-                    // `(Some, Some)` and `(None, None)` are the only two pairs
-                    // `record` ever writes — it always writes both columns
-                    // together or neither, driven from the JSON side's
-                    // `Option<StagedProgress>`, where `completed`/`total` are
-                    // one field, not two, and cannot come apart (a round-4
-                    // review finding on #103's own PR). This diff's two
-                    // independently nullable columns can still represent a
-                    // pair no write path produces — a hand-edited row, or a
-                    // migration gone wrong — and the catch-all this fixes
-                    // used to read that mismatch as "not staged" the same as
-                    // a genuine `(None, None)`, silently losing whatever
-                    // progress the row actually carried rather than saying
-                    // the row could not be read. Refused as `Malformed`
-                    // instead, by the same reasoning `read_json`'s strict
-                    // parse already refuses an inconsistent JSON document.
-                    let staged = match (
-                        opt::<i32>(row, "staged_completed")?,
-                        opt::<i32>(row, "staged_total")?,
-                    ) {
-                        (Some(completed), Some(total)) => Ok(Some(TimelineStaged {
-                            completed: as_count(completed, "staged_completed")?,
-                            total: as_count(total, "staged_total")?,
-                        })),
-                        // A migrated row that is not a staged checkpoint: both
-                        // are NULL together, which is what "not
-                        // mid-deployment" means (`pbps_model::StagedProgress`'s
-                        // own doc comment).
-                        (None, None) => Ok(None),
-                        (Some(completed), None) => Err(Unreadable::Malformed(format!(
-                            "`staged_completed` is {completed} but `staged_total` is NULL"
-                        ))),
-                        (None, Some(total)) => Err(Unreadable::Malformed(format!(
-                            "`staged_total` is {total} but `staged_completed` is NULL"
-                        ))),
-                    };
-                    match staged {
-                        Ok(staged) => Ok(TimelineState::from_projected(
-                            version, tables, modules, staged,
-                        )
-                        .expect("the version was already checked as readable above")),
-                        Err(e) => Err(e),
-                    }
-                }
-            })
-        }
+        Some(version) => Some(migrated_state(row, version)?),
     };
 
     ledger_row(row, id, state)
+}
+
+/// The state of a migrated row, or why this build cannot read it.
+///
+/// Every value `record` never writes — a negative or NULL count, a negative
+/// version, a half-populated staged pair — is carried as this row's
+/// `Unreadable`, and `timeline()` answers with every other row intact
+/// (DECISIONS 218, #372). Only a failure to read a column at all is thrown.
+///
+/// The version is checked before any other projected column is even read,
+/// not only before `TimelineState` is built from them (a round-3 review
+/// finding on #103's own PR): `from_projected` already refuses an
+/// unsupported version, but a newer pbps that wrote both an unsupported
+/// version and a count this build cannot parse must refuse just that row —
+/// the one ordering the JSON fallback never got wrong (`read_json` checks
+/// the version before it touches the rest of the document at all). This is a
+/// second call to the same `check_readable_version` `from_projected` already
+/// calls, not a second check that could disagree with it.
+fn migrated_state(
+    row: &pbps_db::Row,
+    version: i32,
+) -> Result<Result<TimelineState, Unreadable>, DbError> {
+    let version = match as_version(version, "state_version") {
+        Ok(v) => v,
+        Err(e) => return Ok(Err(e)),
+    };
+    if let Err(e) = pbps_model::check_readable_version(version) {
+        return Ok(Err(e));
+    }
+    let tables = match count(row, "tables_count")? {
+        Ok(n) => n,
+        Err(e) => return Ok(Err(e)),
+    };
+    let modules = match count(row, "modules_count")? {
+        Ok(n) => n,
+        Err(e) => return Ok(Err(e)),
+    };
+    // `(Some, Some)` and `(None, None)` are the only two pairs `record` ever
+    // writes — it always writes both columns together or neither, driven from
+    // the JSON side's `Option<StagedProgress>`, where `completed`/`total` are
+    // one field, not two, and cannot come apart (a round-4 review finding on
+    // #103's own PR). These two independently nullable columns can still
+    // represent a pair no write path produces — a hand-edited row, or a
+    // migration gone wrong — and it is refused as `Malformed` rather than read
+    // as "not staged" the same as a genuine `(None, None)`, by the same
+    // reasoning `read_json`'s strict parse refuses an inconsistent document.
+    let staged = match (
+        opt::<i32>(row, "staged_completed")?,
+        opt::<i32>(row, "staged_total")?,
+    ) {
+        (Some(completed), Some(total)) => match (
+            as_count(completed, "staged_completed"),
+            as_count(total, "staged_total"),
+        ) {
+            (Ok(completed), Ok(total)) => Some(TimelineStaged { completed, total }),
+            (Err(e), _) | (_, Err(e)) => return Ok(Err(e)),
+        },
+        // A migrated row that is not a staged checkpoint: both are NULL
+        // together, which is what "not mid-deployment" means
+        // (`pbps_model::StagedProgress`'s own doc comment).
+        (None, None) => None,
+        (Some(completed), None) => {
+            return Ok(Err(Unreadable::Malformed(format!(
+                "`staged_completed` is {completed} but `staged_total` is NULL"
+            ))));
+        }
+        (None, Some(total)) => {
+            return Ok(Err(Unreadable::Malformed(format!(
+                "`staged_total` is {total} but `staged_completed` is NULL"
+            ))));
+        }
+    };
+    Ok(Ok(TimelineState::from_projected(
+        version, tables, modules, staged,
+    )
+    .expect("the version was already checked as readable above")))
 }
 
 /// A row from [`SELECT_TIMELINE_UNMIGRATED`]: the six columns a `__pbps_state`
