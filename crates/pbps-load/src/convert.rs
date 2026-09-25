@@ -206,14 +206,6 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
 
     let mut columns = indexmap::IndexMap::with_capacity(dto.columns.len());
     for (col_name, c) in dto.columns {
-        let ty = match parse_at::<ColumnType>(src, &c.ty, "invalid type") {
-            Ok(t) => t,
-            Err(e) => {
-                errs.push(e);
-                continue;
-            }
-        };
-
         // A column name is a YAML mapping key, never parsed the way `table:`
         // is, so a `.` in it reaches here unchecked. `ColumnRef` joins
         // `schema.table.column` with the same character it splits on to read
@@ -223,7 +215,11 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
         // at the one place this name is minted, rather than left for the ids
         // file or a saved plan to fail on reading its own output back with an
         // error that names neither the column nor this file.
-        if let Err(e) = pbps_model::check_segment(&col_name) {
+        //
+        // Asked before the type, and neither answer stops the other: the two
+        // are independent, and a type error that `continue`d first hid a
+        // bad name until the next validation cycle (#410).
+        let named = pbps_model::check_segment(&col_name).map_err(|e| {
             errs.push(
                 LoadError::semantic(
                     src,
@@ -236,8 +232,11 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
                      and column and cannot store one inside a name",
                 ),
             );
+        });
+        let ty = parse_at::<ColumnType>(src, &c.ty, "invalid type").map_err(|e| errs.push(e));
+        let (Ok(()), Ok(ty)) = (named, ty) else {
             continue;
-        }
+        };
 
         if let (Some(table), Some(from)) = (&name, &c.renamed_from) {
             intents.push(Intent::RenameColumn {

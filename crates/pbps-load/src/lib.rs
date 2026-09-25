@@ -296,6 +296,37 @@ mod tests {
         load_table_str(p(), text).expect_err("expected the load to fail")
     }
 
+    /// #410: a dotted column name and a malformed type on the same column
+    /// are two independent problems, and one load reports both. A type error
+    /// used to `continue` before the name was checked, so the bad name only
+    /// surfaced on the next validation cycle. Each alone still reports only
+    /// itself, and a column with neither loads.
+    #[test]
+    fn a_dotted_column_name_and_a_bad_type_are_both_reported_in_one_load() {
+        let both = errors("table: dbo.t\ncolumns:\n  \"a.b\": {type: \"int(\"}\n");
+        let text = render(&both);
+        assert_eq!(both.len(), 2, "{text}");
+        assert!(
+            text.contains("column `a.b`"),
+            "the name is reported: {text}"
+        );
+        assert!(
+            text.contains("unclosed parenthesis"),
+            "the type is reported: {text}"
+        );
+
+        let name = errors("table: dbo.t\ncolumns:\n  \"a.b\": {type: int}\n");
+        assert_eq!(name.len(), 1, "{}", render(&name));
+        assert!(render(&name).contains("column `a.b`"));
+
+        let ty = errors("table: dbo.t\ncolumns:\n  ab: {type: \"int(\"}\n");
+        assert_eq!(ty.len(), 1, "{}", render(&ty));
+        assert!(render(&ty).contains("unclosed parenthesis"));
+
+        load_table_str(p(), "table: dbo.t\ncolumns:\n  ab: {type: int}\n")
+            .expect("a plain name and a valid type load");
+    }
+
     fn render(errs: &[LoadError]) -> String {
         errs.iter()
             .map(|e| format!("{e:?}: {e}"))
