@@ -228,6 +228,7 @@ fn derived(
     object: &ObjectIdentity,
     input: &super::manifest::Input,
     paths: &Paths,
+    routines: &BTreeMap<ObjectIdentity, super::manifest::Input>,
 ) -> BTreeSet<CandidateSet> {
     let mut sets = BTreeSet::from([CandidateSet {
         class: CandidateClass::Cast,
@@ -250,11 +251,12 @@ fn derived(
         // be a call a same-named routine would now take, and a routine
         // binding one a same-named type would now take (measured on 16 and
         // 18: `foo('x')` calls foo(text) until a type `foo` exists). A cast
-        // takes exactly one argument, so only a one-argument routine can be
+        // takes exactly one argument, so only a routine a one-argument call
+        // can reach — its declared count, less defaults, variadic — can be
         // displaced by a type.
         let classes: &[CandidateClass] = match class {
             CandidateClass::Type => &[CandidateClass::Type, CandidateClass::Routine],
-            CandidateClass::Routine if target.signature.len() == 1 => {
+            CandidateClass::Routine if callable_with_one(routines, target) => {
                 &[CandidateClass::Type, CandidateClass::Routine]
             }
             CandidateClass::Routine => &[CandidateClass::Routine],
@@ -284,7 +286,7 @@ fn derived(
 pub fn scope(desired: &CapturedInputs, managed: &[&Managed], paths: &Paths) -> CaptureScope {
     let mut candidates: BTreeSet<CandidateSet> = managed.iter().flat_map(|m| m.scope()).collect();
     for (object, input) in surfaces(desired) {
-        candidates.extend(derived(object, input, paths));
+        candidates.extend(derived(object, input, paths, &desired.inputs));
     }
     CaptureScope {
         retained: BTreeSet::new(),
@@ -374,11 +376,14 @@ pub fn assess(
             Verdict::Unresolved {
                 condition: "a binding names a role, which scratch reproduces under another name",
             }
-        } else if !derived(object, input, paths).iter().all(&faithful) {
+        } else if !derived(object, input, paths, &desired.inputs)
+            .iter()
+            .all(&faithful)
+        {
             Verdict::Unresolved {
                 condition: "a same-named candidate on the target was not reconstructed on scratch",
             }
-        } else if compiled_early(object, input, order) {
+        } else if compiled_early(object, input, order, &desired.inputs) {
             Verdict::Unresolved {
                 condition: "the declaration was compiled before an object sharing a name it bound",
             }
@@ -412,12 +417,36 @@ fn properties_equal(left: &BTreeMap<String, Value>, right: &BTreeMap<String, Val
     strip(left) == strip(right)
 }
 
+/// Whether a call with exactly one argument can reach `routine`: its
+/// declared argument count less its defaults is at most one, and it takes at
+/// least one or is variadic. The count at the call site is not in the
+/// binding, so every routine such a call could reach counts; one whose
+/// properties are unreadable counts too.
+fn callable_with_one(
+    routines: &BTreeMap<ObjectIdentity, super::manifest::Input>,
+    routine: &ObjectIdentity,
+) -> bool {
+    let Some(input) = routines.get(routine) else {
+        return true;
+    };
+    let number = |field: &str| input.properties.get(field).and_then(Value::as_u64);
+    let (Some(arguments), Some(defaults)) = (number("pronargs"), number("pronargdefaults")) else {
+        return true;
+    };
+    let variadic = input
+        .properties
+        .get("provariadic")
+        .is_none_or(|value| !value.is_null());
+    arguments.saturating_sub(defaults) <= 1 && (arguments >= 1 || variadic)
+}
+
 /// Whether the module this surface belongs to bound a name that only came
 /// into being later in the reconstruction.
 fn compiled_early(
     object: &ObjectIdentity,
     input: &super::manifest::Input,
     order: &crate::resolver::reconstruct::Reconstruction,
+    routines: &BTreeMap<ObjectIdentity, super::manifest::Input>,
 ) -> bool {
     let Some(later) = order.later_names(owner(object)) else {
         return false;
@@ -426,9 +455,14 @@ fn compiled_early(
     // named like a routine a view calls could not have taken that call.
     input.bindings.iter().any(|binding| {
         binding.target.name.last().is_some_and(|bound| {
-            later
-                .iter()
-                .any(|(kind, name)| *name == bound && kind.shadows(&binding.target))
+            later.iter().any(|(kind, name)| {
+                *name == bound
+                    && kind.shadows(
+                        &binding.target.class,
+                        binding.target.class == "pg_proc"
+                            && callable_with_one(routines, &binding.target),
+                    )
+            })
         })
     })
 }
@@ -572,7 +606,7 @@ mod tests {
             vec!["shared".to_owned(), "pg_temp".to_owned()],
             BTreeMap::new(),
         );
-        let sets = derived(&view, &input, &paths);
+        let sets = derived(&view, &input, &paths, &BTreeMap::new());
         let set = |class, namespace: Option<&str>, name: Option<&str>| CandidateSet {
             class,
             namespace: namespace.map(str::to_owned),
@@ -592,17 +626,35 @@ mod tests {
                 set(CandidateClass::Type, Some("util"), Some("f")),
             ])
         );
-        // A call of any other arity cannot be a cast, so a routine bound
-        // with no argument derives no type sets.
-        let nullary = Input {
-            properties: BTreeMap::new(),
-            bindings: vec![bound(id("pg_proc", &["util", "f"], Vec::new()))],
-        };
-        assert!(
-            !derived(&view, &nullary, &paths)
+        // A call no one-argument call can reach cannot be a cast, so it
+        // derives no type sets; a routine a single argument reaches through
+        // its defaults does.
+        let routine = |arguments: u64, defaults: u64| {
+            let target = id("pg_proc", &["util", "f"], Vec::new());
+            let properties = BTreeMap::from([
+                ("pronargs".to_owned(), json!(arguments)),
+                ("pronargdefaults".to_owned(), json!(defaults)),
+                ("provariadic".to_owned(), Value::Null),
+            ]);
+            let call = Input {
+                properties: BTreeMap::new(),
+                bindings: vec![bound(target.clone())],
+            };
+            let catalog = BTreeMap::from([(
+                target,
+                Input {
+                    properties,
+                    bindings: Vec::new(),
+                },
+            )]);
+            derived(&view, &call, &paths, &catalog)
                 .iter()
                 .any(|set| set.class == CandidateClass::Type)
-        );
+        };
+        assert!(!routine(0, 0), "a nullary call is not a cast");
+        assert!(!routine(2, 0), "two required arguments are not a cast");
+        assert!(routine(1, 0));
+        assert!(routine(2, 1), "a defaulted second argument leaves one");
         // An extra the deployer cannot use is not on its measured path, so
         // nothing in it is a candidate.
         let measured = Paths::new(
@@ -612,7 +664,7 @@ mod tests {
                 vec!["pg_catalog".to_owned(), "app".to_owned()],
             )]),
         );
-        let visible = derived(&view, &input, &measured);
+        let visible = derived(&view, &input, &measured, &BTreeMap::new());
         assert!(
             !visible
                 .iter()

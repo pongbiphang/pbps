@@ -1186,3 +1186,43 @@ async fn a_type_cannot_take_a_call_that_is_not_a_cast() {
         );
     }
 }
+
+/// The call site's arity, not the declaration's: `foo('x')` reaches
+/// foo(text, integer DEFAULT 0) with one argument, and a type `foo` arriving
+/// after the view turns the same call into a cast (measured on 16 and 18).
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_type_can_take_a_call_that_defaults_reduce_to_one_argument() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let declared = || {
+            Declared::default()
+                .function(
+                    "app.foo(text,integer)",
+                    "(text, integer DEFAULT 0) RETURNS text LANGUAGE sql IMMUTABLE RETURN 'routine'",
+                )
+                .view("app.v", "SELECT foo('x')::text AS x")
+        };
+        let assessment = analyze(
+            &server,
+            "defaulted",
+            Case {
+                schemas: &["app"],
+                extras: &[],
+                target: "
+                    SET search_path = app;
+                    CREATE FUNCTION foo(text, integer DEFAULT 0) RETURNS text LANGUAGE sql IMMUTABLE RETURN 'routine';
+                    CREATE VIEW app.v AS SELECT foo('x')::text AS x;
+                    CREATE TYPE app.foo AS ENUM ('x');",
+                base: declared(),
+                desired: declared(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(only(&assessment, "app", "v"), Verdict::Unresolved { .. }),
+            "{variable}: {assessment:#?}"
+        );
+    }
+}

@@ -913,7 +913,7 @@ preferred binds the other one silently. That is detected from the captured
 bindings instead of prevented: a module that bound any name first made
 nameable later in the reconstruction, by an object that could have been
 resolved in its place, is unresolved: a later relation for a relation, a row
-type or a one-argument call (its row type can take `t(x)`), a later routine for a routine
+type or a call a single argument can reach (its row type can take `t(x)`), a later routine for a routine
 or a function-style cast, a later index for a relation only. The check is by name within those kinds, so it is
 conservative — a qualified reference it cannot tell from a bare one is
 flagged too — and a `depends_on` edge that moves the other object first
@@ -940,8 +940,8 @@ routine, type, operator, collation or operator class/family name, looked up in
 every schema of the deployer's effective path as the analysis scope measured it
 (`pg_catalog`, then the write path's schemas it may use; an extra without
 `USAGE` is not searched) and in the schema it bound into; a bound type name
-is looked up as a routine too and a bound one-argument routine name as a
-type, since `t(x)` is an exact call, else a cast to `t`, else the
+is looked up as a routine too, and a bound routine a one-argument call can
+reach (its declared count less defaults, or variadic) as a type, since `t(x)` is an exact call, else a cast to `t`, else the
 best-matching call, and a cast takes exactly one argument —
 plus every cast, which resolution consults with no name. A
 declaration the plan leaves unchanged has the same text on both sides and
