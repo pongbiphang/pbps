@@ -1,10 +1,7 @@
 //! Read the recorded schema and identity map on the capture's own snapshot.
 //! No migration, table creation, or public checksum/source output occurs here.
 
-use super::{
-    logical::{self, Catalog},
-    read::Failure,
-};
+use super::{logical::Catalog, read::Failure};
 use pbps_db::transport::QueryConnection;
 use serde_json::Value;
 
@@ -20,6 +17,35 @@ pub(super) async fn read(
     conn: &mut impl QueryConnection,
     catalog: &Catalog,
 ) -> Result<Baseline, Failure> {
+    // Use the write path's complete recipe/editor rule, on this capture's
+    // already-owned canonical snapshot. The source/type closure has qualified
+    // before any of these facts may call a catalog renderer. The surrounding
+    // raw/rendered/fresh witnesses cover every catalog this query consults.
+    let facts = conn
+        .query(&crate::state::ledger_facts())
+        .await
+        .map_err(|_| Failure::Read)?;
+    let account = conn
+        .query("SELECT current_user::text AS me")
+        .await
+        .map_err(|_| Failure::Read)?;
+    let [account] = account.as_slice() else {
+        return Err(Failure::Incomplete);
+    };
+    let account = account
+        .try_get::<&str>("me")
+        .map_err(|_| Failure::Incomplete)?
+        .ok_or(Failure::Incomplete)?;
+    let problems = crate::state::ledger_problems_from_facts(&facts, account)
+        .map_err(|_| Failure::Incomplete)?;
+    if !problems.is_empty() {
+        // Recipe differences may contain private defaults or role names.
+        // The capture boundary reports the failed qualification, never SQL.
+        return Err(Failure::Coverage(super::Uncovered::class(
+            "recorded-baseline",
+            "ledger recipe or editor is not qualified",
+        )));
+    }
     let mut relations = catalog.rows["pg_class"].iter().filter(|row| {
         catalog.identity("pg_class", row).is_ok_and(|id| {
             id.name
@@ -29,61 +55,15 @@ pub(super) async fn read(
                 ]
         })
     });
-    let Some(relation) = relations.next() else {
+    if relations.next().is_none() {
         return Ok(Baseline::Absent);
-    };
-    if relations.next().is_some()
-        || logical::string(relation, "relkind") != Ok("r")
-        || relation.get("relrowsecurity") != Some(&Value::Bool(false))
-    {
-        return Err(Failure::Incomplete);
     }
-    let relation = logical::number(relation, "oid").map_err(|_| Failure::Incomplete)?;
-    let mut id_number = None;
-    for (name, kind) in [("id", "int8"), ("state_json", "text")] {
-        let matching: Vec<_> = catalog.rows["pg_attribute"]
-            .iter()
-            .filter(|row| {
-                logical::number(row, "attrelid") == Ok(relation)
-                    && logical::string(row, "attname") == Ok(name)
-                    && row.get("attisdropped") == Some(&Value::Bool(false))
-            })
-            .collect();
-        let [attribute] = matching.as_slice() else {
-            return Err(Failure::Incomplete);
-        };
-        let id = catalog
-            .object(
-                "pg_type",
-                logical::number(attribute, "atttypid").map_err(|_| Failure::Incomplete)?,
-            )
-            .map_err(|_| Failure::Incomplete)?;
-        if id.name != ["pg_catalog", kind]
-            || attribute.get("attnotnull") != Some(&Value::Bool(true))
-        {
-            return Err(Failure::Incomplete);
-        }
-        if name == "id" {
-            id_number =
-                Some(logical::signed(attribute, "attnum").map_err(|_| Failure::Incomplete)?);
-        }
-    }
-    let key = serde_json::json!([id_number.ok_or(Failure::Incomplete)?]);
-    if !catalog.rows["pg_constraint"].iter().any(|row| {
-        logical::number(row, "conrelid") == Ok(relation)
-            && logical::string(row, "contype") == Ok("p")
-            && row.get("conkey") == Some(&key)
-            && row.get("convalidated") == Some(&Value::Bool(true))
-            && row.get("condeferrable") == Some(&Value::Bool(false))
-            && row
-                .get("conenforced")
-                .is_none_or(|value| value == &Value::Bool(true))
-    }) {
+    if relations.next().is_some() {
         return Err(Failure::Incomplete);
     }
     let rows = conn
         .query(
-            "SELECT id::text AS id, state_json FROM public.__pbps_state ORDER BY id DESC LIMIT 1",
+            "SELECT id::text AS id, state_json FROM ONLY public.__pbps_state ORDER BY id DESC LIMIT 1",
         )
         .await
         .map_err(|_| Failure::Read)?;
@@ -116,3 +96,6 @@ pub(super) async fn read(
     let state = serde_json::from_str(text).map_err(|_| Failure::Incomplete)?;
     Ok(Baseline::Recorded { entry, state })
 }
+
+#[cfg(test)]
+mod tests;
