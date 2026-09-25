@@ -969,8 +969,8 @@ which says how to add an entry here.
 
 <a id="dec-319-1"></a>
 
-**DEC-319.1. A PostgreSQL plan pins every unmanaged routine a non-superuser
-can replace, under the environment's key, and `apply` refuses a changed pin before its
+**DEC-319.1. A PostgreSQL plan pins every unmanaged routine not held only by
+superusers, under the environment's key, and `apply` refuses a changed pin before its
 probes, before its DDL and before it commits (#319; planned).** The drift check
 (SPEC §7.6) covers the managed set, and SPEC §8.2 leaves everything else out of
 the comparison. It says nothing about the code a plan runs. A CHECK the plan adds
@@ -1013,26 +1013,33 @@ writes commits with the approved changes.
 both conditions:
 - it is not in the plan's managed set, whose routines the drift check and the
   read-back already hold;
-- a role that is not a superuser can replace it. A role can replace a routine
-  when it holds the owner's rights, either through inheritance
-  (`pg_has_role(role, owner, 'USAGE')`, DECISIONS 450) or through a `SET` path
-  (`pg_has_role(role, owner, 'SET')` from PostgreSQL 16; before 16, every
-  membership can `SET ROLE`, so `'MEMBER'`). A membership granted `INHERIT
-  FALSE, SET FALSE` confers neither. `pg_has_role` still reports `MEMBER`
-  for it, but the member's `CREATE OR REPLACE` fails with "must be owner",
-  measured on 18.6.
+- it is not held only by superusers. It is held only by superusers when its
+  owner is a superuser and every role that is a member of the owner, by any
+  path and with any grant options (`pg_has_role(role, owner, 'MEMBER')`), is
+  a superuser too. Every other routine is pinned, whatever its owner can log
+  in to, create or be granted.
 
-  The roles tested are the *actors*, as the ledger editor rule defines them.
-  An actor is a role that can log in, or any role with a backend connected to
-  this database in `pg_stat_activity` (DEC-862.1). A role that is neither
-  acts only through its members, and they are tested in their own right. A
-  `NOLOGIN` owner with no member and no session therefore makes nothing
-  replaceable. An actor that is a superuser, or that can become the deployment
-  account (DEC-834.1's trust), is not counted: nothing pbps checks restrains
-  the first, and the second is the deployer. The extension-owner test below
-  uses the same actors. A role that gains `LOGIN`, a session or a membership
-  between plan and apply brings its routines into the recomputed set, and that
-  refuses like any other change.
+  The test deliberately asks less than "who can replace this routine today".
+  Two review rounds of PR #985 narrowed it that way. The first counted only
+  roles with the owner's rights through `USAGE` or `SET`. The second counted
+  only actors in DEC-862.1's sense, meaning login roles and roles with a
+  session. The next round found three holes:
+  - `CREATE OR REPLACE` also needs `CREATE` on the schema;
+  - a backend that ran `SET ROLE` to the owner keeps that role after its
+    membership is revoked, while `pg_stat_activity` still names its login role;
+  - the answer changes the moment a grant does.
+
+  Each narrowing re-derives the engine's authorization, the second
+  implementation DECISIONS 521 and DEC-952.1 warn against, and each can only
+  drop a routine that should be pinned. The broad rule's error runs the other
+  way. A routine that no one could in fact replace is pinned anyway, and the
+  cost is that the environment needs a fingerprint key, which DEC-952.1
+  already asks every environment to have. The one exclusion that stays is
+  superuser-only ownership. Nothing pbps checks restrains a superuser, and
+  measured on 18.6, `MEMBER` counts even `INHERIT FALSE, SET FALSE` grants,
+  so no member that could act slips through it. A session that assumed a
+  superuser role while it was a member, and kept it after the revoke, is a
+  superuser session.
 
 No schema is exempt by name. The built-in routines in `pg_catalog` and
 `information_schema` belong to the bootstrap superuser and fall out of the set
@@ -1052,8 +1059,8 @@ member routines is not the only way to change them, though. The extension's
 owner, here the plain role, can run `ALTER EXTENSION … UPDATE`, whose trusted
 script replaces member routines and leaves their owner alone, or it can drop
 the extension and create it at another version. So an extension member is also
-in the set when a non-superuser holds its extension's owner's rights, by the
-same `USAGE` or `SET` test. Its pin input then carries the extension's OID and
+in the set when its extension is not held only by superusers, by the same
+test applied to the extension's owner. Its pin input then carries the extension's OID and
 `extversion` beside the routine. A routine that changes owner,
 or whose owner's membership changes, can enter or leave the set, and that is a
 change like any other.
@@ -1079,9 +1086,11 @@ routine contributes:
 - for a member of an extension a non-superuser controls, the extension's OID
   and `extversion`.
 
-Every reference in the input is an OID and never a name. `regproc` columns
-(`prosupport`, the `pg_aggregate` support functions) are cast to `oid`,
-because `to_jsonb` renders them as bare names. A name is what an approved plan
+Every reference in the input is an OID and never a name. Every `reg*` column is
+cast to `oid`: the `regproc` ones (`prosupport`, the `pg_aggregate` support
+functions) and the `regoperator` sort operator `aggsortop`. `to_jsonb`
+renders them as names, and an operator's name carries its operand types'
+names. A name is what an approved plan
 legitimately changes. Measured on 18.6: a routine taking a table's row type
 kept a byte-identical row, less `proacl`, while the plan-shaped `ALTER TABLE …
 RENAME` and `ALTER ROLE … RENAME` ran. Its `pg_get_function_identity_arguments`
@@ -1102,7 +1111,7 @@ of routines. It still lets a refusal say where the change is.
 *When the plan has no key.* `plan` refuses a database-origin plan whose pin set
 is not empty when its environment has no fingerprint key. The remedy names
 `pbps key generate` and `fingerprint_key_env` / `fingerprint_key_file`. A
-database in which no unmanaged routine is replaceable by a non-superuser needs
+database in which every unmanaged routine is held only by superusers needs
 no key and records no pins. Pins apply
 under every `unmanaged` mode, `error` included. Extension members are left out
 of the unmanaged inventory (DECISIONS 305), so a re-owned extension routine can
