@@ -830,3 +830,9 @@ any trailing space before it, where padding cannot reach. It is one idiom for
 all three comparisons. A `DATALENGTH` test would work too, but only paired
 with its own name: an `IN` list of lengths lets `'__pbps_lock '` through,
 because it is exactly as long as `'__pbps_state'`.
+
+The object-name side is tested `IS NOT NULL` before the sentinel is appended.
+Under `CONCAT_NULL_YIELDS_NULL OFF`, which a server's `user options` can make
+the default and pbps does not pin, `NULL + N'|'` is `N'|'` (measured), so an
+absent table would otherwise read as misspelt and refuse creating the ledger.
+The pull's filter compares `sys` names, which are never NULL.

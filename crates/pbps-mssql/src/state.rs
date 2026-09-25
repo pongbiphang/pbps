@@ -75,7 +75,8 @@ END;";
 const CONFIDENTIAL_FACTS: &str = "\
 DECLARE @o int = OBJECT_ID(N'dbo.__pbps_state_confidential', N'U');
 SELECT 'spelled ' + OBJECT_NAME(@o) COLLATE DATABASE_DEFAULT AS fact
- WHERE (OBJECT_NAME(@o) + N'|') COLLATE Latin1_General_BIN2 <> N'__pbps_state_confidential|'
+ WHERE OBJECT_NAME(@o) IS NOT NULL
+   AND (OBJECT_NAME(@o) + N'|') COLLATE Latin1_General_BIN2 <> N'__pbps_state_confidential|'
 UNION ALL
 SELECT 'column ' + c.name COLLATE DATABASE_DEFAULT + ' '
        + TYPE_NAME(c.user_type_id) COLLATE DATABASE_DEFAULT + ' '
@@ -379,18 +380,23 @@ const DELETE_LOCK: &str = "DELETE FROM dbo.__pbps_lock WHERE id = 1;";
 /// the `|` appended to both sides keeps SQL Server from padding a trailing
 /// space away: `OBJECT_ID` resolves the ledger's name to a project's
 /// `dbo.[__pbps_state ]` on every collation, and a bare `<>` read the two as
-/// equal (#954, measured on the pinned server).
+/// equal (#954, measured on the pinned server). The `IS NOT NULL` comes first
+/// because under `CONCAT_NULL_YIELDS_NULL OFF`, which a server's `user options`
+/// can make the default, `NULL + N'|'` is `N'|'`: an absent table would read as
+/// misspelt and refuse creating the ledger (measured).
 /// An invisible table resolves to NULL and has no row either: that is
 /// [`is_initialized`]'s question, not this one.
 const MISSPELT_LEDGER: &str = "\
 SELECT N'__pbps_state' AS ledger,
        OBJECT_NAME(OBJECT_ID(N'dbo.__pbps_state', N'U')) COLLATE DATABASE_DEFAULT AS found
- WHERE (OBJECT_NAME(OBJECT_ID(N'dbo.__pbps_state', N'U')) + N'|') COLLATE Latin1_General_BIN2
+ WHERE OBJECT_NAME(OBJECT_ID(N'dbo.__pbps_state', N'U')) IS NOT NULL
+   AND (OBJECT_NAME(OBJECT_ID(N'dbo.__pbps_state', N'U')) + N'|') COLLATE Latin1_General_BIN2
        <> N'__pbps_state|'
 UNION ALL
 SELECT N'__pbps_lock' AS ledger,
        OBJECT_NAME(OBJECT_ID(N'dbo.__pbps_lock', N'U')) COLLATE DATABASE_DEFAULT AS found
- WHERE (OBJECT_NAME(OBJECT_ID(N'dbo.__pbps_lock', N'U')) + N'|') COLLATE Latin1_General_BIN2
+ WHERE OBJECT_NAME(OBJECT_ID(N'dbo.__pbps_lock', N'U')) IS NOT NULL
+   AND (OBJECT_NAME(OBJECT_ID(N'dbo.__pbps_lock', N'U')) + N'|') COLLATE Latin1_General_BIN2
        <> N'__pbps_lock|';";
 
 /// Refuses when a ledger name resolves to a project's table spelled otherwise

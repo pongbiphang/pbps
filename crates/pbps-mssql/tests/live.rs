@@ -2444,6 +2444,46 @@ async fn a_project_table_padded_onto_the_protected_name_is_refused() {
     db.drop().await;
 }
 
+/// Review of #962: under `CONCAT_NULL_YIELDS_NULL OFF`, which a server's `user
+/// options` can make every session's default, `NULL + N'|'` is `N'|'`. The
+/// spelling checks append that sentinel, so without their `IS NOT NULL` guard an
+/// absent ledger read as misspelt and a fresh database could not be recorded to.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn an_absent_ledger_is_not_misspelt_when_null_concatenation_is_off() {
+    let mut db = TestDb::create("concat_null962").await;
+    db.conn
+        .execute("SET CONCAT_NULL_YIELDS_NULL OFF;")
+        .await
+        .unwrap();
+    let schema = Schema::default();
+    let ids = IdsFile::default();
+    assert!(
+        pbps_mssql::state::protected_table_problems(&mut db.conn)
+            .await
+            .unwrap()
+            .is_empty(),
+        "an absent protected table has no problems"
+    );
+    pbps_mssql::state::record(
+        &mut db.conn,
+        &snapshot(pbps_model::StateKind::Apply, &schema, &ids),
+    )
+    .await
+    .expect("a fresh ledger is created and recorded to");
+    let mut full = snapshot(pbps_model::StateKind::Apply, &schema, &ids);
+    full.plan_checksum = Some("e".repeat(64));
+    let stub = snapshot(pbps_model::StateKind::Apply, &schema, &ids);
+    pbps_mssql::state::record_confidential(&mut db.conn, &stub, &full)
+        .await
+        .expect("a fresh protected table is created and recorded to");
+    pbps_mssql::state::lock(&mut db.conn, "live-test")
+        .await
+        .unwrap();
+    assert!(pbps_mssql::state::unlock(&mut db.conn).await.unwrap());
+    db.drop().await;
+}
+
 /// #894: the same fold for the ordinary ledger. On a case-insensitive database
 /// `OBJECT_ID(N'dbo.__pbps_state')` resolves to a project's own
 /// `dbo.__PBPS_STATE`, so `ensure_tables` skipped creating the ledger and every
