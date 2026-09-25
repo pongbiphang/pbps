@@ -5764,6 +5764,40 @@ mod tests {
         assert_eq!(kinds(&cs), ["RenameTable", "DropCheck"], "{cs:?}");
     }
 
+    /// Review of #969: the move carries a check the table keeps into its
+    /// destination, where the plan drops another table's check of that name.
+    /// That drop has to go first, and it is addressed as it is.
+    #[test]
+    fn a_destination_constraint_a_moved_table_would_collide_with_is_dropped_first() {
+        let check = || pbps_model::schema::CheckConstraint {
+            expression: "id > 0".into(),
+        };
+        let mut old_t = table(&[("id", Column::new(ty("int")))]);
+        old_t.checks.insert("c".into(), check());
+        let mut other = table(&[("id", Column::new(ty("int")))]);
+        other.checks.insert("c".into(), check());
+        let base = two_tables(("s1.old", old_t.clone()), ("s2.other", other));
+        let declared = two_tables(
+            ("s2.new", old_t),
+            ("s2.other", table(&[("id", Column::new(ty("int")))])),
+        );
+        let cs = run_with(
+            &MinimalDialect,
+            &base,
+            &declared,
+            &[Intent::RenameTable {
+                from: "s1.old".parse().unwrap(),
+                to: "s2.new".parse().unwrap(),
+            }],
+        );
+        assert_eq!(kinds(&cs), ["DropCheck", "RenameTable"], "{cs:?}");
+        assert_eq!(
+            cs.changes[0].change.table().unwrap().clone(),
+            "s2.other".parse().unwrap(),
+            "{cs:?}"
+        );
+    }
+
     /// The same for a foreign key, the other constraint no index backs.
     #[test]
     fn a_dropped_foreign_key_that_frees_a_renamed_targets_name_precedes_the_rename() {

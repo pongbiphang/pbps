@@ -41,6 +41,17 @@ pub(crate) fn order(
                     .entry(TableName::new(to.schema.clone(), from.name.clone()))
                     .or_default()
                     .insert(i);
+                // And the move carries the table's own named indexes or
+                // constraints into the destination, where a same-named one on
+                // another table has to be dropped first (review of #969).
+                if let Some(moving) = base.schema.tables.get(from) {
+                    for carried in carried_names(moving, indexes, constraints) {
+                        claims
+                            .entry(TableName::new(to.schema.clone(), carried))
+                            .or_default()
+                            .insert(i);
+                    }
+                }
             }
         }
     }
@@ -195,6 +206,25 @@ pub(crate) fn order(
             planned.push(pending[i].take().expect("not selected"));
         }
     }
+}
+
+/// The names a table takes into its schema's table namespace besides its own:
+/// the same kinds [`dropped_relation`] releases, by the dialect's two answers.
+fn carried_names(
+    table: &pbps_model::schema::Table,
+    indexes: bool,
+    constraints: bool,
+) -> Vec<String> {
+    let mut names: Vec<String> = table.unique.keys().cloned().collect();
+    names.extend(table.primary_key.as_ref().and_then(|pk| pk.name.clone()));
+    if indexes {
+        names.extend(table.indexes.keys().cloned());
+    }
+    if constraints {
+        names.extend(table.checks.keys().cloned());
+        names.extend(table.foreign_keys.keys().cloned());
+    }
+    names
 }
 
 /// The table and name a change releases in its schema's table namespace, if

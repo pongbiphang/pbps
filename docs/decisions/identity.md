@@ -529,7 +529,9 @@ share the namespace, and a check or foreign key only where constraints do.
 A table moved to another schema carries its constraints (SQL Server's
 `TRANSFER`) or indexes (PostgreSQL's `SET SCHEMA`) into it, and a name held
 there refuses the move (Msg 15530, measured). So each one the plan drops anyway
-goes before the move, addressed by the source name.
+goes before the move, addressed by the source name. The ones it keeps are claims
+in the destination, and a same-named constraint or index the plan drops there,
+on another table, goes before the move too.
 
 The default constraints the emitter names itself are in that namespace too
 (#969), and `DF_{table}_{column}` did not say where the table ended:
