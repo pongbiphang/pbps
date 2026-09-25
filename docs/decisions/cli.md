@@ -672,13 +672,17 @@ Two tests in `integration` hold the part a reviewer cannot see.
     misspelt key.
   - `Discovery`'s `observations` and `qualification` maps. They accept new
     keys whose values are `Observation`s, and nothing else.
-- `a_constrained_object_changes_only_with_the_wire_version` compares each
-  constrained object with every archived schema set stamped with the same wire
-  version, descriptions aside. Archives never change, so an edit to one of these
-  objects fails until `output::SCHEMA_VERSION` moves. The comparison is
-  conservative: it also refuses a change the old document would still accept,
-  such as removing an optional property from a closed object. Deciding JSON
-  Schema containment in general is not attempted (DECISIONS 465).
+- `a_constrained_object_changes_only_with_the_wire_version` checks each
+  constrained object against every archived schema set stamped with the same
+  wire version. The archive must still accept what the object now describes.
+  A property may be dropped or become required. A property may not be added,
+  stop being required or change its own schema, and no other keyword may
+  change. Descriptions are ignored where they annotate a schema, but not where
+  `description` names a property. Archives never change, so a change the old
+  document would refuse fails until `output::SCHEMA_VERSION` moves. A
+  property's own schema is compared by equality, so a narrowing inside it is
+  refused conservatively. Deciding JSON Schema containment in general is not
+  attempted (DECISIONS 465).
 
 `pbps-ui`'s contract types use `deny_unknown_fields` on purpose. They ship in
 the same binary as the CLI they read (ADR-0015 decision 6), and each addition

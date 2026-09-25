@@ -501,11 +501,11 @@ mod tests {
 
     /// Naming the constrained objects says where an addition is breaking; this
     /// says that such a change moves the wire version. Every archived envelope
-    /// document stamped with the current `output::SCHEMA_VERSION` must hold
-    /// each constrained object this build still publishes exactly as it is now,
-    /// descriptions aside. The archives never change (DECISIONS 465), so
-    /// editing one of these objects fails here until the wire version and the
-    /// schema's `const` move with it (DECISIONS 224, DEC-997.1).
+    /// document stamped with the current `output::SCHEMA_VERSION` must still
+    /// accept each constrained object this build publishes (`still_accepted`,
+    /// descriptions aside). The archives never change (DECISIONS 465), so a
+    /// change the old document would refuse fails here until the wire version
+    /// and the schema's `const` move with it (DECISIONS 224, DEC-997.1).
     #[test]
     fn a_constrained_object_changes_only_with_the_wire_version() {
         let current = constrained_objects(&schema(SchemaKind::Envelope));
@@ -525,11 +525,13 @@ mod tests {
             }
             for (path, then) in constrained_objects(&archived) {
                 if let Some(now) = current.get(&path) {
-                    assert_eq!(
-                        now, &then,
-                        "`{path}` differs from schema set {version} under the same envelope \
-                         wire version; move output::SCHEMA_VERSION (DEC-997.1)"
-                    );
+                    if let Err(why) = still_accepted(&then, now) {
+                        panic!(
+                            "`{path}` {why}, which schema set {version} refuses under the \
+                             same envelope wire version; move output::SCHEMA_VERSION \
+                             (DEC-997.1)"
+                        );
+                    }
                     compared += 1;
                 }
             }
@@ -538,6 +540,100 @@ mod tests {
             compared > 0,
             "no archive under this wire version was compared"
         );
+    }
+
+    /// Whether every value `now` describes is accepted by `then`, for one
+    /// constrained object. A property may be dropped and a property may become
+    /// required; a property may not appear, stop being required, or change its
+    /// own schema, and nothing else about the object may change. Comparing a
+    /// property's schema by equality is conservative: deciding JSON Schema
+    /// containment in general is not attempted (DECISIONS 465).
+    fn still_accepted(then: &serde_json::Value, now: &serde_json::Value) -> Result<(), String> {
+        let empty = serde_json::Map::new();
+        let properties = |schema: &serde_json::Value| {
+            schema
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let required = |schema: &serde_json::Value| -> std::collections::BTreeSet<String> {
+            schema
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|name| name.as_str().map(str::to_owned))
+                .collect()
+        };
+        let (was, is) = (properties(then), properties(now));
+        for (name, schema) in &is {
+            match was.get(name) {
+                None => return Err(format!("adds property `{name}`")),
+                Some(old) if old != schema => return Err(format!("changes property `{name}`")),
+                Some(_) => {}
+            }
+        }
+        if let Some(name) = required(then).difference(&required(now)).next() {
+            return Err(format!("no longer requires `{name}`"));
+        }
+        let rest = |schema: &serde_json::Value| -> serde_json::Map<String, serde_json::Value> {
+            schema
+                .as_object()
+                .unwrap_or(&empty)
+                .iter()
+                .filter(|(key, _)| !matches!(key.as_str(), "properties" | "required"))
+                .map(|(key, v)| (key.clone(), v.clone()))
+                .collect()
+        };
+        if rest(then) != rest(now) {
+            return Err("changes a keyword other than its properties".to_owned());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_constrained_object_may_drop_an_optional_property_and_nothing_looser() {
+        let then = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "kind": { "const": "docker" }, "pull": { "type": "string" } },
+            "required": ["kind"],
+        });
+        let mut dropped = then.clone();
+        dropped["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pull");
+        assert_eq!(still_accepted(&then, &dropped), Ok(()));
+        let mut tightened = then.clone();
+        tightened["required"] = serde_json::json!(["kind", "pull"]);
+        assert_eq!(still_accepted(&then, &tightened), Ok(()));
+
+        let mut added = then.clone();
+        added["properties"]["platform"] = serde_json::json!({ "type": "string" });
+        assert!(
+            still_accepted(&then, &added)
+                .unwrap_err()
+                .contains("adds property `platform`")
+        );
+        let mut loosened = then.clone();
+        loosened["required"] = serde_json::json!([]);
+        assert!(
+            still_accepted(&then, &loosened)
+                .unwrap_err()
+                .contains("no longer requires `kind`")
+        );
+        let mut retyped = then.clone();
+        retyped["properties"]["pull"] = serde_json::json!({ "type": "integer" });
+        assert!(
+            still_accepted(&then, &retyped)
+                .unwrap_err()
+                .contains("changes property `pull`")
+        );
+        let mut opened = then.clone();
+        opened["additionalProperties"] = serde_json::json!({ "type": "string" });
+        assert!(still_accepted(&then, &opened).is_err());
     }
 
     #[test]
@@ -553,6 +649,7 @@ mod tests {
                     "inner": {
                         "description": "dropped before comparison",
                         "type": "object",
+                        "properties": { "description": { "type": "string" } },
                         "additionalProperties": false
                     }
                 } }] },
@@ -563,7 +660,11 @@ mod tests {
         assert_eq!(names, ["Map", "Nested/oneOf/0/properties/inner"]);
         assert_eq!(
             constrained["Nested/oneOf/0/properties/inner"],
-            serde_json::json!({ "type": "object", "additionalProperties": false })
+            serde_json::json!({
+                "type": "object",
+                "properties": { "description": { "type": "string" } },
+                "additionalProperties": false
+            })
         );
     }
 
@@ -579,12 +680,27 @@ mod tests {
                 Some(_) | None => false,
             }
         }
+        // `description` is dropped where it is a schema's annotation keyword,
+        // never where it names a property: under these keywords the keys are
+        // names, and each value is a schema of its own.
         fn without_descriptions(value: &serde_json::Value) -> serde_json::Value {
             match value {
                 serde_json::Value::Object(map) => map
                     .iter()
                     .filter(|(key, _)| key.as_str() != "description")
-                    .map(|(key, v)| (key.clone(), without_descriptions(v)))
+                    .map(|(key, v)| {
+                        let v = match (key.as_str(), v) {
+                            (
+                                "properties" | "patternProperties" | "$defs" | "dependentSchemas",
+                                serde_json::Value::Object(named),
+                            ) => named
+                                .iter()
+                                .map(|(name, schema)| (name.clone(), without_descriptions(schema)))
+                                .collect(),
+                            _ => without_descriptions(v),
+                        };
+                        (key.clone(), v)
+                    })
                     .collect(),
                 serde_json::Value::Array(items) => items.iter().map(without_descriptions).collect(),
                 serde_json::Value::Null
