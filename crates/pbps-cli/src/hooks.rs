@@ -66,9 +66,28 @@ pub fn run_apply_attempt(
     // failure semantics even if that ever changes: notification must not
     // replace the deployment result.
     match serde_json::to_string(&payload) {
-        Ok(json) => run(command, &json, "on_apply_attempt"),
+        // `apply` has no machine-readable output; its report is for a person.
+        Ok(json) => run(command, &json, "on_apply_attempt", HookStdout::Shared),
         Err(e) => eprintln!("warning: the on_apply_attempt payload could not be serialized: {e}"),
     }
+}
+
+/// Where a hook's own stdout goes (#493).
+///
+/// A hook is the operator's shell command, and what it prints is not this
+/// tool's output. On a human report it may share the terminal, as it always
+/// has. On a machine-readable one it may not: `verify --format json` prints its
+/// envelope first and runs `on_drift` after, so an inherited stdout appended
+/// the hook's text to the document a consumer parses, and a strict consumer
+/// (the local viewer) refused the whole read. The caller says which it is, so
+/// no hook site can forget to choose.
+#[derive(Clone, Copy)]
+pub enum HookStdout {
+    /// Shares the command's stdout: the report there is for a person.
+    Shared,
+    /// Sent to stderr, where diagnostics already go: stdout is one typed
+    /// document and nothing may follow it.
+    Stderr,
 }
 
 /// Runs `command` through the platform shell with `payload` on stdin.
@@ -76,10 +95,14 @@ pub fn run_apply_attempt(
 /// The shell is what makes the hook a one-liner in `pbps.yml` — pipes,
 /// redirection and `$VAR` all work, and the alternative would be a config
 /// format that reinvents argv.
-pub fn run(command: &str, payload: &str, what: &str) {
+pub fn run(command: &str, payload: &str, what: &str, stdout: HookStdout) {
     let mut shell = platform_shell(command);
+    shell.stdin(Stdio::piped()).env("PBPS_HOOK", what);
+    if let HookStdout::Stderr = stdout {
+        shell.stdout(std::io::stderr());
+    }
 
-    let child = shell.stdin(Stdio::piped()).env("PBPS_HOOK", what).spawn();
+    let child = shell.spawn();
 
     let mut child = match child {
         Ok(c) => c,

@@ -3018,7 +3018,14 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
 
     if report.has_drift() {
         if let Some(hook) = &project.config.hooks.on_drift {
-            crate::hooks::run(hook, &payload, "on_drift");
+            // After the envelope under `--format json`: the hook's own output
+            // must not become trailing bytes of that document (#493).
+            let stdout = if json {
+                crate::hooks::HookStdout::Stderr
+            } else {
+                crate::hooks::HookStdout::Shared
+            };
+            crate::hooks::run(hook, &payload, "on_drift", stdout);
         }
         // A distinct exit code so a scheduled pipeline can tell "the database moved"
         // from "the tool could not run" — the two need different people woken up.
@@ -4287,7 +4294,7 @@ pub fn cmd_apply(
             // own key so existing success-only integrations cannot be invoked
             // on a failure or misread an unrelated payload shape.
             if let Some(hook) = &project.config.hooks.on_apply {
-                crate::hooks::run(hook, &raw, "on_apply");
+                crate::hooks::run(hook, &raw, "on_apply", crate::hooks::HookStdout::Shared);
             }
             if let Some(hook) = &project.config.hooks.on_apply_attempt {
                 crate::hooks::run_apply_attempt(
