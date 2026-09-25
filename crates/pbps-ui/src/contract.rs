@@ -117,8 +117,16 @@ pub struct Explanation {
     pub approve_with: String,
     pub plan_path: Option<String>,
     pub probes: Vec<String>,
+    pub unchecked: Vec<Unchecked>,
     pub statement_count: usize,
     pub target: Option<Target>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Unchecked {
+    pub check: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

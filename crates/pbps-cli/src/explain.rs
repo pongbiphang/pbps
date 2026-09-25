@@ -65,6 +65,13 @@ pub struct Explanation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_path: Option<String>,
     pub probes: Vec<String>,
+    /// Checks the plan implies but that cannot be asked before it runs — a
+    /// predicate over rows the plan itself writes, say. Kept apart from
+    /// [`Explanation::probes`]: those are counted against the data before the
+    /// first statement, these are left to the engine inside the apply, and a
+    /// reviewer shown only the first list would read the second as absent
+    /// (#478).
+    pub unchecked: Vec<UncheckedDetail>,
     /// Statements the plan will run. Counted, not listed: the SQL is
     /// `plan --sql`'s job, and duplicating it here would invite a reviewer to
     /// read one and approve the other.
@@ -79,6 +86,14 @@ pub struct RiskDetail {
     pub class: &'static str,
     pub why: &'static str,
     pub changes: Vec<String>,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct UncheckedDetail {
+    /// The check, naming the object it is about.
+    pub check: String,
+    /// Why it cannot be asked before the plan runs.
+    pub reason: String,
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
@@ -356,6 +371,7 @@ fn explain(
         )
     };
 
+    let preflight = dialect.preflight(cs);
     Ok(Explanation {
         applyable: plan.origin.is_applyable(),
         dialect: plan.dialect.clone(),
@@ -374,11 +390,18 @@ fn explain(
         risks,
         approve_with: approve,
         plan_path: (plan_arg == placeholder("plan path")).then_some(literal),
-        probes: dialect
-            .preflight(cs)
+        probes: preflight
             .probes
             .into_iter()
             .map(|p| p.description)
+            .collect(),
+        unchecked: preflight
+            .unchecked
+            .into_iter()
+            .map(|u| UncheckedDetail {
+                check: u.description,
+                reason: u.reason,
+            })
             .collect(),
         statement_count: crate::statements(cs, dialect)?.len(),
         target: match target {
@@ -608,11 +631,13 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
     }
 
     out.push_str("\nChecks that run before the first statement\n");
-    if e.probes.is_empty() {
+    if e.probes.is_empty() && e.unchecked.is_empty() {
         // Not "everything is fine": a plan with nothing to probe is the ordinary
         // case, and phrasing it as reassurance would make the reviewer read a
         // silence as a clearance.
         out.push_str("  None: no change in this plan has a hazard that today's data can answer.\n");
+    } else if e.probes.is_empty() {
+        out.push_str("  None can run: each check this plan implies is listed below.\n");
     } else {
         for p in &e.probes {
             out.push_str(&format!("  - {p}\n"));
@@ -620,6 +645,19 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
         out.push_str(
             "  Each counts the rows that would break. A non-zero count stops the apply before\n  \
              the first statement runs.\n",
+        );
+    }
+    if !e.unchecked.is_empty() {
+        // Named as a gap, not folded into the list above: these were never
+        // asked, and apply says so as it runs. A reviewer who met them first
+        // in apply's warnings approved without seeing them (#478).
+        out.push_str("\nChecks that cannot run before the plan\n");
+        for u in &e.unchecked {
+            out.push_str(&format!("  - {}: {}\n", u.check, u.reason));
+        }
+        out.push_str(
+            "  Nothing counts these rows beforehand. The engine enforces each one when the\n  \
+             apply reaches it, and a violation fails the apply at that statement.\n",
         );
     }
 

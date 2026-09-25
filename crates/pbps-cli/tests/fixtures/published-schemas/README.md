@@ -37,3 +37,5 @@ The schema-set version is independent of the emitted envelope's
 DECISIONS 465).
 - `15/` adds an environment's `fingerprint_key_env` and `fingerprint_key_file`,
   naming where its fingerprint key is read from (issue #952, DEC-952.1).
+- `16/` adds `explain`'s `unchecked`, the checks a plan implies that cannot be asked
+  before it runs, apart from its executable `probes` (issue #478).
