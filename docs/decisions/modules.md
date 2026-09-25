@@ -1387,7 +1387,6 @@ the refusal (2026-09-25).
   definer's pinned path, which is what this entry fixes. A helper that is itself
   a definer is held to the same form only when the plan writes it.
 
-
 <a id="dec-942-1"></a>
 
 **DEC-942.1. When a PostgreSQL plan rebuilds a function, what the plan itself
