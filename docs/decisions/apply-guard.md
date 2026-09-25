@@ -966,3 +966,221 @@ which says how to add an entry here.
     own uncommitted `CREATE TABLE` and the row it inserted, which is the
     whole reason it exists. Reverting the CLI's two `InsideOwnTransaction`
     sites to `Snapshot` brings the original refusal back in both flow tests.
+
+<a id="dec-319-1"></a>
+
+**DEC-319.1. A PostgreSQL plan pins every unmanaged routine not held only by
+superusers, under the environment's key, and `apply` refuses a changed pin before its
+probes, before its DDL and before it commits (#319; planned).** The drift check
+(SPEC §7.6) covers the managed set, and SPEC §8.2 leaves everything else out of
+the comparison. It says nothing about the code a plan runs. A CHECK the plan adds
+can call `ext.helper(x)`, which the plan does not manage. The helper's owner can
+replace it after approval, and the deployer runs the new body twice: once in a
+pre-flight probe, and again in the DDL that validates the constraint. #805 made
+the probe read-only (DECISIONS 537), so a write from the probe no longer
+persists. The DDL runs inside the apply transaction, though, and whatever it
+writes commits with the approved changes.
+
+*Why not the obvious fixes.*
+- *Lock the routines.* A deployer that is not a superuser cannot: `SELECT …
+  FROM pg_proc … FOR SHARE` is `permission denied for table pg_proc`, measured
+  on 18.6 for this entry and earlier for module rebuilds (DECISIONS 420). The
+  apply can only detect a replacement, not prevent one.
+- *Compare the text a plan saw.* A plan file that carries an external routine's
+  body, or a bare SHA-256 of it, publishes a guessing oracle for any literal in
+  that body. DEC-952.1 answers exactly this: the fingerprint is an HMAC under the
+  environment's key.
+- *Pin only what the plan can reach.* The first drafts of this entry did that.
+  They started from the plan's text and followed calls, triggers, foreign-key
+  actions and stored expressions. Each review round of PR #985 found another
+  surface through which the engine runs a routine that no statement names:
+  - a cascade's target table;
+  - a table a trigger body writes;
+  - a domain's default;
+  - a row-security policy;
+  - an `INSTEAD OF` trigger, or a view rewritten to its base table.
+
+  The list does not end there. Operators, casts, a type's I/O functions and
+  names built at run time lie on the same road. Every entry on it is a
+  `pg_proc` row, though. Pinning the rows, rather than the paths to them, ends
+  the enumeration. This is the lesson of DEC-952.1 (#880) in another place: stop
+  re-deriving what the engine will do, and pin what it does it with.
+- *Resolve bindings as the engine does.* A declaration the plan has not created
+  yet has no bindings to read, and a PL/pgSQL body binds when it runs. Engine
+  resolution belongs to the resolver (SPEC §9.3.2, #614).
+
+*What is pinned.* Every routine (`pg_proc` row) that meets all three
+conditions:
+- it is not in the plan's managed set;
+- it does not live in a temporary schema. The engine answers this with
+  `pg_is_other_temp_schema(pronamespace)` and `pg_my_temp_schema()`, so no
+  schema is excluded by name. The deployment session cannot resolve another
+  session's `pg_temp_N` routine, and the engine drops that routine when its
+  session ends, so a plan made while one existed would refuse after ordinary
+  cleanup. pbps creates no temporary routine of its own;
+- it is not held only by superusers. It is held only by superusers when its
+  owner is a superuser and every role that is a member of the owner, by any
+  path and with any grant options (`pg_has_role(role, owner, 'MEMBER')`), is
+  a superuser too. Every other routine is pinned, whatever its owner can log
+  in to, create or be granted.
+
+  The test deliberately asks less than "who can replace this routine today".
+  Two review rounds of PR #985 narrowed it that way. The first counted only
+  roles with the owner's rights through `USAGE` or `SET`. The second counted
+  only actors in DEC-862.1's sense, meaning login roles and roles with a
+  session. The next round found three holes:
+  - `CREATE OR REPLACE` also needs `CREATE` on the schema;
+  - a backend that ran `SET ROLE` to the owner keeps that role after its
+    membership is revoked, while `pg_stat_activity` still names its login role;
+  - the answer changes the moment a grant does.
+
+  Each narrowing re-derives the engine's authorization, the second
+  implementation DECISIONS 521 and DEC-952.1 warn against, and each can only
+  drop a routine that should be pinned. The broad rule's error runs the other
+  way. A routine that no one could in fact replace is pinned anyway, and the
+  cost is that the environment needs a fingerprint key, which DEC-952.1
+  already asks every environment to have. The one exclusion that stays is
+  superuser-only ownership. Nothing pbps checks restrains a superuser, and
+  measured on 18.6, `MEMBER` counts even `INHERIT FALSE, SET FALSE` grants,
+  so no member that could act slips through it. A session that assumed a
+  superuser role while it was a member, and kept it after the revoke, is a
+  superuser session.
+
+No other schema is exempt. The built-in routines in `pg_catalog` and
+`information_schema` belong to the bootstrap superuser and fall out of the set
+by the second condition. A routine that an administrator created or re-owned
+there, where a plain role can replace it, stays in.
+
+The last condition is the one that keeps the set small. Only the owner, a
+member of the owner's role, or a superuser can replace or re-own a routine, and
+nothing pbps checks restrains a superuser. Membership counts even into a
+superuser's role. A plain role granted `postgres` replaced a `postgres`-owned
+function with `CREATE OR REPLACE`, measured on 18.6, while `rolsuper` stayed
+false for it. Extension members are included on
+the same terms. A trusted extension that a non-superuser installs still creates
+its routines owned by the bootstrap superuser: pgcrypto's 37, installed by a
+plain role with `CREATE` on the database, measured on 18.6. Owning the
+member routines is not the only way to change them, though. The extension's
+owner, here the plain role, can run `ALTER EXTENSION … UPDATE`, whose trusted
+script replaces member routines and leaves their owner alone, or it can drop
+the extension and create it at another version. So an extension member is also
+in the set when its extension is not held only by superusers, by the same
+test applied to the extension's owner. Its pin input then carries the extension's OID and
+`extversion` beside the routine. A routine that changes owner,
+or whose owner's membership changes, can enter or leave the set, and that is a
+change like any other.
+
+*What a pin holds.* One entry per schema, keyed by the schema's OID. Each is
+an HMAC under the environment's key (DEC-952.1), with rule
+`pbps/external-routine-pin/v1` and the namespace OID as component. The input
+is the canonical list of the schema's in-scope routines, in OID order. Each
+routine contributes:
+- its OID and its **whole `pg_proc` row**, read with `to_jsonb` minus `oid`
+  and minus `proacl`. That covers the body, volatility, `proparallel`,
+  strictness, `SECURITY DEFINER`, `proconfig`, cost and the owner. The column
+  list is not chosen property by property, because a property left off a
+  hand-picked list is a replacement the pin cannot see. An aggregate that
+  changes only `PARALLEL` differs only in `proparallel`, which no
+  `pg_aggregate` column holds. A column a later PostgreSQL release adds joins
+  the input without a code change. A plan and an apply on different server
+  versions refuse before any comparison, because the release is recorded
+  beside the pins;
+- its `proacl` as `aclexplode` rows of grantor OID, grantee OID, privilege and
+  grant option;
+- for an aggregate, its **whole `pg_aggregate` row** too;
+- for a member of an extension a non-superuser controls, the extension's OID
+  and `extversion`.
+
+Every reference in the input is an OID and never a name. Every `reg*` column is
+cast to `oid`: the `regproc` ones (`prosupport`, the `pg_aggregate` support
+functions) and the `regoperator` sort operator `aggsortop`. `to_jsonb`
+renders them as names, and an operator's name carries its operand types'
+names. A name is what an approved plan
+legitimately changes. Measured on 18.6: a routine taking a table's row type
+kept a byte-identical row, less `proacl`, while the plan-shaped `ALTER TABLE …
+RENAME` and `ALTER ROLE … RENAME` ran. Its `pg_get_function_identity_arguments`
+went from `t1` to `t2`, and its `proacl` text changed with the grantee's name.
+Pinning names would make the closing check blame an approved rename on an
+external change. The engine binds these references by OID, so the OID is also
+the faithful input. A routine re-pointed to a different object differs, and a
+renamed object does not. Nothing is deparsed: `pg_get_functiondef` renders
+what the row already holds, and it refuses an aggregate (SQLSTATE 42809).
+
+The deployer can read all of these for another role's routine, even one whose
+`EXECUTE` is revoked from it (measured on 18.6). The saved plan records
+each namespace OID with its name at plan time (for messages only), its digest
+and its routine count, plus the key identifier, in a new plan version. The plan checksum covers them as it covers the rest of the
+file. One entry per schema keeps a plan small when an extension brings hundreds
+of routines. It still lets a refusal say where the change is.
+
+*When the plan has no key.* `plan` refuses a database-origin plan whose pin set
+is not empty when its environment has no fingerprint key. The remedy names
+`pbps key generate` and `fingerprint_key_env` / `fingerprint_key_file`. A
+database in which every unmanaged routine is held only by superusers needs
+no key and records no pins. Pins apply
+under every `unmanaged` mode, `error` included. Extension members are left out
+of the unmanaged inventory (DECISIONS 305), so a re-owned extension routine can
+sit in an `error` plan's database without refusing it.
+
+*When `apply` checks.* `apply` recomputes the set, then compares it with the
+plan's pins in three places:
+- under the deployment lock, after the drift check and before `preflight`, in
+  a snapshot read of its own;
+- inside the apply transaction, after `BEGIN` and before the first statement;
+- after the read-back and before `record`, so a replacement during the DDL
+  rolls the apply back.
+
+The two checks inside the transaction need a fresh snapshot for each
+statement, so the apply transaction opens with `BEGIN ISOLATION LEVEL READ
+COMMITTED` rather than a bare `BEGIN`. A bare `BEGIN` inherits
+`default_transaction_isolation`. Measured on 18.6 with that set to `repeatable
+read` on the database: a transaction's second `SELECT` of a routine's
+`pg_proc` row still returned the old `prosrc` after another session's `CREATE
+OR REPLACE`. A call in that same transaction ran the new body, because the
+engine looks routines up in its catalog snapshot, not the transaction's. A
+closing check under such a snapshot would compare the stale row and pass.
+The explicit level makes the check see what the DDL ran. A staged step opens
+its transaction the same way.
+
+*Managed routines are not pinned.* A routine in the plan's managed set is the
+drift check's and the read-back's (SPEC §7.6), and a pin over it would have to
+predict what the plan's own statements do to its row: a grant, a rebuild, a
+re-owned rebuild. Whether the managed comparison should also hold a routine's
+owner and ACL is a question about SPEC §7.6's managed state, not about
+external routines, and it is #994. A routine the plan itself creates is in the
+managed set, so it never counts as a new unmanaged one. A digest mismatch, a schema that gained or lost pinned
+routines, an unreadable catalog row and a key identifier that is not the plan's
+all refuse. None of them reads as "nothing changed" (AGENTS.md: absent, empty
+and unreadable differ). Each refusal names the schema and gives the remedy,
+which is to replan.
+
+A staged plan is checked under the lock before pre-flight, and again before
+each step's statements and after each step, before its checkpoint is recorded.
+The last step is covered too. It gets no transaction that spans its steps. A
+step's statement is permanent once it commits, so a mismatch found after it is
+a post-commit guard failure under DECISIONS 159: the step's checkpoint is
+recorded, and then the apply stops with the refusal. A replacement is caught
+at the step it happened in, not rolled back past it.
+
+The price is over-inclusion. A change between plan and apply to any pinned routine
+refuses the apply, even one this plan never runs. The
+remedy is a replan, as it is for drift in the managed set. The window between
+plan and apply is short, and an external routine that changes inside it is
+exactly what an operator should look at before running approved DDL.
+
+*What it does not cover.*
+- A new call site attached after approval to a routine that has not changed,
+  such as a new policy, domain default or trigger on an unmanaged object. That
+  is not a replaced routine. Unmanaged objects other than routines stay outside
+  the comparison (SPEC §8.2). Triggers on written tables are DECISIONS 445/451's
+  execution-trust check.
+- A routine that only superusers can replace. A superuser can change anything
+  this check reads, and the check itself.
+- A replace-and-restore that falls entirely between two checks. Probes are
+  read-only and the last check precedes the commit, so what such a body can
+  still do is non-transactional: the SPEC §7.6 limit, "protection against
+  arbitrary external writes after the last observation".
+- SQL Server. A CHECK there can call a scalar UDF too; its pins are #984.
+- #322, which is about binding at run time. A `SECURITY DEFINER` routine the
+  plan created binds its unqualified helpers when a user calls it, long after
+  `apply` has checked anything.
