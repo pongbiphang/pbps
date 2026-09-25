@@ -691,3 +691,30 @@ SPEC §9.5 still leaves the transfer's own `CONTROL` demand unmodelled; this
 entry removes an over-demand and adds none. PostgreSQL's `doctor` takes its
 managed schemas from the declarations alone, so it has no such retention to
 narrow.
+
+<a id="dec-356-1"></a>
+
+**DEC-356.1. On SQL Server, `doctor` keeps the schema of every recorded table
+and every recorded module managed until that object's drop is recorded (#99,
+#355, #356).** SPEC §9.5 asks `doctor` whether the account can run what the
+next plan runs, and the next plan is computed against the recorded state. A
+table or a view, procedure or function that the ledger records and the
+declarations no longer name is a pending `DROP`, and that `DROP` needs `ALTER`
+on its schema. If the object was the last one the declarations had in that
+schema, the declarations alone no longer name the schema. Without this rule
+`doctor` stopped asking about it and reported ready, and the account then
+failed the drop at apply. The rule is the same as DECISIONS 69's for managed
+roles: what the recorded state holds is what the next plan acts on.
+
+*Where it stops.*
+- A recorded drop removes the object from the recorded state, so a schema
+  kept only by it leaves the managed set with the next entry. A tombstone is
+  permanent history, and it never keeps a schema managed.
+- A recorded table that the project ids place in another schema is a move,
+  not a drop, and it does not keep its source schema managed (DEC-352.1). A
+  module has no uid, so it has no such exception.
+
+The live regressions are `recorded_last_table_keeps_its_schema_in_the_readiness_check`
+(a table, and the tombstone negative) and
+`a_recorded_module_keeps_its_schema_in_the_readiness_check_until_its_drop` (a
+view, a procedure and a function, each with the completed-drop negative).
