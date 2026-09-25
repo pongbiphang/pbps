@@ -6,7 +6,7 @@ use super::{BoundTarget, NativeTarget, correlate, engine, executables};
 use pbps_db::resolver::{
     InstanceObservation,
     capture::{CaptureDifference, InputChange},
-    environment::{ExecutableIdentity, ExecutableRole, ExecutableSet, Provenance},
+    environment::{ExecutableIdentity, ExecutableRole, Provenance},
 };
 use pbps_pg::resolver::capture::{CaptureError, CaptureScope, CapturedInputs};
 
@@ -26,13 +26,18 @@ pub enum CaptureFailure {
 /// executable/content comparisons are input verifiers, not public evidence.
 pub struct CapturedTargetInputs {
     catalog: CapturedInputs,
-    executables: ExecutableSet,
+    executables: executables::CapturedExecutables,
     instance: InstanceObservation,
 }
 
 impl CapturedTargetInputs {
     pub fn catalog(&self) -> &CapturedInputs {
         &self.catalog
+    }
+
+    #[cfg(test)]
+    pub(super) fn native_library_count(&self) -> usize {
+        self.executables.libraries().count()
     }
 
     pub fn compare(&self, current: &Self) -> Vec<CaptureDifference> {
@@ -62,7 +67,10 @@ async fn check(bound: &mut BoundTarget) -> Result<(), CaptureFailure> {
         .map_err(|_| CaptureFailure::Binding)
 }
 
-fn qualified(executables: &ExecutableSet) -> bool {
+fn qualified<'a>(
+    engine: &ExecutableIdentity,
+    libraries: impl Iterator<Item = &'a ExecutableIdentity>,
+) -> bool {
     fn readable(input: &ExecutableIdentity) -> bool {
         let Some(digest) = &input.digest else {
             return false;
@@ -82,9 +90,7 @@ fn qualified(executables: &ExecutableSet) -> bool {
             ) | (ExecutableRole::LateLoaded, Provenance::DiskCandidate)
         )
     }
-    executables.engine.role == ExecutableRole::Engine
-        && readable(&executables.engine)
-        && executables.libraries.iter().all(readable)
+    engine.role == ExecutableRole::Engine && readable(engine) && libraries.into_iter().all(readable)
 }
 
 impl NativeTarget {
@@ -101,15 +107,10 @@ impl NativeTarget {
         check(&mut bound).await?;
         let hints = pbps_pg::resolver::capture::capture(&mut bound.connection, scope).await?;
         let required = hints.runtime_inputs().map_err(CaptureError::Coverage)?;
-        let before = executables::executables(
-            bound.lease.owner(),
-            &required.libraries,
-            &required.dynamic_library_path,
-            &[],
-        )
-        .await
-        .map_err(|_| CaptureFailure::Executables)?;
-        if !qualified(&before) {
+        let before = executables::captured_executables(bound.lease.owner(), &required)
+            .await
+            .map_err(|_| CaptureFailure::Executables)?;
+        if !qualified(before.engine(), before.libraries()) {
             return Err(CaptureFailure::Executables);
         }
         check(&mut bound).await?;
@@ -117,15 +118,10 @@ impl NativeTarget {
         if !hints.compare(&catalog).is_empty() {
             return Err(CaptureFailure::Changed);
         }
-        let after = executables::executables(
-            bound.lease.owner(),
-            &required.libraries,
-            &required.dynamic_library_path,
-            &[],
-        )
-        .await
-        .map_err(|_| CaptureFailure::Executables)?;
-        if !qualified(&after) {
+        let after = executables::captured_executables(bound.lease.owner(), &required)
+            .await
+            .map_err(|_| CaptureFailure::Executables)?;
+        if !qualified(after.engine(), after.libraries()) {
             return Err(CaptureFailure::Executables);
         }
         if before != after {
@@ -154,6 +150,7 @@ impl NativeTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_db::resolver::environment::ExecutableSet;
 
     fn fixture(role: ExecutableRole, provenance: Provenance) -> ExecutableIdentity {
         ExecutableIdentity {
@@ -174,15 +171,15 @@ mod tests {
                 Provenance::LoadedContent,
             )],
         };
-        assert!(qualified(&inputs));
+        assert!(qualified(&inputs.engine, inputs.libraries.iter()));
         inputs.engine.provenance = Provenance::DiskCandidate;
-        assert!(!qualified(&inputs));
+        assert!(!qualified(&inputs.engine, inputs.libraries.iter()));
         inputs.engine.provenance = Provenance::LoadedContent;
         inputs.libraries[0].provenance = Provenance::DiskCandidate;
-        assert!(!qualified(&inputs));
+        assert!(!qualified(&inputs.engine, inputs.libraries.iter()));
         inputs.libraries[0].role = ExecutableRole::LateLoaded;
-        assert!(qualified(&inputs));
+        assert!(qualified(&inputs.engine, inputs.libraries.iter()));
         inputs.libraries[0].digest = None;
-        assert!(!qualified(&inputs));
+        assert!(!qualified(&inputs.engine, inputs.libraries.iter()));
     }
 }

@@ -1440,6 +1440,7 @@ dependencies = [
  "pbps-dialect",
  "pbps-diff",
  "pbps-model",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.10.9",

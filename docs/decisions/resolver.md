@@ -763,3 +763,28 @@ absence of a live foreign holder establishes its origin. Trusted provisioning
 must supply the private devpts instance and exclude transferred foreign
 terminals; unknown origin requires reprovisioning. The profile's kind/flag
 checks do not certify that historical premise.
+
+
+<a id="dec-876-1"></a>
+
+**DEC-876.1. Native capture transfers an operation, not source-bearing path
+strings (#876).** Removing Debug/Serialize from a public record did not hide
+its fields: a downstream crate could still extract `probin`, preload names and
+`dynamic_library_path`. A callback receiving those strings would preserve the
+same escape. Requirements and resolved candidate spellings therefore stay
+inside engine-owned opaque types. A read operation accepts an already-held
+root and the lifecycle's mapping inventory, returning only a supplied mapping
+index or an opaque reader. The reader has no File/raw-handle getter or ordinary
+formatting/serialization; even File's Debug can reveal its path. This is API
+encapsulation against accidental source disclosure, not an isolation boundary
+against privileged code that can independently inspect the same process.
+
+The engine owns PostgreSQL loader rules and the narrowly scoped confined open;
+CLI retains process leases, complete loaded-content observations, off-runtime
+hashing, inode/size/content alias correlation and cancellation. Candidates open
+sequentially, preserving the descriptor bound and first-opened-file behavior.
+Exact mapped candidates retain loaded evidence even after their disk name
+vanishes. An opened but unreadable file never falls through to a later file.
+The selected candidate position and opaque resolution preserve comparison
+identity without exporting a path hash. No public verifier, provisioning code,
+source publication path or protected ledger storage is introduced.
