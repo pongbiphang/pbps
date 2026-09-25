@@ -89,12 +89,9 @@ pub(crate) fn a_projects_schema(name: &str) -> bool {
 /// The ledger names and schema come from the ledger implementation, so the
 /// catalog and validation reserve exactly the same identities (DECISIONS 284).
 /// A project's same-named tables in another schema remain ordinary tables.
-pub(crate) const OURS: [&str; 3] = [
+pub(crate) const OURS: [&str; 2] = [
     pbps_db::ledger::STATE_TABLE_NAME,
     pbps_db::ledger::LOCK_TABLE_NAME,
-    // The protected half of confidential records (DEC-868.1): created by the
-    // first one, and never managed schema.
-    pbps_db::ledger::CONFIDENTIAL_TABLE_NAME,
 ];
 
 pub(crate) fn is_ours(name: &TableName) -> bool {

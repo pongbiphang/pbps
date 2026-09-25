@@ -35,3 +35,5 @@ constraint or enum edit when the generator and top-level copies change together.
 The schema-set version is independent of the emitted envelope's
 `schema_version` and the saved-plan/state format versions (SPEC 9.8, 14.2;
 DECISIONS 465).
+- `15/` adds an environment's `fingerprint_key_env` and `fingerprint_key_file`,
+  naming where its fingerprint key is read from (issue #952, DEC-952.1).

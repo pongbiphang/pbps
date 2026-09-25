@@ -31,7 +31,7 @@ use crate::introspect::{
 /// **By the exact spelling, under a binary collation.** `is_ours` reserves only
 /// the spelling pbps creates, so the filter must hide only that spelling too:
 /// compared under a case-insensitive database collation, a project's own
-/// `dbo.__PBPS_STATE_CONFIDENTIAL` read as the ledger, and the pull reported a
+/// `dbo.__PBPS_STATE` read as the ledger, and the pull reported a
 /// declared table absent.
 ///
 /// The PostgreSQL pull lists the same two names unqualified, because the schema
@@ -40,16 +40,12 @@ use crate::introspect::{
 /// out and validation therefore reserves (the PostgreSQL side's
 /// `catalog::is_ours`). The exact spelling pbps creates, and no other:
 /// validation runs offline and cannot know the database's collation, and on a
-/// case-sensitive one `dbo.__PBPS_STATE_CONFIDENTIAL` is a different table the
+/// case-sensitive one `dbo.__PBPS_STATE` is a different table the
 /// project may declare — the dialect's `fold_ident` preserves case for the
 /// same reason.
 pub(crate) fn is_ours(name: &pbps_model::TableName) -> bool {
-    [
-        crate::state::STATE_TABLE,
-        crate::state::LOCK_TABLE,
-        crate::state::CONFIDENTIAL_TABLE,
-    ]
-    .contains(&format!("{}.{}", name.schema, name.name).as_str())
+    [crate::state::STATE_TABLE, crate::state::LOCK_TABLE]
+        .contains(&format!("{}.{}", name.schema, name.name).as_str())
 }
 
 // The `|` appended to both sides is what makes the comparison exact: SQL Server
@@ -66,7 +62,7 @@ SELECT t.object_id, s.name AS schema_name, t.name AS table_name, t.temporal_type
  WHERE t.is_ms_shipped = 0
    AND NOT ((s.name + N'|') COLLATE Latin1_General_BIN2 = N'dbo|'
             AND (t.name + N'|') COLLATE Latin1_General_BIN2
-                IN (N'__pbps_state|', N'__pbps_lock|', N'__pbps_state_confidential|'))
+                IN (N'__pbps_state|', N'__pbps_lock|'))
  ORDER BY s.name, t.name;";
 
 // SQL Server added both `sys.tables.temporal_type` and `sys.periods` in 2016.
@@ -80,7 +76,7 @@ SELECT t.object_id, s.name AS schema_name, t.name AS table_name,
  WHERE t.is_ms_shipped = 0
    AND NOT ((s.name + N'|') COLLATE Latin1_General_BIN2 = N'dbo|'
             AND (t.name + N'|') COLLATE Latin1_General_BIN2
-                IN (N'__pbps_state|', N'__pbps_lock|', N'__pbps_state_confidential|'))
+                IN (N'__pbps_state|', N'__pbps_lock|'))
  ORDER BY s.name, t.name;";
 
 fn tables_query(product_version: &str, edition: &str) -> String {
@@ -1030,11 +1026,7 @@ mod tests {
     /// the filter behind.
     #[test]
     fn the_table_filter_names_the_ledgers_own_qualified_tables_and_matches_no_pattern() {
-        for qualified in [
-            crate::state::STATE_TABLE,
-            crate::state::LOCK_TABLE,
-            crate::state::CONFIDENTIAL_TABLE,
-        ] {
+        for qualified in [crate::state::STATE_TABLE, crate::state::LOCK_TABLE] {
             let (schema, name) = qualified.split_once('.').expect("a qualified name");
             assert!(
                 TABLES.contains(&format!(

@@ -24,7 +24,8 @@ Connected `doctor`, in human and JSON output, now reports:
   analysis-specific environment compatibility, per-statement deployment
   settings/authorization, authenticated transport, instance separation,
   runtime containment, backend stability and binding coverage. Conditional
-  private-input handling retains the #594 dependency.
+  private-input handling retains its source-privacy controls (#617); its
+  fingerprints are keyed (DEC-952.1).
 
 `session_*` observations do not describe the future apply context. Persisted
 module settings, per-object collations, relevant native-library identities and
@@ -136,19 +137,17 @@ before the next issue is claimed. #597 is complete; #606 through #611 are delive
 | 15 | [#620](https://github.com/pongbiphang/pbps/issues/620) | implement qualified binding planning and transactional apply |
 | 16 | [#621](https://github.com/pongbiphang/pbps/issues/621) | complete the cross-engine acceptance matrix and delivery documentation |
 
-#594 must separately complete its accepted design, implementation and legacy-
-reader compatibility tests before #618 is claimed. It is an additional hard
-prerequisite, not a waived or implicitly chosen ledger/access transition.
-#617 qualifies private reconstruction controls; it does not enable confidential
-publication/apply/recording by itself. The SQL Server binding design precedes
+#594's legacy-reader boundary is no longer a prerequisite: #952 keyed the
+fingerprints (DEC-952.1), so a resolver plan records no verifier to protect.
+#617 still qualifies private reconstruction controls for the source itself. The SQL Server binding design precedes
 its adapter, and final acceptance covers both engines independently. Every
 agreed stage needs successful supported cases; permanent refusal is not delivery.
 
 ## Coordination and boundaries
 
-- [#594](https://github.com/pongbiphang/pbps/issues/594) blocks confidential
-  paths, not ordinary discovery or all managed-only work. Its separate design
-  acceptance is a prerequisite; this plan chooses no physical ledger layout.
+- [#952](https://github.com/pongbiphang/pbps/issues/952) keys every
+  external-input fingerprint to the environment (DEC-952.1), replacing #594's
+  protected-storage design; sealing records the key identifier (#614).
 - [#587](https://github.com/pongbiphang/pbps/issues/587) owns existing `--dev`
   containment. Code reuse does not certify or remove preview workflows.
 - Keep #230 / PR #542, #173 / PR #487 and #232 / PR #546 protections until

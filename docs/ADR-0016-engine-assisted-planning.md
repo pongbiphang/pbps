@@ -483,6 +483,29 @@ secrets before hashing and thereby hide changes to them. Canonicalization must
 not guess SQL equivalence. A fingerprint detects changes; it is not encryption
 or a promise that review artifacts are suitable for public disclosure.
 
+*Amended (#952, [DEC-952.1](decisions/ledger.md#dec-952-1)):* every
+external-input fingerprint is HMAC-SHA256 under the target environment's
+fingerprint key, not a bare SHA-256. The property the next paragraph describes
+belongs to a hash anyone can compute. A public salt does not remove it; a secret
+key does. Without the key, a fingerprint tests no guess, and neither do the plan
+checksum and snapshots derived from it. The confidential classification, the
+protected output and launch paths, the placeholder checksum and the ledger
+reader qualification below were the price of an unkeyed verifier. They no longer
+apply to keyed evidence, and a plan's checksum is again an ordinary approval
+and audit value.
+
+The key is not a key-management system in the sense this decision refuses:
+- pbps generates keys (`pbps key generate`) and checks them (`pbps doctor`);
+- it stores, shares and rotates nothing;
+- an environment names its key's source (`fingerprint_key_env` or
+  `fingerprint_key_file`) exactly as it names its connection string's.
+
+A sealed plan records the key identifier; `apply` under another key refuses
+(#614, #616), and resolver planning with no key refuses. What still holds is
+the privacy of the source itself during reconstruction: transport, logging and
+scratch storage (#617). The paragraphs below are kept as the reasoning that led
+here.
+
 **External-input fingerprints are confidential verifiers, not declassified
 source.** Knowing the surrounding definition can let a reader test guesses of
 a low-entropy literal against its digest. A public salt or another hash does
@@ -547,10 +570,12 @@ those readers. [#594](https://github.com/pongbiphang/pbps/issues/594) must separ
 design, implement and test an enforceable ledger projection/storage or
 legacy-access compatibility boundary, including snapshot copies, fallback
 queries and direct readers on both engines. This ADR chooses no physical layout,
-migration protocol or credential transition; *amended:* #594 chose protected
-storage — the whole confidential snapshot and checksum in a separate,
-reader-qualified ledger table, with nothing left in any pre-feature projection
-— recorded as [DEC-868.1](decisions/ledger.md#dec-868-1). Until that follow-up is accepted,
+migration protocol or credential transition. *Amended:* #594 chose protected
+storage, recorded as [DEC-868.1](decisions/ledger.md#dec-868-1): the whole
+confidential snapshot and checksum in a separate, reader-qualified ledger table,
+with nothing left in any pre-feature projection. #952 then made that unnecessary
+by keying the fingerprints ([DEC-952.1](decisions/ledger.md#dec-952-1)), and the
+protected table was removed. Until that follow-up is accepted,
 implemented and passes its compatibility tests, confidential resolver-plan
 publication, application and recording remain disabled. A warning, operator
 assertion, format bump or installation of a newer client cannot waive the gate;

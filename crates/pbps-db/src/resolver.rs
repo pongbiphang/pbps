@@ -221,7 +221,7 @@ impl Discovery {
             ("instance-separation", "Prove that the actual resolver backend is outside the target cluster or instance before scratch DDL."),
             ("execution-containment", "Qualify runtime-enforced network/filesystem containment, bounded resources and lifetime."),
             ("run-stability", "Qualify backend continuity and protection against relevant in-place changes throughout compilation."),
-            ("private-input-handling", "If external definitions are needed, qualify private transport, logging, storage and confidential artifact handling, including the legacy-reader prerequisite (#594)."),
+            ("private-input-handling", "If external definitions are needed, qualify private transport, logging and storage of their source; their fingerprints are keyed to the environment (DEC-952.1)."),
             ("binding-adapter", "Binding resolution is not implemented; discovery cannot supply evidence or replace existing planning protections."),
         ].into_iter().map(|(key, reason)| (key.into(), Observation::Unknown { reason: reason.into() })).collect();
         Self {

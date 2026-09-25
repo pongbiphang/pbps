@@ -99,6 +99,8 @@ how to add an entry here.
      compatibility tests; its acceptance, implementation and passing tests are
      mandatory before confidential resolver publication/apply/recording is
      enabled. Version metadata or new-client redaction cannot waive that gate.
+     *Since DEC-952.1 (#952) the fingerprints are keyed per environment, so no
+     verifier is recorded and this gate, with #594's ledger design, is gone.*
      This decision selects no physical ledger migration or credential transition
      and preserves ordinary-plan behavior and explicit SHA-256 approval.
      Before source transfer, qualify and enforce engine/platform controls over
@@ -736,7 +738,7 @@ limitations rather than empty dependency proofs; C routines still name native
 file prerequisites even without extension membership. A catalog read is not a
 native runtime qualification, a scope request is not proof of complete SQL
 analysis, and neither creates an applyable artifact. Reconstruction, compilation,
-ordering and #594's protected publication/apply/recording remain separate gates.
+ordering and sealing the keyed evidence (#614, DEC-952.1) remain separate gates.
 
 
 <a id="dec-643-1"></a>

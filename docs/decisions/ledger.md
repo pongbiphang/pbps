@@ -699,6 +699,9 @@ unsupported-version and fallback paths, and direct `SELECT *` on the ordinary
 table — never outputs a confidential checksum, while ordinary records' history
 and approval by the same SHA-256 keep working.
 
+*Superseded by [DEC-952.1](#dec-952-1): the fingerprints are keyed, so there is
+no verifier to store apart and no protected table.*
+
 <a id="dec-878-1"></a>
 
 **DEC-878.1. Each engine writes a confidential record's two halves in one
@@ -725,6 +728,9 @@ Server batch takes an exclusive table lock *before* re-checking for a trigger,
 so none can be added between the check and the delete. The protected table is
 in both engines' ledger-name filters, so the pull never takes it for managed
 schema. Reader qualification is #879 and #880.
+
+*Superseded by [DEC-952.1](#dec-952-1); #952 removed the protected table this
+entry describes.*
 
 <a id="dec-901-1"></a>
 
@@ -763,8 +769,8 @@ setting names another installed method would otherwise create a ledger that the
 check then refuses. `emit.rs` writes the clause on managed tables for the same
 reason. Measured on 18.6 with a second method built on the heap handler.
 
-The protected table DEC-878.1 added is held to the same table-level facts and
-created `USING heap` too. `prune`'s one gate now covers all three tables, so a
+The protected table DEC-878.1 added was held to the same table-level facts and
+created `USING heap` too, until #952 removed it (DEC-952.1). `prune`'s one gate now covers all three tables, so a
 view at the protected name is refused before the combined delete (#885). A
 table inheriting from the protected one is refused rather than deleted around
 with `ONLY`, as for the other two.
@@ -861,3 +867,69 @@ every row and every column, not on one value in one row, and the version
 check that already refuses an unsupported version carries that row too.
 Making the one malformed marker a hard failure would recreate, for this
 column, the batch-wide outage the rest of this entry removes.
+
+<a id="dec-952-1"></a>
+
+**DEC-952.1. External-input fingerprints are HMAC-SHA256 under a per-environment
+key that pbps generates and checks but does not keep; nothing a resolver plan
+records is a verifier to hide, so the ledger stores it as it stores any plan
+(#952; supersedes DEC-868.1 and DEC-878.1, amends ADR-0016 decision 5).**
+The secret was never the fingerprint. A bare SHA-256 over a definition that
+carries a literal is a guessing oracle for anyone who can compute it, and
+DEC-868.1 answered by hiding the oracle. It kept the checksum in a protected
+table and proved from the catalog that every reader of that table could become
+the deployment account. That proof re-derives an engine's effective
+permissions, the second implementation DECISIONS 521 warns against. On SQL
+Server it did not converge: #880 / PR #928 ran 16 review rounds, and nearly
+every round found another real authorization path. It also could not have held.
+Measured on SQL Server 2025 (#918), the INSERT's parameters reach the plan cache
+and Query Store, readable by principals the proof never asks about.
+
+Keying removes the oracle rather than hiding it. Without the key, a fingerprint
+tests no guess, and neither does a checksum or snapshot derived from it.
+
+*The key.*
+- It is per environment, never shared, never defaulted. A key one environment's
+  fingerprints were made under is no evidence for another's.
+- An environment names its source exactly as it names its connection string:
+  `fingerprint_key_env` (a variable) or `fingerprint_key_file` (a file readable
+  by its owner only). Both is refused when `pbps.yml` is read.
+- Owner-only is proved from Unix permission bits. On a platform without them,
+  where pbps reads no ACLs, a key file is refused rather than trusted, and
+  `key generate --out` refuses to write one. The variable form works
+  everywhere.
+- A variable that is unset and one that is set but not valid text are
+  different faults, reported with different remedies.
+- It is base64 of at least 32 bytes, HMAC-SHA256's own output length.
+  `pbps key generate` prints one, or writes a new mode-0600 file and never
+  overwrites an existing one, because a replaced key voids every pending plan.
+- `pbps doctor` reports its key identifier: the first 8 bytes of an HMAC under
+  the key over a fixed label. The identifier tells keys apart and reveals
+  nothing usable.
+
+*Why pbps does not keep it.* The only places pbps could keep a key are the
+target database, whose readers are the problem, or the local disk, which the
+machine that plans and the machine that applies do not share. A service would
+be the approval or key-management system ADR-0016 refuses, and SPEC 14.3's
+air-gapped rule refuses it too. The operator's secret tooling already delivers
+the connection string. It delivers the key the same way.
+
+*Two kinds of key.* A fingerprint that outlives the process, sealed into a plan
+and compared at apply, is made under the environment's key. The sealed plan
+records the key identifier, and `apply` under another key refuses with a replan
+remedy (#614, #616, which seal and recheck and did not exist when this was
+decided). A fingerprint compared and dropped within one process needs no shared
+key: the capture comparison and the authorization-context digests use a random
+per-process key (`FingerprintKey::process`). No bare SHA-256 over a private input
+exists anywhere, not even in memory.
+
+*The primitive.* It is RustCrypto's `hmac` 0.13 over `sha2` 0.11, the pair
+`postgres-protocol` already resolves (DECISIONS 434), rather than a new `hmac`
+0.12 for the workspace's `sha2` 0.10. RFC 4231 test case 2 pins it. Every part
+is length-framed, so moving a boundary between rule, component and input changes
+the message.
+
+*What stays.* The source of retained definitions is still private while it is
+reconstructed (#617). Keying the verifiers does not declassify the definitions
+they cover. A leaked key restores the guessing exposure to its holders, who
+already hold the credentials that read the definitions.

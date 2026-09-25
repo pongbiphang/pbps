@@ -2,9 +2,9 @@
 //! No external verifier, source, or derived checksum is an ordinary report.
 
 use super::{CaptureScope, Uncovered, bindings::Binding, properties, read, scope};
+use pbps_db::fingerprint::FingerprintKey;
 use pbps_db::resolver::capture::{CaptureDifference, InputChange, ObjectIdentity};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 struct Input {
@@ -194,14 +194,15 @@ impl CapturedInputs {
 fn fingerprint(rule: &str, component: &str, input: &impl serde::Serialize) -> [u8; 32] {
     // JSON encodes only normalized, deterministic maps/ordered arrays. This
     // is byte identity under a versioned rule, not guessed SQL equivalence.
-    // Length framing keeps domain labels distinct from private input bytes.
-    let mut hash = Sha256::new();
-    for bytes in [rule.as_bytes(), component.as_bytes()] {
-        hash.update((bytes.len() as u64).to_be_bytes());
-        hash.update(bytes);
-    }
-    hash.update(serde_json::to_vec(input).expect("canonical private input serializes"));
-    hash.finalize().into()
+    // Keyed (DEC-952.1): these digests are compared and dropped within the
+    // process, so the process key serves, and no bare SHA-256 over a private
+    // input exists to test guesses against. A digest that is ever kept must
+    // be made under the environment's key instead (#614).
+    FingerprintKey::process().fingerprint(
+        rule,
+        component,
+        &serde_json::to_vec(input).expect("canonical private input serializes"),
+    )
 }
 
 pub(super) fn finish(

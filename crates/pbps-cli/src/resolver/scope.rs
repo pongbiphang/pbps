@@ -21,6 +21,7 @@
 //! as the reproduced deployer — no projection to keep in step with it
 //! (DECISIONS 520, 521).
 
+use pbps_db::fingerprint::FingerprintKey;
 use pbps_db::resolver::Observation;
 use pbps_db::resolver::environment::{
     CatalogFacts, DatabaseRecipe, EnvironmentFacts, RecipeUnavailable, ScopeReport,
@@ -29,7 +30,6 @@ use pbps_db::transport::QueryConnection;
 use pbps_db::{DbError, Driver};
 use pbps_mssql::resolver::authorization as mssql_auth;
 use pbps_pg::resolver::authorization as pg_auth;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 /// A schema grant or revoke the plan performs before its DDL, in the shape
@@ -80,9 +80,20 @@ pub enum Principals {
     Mssql(mssql_auth::PrincipalMap),
 }
 
+/// The authorization context's digest, keyed (DEC-952.1). Held and compared
+/// within this run only, so the process key serves; sealing one into a plan
+/// (#614) must use the environment's key.
 fn digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    FingerprintKey::process()
+        .fingerprint(AUTHORIZATION_RULE, "authorization", bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
+
+/// The label authorization digests are keyed under; distinct from the capture
+/// rule's so that no authorization digest equals a catalog one.
+const AUTHORIZATION_RULE: &str = "pbps/authorization-context/v1";
 
 /// The schemas whose authorization is read and reproduced for a request:
 /// the in-scope schemas and, on PostgreSQL, the write-path extras, without

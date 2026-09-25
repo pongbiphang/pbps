@@ -14,6 +14,7 @@ mod explain;
 mod hooks;
 mod init;
 mod integration;
+mod key;
 mod output;
 mod prompt;
 mod report;
@@ -373,6 +374,12 @@ enum Command {
         command: StateCommand,
     },
 
+    /// Fingerprint keys for engine-assisted planning (DEC-952.1)
+    Key {
+        #[command(subcommand)]
+        command: KeyCommand,
+    },
+
     /// One screen across every configured environment
     Status {
         /// text (default) or json
@@ -426,7 +433,8 @@ impl Command {
             | Command::Snapshot { .. }
             | Command::Baseline { .. }
             | Command::Bootstrap { .. }
-            | Command::Unlock { .. } => return None,
+            | Command::Unlock { .. }
+            | Command::Key { .. } => return None,
             // The one subcommand that speaks an envelope. Matched on its own
             // rather than folded into the arm above, because a project that
             // cannot be discovered has to reach a `state list --format json`
@@ -438,6 +446,17 @@ impl Command {
         };
         (format == OutputFormat::Json).then_some(name)
     }
+}
+
+#[derive(Subcommand)]
+enum KeyCommand {
+    /// Print a new random fingerprint key, or write it to a new owner-only file
+    Generate {
+        /// Write the key to this new file (mode 0600) instead of stdout; an
+        /// existing file is never overwritten
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -575,6 +594,14 @@ fn run() -> anyhow::Result<()> {
     if let Command::Man { out } = &cli.command {
         return integration::cmd_man(out);
     }
+    // A key belongs to an environment, but making one needs no project: it is
+    // generated before the pbps.yml that names it may exist.
+    if let Command::Key {
+        command: KeyCommand::Generate { out },
+    } = &cli.command
+    {
+        return key::cmd_generate(out.as_deref());
+    }
     // `explain` needs a project only to look an --env name up in pbps.yml. The
     // reviewer this command exists for may have been handed nothing but
     // plan.json, in a directory with no project at all — and the plan carries
@@ -678,6 +705,7 @@ fn run() -> anyhow::Result<()> {
         | Command::Schema { .. }
         | Command::Completions { .. }
         | Command::Man { .. }
+        | Command::Key { .. }
         | Command::Explain { .. } => {
             unreachable!("these return before project discovery")
         }

@@ -35,6 +35,11 @@ rustls-native-certs.workspace = true
 # `rand` shuffles the resolved address list for `load_balance_hosts=random`.
 socket2.workspace = true
 rand.workspace = true
+# Keyed fingerprints (DEC-952.1): the key is read as base64 and mixed in with
+# HMAC-SHA256.
+base64.workspace = true
+hmac.workspace = true
+sha2-hmac.workspace = true
 
 # The socket opener's tests need a runtime: they build a black hole out of a
 # listening socket and time the attempts against it.

@@ -2,7 +2,7 @@
 //!
 //! The identities and failed conditions are safe for ordinary diagnostics.
 //! Definitions, prerequisite properties and their guessing verifiers are not
-//! part of this report (ADR-0016; confidential artifact integration is #594).
+//! part of this report (ADR-0016). The verifiers are keyed (DEC-952.1).
 
 /// An engine object identified without a database-local object number.
 /// `name` is a sequence of identifier components, never a dotted string:

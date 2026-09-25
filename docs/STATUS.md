@@ -26,7 +26,7 @@ Offline: `plan` (`--check` / `--since` / `--base` / `--out` / `--sql` / `--dev`)
 `drop-table`, `drop-role`,
 `docs` (`--format` / `--out` / `--title`), `explain` (`--plan`), `doctor`
 (`--env`), `schema` (`--kind declaration|config|envelope`), `completions`,
-`man`. Every read-only command
+`man`, `key generate` (`--out`). Every read-only command
 takes `--format human|json`; `--no-input` is global. The envelope those
 commands emit has a published schema of its own (`schema --kind envelope`,
 `schemas/envelope.schema.json`), and a test validates each command's real
@@ -156,11 +156,12 @@ containment and engine evidence remain separate premises (DECISIONS 533).
 
 The PostgreSQL target-input library (#612) captures actual historical bindings,
 recorded baseline, complete requested candidate sets and prerequisite properties
-on one owned snapshot. Fresh recapture compares private versioned fingerprints;
+on one owned snapshot. Fresh recapture compares private versioned fingerprints,
+keyed under a per-process key (DEC-952.1);
 native capture additionally qualifies executable content and expires canceled
 connections. Unknown required coverage refuses. This is a library boundary,
-not enabled CLI resolution or a saved-plan/apply path; reconstruction and #594
-remain required. See [the capture contract and fixtures](RESOLVER-CAPTURE.md).
+not enabled CLI resolution or a saved-plan/apply path; reconstruction and
+sealing (#614) remain required. See [the capture contract and fixtures](RESOLVER-CAPTURE.md).
 
 Delivery is split into three stages:
 
@@ -178,11 +179,13 @@ Delivery is split into three stages:
 3. SQL Server binding resolution after its own design and live-engine tests,
    reusing the shared infrastructure rather than PostgreSQL binding semantics.
 
-Confidential resolver-plan publication/apply is blocked on the separate
-legacy-reader protection design, implementation and compatibility tests in
-[#594](https://github.com/pongbiphang/pbps/issues/594). A format/classification
-change alone does not protect old timeline readers. This PR selects no ledger
-migration or access-transition architecture; ordinary paths remain unchanged.
+Resolver-plan fingerprints are keyed under each environment's fingerprint key
+([DEC-952.1](decisions/ledger.md#dec-952-1), #952). Without the key they test no
+guess of the literals they cover, so a resolver plan and its checksum are
+handled and recorded as any plan's, with no protected ledger table or reader
+qualification (the design of #594, now superseded). `pbps key generate` makes a
+key, and `pbps doctor` checks each environment's. Sealing the key identifier
+into a plan and refusing `apply` under another key are part of #614 and #616.
 
 Neither a suggested Docker image nor a successful preview is deployment proof.
 Runtime/dynamic-SQL analysis, automatic custom-image synthesis, snapshot-derived
