@@ -4247,6 +4247,22 @@ fn postgres_rehearsals_refuse_before_connecting_or_starting_a_container() {
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
 }
 
+/// PostgreSQL keeps a check or foreign-key name per table (issue #496,
+/// measured on 18.6), so the two tables SQL Server refuses in `flow.rs`'s
+/// `two_tables_with_one_constraint_name_are_refused` validate here.
+#[test]
+fn two_tables_with_one_check_name_are_accepted() {
+    let d = Demo::new("check-namespace");
+    d.table("table: app.t1\ncolumns:\n  n: {type: integer}\nchecks:\n  c: n > 0\n");
+    std::fs::write(
+        d.dir.join("schema/app.t2.yml"),
+        "table: app.t2\ncolumns:\n  n: {type: integer}\nchecks:\n  c: n > 0\n",
+    )
+    .unwrap();
+    let o = d.run(&["validate"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+}
+
 /// An index occupies the schema's relation namespace on PostgreSQL, alongside
 /// tables and views — not a per-table namespace as on SQL Server — so two
 /// tables in one schema declaring an index of the same name is refused before

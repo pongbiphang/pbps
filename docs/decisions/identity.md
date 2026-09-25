@@ -494,3 +494,65 @@ annotation cases through `resolve` now say so through
 `resolve_with_annotations`, so they pin the provenance they mean, not the
 lenient default. Pinned by
 `a_rename_handed_to_resolve_is_a_current_decision_and_an_annotation_is_not`.
+
+<a id="dec-496-1"></a>
+
+**DEC-496.1. On SQL Server a declared constraint name must be free in its
+schema, not only in its table (#496; the fourth case of the namespace rule
+DECISIONS 201 and 453 moved to the dialect).** Every primary key, unique,
+check, foreign-key and default constraint is a row in `sys.objects`, whose
+names are unique per schema together with tables, views, routines and triggers.
+Measured on 17.0.4075.5: two tables in one schema declaring a check `c`, a
+foreign key named like another table's check, and a constraint named like a
+table, view, procedure, function or trigger are each refused (Msg 2714, then
+1750). An index of that name, or the same check in another schema, is
+accepted. PostgreSQL 18.6 keeps a check or foreign-key name per table, and puts
+only the index behind a key in its relation namespace (453).
+
+So `Dialect::constraints_share_namespace_with_tables`, `true` by default as
+SQL Server's answer and `false` on PostgreSQL, gates
+`check_constraint_names`, which runs beside `check_index_names` in the one list
+every command asks (DECISIONS 141). Two constraints of one table are left to
+`Table::constraint_name_conflicts`, so one defect is reported once (#498).
+Names are compared exactly, because validation is offline and cannot know the
+collation. A pair differing only in case is refused by a case-insensitive
+engine loudly, before anything else of the statement runs, and is a legal pair
+on a case-sensitive one, both pinned live.
+
+The same namespace orders a plan. A table renamed onto a name that another
+table's dropped check, foreign key, unique or primary key releases has to wait
+for that drop, as it waits for a freed index on PostgreSQL (DECISIONS 496).
+Measured on 17.0.4075.5: `sp_rename 'dbo.old', 'c'` is refused (Msg 15335)
+while a check `c` exists, and succeeds after it is dropped. `rename_order` now
+takes the dialect's two answers: an index releases a name only where indexes
+share the namespace, and a check or foreign key only where constraints do.
+A table moved to another schema carries its constraints (SQL Server's
+`TRANSFER`) or indexes (PostgreSQL's `SET SCHEMA`) into it, and a name held
+there refuses the move (Msg 15530, measured). So each one the plan drops anyway
+goes before the move, addressed by the source name. The ones it keeps are claims
+in the destination, and a same-named constraint or index the plan drops there,
+on another table, goes before the move too.
+
+The default constraints the emitter names itself are in that namespace too
+(#969), and `DF_{table}_{column}` did not say where the table ended:
+`dbo.a_b.c` and `dbo.a.b_c` both spelled `DF_a_b_c`, and the second
+`CREATE TABLE` was refused. The emitter sees one change at a time, so it cannot
+keep a short name only where nothing collides. So the name is now
+`DF_pbps_{table}_{column}` when the table's name has no underscore, which makes
+the first `_` after the prefix the boundary. Otherwise it is
+`DF_pbps_{table}_{column}_{digest}`, with the digest of the qualified column
+that a name too long to fit already carried. `pbps_` marks the name as this
+tool's, apart from the `DF_<table>_<column>` many teams write by hand. No
+environment had been deployed under the old shape, and nothing reads a
+generated name back: a drop looks the name up in the catalog. The generated
+names are deliberately **not** folded into `check_constraint_names`.
+Validation is offline, and cannot tell a column whose default `pbps` will
+create from an adopted one whose default already has another name. Claiming
+the would-be name for every defaulted column refused a valid database that
+held a constraint of that spelling (review of #969). What is left is a declared
+constraint spelled `DF_pbps_…` beside a default `pbps` does create, which the
+engine refuses at apply; `pbps_` is what makes it unlikely.
+A short name never ends like a digested one (`_` and sixteen hex digits, in
+either case, since a case-insensitive database folds them). A name that would
+is digested as well, so that `dbo.a.b_c_<the digest of dbo.a_b.c>` cannot
+spell the digested name of `dbo.a_b.c`.

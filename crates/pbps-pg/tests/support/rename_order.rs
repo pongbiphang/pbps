@@ -284,7 +284,17 @@ async fn rename_dependencies_execute_with_their_statement_time_names() {
                 matches!(&changes.changes[0].change, Change::DropForeignKey { table, .. } if table.to_string() == "app.old")
             );
         } else if case == "index_cross" {
-            assert!(sql[0].contains("DROP INDEX \"app\".\"target\""), "{sql:?}");
+            // The freeing drop precedes the move, and so, since #969's review,
+            // does the moved table's own dropped index: it has nothing to carry.
+            let at = |needle: &str| sql.iter().position(|s| s.contains(needle)).unwrap();
+            assert!(
+                at("DROP INDEX \"app\".\"target\"") < at("SET SCHEMA"),
+                "{sql:?}"
+            );
+            assert!(
+                at("DROP INDEX \"app\".\"kept\"") < at("SET SCHEMA"),
+                "{sql:?}"
+            );
         } else if case == "owner_cycle" {
             assert!(
                 matches!(&changes.changes[0].change, Change::DropUnique { table, .. } if table.name.starts_with("old_"))

@@ -3,6 +3,13 @@
 //! The ordinary classes still order the rest of the plan. This small graph
 //! runs after module drops and before other table work; it cannot move a column,
 //! row, grant or module across its existing boundary (DECISIONS 496).
+//!
+//! Which drops release a name a table can take is the dialect's: an index or
+//! the index behind a key where indexes share the table namespace
+//! (PostgreSQL), and every named constraint where constraints do (SQL Server,
+//! DEC-496.1). Measured on 17.0.4075.5: `sp_rename 'dbo.old', 'c'` is refused
+//! (Msg 15335) while another table still has a check `c`, and succeeds once the
+//! check is dropped.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,7 +24,9 @@ pub(crate) fn order(
     renames: &Renames,
     dialect: &dyn Dialect,
 ) {
-    if !dialect.indexes_share_namespace_with_tables() {
+    let indexes = dialect.indexes_share_namespace_with_tables();
+    let constraints = dialect.constraints_share_namespace_with_tables();
+    if !indexes && !constraints {
         return;
     }
     let mut owners = BTreeMap::new();
@@ -32,6 +41,17 @@ pub(crate) fn order(
                     .entry(TableName::new(to.schema.clone(), from.name.clone()))
                     .or_default()
                     .insert(i);
+                // And the move carries the table's own named indexes or
+                // constraints into the destination, where a same-named one on
+                // another table has to be dropped first (review of #969).
+                if let Some(moving) = base.schema.tables.get(from) {
+                    for carried in carried_names(moving, indexes, constraints) {
+                        claims
+                            .entry(TableName::new(to.schema.clone(), carried))
+                            .or_default()
+                            .insert(i);
+                    }
+                }
             }
         }
     }
@@ -54,7 +74,7 @@ pub(crate) fn order(
     let mut drops = BTreeSet::new();
     let mut keys = Vec::new();
     for (i, p) in planned.iter().enumerate() {
-        let Some((table, name)) = dropped_relation(&p.change) else {
+        let Some((table, name)) = dropped_relation(&p.change, indexes, constraints) else {
             continue;
         };
         // A carried index may occupy the source schema now and the destination
@@ -65,6 +85,20 @@ pub(crate) fn order(
                 drops.insert(i);
                 edges[i].extend(waiting);
             }
+        }
+        // A table moved to another schema carries its indexes (PostgreSQL's
+        // SET SCHEMA) or constraints (SQL Server's TRANSFER) into it, where a
+        // name another object holds refuses the whole move. Measured on
+        // 17.0.4075.5: `ALTER SCHEMA s2 TRANSFER s1.old` is refused (Msg 15530)
+        // while `old` has a check `c` and `s2.c` is a table, and succeeds once
+        // the check is dropped. One this plan drops anyway has nothing to
+        // carry, so it goes first, addressed by the source name (review of
+        // #969).
+        if let Some((rename, _)) = owners.get(table)
+            && source.schema != table.schema
+        {
+            drops.insert(i);
+            edges[i].insert(*rename);
         }
         if drops.contains(&i)
             && let Some(t) = before(table)
@@ -151,6 +185,7 @@ pub(crate) fn order(
             if let Change::DropIndex { table, .. }
             | Change::DropUnique { table, .. }
             | Change::DropForeignKey { table, .. }
+            | Change::DropCheck { table, .. }
             | Change::SetPrimaryKey {
                 table, to: None, ..
             } = &mut planned[drop].change
@@ -173,19 +208,56 @@ pub(crate) fn order(
     }
 }
 
-fn dropped_relation(change: &Change) -> Option<(&TableName, &str)> {
-    if let Change::DropIndex { table, name } | Change::DropUnique { table, name } = change {
-        Some((table, name))
-    } else if let Change::SetPrimaryKey {
+/// The names a table takes into its schema's table namespace besides its own:
+/// the same kinds [`dropped_relation`] releases, by the dialect's two answers.
+fn carried_names(
+    table: &pbps_model::schema::Table,
+    indexes: bool,
+    constraints: bool,
+) -> Vec<String> {
+    let mut names: Vec<String> = table.unique.keys().cloned().collect();
+    names.extend(table.primary_key.as_ref().and_then(|pk| pk.name.clone()));
+    if indexes {
+        names.extend(table.indexes.keys().cloned());
+    }
+    if constraints {
+        names.extend(table.checks.keys().cloned());
+        names.extend(table.foreign_keys.keys().cloned());
+    }
+    names
+}
+
+/// The table and name a change releases in its schema's table namespace, if
+/// any. `indexes` and `constraints` are the dialect's two answers: a key's name
+/// is released under either, an index's only where indexes share the namespace,
+/// and a check's or a foreign key's only where constraints do.
+fn dropped_relation(
+    change: &Change,
+    indexes: bool,
+    constraints: bool,
+) -> Option<(&TableName, &str)> {
+    if let Change::DropUnique { table, name } = change {
+        return Some((table, name));
+    }
+    if let Change::DropIndex { table, name } = change
+        && indexes
+    {
+        return Some((table, name));
+    }
+    if let Change::DropCheck { table, name } | Change::DropForeignKey { table, name } = change
+        && constraints
+    {
+        return Some((table, name));
+    }
+    if let Change::SetPrimaryKey {
         table,
         from: Some(pk),
         to: None,
     } = change
     {
-        pk.name.as_deref().map(|name| (table, name))
-    } else {
-        None
+        return pk.name.as_deref().map(|name| (table, name));
     }
+    None
 }
 
 fn reaches(edges: &[BTreeSet<usize>], from: usize, target: usize) -> bool {

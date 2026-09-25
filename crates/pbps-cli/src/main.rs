@@ -1631,6 +1631,12 @@ pub(crate) fn declaration_problems(
     for problem in pbps_dialect::check_index_names(schema, dialect) {
         out.push(("schema.name-collision", problem));
     }
+    // And a fourth: on SQL Server every constraint is a schema object beside
+    // tables and routines, so two tables' constraints of one name collide, where
+    // PostgreSQL keeps them per table (issue #496).
+    for problem in pbps_dialect::check_constraint_names(schema, dialect) {
+        out.push(("schema.name-collision", problem));
+    }
     // Roles (ADR-0005): a grant on an object nobody declares is the
     // foreign-key-target rule applied to permissions.
     for problem in pbps_model::role::check(schema) {

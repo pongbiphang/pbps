@@ -44,7 +44,7 @@ pub(crate) fn qualified(t: &TableName) -> Result<String, DialectError> {
 /// # Why it can be shortened, and why it must be
 ///
 /// A table name and a column name may each legally be 128 characters, so
-/// `DF_{table}_{column}` can exceed the limit while every name the user wrote
+/// the prefix, table and column can exceed the limit while every name the user wrote
 /// is valid. Refusing there refuses a valid plan, naming an identifier that
 /// appears nowhere in the user's YAML and that they cannot shorten without
 /// renaming their table.
@@ -54,12 +54,32 @@ pub(crate) fn qualified(t: &TableName) -> Result<String, DialectError> {
 /// catalog rather than reconstructing it, precisely because a column adopted
 /// through `pull` carries a name `pbps` never chose. A constraint created by
 /// an older version keeps whatever name it was given.
-fn default_constraint_name(table: &TableName, column: &str) -> String {
-    let full = format!("DF_{}_{}", table.name, column);
-    if utf16_units(&full) <= MAX_IDENT_CHARS {
+///
+/// # Why a table name with an underscore takes the digest (#969)
+///
+/// `DF_pbps_{table}_{column}` does not say where the table ends. `dbo.a_b`
+/// with a column `c` and `dbo.a` with a column `b_c` both spell
+/// `DF_pbps_a_b_c`, and a
+/// constraint name is unique per schema on this engine (DEC-496.1). Measured:
+/// the second `CREATE TABLE` is refused (Msg 1750), after the first has run.
+/// The emitter sees one change at a time, so it cannot keep the short name
+/// only where no other table collides. Instead the short name is kept exactly
+/// when the table's name has no underscore and the name does not end the way a
+/// digested one does ([`ends_like_a_digest`]). The first `_` after the prefix is then
+/// the boundary, so no two such names are equal. Every other name carries
+/// the digest of the qualified column, as a name too long to fit already did.
+/// The table side, not the column side, because the columns that carry
+/// defaults are the ones most often spelled with an underscore (`created_at`,
+/// `is_active`). No environment was deployed under the old shape.
+pub(crate) fn default_constraint_name(table: &TableName, column: &str) -> String {
+    let full = format!("{DEFAULT_NAME_PREFIX}{}_{}", table.name, column);
+    if !table.name.contains('_')
+        && !ends_like_a_digest(&full)
+        && utf16_units(&full) <= MAX_IDENT_CHARS
+    {
         return full;
     }
-    shortened_default_constraint_name(table, column)
+    digested_default_constraint_name(table, column)
 }
 
 /// An identifier's length in the unit the server measures it in.
@@ -95,6 +115,13 @@ fn cut_to_utf16(s: &str, units: usize) -> String {
         .collect()
 }
 
+/// What every default-constraint name `pbps` creates begins with. `DF_` is SQL
+/// Server's own convention for a default, and `pbps_` marks the name as this
+/// tool's: many teams name their defaults `DF_<table>_<column>` by hand, and a
+/// constraint `pbps` creates should neither collide with one of those nor be
+/// mistaken for one (#969).
+const DEFAULT_NAME_PREFIX: &str = "DF_pbps_";
+
 /// The digest, in hex characters, appended to a shortened name.
 ///
 /// 64 bits rather than the 32 that would do: two truncations colliding would
@@ -104,14 +131,31 @@ fn cut_to_utf16(s: &str, units: usize) -> String {
 /// of parts that are already truncated.
 const DEFAULT_NAME_DIGEST_CHARS: usize = 16;
 
-/// `DF_<table>_<column>_<digest>`, cut to fit and stable across runs.
+/// Whether `name` ends the way every digested name does: `_` and
+/// [`DEFAULT_NAME_DIGEST_CHARS`] hex digits, in either case, since a
+/// case-insensitive database reads `…_EE88…` and `…_ee88…` as one name. A
+/// short name that did
+/// would be spelled like some digested one. `dbo.a.b_c_<the digest of
+/// dbo.a_b.c>` and `dbo.a_b.c` gave one name (review of #969), so such a name
+/// takes the digested form too, and the two forms never meet.
+fn ends_like_a_digest(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() > DEFAULT_NAME_DIGEST_CHARS
+        && bytes[bytes.len() - DEFAULT_NAME_DIGEST_CHARS - 1] == b'_'
+        && bytes[bytes.len() - DEFAULT_NAME_DIGEST_CHARS..]
+            .iter()
+            .all(u8::is_ascii_hexdigit)
+}
+
+/// `DF_pbps_<table>_<column>_<digest>`, cut to fit where it must, and stable across
+/// runs.
 ///
 /// The digest is over the **qualified** column, so the two halves of the name
 /// that were truncated away still separate two columns that now share a
 /// prefix. It is seeded with NUL between the parts: NUL is the one character
 /// [`quote`] refuses outright, so no name can contain one and no two different
 /// triples can spell the same seed.
-fn shortened_default_constraint_name(table: &TableName, column: &str) -> String {
+fn digested_default_constraint_name(table: &TableName, column: &str) -> String {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
@@ -127,14 +171,14 @@ fn shortened_default_constraint_name(table: &TableName, column: &str) -> String 
         .map(|b| format!("{b:02x}"))
         .collect();
 
-    // "DF_" + table + "_" + column + "_" + digest. The digest and the fixed
+    // Prefix + table + "_" + column + "_" + digest. The digest and the fixed
     // parts are ASCII, so their unit count is their length.
-    let budget = MAX_IDENT_CHARS - "DF_".len() - 2 - DEFAULT_NAME_DIGEST_CHARS;
+    let budget = MAX_IDENT_CHARS - DEFAULT_NAME_PREFIX.len() - 2 - DEFAULT_NAME_DIGEST_CHARS;
     let (table_units, column_units) = share(budget, utf16_units(&table.name), utf16_units(column));
 
     let short_table = cut_to_utf16(&table.name, table_units);
     let short_column = cut_to_utf16(column, column_units);
-    format!("DF_{short_table}_{short_column}_{digest}")
+    format!("{DEFAULT_NAME_PREFIX}{short_table}_{short_column}_{digest}")
 }
 
 /// Splits `budget` UTF-16 units between two parts that do not both fit.
@@ -1715,7 +1759,8 @@ mod tests {
         });
         assert!(sql[0].contains("[id] bigint IDENTITY(1,1) NOT NULL"));
         assert!(
-            sql[0].contains("[status] tinyint NOT NULL CONSTRAINT [DF_t_status] DEFAULT (0\n)"),
+            sql[0]
+                .contains("[status] tinyint NOT NULL CONSTRAINT [DF_pbps_t_status] DEFAULT (0\n)"),
             "{}",
             sql[0]
         );
@@ -1973,7 +2018,7 @@ mod tests {
 
         // The cut never splits a character, so what is left is still the
         // characters it came from.
-        assert!(name.starts_with("DF_\u{1f600}"), "{name}");
+        assert!(name.starts_with("DF_pbps_\u{1f600}"), "{name}");
 
         // And the entry check is in units too: this one is 69 characters, so
         // a character count would have returned it whole at 133 units.
@@ -1984,7 +2029,7 @@ mod tests {
             short_column.encode_utf16().count()
         );
         assert!(
-            format!("DF_{}_a", table.name).chars().count() <= MAX_IDENT_CHARS,
+            format!("DF_pbps_{}_a", table.name).chars().count() <= MAX_IDENT_CHARS,
             "the character count has to be under the limit, or this proves nothing"
         );
     }
@@ -2011,25 +2056,97 @@ mod tests {
         assert_ne!(a, default_constraint_name(&elsewhere, &first));
     }
 
-    /// The shortening must not reach a name that already fits, or every
-    /// existing plan would be rewritten by upgrading.
+    /// A name that fits keeps its short, readable form when its table's name
+    /// has no underscore: a digest there would say nothing the name does not.
     #[test]
-    fn a_generated_default_name_that_fits_is_left_exactly_as_it_was() {
+    fn a_generated_default_name_that_fits_keeps_its_short_form() {
         assert_eq!(
             default_constraint_name(&tname("dbo.customer"), "status"),
-            "DF_customer_status"
+            "DF_pbps_customer_status"
         );
-        // Exactly at the limit: "DF_" + 62 + "_" + 62 == 128.
-        let table = TableName::new("dbo", "t".repeat(62));
-        let column = "c".repeat(62);
+        assert_eq!(
+            default_constraint_name(&tname("dbo.customer"), "created_at"),
+            "DF_pbps_customer_created_at",
+            "an underscore in the column does not make the boundary ambiguous"
+        );
+        // Exactly at the limit: "DF_pbps_" + 59 + "_" + 60 == 128.
+        let table = TableName::new("dbo", "t".repeat(59));
+        let column = "c".repeat(60);
         let name = default_constraint_name(&table, &column);
         assert_eq!(name.chars().count(), MAX_IDENT_CHARS);
-        assert_eq!(name, format!("DF_{}_{}", "t".repeat(62), "c".repeat(62)));
+        assert_eq!(
+            name,
+            format!("DF_pbps_{}_{}", "t".repeat(59), "c".repeat(60))
+        );
 
         // One more character, and it is cut rather than refused.
-        let over = default_constraint_name(&table, &"c".repeat(63));
+        let over = default_constraint_name(&table, &"c".repeat(61));
         assert!(over.chars().count() <= MAX_IDENT_CHARS, "{over}");
-        assert!(over.len() < format!("DF_{}_{}", "t".repeat(62), "c".repeat(63)).len());
+        assert!(over.len() < format!("DF_pbps_{}_{}", "t".repeat(59), "c".repeat(61)).len());
+    }
+
+    /// #969: `DF_pbps_{table}_{column}` does not say where the table ends, so
+    /// `dbo.a_b.c` and `dbo.a.b_c` both spelled `DF_pbps_a_b_c` and the engine
+    /// refused the second `CREATE TABLE` (Msg 1750). A table name with an
+    /// underscore takes the digest.
+    #[test]
+    fn two_columns_whose_names_join_to_one_string_get_two_default_names() {
+        let a = default_constraint_name(&tname("dbo.a_b"), "c");
+        let b = default_constraint_name(&tname("dbo.a"), "b_c");
+        assert_ne!(a, b);
+        assert_eq!(
+            b, "DF_pbps_a_b_c",
+            "the table without an underscore keeps its short form"
+        );
+        assert!(a.starts_with("DF_pbps_a_b_c_"), "{a}");
+    }
+
+    /// Review of #969: a column spelled like a digested name. `dbo.a.b_c_<the
+    /// digest of dbo.a_b.c>` took the short form and spelled exactly the
+    /// digested name of `dbo.a_b.c`. A name that ends like a digest is
+    /// digested itself, so the two forms never meet.
+    #[test]
+    fn a_column_spelled_like_a_digest_does_not_take_a_digested_name() {
+        let digested = default_constraint_name(&tname("dbo.a_b"), "c");
+        let suffix = &digested["DF_pbps_a_b_c_".len()..];
+        let impostor = default_constraint_name(&tname("dbo.a"), &format!("b_c_{suffix}"));
+        assert_ne!(digested, impostor);
+        assert!(ends_like_a_digest(&digested), "{digested}");
+        assert!(!ends_like_a_digest("DF_pbps_customer_status"));
+        assert!(
+            ends_like_a_digest("DF_pbps_t_c_0123456789ABCDEF"),
+            "a case-insensitive database folds an uppercase suffix onto a digest"
+        );
+        assert!(!ends_like_a_digest("DF_pbps_t_c_0123456789abcdeg"));
+    }
+
+    /// The rule behind that test, over every short name: no two columns of one
+    /// schema are given one default name. Every table and column spelled from
+    /// `a`, `b` and `_`, up to four characters each.
+    #[test]
+    fn no_two_columns_of_a_schema_share_a_generated_default_name() {
+        fn spellings(max: usize) -> Vec<String> {
+            let mut out = vec![String::new()];
+            let mut all = Vec::new();
+            for _ in 0..max {
+                out = out
+                    .iter()
+                    .flat_map(|p| ['a', 'b', '_'].map(|c| format!("{p}{c}")))
+                    .collect();
+                all.extend(out.iter().cloned());
+            }
+            all
+        }
+        let names = spellings(4);
+        let mut seen: BTreeMap<String, (String, String)> = BTreeMap::new();
+        for table in &names {
+            for column in &names {
+                let name = default_constraint_name(&TableName::new("dbo", table.clone()), column);
+                if let Some(other) = seen.insert(name.clone(), (table.clone(), column.clone())) {
+                    panic!("{name} is both {other:?} and {:?}", (table, column));
+                }
+            }
+        }
     }
 
     /// A part shorter than its half keeps all of itself. Halving both would
@@ -2055,7 +2172,7 @@ mod tests {
             to: Some("1".into()),
         });
         assert!(sql[0].contains("sys.default_constraints"));
-        assert!(sql[0].contains("ADD CONSTRAINT [DF_t_status] DEFAULT (1\n) FOR [status]"));
+        assert!(sql[0].contains("ADD CONSTRAINT [DF_pbps_t_status] DEFAULT (1\n) FOR [status]"));
 
         let add_only = sql_of(&Change::AlterColumnDefault {
             uid: uid("c_k7x2mq"),
