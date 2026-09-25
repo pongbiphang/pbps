@@ -652,8 +652,9 @@ the validation outcome does.
   document. So does a type widened or changed so that a value the old schema
   refused can be emitted, and so does a new enum value. A field added to an
   object that constrains the properties it does not name fails it as well.
-  Such an object's `additionalProperties` is `false`, or a schema every
-  unnamed value must match. These move the version together with the
+  Such an object restricts `additionalProperties` or `unevaluatedProperties`
+  (to `false` or a schema), restricts `propertyNames`, or sets
+  `maxProperties`. These move the version together with the
   schema's `const` (DECISIONS 224).
 
 Moving the version on every addition was the alternative. It would make every
@@ -678,10 +679,11 @@ Two tests in `integration` hold the part a reviewer cannot see.
   A property may be dropped or become required. A property may not be added,
   stop being required or change its own schema, and no other keyword may
   change. The current object is found by its pointer even when it is no
-  longer constrained, so an object that opens is compared too. Descriptions
-  are ignored where they annotate a schema, but not where `description` names
-  a property or sits inside a `const`, `enum`, `default` or `examples`
-  literal. Archives never change, so a change the old
+  longer constrained, so an object that opens is compared too. Annotation
+  keywords (`description`, `title`, `$comment`, `default`, `examples`,
+  `deprecated`, `readOnly`, `writeOnly`) are ignored, because they change no
+  validation. A property named like one is kept, and so is a `const` or
+  `enum` literal that holds one. Archives never change, so a change the old
   document would refuse fails until `output::SCHEMA_VERSION` moves. A
   property's own schema is compared by equality, so a narrowing inside it is
   refused conservatively. Deciding JSON Schema containment in general is not

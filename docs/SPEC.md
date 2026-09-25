@@ -1949,8 +1949,9 @@ could fail validation against the envelope schema published before it
 - These move it: a required field removed or renamed, a type widened or
   changed so that a value the old schema refused can be emitted, a new enum
   value, or a field added to one of the few objects that constrain the
-  properties they do not name. Those objects are the ones whose
-  `additionalProperties` is `false` or a schema.
+  properties they do not name. Those objects are the ones that restrict
+  `additionalProperties`, `unevaluatedProperties` or `propertyNames`, or set
+  `maxProperties`.
 
 A consumer that parses `data` strictly accepts that it must update with the
 tool.

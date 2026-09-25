@@ -476,9 +476,10 @@ mod tests {
     /// An additive `data` field keeps the envelope's wire version only where
     /// the published schema leaves an object open: a consumer validating
     /// against the older document still accepts the envelope that carries it
-    /// (DEC-997.1). An object that constrains the properties it does not name —
-    /// `additionalProperties: false`, or a schema every unnamed value must
-    /// match — refuses some additions, so each one is named here on purpose.
+    /// (DEC-997.1). An object that constrains the properties it does not name
+    /// (through `additionalProperties`, `unevaluatedProperties`,
+    /// `propertyNames` or `maxProperties`) refuses some additions, so each one
+    /// is named here on purpose.
     ///
     /// `ResolverProfile` is the configuration's own type, echoed by a connected
     /// plan's resolver selection, and stays closed so `pbps.yml` refuses a
@@ -503,7 +504,7 @@ mod tests {
     /// says that such a change moves the wire version. Every archived envelope
     /// document stamped with the current `output::SCHEMA_VERSION` must still
     /// accept each constrained object this build publishes (`still_accepted`,
-    /// descriptions aside). The archives never change (DECISIONS 465), so a
+    /// annotations aside). The archives never change (DECISIONS 465), so a
     /// change the old document would refuse fails here until the wire version
     /// and the schema's `const` move with it (DECISIONS 224, DEC-997.1).
     #[test]
@@ -641,9 +642,13 @@ mod tests {
                 "Empty": { "type": "object", "additionalProperties": {} },
                 "Unset": { "type": "object", "properties": { "a": {} } },
                 "Map": { "type": "object", "additionalProperties": { "type": "string" } },
+                "Named": { "type": "object", "propertyNames": { "pattern": "^a" } },
+                "Bounded": { "type": "object", "maxProperties": 2 },
+                "Unevaluated": { "type": "object", "unevaluatedProperties": false },
                 "Nested": { "oneOf": [{ "properties": {
                     "inner": {
                         "description": "dropped before comparison",
+                        "title": "dropped too",
                         "type": "object",
                         "properties": { "description": { "type": "string" } },
                         "additionalProperties": false
@@ -653,7 +658,16 @@ mod tests {
         });
         let constrained = constrained_objects(&document);
         let names: Vec<&str> = constrained.keys().map(String::as_str).collect();
-        assert_eq!(names, ["Map", "Nested/oneOf/0/properties/inner"]);
+        assert_eq!(
+            names,
+            [
+                "Bounded",
+                "Map",
+                "Named",
+                "Nested/oneOf/0/properties/inner",
+                "Unevaluated"
+            ]
+        );
         assert_eq!(
             constrained["Nested/oneOf/0/properties/inner"],
             serde_json::json!({
@@ -664,9 +678,21 @@ mod tests {
         );
     }
 
-    /// Keywords whose value is an instance literal, not a schema: nothing
-    /// beneath them is a keyword, so nothing there is dropped or walked.
-    const LITERALS: [&str; 4] = ["const", "enum", "default", "examples"];
+    /// Keywords whose value is an instance literal that validation compares
+    /// against: nothing beneath them is a keyword, so it is kept verbatim.
+    const LITERALS: [&str; 2] = ["const", "enum"];
+    /// Annotation keywords: they change no validation, so a change to one
+    /// never needs the wire version to move.
+    const ANNOTATIONS: [&str; 8] = [
+        "description",
+        "title",
+        "$comment",
+        "default",
+        "examples",
+        "deprecated",
+        "readOnly",
+        "writeOnly",
+    ];
     /// Keywords whose value maps names to schemas: the keys are names, never
     /// keywords, and each value is a schema of its own.
     const NAME_MAPS: [&str; 4] = [
@@ -684,7 +710,7 @@ mod tests {
     ) -> Vec<(String, &'a serde_json::Value)> {
         let escape = |segment: &str| segment.replace('~', "~0").replace('/', "~1");
         match value {
-            _ if LITERALS.contains(&key) => Vec::new(),
+            _ if LITERALS.contains(&key) || ANNOTATIONS.contains(&key) => Vec::new(),
             serde_json::Value::Object(named) if NAME_MAPS.contains(&key) => named
                 .iter()
                 .map(|(name, schema)| (format!("{}/{}", escape(key), escape(name)), schema))
@@ -702,15 +728,14 @@ mod tests {
         }
     }
 
-    /// A schema with its `description` annotations removed: they change no
-    /// validation. A property named `description` and a literal holding one
-    /// are kept.
+    /// A schema with its annotation keywords removed. A property named like
+    /// one, and a `const` or `enum` literal holding one, are kept.
     fn without_annotations(schema: &serde_json::Value) -> serde_json::Value {
         let serde_json::Value::Object(map) = schema else {
             return schema.clone();
         };
         map.iter()
-            .filter(|(key, _)| key.as_str() != "description")
+            .filter(|(key, _)| !ANNOTATIONS.contains(&key.as_str()))
             .map(|(key, value)| {
                 let value = match value {
                     _ if LITERALS.contains(&key.as_str()) => value.clone(),
@@ -737,12 +762,21 @@ mod tests {
     fn constrained_objects(
         document: &serde_json::Value,
     ) -> std::collections::BTreeMap<String, serde_json::Value> {
-        fn constrains(map: &serde_json::Map<String, serde_json::Value>) -> bool {
-            match map.get("additionalProperties") {
-                Some(serde_json::Value::Bool(false)) => true,
+        // A keyword constrains unnamed properties unless it is absent,
+        // `true` or `{}`, the three spellings of "anything".
+        fn restricts(value: Option<&serde_json::Value>) -> bool {
+            match value {
+                Some(serde_json::Value::Bool(allowed)) => !allowed,
                 Some(serde_json::Value::Object(schema)) => !schema.is_empty(),
-                Some(_) | None => false,
+                Some(_) => true,
+                None => false,
             }
+        }
+        fn constrains(map: &serde_json::Map<String, serde_json::Value>) -> bool {
+            restricts(map.get("additionalProperties"))
+                || restricts(map.get("unevaluatedProperties"))
+                || restricts(map.get("propertyNames"))
+                || map.contains_key("maxProperties")
         }
         fn walk(
             schema: &serde_json::Value,
@@ -836,6 +870,8 @@ mod tests {
 
         let mut annotated = archived.clone();
         annotated["$defs"]["D"]["properties"]["closed"]["description"] = "reworded".into();
+        annotated["$defs"]["D"]["properties"]["closed"]["properties"]["tag"]["default"] =
+            "another default".into();
         assert_eq!(refused_changes(&archived, &annotated), (2, Vec::new()));
     }
 
