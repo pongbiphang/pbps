@@ -841,6 +841,7 @@ mod tests {
                     table: tname("dbo.customer"),
                     from: "email".into(),
                     to: "contact_email".into(),
+                    table_was: None,
                 }),
                 PlannedChange::new(Change::DropTable {
                     uid: "t_bbbbbb".parse().unwrap(),
@@ -869,6 +870,7 @@ mod tests {
                 table: tname("dbo.customer"),
                 from: "email".into(),
                 to: "contact_email".into(),
+                table_was: None,
             })],
         };
 

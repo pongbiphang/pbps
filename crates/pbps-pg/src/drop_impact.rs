@@ -708,6 +708,7 @@ mod tests {
                     table: u.clone(),
                     from: "old".into(),
                     to: "new".into(),
+                    table_was: None,
                 }),
                 PlannedChange::new(Change::CreateTable {
                     uid: "t_bbbbbb".parse().unwrap(),

@@ -15887,6 +15887,7 @@ async fn narrowing_projection_keeps_added_foreign_key_checks_for_fitting_rows() 
                 table: child.clone(),
                 from: "v".into(),
                 to: child_column.into(),
+                table_was: None,
             });
         }
         let column = if side == "child" {
@@ -19760,6 +19761,7 @@ async fn planned_key_collation_guards_use_renamed_added_created_and_retyped_colu
                         table: child.clone(),
                         from: "ref".into(),
                         to: column.into(),
+                        table_was: None,
                     });
                 }
                 "add" | "add_default" => {
@@ -24664,12 +24666,14 @@ async fn estimate_provenance_follows_renamed_columns_for_indexes_and_checks() {
                 table: new.clone(),
                 from: "v".into(),
                 to: "amount".into(),
+                table_was: None,
             }),
             PlannedChange::new(Change::RenameColumn {
                 uid: "c_bbbbbb".parse().unwrap(),
                 table: new.clone(),
                 from: "n".into(),
                 to: "required".into(),
+                table_was: None,
             }),
             PlannedChange::new(Change::AlterColumnType {
                 uid: "c_aaaaaa".parse().unwrap(),
@@ -25879,6 +25883,7 @@ async fn drop_blockers_follow_prior_renames_and_refuse_missing_existing_targets(
             table: TableName::new(&s, "renamed"),
             from: "id".into(),
             to: "ident".into(),
+            table_was: None,
         },
         Change::DropColumn {
             uid: "c_aaaaaa".parse().unwrap(),
@@ -27548,6 +27553,7 @@ async fn doctor_data_column_acl_follows_recorded_identity_not_a_reused_name() {
             table: "public.t".parse().unwrap(),
             from: "old_label".into(),
             to: "label".into(),
+            table_was: None,
         },
     )
     .await;

@@ -2493,6 +2493,7 @@ async fn a_renamed_tables_and_columns_generated_defaults_follow_them() {
                 table: "dbo.t".parse().unwrap(),
                 from: "c".into(),
                 to: "d".into(),
+                table_was: None,
             })],
         },
     )
@@ -2527,6 +2528,43 @@ async fn a_renamed_tables_and_columns_generated_defaults_follow_them() {
                 to: "dbo.w".parse().unwrap(),
                 defaults: vec!["c".into()],
             })],
+        },
+    )
+    .await;
+
+    // Review of #988: when the table rename had to leave the default under
+    // the old table's name, the column rename that follows still finds it,
+    // and a new table under the old name can take that name back.
+    apply(
+        &mut db.conn,
+        &ChangeSet {
+            changes: vec![create("t_aaa004", "dbo.p", &["a"])],
+        },
+    )
+    .await;
+    db.conn
+        .execute("CREATE TABLE dbo.DF_pbps_q_a (id int);")
+        .await
+        .unwrap();
+    apply(
+        &mut db.conn,
+        &ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::RenameTable {
+                    uid: "t_aaa004".parse().unwrap(),
+                    from: "dbo.p".parse().unwrap(),
+                    to: "dbo.q".parse().unwrap(),
+                    defaults: vec!["a".into()],
+                }),
+                PlannedChange::new(Change::RenameColumn {
+                    uid: "t_aaa004".parse().unwrap(),
+                    table: "dbo.q".parse().unwrap(),
+                    from: "a".into(),
+                    to: "b".into(),
+                    table_was: Some("dbo.p".parse().unwrap()),
+                }),
+                create("t_aaa005", "dbo.p", &["a"]),
+            ],
         },
     )
     .await;
@@ -2571,6 +2609,8 @@ async fn a_renamed_tables_and_columns_generated_defaults_follow_them() {
         names,
         [
             ("dbo.adopted.c".to_owned(), "DF_legacy_c".to_owned()),
+            ("dbo.p.a".to_owned(), "DF_pbps_p_a".to_owned()),
+            ("dbo.q.b".to_owned(), "DF_pbps_q_b".to_owned()),
             ("dbo.t.c".to_owned(), "DF_pbps_t_c".to_owned()),
             ("dbo.t.d".to_owned(), "DF_pbps_t_d".to_owned()),
             ("dbo.w.c".to_owned(), "DF_pbps_u_c".to_owned()),
@@ -2945,6 +2985,7 @@ async fn a_column_rename_on_a_renamed_table_still_finds_its_blocker() {
                 table: "dbo.customer".parse().unwrap(),
                 from: "email".into(),
                 to: "contact_email".into(),
+                table_was: None,
             }),
         ],
     };
@@ -13226,6 +13267,7 @@ async fn an_undeclared_key_on_a_retyped_column_is_named_before_the_widening() {
             table: TableName::new("dbo", "p_renamed"),
             from: "code".into(),
             to: "renamed".into(),
+            table_was: None,
         },
         Change::AlterColumnType {
             uid: "c_bbbbbb".parse().unwrap(),

@@ -263,6 +263,7 @@ async fn connected_estimates_keep_storage_and_identity_uncertainty_visible() {
                 table: "dbo.renamed".parse().unwrap(),
                 from: "v".into(),
                 to: "amount".into(),
+                table_was: None,
             }),
             PlannedChange::new(Change::RenameTable {
                 uid: pbps_model::Uid::generate(UidKind::Table),

@@ -689,6 +689,8 @@ fn diff_columns(
                 table: declared_table_name.clone(),
                 from: base_ref.name.clone(),
                 to: declared_ref.name.clone(),
+                table_was: (base_table_name != declared_table_name)
+                    .then(|| base_table_name.clone()),
             });
         }
 
@@ -5846,6 +5848,57 @@ mod tests {
             panic!("{cs:?}");
         };
         assert_eq!(defaults, &["a".to_owned()]);
+    }
+
+    /// A column rename in a plan that also renames its table names the old
+    /// table, so the emitter can find a generated default the table rename
+    /// had to leave under the old table's name (#975). Without a table rename
+    /// it names none.
+    #[test]
+    fn a_column_rename_names_the_old_table_only_when_the_table_is_renamed_too() {
+        let other = ("app.other", table(&[("n", Column::new(ty("int")))]));
+        let base = two_tables(
+            ("app.old", table(&[("a", Column::new(ty("int")))])),
+            other.clone(),
+        );
+        let renamed =
+            |t: &str| two_tables((t, table(&[("b", Column::new(ty("int")))])), other.clone());
+        let column = |t: &str| Intent::RenameColumn {
+            table: t.parse().unwrap(),
+            from: "a".into(),
+            to: "b".into(),
+        };
+        let table_was = |cs: &ChangeSet| {
+            cs.changes
+                .iter()
+                .find_map(|p| match &p.change {
+                    Change::RenameColumn { table_was, .. } => Some(table_was.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{cs:?}"))
+        };
+
+        let both = run_with(
+            &MinimalDialect,
+            &base,
+            &renamed("app.new"),
+            &[
+                Intent::RenameTable {
+                    from: "app.old".parse().unwrap(),
+                    to: "app.new".parse().unwrap(),
+                },
+                column("app.new"),
+            ],
+        );
+        assert_eq!(table_was(&both), Some("app.old".parse().unwrap()));
+
+        let alone = run_with(
+            &MinimalDialect,
+            &base,
+            &renamed("app.old"),
+            &[column("app.old")],
+        );
+        assert_eq!(table_was(&alone), None);
     }
 
     /// The same for a foreign key, the other constraint no index backs.

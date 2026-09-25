@@ -7267,12 +7267,14 @@ mod tests {
                     table: "dbo.t".parse().unwrap(),
                     from: "a".into(),
                     to: "a2".into(),
+                    table_was: None,
                 }),
                 PlannedChange::new(Change::RenameColumn {
                     uid: "c_bbbbbb".parse().unwrap(),
                     table: "dbo.t".parse().unwrap(),
                     from: "b".into(),
                     to: "b2".into(),
+                    table_was: None,
                 }),
             ],
         };
@@ -7483,6 +7485,7 @@ mod tests {
                     table: named.clone(),
                     from: "label".to_owned(),
                     to: "note".to_owned(),
+                    table_was: None,
                 }),
             ],
         };
@@ -9565,6 +9568,7 @@ mod tests {
                     table: "dbo.t".parse().unwrap(),
                     from: "old".to_owned(),
                     to: "new".to_owned(),
+                    table_was: None,
                 },
             )],
         };
@@ -10572,6 +10576,7 @@ mod tests {
                     table: dbo_t.clone(),
                     from: "a".to_owned(),
                     to: "b".to_owned(),
+                    table_was: None,
                 },
             )],
         };
@@ -10648,6 +10653,7 @@ mod tests {
                     table: dbo_t.clone(),
                     from: "a".to_owned(),
                     to: "b".to_owned(),
+                    table_was: None,
                 }),
                 pbps_model::PlannedChange::new(pbps_model::Change::AlterColumnType {
                     uid: "c_aaaaaa".parse().unwrap(),

@@ -890,6 +890,7 @@ mod tests {
                 table: TableName::new("app", "u"),
                 from: "n".into(),
                 to: "m".into(),
+                table_was: None,
             },
             alter(&s, "app.f(integer)"),
         ]);

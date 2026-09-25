@@ -591,7 +591,10 @@ so it follows:
 - `RenameTable` carries the columns that have a default when it runs, by their
   names then (`defaults`). The emitter renames each default after the table's
   rename, to the name the new table would give it.
-- `RenameColumn` renames its column's default in the same batch.
+- `RenameColumn` renames its column's default in the same batch. When the
+  plan also renamed the table, it carries the old table name (`table_was`) and
+  looks for the default under both tables' names, since a table rename whose
+  target was taken leaves it under the old one.
 
 Each rename happens only if the constraint still has the name `pbps` generated
 (compared past padding, DEC-954.1), so an adopted default under a name `pbps`
@@ -600,5 +603,5 @@ holds is left alone as well, and the default keeps its old name, so the table
 or column rename it follows still runs (review of #988). Deriving the name from
 a uid instead would have left
 names that no longer say which table and column they belong to, which is the
-reason `pbps` names defaults at all. The field is `#[serde(default)]`; per
+reason `pbps` names defaults at all. Both fields are `#[serde(default)]`; per
 DECISIONS 145 no plan format bump is needed before the first release.

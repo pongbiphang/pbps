@@ -901,6 +901,7 @@ mod tests {
                     table: tname("app.customer"),
                     from: "v".into(),
                     to: "amount".into(),
+                    table_was: None,
                 }),
                 // A table this plan leaves alone, to show the translation is a
                 // lookup and not a rewrite of every name in sight.
@@ -965,12 +966,14 @@ mod tests {
                     table: tname("app.customer"),
                     from: "v".into(),
                     to: "amount".into(),
+                    table_was: None,
                 }),
                 PlannedChange::new(Change::RenameColumn {
                     uid: "c_cccccc".parse().unwrap(),
                     table: tname("app.customer"),
                     from: "n".into(),
                     to: "required".into(),
+                    table_was: None,
                 }),
                 PlannedChange::new(Change::RenameTable {
                     uid: "t_aaaaaa".parse().unwrap(),

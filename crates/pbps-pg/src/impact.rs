@@ -533,6 +533,7 @@ mod tests {
                     table: tname("app.customer"),
                     from: "email".into(),
                     to: "contact_email".into(),
+                    table_was: None,
                 }),
                 PlannedChange::new(Change::DropTable {
                     uid: "t_bbbbbb".parse().expect("a uid"),
@@ -570,6 +571,7 @@ mod tests {
                     table: tname("app.customer"),
                     from: "email".into(),
                     to: "contact_email".into(),
+                    table_was: None,
                 }),
             ],
         };

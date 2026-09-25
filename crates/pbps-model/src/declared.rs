@@ -515,6 +515,7 @@ mod tests {
                 table: t(),
                 from: "k".to_owned(),
                 to: "kk".to_owned(),
+                table_was: None,
             },
             Change::RenameTable {
                 uid: "t_aaaaaa".parse().unwrap(),

@@ -210,6 +210,12 @@ pub enum Change {
         table: TableName,
         from: String,
         to: String,
+        /// The table's name before this plan renamed it, when it did. The
+        /// table rename leaves a generated default under the name built from
+        /// this one when the name it would move to is taken, so the column
+        /// rename looks for both (#975).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        table_was: Option<TableName>,
     },
     AlterColumnType {
         uid: Uid,
@@ -2558,6 +2564,7 @@ mod tests {
                 table: "dbo.customer".parse().unwrap(),
                 from: "mobile".into(),
                 to: "phone".into(),
+                table_was: None,
             }
             .columns_promised()
             .is_empty()
