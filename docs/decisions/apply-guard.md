@@ -969,18 +969,17 @@ which says how to add an entry here.
 
 <a id="dec-319-1"></a>
 
-**DEC-319.1. A PostgreSQL plan pins every unmanaged routine its statements,
-probes and fired triggers can call by name, under the environment's key, and
-`apply` refuses a changed pin before its probes, before its DDL and before it
-commits (#319; planned).** The drift check (SPEC §7.6) covers the managed set,
-and SPEC §8.2 leaves everything else out of the comparison. It says nothing
-about the code a plan runs. A CHECK the plan adds can call `ext.helper(x)`, which
-the plan does not manage. The helper's owner can replace it after approval, and
-the deployer runs the new body twice: once in a pre-flight probe, and again in
-the DDL that validates the constraint. #805 made the probe read-only (DECISIONS
-537), so a write from the probe no longer persists. The DDL runs inside the
-apply transaction, though, and whatever it writes commits with the approved
-changes.
+**DEC-319.1. A PostgreSQL plan pins every unmanaged routine a non-superuser
+can replace, under the environment's key, and `apply` refuses a changed pin before its
+probes, before its DDL and before it commits (#319; planned).** The drift check
+(SPEC §7.6) covers the managed set, and SPEC §8.2 leaves everything else out of
+the comparison. It says nothing about the code a plan runs. A CHECK the plan adds
+can call `ext.helper(x)`, which the plan does not manage. The helper's owner can
+replace it after approval, and the deployer runs the new body twice: once in a
+pre-flight probe, and again in the DDL that validates the constraint. #805 made
+the probe read-only (DECISIONS 537), so a write from the probe no longer
+persists. The DDL runs inside the apply transaction, though, and whatever it
+writes commits with the approved changes.
 
 *Why not the obvious fixes.*
 - *Lock the routines.* A deployer that is not a superuser cannot: `SELECT …
@@ -991,108 +990,109 @@ changes.
   body, or a bare SHA-256 of it, publishes a guessing oracle for any literal in
   that body. DEC-952.1 answers exactly this: the fingerprint is an HMAC under the
   environment's key.
+- *Pin only what the plan can reach.* The first drafts of this entry did that.
+  They started from the plan's text and followed calls, triggers, foreign-key
+  actions and stored expressions. Each review round of PR #985 found another
+  surface through which the engine runs a routine that no statement names:
+  - a cascade's target table;
+  - a table a trigger body writes;
+  - a domain's default;
+  - a row-security policy;
+  - an `INSTEAD OF` trigger, or a view rewritten to its base table.
+
+  The list does not end there. Operators, casts, a type's I/O functions and
+  names built at run time lie on the same road. Every entry on it is a
+  `pg_proc` row, though. Pinning the rows, rather than the paths to them, ends
+  the enumeration. This is the lesson of DEC-952.1 (#880) in another place: stop
+  re-deriving what the engine will do, and pin what it does it with.
 - *Resolve bindings as the engine does.* A declaration the plan has not created
   yet has no bindings to read, and a PL/pgSQL body binds when it runs. Engine
-  resolution belongs to the resolver (SPEC §9.3.2, #614), which needs its own
-  scratch database. This check is for every plan, so it matches names instead.
-  Over-inclusion costs a replan when an unrelated same-named routine changes.
-  Under-inclusion would miss the attack. The name rule errs toward the first.
+  resolution belongs to the resolver (SPEC §9.3.2, #614).
 
-*What is pinned.*
-- *Scope.* Every routine in `pg_proc` that is not managed, outside `pg_catalog`
-  and `information_schema`. Extension members count as unmanaged here, though the
-  pull skips them.
-- *Roots.* Collection starts from three kinds of text, all scanned with literal
-  contents kept, so that `EXECUTE 'SELECT helper()'` is a call:
-  - the plan's statements and the probe SQL derived from it;
-  - the functions of triggers on every table in each row operation's
-    write-producing closure, which follows the foreign-key actions that write
-    for it (DECISIONS 451). This extends DECISIONS 445/450's direct
-    trigger-function check to transitive calls;
-  - the stored expressions the engine evaluates on the same tables and on
-    every table the plan alters, none of which appears in a DML statement's
-    text. A cascade two foreign keys away evaluates the CHECKs of the table it
-    writes, just as the named table does.
-    That means every CHECK (`pg_get_constraintdef`), every default and
-    generated column (`pg_get_expr` over `adbin`), every index expression and
-    predicate (`pg_get_indexdef`), and the CHECKs of every domain a column
-    uses. An unchanged `CHECK (ext.helper(value))` runs its helper on every
-    row the plan writes;
-  - the functions of enabled event triggers, which the DDL fires.
-- *Calls.* A call is an identifier, qualified or bare, followed by `(`, or the
-  name after `CALL`. Names match case-insensitively.
-- *Name sets.* A name pins the set of **every** in-scope routine with that
-  name, in every schema and every overload. A routine added later anywhere with
-  that name, including one that would shadow the first through a caller's
-  `search_path`, changes the set. The probes resolve names under the deployer's
-  own path, not the DDL's write path (preflight.rs), so pinning one resolved
-  binding would miss this.
-- *Reached tables.* A table's name matters as much as a routine's. A trigger
-  or routine body that writes another table makes the engine run that table's
-  triggers and stored expressions. Telling a write from a read in a
-  PL/pgSQL body, or in a dynamic string, would mean parsing it. So any
-  identifier in scanned text, qualified or bare, that names a table in any
-  schema reaches that table, and the table reaches its write-producing closure
-  (DECISIONS 451). Each reached table adds its trigger functions and stored
-  expressions to the roots, exactly as a table the plan writes directly does.
-  An `INSERT INTO audit …` in a managed trigger's body therefore pins the
-  helpers that `audit`'s CHECKs and defaults call.
-- *Closure.* Every body and expression matched along the way, managed or not,
-  is scanned in turn, for calls and for table names, until no new name
-  appears.
-- *Aggregates.* An aggregate is in scope like any routine, but it has no body
-  to deparse. `pg_get_functiondef` refuses one with SQLSTATE 42809 (measured on
-  18.6, and in the live suite). Its definition is therefore its `pg_aggregate`
-  row, and each support function comes by `regprocedure`: transition, final,
-  combine, serial, deserial, the moving-aggregate ones, and the sort
-  operator's. Those functions join the closure, because they are what runs. A
-  window function (`prokind = 'w'`) deparses like any other routine: all 15
-  built-in ones return a definition on 18.6 and on 16.15, measured for this
-  entry. A plan that reaches an aggregate is therefore still accepted.
+*What is pinned.* Every routine (`pg_proc` row) that meets all three conditions:
+- it lies outside `pg_catalog` and `information_schema`;
+- it is not in the plan's managed set, whose routines the drift check and the
+  read-back already hold;
+- a role that is not a superuser can replace it. That is the case unless its
+  owner is a superuser and every member of the owner's role, by any path
+  (`pg_has_role(member, owner, 'MEMBER')`), is a superuser too.
 
-*What a pin holds.* One entry per name. Each is an HMAC under the
+The last condition is the one that keeps the set small. Only the owner, a
+member of the owner's role, or a superuser can replace or re-own a routine, and
+nothing pbps checks restrains a superuser. Membership counts even into a
+superuser's role. A plain role granted `postgres` replaced a `postgres`-owned
+function with `CREATE OR REPLACE`, measured on 18.6, while `rolsuper` stayed
+false for it. Extension members are included on
+the same terms. A trusted extension that a non-superuser installs still creates
+its routines owned by the bootstrap superuser: pgcrypto's 37, installed by a
+plain role with `CREATE` on the database, measured on 18.6. So an extension
+routine is excluded unless someone has re-owned it. A routine that changes owner,
+or whose owner's membership changes, can enter or leave the set, and that is a
+change like any other.
+
+*What a pin holds.* One entry per schema. Each is an HMAC under the
 environment's key (DEC-952.1), with rule `pbps/external-routine-pin/v1` and the
-name as component. The input is the canonical list of that name's routines,
-each with:
-- its schema and `pg_get_function_identity_arguments`;
-- its `pg_get_functiondef`, which carries the body, the language, `SECURITY
-  DEFINER`, volatility and every `SET` clause (DECISIONS 306);
+schema name as component. The input is the canonical list, in identity order,
+of the schema's in-scope routines. Each routine contributes:
+- its name and `pg_get_function_identity_arguments`;
+- its definition. For a function or procedure this is `pg_get_functiondef`,
+  which carries the body, the language, `SECURITY DEFINER`, volatility and
+  every `SET` clause (DECISIONS 306). An aggregate has no deparsable body
+  (SQLSTATE 42809, measured on 18.6 and in the live suite), so its definition
+  is its `pg_aggregate` row, with every support function and the sort operator
+  given as `regprocedure` or `regoperator` text. A window function deparses
+  like any function: 15 of 15 built-in ones on 18.6 and on 16.15, measured;
 - its owner's name, which the definition does not contain (measured);
 - its `proacl`.
 
 The deployer can read all of these for another role's routine, even one whose
 `EXECUTE` is revoked from it (measured on 18.6). The saved plan records the
-names, their digests and the key identifier, in a new plan version. The plan
-checksum covers them the way it covers the rest of the file.
+schema names, their digests, their routine counts and the key identifier, in a
+new plan version. The plan checksum covers them as it covers the rest of the
+file. One entry per schema keeps a plan small when an extension brings hundreds
+of routines. It still lets a refusal say where the change is.
 
 *When the plan has no key.* `plan` refuses a database-origin plan whose pin set
 is not empty when its environment has no fingerprint key. The remedy names
-`pbps key generate` and `fingerprint_key_env` / `fingerprint_key_file`. A plan
-that reaches no unmanaged routine needs no key and records no pins. Under
-`unmanaged: error` a plan with unmanaged routines is already refused, so pins
-matter only under `ignore` and `warn`.
+`pbps key generate` and `fingerprint_key_env` / `fingerprint_key_file`. A
+database in which no unmanaged routine is replaceable by a non-superuser needs
+no key and records no pins. Under `unmanaged: error` a plan with unmanaged routines is
+already refused, so pins matter only under `ignore` and `warn`.
 
-*When `apply` checks.* `apply` recomputes the pins from the plan's own roots,
-then compares them in three places:
+*When `apply` checks.* `apply` recomputes the set, then compares it with the
+plan's pins in three places:
 - under the deployment lock, after the drift check and before `preflight`, in
   a snapshot read of its own;
 - inside the apply transaction, after `BEGIN` and before the first statement;
 - after the read-back and before `record`, so a replacement during the DDL
   rolls the apply back.
 
-A digest mismatch, a name that gained or lost a routine, an unreadable
-definition and a key identifier that is not the plan's all refuse. None of them
-reads as "nothing changed" (AGENTS.md: absent, empty and unreadable differ).
-Each refusal names the routine name and the remedy, which is to replan. A
-staged plan is checked under the lock before pre-flight, and again before each
-step's statements and before each checkpoint it records. It gets no transaction
-that spans its steps, so a replacement is caught at the next step boundary, not
-rolled back past it.
+A routine the plan itself creates is in the managed set, so it never counts as
+a new unmanaged one. A digest mismatch, a schema that gained or lost pinned
+routines, an unreadable definition and a key identifier that is not the plan's
+all refuse. None of them reads as "nothing changed" (AGENTS.md: absent, empty
+and unreadable differ). Each refusal names the schema and gives the remedy,
+which is to replan.
+
+A staged plan is checked under the lock before pre-flight, and again before
+each step's statements and before each checkpoint it records. It gets no
+transaction that spans its steps, so a replacement is caught at the next step
+boundary, not rolled back past it.
+
+The price is over-inclusion. A change between plan and apply to any unmanaged,
+non-superuser routine refuses the apply, even one this plan never runs. The
+remedy is a replan, as it is for drift in the managed set. The window between
+plan and apply is short, and an external routine that changes inside it is
+exactly what an operator should look at before running approved DDL.
 
 *What it does not cover.*
-- Routines reached with no call syntax: operators, casts, a type's I/O
-  functions, and names assembled at run time (`EXECUTE 'hel' || 'per()'`). The
-  resolver's node-tree capture covers the first three for resolver plans (#614).
+- A new call site attached after approval to a routine that has not changed,
+  such as a new policy, domain default or trigger on an unmanaged object. That
+  is not a replaced routine. Unmanaged objects other than routines stay outside
+  the comparison (SPEC §8.2). Triggers on written tables are DECISIONS 445/451's
+  execution-trust check.
+- A routine that only superusers can replace. A superuser can change anything
+  this check reads, and the check itself.
 - A replace-and-restore that falls entirely between two checks. Probes are
   read-only and the last check precedes the commit, so what such a body can
   still do is non-transactional: the SPEC §7.6 limit, "protection against
