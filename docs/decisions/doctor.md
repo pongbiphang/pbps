@@ -642,3 +642,27 @@ Which permissions `doctor` asks for, and on which securables. Part of the
      demand is on an object that exists, at the securable it exists on, which is
      an over-demand this reading cannot see; the destination demand was one it
      could.
+
+<a id="dec-384-1"></a>
+
+**DEC-384.1. SQL Server `doctor` asks the database's collation which names are
+one securable, instead of folding them in Rust (#384, #673).** Three
+comparisons decided it in Rust:
+
+- `resolve_for_query`'s claim check folded with `to_lowercase`. That covers
+  case only, so on an accent-, width- or kana-insensitive database a reused
+  `app.cafe` beside a recorded `app.café` passed as a different table, and was
+  asked about under the departing identity's object.
+- The foreign-key targets the CLI reports as undeclared were compared exactly.
+- The delete count's catalog children were checked against the managed names
+  exactly.
+
+The last two asked a managed table a second time under another spelling.
+
+All three now go through `catalog::matching_table_names`, which compares under
+`DATABASE_DEFAULT` (DECISIONS 119, 142), in `pbps-mssql::doctor`. That is where
+the engine is known. The CLI's `referenced_targets` stays exact, because it
+reads the declarations offline and serves PostgreSQL, where the exact
+comparison is right. On a case-sensitive database the engine keeps the
+spellings apart, and so do these checks. The cost is up to five round trips
+per environment, each skipped when its lists are empty.

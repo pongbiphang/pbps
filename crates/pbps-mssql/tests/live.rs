@@ -5714,6 +5714,185 @@ async fn a_case_differing_reused_name_collides_under_the_servers_default_collati
     db.drop().await;
 }
 
+/// #384: the claim check asks the engine, not a Rust fold. On an
+/// accent-insensitive database `app.café` and `app.cafe` are one securable,
+/// which `to_lowercase` kept apart. With a rename freeing `app.café` and a new
+/// `app.cafe` declared, the new table must not be asked about under the
+/// departing identity's object. On a case-sensitive database, the control,
+/// `app.Old_Name` and `app.old_name` are two tables, and the new one is asked
+/// about as itself.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_reused_name_collides_by_the_databases_collation_not_by_a_case_fold() {
+    for (collation, old, new_decl, collides) in [
+        ("SQL_Latin1_General_CP1_CI_AI", "app.café", "app.cafe", true),
+        (
+            "Latin1_General_CS_AS",
+            "app.Old_Name",
+            "app.old_name",
+            false,
+        ),
+    ] {
+        let mut db = TestDb::create("doctorcollation384").await;
+        db.conn
+            .execute(&format!(
+                "USE master; ALTER DATABASE [{0}] COLLATE {collation}; USE [{0}];",
+                db.name
+            ))
+            .await
+            .expect("set the database collation");
+        db.conn
+            .execute("IF SCHEMA_ID(N'app') IS NULL EXEC(N'CREATE SCHEMA app;');")
+            .await
+            .expect("the app schema");
+        let (schema, old_table) = old.split_once('.').unwrap();
+        let (_, new_table) = new_decl.split_once('.').unwrap();
+        db.conn
+            .execute(&format!(
+                "CREATE TABLE [{schema}].[{old_table}] (code varchar(20) NOT NULL PRIMARY KEY, \
+                 label nvarchar(50) NOT NULL);"
+            ))
+            .await
+            .expect("the departing identity's table");
+        if !collides {
+            // A different table here: the control asks about it as itself.
+            db.conn
+                .execute(&format!(
+                    "CREATE TABLE [{schema}].[{new_table}] (code varchar(20) NOT NULL \
+                     PRIMARY KEY, label nvarchar(50) NOT NULL);"
+                ))
+                .await
+                .expect("the arriving identity's own table");
+        }
+        let uid1: Uid = "t_eee555".parse().unwrap();
+        let uid2: Uid = "t_fff666".parse().unwrap();
+        let mut recorded_ids = IdsFile::default();
+        recorded_ids
+            .tables
+            .insert(uid1.clone(), old.parse().unwrap());
+        let mut project_ids = IdsFile::default();
+        project_ids
+            .tables
+            .insert(uid1, "app.new_name".parse().unwrap());
+        project_ids.tables.insert(uid2, new_decl.parse().unwrap());
+        pbps_mssql::state::record(
+            &mut db.conn,
+            &snapshot(
+                pbps_model::StateKind::Apply,
+                &Schema::default(),
+                &recorded_ids,
+            ),
+        )
+        .await
+        .expect("record the environment's own state");
+        let data: pbps_mssql::doctor::DataTables = [
+            ("app.new_name".parse().unwrap(), seeded_table()),
+            (new_decl.parse().unwrap(), seeded_table()),
+        ]
+        .into_iter()
+        .collect();
+        let held = pbps_mssql::doctor::permissions(
+            &mut db.conn,
+            &[],
+            &["app".to_owned()],
+            &Default::default(),
+            &pbps_mssql::doctor::GrantTargets::default(),
+            &data,
+            &Default::default(),
+            &project_ids,
+        )
+        .await
+        .expect("read permissions");
+        let arriving: pbps_model::ObjectName = new_decl.parse().unwrap();
+        let departing: pbps_model::ObjectName = old.parse().unwrap();
+        let asked: Vec<&pbps_model::ObjectName> = held.data_objects.keys().collect();
+        assert!(
+            asked.contains(&&departing),
+            "{collation}: the confirmed rename is asked under the recorded name: {asked:?}"
+        );
+        assert_eq!(
+            asked.contains(&&arriving),
+            !collides,
+            "{collation}: {new_decl} beside a recorded {old}: {asked:?}"
+        );
+        db.drop().await;
+    }
+}
+
+/// #673: which names are one securable is the collation's answer, so on a
+/// case-insensitive database a foreign-key target spelled `app.T` beside a
+/// declared `app.t`, and a catalog child `app.kid` of a declared `app.Kid`, are
+/// managed tables. They were asked about a second time under their other
+/// spelling. On a case-sensitive database they are different tables, and are
+/// asked about.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_managed_table_under_another_spelling_is_not_asked_about_twice() {
+    for (collation, one_securable) in [
+        ("SQL_Latin1_General_CP1_CI_AS", true),
+        ("Latin1_General_CS_AS", false),
+    ] {
+        let mut db = TestDb::create("doctorspelling673").await;
+        db.conn
+            .execute(&format!(
+                "USE master; ALTER DATABASE [{0}] COLLATE {collation}; USE [{0}];",
+                db.name
+            ))
+            .await
+            .expect("set the database collation");
+        db.conn
+            .execute("IF SCHEMA_ID(N'app') IS NULL EXEC(N'CREATE SCHEMA app;');")
+            .await
+            .expect("the app schema");
+        db.conn
+            .execute(
+                "CREATE TABLE app.t (code varchar(20) NOT NULL PRIMARY KEY, \
+                 label nvarchar(50) NOT NULL); INSERT INTO app.t VALUES ('a', N'A');
+                 CREATE TABLE app.kid (id int NOT NULL PRIMARY KEY, \
+                 parent varchar(20) NULL REFERENCES app.t(code));",
+            )
+            .await
+            .expect("the parent and its child");
+        let managed: Vec<pbps_model::ObjectName> =
+            vec!["app.t".parse().unwrap(), "app.Kid".parse().unwrap()];
+        let mut referenced = pbps_mssql::doctor::ReferencedColumns::new();
+        referenced.insert(
+            "app.T".parse().unwrap(),
+            ["code".to_owned()].into_iter().collect(),
+        );
+        let data: pbps_mssql::doctor::DataTables = [("app.t".parse().unwrap(), seeded_table())]
+            .into_iter()
+            .collect();
+        let held = pbps_mssql::doctor::permissions(
+            &mut db.conn,
+            &managed,
+            &["app".to_owned()],
+            &referenced,
+            &pbps_mssql::doctor::GrantTargets::default(),
+            &data,
+            &Default::default(),
+            &IdsFile::default(),
+        )
+        .await
+        .expect("read permissions");
+        let target: pbps_model::ObjectName = "app.T".parse().unwrap();
+        assert_eq!(
+            held.referenced_objects.contains_key(&target),
+            !one_securable,
+            "{collation}: the foreign-key target: {:?}",
+            held.referenced_objects
+        );
+        let child = pbps_mssql::doctor::Securable::Object("app.kid".parse().unwrap());
+        assert_eq!(
+            held.delete_children.contains_key(&child),
+            !one_securable,
+            "{collation}: the delete count's child: {:?}",
+            held.delete_children
+        );
+        db.drop().await;
+    }
+}
+
 /// The count that runs *before* a reference-data `DELETE` refuses until it can
 /// prove the row-level security policy catalog readable, and `doctor` has to
 /// say which read that is (DECISIONS 468, 505).
