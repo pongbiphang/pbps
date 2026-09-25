@@ -30,7 +30,7 @@ use pbps_db::resolver::environment::{
     CatalogFacts, ExecutableIdentity, ExecutableRole, ExecutableSet, Provenance, guc_list,
 };
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
 use std::os::unix::fs::{FileExt, MetadataExt};
@@ -103,29 +103,8 @@ pub(crate) async fn executables(
     dynamic_library_path: &str,
     packages: &[&str],
 ) -> Result<ExecutableSet, UnqualifiedProcess> {
-    lease.check()?;
+    let (engine, mapped, observed) = inventory(lease, packages).await?;
     let engine_path = lease.executable_path().to_path_buf();
-    let engine = ExecutableIdentity {
-        role: ExecutableRole::Engine,
-        path: engine_path.to_string_lossy().into_owned(),
-        digest: Some(digest_of(lease.executable_file()).await?),
-        provenance: Provenance::LoadedContent,
-        disk_differs_from_loaded: Some(disk_differs(
-            lease,
-            &engine_path,
-            lease
-                .executable_file()
-                .metadata()
-                .map_err(|_| UnqualifiedProcess)?
-                .ino(),
-        )),
-    };
-
-    let mapped = mappings(&lease.read_proc("maps", 8 * 1024 * 1024)?, packages);
-    let mut observed = BTreeMap::new();
-    for (path, mapping) in &mapped {
-        observed.insert(path.clone(), mapped_library(lease, path, mapping).await);
-    }
     let libdir = library_directory(&engine_path);
     let cwd = lease.working_directory()?;
     // Resolve required names before reporting mappings, so each can claim
@@ -230,6 +209,142 @@ pub(crate) async fn executables(
     libraries.extend(late);
     lease.check()?;
     Ok(ExecutableSet { engine, libraries })
+}
+
+/// Private native evidence for a source-bearing capture. Candidate spellings
+/// live in the engine-owned resolution; the rest is the same measured content
+/// inventory used by runtime qualification. Nothing here is an output report.
+#[derive(PartialEq, Eq)]
+pub(super) struct CapturedExecutables {
+    engine: ExecutableIdentity,
+    mapped: Vec<ExecutableIdentity>,
+    required: Vec<(usize, ExecutableIdentity)>,
+    resolution: super::target::engine::RuntimeResolution,
+}
+
+impl CapturedExecutables {
+    pub(super) fn engine(&self) -> &ExecutableIdentity {
+        &self.engine
+    }
+    pub(super) fn libraries(&self) -> impl Iterator<Item = &ExecutableIdentity> {
+        self.mapped
+            .iter()
+            .chain(self.required.iter().map(|(_, file)| file))
+    }
+}
+
+/// Observe the same complete mapped inventory and loader candidates without
+/// receiving the raw names that the engine captured from retained source.
+pub(super) async fn captured_executables(
+    lease: &ProcessLease,
+    inputs: &super::target::engine::RuntimeInputs,
+) -> Result<CapturedExecutables, UnqualifiedProcess> {
+    use super::target::engine::NativeLibrary;
+    let (engine, mapped, observed) = inventory(lease, &[]).await?;
+    let paths: Vec<_> = mapped.keys().cloned().collect();
+    let resolution = inputs.resolve_native(lease.executable_path(), &lease.working_directory()?);
+    let mut required = Vec::new();
+    let mut claimed = BTreeSet::new();
+    for index in 0..resolution.len() {
+        lease.check()?;
+        let selected = resolution
+            .open(index, &lease.root()?, &paths)
+            .map_err(|_| UnqualifiedProcess)?;
+        lease.check()?;
+        let (candidate, mut identity) = match selected {
+            NativeLibrary::Mapped { candidate, mapping } => {
+                claimed.insert(paths[mapping].clone());
+                (candidate, observed[&paths[mapping]].identity.clone())
+            }
+            NativeLibrary::Candidate { candidate, reader } => {
+                let metadata = reader.identity().ok();
+                let digest = tokio::task::spawn_blocking(move || digest_blocking(&reader))
+                    .await
+                    .map_err(|_| UnqualifiedProcess)?;
+                let correlated = metadata.and_then(|(inode, size)| {
+                    let digest = digest.as_ref().ok()?;
+                    mapped
+                        .iter()
+                        .find(|(path, mapping)| {
+                            let loaded = &observed[*path];
+                            mapping.inode == inode
+                                && loaded.size == Some(size)
+                                && loaded.identity.digest.as_ref() == Some(digest)
+                        })
+                        .map(|(path, _)| (path.clone(), observed[path].identity.clone()))
+                });
+                let identity = match correlated {
+                    Some((path, identity)) => {
+                        claimed.insert(path);
+                        identity
+                    }
+                    None => ExecutableIdentity {
+                        role: ExecutableRole::LateLoaded,
+                        // The opaque resolution and candidate position preserve
+                        // identity; an ordinary path label would expose source.
+                        path: String::new(),
+                        digest: Some(digest?),
+                        provenance: Provenance::DiskCandidate,
+                        disk_differs_from_loaded: None,
+                    },
+                };
+                (candidate, identity)
+            }
+        };
+        identity.path.clear();
+        required.push((candidate, identity));
+    }
+    lease.check()?;
+    Ok(CapturedExecutables {
+        engine,
+        // A claimed mapping is represented by its required spellings alone,
+        // as in the ordinary qualifier. Keeping the original name too would
+        // duplicate aliases and compare an irrelevant loaded-path spelling.
+        mapped: observed
+            .into_iter()
+            .filter(|(path, _)| !claimed.contains(path))
+            .map(|(_, file)| file.identity)
+            .collect(),
+        required,
+        resolution,
+    })
+}
+
+async fn inventory(
+    lease: &ProcessLease,
+    packages: &[&str],
+) -> Result<
+    (
+        ExecutableIdentity,
+        BTreeMap<String, Mapping>,
+        BTreeMap<String, MappedLibrary>,
+    ),
+    UnqualifiedProcess,
+> {
+    lease.check()?;
+    let engine_path = lease.executable_path().to_path_buf();
+    let engine = ExecutableIdentity {
+        role: ExecutableRole::Engine,
+        path: engine_path.to_string_lossy().into_owned(),
+        digest: Some(digest_of(lease.executable_file()).await?),
+        provenance: Provenance::LoadedContent,
+        disk_differs_from_loaded: Some(disk_differs(
+            lease,
+            &engine_path,
+            lease
+                .executable_file()
+                .metadata()
+                .map_err(|_| UnqualifiedProcess)?
+                .ino(),
+        )),
+    };
+
+    let mapped = mappings(&lease.read_proc("maps", 8 * 1024 * 1024)?, packages);
+    let mut observed = BTreeMap::new();
+    for (path, mapping) in &mapped {
+        observed.insert(path.clone(), mapped_library(lease, path, mapping).await);
+    }
+    Ok((engine, mapped, observed))
 }
 
 /// One file identity and its file-backed ranges as `maps` reports them.
@@ -436,50 +551,9 @@ pub(crate) fn resolve(
     dynamic_library_path: &str,
     cwd: &Path,
 ) -> Vec<String> {
-    // The loader tries the name exactly as given before appending the
-    // platform suffix (`expand_dynamic_library_name`): a bare name is looked
-    // for in every directory of the path as is, then in every directory with
-    // `.so`; a name with a directory is tried as is, then suffixed. Emitting
-    // the suffixed form alone read a valid `/opt/plugin` as unreadable and
-    // could hash an unrelated `/opt/plugin.so` beside it (finding on #688).
-    let bases: Vec<PathBuf> = if let Some(rest) = name.strip_prefix("$libdir/") {
-        vec![libdir.join(rest)]
-    } else if name.contains('/') {
-        // A name with a directory is used as given; a relative one is
-        // relative to the backend's working directory, the data directory
-        // (measured on 18: `CREATE FUNCTION ... AS 'plugins/relhstore'`
-        // loads `$PGDATA/plugins/relhstore.so` and stores the name as
-        // written). Anchored at the root instead, `plugins/foo` read
-        // `/plugins/foo`, absent or another file (finding on #688).
-        vec![cwd.join(name)]
-    } else {
-        // A bare name is searched along `dynamic_library_path`, `$libdir`
-        // expanding to the engine's library directory; the default is just
-        // `$libdir`. Each directory is a candidate, in order.
-        let dirs: Vec<String> = dynamic_library_path
-            .split(':')
-            .map(str::trim)
-            .filter(|dir| !dir.is_empty())
-            .map(|dir| match dir.strip_prefix("$libdir") {
-                Some(rest) => format!("{}{rest}", libdir.to_string_lossy()),
-                None => dir.to_owned(),
-            })
-            .collect();
-        let dirs = if dirs.is_empty() {
-            vec![libdir.to_string_lossy().into_owned()]
-        } else {
-            dirs
-        };
-        dirs.into_iter()
-            .map(|dir| PathBuf::from(dir).join(name))
-            .collect()
-    };
-    let exact: Vec<String> = bases
-        .iter()
-        .map(|path| path.to_string_lossy().into_owned())
-        .collect();
-    let suffixed: Vec<String> = exact.iter().map(|path| format!("{path}.so")).collect();
-    exact.into_iter().chain(suffixed).collect()
+    // Keep one loader rule for ordinary environment observations and the
+    // opaque capture operation; the latter never exposes its input names.
+    super::target::engine::native_library_candidates(name, libdir, dynamic_library_path, cwd)
 }
 
 /// SHA-256 of a file's content, computed off the runtime's thread. The
@@ -492,9 +566,35 @@ async fn digest_of(file: &File) -> Result<String, UnqualifiedProcess> {
         .map_err(|_| UnqualifiedProcess)?
 }
 
+// Both ordinary files and the engine's opaque reader share the exact hashing
+// loop, including its off-runtime caller, size bound and ESPIPE fallback.
+trait ContentReader {
+    fn read_at(&self, buffer: &mut [u8], offset: u64) -> std::io::Result<usize>;
+    fn read_to_end(&self, buffer: &mut Vec<u8>) -> std::io::Result<usize>;
+}
+
+impl ContentReader for File {
+    fn read_at(&self, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        FileExt::read_at(self, buffer, offset)
+    }
+    fn read_to_end(&self, buffer: &mut Vec<u8>) -> std::io::Result<usize> {
+        let mut file = self;
+        Read::read_to_end(&mut file, buffer)
+    }
+}
+
+impl ContentReader for super::target::engine::NativeLibraryReader {
+    fn read_at(&self, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        self.read_at(buffer, offset)
+    }
+    fn read_to_end(&self, buffer: &mut Vec<u8>) -> std::io::Result<usize> {
+        self.read_to_end(buffer)
+    }
+}
+
 /// SHA-256 of a file's content, read positionally so a handle shared with
 /// the lease keeps its own cursor untouched.
-fn digest_blocking(file: &File) -> Result<String, UnqualifiedProcess> {
+fn digest_blocking(file: &impl ContentReader) -> Result<String, UnqualifiedProcess> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1024 * 1024];
     let mut offset = 0u64;
@@ -506,9 +606,7 @@ fn digest_blocking(file: &File) -> Result<String, UnqualifiedProcess> {
             // fall back to a fresh sequential read of the same handle.
             Err(error) if error.raw_os_error() == Some(libc_espipe()) && offset == 0 => {
                 let mut whole = Vec::new();
-                let mut handle = file;
-                handle
-                    .read_to_end(&mut whole)
+                file.read_to_end(&mut whole)
                     .map_err(|_| UnqualifiedProcess)?;
                 if whole.len() as u64 > CONTENT_LIMIT {
                     return Err(UnqualifiedProcess);

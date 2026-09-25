@@ -23,6 +23,11 @@ sha2.workspace = true
 # has to carry both (Phase 5 step 7).
 thiserror.workspace = true
 
+# The opaque native transfer opens only beneath a caller-held root. It does
+# not discover processes, acquire a runtime, or own lifecycle qualification.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 # The live suite plans a migration the way `plan --db` does, so that what it
 # applies is a real `ChangeSet` and not a hand-built list of changes.

@@ -157,6 +157,15 @@ scratch-resource SQL stays in the engine crates behind that same seam.
 See [the runtime boundary](RESOLVER-RUNTIME.md) for its staged startup,
 supported profiles and the remaining environment/binding gates.
 
+Native capture transfers source-bearing library requirements through opaque
+engine operations (DEC-876.1). The PostgreSQL adapter owns its loader rules and
+opens one candidate beneath a root capability supplied by the CLI. It returns
+a mapping index or a reader with no path/raw-handle getter, Debug or Serialize.
+CLI still owns process/root qualification, mapping observation, content hashing,
+alias correlation, cancellation and every runtime lifecycle operation. The
+engine neither discovers processes nor acquires/provisions a runtime, and no
+filesystem responsibility moves into database transport.
+
 ## Inviolable constraints
 
 Keep these numbers stable: other documents cite them. Where a rule already

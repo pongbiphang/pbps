@@ -20,3 +20,9 @@ pub(super) async fn identity(
         Driver::Mssql => pbps_mssql::resolver::instance_identity(connection).await,
     }
 }
+
+// These are opaque PostgreSQL loader operations, not a catalog report. SQL
+// dispatch remains separate; no private path crosses the engine boundary.
+pub(in crate::resolver::native) use pbps_pg::resolver::capture::{
+    NativeLibrary, NativeLibraryReader, RuntimeInputs, RuntimeResolution, native_library_candidates,
+};

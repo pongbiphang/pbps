@@ -10,7 +10,7 @@ use pbps_db::transport::PeerVerifiedConn;
 use std::sync::{Arc, Weak};
 
 #[path = "target_engine.rs"]
-mod engine;
+pub(super) mod engine;
 
 #[path = "target_capture.rs"]
 mod capture;

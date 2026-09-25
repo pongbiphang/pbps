@@ -143,9 +143,36 @@ mod baseline;
 
 mod session;
 
-/// Private transfer to the native lifecycle, not a report or saved artifact.
-/// Paths can come from retained source, so this has no Debug or Serialize.
+/// Opaque native requirements, not a report or saved artifact. Paths may
+/// come from retained source; native consumers use the bounded file operation
+/// instead of receiving strings, callbacks over them, or public verifiers.
+///
+/// A downstream caller cannot extract either source-bearing field:
+/// ```compile_fail,E0616
+/// use pbps_pg::resolver::capture::RuntimeInputs;
+/// fn extract(inputs: RuntimeInputs) -> Vec<String> { inputs.libraries }
+/// ```
+/// ```compile_fail,E0616
+/// use pbps_pg::resolver::capture::RuntimeInputs;
+/// fn extract(inputs: RuntimeInputs) -> String { inputs.dynamic_library_path }
+/// ```
+/// Ordinary formatting cannot turn the transfer into a path report:
+/// ```compile_fail,E0277
+/// use pbps_pg::resolver::capture::RuntimeInputs;
+/// fn report(inputs: RuntimeInputs) -> String { format!("{inputs:?}") }
+/// ```
+/// ```compile_fail,E0277
+/// use pbps_pg::resolver::capture::RuntimeInputs;
+/// fn report(inputs: RuntimeInputs) { let _ = serde_json::to_string(&inputs); }
+/// ```
 pub struct RuntimeInputs {
-    pub libraries: Vec<String>,
-    pub dynamic_library_path: String,
+    libraries: Vec<String>,
+    dynamic_library_path: String,
 }
+
+#[cfg(target_os = "linux")]
+mod native_inputs;
+#[cfg(target_os = "linux")]
+pub use native_inputs::{
+    NativeLibrary, NativeLibraryReader, RuntimeResolution, native_library_candidates,
+};

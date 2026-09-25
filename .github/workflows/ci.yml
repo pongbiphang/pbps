@@ -76,6 +76,9 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace --all-targets
+      # --all-targets excludes doctests. These compile-fail cases pin the
+      # downstream opacity of source-bearing native capture inputs (#876).
+      - run: cargo test -p pbps-pg --doc
 
   # Development happens on Linux, so Windows coverage rests entirely on this
   # job: line endings, path separators and terminal detection are the kinds of

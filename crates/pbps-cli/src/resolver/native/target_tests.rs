@@ -225,16 +225,33 @@ async fn postgres_capture_is_fresh_and_cancellation_expires_its_connection(
         "CREATE SCHEMA capture_fixture",
         "CREATE TABLE capture_fixture.t(id integer)",
         "CREATE VIEW capture_fixture.v AS SELECT id+1 AS id FROM capture_fixture.t",
+        "CREATE EXTENSION hstore WITH SCHEMA capture_fixture",
+        "CREATE FUNCTION capture_fixture.standalone_handler() RETURNS language_handler AS '$libdir/../lib/plpgsql','plpgsql_call_handler' LANGUAGE c",
+        "LOAD 'auto_explain'",
+        "SET session_preload_libraries='auto_explain'",
+        "SET dynamic_library_path='/pbps_private_path876:$libdir'",
     ] {
         connection.query(statement).await.unwrap();
     }
     let scope = CaptureScope {
         retained: Default::default(),
-        candidates: [CandidateSet {
-            class: CandidateClass::Relation,
-            namespace: Some("capture_fixture".into()),
-            name: None,
-        }]
+        candidates: [
+            CandidateSet {
+                class: CandidateClass::Relation,
+                namespace: Some("capture_fixture".into()),
+                name: None,
+            },
+            CandidateSet {
+                class: CandidateClass::Routine,
+                namespace: Some("capture_fixture".into()),
+                name: Some("standalone_handler".into()),
+            },
+            CandidateSet {
+                class: CandidateClass::Extension,
+                namespace: None,
+                name: Some("hstore".into()),
+            },
+        ]
         .into_iter()
         .collect(),
     };
@@ -243,6 +260,25 @@ async fn postgres_capture_is_fresh_and_cancellation_expires_its_connection(
     if std::env::var("PBPS_NATIVE_FACTORY_FIXTURE").as_deref() == Ok("1") {
         let captured =
             captured.expect("native capture must qualify actual loaded executable content");
+        // The ordinary qualifier already normalizes a required alias to its
+        // loaded object. The opaque transfer must preserve that same census.
+        let ordinary = executables::executables(
+            target.current.as_ref().unwrap().lease.owner(),
+            &[
+                "$libdir/../lib/plpgsql".into(),
+                "$libdir/hstore".into(),
+                "auto_explain".into(),
+            ],
+            "/pbps_private_path876:$libdir",
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            captured.native_library_count(),
+            ordinary.libraries.len(),
+            "opaque transfer must not duplicate a loaded library under a required alias"
+        );
         let (_, unchanged) = target.recapture_postgres(&captured).await.unwrap();
         assert!(
             unchanged.is_empty(),
@@ -251,6 +287,30 @@ async fn postgres_capture_is_fresh_and_cancellation_expires_its_connection(
         let mut writer = PeerVerifiedConn::connect(Driver::Postgres, primary)
             .await
             .unwrap();
+        // An extension-free C routine must still name its native prerequisite.
+        // Alter only this owned fixture's row, then restore it before asserting.
+        writer.query("UPDATE pg_catalog.pg_proc SET probin='/pbps_private_missing876' WHERE oid='capture_fixture.standalone_handler()'::regprocedure").await.unwrap();
+        let unavailable = target.capture_postgres(&scope).await;
+        writer.query("UPDATE pg_catalog.pg_proc SET probin='$libdir/../lib/plpgsql' WHERE oid='capture_fixture.standalone_handler()'::regprocedure").await.unwrap();
+        let error = match unavailable {
+            Err(error) => error,
+            Ok(_) => panic!("an unreadable standalone C prerequisite was accepted"),
+        };
+        assert!(matches!(error, CaptureFailure::Executables));
+        for report in [format!("{error}"), format!("{error:?}")] {
+            assert!(
+                !report.contains("pbps_private_missing876")
+                    && !report.contains("pbps_private_path876")
+            );
+        }
+        assert!(
+            target.identity().is_err(),
+            "unreadable native inputs expire the binding"
+        );
+        let connection = PeerVerifiedConn::connect(Driver::Postgres, primary)
+            .await
+            .unwrap();
+        target = NativeTarget::establish(connection, main_pid).await.unwrap();
         writer
             .query("ALTER TABLE capture_fixture.t ADD COLUMN added integer")
             .await
@@ -259,6 +319,10 @@ async fn postgres_capture_is_fresh_and_cancellation_expires_its_connection(
         assert!(
             !changed.is_empty(),
             "a native recapture cannot reuse old catalog facts"
+        );
+        let report = serde_json::to_string(&changed).unwrap();
+        assert!(
+            !report.contains("pbps_private_path876") && !report.contains("$libdir/../lib/plpgsql")
         );
         // This server belongs solely to the native fixture. Hold one catalog
         // lock to put a real reload after session pinning and before rendering;
