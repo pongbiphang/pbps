@@ -403,11 +403,13 @@ fn a_trigger_request_failing_a_guard_starts_nothing() {
     assert!(!viewer.directory.join("guarded.json").exists());
 }
 
-/// ADR-0015 decision 4 for the trigger: the connection string is read by the
-/// child from its environment and appears in no request, response or page,
-/// including when the child fails to connect and reports why.
+/// ADR-0015 decision 4 across the viewer (#1025, #1050): the connection
+/// string is read by the child from its environment. It appears in no
+/// response, served asset or file the session leaves, including when the child
+/// fails to connect and reports why. The approved checksum typed into an
+/// apply is not stored either (ADR-0006).
 #[test]
-fn a_connection_string_never_reaches_a_trigger_response() {
+fn a_connection_string_never_reaches_a_response_or_a_file() {
     const SECRET: &str = "Sup3rS3cretPbpsUiPassword";
     let connection = format!(
         "Server=127.0.0.1,1;Database=d;User Id=u;Password={SECRET};TrustServerCertificate=true;Connect Timeout=2"
@@ -478,12 +480,86 @@ fn a_connection_string_never_reaches_a_trigger_response() {
         "{}",
         runs[0]
     );
-    for body in bodies.iter().chain(&more).chain([&started]) {
+    // The reads that connect, and a compose preview, answered with the same
+    // environment in place.
+    let mut answers = Vec::new();
+    for path in [
+        "/api/status",
+        "/api/drift?env=guarded",
+        "/api/timeline?env=guarded",
+        "/api/plan?path=saved.json",
+    ] {
+        let (status, _, body) = viewer.read(path);
+        assert_eq!(status, 200, "{path}: {body}");
+        answers.push(body);
+    }
+    answers.push(
+        viewer
+            .post(
+                "/api/compose/preview",
+                r#"{"intent":{"kind":"annotation"},"message":"m","remote":"origin","remote_base_ref":"refs/heads/master"}"#,
+            )
+            .2,
+    );
+    // A well-formed approval, typed into an apply the CLI refuses.
+    const APPROVAL: &str = "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00";
+    viewer.post(
+        "/api/trigger/apply",
+        &format!(
+            r#"{{"environment":"guarded","plan":"saved.json","checksum":"{APPROVAL}","allow":["rename"],"staged":false,"resume":false}}"#
+        ),
+    );
+    let (_, last) = viewer.wait_for_runs();
+    for body in bodies
+        .iter()
+        .chain(&more)
+        .chain(&last)
+        .chain([&started])
+        .chain(&answers)
+    {
         assert!(!body.contains(SECRET), "{body}");
         assert!(!body.contains("127.0.0.1,1"), "{body}");
     }
-    for asset in ["/", "/app.js", "/trigger.js"] {
+    for asset in ["/", "/app.js", "/compose.js", "/trigger.js", "/style.css"] {
         assert!(!viewer.request("GET", asset, &[]).2.contains(SECRET));
+    }
+
+    // Every file the session left, git's compressed objects included.
+    fn walk(path: &std::path::Path, found: &mut Vec<(PathBuf, Vec<u8>)>) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else {
+                found.push((path.clone(), std::fs::read(&path).unwrap_or_default()));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(&viewer.directory, &mut files);
+    let objects = Command::new("git")
+        .current_dir(&viewer.directory)
+        .args(["cat-file", "--batch-all-objects", "--batch"])
+        .output()
+        .unwrap();
+    assert!(objects.status.success());
+    assert!(
+        !objects.stdout.is_empty(),
+        "the project's objects were read"
+    );
+    files.push(("git objects".into(), objects.stdout));
+    for (path, bytes) in &files {
+        let text = String::from_utf8_lossy(bytes);
+        assert!(
+            !text.contains(SECRET),
+            "{} holds the password",
+            path.display()
+        );
+        assert!(
+            !text.contains(APPROVAL),
+            "{} holds the approval",
+            path.display()
+        );
     }
 }
 

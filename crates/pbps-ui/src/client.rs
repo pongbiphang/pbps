@@ -13,7 +13,7 @@ pub enum View {
 }
 
 impl View {
-    fn arguments(&self) -> Vec<String> {
+    pub(crate) fn arguments(&self) -> Vec<String> {
         match self {
             Self::Status => vec!["status".into(), "--format=json".into()],
             // `--env`, never `--db`: a name from the browser cannot become a
