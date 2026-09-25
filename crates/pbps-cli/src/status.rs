@@ -203,10 +203,29 @@ async fn read_lock(conn: &mut Conn) -> (Option<String>, Option<String>) {
 /// ledger redaction can treat the two frames apart (DECISIONS 455, 456). That
 /// split is for the ledger; `status` redacts nothing, and reading only the top
 /// frame here dropped a catalog `40P01`'s diagnosis while keeping its retry
-/// advice (#489). A frame is never repeated: only `Context` carries a source,
-/// and its own text does not interpolate it.
+/// advice (#489).
+///
+/// Walked here rather than with `{:#}`, which prints every frame even when a
+/// parent has already spelled its source out: `DbError::Connect` renders as
+/// "cannot reach `host`: {source}" *and* exposes that same I/O error through
+/// `source()`, so a refused socket read "…: connection refused: connection
+/// refused" (#1003). A frame whose text its parent already ends with adds
+/// nothing and is skipped; every other frame, `Context`'s driver sentence
+/// among them, is kept.
 fn operator_detail(e: impl std::error::Error + Send + Sync + 'static) -> String {
-    format!("{:#}", anyhow::Error::new(e))
+    let mut out = e.to_string();
+    let mut parent = out.clone();
+    let mut next = e.source();
+    while let Some(frame) = next {
+        let text = frame.to_string();
+        if !parent.ends_with(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        parent = text;
+        next = frame.source();
+    }
+    out
 }
 
 async fn one(
@@ -797,6 +816,34 @@ mod tests {
             (
                 pbps_db::DbError::Refused("the catalog row vanished".to_owned()),
                 vec!["the catalog row vanished"],
+            ),
+            // Its own text already ends with its source's: once, not twice
+            // (#1003).
+            (
+                pbps_db::DbError::Connect {
+                    addr: "db.test:5432".to_owned(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "connection refused",
+                    ),
+                },
+                vec!["cannot reach `db.test:5432`: connection refused"],
+            ),
+            // The same, wrapped in guidance: the guidance and the socket's
+            // words each appear once.
+            (
+                pbps_db::DbError::Connect {
+                    addr: "db.test:5432".to_owned(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "connection refused",
+                    ),
+                }
+                .context("add `sslmode=disable` on a network you trust"),
+                vec![
+                    "add `sslmode=disable` on a network you trust",
+                    "cannot reach `db.test:5432`: connection refused",
+                ],
             ),
         ];
         for (error, frames) in cases {
