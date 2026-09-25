@@ -941,8 +941,11 @@ resolves the same names; only the selected objects can differ, and that is
 what the bindings carry. On the target each member must be an engine object
 scratch has with the same properties, role references removed because the
 bootstrap superuser's name is the installation's, or one of the project's
-managed objects by name; a routine name holds only as many overloads as the
-model declares. An unmanaged overload beside a managed one, a routine planted
+managed objects by name. A routine is managed only as the exact overload
+scratch compiled for a declaration the plan keeps; overloads the plan drops,
+never compiled, are the only ones counted. A count alone let an unmanaged
+overload stand in for a declared one the target had lost. An unmanaged overload
+beside a managed one, a routine planted
 in `pg_catalog` and a built-in cast whose context was changed each leave the
 surface unresolved, measured on both majors; so does an extension's object,
 because nothing but managed declarations is reconstructed until retained

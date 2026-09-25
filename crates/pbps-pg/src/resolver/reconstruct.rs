@@ -258,6 +258,15 @@ impl Reconstruction {
         )
     }
 
+    /// The catalog identity of the routine compiled for `id`, once the
+    /// reconstruction has compiled; `None` for a module it does not compile.
+    pub fn created(&self, id: &ModuleId) -> Option<&ObjectIdentity> {
+        self.steps
+            .iter()
+            .find(|step| step.module.as_ref() == Some(id))
+            .and_then(|step| step.created.as_ref())
+    }
+
     /// Runs every step in one transaction under the dialect's session pins,
     /// as whatever role the session currently is — the reproduced deployer,
     /// which the scope has entered. Committed only when all of it compiled;

@@ -25,13 +25,13 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The target's managed objects, by the names pbps's own model gives them.
-/// Routines overload, so they are counted: every managed overload exists on
-/// the target, and one more member of that name than the model holds is an
-/// object nobody reconstructed.
+/// Routines overload, so they are held by declared identity: a routine's
+/// catalog identity is known once scratch has compiled its declaration
+/// (DEC-613.2).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Managed {
     relations: BTreeSet<(String, String)>,
-    routines: BTreeMap<(String, String), usize>,
+    routines: BTreeMap<(String, String), BTreeSet<pbps_model::ModuleId>>,
 }
 
 impl Managed {
@@ -56,7 +56,9 @@ impl Managed {
                 pbps_model::ModuleId::Named(_) => {
                     managed.relations.insert(key);
                 }
-                pbps_model::ModuleId::Routine(_) => *managed.routines.entry(key).or_default() += 1,
+                pbps_model::ModuleId::Routine(_) => {
+                    managed.routines.entry(key).or_default().insert(id.clone());
+                }
                 pbps_model::ModuleId::Trigger { .. } => {}
             }
         }
@@ -87,6 +89,7 @@ impl Managed {
         class: CandidateClass,
         member: &ObjectIdentity,
         members: &BTreeSet<ObjectIdentity>,
+        order: &crate::resolver::reconstruct::Reconstruction,
     ) -> bool {
         let [schema, name] = member.name.as_slice() else {
             return false;
@@ -102,12 +105,30 @@ impl Managed {
                         .strip_prefix('_')
                         .is_some_and(|element| self.relations.contains(&key(element)))
             }
+            // A declared overload the desired schema keeps was compiled on
+            // scratch, which gives its catalog identity, and only that
+            // identity is it: a count would let an unmanaged overload stand
+            // in for a declared one the target lacks. An overload the plan
+            // drops was never compiled, so those alone are counted, against
+            // the target members no compiled identity accounts for.
             CandidateClass::Routine => {
-                let present = members
+                let Some(declared) = self.routines.get(&key(name)) else {
+                    return false;
+                };
+                let known: BTreeSet<&ObjectIdentity> =
+                    declared.iter().filter_map(|id| order.created(id)).collect();
+                if known.contains(member) {
+                    return true;
+                }
+                let dropped = declared
                     .iter()
-                    .filter(|other| other.name == member.name)
+                    .filter(|id| order.created(id).is_none())
                     .count();
-                self.routines.get(&key(name)) == Some(&present)
+                let unaccounted = members
+                    .iter()
+                    .filter(|other| other.name == member.name && !known.contains(other))
+                    .count();
+                unaccounted <= dropped
             }
             CandidateClass::Operator
             | CandidateClass::Collation
@@ -283,7 +304,7 @@ pub fn assess(
                     _ => false,
                 };
             }
-            !on_target.contains(member) || managed.holds(set.class, member, on_target)
+            !on_target.contains(member) || managed.holds(set.class, member, on_target, order)
         })
     };
     let mut assessment = Assessment::default();
@@ -399,9 +420,9 @@ mod tests {
         ));
     }
 
-    /// A relation's name covers its row type and array type; a routine's
-    /// name holds only as many overloads as the model declares, so one more
-    /// on the target is an object nobody reconstructed.
+    /// A relation's name covers its row type and array type. An overload
+    /// the plan drops is accounted for by count, so one more member of that
+    /// name on the target is an object nobody reconstructed.
     #[test]
     fn managed_names_hold_their_own_objects_and_nothing_beside_them() {
         let mut schema = pbps_model::Schema::default();
@@ -418,27 +439,35 @@ mod tests {
         );
         let managed = Managed::from_schema(&schema);
         let none = BTreeSet::new();
+        // Nothing compiled: every declared overload counts as one the plan
+        // drops. The compiled-identity half is pinned on real engines.
+        let order = crate::resolver::reconstruct::Reconstruction::new(&crate::Postgres::new(), &[])
+            .unwrap();
         let relation = id("pg_class", &["app", "t"], Vec::new());
-        assert!(managed.holds(CandidateClass::Relation, &relation, &none));
+        assert!(managed.holds(CandidateClass::Relation, &relation, &none, &order));
         assert!(managed.holds(
             CandidateClass::Type,
             &id("pg_type", &["app", "t"], Vec::new()),
-            &none
+            &none,
+            &order
         ));
         assert!(managed.holds(
             CandidateClass::Type,
             &id("pg_type", &["app", "_t"], Vec::new()),
-            &none
+            &none,
+            &order
         ));
         assert!(!managed.holds(
             CandidateClass::Relation,
             &id("pg_class", &["other", "t"], Vec::new()),
-            &none
+            &none,
+            &order
         ));
         assert!(!managed.holds(
             CandidateClass::Operator,
             &id("pg_operator", &["app", "t"], Vec::new()),
-            &none
+            &none,
+            &order
         ));
         let integer = id(
             "pg_proc",
@@ -452,8 +481,8 @@ mod tests {
         );
         let one = BTreeSet::from([integer.clone()]);
         let two = BTreeSet::from([integer.clone(), text]);
-        assert!(managed.holds(CandidateClass::Routine, &integer, &one));
-        assert!(!managed.holds(CandidateClass::Routine, &integer, &two));
+        assert!(managed.holds(CandidateClass::Routine, &integer, &one, &order));
+        assert!(!managed.holds(CandidateClass::Routine, &integer, &two, &order));
     }
 
     /// A surface depends on every name it bound, looked up along its own

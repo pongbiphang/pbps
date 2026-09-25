@@ -661,7 +661,17 @@ async fn a_candidate_scratch_did_not_reproduce_leaves_the_surface_unresolved() {
     };
     for variable in SERVERS {
         let server = std::env::var(variable).unwrap();
-        let declared = || numeric_f().view("app.v", "SELECT f(1) AS x");
+        let declared = |tag: &str| {
+            let declared = numeric_f().view("app.v", "SELECT f(1) AS x");
+            if tag == "drifted" {
+                declared.function(
+                    "app.f(boolean)",
+                    "(boolean) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN 0",
+                )
+            } else {
+                declared
+            }
+        };
         for (tag, target, schemas, extras) in [
             (
                 "unmanaged",
@@ -678,6 +688,17 @@ async fn a_candidate_scratch_did_not_reproduce_leaves_the_surface_unresolved() {
                  CREATE FUNCTION app.f(integer) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;
                  SET search_path = app;
                  CREATE VIEW app.v AS SELECT f(1) AS x;",
+                &["app"][..],
+                &[][..],
+            ),
+            // The target lost a declared overload and gained an unmanaged
+            // one: the count still matches, the identities do not.
+            (
+                "drifted",
+                "CREATE FUNCTION app.f(numeric) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;
+                 SET search_path = app;
+                 CREATE VIEW app.v AS SELECT f(1) AS x;
+                 CREATE FUNCTION app.f(integer) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;",
                 &["app"][..],
                 &[][..],
             ),
@@ -708,8 +729,8 @@ async fn a_candidate_scratch_did_not_reproduce_leaves_the_surface_unresolved() {
                     schemas,
                     extras,
                     target,
-                    base: declared(),
-                    desired: declared(),
+                    base: declared(tag),
+                    desired: declared(tag),
                 },
             )
             .await
