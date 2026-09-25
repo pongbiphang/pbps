@@ -1428,6 +1428,106 @@ fn a_check_calling_a_procedure_turned_function_follows_its_create() {
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
 }
 
+/// A table the same revision creates, whose check, filtered index and default
+/// call a function that revision rebuilds: they are created after the rebuild,
+/// and the plan applies (#1027). They ride inside one `CreateTable` in the
+/// differ's output, so the positional move of DEC-942.1 cannot reach them until
+/// they are split out. Controls: the same new table with no rebuild stays one
+/// `CREATE TABLE` with its check inside the plan's table creation, and a new
+/// table whose rows the plan writes keeps its default.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_new_tables_expressions_calling_a_rebuilt_function_follow_it() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "new-table-after-rebuild");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$",
+    );
+    let d = Demo::new("new-table-after-rebuild");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    let function = d.dir.join("schema/app.f%28integer%29.function.yml");
+    let text = std::fs::read_to_string(&function).unwrap();
+    std::fs::write(&function, text.replace("SELECT x", "SELECT x + 0")).unwrap();
+    std::fs::write(
+        d.dir.join("schema/app.n.yml"),
+        "table: app.n\ncolumns:\n  id: {type: integer, nullable: false}\n  \
+         v: {type: integer, default: 'app.f(1)'}\n\
+         primary_key: {name: n_pkey, columns: [id]}\n\
+         checks:\n  ck_n: 'app.f(id) >= 0'\n\
+         indexes:\n  ix_n: {columns: [id], where: 'app.f(id) > 0'}\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    let create = at("CREATE FUNCTION");
+    assert!(
+        at("CREATE TABLE \"app\".\"n\"") < at("DROP FUNCTION"),
+        "{script}"
+    );
+    assert!(create < at("ADD CONSTRAINT \"ck_n\""), "{script}");
+    assert!(create < at("CREATE INDEX \"ix_n\""), "{script}");
+    assert!(
+        create < at("ALTER TABLE \"app\".\"n\" ALTER COLUMN \"v\" SET DEFAULT"),
+        "{script}"
+    );
+    let allow = ["--allow", "constraint", "--allow", "grant-widen"];
+    succeeds(approved_apply(&d, connection, &plan, &allow));
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    std::fs::remove_file(&plan).unwrap();
+
+    // Control: a new table beside no rebuild keeps its expressions in the
+    // table's own creation, as the differ writes it.
+    std::fs::write(
+        d.dir.join("schema/app.m.yml"),
+        "table: app.m\ncolumns:\n  id: {type: integer, nullable: false, default: 'app.f(2)'}\n\
+         primary_key: {name: m_pkey, columns: [id]}\nchecks:\n  ck_m: 'app.f(id) >= 0'\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    assert!(!script.contains("DROP FUNCTION"), "{script}");
+    assert!(
+        !script.contains("ALTER COLUMN \"id\" SET DEFAULT"),
+        "{script}"
+    );
+    succeeds(approved_apply(&d, connection, &plan, &allow));
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
 /// A check, a filtered index and a default the same revision adds, each calling
 /// a function that revision rebuilds, are created after the rebuild (#942,
 /// DEC-942.1). `modules::dependents` reads the catalog, where none of them

@@ -1654,6 +1654,12 @@ fn refuse_unplanned_movement(
     // the differ has taken them out of the payload: a name restored without
     // one leaves what the key points at unchecked (DECISIONS 184).
     let mut added_fks: BTreeMap<(&TableName, &str), &pbps_model::ForeignKey> = BTreeMap::new();
+    // Likewise an index taken out of a created table's payload and added by a
+    // change of its own: a filtered one split out to follow a rebuilt
+    // function (#1027, DEC-942.1). Without its definition here the name alone
+    // would answer for it, and a same-named index of another shape put there
+    // by another session would be recorded as this plan's.
+    let mut added_indexes: BTreeMap<(&TableName, &str), &pbps_model::Index> = BTreeMap::new();
     let mut added_parts: BTreeMap<&TableName, BTreeSet<(pbps_model::Part, &str)>> = BTreeMap::new();
     let mut redefined: BTreeMap<TableName, BTreeMap<String, BTreeSet<pbps_model::ColumnField>>> =
         BTreeMap::new();
@@ -1668,6 +1674,11 @@ fn refuse_unplanned_movement(
     // the other from every comparison (DECISIONS 168).
     let mut constraints: BTreeMap<&TableName, BTreeSet<(pbps_model::Part, &str)>> = BTreeMap::new();
     let mut keys: BTreeSet<&TableName> = BTreeSet::new();
+    // The defaults a change of this plan's own sets, by column. A created
+    // table's column may have its default taken out of the `CREATE` and set
+    // after a function the plan rebuilds (#1027, DEC-942.1), so the payload
+    // alone is not what the column will hold, as with its parts above.
+    let mut set_defaults: BTreeMap<(&TableName, &str), Option<&String>> = BTreeMap::new();
     // A freeing drop can now run before its owner's table rename. Its typed
     // address is the one that exists at execution; shape exclusions and net
     // postconditions must follow only the subsequent renames (DECISIONS 496).
@@ -1754,6 +1765,9 @@ fn refuse_unplanned_movement(
         if let pbps_model::Change::CreateTable { name, table, .. } = &p.change {
             created.insert(name, table.as_ref());
         }
+        if let pbps_model::Change::AlterColumnDefault { column, to, .. } = &p.change {
+            set_defaults.insert((&column.table, column.name.as_str()), to.as_ref());
+        }
         if let pbps_model::Change::AddForeignKey {
             table,
             name,
@@ -1761,6 +1775,9 @@ fn refuse_unplanned_movement(
         } = &p.change
         {
             added_fks.insert((table, name.as_str()), constraint.as_ref());
+        }
+        if let pbps_model::Change::AddIndex { table, name, index } = &p.change {
+            added_indexes.insert((table, name.as_str()), index.as_ref());
         }
         if let Some(dropped) = p.change.drops() {
             gone.insert(dropped);
@@ -1972,7 +1989,20 @@ fn refuse_unplanned_movement(
                 let Some(now) = now.columns.get(n) else {
                     continue;
                 };
-                if !column_as_declared(dialect, was, now) {
+                let as_created = column_as_declared(dialect, was, now);
+                // With a default this plan sets later: that one once every
+                // statement has run, and either before then, since a staged
+                // checkpoint may fall between the `CREATE` and the default.
+                let as_declared = match set_defaults.get(&(now_name, n.as_str())) {
+                    Some(to) => {
+                        let mut finished = was.clone();
+                        finished.default = to.cloned();
+                        column_as_declared(dialect, &finished, now)
+                            || (!settled.whole() && as_created)
+                    }
+                    None => as_created,
+                };
+                if !as_declared {
                     moved.push(format!(
                         "{now_name} column `{n}` is not the one this plan's `CREATE TABLE` \
                          declares"
@@ -2011,8 +2041,11 @@ fn refuse_unplanned_movement(
                     ));
                 }
             }
-            for (n, was) in &declared.indexes {
-                if let Some(now) = now.indexes.get(n)
+            for (n, now) in &now.indexes {
+                if let Some(was) = added_indexes
+                    .get(&(now_name, n.as_str()))
+                    .copied()
+                    .or_else(|| declared.indexes.get(n))
                     && !index_as_declared(was, now)
                 {
                     moved.push(format!(
@@ -8420,6 +8453,142 @@ mod tests {
             Settled::Whole,
         )
         .expect("a replacement is a drop and a create, and the create is the net");
+    }
+
+    /// An index split out of a created table's payload (#1027) answers for
+    /// its whole structure, not only its name: another session's same-named
+    /// index of another shape is movement, at every read (#1056 review).
+    #[test]
+    fn a_created_tables_split_index_answers_for_its_structure() {
+        use pbps_model::{Change, Column, Index, IndexColumn, PlannedChange, Table};
+        let name = TableName::new("app", "t");
+        let mut created = Table::default();
+        for column in ["id", "other"] {
+            created
+                .columns
+                .insert(column.into(), Column::new("int".parse().unwrap()));
+        }
+        let index = |column: &str, unique: bool, filter: Option<&str>| Index {
+            columns: vec![IndexColumn {
+                name: column.into(),
+                descending: false,
+            }],
+            include: vec![],
+            unique,
+            filter: filter.map(Into::into),
+        };
+        let planned_index = index("id", false, Some("id > 0"));
+        let changes = pbps_model::ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::CreateTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    name: name.clone(),
+                    table: Box::new(created.clone()),
+                }),
+                PlannedChange::new(Change::AddIndex {
+                    table: name.clone(),
+                    name: "ix".into(),
+                    index: Box::new(planned_index.clone()),
+                }),
+            ],
+        };
+        let with_index = |ix: Index| {
+            let mut t = created.clone();
+            t.indexes.insert("ix".into(), ix);
+            Schema {
+                tables: [(name.clone(), t)].into(),
+                ..Default::default()
+            }
+        };
+        for settled in [Settled::SoFar, Settled::Whole] {
+            refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                &changes,
+                &Schema::default(),
+                &with_index(planned_index.clone()),
+                "test",
+                settled,
+            )
+            .expect("the index this plan adds, as it adds it");
+            for other in [
+                index("other", false, Some("id > 0")),
+                index("id", true, Some("id > 0")),
+                index("id", false, None),
+            ] {
+                let e = refuse_unplanned_movement(
+                    &pbps_mssql::Mssql,
+                    &changes,
+                    &Schema::default(),
+                    &with_index(other.clone()),
+                    "test",
+                    settled,
+                )
+                .expect_err("a same-named index of another shape is not this plan's");
+                assert!(format!("{e:#}").contains("index `ix`"), "{other:?}: {e:#}");
+            }
+        }
+    }
+
+    /// A created table's default set by a later change of the same plan
+    /// (#1027: split out to follow a rebuilt function) is what the column has
+    /// to hold once every statement has run. Before then, either state is
+    /// one the plan passes through. A default nobody planned still refuses.
+    #[test]
+    fn a_created_tables_default_set_later_by_the_plan_is_the_one_it_must_hold() {
+        use pbps_model::{Change, Column, ColumnRef, PlannedChange, Table};
+        let name = TableName::new("app", "t");
+        let mut created = Table::default();
+        created
+            .columns
+            .insert("v".into(), Column::new("int".parse().unwrap()));
+        let with_default = |default: Option<&str>| {
+            let mut t = created.clone();
+            t.columns.get_mut("v").unwrap().default = default.map(Into::into);
+            Schema {
+                tables: [(name.clone(), t)].into(),
+                ..Default::default()
+            }
+        };
+        let create = PlannedChange::new(Change::CreateTable {
+            uid: "t_aaaaaa".parse().unwrap(),
+            name: name.clone(),
+            table: Box::new(created.clone()),
+        });
+        let set_default = PlannedChange::new(Change::AlterColumnDefault {
+            uid: "c_bbbbbb".parse().unwrap(),
+            column: ColumnRef::new(name.clone(), "v"),
+            from: None,
+            to: Some("1".into()),
+        });
+        let planned = pbps_model::ChangeSet {
+            changes: vec![create.clone(), set_default],
+        };
+        let check = |changes: &pbps_model::ChangeSet, after: &Schema, settled| {
+            refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                changes,
+                &Schema::default(),
+                after,
+                "test",
+                settled,
+            )
+        };
+        check(&planned, &with_default(Some("1")), Settled::Whole)
+            .expect("the default the plan sets is there");
+        let e = check(&planned, &with_default(None), Settled::Whole)
+            .expect_err("every statement ran, and the planned default is missing");
+        assert!(format!("{e:#}").contains("column `v`"), "{e:#}");
+        for default in [None, Some("1")] {
+            check(&planned, &with_default(default), Settled::SoFar)
+                .expect("a checkpoint may fall between the CREATE and the default");
+        }
+        let unplanned = pbps_model::ChangeSet {
+            changes: vec![create],
+        };
+        for settled in [Settled::SoFar, Settled::Whole] {
+            check(&unplanned, &with_default(Some("1")), settled)
+                .expect_err("a default no change of this plan sets is movement");
+        }
     }
 
     #[test]

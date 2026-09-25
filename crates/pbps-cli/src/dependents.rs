@@ -557,6 +557,135 @@ pub(crate) fn weave(
     Ok(cs.changes.len() - before)
 }
 
+/// Where the last function create is, when the plan rebuilds a function;
+/// `None` when it rebuilds none, and nothing has to follow a create.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn last_function_create(cs: &ChangeSet) -> Option<usize> {
+    // A routine the plan drops and creates counts when either side is a
+    // function. The created side counts because a procedure that becomes a
+    // function is a `DropModule` of the procedure and a `CreateModule` of the
+    // function under one id, and whatever calls the new function has to follow
+    // its create (#1024). The dropped side counts too: a function that becomes
+    // a procedure leaves nothing of its own to call, but the same revision may
+    // create another function that a new check calls, and judging by the
+    // created kind alone stopped moving that check (#1047).
+    let rebuilt = dropped_modules(cs).into_iter().any(|(id, dropped)| {
+        cs.changes.iter().any(|p| match &p.change {
+            Change::AlterModule { id: x, module } | Change::CreateModule { id: x, module } => {
+                *x == id && (dropped == ModuleKind::Function || module.kind == ModuleKind::Function)
+            }
+            _ => false,
+        })
+    });
+    if !rebuilt {
+        return None;
+    }
+    cs.changes.iter().rposition(|p| match &p.change {
+        Change::AlterModule { module, .. } | Change::CreateModule { module, .. } => {
+            module.kind == ModuleKind::Function
+        }
+        _ => false,
+    })
+}
+
+/// Splits a table this plan creates, ahead of a function it rebuilds, into
+/// the table and its expression-bearing parts as separate changes, so that
+/// [`after_the_rebuilds`] can move them after the function (#1027,
+/// DEC-942.1). Returns how many changes it added.
+///
+/// The differ writes a new table as one `CreateTable` carrying its checks,
+/// indexes and column defaults, and emits them together. Moving that change
+/// is not an option, since views and routines may read the table. So its
+/// checks become `AddCheck`, its filtered indexes `AddIndex`, and its column
+/// defaults `AlterColumnDefault`, each right after the table. The same rule
+/// as for an existing table then places them. An unfiltered index stays in
+/// the table: it holds no expression. A default stays when the plan writes
+/// the table's rows, which would otherwise be inserted without it, and when
+/// no ids file names the column, since `AlterColumnDefault` needs its uid.
+///
+/// Split this way, the table's check is added to an empty table, and it asks
+/// for `--allow constraint` as any added check does. The approver sees the
+/// constraint as its own step, where before it was inside `CREATE TABLE`.
+// The complement is every change that writes no rows.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub(crate) fn split_new_tables(
+    cs: &mut ChangeSet,
+    ids: &[&IdsFile],
+    dialect: &dyn Dialect,
+) -> usize {
+    let Some(last) = last_function_create(cs) else {
+        return 0;
+    };
+    let writes_rows: std::collections::BTreeSet<pbps_model::TableName> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::InsertRow { table, .. } | Change::UpdateRow { table, .. } => {
+                Some(table.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    let mut added = 0;
+    for i in (0..last).rev() {
+        let Change::CreateTable { name, table, .. } = &mut cs.changes[i].change else {
+            continue;
+        };
+        let name = name.clone();
+        let mut parts: Vec<Change> = Vec::new();
+        for (check, constraint) in std::mem::take(&mut table.checks) {
+            parts.push(Change::AddCheck {
+                table: name.clone(),
+                name: check,
+                constraint,
+            });
+        }
+        let filtered: Vec<String> = table
+            .indexes
+            .iter()
+            .filter(|(_, index)| index.filter.is_some())
+            .map(|(n, _)| n.clone())
+            .collect();
+        for index in filtered {
+            if let Some(spec) = table.indexes.remove(&index) {
+                parts.push(Change::AddIndex {
+                    table: name.clone(),
+                    name: index,
+                    index: Box::new(spec),
+                });
+            }
+        }
+        if !writes_rows.contains(&name) {
+            for (column, spec) in table.columns.iter_mut() {
+                let column_ref = ColumnRef::new(name.clone(), column.clone());
+                let Some(uid) = ids.iter().find_map(|ids| ids.column_uid(&column_ref)) else {
+                    continue;
+                };
+                if let Some(to) = spec.default.take() {
+                    parts.push(Change::AlterColumnDefault {
+                        uid: uid.clone(),
+                        column: column_ref,
+                        from: None,
+                        to: Some(to),
+                    });
+                }
+            }
+        }
+        if parts.is_empty() {
+            continue;
+        }
+        // The table's own change no longer carries what moved out of it, so
+        // its risks are recomputed with the rest.
+        let table_change = cs.changes[i].change.clone();
+        cs.changes[i] = planned(table_change, dialect);
+        added += parts.len();
+        for (k, part) in parts.into_iter().enumerate() {
+            cs.changes.insert(i + 1 + k, planned(part, dialect));
+        }
+    }
+    added
+}
+
 /// Moves what this plan adds that may call a function it rebuilds to after
 /// that function's create (#942, DEC-942.1). Returns how many changes moved.
 ///
@@ -587,31 +716,7 @@ pub(crate) fn weave(
 /// has to exist before the modules that may read it.
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(crate) fn after_the_rebuilds(cs: &mut ChangeSet) -> usize {
-    // A routine the plan drops and creates counts when either side is a
-    // function. The created side counts because a procedure that becomes a
-    // function is a `DropModule` of the procedure and a `CreateModule` of the
-    // function under one id, and whatever calls the new function has to follow
-    // its create (#1024). The dropped side counts too: a function that becomes
-    // a procedure leaves nothing of its own to call, but the same revision may
-    // create another function that a new check calls, and judging by the
-    // created kind alone stopped moving that check (#1047).
-    let rebuilt = dropped_modules(cs).into_iter().any(|(id, dropped)| {
-        cs.changes.iter().any(|p| match &p.change {
-            Change::AlterModule { id: x, module } | Change::CreateModule { id: x, module } => {
-                *x == id && (dropped == ModuleKind::Function || module.kind == ModuleKind::Function)
-            }
-            _ => false,
-        })
-    });
-    if !rebuilt {
-        return 0;
-    }
-    let Some(last) = cs.changes.iter().rposition(|p| match &p.change {
-        Change::AlterModule { module, .. } | Change::CreateModule { module, .. } => {
-            module.kind == ModuleKind::Function
-        }
-        _ => false,
-    }) else {
+    let Some(last) = last_function_create(cs) else {
         return 0;
     };
     let writes_rows = |table: &pbps_model::TableName| {
@@ -948,6 +1053,98 @@ mod tests {
         let before = names(&cs);
         assert_eq!(after_the_rebuilds(&mut cs), 0);
         assert_eq!(names(&cs), before);
+    }
+
+    /// #1027: a table the plan creates ahead of a rebuilt function is split
+    /// into the table and its expression-bearing parts, which then follow the
+    /// function. An unfiltered index stays in the table; a table whose rows
+    /// the plan writes keeps its default; no rebuild splits nothing.
+    #[test]
+    fn a_new_tables_expressions_are_split_out_to_follow_a_rebuilt_function() {
+        let (s, _) = declared();
+        let n = TableName::new("app", "n");
+        let mut t = Table::default();
+        t.columns.insert(
+            "id".into(),
+            Column::new("integer".parse().unwrap()).not_null(),
+        );
+        let mut v = Column::new("integer".parse().unwrap());
+        v.default = Some("app.f(1)".into());
+        t.columns.insert("v".into(), v);
+        t.checks.insert(
+            "ck_n".into(),
+            CheckConstraint {
+                expression: "app.f(id) >= 0".into(),
+            },
+        );
+        for (name, filter) in [("ix_f", Some("app.f(id) > 0")), ("ix_u", None)] {
+            t.indexes.insert(
+                name.into(),
+                pbps_model::Index {
+                    columns: vec![pbps_model::IndexColumn {
+                        name: "id".into(),
+                        descending: false,
+                    }],
+                    include: Vec::new(),
+                    unique: filter.is_none(),
+                    filter: filter.map(Into::into),
+                },
+            );
+        }
+        let mut ids = IdsFile::default();
+        ids.columns.insert(
+            Uid::derived(UidKind::Column, "app.n.v", 0),
+            ColumnRef::new(n.clone(), "v"),
+        );
+        let create = Change::CreateTable {
+            uid: Uid::derived(UidKind::Table, "app.n", 0),
+            name: n.clone(),
+            table: Box::new(t.clone()),
+        };
+        #[allow(clippy::wildcard_enum_match_arm)]
+        let table_of = |cs: &ChangeSet| match &cs.changes[0].change {
+            Change::CreateTable { table, .. } => (**table).clone(),
+            other => panic!("{other:?}"),
+        };
+
+        let mut cs = plan(vec![create.clone(), alter(&s, "app.f(integer)")]);
+        assert_eq!(split_new_tables(&mut cs, &[&ids], pg().as_ref()), 3);
+        let left = table_of(&cs);
+        assert!(left.checks.is_empty());
+        assert_eq!(left.indexes.keys().collect::<Vec<_>>(), ["ix_u"]);
+        assert_eq!(left.columns["v"].default, None);
+        assert_eq!(after_the_rebuilds(&mut cs), 3);
+        assert_eq!(
+            names(&cs)[1..],
+            [
+                "alter app.f(integer)",
+                "add check ck_n",
+                "add index ix_f",
+                "default v -> Some(\"app.f(1)\")",
+            ]
+        );
+
+        // Rows written to the new table: the default stays for them.
+        let insert = Change::InsertRow {
+            table: n.clone(),
+            key_column: "id".into(),
+            identity_key: false,
+            key: pbps_model::RowKey::from("1"),
+            row: pbps_model::Row::default(),
+            defaults: BTreeMap::new(),
+            types: BTreeMap::new(),
+        };
+        let mut cs = plan(vec![create.clone(), insert, alter(&s, "app.f(integer)")]);
+        assert_eq!(split_new_tables(&mut cs, &[&ids], pg().as_ref()), 2);
+        assert_eq!(
+            table_of(&cs).columns["v"].default.as_deref(),
+            Some("app.f(1)")
+        );
+
+        // No function rebuilt: the table is left as the differ wrote it.
+        let mut cs = plan(vec![create]);
+        assert_eq!(split_new_tables(&mut cs, &[&ids], pg().as_ref()), 0);
+        assert_eq!(table_of(&cs), t);
     }
 
     /// Negatives: no function rebuilt (a view rebuilt, or nothing), and a

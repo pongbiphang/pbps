@@ -1423,6 +1423,26 @@ and rolls back.
 - **A column added with a default that calls the function.** The column has to
   exist before any module that reads it.
 
+A table the plan creates carries its checks, indexes and column defaults
+inside one `CreateTable`. That change cannot move, since views and routines
+may read the table. So when the plan rebuilds a function, a new table ahead of
+the last function create is split first (#1027):
+
+- its checks become `AddCheck`;
+- its filtered indexes become `AddIndex`;
+- its column defaults become `AlterColumnDefault`.
+
+The rule above then places them. A default stays inside the `CREATE TABLE`
+when the plan writes that table's rows, or when no ids file names the column.
+A split-out check asks for `--allow constraint`, as any added check does. The
+apply's read-back holds a created column to the default a later change of the
+same plan sets, once every statement has run. At a staged checkpoint before
+that change, either state passes. A split-out index answers for its whole
+structure through its `AddIndex`, as a split-out foreign key does through its
+`AddForeignKey` (DECISIONS 184). With only its name, a same-named index of
+another shape, put there by another session during a staged run, would be
+recorded as this plan's.
+
 A plan that rebuilds no function keeps the differ's order. Measured on
 PostgreSQL: a function edit together with a new check, filtered index and
 default calling it applies, `verify` is clean, and planning again reports no
