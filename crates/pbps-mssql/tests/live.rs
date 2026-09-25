@@ -1104,6 +1104,92 @@ async fn bootstrap_then_introspect_returns_the_declared_schema() {
     assert_eq!(pulled.schema, normalized(&declared));
 }
 
+/// The catalog keeps each dotted part as the engine spells it in every place
+/// a table or column is named again: key and index members, and both ends of
+/// a foreign key (#485). The pull regression in `flow.rs` asserts only the
+/// identity refusal (DECISIONS 444), which the table and column inventory
+/// alone still trigger; these fields are asserted here, before identity, as
+/// the structured values themselves.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn dotted_names_survive_introspection_in_keys_indexes_and_foreign_keys() {
+    use pbps_model::TableName;
+
+    // The last row is the ordinary-name negative: the same shape, no dots, so
+    // a spelling mangled for every name (not only a dotted one) fails too.
+    for (tag, schema, table, column) in [
+        ("dotschema", "schema.dot", "parent", "id"),
+        ("dottable", "dbo", "table.dot", "id"),
+        ("dotcolumn", "dbo", "parent", "column.dot"),
+        ("nodot", "dbo", "parent", "id"),
+    ] {
+        let mut db = TestDb::create(tag).await;
+        if schema != "dbo" {
+            db.conn
+                .execute(&format!("CREATE SCHEMA [{schema}];"))
+                .await
+                .expect("schema");
+        }
+        db.conn
+            .execute(&format!(
+                "CREATE TABLE [{schema}].[{table}] ([{column}] int NOT NULL, other int NOT NULL, \
+                 CONSTRAINT pk_parent PRIMARY KEY ([{column}]));
+                 CREATE INDEX ix_parent ON [{schema}].[{table}] ([{column}]) INCLUDE (other);
+                 CREATE INDEX ix_include ON [{schema}].[{table}] (other) INCLUDE ([{column}]);
+                 CREATE TABLE dbo.child ([{column}] int, \
+                 CONSTRAINT fk_parent FOREIGN KEY ([{column}]) \
+                 REFERENCES [{schema}].[{table}] ([{column}]));"
+            ))
+            .await
+            .expect("tables");
+
+        let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
+            .await
+            .expect("introspect");
+        db.drop().await;
+
+        let parent_name = TableName::new(schema, table);
+        let parent = pulled.schema.tables.get(&parent_name).unwrap_or_else(|| {
+            panic!(
+                "{tag}: `{parent_name}` in {:?}",
+                pulled.schema.tables.keys()
+            )
+        });
+        assert_eq!(
+            parent.primary_key.as_ref().map(|pk| pk.columns.clone()),
+            Some(vec![column.to_owned()]),
+            "{tag}: primary-key members"
+        );
+        let ix = &parent.indexes["ix_parent"];
+        assert_eq!(
+            ix.columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            [column],
+            "{tag}: index key members"
+        );
+        assert_eq!(ix.include, ["other"], "{tag}: included columns");
+        assert_eq!(
+            parent.indexes["ix_include"].include,
+            [column],
+            "{tag}: an included dotted column"
+        );
+
+        let child = &pulled.schema.tables[&TableName::new("dbo", "child")];
+        let fk = &child.foreign_keys["fk_parent"];
+        assert_eq!(fk.columns, [column], "{tag}: referencing columns");
+        // Compared part by part, not as a joined string: `schema.dot`.`parent`
+        // and `schema`.`dot.parent` join to the same text.
+        assert_eq!(
+            fk.references_table.schema, schema,
+            "{tag}: referenced schema"
+        );
+        assert_eq!(fk.references_table.name, table, "{tag}: referenced table");
+        assert_eq!(fk.references_columns, [column], "{tag}: referenced columns");
+    }
+}
+
 /// SPEC §11.5 invariant 3, the most important one: a database in state A,
 /// apply `plan(A -> B)`, introspect, equals B. The migration includes a column
 /// rename, a widening, a tightened nullability with a new default, a dropped
