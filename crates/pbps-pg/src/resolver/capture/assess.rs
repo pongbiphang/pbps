@@ -304,7 +304,14 @@ pub fn assess(
                     _ => false,
                 };
             }
-            !on_target.contains(member) || managed.holds(set.class, member, on_target, order)
+            // Scratch's user schemas hold only the declarations and what
+            // creating them made — an identity column's sequence, a key's
+            // index, a relation's row type — so a member scratch has too was
+            // reproduced, whatever the model calls it. What only the target
+            // has must be one of the project's own objects the plan drops.
+            !on_target.contains(member)
+                || on_scratch.contains(member)
+                || managed.holds(set.class, member, on_target, order)
         })
     };
     let mut assessment = Assessment::default();

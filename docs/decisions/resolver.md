@@ -940,8 +940,10 @@ declaration the plan leaves unchanged has the same text on both sides and
 resolves the same names; only the selected objects can differ, and that is
 what the bindings carry. On the target each member must be an engine object
 scratch has with the same properties, role references removed because the
-bootstrap superuser's name is the installation's, or one of the project's
-managed objects by name. A routine is managed only as the exact overload
+bootstrap superuser's name is the installation's; a member of a user schema
+scratch has too, which creating a declaration made (an identity column's
+sequence, a key's index, a row type); or one of the project's managed objects
+by name. A routine is managed only as the exact overload
 scratch compiled for a declaration the plan keeps; overloads the plan drops,
 never compiled, are the only ones counted. A count alone let an unmanaged
 overload stand in for a declared one the target had lost. An unmanaged overload
