@@ -603,7 +603,7 @@ fn foreign_namespace_sharers_remain_visible_outside_the_container_pid_view() {
     assert!(matches!(namespace.as_str(), "mnt" | "ipc"));
     let anchor = ProcessLease::capture(pid.parse().unwrap()).unwrap();
     let mut foreign = false;
-    let result = super::super::for_each_occupant(&anchor, &namespace, |occupant| {
+    let result = super::super::for_each_foreign_occupant(&anchor, &namespace, |occupant| {
         if !anchor.same_namespace(occupant, "pid")? {
             foreign = true;
             Err(UnqualifiedProcess)

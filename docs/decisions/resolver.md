@@ -790,3 +790,46 @@ vanishes. An opened but unreadable file never falls through to a later file.
 The selected candidate position and opaque resolution preserve comparison
 identity without exporting a path hash. No public verifier, provisioning code,
 source publication path or protected ledger storage is introduced.
+
+
+<a id="dec-882-1"></a>
+
+**DEC-882.1. Closing target capture compares the complete safe public role
+record without authentication-catalog access (#882).** `pg_roles` has no
+`xmin`, so the owned catalog read's physical witness did not cover an
+identity-preserving authorization change. Both supported PostgreSQL majors
+accept such changes during the first snapshot. Capture now projects the same
+qualified public role fields (excluding the masked password field) in its raw,
+rendered and fresh closing reads. The closing cursor shares one new snapshot
+across public role values, complete role membership/absence and the existing
+physical witnesses; unreadable input refuses rather than becoming empty.
+Canonical settings keep timestamp-valued properties comparable without changing
+the caller's settings. `pg_auth_members` retains its physical tuple witness.
+
+This public-value comparison preserves ordinary-reader support without
+requiring password-verifier access through `pg_authid`. It detects a changed
+closing role record, not every intervening ALTER ROLE: changing a public field
+and restoring it before the fresh snapshot can compare equal. That measured
+limit is explicit; this observation is not a continuous authorization-history
+proof or an enabled resolver-backed apply path.
+
+
+<a id="dec-882-2"></a>
+
+**DEC-882.2. Foreign mount/IPC accounting excludes known PID members before
+executable qualification (merge-group repair for #978).** The merge group's
+PostgreSQL guard-limit test refused its valid DDL control with a
+`capture-executable` / `Containment(Accounting)` failure. Ten isolated engine
+repetitions passed, so the original timing-dependent failure was not reproduced
+locally. A deterministic kernel control nevertheless demonstrates the extra
+requirement: a live known PID member with an executable that cannot earn a
+ProcessLease was rejected by a check whose only question is namespace ownership.
+
+The foreign-sharer scan now compares the held task's PID namespace first.
+Known members belong to the separate scoped credential/cgroup qualification;
+this scan does not open their executables again. Foreign tasks still require
+qualification and caller disposition, unreadable namespace evidence refuses,
+and the selected anchor must remain live. The regression exercises actual
+private namespaces, a normal-user-built executable, foreign mount/IPC sharers
+and anchor loss. Removing the production membership filter restores its failure.
+This neither relaxes occupant credentials nor makes the live census atomic.

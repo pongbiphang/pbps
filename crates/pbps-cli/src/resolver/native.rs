@@ -1278,9 +1278,9 @@ pub(crate) fn namespace_task_ids(
 /// qualifying each task, so a short-lived occupant — a forwarder's `cat` pipe
 /// being reaped and respawned while it forwards — is skipped as it vanishes
 /// rather than refused for having, at the instant of capture, no executable to
-/// read. `for_each_occupant` cannot serve here for exactly that reason: it
-/// captures a `ProcessLease` for every occupant, and a zombie between reap and
-/// wait has none. The caller decides what an unaccounted task means.
+/// read. A foreign-occupant lease cannot serve here: a forwarder has its own
+/// PID namespace, and its transient tasks need not yield executables. The
+/// caller decides what an unaccounted task means.
 pub(crate) fn foreign_network_tasks(
     net_anchor: &ProcessLease,
     pid_anchors: &[&ProcessLease],
@@ -1312,9 +1312,11 @@ pub(crate) fn foreign_network_tasks(
     Ok(foreign)
 }
 
-/// Applies one check to every task sharing a lease's namespace, capturing
-/// each in turn and letting it go before the next.
-pub(crate) fn for_each_occupant(
+/// Applies a check only to tasks outside the anchor's PID namespace that
+/// share its selected namespace. The scoped occupant check already qualifies
+/// the anchor's members; re-opening their executables here adds no membership
+/// evidence and races normally terminating backends (DEC-882.2).
+pub(crate) fn for_each_foreign_occupant(
     anchor: &ProcessLease,
     namespace: &str,
     mut inspect: impl FnMut(&ProcessLease) -> Result<(), UnqualifiedProcess>,
@@ -1325,6 +1327,14 @@ pub(crate) fn for_each_occupant(
             Err(error) if process_gone(&error) => continue,
             Err(_) => return Err(UnqualifiedProcess),
         };
+        let pid_namespace = match File::open(proc_base(&directory).join("ns/pid")) {
+            Ok(handle) => handle,
+            Err(error) if process_gone(&error) => continue,
+            Err(_) => return Err(UnqualifiedProcess),
+        };
+        if anchor.owns_namespace("pid", &pid_namespace)? {
+            continue;
+        }
         if let Some(()) = observe_incidental(id, &directory, |lease| inspect(&lease))? {
             continue;
         }
@@ -2053,3 +2063,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod accounting_tests;

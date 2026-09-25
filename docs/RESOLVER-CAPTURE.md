@@ -32,11 +32,22 @@ The snapshot does not freeze PostgreSQL's catalog-rendering functions. A
 private, same-capture tuple witness covers the catalogs that can supply their
 names/properties. After rendering, the adapter commits and observes those
 witnesses with a **fresh** read-only snapshot. The witness cursor holds that
-new snapshot across all its fetches. A rename or change-and-restore
-invalidates the read. Witnesses are deliberately conservative: unrelated
-catalog writes can require another capture. These physical tuple coordinates
+new snapshot across all its fetches. A rename or change-and-restore in a
+tuple-witnessed catalog invalidates the read. Witnesses are deliberately
+conservative: unrelated catalog writes can require another capture. These physical tuple coordinates
 never enter logical fingerprints, cross-database binding comparison or any
-saved artifact. There is no production DDL, production-data copy, target agent
+saved artifact.
+
+The public `pg_roles` view has no tuple-version witness. Its complete set of
+qualified public fields, including role identities and properties, is compared
+on that same fresh snapshot instead; neither `pg_authid` nor password verifiers
+are read. Changed values and added/removed roles refuse the capture, as do
+unreadable facts. Role-membership edges retain their physical witnesses in
+`pg_auth_members`. Equality of public role values does not detect a change that
+was fully restored before the closing snapshot; it is not a continuous
+privilege-history certificate (DEC-882.1).
+
+There is no production DDL, production-data copy, target agent
 or transaction held across image acquisition or scratch compilation.
 
 Session settings whose lifetime is `user` are pinned transaction-locally.
