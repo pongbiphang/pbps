@@ -185,6 +185,16 @@ type, routine, operator and extension changes; authorization/session changes;
 baseline states; unsupported layouts/versions; output qualification; local
 setting restoration; and preservation of caller-owned transactions.
 
+Native lifecycle reads route through the CLI engine seam, with exhaustive
+actual-connection dispatch for both requirement discovery and the enclosed
+fresh capture. `pbps-db::resolver::capture::CaptureError` is the shared,
+source-free refusal shape, re-exported at the existing PostgreSQL API path.
+Private captured catalogs and native source capabilities stay in the engine;
+the route does not turn an ordinary report into source authority. SQL Server
+returns a named unsupported-capture refusal. A raw route leaves an existing
+caller transaction untouched; a refused native capture expires its binding
+and every weak witness, just like other capture failures.
+
 The disposable native TLS fixtures exercise loaded-content qualification,
 disk-only refusal, fresh recapture, a real configuration reload between
 component reads, and cancellation expiry. Protection-removal

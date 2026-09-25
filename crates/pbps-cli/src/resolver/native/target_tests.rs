@@ -66,8 +66,14 @@ async fn native_aliases_share_one_instance_and_backend_children_cannot_claim_ano
         "a backend child cannot be relabeled as another service"
     );
 
-    if driver == Driver::Postgres {
-        postgres_capture_is_fresh_and_cancellation_expires_its_connection(&primary, main_pid).await;
+    match driver {
+        Driver::Postgres => {
+            postgres_capture_is_fresh_and_cancellation_expires_its_connection(&primary, main_pid)
+                .await;
+        }
+        Driver::Mssql => {
+            sql_server_capture_refuses_by_name_and_expires_binding(&primary, main_pid).await
+        }
     }
 
     // The supervisor owns this fixture and explicitly permits its process to
@@ -516,4 +522,61 @@ async fn postgres_capture_is_fresh_and_cancellation_expires_its_connection(
         .query("DROP SCHEMA capture_fixture CASCADE")
         .await
         .unwrap();
+}
+
+async fn sql_server_capture_refuses_by_name_and_expires_binding(primary: &str, main_pid: u32) {
+    use pbps_db::resolver::capture::CaptureError;
+    let scope = engine::CaptureScope {
+        retained: Default::default(),
+        candidates: Default::default(),
+    };
+    let mut connection = PeerVerifiedConn::connect(Driver::Mssql, primary)
+        .await
+        .unwrap();
+    // Both routes refuse before PostgreSQL SQL can reach this real connection.
+    // Keep a caller transaction live to also pin the absence of transaction I/O.
+    connection.query("BEGIN TRANSACTION").await.unwrap();
+    assert!(matches!(
+        engine::capture_with_runtime_inputs(&mut connection, &scope).await,
+        Err(CaptureError::Unsupported {
+            engine: "SQL Server"
+        })
+    ));
+    assert!(matches!(
+        engine::capture(&mut connection, &scope).await,
+        Err(CaptureError::Unsupported {
+            engine: "SQL Server"
+        })
+    ));
+    let rows = connection
+        .query("SELECT CONVERT(int, @@TRANCOUNT) AS depth")
+        .await
+        .unwrap();
+    assert_eq!(rows[0].try_get::<i32>("depth").unwrap(), Some(1));
+    connection.query("ROLLBACK TRANSACTION").await.unwrap();
+    let mut target = NativeTarget::establish(connection, main_pid).await.unwrap();
+    let witness = target.witness().unwrap();
+    let error = match target.capture_postgres(&scope).await {
+        Err(error) => error,
+        Ok(_) => panic!("an unsupported engine cannot produce captured input"),
+    };
+    assert!(matches!(
+        error,
+        CaptureFailure::Catalog(CaptureError::Unsupported {
+            engine: "SQL Server"
+        })
+    ));
+    assert!(error.to_string().contains("SQL Server"));
+    assert!(
+        target.identity().is_err(),
+        "refusal expires the native target"
+    );
+    assert!(
+        witness.check().is_err(),
+        "refusal expires existing scratch witnesses"
+    );
+    assert!(
+        target.capture_postgres(&scope).await.is_err(),
+        "refusal cannot revive a consumed binding"
+    );
 }

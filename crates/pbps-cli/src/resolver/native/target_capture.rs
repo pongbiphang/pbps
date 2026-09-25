@@ -3,16 +3,16 @@
 //! the returned fresh read is enclosed by the native build observations.
 
 use super::{BoundTarget, NativeTarget, correlate, engine, executables};
+use engine::{CaptureScope, CapturedInputs};
 use pbps_db::resolver::{
     InstanceObservation,
-    capture::{CaptureDifference, InputChange},
+    capture::{CaptureDifference, CaptureError, InputChange},
     environment::{ExecutableIdentity, ExecutableRole, Provenance},
 };
-use pbps_pg::resolver::capture::{CaptureError, CaptureScope, CapturedInputs};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureFailure {
-    #[error("target capture requires a qualified PostgreSQL native connection")]
+    #[error("target capture requires a qualified native connection")]
     Binding,
     #[error(transparent)]
     Catalog(#[from] CaptureError),
@@ -101,15 +101,11 @@ impl NativeTarget {
         // Ownership moves before the first await. Cancellation, even during
         // an owned SQL transaction, drops the connection and every weak lease.
         let mut bound = self.current.take().ok_or(CaptureFailure::Binding)?;
-        if bound.connection.driver() != pbps_db::Driver::Postgres {
-            return Err(CaptureFailure::Binding);
-        }
         check(&mut bound).await?;
         // Native-input authority comes only from our own fresh connected read.
         // The returned catalog alone cannot recreate it (DEC-974.1).
         let (hints, required) =
-            pbps_pg::resolver::capture::capture_with_runtime_inputs(&mut bound.connection, scope)
-                .await?;
+            engine::capture_with_runtime_inputs(&mut bound.connection, scope).await?;
         let before = executables::captured_executables(bound.lease.owner(), &required)
             .await
             .map_err(|_| CaptureFailure::Executables)?;
@@ -117,7 +113,7 @@ impl NativeTarget {
             return Err(CaptureFailure::Executables);
         }
         check(&mut bound).await?;
-        let catalog = pbps_pg::resolver::capture::capture(&mut bound.connection, scope).await?;
+        let catalog = engine::capture(&mut bound.connection, scope).await?;
         if !hints.compare(&catalog).is_empty() {
             return Err(CaptureFailure::Changed);
         }
@@ -154,6 +150,20 @@ impl NativeTarget {
 mod tests {
     use super::*;
     use pbps_db::resolver::environment::ExecutableSet;
+
+    #[test]
+    fn capture_lifecycle_routes_without_naming_an_adapter() {
+        // This is an architectural requirement: live PG behavior alone cannot
+        // distinguish a routed read from the same adapter called directly.
+        let source = include_str!("target_capture.rs");
+        let (production, _) = source.rsplit_once("\n#[cfg(test)]\nmod tests {").unwrap();
+        for adapter in ["pbps_pg", "pbps_mssql"] {
+            assert!(
+                !production.contains(adapter),
+                "lifecycle bypasses engine routing: {adapter}"
+            );
+        }
+    }
 
     fn fixture(role: ExecutableRole, provenance: Provenance) -> ExecutableIdentity {
         ExecutableIdentity {

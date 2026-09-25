@@ -157,6 +157,14 @@ scratch-resource SQL stays in the engine crates behind that same seam.
 See [the runtime boundary](RESOLVER-RUNTIME.md) for its staged startup,
 supported profiles and the remaining environment/binding gates.
 
+Both native catalog capture operations route through `native/target_engine`
+by an exhaustive match on the actual verified connection's driver. Capture
+refusals and comparison reports use `pbps-db::resolver::capture`; opaque
+PostgreSQL catalog/source capabilities remain engine-owned private state, as
+with the engine-only state in DECISIONS 417. SQL Server capture refuses by name
+until implemented. The CLI still takes ownership before the first await and
+expires the complete native binding on refusal or cancellation.
+
 Native capture transfers source-bearing library requirements through an opaque
 engine capability issued separately to the producer of a fresh connected read
 (DEC-974.1). Ordinary captured evidence cannot recover this capability. Its

@@ -36,3 +36,52 @@ pub struct CaptureDifference {
     pub object: Option<ObjectIdentity>,
     pub change: InputChange,
 }
+
+/// A safe, named coverage refusal; no source or property value is included.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("target capture cannot cover {class}: {condition}")]
+pub struct Uncovered {
+    pub class: String,
+    pub object: Option<ObjectIdentity>,
+    pub condition: &'static str,
+}
+
+impl Uncovered {
+    pub fn class(class: &str, condition: &'static str) -> Self {
+        Self {
+            class: class.into(),
+            object: None,
+            condition,
+        }
+    }
+    pub fn object(object: &ObjectIdentity, condition: &'static str) -> Self {
+        Self {
+            class: object.class.clone(),
+            object: Some(object.clone()),
+            condition,
+        }
+    }
+}
+
+/// Source-free capture refusals shared by the engine adapters and CLI routing.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CaptureError {
+    #[error("target input capture is not implemented for {engine}")]
+    Unsupported { engine: &'static str },
+    #[error(transparent)]
+    Coverage(#[from] Uncovered),
+    #[error("target capture requires its own transaction")]
+    CallerTransaction,
+    #[error("target capture cannot qualify this engine version")]
+    Version,
+    #[error("target capture could not read a required catalog")]
+    Read,
+    #[error("target capture received incomplete catalog input")]
+    Incomplete,
+    #[error("catalog changed while canonical definitions were rendered")]
+    Changed,
+    #[error("session inputs changed during target capture")]
+    EnvironmentChanged,
+    #[error("target capture could not close its read transaction")]
+    Close,
+}
