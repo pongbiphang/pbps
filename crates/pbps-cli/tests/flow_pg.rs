@@ -3852,6 +3852,102 @@ fn a_grant_a_third_role_made_is_kept_and_only_its_removal_is_refused() {
     assert_eq!(reads(), 0, "the grantor's revoke took it away");
 }
 
+/// #696: a grant the table's owner made is revocable only by a connection
+/// that can act as the owner. A least-privilege deployer that is neither the
+/// owner, a superuser nor a member of the owner cannot take it back: its
+/// `REVOKE` fails with `permission denied` (measured here). So a plan that
+/// narrows the role is refused before a statement runs, naming the owner as
+/// the one who can revoke it, while the read and a declaration that keeps the
+/// grant are unaffected. The same plan made over a superuser connection is an
+/// ordinary one.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn an_owners_grant_a_least_privilege_deployer_cannot_revoke_is_refused_before_it_runs() {
+    let admin = server();
+    let pid = std::process::id();
+    let owner = format!("pbps_ogr_owner_{pid}");
+    let deployer = format!("pbps_ogr_deploy_{pid}");
+    let reader = format!("pbps_ogr_read_{pid}");
+    let _roles = ClusterRoles {
+        server: admin.clone(),
+        names: vec![owner.clone(), deployer.clone(), reader.clone()],
+    };
+    on_server(
+        &admin,
+        &format!(
+            "CREATE ROLE {owner} NOSUPERUSER; \
+             CREATE ROLE {deployer} LOGIN NOSUPERUSER PASSWORD 'trigger-test'; \
+             CREATE ROLE {reader} NOSUPERUSER"
+        ),
+    );
+    let own = OwnDatabase::new(&admin, "owner-grant");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!(
+            "CREATE SCHEMA app AUTHORIZATION {deployer}; \
+             GRANT CREATE ON SCHEMA public TO {deployer}; \
+             CREATE TABLE app.t(id bigint NOT NULL, CONSTRAINT pk_t PRIMARY KEY (id)); \
+             ALTER TABLE app.t OWNER TO {owner}; \
+             GRANT USAGE ON SCHEMA app TO {owner}, {reader}; \
+             SET ROLE {owner}; GRANT SELECT, INSERT ON app.t TO {reader}; RESET ROLE"
+        ),
+    );
+    let deployment = as_role(connection, &deployer);
+    // The premise, measured: this deployer's `REVOKE` cannot take the owner's
+    // entry back.
+    let denied = try_on_server(
+        connection,
+        &format!("SET ROLE {deployer}; REVOKE INSERT ON app.t FROM {reader}"),
+    )
+    .expect_err("a non-owner's revoke of the owner's grant");
+    assert!(denied.contains("permission denied"), "{denied}");
+    on_server(connection, "RESET ROLE");
+
+    let d = Demo::new("owner-grant");
+    d.table(ONE_COLUMN);
+    let file = d.dir.join("schema/reader.yml");
+    let declaration = |permissions: &str| {
+        format!("role: {reader}\ngrants:\n  schema::app: [usage]\n  app.t: [{permissions}]\n")
+    };
+    // The declaration that keeps the grant reads and baselines as before.
+    std::fs::write(&file, declaration("select, insert")).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&[
+        "baseline",
+        "--db",
+        &deployment,
+        "--reason",
+        "adopting a database whose owner granted into it",
+    ]));
+
+    // Narrowing it is what this deployer cannot do.
+    std::fs::write(&file, declaration("select")).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let refused = d.run(&["plan", "--db", &deployment, "--out", plan.to_str().unwrap()]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("unrevocable_grants")
+            && stderr(&refused).contains(&format!("granted by `{owner}`"))
+            && stderr(&refused).contains(&format!("Have `{owner}` revoke it")),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!plan.exists(), "a refused plan writes no artifact");
+
+    // A superuser can take it back, so the same plan is an ordinary one there.
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+}
+
 /// Issue #251, the rename the check has to see through. A plan that renames a
 /// table and narrows a role in the same step spells the `Revoke` with the name
 /// the plan leaves behind, while the read that found the grant knows the

@@ -1073,14 +1073,15 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
         // (`revocable_by_current_role`), the same expression `doctor` asks it
         // with.
         //
-        // The **owner**'s own entries are exempt ahead of that answer, and
-        // deliberately: they are what `acldefault` supplies and what a
-        // superuser's grant on somebody else's object is recorded as (both
-        // measured on 18.6). A least-privilege deployer cannot revoke them
-        // either — the pull is *run* as that account, by design (DECISIONS
-        // 375) — and reporting them here would refuse to read the databases
-        // this tool is built to deploy into. That narrowing is #696's, with
-        // the deployment-privilege question it needs answering first.
+        // The **owner**'s entries get the same answer, and no exemption
+        // (#696). They are what a superuser's grant on somebody else's object
+        // is recorded as, and the engine's answer already covers the
+        // connections that can take them back: the owner, a superuser, and a
+        // member of the owner (`revocable_by_current_role`). A least-privilege
+        // deployer that is none of those cannot: measured on 18.6, its
+        // `REVOKE` fails with `permission denied` and the entry stands.
+        // Reporting it costs that deployer nothing it had: the finding
+        // refuses only a plan that revokes the entry, never the read (below).
         //
         // The limitation is on one direction, and it is recorded as one.
         // Dropping the grant here instead refused every connected command
@@ -1092,11 +1093,9 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
         // impossible `REVOKE` is the one refused (`engine::unrevocable_grants`).
         //
         // Folding it in with nothing recorded is the other wrong answer: the
-        // narrowing plan would be built and run, and the `REVOKE` would
-        // report success with the entry still standing. The apply's
-        // read-back does not catch that — measured, it exited 0 and recorded
-        // the narrowing as converged (#700).
-        if g.grantor != g.owner && !g.revocable {
+        // narrowing plan would be built and run, and only the apply's closing
+        // read would refuse it, after its statements ran (#700).
+        if !g.revocable {
             pulled.unrevocable.push(pbps_db::catalog::Unrevocable {
                 role: grantee.to_owned(),
                 target: target.clone(),
@@ -3194,8 +3193,10 @@ mod tests {
             found.why
         );
 
-        // The owner's own grant — which is what a superuser's grant on
-        // somebody else's object is recorded as — is an ordinary grant.
+        // The owner's grant, which is also what a superuser's grant on somebody
+        // else's object is recorded as, is an ordinary grant when this
+        // connection can take it back: it is the owner, a superuser, or a
+        // member of the owner.
         let pulled = assemble(&RawCatalog {
             roles: vec![role("app_reader")],
             grants: vec![third("deploy", true)],
@@ -3211,6 +3212,25 @@ mod tests {
             !pulled_role(&pulled, "app_reader").grants.is_empty(),
             "the owner's grant belongs in the role's set"
         );
+
+        // #696: and one it cannot take back is reported like any other, with
+        // no exemption for the owner. It stays in the role's set; only a plan
+        // that revokes it is refused.
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![third("deploy", false)],
+            ..declaring('f', &[])
+        });
+        assert_eq!(pulled.unrevocable.len(), 1, "{:?}", pulled.unrevocable);
+        assert!(
+            pulled.unrevocable[0].why.contains("granted by `deploy`")
+                && pulled.unrevocable[0]
+                    .why
+                    .contains("Have `deploy` revoke it"),
+            "{}",
+            pulled.unrevocable[0].why
+        );
+        assert!(!pulled_role(&pulled, "app_reader").grants.is_empty());
 
         // The second negative case, and the one the owner test alone gets
         // wrong: a least-privilege deployer holding `WITH GRANT OPTION`
