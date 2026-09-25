@@ -666,3 +666,28 @@ reads the declarations offline and serves PostgreSQL, where the exact
 comparison is right. On a case-sensitive database the engine keeps the
 spellings apart, and so do these checks. The cost is up to five round trips
 per environment, each skipped when its lists are empty.
+
+<a id="dec-352-1"></a>
+
+**DEC-352.1. On SQL Server, a recorded table that the project now declares in
+another schema does not keep its source schema managed in `doctor` (#352).**
+A recorded table stays managed until its drop is recorded. That is what makes
+`doctor` ask about the schema of a table that the declarations no longer name,
+and a drop needs `ALTER` there. A table that the ids file has moved to another
+schema is not being dropped, though. Its identity survives, and the plan
+moves it with `ALTER SCHEMA dest TRANSFER`. Measured on SQL Server 2025, that
+statement runs for an account that holds `CONTROL` on the table and `ALTER` on
+the destination and nothing on the source schema. Keeping the source schema
+in the managed set demanded the whole managed permission list there, and the
+move never uses it.
+
+The move is recognised from identities only. The recorded ids name the
+table's uid, and the project ids place that uid in a different schema. A
+table renamed within its schema, a table the project no longer declares, and a
+recorded table whose uid the recorded ids do not name all keep the source
+schema managed. Without a recognised move the answer errs towards asking.
+
+SPEC §9.5 still leaves the transfer's own `CONTROL` demand unmodelled; this
+entry removes an over-demand and adds none. PostgreSQL's `doctor` takes its
+managed schemas from the declarations alone, so it has no such retention to
+narrow.

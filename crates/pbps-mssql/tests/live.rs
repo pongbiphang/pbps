@@ -14290,3 +14290,110 @@ async fn doctor_reads_the_permissions_of_more_schemas_than_one_statement_can_bin
     }
     db.drop().await;
 }
+
+/// #352. A recorded table the project now declares in another schema is an
+/// identity-preserving move, `ALTER SCHEMA dest TRANSFER`, which needs
+/// `CONTROL` on the table and `ALTER` on the destination and nothing on the
+/// source. `doctor` must not demand the managed schema set on that source.
+/// The same recorded table with no declaration is a drop, and still does.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_moved_table_does_not_keep_its_source_schema_managed_but_a_dropped_one_does() {
+    let mut db = TestDb::create("doctormovedtable").await;
+    db.conn
+        .execute(
+            "EXEC('CREATE SCHEMA legacy'); EXEC('CREATE SCHEMA modern'); \
+             CREATE TABLE legacy.t (id int NOT NULL); \
+             CREATE USER deployer WITHOUT LOGIN; GRANT VIEW DEFINITION TO deployer; \
+             GRANT CONTROL ON legacy.t TO deployer; GRANT ALTER ON SCHEMA::modern TO deployer;",
+        )
+        .await
+        .unwrap();
+    pbps_mssql::state::ensure_tables(&mut db.conn)
+        .await
+        .unwrap();
+    // The ledger has to be readable, or neither call sees a recorded table
+    // at all and the drop negative below would pass for the wrong reason.
+    db.conn
+        .execute("GRANT SELECT ON SCHEMA::dbo TO deployer;")
+        .await
+        .unwrap();
+    let uid: pbps_model::Uid = "t_aaaaaa".parse().unwrap();
+    let mut recorded = Schema::default();
+    recorded
+        .tables
+        .insert(TableName::new("legacy", "t"), Table::default());
+    let mut recorded_ids = IdsFile::default();
+    recorded_ids
+        .tables
+        .insert(uid.clone(), TableName::new("legacy", "t"));
+    pbps_mssql::state::record(
+        &mut db.conn,
+        &StateSnapshot::new(
+            pbps_model::StateKind::Apply,
+            recorded,
+            recorded_ids,
+            "live-test",
+        ),
+    )
+    .await
+    .unwrap();
+
+    let mut moved_ids = IdsFile::default();
+    moved_ids
+        .tables
+        .insert(uid.clone(), TableName::new("modern", "t"));
+    db.conn
+        .execute("EXECUTE AS USER = 'deployer';")
+        .await
+        .unwrap();
+    let moved = pbps_mssql::doctor::permissions(
+        &mut db.conn,
+        &[TableName::new("modern", "t")],
+        &["modern".to_owned()],
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &moved_ids,
+    )
+    .await
+    .unwrap();
+    let dropped = pbps_mssql::doctor::permissions(
+        &mut db.conn,
+        &[],
+        &[],
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &IdsFile::default(),
+    )
+    .await
+    .unwrap();
+    // Measured, not assumed: this account can make the move with what it
+    // holds, and nothing on `legacy` is part of that.
+    let transferred = db
+        .conn
+        .execute("ALTER SCHEMA modern TRANSFER legacy.t;")
+        .await;
+    db.conn.execute("REVERT;").await.unwrap();
+    transferred.expect("CONTROL on the table and ALTER on the destination make the move");
+
+    assert!(!moved.schemas.contains_key("legacy"), "{moved:?}");
+    assert!(
+        !pbps_mssql::doctor::missing(&moved)
+            .iter()
+            .any(|gap| gap.securable() == "SCHEMA::[legacy]"),
+        "{moved:?}"
+    );
+    // The negative: no declaration keeps the table, so it is a drop, and its
+    // schema is still asked for the managed set.
+    assert!(
+        pbps_mssql::doctor::missing(&dropped)
+            .iter()
+            .any(|gap| gap.permission == "ALTER" && gap.securable() == "SCHEMA::[legacy]"),
+        "{dropped:?}"
+    );
+    db.drop().await;
+}
