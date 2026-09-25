@@ -1009,13 +1009,23 @@ writes commits with the approved changes.
   yet has no bindings to read, and a PL/pgSQL body binds when it runs. Engine
   resolution belongs to the resolver (SPEC §9.3.2, #614).
 
-*What is pinned.* Every routine (`pg_proc` row) that meets all three conditions:
-- it lies outside `pg_catalog` and `information_schema`;
+*What is pinned.* Every routine (`pg_proc` row), in any schema, that meets
+both conditions:
 - it is not in the plan's managed set, whose routines the drift check and the
   read-back already hold;
-- a role that is not a superuser can replace it. That is the case unless its
-  owner is a superuser and every member of the owner's role, by any path
-  (`pg_has_role(member, owner, 'MEMBER')`), is a superuser too.
+- a role that is not a superuser can replace it. A role can replace a routine
+  when it holds the owner's rights, either through inheritance
+  (`pg_has_role(role, owner, 'USAGE')`, DECISIONS 450) or through a `SET` path
+  (`pg_has_role(role, owner, 'SET')` from PostgreSQL 16; before 16, every
+  membership can `SET ROLE`, so `'MEMBER'`). A membership granted `INHERIT
+  FALSE, SET FALSE` confers neither. `pg_has_role` still reports `MEMBER`
+  for it, but the member's `CREATE OR REPLACE` fails with "must be owner",
+  measured on 18.6.
+
+No schema is exempt by name. The built-in routines in `pg_catalog` and
+`information_schema` belong to the bootstrap superuser and fall out of the set
+by the second condition. A routine that an administrator created or re-owned
+there, where a plain role can replace it, stays in.
 
 The last condition is the one that keeps the set small. Only the owner, a
 member of the owner's role, or a superuser can replace or re-own a routine, and
