@@ -587,16 +587,18 @@ pub(crate) fn weave(
 /// has to exist before the modules that may read it.
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(crate) fn after_the_rebuilds(cs: &mut ChangeSet) -> usize {
-    // Judged by the kind the plan creates, not the kind it drops: a routine
-    // changing from a procedure to a function is emitted as a `DropModule` of
-    // the procedure and a `CreateModule` of the function under one id, and an
-    // addition calling that new function has to follow its create just the
-    // same (#1024). The reverse change leaves no function to call, so it moves
-    // nothing.
-    let rebuilt = dropped_modules(cs).into_iter().any(|(id, _)| {
+    // A routine the plan drops and creates counts when either side is a
+    // function. The created side counts because a procedure that becomes a
+    // function is a `DropModule` of the procedure and a `CreateModule` of the
+    // function under one id, and whatever calls the new function has to follow
+    // its create (#1024). The dropped side counts too: a function that becomes
+    // a procedure leaves nothing of its own to call, but the same revision may
+    // create another function that a new check calls, and judging by the
+    // created kind alone stopped moving that check (#1047).
+    let rebuilt = dropped_modules(cs).into_iter().any(|(id, dropped)| {
         cs.changes.iter().any(|p| match &p.change {
             Change::AlterModule { id: x, module } | Change::CreateModule { id: x, module } => {
-                *x == id && module.kind == ModuleKind::Function
+                *x == id && (dropped == ModuleKind::Function || module.kind == ModuleKind::Function)
             }
             _ => false,
         })
@@ -870,9 +872,10 @@ mod tests {
 
     /// #1024: a procedure that becomes a function is dropped as a procedure
     /// and created as a function, and what calls the new function follows its
-    /// create. The reverse leaves no function behind and moves nothing.
+    /// create. #1047: the reverse still counts, for another function the same
+    /// revision creates.
     #[test]
-    fn a_procedure_becoming_a_function_counts_as_a_function_rebuild() {
+    fn a_routine_changing_kind_to_or_from_a_function_counts_as_a_function_rebuild() {
         let routine = id("app.f(integer)");
         let as_kind = |kind| {
             Box::new(module(
@@ -901,10 +904,40 @@ mod tests {
             ]
         );
 
+        // #1047: a function that becomes a procedure, beside a new function
+        // `g` the check calls. The check follows `g`'s create.
         let mut cs = plan(vec![
             Change::DropModule {
                 id: routine.clone(),
                 kind: ModuleKind::Function,
+            },
+            add_check("ck"),
+            Change::CreateModule {
+                id: routine.clone(),
+                module: as_kind(ModuleKind::Procedure),
+            },
+            Change::CreateModule {
+                id: id("app.g(integer)"),
+                module: as_kind(ModuleKind::Function),
+            },
+        ]);
+        assert_eq!(after_the_rebuilds(&mut cs), 1);
+        assert_eq!(
+            names(&cs),
+            [
+                "drop app.f(integer)",
+                "create app.f(integer)",
+                "create app.g(integer)",
+                "add check ck"
+            ]
+        );
+
+        // Negative: a procedure rebuilt as a procedure is no function
+        // rebuild, and a check beside it stays where the differ put it.
+        let mut cs = plan(vec![
+            Change::DropModule {
+                id: routine.clone(),
+                kind: ModuleKind::Procedure,
             },
             add_check("ck"),
             Change::CreateModule {

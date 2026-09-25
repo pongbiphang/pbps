@@ -1287,6 +1287,78 @@ fn module_rebuilds_refuse_carried_state_before_planning_and_before_recording() {
 /// The objects are created on the server and adopted with `pull`, because a
 /// table whose check calls a function cannot be bootstrapped: tables are built
 /// before modules.
+/// A function that becomes a procedure, a new function `g` beside it, and a
+/// check calling `g`: the check still follows `CREATE FUNCTION` for `g`
+/// (#1047). Judging the rebuild by the created kind alone stopped moving it.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_check_calling_a_new_function_follows_it_beside_a_function_turned_procedure() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "function-to-procedure");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE TABLE app.t (id integer PRIMARY KEY)",
+    );
+    let d = Demo::new("function-to-procedure");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    std::fs::remove_file(d.dir.join("schema/app.f%28integer%29.function.yml")).unwrap();
+    std::fs::write(
+        d.dir.join("schema/app.f%28integer%29.procedure.yml"),
+        "procedure: app.f(integer)\npublic_execute: true\n\ndefinition: |-\n  \
+         (IN x integer) LANGUAGE sql AS $$ SELECT 1 $$\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/app.g%28integer%29.function.yml"),
+        "function: app.g(integer)\npublic_execute: true\n\ndefinition: |-\n  \
+         (x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$\n",
+    )
+    .unwrap();
+    let table = d.dir.join("schema/app.t.yml");
+    let text = std::fs::read_to_string(&table).unwrap();
+    std::fs::write(&table, format!("{text}checks:\n  ck_g: 'app.g(id) >= 0'\n")).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    assert!(
+        at("CREATE FUNCTION \"app\".\"g\"") < at("ADD CONSTRAINT \"ck_g\""),
+        "{script}"
+    );
+    let allow = [
+        "--allow",
+        "constraint",
+        "--allow",
+        "destructive",
+        "--allow",
+        "grant-widen",
+    ];
+    succeeds(approved_apply(&d, connection, &plan, &allow));
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
 /// A procedure that becomes a function, and a check added in the same revision
 /// that calls the new function: the check follows `CREATE FUNCTION` and the
 /// plan applies (#1024). The kind change is a `DropModule` of the procedure and

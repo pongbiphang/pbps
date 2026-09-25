@@ -1402,9 +1402,10 @@ Which function an expression calls cannot be known without parsing it, and the
 planner does not parse expressions (DECISIONS 174). So the rule is positional
 rather than per call. When the plan rebuilds a function, these move after the
 last function the plan creates, keeping their order. A routine counts as a
-rebuilt function when the plan drops it and creates it *as a function*, so a
-procedure that becomes a function counts too, and a function that becomes a
-procedure does not (#1024). What moves:
+rebuilt function when the plan drops and creates it and either side is a
+function. A procedure that becomes a function counts (#1024), and so does a
+function that becomes a procedure, since the same revision may create another
+function a new check calls (#1047). What moves:
 
 - every check;
 - every index with a filter, since an index's columns are names and its filter
