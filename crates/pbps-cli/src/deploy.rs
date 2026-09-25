@@ -1668,6 +1668,11 @@ fn refuse_unplanned_movement(
     // the other from every comparison (DECISIONS 168).
     let mut constraints: BTreeMap<&TableName, BTreeSet<(pbps_model::Part, &str)>> = BTreeMap::new();
     let mut keys: BTreeSet<&TableName> = BTreeSet::new();
+    // The defaults a change of this plan's own sets, by column. A created
+    // table's column may have its default taken out of the `CREATE` and set
+    // after a function the plan rebuilds (#1027, DEC-942.1), so the payload
+    // alone is not what the column will hold, as with its parts above.
+    let mut set_defaults: BTreeMap<(&TableName, &str), Option<&String>> = BTreeMap::new();
     // A freeing drop can now run before its owner's table rename. Its typed
     // address is the one that exists at execution; shape exclusions and net
     // postconditions must follow only the subsequent renames (DECISIONS 496).
@@ -1753,6 +1758,9 @@ fn refuse_unplanned_movement(
         }
         if let pbps_model::Change::CreateTable { name, table, .. } = &p.change {
             created.insert(name, table.as_ref());
+        }
+        if let pbps_model::Change::AlterColumnDefault { column, to, .. } = &p.change {
+            set_defaults.insert((&column.table, column.name.as_str()), to.as_ref());
         }
         if let pbps_model::Change::AddForeignKey {
             table,
@@ -1972,7 +1980,20 @@ fn refuse_unplanned_movement(
                 let Some(now) = now.columns.get(n) else {
                     continue;
                 };
-                if !column_as_declared(dialect, was, now) {
+                let as_created = column_as_declared(dialect, was, now);
+                // With a default this plan sets later: that one once every
+                // statement has run, and either before then, since a staged
+                // checkpoint may fall between the `CREATE` and the default.
+                let as_declared = match set_defaults.get(&(now_name, n.as_str())) {
+                    Some(to) => {
+                        let mut finished = was.clone();
+                        finished.default = to.cloned();
+                        column_as_declared(dialect, &finished, now)
+                            || (!settled.whole() && as_created)
+                    }
+                    None => as_created,
+                };
+                if !as_declared {
                     moved.push(format!(
                         "{now_name} column `{n}` is not the one this plan's `CREATE TABLE` \
                          declares"
@@ -8399,6 +8420,68 @@ mod tests {
             Settled::Whole,
         )
         .expect("a replacement is a drop and a create, and the create is the net");
+    }
+
+    /// A created table's default set by a later change of the same plan
+    /// (#1027: split out to follow a rebuilt function) is what the column has
+    /// to hold once every statement has run. Before then, either state is
+    /// one the plan passes through. A default nobody planned still refuses.
+    #[test]
+    fn a_created_tables_default_set_later_by_the_plan_is_the_one_it_must_hold() {
+        use pbps_model::{Change, Column, ColumnRef, PlannedChange, Table};
+        let name = TableName::new("app", "t");
+        let mut created = Table::default();
+        created
+            .columns
+            .insert("v".into(), Column::new("int".parse().unwrap()));
+        let with_default = |default: Option<&str>| {
+            let mut t = created.clone();
+            t.columns.get_mut("v").unwrap().default = default.map(Into::into);
+            Schema {
+                tables: [(name.clone(), t)].into(),
+                ..Default::default()
+            }
+        };
+        let create = PlannedChange::new(Change::CreateTable {
+            uid: "t_aaaaaa".parse().unwrap(),
+            name: name.clone(),
+            table: Box::new(created.clone()),
+        });
+        let set_default = PlannedChange::new(Change::AlterColumnDefault {
+            uid: "c_bbbbbb".parse().unwrap(),
+            column: ColumnRef::new(name.clone(), "v"),
+            from: None,
+            to: Some("1".into()),
+        });
+        let planned = pbps_model::ChangeSet {
+            changes: vec![create.clone(), set_default],
+        };
+        let check = |changes: &pbps_model::ChangeSet, after: &Schema, settled| {
+            refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                changes,
+                &Schema::default(),
+                after,
+                "test",
+                settled,
+            )
+        };
+        check(&planned, &with_default(Some("1")), Settled::Whole)
+            .expect("the default the plan sets is there");
+        let e = check(&planned, &with_default(None), Settled::Whole)
+            .expect_err("every statement ran, and the planned default is missing");
+        assert!(format!("{e:#}").contains("column `v`"), "{e:#}");
+        for default in [None, Some("1")] {
+            check(&planned, &with_default(default), Settled::SoFar)
+                .expect("a checkpoint may fall between the CREATE and the default");
+        }
+        let unplanned = pbps_model::ChangeSet {
+            changes: vec![create],
+        };
+        for settled in [Settled::SoFar, Settled::Whole] {
+            check(&unplanned, &with_default(Some("1")), settled)
+                .expect_err("a default no change of this plan sets is movement");
+        }
     }
 
     #[test]
