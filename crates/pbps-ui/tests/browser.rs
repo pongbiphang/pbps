@@ -1,4 +1,9 @@
 //! Execute the shipped JavaScript, including asynchronous DOM event handling.
+// The test harness, not the UI, reads which Node.js to run.
+#![expect(
+    clippy::disallowed_methods,
+    reason = "PBPS_TEST_NODE selects the test's Node.js"
+)]
 use std::io::Write;
 use std::process::{Command, Stdio};
 

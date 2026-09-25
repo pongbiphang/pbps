@@ -1,0 +1,15 @@
+# ADR-0015 decision 4: the UI process never holds a connection string. The
+# child reads `url_env` itself, so nothing in this crate may read an
+# environment variable's value. These lints resolve paths after macro
+# expansion, which a source scan cannot (#1050, DEC-1050.1). Compose's
+# names-only `GIT_*` scrub is the one allowed site, marked where it is.
+disallowed-methods = [
+    { path = "std::env::var", reason = "the UI never reads an environment value (ADR-0015 decision 4)" },
+    { path = "std::env::var_os", reason = "the UI never reads an environment value (ADR-0015 decision 4)" },
+    { path = "std::env::vars", reason = "the UI never reads an environment value (ADR-0015 decision 4)" },
+    { path = "std::env::vars_os", reason = "the UI never reads an environment value (ADR-0015 decision 4)" },
+]
+disallowed-macros = [
+    { path = "std::env", reason = "embeds an environment value in the UI binary (ADR-0015 decision 4)" },
+    { path = "std::option_env", reason = "embeds an environment value in the UI binary (ADR-0015 decision 4)" },
+]

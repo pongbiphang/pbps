@@ -428,8 +428,15 @@ hand, though, passes for a route added after it was written.
   argument vector. SQL sent through every route and every field reaches a
   child only as the value of one fixed option, never as an argument of its
   own.
-- A source test pins that `pbps-ui` reads no environment *value*. Compose's
-  names-only `GIT_*` scrub is the one named exception.
+- `pbps-ui` reads no environment *value*. Two checks hold this.
+  - `crates/pbps-ui/clippy.toml` disallows `std::env::var`, `var_os`,
+    `vars`, `vars_os` and the `env!`/`option_env!` macros. Clippy resolves
+    paths after macro expansion, and CI runs it with `-D warnings`.
+  - A source scan, with comments and whitespace removed, is a second net that
+    names the site it finds.
+  Compose's names-only `GIT_*` scrub is the one allowed site, marked with
+  `#[expect]` and a reason. A test pins the clippy configuration, so deleting
+  it fails.
 - The real-CLI test searches every response, served asset and file the
   session leaves (git's compressed objects included) for the password marker
   and the typed checksum.

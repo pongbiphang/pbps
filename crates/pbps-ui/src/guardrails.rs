@@ -475,11 +475,35 @@ fn an_aliased_imported_or_spaced_environment_read_is_still_seen() {
     }
 }
 
+/// The source scan cannot see a path a macro assembles during expansion;
+/// clippy's `disallowed_methods` and `disallowed_macros`, which resolve paths
+/// after expansion, can, and CI runs clippy with `-D warnings`. This pins the
+/// configuration those lints read, so deleting it fails a test.
+#[test]
+fn clippy_forbids_every_environment_read_in_this_crate() {
+    let config = include_str!("../clippy.toml");
+    for path in [
+        "std::env::var\"",
+        "std::env::var_os\"",
+        "std::env::vars\"",
+        "std::env::vars_os\"",
+        "std::env\"",
+        "std::option_env\"",
+    ] {
+        assert!(config.contains(&format!("path = \"{path}")), "{path}");
+    }
+    assert!(config.contains("disallowed-methods") && config.contains("disallowed-macros"));
+}
+
 /// ADR-0015 decision 4: the UI process never holds a connection string. The
 /// child reads `url_env` itself, and the UI must not read any environment
 /// value. The one read is compose's names-only scrub, removed by its exact
 /// text before the scan and required to be where it is.
 #[test]
+#[expect(
+    clippy::disallowed_macros,
+    reason = "the test locates this crate's sources"
+)]
 fn the_ui_reads_no_environment_value() {
     fn sources(directory: &std::path::Path, found: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(directory).unwrap() {

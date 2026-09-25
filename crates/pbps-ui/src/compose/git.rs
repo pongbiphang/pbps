@@ -14,6 +14,10 @@ pub(super) struct Git {
 }
 
 impl Git {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "reads the names of inherited GIT_* variables and discards every value"
+    )]
     pub fn command(&self) -> Command {
         let mut command = Command::new("git");
         // Keep the user's authentication mechanism, but never repository,
