@@ -86,6 +86,72 @@ fn no_write_action_accepts_a_field_it_does_not_name() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
+/// Compose's named fields reach the CLI, too: identifiers as operands after
+/// `--`, where the CLI can read nothing as an option, and a drop reason as
+/// its own `--reason=` value. Each intent comes from JSON, as the browser
+/// sends it, with SQL in every string field.
+#[cfg(target_os = "linux")]
+#[test]
+fn compose_intent_fields_reach_the_cli_only_as_operands_or_one_option_value() {
+    use compose::Intent;
+    // Exhaustive on purpose: a new intent fails to compile here until it is
+    // added to the bodies below.
+    fn kind(intent: &Intent) -> &'static str {
+        match intent {
+            Intent::Rename { .. } => "rename",
+            Intent::RenameTable { .. } => "rename-table",
+            Intent::Drop { .. } => "drop",
+            Intent::DropTable { .. } => "drop-table",
+            Intent::RenameRole { .. } => "rename-role",
+            Intent::DropRole { .. } => "drop-role",
+            Intent::Declarations => "declarations",
+        }
+    }
+    let bodies = [
+        serde_json::json!({"kind": "rename", "from": SQL, "to": SQL}),
+        serde_json::json!({"kind": "rename-table", "from": SQL, "to": SQL}),
+        serde_json::json!({"kind": "drop", "column": SQL, "reason": SQL}),
+        serde_json::json!({"kind": "drop-table", "table": SQL, "reason": SQL}),
+        serde_json::json!({"kind": "rename-role", "from": SQL, "to": SQL}),
+        serde_json::json!({"kind": "drop-role", "role": SQL, "reason": SQL}),
+        serde_json::json!({"kind": "declarations"}),
+    ];
+    let mut kinds = Vec::new();
+    for body in bodies {
+        let intent: Intent = serde_json::from_value(body).unwrap();
+        kinds.push(kind(&intent));
+        let arguments = intent.arguments(SQL);
+        assert!(
+            arguments[0]
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c == '-'),
+            "{arguments:?}"
+        );
+        let separator = arguments.iter().position(|a| a == "--");
+        for (index, argument) in arguments.iter().enumerate() {
+            let operand = separator.is_some_and(|at| index > at);
+            let option = argument
+                .split_once('=')
+                .is_some_and(|(flag, rest)| flag.starts_with("--") && rest == SQL);
+            assert!(
+                !argument.contains(SQL) || operand || option,
+                "{argument:?} in {arguments:?}"
+            );
+        }
+        assert!(arguments.iter().filter(|a| *a == "--").count() <= 1);
+    }
+    let mut unique = kinds.clone();
+    unique.dedup();
+    assert_eq!(unique.len(), 7, "every intent is exercised: {kinds:?}");
+    // And a field the intent does not name is refused.
+    assert!(
+        serde_json::from_value::<Intent>(
+            serde_json::json!({"kind": "rename", "from": "a", "to": "b", "sql": SQL})
+        )
+        .is_err()
+    );
+}
+
 #[test]
 fn the_route_tables_are_the_whole_router() {
     let peer = Some("127.0.0.1:1234".parse().unwrap());
@@ -141,7 +207,12 @@ fn reaches_environment(line: &str) -> bool {
         .collect();
     let import = line.trim_start().starts_with("use ");
     // A name that reads the environment by itself, or any import of `env`.
-    let direct = (import && words.contains(&"env"))
+    // The compile-time macros embed a variable's value in the binary; only
+    // Cargo's own manifest directory, a build path, is allowed.
+    let embedded = (line.contains("env!(") && !line.contains("env!(\"CARGO_MANIFEST_DIR\")"))
+        || line.contains("option_env!(");
+    let direct = embedded
+        || (import && words.contains(&"env"))
         || words
             .iter()
             .any(|w| matches!(*w, "getenv" | "environ" | "vars_os" | "var_os"));
@@ -166,6 +237,9 @@ fn an_aliased_or_imported_environment_read_is_still_seen() {
         "let url = env::var_os(name);",
         "for (k, v) in std::env::vars() {",
         "let p = libc::getenv(name);",
+        "const URL: &str = env!(\"PBPS_DB\");",
+        "let url = option_env!(\"PBPS_DB\");",
+        "let url = core::env!(\"PBPS_DB\");",
         "let p = std::env::temp_dir().join(std::env::var(\"X\").unwrap());",
     ] {
         assert!(reaches_environment(line), "{line}");
@@ -174,6 +248,7 @@ fn an_aliased_or_imported_environment_read_is_still_seen() {
         "let path = std::env::temp_dir().join(\"x\");",
         "command.env_remove(name);",
         ".env_clear()",
+        "let root = std::path::Path::new(env!(\"CARGO_MANIFEST_DIR\"));",
         "let environment = run.environment.clone();",
         "(\"/api/drift\", Some(\"env\"), View::Drift),",
     ] {
