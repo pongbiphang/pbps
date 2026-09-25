@@ -969,7 +969,7 @@ which says how to add an entry here.
 
 <a id="dec-319-1"></a>
 
-**DEC-319.1. A PostgreSQL plan pins every unmanaged routine not held only by
+**DEC-319.1. A PostgreSQL plan pins every routine not held only by
 superusers, under the environment's key, and `apply` refuses a changed pin before its
 probes, before its DDL and before it commits (#319; planned).** The drift check
 (SPEC §7.6) covers the managed set, and SPEC §8.2 leaves everything else out of
@@ -1009,10 +1009,14 @@ writes commits with the approved changes.
   yet has no bindings to read, and a PL/pgSQL body binds when it runs. Engine
   resolution belongs to the resolver (SPEC §9.3.2, #614).
 
-*What is pinned.* Every routine (`pg_proc` row), in any schema, that meets
+*What is pinned.* Every routine (`pg_proc` row), managed or not, that meets
 both conditions:
-- it is not in the plan's managed set, whose routines the drift check and the
-  read-back already hold;
+- it does not live in a temporary schema. The engine answers this with
+  `pg_is_other_temp_schema(pronamespace)` and `pg_my_temp_schema()`, so no
+  schema is excluded by name. The deployment session cannot resolve another
+  session's `pg_temp_N` routine, and the engine drops that routine when its
+  session ends, so a plan made while one existed would refuse after ordinary
+  cleanup. pbps creates no temporary routine of its own;
 - it is not held only by superusers. It is held only by superusers when its
   owner is a superuser and every role that is a member of the owner, by any
   path and with any grant options (`pg_has_role(role, owner, 'MEMBER')`), is
@@ -1041,7 +1045,7 @@ both conditions:
   superuser role while it was a member, and kept it after the revoke, is a
   superuser session.
 
-No schema is exempt by name. The built-in routines in `pg_catalog` and
+No other schema is exempt. The built-in routines in `pg_catalog` and
 `information_schema` belong to the bootstrap superuser and fall out of the set
 by the second condition. A routine that an administrator created or re-owned
 there, where a plain role can replace it, stays in.
@@ -1112,7 +1116,7 @@ of routines. It still lets a refusal say where the change is.
 is not empty when its environment has no fingerprint key. The remedy names
 `pbps key generate` and `fingerprint_key_env` / `fingerprint_key_file`. A
 database in which every unmanaged routine is held only by superusers needs
-no key and records no pins. Pins apply
+no key. Its plan records only the unkeyed managed pins. Pins apply
 under every `unmanaged` mode, `error` included. Extension members are left out
 of the unmanaged inventory (DECISIONS 305), so a re-owned extension routine can
 sit in an `error` plan's database without refusing it.
@@ -1125,8 +1129,24 @@ plan's pins in three places:
 - after the read-back and before `record`, so a replacement during the DDL
   rolls the apply back.
 
-A routine the plan itself creates is in the managed set, so it never counts as
-a new unmanaged one. A digest mismatch, a schema that gained or lost pinned
+*Managed routines are pinned too.* The drift check and the read-back compare
+a managed routine's definition, not its owner or its ACL. A managed
+`SECURITY DEFINER` routine that another session re-owns after approval would
+run the same body as a different principal. The first two checks hold every
+pinned routine, managed ones included, because no statement has run yet. The
+closing check leaves out the routines the plan itself touches: those it
+creates, replaces, rebuilds, renames or drops. Their new state is what the
+read-back compares. It holds every other routine, managed or not, to its
+plan-time pin.
+
+A managed routine's pin needs no key. Its body is the declaration, which the
+plan file and git already carry, so a digest of its row reveals nothing the
+plan does not. Managed routines are therefore pinned apart: a SHA-256 per
+routine OID over the same row input, which the plan checksum covers. The
+keyed per-schema entries hold only unmanaged routines, whose bodies are
+private (DEC-952.1). Moving a routine between the two sets, by the plan
+creating or dropping it or by `ids` naming it, is the plan's own change and
+follows the closing-check rule above. A digest mismatch, a schema that gained or lost pinned
 routines, an unreadable catalog row and a key identifier that is not the plan's
 all refuse. None of them reads as "nothing changed" (AGENTS.md: absent, empty
 and unreadable differ). Each refusal names the schema and gives the remedy,
@@ -1140,8 +1160,8 @@ a post-commit guard failure under DECISIONS 159: the step's checkpoint is
 recorded, and then the apply stops with the refusal. A replacement is caught
 at the step it happened in, not rolled back past it.
 
-The price is over-inclusion. A change between plan and apply to any unmanaged,
-non-superuser routine refuses the apply, even one this plan never runs. The
+The price is over-inclusion. A change between plan and apply to any pinned routine
+refuses the apply, even one this plan never runs. The
 remedy is a replan, as it is for drift in the managed set. The window between
 plan and apply is short, and an external routine that changes inside it is
 exactly what an operator should look at before running approved DDL.
