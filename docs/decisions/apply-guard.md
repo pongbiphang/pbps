@@ -1056,8 +1056,10 @@ of routines. It still lets a refusal say where the change is.
 is not empty when its environment has no fingerprint key. The remedy names
 `pbps key generate` and `fingerprint_key_env` / `fingerprint_key_file`. A
 database in which no unmanaged routine is replaceable by a non-superuser needs
-no key and records no pins. Under `unmanaged: error` a plan with unmanaged routines is
-already refused, so pins matter only under `ignore` and `warn`.
+no key and records no pins. Pins apply
+under every `unmanaged` mode, `error` included. Extension members are left out
+of the unmanaged inventory (DECISIONS 305), so a re-owned extension routine can
+sit in an `error` plan's database without refusing it.
 
 *When `apply` checks.* `apply` recomputes the set, then compares it with the
 plan's pins in three places:
@@ -1075,9 +1077,11 @@ and unreadable differ). Each refusal names the schema and gives the remedy,
 which is to replan.
 
 A staged plan is checked under the lock before pre-flight, and again before
-each step's statements and before each checkpoint it records. It gets no
-transaction that spans its steps, so a replacement is caught at the next step
-boundary, not rolled back past it.
+each step's statements. It gets no transaction that spans its steps. A step's
+statement is permanent once it commits, so a mismatch found after that is a
+post-commit guard failure under DECISIONS 159: the step's checkpoint is
+recorded, and then the apply stops with the refusal. A replacement is caught
+at the next step boundary, not rolled back past it.
 
 The price is over-inclusion. A change between plan and apply to any unmanaged,
 non-superuser routine refuses the apply, even one this plan never runs. The
