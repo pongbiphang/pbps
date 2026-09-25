@@ -221,6 +221,7 @@ impl NativeTarget {
         schemas: &[String],
         write_path_extras: &[String],
         authorization_schemas: &[String],
+        planned: &[scope::PlannedGrant],
     ) -> Result<(EnvironmentFacts, scope::Authorization), EnvironmentError> {
         self.check().await.map_err(|_| EnvironmentError::Binding)?;
         let bound = self.current.as_mut().ok_or(EnvironmentError::Binding)?;
@@ -231,6 +232,7 @@ impl NativeTarget {
             schemas,
             write_path_extras,
             authorization_schemas,
+            planned,
         )
         .await
         .map_err(EnvironmentError::Catalog)?;

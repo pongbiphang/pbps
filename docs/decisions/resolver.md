@@ -862,3 +862,23 @@ sequential opens, unlinked mapped content and unreadable-first-candidate refusal
 are unchanged. No kernel qualification/provisioning moves into the engine or
 transport; no caller boolean, forged trait, global secret or protected storage
 is introduced. HMAC plan fingerprints do not authorize this in-memory access.
+
+<a id="dec-726-1"></a>
+
+**DEC-726.1. A planned grant's principal is resolved to the catalog's
+spelling through `USER_NAME(USER_ID(..))`, not through
+`sys.database_principals` (#726).** On a case-insensitive SQL Server database
+`readers` and a catalogued `Readers` are one principal, and `PUBLIC` is
+`public`; keyed as planned they were two, so the reproduction cloned a second
+principal for the plan's spelling, the planned grant landed on the clone, and a
+built-in in another casing was cloned as a user. The target's context read now
+takes the planned principals and records each catalog spelling that differs
+(`AuthorizationContext::spellings`), which the principal map, `is_built_in`
+and `apply_planned` use; it is part of the sealed digest, so a rename before a
+check moves it. The catalog view was the obvious lookup and is wrong for an
+ordinary deployer: it shows only the principals the deployer may see, so a role
+it merely grants to has no row and would stay as planned. The metadata
+functions answer for every principal (measured on 17.0 as a user holding no
+permission), and they are what spells every grantee in the context already. A
+name with no principal behind it stays as planned, since the plan may create
+it.

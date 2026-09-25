@@ -463,7 +463,8 @@ mod editions611 {
 mod recon611 {
     use super::*;
     use pbps_mssql::resolver::authorization::{
-        PlannedGrant, PrincipalMap, apply_planned, enter, read, reconstruct, verify,
+        PlannedGrant, PrincipalMap, apply_planned, enter, read, reconstruct, resolve_spellings,
+        verify,
     };
 
     /// On a case-insensitive database `DBO` and `App` are valid spellings of
@@ -548,6 +549,168 @@ mod recon611 {
             .unwrap_err()
             .to_string();
         assert!(absent.contains("does not exist"), "{absent}");
+
+        drop(run);
+        drop(planning);
+        let mut master = connect_live(&conn_str()).await.unwrap();
+        target.drop().await;
+        scratch.drop().await;
+        for login in [&dep, &run_login] {
+            master
+                .execute(&format!("DROP LOGIN [{login}];"))
+                .await
+                .unwrap();
+        }
+    }
+
+    /// #726: a planned grant to `readers` on a case-insensitive database is a
+    /// grant to the catalogued role `Readers`, and `PUBLIC` is `public`. The
+    /// reproduction makes one run-local principal for the role, the planned
+    /// grant lands on it, and `public` keeps its identity. A role the deployer
+    /// cannot see at all still resolves: `sys.database_principals` hides its
+    /// row, and the metadata functions do not.
+    #[tokio::test]
+    #[ignore = "needs live SQL Server"]
+    async fn a_planned_principal_in_another_casing_is_granted_to_the_catalogs_principal() {
+        let mut target = TestDb::create("recon726_t").await;
+        let mut scratch = TestDb::create("recon726_s").await;
+        let pid = std::process::id();
+        let dep = format!("pbps_pdep726_{pid}");
+        let run_login = format!("pbps_prun726_{pid}");
+        for statement in [
+            format!(
+                "CREATE LOGIN [{dep}] WITH PASSWORD = 'Pbps!Recon726', CHECK_POLICY = OFF; \
+                 CREATE USER [{dep}] FOR LOGIN [{dep}]; CREATE USER app_owner WITHOUT LOGIN; \
+                 CREATE ROLE Readers; CREATE ROLE Hidden; \
+                 ALTER ROLE Readers ADD MEMBER [{dep}];"
+            ),
+            "CREATE SCHEMA app AUTHORIZATION app_owner;".to_owned(),
+            format!(
+                "GRANT SELECT ON SCHEMA::app TO Readers; \
+                 GRANT REFERENCES ON SCHEMA::app TO [{dep}] WITH GRANT OPTION;"
+            ),
+        ] {
+            target.conn.execute(&statement).await.unwrap();
+        }
+        let schemas = ["app".to_owned()];
+        let mut planning = connect_live(&login_url(&dep, "Pbps!Recon726", &target.name))
+            .await
+            .unwrap();
+        // The premise: the deployer cannot see the hidden role's row.
+        let hidden = planning
+            .query("SELECT name FROM sys.database_principals WHERE name = N'hidden';")
+            .await
+            .unwrap();
+        assert!(
+            hidden.is_empty(),
+            "the deployer was expected not to see Hidden"
+        );
+
+        let mut context = read(&mut planning, &schemas).await.unwrap();
+        assert!(
+            context.schemas["app"]
+                .grants
+                .iter()
+                .any(|g| g.grantee == "Readers" && g.permission == "SELECT"),
+            "the role's grant is in the context: {:?}",
+            context.schemas["app"].grants
+        );
+        let unresolved = context.clone();
+        resolve_spellings(
+            &mut planning,
+            &mut context,
+            &[
+                "readers".to_owned(),
+                "PUBLIC".to_owned(),
+                "hidden".to_owned(),
+                "auditors".to_owned(),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            context
+                .spellings
+                .iter()
+                .map(|(a, b)| (a.as_str(), b.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("PUBLIC", "public"),
+                ("hidden", "Hidden"),
+                ("readers", "Readers")
+            ],
+            "a name with no principal behind it stays as planned"
+        );
+
+        let planned: Vec<PlannedGrant> = ["readers", "PUBLIC"]
+            .into_iter()
+            .map(|principal| PlannedGrant {
+                principal: principal.into(),
+                schema: "app".into(),
+                permission: "REFERENCES".into(),
+                revoke: false,
+            })
+            .collect();
+        let map = PrincipalMap::generate(&context, &planned, &format!("p{pid}"));
+        // Unresolved, both planned spellings were principals of their own.
+        assert_eq!(
+            PrincipalMap::generate(&unresolved, &planned, &format!("p{pid}"))
+                .run_local_names()
+                .len(),
+            map.run_local_names().len() + 2
+        );
+
+        scratch
+            .conn
+            .execute(&format!(
+                "CREATE LOGIN [{run_login}] WITH PASSWORD = 'Pbps!Run726', CHECK_POLICY = OFF; \
+                 ALTER AUTHORIZATION ON DATABASE::[{}] TO [{run_login}];",
+                scratch.name
+            ))
+            .await
+            .unwrap();
+        reconstruct(&mut scratch.conn, &map, &context, &run_login)
+            .await
+            .unwrap();
+        let mut run = connect_live(&login_url(&run_login, "Pbps!Run726", &scratch.name))
+            .await
+            .unwrap();
+        enter(&mut run, map.deployer(&context).as_deref())
+            .await
+            .unwrap();
+        let differences = verify(&mut run, &map, &context, &schemas).await.unwrap();
+        assert!(
+            differences.is_empty(),
+            "reproduction differed: {differences:?}"
+        );
+        apply_planned(&mut run, &map, &planned).await.unwrap();
+
+        // The planned grants landed on the role's stand-in, the principal
+        // that holds the role's SELECT, and on `public` itself.
+        let grantees = |permission: &str| {
+            format!(
+                "SELECT USER_NAME(p.grantee_principal_id) AS grantee \
+                 FROM sys.database_permissions p \
+                 WHERE p.class = 3 AND p.major_id = SCHEMA_ID(N'app') \
+                   AND p.permission_name = N'{permission}' AND p.state = 'G' \
+                 ORDER BY 1;"
+            )
+        };
+        let names = |rows: Vec<pbps_db::Row>| -> Vec<String> {
+            rows.iter()
+                .map(|r| r.try_get::<&str>("grantee").unwrap().unwrap().to_owned())
+                .collect()
+        };
+        let select = names(scratch.conn.query(&grantees("SELECT")).await.unwrap());
+        let [role] = select.as_slice() else {
+            panic!("one SELECT grantee expected: {select:?}");
+        };
+        let mut expected = vec![role.clone(), "public".to_owned()];
+        expected.sort();
+        assert_eq!(
+            names(scratch.conn.query(&grantees("REFERENCES")).await.unwrap()),
+            expected
+        );
 
         drop(run);
         drop(planning);
