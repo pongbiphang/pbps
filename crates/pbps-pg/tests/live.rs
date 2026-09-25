@@ -28165,3 +28165,86 @@ async fn the_ledger_is_created_on_heap_whatever_the_default_access_method() {
         .unwrap();
     db.drop().await;
 }
+
+/// #361. The legacy `state_json` fallback handles a `42501` denial by carrying
+/// it as `Unreadable::Denied` and returning `Ok`. A failed statement aborts a
+/// caller's open transaction, so without rewinding it that `Ok` left the next
+/// statement to fail with `25P02` and the `COMMIT` to roll back in silence.
+/// Called inside a transaction, the timeline must leave the transaction usable,
+/// and must still report the denied row.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_denied_legacy_row_leaves_the_callers_transaction_usable() {
+    let mut db = TestDb::create("denied361").await;
+    db.conn
+        .execute(PRE_103_CREATE_STATE)
+        .await
+        .expect("create the pre-#103 ledger");
+    let schema = schema_103(1, 0);
+    let ids = mint_ids(&schema, &IdsFile::default(), &[]);
+    let legacy = StateSnapshot::new(StateKind::Apply, schema, ids, "pre-103-operator");
+    let legacy_json = serde_json::to_string(&legacy).expect("serialize");
+    db.conn
+        .execute_with(
+            "INSERT INTO public.__pbps_state (kind, state_json, operator) VALUES ($1, $2, $3)",
+            &[
+                "apply".into(),
+                legacy_json.as_str().into(),
+                "pre-103-operator".into(),
+            ],
+        )
+        .await
+        .expect("a legacy row");
+
+    let role = format!("pbps_denied361_{}", std::process::id());
+    let password = "pbpsDenied361!1";
+    let _ = db
+        .conn
+        .execute(&format!("DROP ROLE IF EXISTS {role}"))
+        .await;
+    db.conn
+        .execute(&format!("CREATE ROLE {role} LOGIN PASSWORD '{password}'"))
+        .await
+        .expect("create role");
+    db.conn
+        .execute(&format!(
+            "GRANT SELECT (id, applied_at, kind, git_sha, plan_checksum, operator, reason) \
+             ON public.__pbps_state TO {role}"
+        ))
+        .await
+        .expect("grant every column except state_json");
+    let mut lp = Conn::connect(
+        pbps_db::Driver::Postgres,
+        &conn_str_as(&role, password, &db.name),
+    )
+    .await
+    .expect("connect as the role");
+
+    lp.execute("BEGIN").await.expect("begin");
+    let rows = state::timeline(&mut lp, 10)
+        .await
+        .expect("the denial is carried, not thrown");
+    assert_eq!(rows.len(), 1);
+    assert!(
+        matches!(&rows[0].state, Err(pbps_model::Unreadable::Denied(_))),
+        "{:?}",
+        rows[0].state
+    );
+    // The transaction is still usable, and commits.
+    lp.query("SELECT 1 AS one")
+        .await
+        .expect("the caller's transaction was left aborted");
+    lp.execute("COMMIT").await.expect("commit");
+
+    // Outside a transaction the same call is unchanged.
+    let rows = state::timeline(&mut lp, 10).await.expect("timeline");
+    assert!(matches!(
+        &rows[0].state,
+        Err(pbps_model::Unreadable::Denied(_))
+    ));
+
+    drop(lp);
+    db.drop().await;
+    let mut admin = connect().await;
+    let _ = admin.execute(&format!("DROP ROLE IF EXISTS {role}")).await;
+}

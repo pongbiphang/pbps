@@ -1341,7 +1341,18 @@ pub async fn timeline(conn: &mut Conn, limit: u32) -> Result<Vec<TimelineEntry>,
     for chunk in legacy_ids.chunks(MAX_PARAMETERS) {
         let sql = select_legacy_state_json(chunk.len());
         let params: Vec<Param<'_>> = chunk.iter().map(|&id| id.into()).collect();
-        match conn.query_with(&sql, &params).await {
+        // Under a savepoint, because the denial below is *handled*: a failed
+        // statement aborts a caller's open transaction, and returning `Ok`
+        // over an aborted transaction turns its next statement into `25P02`
+        // and its `COMMIT` into a silent rollback (#361). See [`Recoverable`].
+        let guard = Recoverable::take(conn).await?;
+        let answer = conn.query_with(&sql, &params).await;
+        match &answer {
+            Ok(_) => guard.release(conn).await?,
+            Err(e) if is_select_denied(e) => guard.rewind(conn).await?,
+            Err(_) => guard.rewind_quietly(conn).await,
+        }
+        match answer {
             Ok(rows) => {
                 for row in &rows {
                     let id: i64 = number(row, "id")?;
