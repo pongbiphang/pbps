@@ -812,3 +812,24 @@ closing role record, not every intervening ALTER ROLE: changing a public field
 and restoring it before the fresh snapshot can compare equal. That measured
 limit is explicit; this observation is not a continuous authorization-history
 proof or an enabled resolver-backed apply path.
+
+
+<a id="dec-882-2"></a>
+
+**DEC-882.2. Foreign mount/IPC accounting excludes known PID members before
+executable qualification (merge-group repair for #978).** The merge group's
+PostgreSQL guard-limit test refused its valid DDL control with a
+`capture-executable` / `Containment(Accounting)` failure. Ten isolated engine
+repetitions passed, so the original timing-dependent failure was not reproduced
+locally. A deterministic kernel control nevertheless demonstrates the extra
+requirement: a live known PID member with an executable that cannot earn a
+ProcessLease was rejected by a check whose only question is namespace ownership.
+
+The foreign-sharer scan now compares the held task's PID namespace first.
+Known members belong to the separate scoped credential/cgroup qualification;
+this scan does not open their executables again. Foreign tasks still require
+qualification and caller disposition, unreadable namespace evidence refuses,
+and the selected anchor must remain live. The regression exercises actual
+private namespaces, a normal-user-built executable, foreign mount/IPC sharers
+and anchor loss. Removing the production membership filter restores its failure.
+This neither relaxes occupant credentials nor makes the live census atomic.

@@ -9,7 +9,7 @@ use super::profile::{self, ServerProfile};
 use super::{Error, Premise};
 use crate::resolver::native::{
     BoundedResourceLease, ProcessLease, UnqualifiedProcess, cgroup_relative,
-    for_each_namespace_task, for_each_occupant, foreign_network_tasks, groups, mount_rows,
+    for_each_foreign_occupant, for_each_namespace_task, foreign_network_tasks, groups, mount_rows,
     private_network, security,
 };
 
@@ -300,13 +300,9 @@ fn accounted(init: &ProcessLease, forwarders: &[&ProcessLease]) -> Result<(), Er
     // engine's files or its shared memory without being in any listing the
     // engine's PID namespace produces. No forwarder shares these.
     for namespace in ["mnt", "ipc"] {
-        for_each_occupant(init, namespace, |occupant| {
-            if init.same_namespace(occupant, "pid")? {
-                Ok(())
-            } else {
-                refused(occupant, namespace);
-                Err(UnqualifiedProcess)
-            }
+        for_each_foreign_occupant(init, namespace, |occupant| {
+            refused(occupant, namespace);
+            Err(UnqualifiedProcess)
         })
         .map_err(Premise::Accounting.named())?;
     }

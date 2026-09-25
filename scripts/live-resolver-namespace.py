@@ -77,6 +77,8 @@ def main():
     if os.geteuid() != 0:
         parser.error("this fixture requires a root observer and a rootful runtime")
     binary = args.test_binary.resolve(strict=True)
+    test(binary, "resolver::native::accounting_tests::known_pid_members_need_no_second_executable_qualification",
+         dict(os.environ), ignored=True)
     command = [args.runtime_binary or args.runtime]
     if args.runtime == "docker":
         if not os.path.isabs(args.docker_socket):
