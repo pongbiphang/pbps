@@ -1007,6 +1007,13 @@ changes.
   - the plan's statements and the probe SQL derived from it;
   - the functions of triggers on every table the plan writes rows to, extending
     DECISIONS 445/450's direct trigger-function check to transitive calls;
+  - the stored expressions the engine evaluates on those tables and on every
+    table the plan alters, none of which appears in a DML statement's text.
+    That means every CHECK (`pg_get_constraintdef`), every default and
+    generated column (`pg_get_expr` over `adbin`), every index expression and
+    predicate (`pg_get_indexdef`), and the CHECKs of every domain a column
+    uses. An unchanged `CHECK (ext.helper(value))` runs its helper on every
+    row the plan writes;
   - the functions of enabled event triggers, which the DDL fires.
 - *Calls.* A call is an identifier, qualified or bare, followed by `(`, or the
   name after `CALL`. Names match case-insensitively.
@@ -1018,6 +1025,14 @@ changes.
   binding would miss this.
 - *Closure.* Every body matched along the way, managed or not, is scanned in
   turn, until no new name appears.
+- *Aggregates.* An aggregate is in scope like any routine, but it has no body
+  to deparse. `pg_get_functiondef` refuses one with SQLSTATE 42809 (measured on
+  18.6, and in the live suite). Its definition is therefore its `pg_aggregate`
+  row, and each support function comes by `regprocedure`: transition, final,
+  combine, serial, deserial, the moving-aggregate ones, and the sort
+  operator's. Those functions join the closure, because they are what runs. A
+  window function (`prokind = 'w'`) deparses like any other routine. A plan
+  that reaches an aggregate is therefore still accepted.
 
 *What a pin holds.* One entry per name. Each is an HMAC under the
 environment's key (DEC-952.1), with rule `pbps/external-routine-pin/v1` and the
