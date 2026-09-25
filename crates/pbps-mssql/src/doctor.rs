@@ -1234,7 +1234,7 @@ async fn object_permissions(
 /// recorded ids name each uid once — so this rule never has to choose between
 /// two confirmed claims.
 ///
-/// # Why the claim comparison is case-folded
+/// # Why the claim comparison is the engine's
 ///
 /// A valid plan can rename `app.Old` to `app.new` and declare a new
 /// `app.old` in the same revision: three different Rust strings, `Old`
@@ -1244,66 +1244,75 @@ async fn object_permissions(
 /// `CI` means SQL Server itself reads `app.Old` and `app.old` as one
 /// securable. Asking `HAS_PERMS_BY_NAME`/`OBJECT_ID` under either spelling
 /// then answers about the departing identity's object, and the arriving
-/// one silently inherits its permissions answer — the exact misattribution
+/// one silently inherits its permissions answer: the exact misattribution
 /// this function exists to refuse, reached past a claim check that never
 /// fires.
 ///
-/// Reproducing SQL Server's actual collation rules in Rust is not
-/// attempted: collations are a hard shape with open issues of their own
-/// (#218, #234, #245), and a second, drifting source of truth for
-/// something the server already owns would be worse than this function's
-/// job is worth. Instead the comparison is deliberately *more* permissive
-/// than any single-byte-per-character SQL collation's case sensitivity
-/// alone: case-folded via `to_lowercase`, which also covers the
-/// accent-sensitive, case-insensitive default measured above. A pair of
-/// names this folds together that a case-*sensitive* collation would keep
-/// apart is a false refusal — cheap, and landing on the schema fallback
-/// for `data` or an unconditional gap for `granted`, both of which already
-/// exist for "cannot safely say" — not a false acceptance, which is what
-/// this whole function exists to rule out (AGENTS.md: when the answer is
-/// not clearly no, it is yes).
-///
-/// This does **not** cover every collation. `to_lowercase` folds case and
-/// nothing else: an accent-insensitive collation (`_AI`, e.g.
-/// `SQL_Latin1_General_CP1_CI_AI`) reads `app.café` and `app.cafe` as one
-/// securable, and this comparison still keeps them apart, so the false
-/// acceptance this function exists to refuse is still reachable through
-/// that door. Width-insensitive (`_WS`) and Kanatype-sensitive collations
-/// are the same shape. The pinned image's default is `_AS`
-/// (accent-sensitive), which is why the live test measuring this passes —
-/// it is not evidence that every collation is covered. Filed as #384
-/// rather than reproduced here.
+/// Which names are one securable is the database collation's answer, not a
+/// fold this code can reproduce: `to_lowercase` covered case and nothing
+/// else, so an accent-insensitive (`_AI`), width-insensitive or
+/// kana-insensitive database still read `app.café` and `app.cafe` as one
+/// object where the fold kept them apart (#384). So the candidates are
+/// asked of the engine instead ([`claimed_elsewhere`], through
+/// `catalog::matching_table_names`, DECISIONS 119, 142), and this function
+/// takes the engine's answer as `colliding`. On a case-sensitive database
+/// that answer keeps `app.Old` and `app.old` apart, as the server does.
 fn resolve_for_query<'a>(
     wanted: impl Iterator<Item = &'a ObjectName>,
     project_ids: &pbps_model::IdsFile,
     recorded_ids: &pbps_model::IdsFile,
+    colliding: &BTreeSet<ObjectName>,
 ) -> (BTreeMap<ObjectName, ObjectName>, BTreeSet<ObjectName>) {
-    // Compared case-folded, not by Rust's exact `Eq` — see this function's own
-    // doc comment for why. Measured on the pinned image (issue #133 round 3):
-    // its default collation is `SQL_Latin1_General_CP1_CI_AS`, case
-    // *insensitive*, so `app.Old` and `app.old` are one securable to the
-    // server and two to a comparison that trusts Rust's ordering.
-    let claimed: BTreeSet<(String, String)> = recorded_ids
-        .tables
-        .values()
-        .map(|name| (name.schema.to_lowercase(), name.name.to_lowercase()))
-        .collect();
     let mut safe: BTreeMap<ObjectName, ObjectName> = BTreeMap::new();
     let mut unresolvable: BTreeSet<ObjectName> = BTreeSet::new();
     for declared in wanted {
-        let query = project_ids.resolved_in(declared, recorded_ids);
-        let confirmed = project_ids
-            .table_uid(declared)
-            .and_then(|uid| recorded_ids.tables.get(uid))
-            == Some(&query);
-        let folded = (query.schema.to_lowercase(), query.name.to_lowercase());
-        if confirmed || !claimed.contains(&folded) {
+        let (query, confirmed) = resolution(declared, project_ids, recorded_ids);
+        if confirmed || !colliding.contains(&query) {
             safe.insert(declared.clone(), query);
         } else {
             unresolvable.insert(declared.clone());
         }
     }
     (safe, unresolvable)
+}
+
+/// The name `declared` has in this environment, and whether the environment's
+/// own recorded ids confirm it.
+fn resolution(
+    declared: &ObjectName,
+    project_ids: &pbps_model::IdsFile,
+    recorded_ids: &pbps_model::IdsFile,
+) -> (ObjectName, bool) {
+    let query = project_ids.resolved_in(declared, recorded_ids);
+    let confirmed = project_ids
+        .table_uid(declared)
+        .and_then(|uid| recorded_ids.tables.get(uid))
+        == Some(&query);
+    (query, confirmed)
+}
+
+/// Of the unconfirmed resolutions of `wanted`, the ones the database's
+/// collation reads as a name the recorded ids already give an identity: the
+/// `colliding` answer [`resolve_for_query`] takes (#384). One round trip,
+/// and none when nothing is unconfirmed or nothing is recorded.
+async fn claimed_elsewhere<'a>(
+    conn: &mut Conn,
+    wanted: impl Iterator<Item = &'a ObjectName>,
+    project_ids: &pbps_model::IdsFile,
+    recorded_ids: &pbps_model::IdsFile,
+) -> Result<BTreeSet<ObjectName>, DbError> {
+    let candidates: Vec<ObjectName> = wanted
+        .map(|declared| resolution(declared, project_ids, recorded_ids))
+        .filter(|(_, confirmed)| !confirmed)
+        .map(|(query, _)| query)
+        .collect();
+    let claimed: Vec<ObjectName> = recorded_ids.tables.values().cloned().collect();
+    Ok(
+        crate::catalog::matching_table_names(conn, &candidates, &claimed)
+            .await?
+            .into_iter()
+            .collect(),
+    )
 }
 
 /// The permissions the connected account effectively holds.
@@ -1517,8 +1526,14 @@ pub async fn permissions(
     let ledger_migration_needed = ledger_objects.contains_key(&ledger_tables()[0])
         && !crate::state::timeline_columns_present(conn).await?;
 
-    let (managed_securable, _) =
-        resolve_for_query(managed_tables.iter(), project_ids, &recorded_ids);
+    let colliding =
+        claimed_elsewhere(conn, managed_tables.iter(), project_ids, &recorded_ids).await?;
+    let (managed_securable, _) = resolve_for_query(
+        managed_tables.iter(),
+        project_ids,
+        &recorded_ids,
+        &colliding,
+    );
     // Recorded names already belong to this environment. Resolve only the
     // declarations: a departing table and a new declaration reusing its name
     // must retain both the existing-object and future-schema questions.
@@ -1574,7 +1589,9 @@ pub async fn permissions(
     // absent from `data_securable` — no object is asked about, and
     // `data_gaps` falls back to the schema answer, exactly like a table this
     // deployment has still to create.
-    let (data_securable, _) = resolve_for_query(data.keys(), project_ids, &recorded_ids);
+    let colliding = claimed_elsewhere(conn, data.keys(), project_ids, &recorded_ids).await?;
+    let (data_securable, _) =
+        resolve_for_query(data.keys(), project_ids, &recorded_ids, &colliding);
     let data_names: Vec<ObjectName> = data_securable.values().cloned().collect();
     // The declared row columns, not the catalog's: see `Columns::Declared`.
     // `UPDATE` is the only one of the three the engine takes at column scope,
@@ -1680,8 +1697,21 @@ pub async fn permissions(
     if !removable.is_empty() {
         let mut columns = ReferencedColumns::new();
         let mut destinations: BTreeSet<String> = BTreeSet::new();
-        for (child, named) in self::delete_children(conn, &removable_names).await? {
-            if !managed_names.contains(&child) {
+        let found = self::delete_children(conn, &removable_names).await?;
+        // The children come from the catalog, spelled as the catalog stores
+        // them; the managed names come from the declarations and the recorded
+        // ids. Which of them are one securable is the collation's answer, so a
+        // child the managed question already asks about under another spelling
+        // is not asked twice (#673).
+        let found_names: Vec<ObjectName> = found.keys().cloned().collect();
+        let managed_list: Vec<ObjectName> = managed_names.iter().cloned().collect();
+        let managed_children: BTreeSet<ObjectName> =
+            crate::catalog::matching_table_names(conn, &found_names, &managed_list)
+                .await?
+                .into_iter()
+                .collect();
+        for (child, named) in found {
+            if !managed_children.contains(&child) {
                 columns.insert(child, named);
             } else if let Some(declared) = moved.get(&child)
                 && declared_keys
@@ -1731,7 +1761,23 @@ pub async fn permissions(
         .filter(|r| matches!(r.needed, Needed::Referenced))
         .map(|r| r.name)
         .collect();
-    let referenced_names: Vec<ObjectName> = referenced.keys().cloned().collect();
+    // A target the CLI kept because no declaration spells it exactly may still
+    // be a managed table under the database's collation: `app.parent` beside a
+    // declared `app.Parent` is one securable on a case-insensitive database,
+    // already asked about as a managed table, and was reported twice under two
+    // spellings (#673). The CLI reads the declarations offline and serves
+    // PostgreSQL too, so the collation is asked here, where the engine is known.
+    let candidates: Vec<ObjectName> = referenced.keys().cloned().collect();
+    let managed_list: Vec<ObjectName> = managed_names.iter().cloned().collect();
+    let own: BTreeSet<ObjectName> =
+        crate::catalog::matching_table_names(conn, &candidates, &managed_list)
+            .await?
+            .into_iter()
+            .collect();
+    let referenced_names: Vec<ObjectName> = candidates
+        .into_iter()
+        .filter(|name| !own.contains(name))
+        .collect();
     let referenced_objects = object_permissions(
         conn,
         &referenced_names,
@@ -1795,8 +1841,14 @@ pub async fn permissions(
         // `resolve_for_query` judges unsafe to resolve is not asked about at
         // all — see `granted_unresolvable`'s doc comment — rather than risk
         // reading a different identity's object under its name.
-        let (safe_targets, unresolvable_targets) =
-            resolve_for_query(targets.objects.iter(), project_ids, &recorded_ids);
+        let colliding =
+            claimed_elsewhere(conn, targets.objects.iter(), project_ids, &recorded_ids).await?;
+        let (safe_targets, unresolvable_targets) = resolve_for_query(
+            targets.objects.iter(),
+            project_ids,
+            &recorded_ids,
+            &colliding,
+        );
         granted_unresolvable.extend(unresolvable_targets);
         let mut objects: BTreeSet<ObjectName> = safe_targets.into_values().collect();
         let mut schemas_wanted: BTreeSet<String> = targets.schemas.iter().cloned().collect();
@@ -2948,7 +3000,11 @@ mod tests {
         project_ids.tables.insert(uid2, table("app.old"));
 
         let wanted = [table("app.new"), table("app.old")];
-        let (safe, unresolvable) = resolve_for_query(wanted.iter(), &project_ids, &recorded_ids);
+        // What the engine answers for this pair: the unconfirmed `app.old`
+        // names the object the recorded ids give uid1.
+        let colliding = [table("app.old")].into_iter().collect();
+        let (safe, unresolvable) =
+            resolve_for_query(wanted.iter(), &project_ids, &recorded_ids, &colliding);
 
         assert_eq!(
             safe.get(&table("app.new")),
@@ -2976,7 +3032,8 @@ mod tests {
         let project_ids = pbps_model::IdsFile::default();
         let recorded_ids = pbps_model::IdsFile::default();
         let wanted = [table("app.a"), table("app.b")];
-        let (safe, unresolvable) = resolve_for_query(wanted.iter(), &project_ids, &recorded_ids);
+        let (safe, unresolvable) =
+            resolve_for_query(wanted.iter(), &project_ids, &recorded_ids, &BTreeSet::new());
         assert_eq!(safe.get(&table("app.a")), Some(&table("app.a")));
         assert_eq!(safe.get(&table("app.b")), Some(&table("app.b")));
         assert!(unresolvable.is_empty(), "{unresolvable:?}");
@@ -2984,12 +3041,12 @@ mod tests {
 
     /// The second door into the same collision, round 2's own review found
     /// (issue #133 round 3): a rename to `app.new` frees `app.Old`, and the
-    /// same plan declares a new `app.old` — three different Rust strings,
-    /// but the pinned image's default collation is case-insensitive, so the
-    /// server reads `app.Old` and `app.old` as one securable. A claim check
-    /// that trusts Rust's exact `Eq` never sees this collision.
+    /// same plan declares a new `app.old`. Whether those are one securable is
+    /// the database collation's answer, not a fold in Rust (#384), so the
+    /// same ids are refused when the engine says they collide and resolved
+    /// when it says they do not, as it does on a case-sensitive database.
     #[test]
-    fn resolve_for_query_folds_case_before_comparing_a_claim() {
+    fn the_engines_answer_decides_whether_a_differently_spelled_claim_collides() {
         let uid1: pbps_model::Uid = "t_ccc333".parse().expect("a well-formed table uid");
         let uid2: pbps_model::Uid = "t_ddd444".parse().expect("a well-formed table uid");
         let mut recorded_ids = pbps_model::IdsFile::default();
@@ -2997,10 +3054,11 @@ mod tests {
         let mut project_ids = pbps_model::IdsFile::default();
         project_ids.tables.insert(uid1, table("app.new"));
         project_ids.tables.insert(uid2, table("app.old"));
-
         let wanted = [table("app.new"), table("app.old")];
-        let (safe, unresolvable) = resolve_for_query(wanted.iter(), &project_ids, &recorded_ids);
 
+        let collides = [table("app.old")].into_iter().collect();
+        let (safe, unresolvable) =
+            resolve_for_query(wanted.iter(), &project_ids, &recorded_ids, &collides);
         assert_eq!(
             safe.get(&table("app.new")),
             Some(&table("app.Old")),
@@ -3008,14 +3066,23 @@ mod tests {
         );
         assert!(
             !safe.contains_key(&table("app.old")),
-            "the differently-cased fallback must not be asked about under a \
-             name the server reads as the same securable: {safe:?}"
+            "a fallback the engine reads as the claimed securable is not asked \
+             about under it: {safe:?}"
         );
         assert_eq!(
             unresolvable,
             [table("app.old")].into_iter().collect(),
             "{unresolvable:?}"
         );
+
+        let (safe, unresolvable) =
+            resolve_for_query(wanted.iter(), &project_ids, &recorded_ids, &BTreeSet::new());
+        assert_eq!(
+            safe.get(&table("app.old")),
+            Some(&table("app.old")),
+            "where the engine keeps the spellings apart, so does this: {safe:?}"
+        );
+        assert!(unresolvable.is_empty(), "{unresolvable:?}");
     }
 
     /// Every DML permission, on one object.
