@@ -691,4 +691,3 @@ SPEC §9.5 still leaves the transfer's own `CONTROL` demand unmodelled; this
 entry removes an over-demand and adds none. PostgreSQL's `doctor` takes its
 managed schemas from the declarations alone, so it has no such retention to
 narrow.
-
