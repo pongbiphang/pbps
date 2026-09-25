@@ -1051,15 +1051,28 @@ environment's key (DEC-952.1), with rule `pbps/external-routine-pin/v1` and the
 schema name as component. The input is the canonical list, in identity order,
 of the schema's in-scope routines. Each routine contributes:
 - its name and `pg_get_function_identity_arguments`;
-- its definition. For a function or procedure this is `pg_get_functiondef`,
-  which carries the body, the language, `SECURITY DEFINER`, volatility and
-  every `SET` clause (DECISIONS 306). An aggregate has no deparsable body
-  (SQLSTATE 42809, measured on 18.6 and in the live suite), so its definition
-  is its `pg_aggregate` row, with every support function and the sort operator
-  given as `regprocedure` or `regoperator` text. A window function deparses
-  like any function: 15 of 15 built-in ones on 18.6 and on 16.15, measured;
-- its owner's name, which the definition does not contain (measured);
-- its `proacl`.
+- its **whole `pg_proc` row**, read with `to_jsonb` minus `oid`. The row
+  holds OID-valued columns such as `proowner`, `prolang`, `prorettype`, the
+  argument types and `prosupport`. Each keeps its OID, and its qualified name
+  is added beside it (`regrole`, `regtype`, `regprocedure`). A `regproc`
+  column renders as a bare, ambiguous name in `to_jsonb`: `aggtransfn` came
+  back as `acc`, measured on 18.6 as the deployer. So a routine rebuilt under
+  the same name still differs by OID, and a name moved to another routine
+  differs by name. That covers the body,
+  volatility, `proparallel`, strictness, `SECURITY DEFINER`, `proconfig`,
+  cost, `proacl` and the owner. The column list is not chosen property by
+  property: a property left off a hand-picked list is a replacement the pin
+  cannot see. An aggregate that changes only `PARALLEL` differs only in
+  `proparallel`, which no `pg_aggregate` column holds. The row is read with
+  `to_jsonb` over the catalog, so a column a later PostgreSQL release adds
+  joins the input without a code change. A plan and an apply on different
+  server versions refuse before any comparison, because the release is
+  recorded beside the pins;
+- for an aggregate, its **whole `pg_aggregate` row** too, rendered the same
+  way, which names every support function and the sort operator;
+- nothing deparsed. `pg_get_functiondef` renders what the row already holds,
+  and it refuses an aggregate (SQLSTATE 42809, measured on 18.6 and in the live
+  suite), so the rows alone are the input for every kind.
 
 The deployer can read all of these for another role's routine, even one whose
 `EXECUTE` is revoked from it (measured on 18.6). The saved plan records the
@@ -1087,7 +1100,7 @@ plan's pins in three places:
 
 A routine the plan itself creates is in the managed set, so it never counts as
 a new unmanaged one. A digest mismatch, a schema that gained or lost pinned
-routines, an unreadable definition and a key identifier that is not the plan's
+routines, an unreadable catalog row and a key identifier that is not the plan's
 all refuse. None of them reads as "nothing changed" (AGENTS.md: absent, empty
 and unreadable differ). Each refusal names the schema and gives the remedy,
 which is to replan.
