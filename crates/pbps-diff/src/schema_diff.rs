@@ -1439,6 +1439,11 @@ fn diff_data(
     if declared_data.mode == DataMode::Exact
         && let Some(base_rows) = base_rows
     {
+        // The baseline names a surviving identity still has, asked once for
+        // the table: the answer is the same for every deleted row, and a scan
+        // per baseline column of every row made an `exact` table's deletes
+        // cost rows × columns × columns in string comparisons (#402).
+        let surviving: BTreeSet<&str> = base_name_of.values().map(String::as_str).collect();
         for (key, before) in base_rows {
             if !declared_data.rows.contains_key(key) {
                 // The recorded row travels with the delete, so the statement
@@ -1501,9 +1506,7 @@ fn diff_data(
                 // reviewer-only cells need their own map (DECISIONS 442).
                 let mut dropped = BTreeMap::new();
                 for (base_column, spec) in &base.columns {
-                    if spec.identity.is_some()
-                        || base_name_of.values().any(|name| name == base_column)
-                    {
+                    if spec.identity.is_some() || surviving.contains(base_column.as_str()) {
                         continue;
                     }
                     dropped.insert(base_column.clone(), cell(before, base_column, Some(spec)));
@@ -3541,6 +3544,99 @@ mod tests {
         );
         assert!(!types.contains_key("label"));
         assert!(!row.contains_key("label"));
+    }
+
+    /// #402: an `exact` table whose declaration drops some columns and all of
+    /// its rows, wide and long enough that a per-column scan of the surviving
+    /// names per deleted row was the planning cost. Every deleted row still
+    /// carries its dropped cells for the reviewer, and no surviving column's
+    /// cell is ever moved into that reviewer-only map — the negative case the
+    /// one-set-per-table answer must not break (DECISIONS 442).
+    #[test]
+    fn every_deleted_row_of_a_wide_table_splits_dropped_and_surviving_cells() {
+        const SURVIVING: usize = 40;
+        const DROPPED: usize = 5;
+        const ROWS: usize = 400;
+        let mut base_table = lookup(DataMode::Exact, &[]);
+        for i in 0..SURVIVING {
+            base_table
+                .columns
+                .insert(format!("keep{i}"), Column::new(ty("nvarchar(50)")));
+        }
+        for i in 0..DROPPED {
+            base_table
+                .columns
+                .insert(format!("gone{i}"), Column::new(ty("nvarchar(50)")));
+        }
+        let rows = &mut base_table.data.as_mut().unwrap().rows;
+        for r in 0..ROWS {
+            let mut row = Row::default();
+            for i in 0..SURVIVING {
+                row.0
+                    .insert(format!("keep{i}"), Value::Text(format!("k{r}")));
+            }
+            for i in 0..DROPPED {
+                row.0
+                    .insert(format!("gone{i}"), Value::Text(format!("g{r}")));
+            }
+            rows.insert(pbps_model::RowKey::from(format!("row{r}").as_str()), row);
+        }
+        let base = schema_of("dbo.s", base_table.clone());
+        let mut declared_table = base_table;
+        declared_table.data.as_mut().unwrap().rows.clear();
+        for i in 0..DROPPED {
+            declared_table.columns.shift_remove(&format!("gone{i}"));
+        }
+        let declared = schema_of("dbo.s", declared_table);
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let drops: Vec<Intent> = (0..DROPPED)
+            .map(|i| Intent::DropColumn {
+                column: format!("dbo.s.gone{i}").parse().unwrap(),
+                reason: "gone".into(),
+            })
+            .collect();
+        let declared_ids = crate::resolve(&declared, &base_ids, &drops, &ctx())
+            .unwrap()
+            .ids;
+        let cs = diff(
+            Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .unwrap();
+
+        let mut deleted = 0;
+        for p in &cs.changes {
+            let Change::DeleteRow { row, dropped, .. } = &p.change else {
+                continue;
+            };
+            deleted += 1;
+            let gone: Vec<&str> = dropped.keys().map(String::as_str).collect();
+            let mut expected: Vec<String> = (0..DROPPED).map(|i| format!("gone{i}")).collect();
+            expected.sort();
+            assert_eq!(
+                gone,
+                expected.iter().map(String::as_str).collect::<Vec<_>>()
+            );
+            for i in 0..SURVIVING {
+                let keep = format!("keep{i}");
+                assert!(
+                    !dropped.contains_key(&keep),
+                    "{keep} moved to the reviewer map"
+                );
+                assert!(row.contains_key(&keep), "{keep} missing from the predicate");
+            }
+        }
+        assert_eq!(deleted, ROWS);
     }
 
     #[test]
