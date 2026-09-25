@@ -1437,7 +1437,11 @@ when the plan writes that table's rows, or when no ids file names the column.
 A split-out check asks for `--allow constraint`, as any added check does. The
 apply's read-back holds a created column to the default a later change of the
 same plan sets, once every statement has run. At a staged checkpoint before
-that change, either state passes.
+that change, either state passes. A split-out index answers for its whole
+structure through its `AddIndex`, as a split-out foreign key does through its
+`AddForeignKey` (DECISIONS 184). With only its name, a same-named index of
+another shape, put there by another session during a staged run, would be
+recorded as this plan's.
 
 A plan that rebuilds no function keeps the differ's order. Measured on
 PostgreSQL: a function edit together with a new check, filtered index and

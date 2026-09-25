@@ -1654,6 +1654,12 @@ fn refuse_unplanned_movement(
     // the differ has taken them out of the payload: a name restored without
     // one leaves what the key points at unchecked (DECISIONS 184).
     let mut added_fks: BTreeMap<(&TableName, &str), &pbps_model::ForeignKey> = BTreeMap::new();
+    // Likewise an index taken out of a created table's payload and added by a
+    // change of its own: a filtered one split out to follow a rebuilt
+    // function (#1027, DEC-942.1). Without its definition here the name alone
+    // would answer for it, and a same-named index of another shape put there
+    // by another session would be recorded as this plan's.
+    let mut added_indexes: BTreeMap<(&TableName, &str), &pbps_model::Index> = BTreeMap::new();
     let mut added_parts: BTreeMap<&TableName, BTreeSet<(pbps_model::Part, &str)>> = BTreeMap::new();
     let mut redefined: BTreeMap<TableName, BTreeMap<String, BTreeSet<pbps_model::ColumnField>>> =
         BTreeMap::new();
@@ -1769,6 +1775,9 @@ fn refuse_unplanned_movement(
         } = &p.change
         {
             added_fks.insert((table, name.as_str()), constraint.as_ref());
+        }
+        if let pbps_model::Change::AddIndex { table, name, index } = &p.change {
+            added_indexes.insert((table, name.as_str()), index.as_ref());
         }
         if let Some(dropped) = p.change.drops() {
             gone.insert(dropped);
@@ -2032,8 +2041,11 @@ fn refuse_unplanned_movement(
                     ));
                 }
             }
-            for (n, was) in &declared.indexes {
-                if let Some(now) = now.indexes.get(n)
+            for (n, now) in &now.indexes {
+                if let Some(was) = added_indexes
+                    .get(&(now_name, n.as_str()))
+                    .copied()
+                    .or_else(|| declared.indexes.get(n))
                     && !index_as_declared(was, now)
                 {
                     moved.push(format!(
@@ -8420,6 +8432,80 @@ mod tests {
             Settled::Whole,
         )
         .expect("a replacement is a drop and a create, and the create is the net");
+    }
+
+    /// An index split out of a created table's payload (#1027) answers for
+    /// its whole structure, not only its name: another session's same-named
+    /// index of another shape is movement, at every read (#1056 review).
+    #[test]
+    fn a_created_tables_split_index_answers_for_its_structure() {
+        use pbps_model::{Change, Column, Index, IndexColumn, PlannedChange, Table};
+        let name = TableName::new("app", "t");
+        let mut created = Table::default();
+        for column in ["id", "other"] {
+            created
+                .columns
+                .insert(column.into(), Column::new("int".parse().unwrap()));
+        }
+        let index = |column: &str, unique: bool, filter: Option<&str>| Index {
+            columns: vec![IndexColumn {
+                name: column.into(),
+                descending: false,
+            }],
+            include: vec![],
+            unique,
+            filter: filter.map(Into::into),
+        };
+        let planned_index = index("id", false, Some("id > 0"));
+        let changes = pbps_model::ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::CreateTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    name: name.clone(),
+                    table: Box::new(created.clone()),
+                }),
+                PlannedChange::new(Change::AddIndex {
+                    table: name.clone(),
+                    name: "ix".into(),
+                    index: Box::new(planned_index.clone()),
+                }),
+            ],
+        };
+        let with_index = |ix: Index| {
+            let mut t = created.clone();
+            t.indexes.insert("ix".into(), ix);
+            Schema {
+                tables: [(name.clone(), t)].into(),
+                ..Default::default()
+            }
+        };
+        for settled in [Settled::SoFar, Settled::Whole] {
+            refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                &changes,
+                &Schema::default(),
+                &with_index(planned_index.clone()),
+                "test",
+                settled,
+            )
+            .expect("the index this plan adds, as it adds it");
+            for other in [
+                index("other", false, Some("id > 0")),
+                index("id", true, Some("id > 0")),
+                index("id", false, None),
+            ] {
+                let e = refuse_unplanned_movement(
+                    &pbps_mssql::Mssql,
+                    &changes,
+                    &Schema::default(),
+                    &with_index(other.clone()),
+                    "test",
+                    settled,
+                )
+                .expect_err("a same-named index of another shape is not this plan's");
+                assert!(format!("{e:#}").contains("index `ix`"), "{other:?}: {e:#}");
+            }
+        }
     }
 
     /// A created table's default set by a later change of the same plan
