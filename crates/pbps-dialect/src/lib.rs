@@ -93,14 +93,21 @@ pub enum DialectError {
 
 /// How safe a type change is.
 ///
-/// The criterion is **whether this kind of change can fail at all**, not whether
-/// today's data happens to be safe — inspecting data is a runtime concern and has
-/// no place in the declarative layer (SPEC §7.2).
+/// The criterion is **whether this kind of change can fail or change stored
+/// values**, not whether today's data happens to be safe — inspecting data is a
+/// runtime concern and has no place in the declarative layer (SPEC §7.2). A
+/// conversion that always succeeds is still not `Safe` when it rewrites what
+/// is stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeChangeRisk {
-    /// No change, or a widening (`int` → `bigint`, `varchar(50)` → `varchar(100)`).
+    /// No change, or a widening that keeps every stored value as it was
+    /// (`int` → `bigint`, `varchar(50)` → `varchar(100)`).
     Safe,
-    /// Narrowing: may truncate.
+    /// Narrowing or value-changing: may truncate or round (`varchar(50)` →
+    /// `varchar(10)`, `time(7)` → `time(3)`), or changes values even though it
+    /// cannot fail — the blank padding of `varchar(10)` → `char(100)`, SQL
+    /// Server's zero bytes in `binary(8)` → `binary(16)`, a number rendered as
+    /// text.
     Narrowing,
     /// Incompatible: the conversion itself may fail (`nvarchar` → `int`).
     Incompatible,
