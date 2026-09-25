@@ -184,6 +184,15 @@ pub enum Change {
         uid: Uid,
         from: TableName,
         to: TableName,
+        /// The columns that carry a default when the table is renamed, by the
+        /// names they have then (a column rename runs after the table's).
+        /// SQL Server names each default it creates after its table and column
+        /// (`DF_pbps_…`, DEC-496.1), and a rename leaves that name behind: a
+        /// new table declared under the old name then generates it again and
+        /// is refused (#975). The emitter renames each generated default with
+        /// its table. Empty on a plan written before this field existed.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        defaults: Vec<String>,
     },
 
     AddColumn {

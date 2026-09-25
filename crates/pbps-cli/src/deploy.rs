@@ -6705,6 +6705,7 @@ mod tests {
                 uid: uid.parse().unwrap(),
                 from: from.parse().unwrap(),
                 to: to.parse().unwrap(),
+                defaults: Vec::new(),
             })
         };
         let mut changes = ChangeSet {
@@ -6982,6 +6983,7 @@ mod tests {
                     uid: "t_aaaaaa".parse().unwrap(),
                     from: "dbo.f".parse().unwrap(),
                     to: "dbo.g".parse().unwrap(),
+                    defaults: Vec::new(),
                 },
             )],
         };
@@ -7147,11 +7149,13 @@ mod tests {
                     uid: "t_aaaaaa".parse().unwrap(),
                     from: "dbo.one".parse().unwrap(),
                     to: "dbo.one_x".parse().unwrap(),
+                    defaults: Vec::new(),
                 }),
                 PlannedChange::new(Change::RenameTable {
                     uid: "t_bbbbbb".parse().unwrap(),
                     from: "dbo.two".parse().unwrap(),
                     to: "dbo.two_x".parse().unwrap(),
+                    defaults: Vec::new(),
                 }),
             ],
         };
@@ -9190,6 +9194,7 @@ mod tests {
                             uid: "t_aaaaaa".parse().unwrap(),
                             from: source,
                             to: destination.clone(),
+                            defaults: Vec::new(),
                         }),
                     ],
                 };
@@ -9488,6 +9493,7 @@ mod tests {
                     uid: "t_aaaaaa".parse().unwrap(),
                     from: "dbo.old".parse().unwrap(),
                     to: "dbo.new".parse().unwrap(),
+                    defaults: Vec::new(),
                 },
             )],
         };
@@ -9689,6 +9695,7 @@ mod tests {
                     uid: uid.clone(),
                     from: "dbo.old".parse().unwrap(),
                     to: "dbo.new".parse().unwrap(),
+                    defaults: Vec::new(),
                 },
                 pbps_model::Change::RenameRole {
                     uid,

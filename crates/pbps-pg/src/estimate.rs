@@ -886,6 +886,7 @@ mod tests {
                     uid: "t_aaaaaa".parse().expect("a uid"),
                     from: tname("app.client"),
                     to: tname("app.customer"),
+                    defaults: Vec::new(),
                 }),
                 PlannedChange::new(Change::AlterColumnType {
                     uid: "c_aaaaaa".parse().expect("a uid"),
@@ -975,6 +976,7 @@ mod tests {
                     uid: "t_aaaaaa".parse().unwrap(),
                     from: tname("app.client"),
                     to: tname("app.customer"),
+                    defaults: Vec::new(),
                 }),
             ],
         };
@@ -1021,6 +1023,7 @@ mod tests {
                     uid: "t_aaaaaa".parse().unwrap(),
                     from: tname("app.t"),
                     to: tname("app.kept"),
+                    defaults: Vec::new(),
                 }),
                 PlannedChange::new(Change::CreateTable {
                     uid: "t_bbbbbb".parse().unwrap(),
@@ -1062,6 +1065,7 @@ mod tests {
                 uid: "t_bbbbbb".parse().unwrap(),
                 from: tname("app.t"),
                 to: tname("app.fresh"),
+                defaults: Vec::new(),
             }));
         renamed.changes.push(index("app.fresh"));
         let es = planned_estimates(&renamed);
@@ -1268,6 +1272,7 @@ mod tests {
                     uid: "t_aaaaaa".parse().unwrap(),
                     from: tname("app.t"),
                     to: tname("app.kept"),
+                    defaults: Vec::new(),
                 }),
                 tighten("app.kept"),
                 drop("app.kept", "later"),

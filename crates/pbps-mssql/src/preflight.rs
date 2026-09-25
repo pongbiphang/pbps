@@ -4088,6 +4088,7 @@ mod tests {
                 uid: uid("t_aaaaaa"),
                 from: tname("dbo.state"),
                 to: tname("dbo.status"),
+                defaults: Vec::new(),
             },
             Change::DeleteRow {
                 table: tname("dbo.status"),
@@ -4210,6 +4211,7 @@ mod tests {
                 uid: uid("t_aaaaaa"),
                 from: tname("dbo.client"),
                 to: tname("dbo.customer"),
+                defaults: Vec::new(),
             },
             Change::AddCheck {
                 table: tname("dbo.customer"),

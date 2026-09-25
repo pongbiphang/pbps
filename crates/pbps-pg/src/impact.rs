@@ -526,6 +526,7 @@ mod tests {
                     uid: "t_aaaaaa".parse().expect("a uid"),
                     from: tname("app.client"),
                     to: tname("app.customer"),
+                    defaults: Vec::new(),
                 }),
                 PlannedChange::new(Change::RenameColumn {
                     uid: "c_aaaaaa".parse().expect("a uid"),
@@ -562,6 +563,7 @@ mod tests {
                     uid: "t_aaaaaa".parse().expect("a uid"),
                     from: tname("app.order"),
                     to: tname("app.purchase"),
+                    defaults: Vec::new(),
                 }),
                 PlannedChange::new(Change::RenameColumn {
                     uid: "c_aaaaaa".parse().expect("a uid"),

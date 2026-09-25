@@ -268,6 +268,7 @@ async fn connected_estimates_keep_storage_and_identity_uncertainty_visible() {
                 uid: pbps_model::Uid::generate(UidKind::Table),
                 from: "dbo.t".parse().unwrap(),
                 to: "dbo.renamed".parse().unwrap(),
+                defaults: Vec::new(),
             }),
         ],
     };

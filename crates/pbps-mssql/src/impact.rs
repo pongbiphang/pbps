@@ -834,6 +834,7 @@ mod tests {
                     uid: "t_aaaaaa".parse().unwrap(),
                     from: tname("dbo.client"),
                     to: tname("dbo.customer"),
+                    defaults: Vec::new(),
                 }),
                 PlannedChange::new(Change::RenameColumn {
                     uid: "c_aaaaaa".parse().unwrap(),

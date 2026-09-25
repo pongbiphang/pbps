@@ -520,6 +520,7 @@ mod tests {
                 uid: "t_aaaaaa".parse().unwrap(),
                 from: t(),
                 to: u.clone(),
+                defaults: Vec::new(),
             },
             Change::AlterModule {
                 id: "dbo.v".parse().unwrap(),

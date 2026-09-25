@@ -2434,6 +2434,132 @@ async fn two_columns_whose_names_join_to_one_string_both_get_their_defaults() {
     db.drop().await;
 }
 
+/// #975: a rename left a generated default under the name built from the old
+/// table or column, so a new table declared under the old name, or a new column
+/// under the old column name, generated that name again and was refused (Msg
+/// 1750). Each generated default now follows its table and column, and a
+/// default under a name `pbps` never chose keeps it.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_renamed_tables_and_columns_generated_defaults_follow_them() {
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+    let mut db = TestDb::create("defaultrename975").await;
+    let defaulted = |columns: &[&str]| {
+        let mut t = Table::default();
+        for column in columns {
+            let mut c = Column::new(ty("int")).not_null();
+            c.default = Some("0".into());
+            t.columns.insert((*column).to_owned(), c);
+        }
+        t
+    };
+    let create = |uid: &str, name: &str, columns: &[&str]| {
+        PlannedChange::new(Change::CreateTable {
+            uid: uid.parse().unwrap(),
+            name: name.parse().unwrap(),
+            table: Box::new(defaulted(columns)),
+        })
+    };
+    // A table renamed, and a new one under its old name, in one plan.
+    apply(
+        &mut db.conn,
+        &ChangeSet {
+            changes: vec![create("t_aaa001", "dbo.t", &["c"])],
+        },
+    )
+    .await;
+    apply(
+        &mut db.conn,
+        &ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::RenameTable {
+                    uid: "t_aaa001".parse().unwrap(),
+                    from: "dbo.t".parse().unwrap(),
+                    to: "dbo.u".parse().unwrap(),
+                    defaults: vec!["c".into()],
+                }),
+                create("t_aaa002", "dbo.t", &["c"]),
+            ],
+        },
+    )
+    .await;
+
+    // A column renamed, and a new column under its old name, in two plans.
+    apply(
+        &mut db.conn,
+        &ChangeSet {
+            changes: vec![PlannedChange::new(Change::RenameColumn {
+                uid: "t_aaa002".parse().unwrap(),
+                table: "dbo.t".parse().unwrap(),
+                from: "c".into(),
+                to: "d".into(),
+            })],
+        },
+    )
+    .await;
+    let mut c = Column::new(ty("int")).not_null();
+    c.default = Some("0".into());
+    apply(
+        &mut db.conn,
+        &ChangeSet {
+            changes: vec![PlannedChange::new(Change::AddColumn {
+                uid: "t_aaa002".parse().unwrap(),
+                table: "dbo.t".parse().unwrap(),
+                name: "c".into(),
+                column: Box::new(c),
+            })],
+        },
+    )
+    .await;
+
+    // A default under a hand-written name is left as it is.
+    db.conn
+        .execute("CREATE TABLE dbo.legacy (c int NOT NULL CONSTRAINT DF_legacy_c DEFAULT 0);")
+        .await
+        .unwrap();
+    apply(
+        &mut db.conn,
+        &ChangeSet {
+            changes: vec![PlannedChange::new(Change::RenameTable {
+                uid: "t_aaa003".parse().unwrap(),
+                from: "dbo.legacy".parse().unwrap(),
+                to: "dbo.adopted".parse().unwrap(),
+                defaults: vec!["c".into()],
+            })],
+        },
+    )
+    .await;
+
+    let rows = db
+        .conn
+        .query(
+            "SELECT OBJECT_SCHEMA_NAME(parent_object_id) + N'.' + OBJECT_NAME(parent_object_id) \
+             + N'.' + COL_NAME(parent_object_id, parent_column_id) AS c, name \
+             FROM sys.default_constraints ORDER BY c;",
+        )
+        .await
+        .unwrap();
+    let names: Vec<(String, String)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.try_get::<&str>("c").unwrap().unwrap().to_owned(),
+                r.try_get::<&str>("name").unwrap().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        names,
+        [
+            ("dbo.adopted.c".to_owned(), "DF_legacy_c".to_owned()),
+            ("dbo.t.c".to_owned(), "DF_pbps_t_c".to_owned()),
+            ("dbo.t.d".to_owned(), "DF_pbps_t_d".to_owned()),
+            ("dbo.u.c".to_owned(), "DF_pbps_u_c".to_owned()),
+        ]
+    );
+    db.drop().await;
+}
+
 /// SPEC §8.1: the whole state goes in and comes back out unchanged. Everything
 /// downstream — drift, the plan checksum, `status` — reads this row, so a
 /// serialization that lost a field would make every one of them quietly wrong.
@@ -2576,6 +2702,7 @@ async fn a_cross_schema_rename_stops_where_the_emitter_says_it_does() {
                 uid: "t_a9k2mq".parse().unwrap(),
                 from: "dbo.customer".parse().unwrap(),
                 to: "sales.client".parse().unwrap(),
+                defaults: Vec::new(),
             },
             pbps_model::Strategy::default(),
         )
@@ -2792,6 +2919,7 @@ async fn a_column_rename_on_a_renamed_table_still_finds_its_blocker() {
                 uid: "t_aaaaaa".parse().unwrap(),
                 from: "dbo.client".parse().unwrap(),
                 to: "dbo.customer".parse().unwrap(),
+                defaults: Vec::new(),
             }),
             PlannedChange::new(Change::RenameColumn {
                 uid: "c_aaaaaa".parse().unwrap(),
@@ -12806,11 +12934,13 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
             uid: "t_aaaaaa".parse().unwrap(),
             from: parent.clone(),
             to: renamed_parent.clone(),
+            defaults: Vec::new(),
         },
         Change::RenameTable {
             uid: "t_bbbbbb".parse().unwrap(),
             from: child.clone(),
             to: renamed_child.clone(),
+            defaults: Vec::new(),
         },
         Change::DropForeignKey {
             table: renamed_child,
@@ -13070,6 +13200,7 @@ async fn an_undeclared_key_on_a_retyped_column_is_named_before_the_widening() {
             uid: "t_aaaaaa".parse().unwrap(),
             from: TableName::new("dbo", "p_varchar"),
             to: TableName::new("dbo", "p_renamed"),
+            defaults: Vec::new(),
         },
         Change::RenameColumn {
             uid: "c_bbbbbb".parse().unwrap(),
