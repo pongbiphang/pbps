@@ -170,15 +170,16 @@ pub(crate) async fn read_target(
         }
         Driver::Mssql => {
             let scope = pbps_mssql::resolver::environment::Scope { schemas };
-            let (catalog, mut authorization) =
-                pbps_mssql::resolver::scope_facts(connection, &scope, authorization_schemas)
-                    .await?;
-            // The planned grants' principals in the catalog's spelling (#726).
-            // Read once, after the bracketed read: a principal renamed in
-            // between moves the sealed digest, which carries the spellings,
-            // and requalification re-reads them with everything else.
+            // The planned grants' principals are resolved to the catalog's
+            // spelling within each bracketed read (#726).
             let names: Vec<String> = planned.iter().map(|g| g.principal.clone()).collect();
-            mssql_auth::resolve_spellings(connection, &mut authorization, &names).await?;
+            let (catalog, authorization) = pbps_mssql::resolver::scope_facts(
+                connection,
+                &scope,
+                authorization_schemas,
+                &names,
+            )
+            .await?;
             Ok((catalog, Authorization::Mssql(authorization)))
         }
     }

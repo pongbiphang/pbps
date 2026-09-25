@@ -366,13 +366,13 @@ mod scope611 {
         // The combined read refuses an in-scope schema that is not there
         // rather than sealing a scope with a hole in it, and reads the same
         // facts when the scope is whole.
-        let refused = scope_facts(&mut deployer, &scope, &schemas)
+        let refused = scope_facts(&mut deployer, &scope, &schemas, &[])
             .await
             .expect_err("an absent in-scope schema refuses the read");
         assert!(refused.to_string().contains("absent611"), "{refused}");
         let whole = ["app".to_owned()];
         let (catalog, authorization) =
-            scope_facts(&mut deployer, &Scope { schemas: &whole }, &whole)
+            scope_facts(&mut deployer, &Scope { schemas: &whole }, &whole, &[])
                 .await
                 .unwrap();
         assert_eq!(catalog.settings["language"].value, "Deutsch");
@@ -640,6 +640,21 @@ mod recon611 {
                 ("readers", "Readers")
             ],
             "a name with no principal behind it stays as planned"
+        );
+
+        // The combined read resolves them inside its bracket, so both halves
+        // carry the spellings and are compared with them (review of #1010).
+        let (_, bracketed) = pbps_mssql::resolver::scope_facts(
+            &mut planning,
+            &pbps_mssql::resolver::environment::Scope { schemas: &schemas },
+            &schemas,
+            &["readers".to_owned(), "PUBLIC".to_owned()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            bracketed.spellings.get("readers").map(String::as_str),
+            Some("Readers")
         );
 
         let planned: Vec<PlannedGrant> = ["readers", "PUBLIC"]

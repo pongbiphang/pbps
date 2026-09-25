@@ -872,8 +872,8 @@ spelling through `USER_NAME(USER_ID(..))`, not through
 `public`; keyed as planned they were two, so the reproduction cloned a second
 principal for the plan's spelling, the planned grant landed on the clone, and a
 built-in in another casing was cloned as a user. The target's context read now
-takes the planned principals and records each catalog spelling that differs
-(`AuthorizationContext::spellings`), which the principal map, `is_built_in`
+takes the planned principals and, within each half of its bracketed read,
+records each catalog spelling that differs (`AuthorizationContext::spellings`), which the principal map, `is_built_in`
 and `apply_planned` use; it is part of the sealed digest, so a rename before a
 check moves it. The catalog view was the obvious lookup and is wrong for an
 ordinary deployer: it shows only the principals the deployer may see, so a role
