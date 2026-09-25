@@ -833,3 +833,32 @@ and the selected anchor must remain live. The regression exercises actual
 private namespaces, a normal-user-built executable, foreign mount/IPC sharers
 and anchor loss. Removing the production membership filter restores its failure.
 This neither relaxes occupant credentials nor makes the live census atomic.
+
+
+<a id="dec-974-1"></a>
+
+**DEC-974.1. Ordinary capture evidence does not grant its producer's native
+source capability (#974).** Opaque fields did not close the public
+`runtime_inputs()` conversion: measured downstream PostgreSQL 16/18 captures,
+recaptures and native capture distinguished guessed singleton mappings,
+accepted an irrelevant root, read crafted-root files and exposed candidate
+precedence. Each is a source observation even without a path getter.
+
+Only a fresh `capture_with_runtime_inputs(connection, scope)` issues the
+separate RuntimeInputs capability. The engine performs its ordinary coherent
+read, then extracts requirements privately for that producer. The ordinary
+CapturedInputs result cannot recover, construct or unlock the capability;
+NativeTarget keeps it inside its owned capture operation and returns only
+ordinary evidence. A downstream recipient cannot apply a new guessed mapping,
+root or candidate probe to an existing result. A caller with its own database
+connection already has authority to query those source catalogs directly;
+this is source authority, not native process admission or isolation of
+privileged Rust code. Opaque operations must not be offered to ordinary report
+consumers merely because their parameters and results contain no raw path.
+
+The lifecycle still supplies its actual held root/mappings, checks process and
+socket leases, correlates loaded content and owns cancellation. Loader rules,
+sequential opens, unlinked mapped content and unreadable-first-candidate refusal
+are unchanged. No kernel qualification/provisioning moves into the engine or
+transport; no caller boolean, forged trait, global secret or protected storage
+is introduced. HMAC plan fingerprints do not authorize this in-memory access.

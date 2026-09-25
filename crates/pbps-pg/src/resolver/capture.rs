@@ -119,6 +119,31 @@ pub async fn capture(
     .map_err(CaptureError::Coverage)
 }
 
+/// Give the producer of a fresh coherent database read its native-input
+/// capability separately from ordinary captured evidence (DEC-974.1).
+///
+/// The connection grants the same catalog-read authority needed to read this
+/// source directly. A previously captured result cannot mint this capability.
+/// Retain `RuntimeInputs` only inside the native lifecycle; do not hand it to
+/// ordinary result consumers. It grants access to source-dependent operations,
+/// not process/root/mapping qualification, which remains the lifecycle's job.
+///
+/// ```compile_fail,E0277
+/// use pbps_pg::resolver::capture::{capture_with_runtime_inputs, CapturedInputs};
+/// async fn acquire(captured: &mut CapturedInputs) {
+///     let scope = captured.scope().clone();
+///     let _ = capture_with_runtime_inputs(captured, &scope).await;
+/// }
+/// ```
+pub async fn capture_with_runtime_inputs(
+    connection: &mut impl pbps_db::transport::QueryConnection,
+    scope: &CaptureScope,
+) -> Result<(CapturedInputs, RuntimeInputs), CaptureError> {
+    let captured = capture(connection, scope).await?;
+    let runtime = captured.runtime_inputs().map_err(CaptureError::Coverage)?;
+    Ok((captured, runtime))
+}
+
 /// A new owned snapshot is required on every recheck; cached rows cannot
 /// answer whether candidate additions or property changes invalidated inputs.
 pub async fn recapture(
@@ -143,9 +168,12 @@ mod baseline;
 
 mod session;
 
-/// Opaque native requirements, not a report or saved artifact. Paths may
-/// come from retained source; native consumers use the bounded file operation
-/// instead of receiving strings, callbacks over them, or public verifiers.
+/// Source-bearing capability issued only to the producer of a fresh database
+/// read by [`capture_with_runtime_inputs`], not recoverable from ordinary
+/// [`CapturedInputs`]. The native lifecycle keeps it private (DEC-974.1).
+/// Paths remain opaque, but resolution/open results depend on them: holders
+/// are authorized to use these operations, so this is not an ordinary report
+/// or a value to delegate to an untrusted result consumer.
 ///
 /// A downstream caller cannot extract either source-bearing field:
 /// ```compile_fail,E0616

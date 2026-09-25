@@ -243,11 +243,11 @@ async fn exercise_capture(connection: String) {
     )
     .await
     .unwrap();
-    let before_extension = capture(&mut conn, &scope).await.unwrap();
+    let (before_extension, extension_runtime) = capture_with_runtime_inputs(&mut conn, &scope)
+        .await
+        .unwrap();
     assert!(
-        before_extension
-            .runtime_inputs()
-            .unwrap()
+        extension_runtime
             .libraries
             .iter()
             .any(|library| library == "$libdir/hstore"),
@@ -262,11 +262,14 @@ async fn exercise_capture(connection: String) {
             name: Some("extra_handler".into()),
         }]),
     };
-    let standalone = capture(&mut conn, &standalone_scope).await.unwrap();
+    let (standalone, standalone_runtime) =
+        capture_with_runtime_inputs(&mut conn, &standalone_scope)
+            .await
+            .unwrap();
+    let ordinary = capture(&mut conn, &standalone_scope).await.unwrap();
+    assert!(standalone.compare(&ordinary).is_empty());
     assert!(
-        standalone
-            .runtime_inputs()
-            .unwrap()
+        standalone_runtime
             .libraries
             .iter()
             .any(|library| library == "$libdir/plpgsql"),

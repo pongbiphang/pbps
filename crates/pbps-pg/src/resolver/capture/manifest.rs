@@ -15,6 +15,43 @@ struct Input {
 /// Private in-memory catalog evidence. It intentionally has no Debug,
 /// Serialize, digest getter, persistence constructor or verified flag.
 /// Executable/environment qualification is still required by the lifecycle.
+/// Receiving ordinary evidence does not grant its producer's native-input
+/// capability (DEC-974.1). In particular, caller-chosen mappings cannot probe it:
+/// ```compile_fail,E0624
+/// use pbps_pg::resolver::capture::{CapturedInputs, NativeLibrary};
+/// use std::{fs::File, path::Path};
+/// fn guess(captured: &CapturedInputs, name: String) -> bool {
+///     let inputs = captured.runtime_inputs().unwrap();
+///     let resolved = inputs.resolve_native(Path::new("/bin/postgres"), Path::new("/"));
+///     let root = File::open("/dev/null").unwrap();
+///     (0..resolved.len()).any(|i| matches!(resolved.open(i, &root, &[name.clone()]),
+///         Ok(NativeLibrary::Mapped { .. })))
+/// }
+/// ```
+/// Neither crafted roots nor selected-candidate positions can reveal its names:
+/// ```compile_fail,E0624
+/// use pbps_pg::resolver::capture::{CapturedInputs, NativeLibrary};
+/// use std::{fs::File, path::Path};
+/// fn probe(captured: &CapturedInputs, crafted_root: &File) -> Option<(usize, Vec<u8>)> {
+///     let inputs = captured.runtime_inputs().unwrap();
+///     let resolved = inputs.resolve_native(Path::new("/bin/postgres"), Path::new("/"));
+///     for i in 0..resolved.len() {
+///         if let Ok(NativeLibrary::Candidate { candidate, reader }) = resolved.open(i, crafted_root, &[]) {
+///             let mut content = Vec::new();
+///             reader.read_to_end(&mut content).ok()?;
+///             return Some((candidate, content));
+///         }
+///     }
+///     None
+/// }
+/// ```
+/// The capability cannot be recovered for later probing either:
+/// ```compile_fail,E0624
+/// use pbps_pg::resolver::capture::{CapturedInputs, RuntimeInputs};
+/// fn acquire(captured: &CapturedInputs) -> RuntimeInputs {
+///     captured.runtime_inputs().unwrap()
+/// }
+/// ```
 pub struct CapturedInputs {
     baseline: super::baseline::Baseline,
     session: super::session::Facts,
@@ -31,10 +68,10 @@ impl CapturedInputs {
         &self.scope
     }
 
-    /// Names the native lifecycle must resolve against the connected backend,
-    /// including non-extension C routines. No reported version certifies these
-    /// executable bytes. This private transfer has no diagnostic serialization.
-    pub fn runtime_inputs(&self) -> Result<super::RuntimeInputs, Uncovered> {
+    // Only the producer of a fresh read may obtain the source capability.
+    // Making this public lets an ordinary result recipient guess names through
+    // mapped equality, crafted-root opens and candidate positions (DEC-974.1).
+    pub(super) fn runtime_inputs(&self) -> Result<super::RuntimeInputs, Uncovered> {
         let mut libraries = BTreeSet::new();
         for (object, input) in &self.inputs {
             if object.class == "pg_proc"
