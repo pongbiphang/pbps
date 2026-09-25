@@ -51,8 +51,10 @@ Its page works offline. Phase 6 step 4 (#494) adds **Compose change**. It
 records a rename, a drop reason or annotations as a reviewed commit on a new
 output branch, following [ADR-0017](ADR-0017-isolated-compose.md) as qualified
 by #745–#748. Its fixed `POST /api/compose/<action>` requests are the viewer's
-only writes. It is Linux-only until #471 qualifies other platforms. Deployment
-actions remain step 5 of #64. See [UI.md](UI.md).
+only writes besides step 5's. Compose is Linux-only until #471 qualifies other
+platforms. Phase 6 step 5 (#1025) adds **Plan & apply**, which runs `plan --env
+--out` and `apply --plan --checksum` with a checksum a person types. See
+[UI.md](UI.md).
 
 A PostgreSQL `SECURITY DEFINER` routine that a plan or `bootstrap` writes must
 pin `search_path` with `pg_temp` last. The stored `proconfig` is checked

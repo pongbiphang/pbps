@@ -27,11 +27,12 @@ source already produced by `docs`, beside its tables and documentation, in a
 script-free sandboxed frame. No assets are downloaded.
 
 The viewer invokes ordinary CLI reads with `--no-input`, including the
-project's existing `on_drift` hook when `verify` finds drift. It adds no polling
-or scheduler. It never runs `plan` or `apply`. Its only writes are the compose
-workflow below, which records intent as a reviewed Git commit on a new branch.
-An explanation can show an approval command as text; it cannot execute it.
-Approval and deployment stay in the ordinary CLI/CI workflow.
+project's existing `on_drift` hook when `verify` finds drift. It adds no
+scheduler. Its writes are the compose workflow below, which records intent as a
+reviewed Git commit on a new branch, and the plan and apply workflow after it,
+which runs the same two commands a terminal would. Approval stays where the
+organization keeps it: the viewer runs `apply` only with the checksum a person
+types, and stores no approval.
 
 If the page says the launch token is missing, reopen the complete printed URL.
 A different Host, port, Origin or token is refused. An incompatible CLI response
@@ -101,3 +102,39 @@ before confirmation ([DECISIONS 534](decisions/compose-and-ui.md#decision-534)).
 
 Compose is qualified on Linux with Git's files ref backend. On other platforms
 the viewer refuses compose actions, so use the CLI there (#471).
+
+## Plan and apply
+
+**Plan & apply** runs the two deployment commands of SPEC §7.3 (#1025, #64
+step 5). Each is one `pbps` child with `--no-input`, started from typed fields:
+
+| Form | Command |
+|---|---|
+| Write plan | `plan --env=<name> --out=<new file>` |
+| Apply plan | `apply --env=<name> --plan=<file> --checksum=<typed> [--allow=<classes>] [--staged] [--resume]` |
+
+- **The environment is a name.** The child reads its connection string from
+  the `url_env` variable, as the CLI does. No field holds a connection string.
+- **The plan file must be new.** The viewer claims the path before the plan
+  runs and refuses one that already names anything, so a plan someone approved
+  is never replaced by a new one. Its directory must exist. A plan that fails
+  gives the empty file back, even with the page closed. If the viewer itself
+  was stopped mid-plan, the refusal says the file is empty; delete it and plan
+  again (DEC-1025.2). Read the new plan with **Read the plan**, which opens the Saved
+  plan view on it.
+- **The checksum is typed, never filled in.** The field starts empty, and
+  nothing the viewer reads fills it. Enter the SHA-256 your deployment gate
+  approved; `apply` refuses a plan whose checksum does not match. Allowed risk
+  classes are typed the same way, and an empty field allows none (DEC-1025.1).
+- **A run outlives the page.** Closing the tab does not stop a plan or apply.
+  The page shows each environment's latest run, and while one is running it
+  asks for the outcome every two seconds. A second run against the same
+  environment is refused until the first ends; the ledger's lock still decides
+  between runs from different places (DEC-1025.3).
+- **The outcome is the CLI's own.** The page shows the exit code and what the
+  command printed, as the command printed it. For the recorded result, open the
+  environment's **Timeline**.
+- **Ctrl-C reaches the run.** Stopping the viewer from its terminal also
+  interrupts a plan or apply it started, exactly as Ctrl-C would interrupt
+  `pbps apply` run there. A staged apply that stopped part-way continues with
+  `--staged --resume`.

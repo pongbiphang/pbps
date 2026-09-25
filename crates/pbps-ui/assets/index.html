@@ -7,6 +7,7 @@
   <link rel="stylesheet" href="/style.css">
   <script src="/app.js" defer></script>
   <script src="/compose.js" defer></script>
+  <script src="/trigger.js" defer></script>
 </head>
 <body>
   <aside>
@@ -22,8 +23,9 @@
     <div class="section-label">CHANGE</div>
     <nav aria-label="Change views">
       <button type="button" data-view="compose">Compose change</button>
+      <button type="button" data-view="deploy">Plan &amp; apply</button>
     </nav>
-    <div class="local"><span class="dot"></span> Local workspace<p>Read views · Changes only as reviewed Git commits</p></div>
+    <div class="local"><span class="dot"></span> Local workspace<p>Read views · Changes as reviewed Git commits · Deploys only with an approved checksum</p></div>
   </aside>
   <main>
     <header><div><div class="eyebrow">PONGBIPHANG SCHEMA</div><h1 id="title">Environments</h1><p id="description">See the recorded state and readiness of your environments.</p></div><button type="button" id="refresh">Refresh</button></header>
