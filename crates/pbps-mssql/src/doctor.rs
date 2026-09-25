@@ -1479,9 +1479,10 @@ pub async fn permissions(
         database.insert(name.trim().to_ascii_uppercase());
     }
 
-    // Recorded tables remain managed until their drop is applied, even when
-    // the declarations no longer name their schema (decision 69). Tombstones
-    // are permanent history and must not keep these requirements switched on.
+    // Recorded tables and modules remain managed until their drop is
+    // applied, even when the declarations no longer name their schema
+    // (DEC-356.1). Tombstones are permanent history and must not keep these
+    // requirements switched on.
     //
     // `recorded_ids` comes from the same read: an unreadable ledger must not
     // be papered over by inventing a resolution from the declarations, so a
@@ -1505,10 +1506,11 @@ pub async fn permissions(
             .filter(|table| moved_to(table, project_ids, &recorded_ids).is_none())
             .map(|table| table.schema.as_str()),
     );
-    // Recorded modules too (#355): a view, procedure or function removed from
-    // the declarations is a pending `DROP` in its schema just as a table is,
-    // and the drop needs `ALTER` there. A module has no uid to move under, so
-    // every recorded one keeps its schema managed until its drop is recorded.
+    // Recorded modules too (#355, DEC-356.1): a view, procedure or function
+    // removed from the declarations is a pending `DROP` in its schema just as
+    // a table is, and the drop needs `ALTER` there. A module has no uid to
+    // move under, so every recorded one keeps its schema managed until its
+    // drop is recorded.
     managed.extend(recorded.modules.keys().map(pbps_model::ModuleId::schema));
 
     // The ledger's schema is queried alongside the managed ones because it is
