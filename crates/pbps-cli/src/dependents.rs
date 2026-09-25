@@ -557,6 +557,90 @@ pub(crate) fn weave(
     Ok(cs.changes.len() - before)
 }
 
+/// Moves what this plan adds that may call a function it rebuilds to after
+/// that function's create (#942, DEC-942.1). Returns how many changes moved.
+///
+/// [`weave`] reads the catalog, where an addition this plan makes does not
+/// exist yet, so it never sees one. The differ puts a check or an index in
+/// class 13 and a default in class 9, ahead of every module in class 14, which
+/// everywhere else is right: a view needs its table's columns, and nothing a
+/// module holds needs a constraint. With a function rebuilt, it is exactly
+/// wrong: the check is created against the old function, and the rebuild's
+/// `DROP FUNCTION` is refused because of it.
+///
+/// Which function an expression calls is not known without parsing it, and
+/// the planner does not parse expressions (DECISIONS 174). So the rule is
+/// positional: when the plan rebuilds a function, every addition that can
+/// carry an expression goes after the last function the plan creates, in the
+/// order it had. That is a check, an index with a filter (an index's columns
+/// are names, so its filter is the only place a call can be), and a default
+/// being set. A unique index with no filter stays where it is, since a
+/// foreign key in its class may rest on it and holds no expression anyway.
+///
+/// One default does not move: a default on a table whose rows this plan
+/// writes. Row writes come before the modules, and a row the plan inserts
+/// would take the old default instead of the declared one. Leaving it in
+/// place means a default that calls the rebuilt function still meets the
+/// `DROP` there, and the apply fails and rolls back. That is loud, where
+/// moving it would record rows the declarations did not ask for. A column
+/// added with a default calling the function is the same case: the column
+/// has to exist before the modules that may read it.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub(crate) fn after_the_rebuilds(cs: &mut ChangeSet) -> usize {
+    let rebuilt = dropped_modules(cs).into_iter().any(|(id, kind)| {
+        kind == ModuleKind::Function
+            && cs.changes.iter().any(|p| match &p.change {
+                Change::AlterModule { id: x, .. } | Change::CreateModule { id: x, .. } => *x == id,
+                _ => false,
+            })
+    });
+    if !rebuilt {
+        return 0;
+    }
+    let Some(last) = cs.changes.iter().rposition(|p| match &p.change {
+        Change::AlterModule { module, .. } | Change::CreateModule { module, .. } => {
+            module.kind == ModuleKind::Function
+        }
+        _ => false,
+    }) else {
+        return 0;
+    };
+    let writes_rows = |table: &pbps_model::TableName| {
+        cs.changes.iter().any(|p| match &p.change {
+            Change::InsertRow { table: t, .. } | Change::UpdateRow { table: t, .. } => t == table,
+            _ => false,
+        })
+    };
+    let moves: Vec<bool> = cs.changes[..last]
+        .iter()
+        .map(|p| match &p.change {
+            Change::AddCheck { .. } => true,
+            Change::AddIndex { index, .. } => index.filter.is_some(),
+            Change::AlterColumnDefault {
+                column,
+                to: Some(_),
+                ..
+            } => !writes_rows(&column.table),
+            _ => false,
+        })
+        .collect();
+    let mut moved = Vec::new();
+    let mut kept = Vec::new();
+    let tail = cs.changes.split_off(last + 1);
+    for (i, p) in cs.changes.drain(..).enumerate() {
+        if moves.get(i).copied().unwrap_or(false) {
+            moved.push(p);
+        } else {
+            kept.push(p);
+        }
+    }
+    let count = moved.len();
+    kept.extend(moved);
+    kept.extend(tail);
+    cs.changes = kept;
+    count
+}
+
 /// Every dependent of a module this plan drops that the plan does not remove
 /// before that drop, named: the apply's question, asked of the saved plan as
 /// it stands. Empty when the plan accounts for everything — which is what
@@ -694,6 +778,128 @@ mod tests {
             id: id(name),
             module: Box::new(s.modules[&id(name)].clone()),
         }
+    }
+
+    // A test rendering: every other change prints as `rendered` prints it.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    fn names(cs: &ChangeSet) -> Vec<String> {
+        cs.changes
+            .iter()
+            .map(|p| match &p.change {
+                Change::AddIndex { name, .. } => format!("add index {name}"),
+                Change::InsertRow { .. } => "insert".to_owned(),
+                _ => rendered(&ChangeSet {
+                    changes: vec![p.clone()],
+                })
+                .remove(0),
+            })
+            .collect()
+    }
+
+    fn add_check(name: &str) -> Change {
+        Change::AddCheck {
+            table: TableName::new("app", "t"),
+            name: name.into(),
+            constraint: CheckConstraint {
+                expression: "app.f(id) >= 0".into(),
+            },
+        }
+    }
+
+    fn add_index(name: &str, filter: Option<&str>) -> Change {
+        Change::AddIndex {
+            table: TableName::new("app", "t"),
+            name: name.into(),
+            index: Box::new(pbps_model::Index {
+                columns: vec![pbps_model::IndexColumn {
+                    name: "id".into(),
+                    descending: false,
+                }],
+                include: Vec::new(),
+                unique: filter.is_none(),
+                filter: filter.map(Into::into),
+            }),
+        }
+    }
+
+    fn set_default(table: &str) -> Change {
+        Change::AlterColumnDefault {
+            uid: Uid::derived(UidKind::Column, &format!("app.{table}.n"), 0),
+            column: ColumnRef::new(TableName::new("app", table), "n"),
+            from: None,
+            to: Some("app.f(1)".into()),
+        }
+    }
+
+    /// #942: what the plan itself adds, in the differ's order ahead of the
+    /// modules, goes after the last function the plan creates when it
+    /// rebuilds one. Relative order is kept; an unfiltered unique index stays.
+    #[test]
+    fn additions_that_can_call_a_rebuilt_function_follow_its_create() {
+        let (s, _) = declared();
+        let mut cs = plan(vec![
+            set_default("t"),
+            add_check("ck_a"),
+            add_index("ix_unique", None),
+            add_index("ix_filtered", Some("app.f(id) > 0")),
+            add_check("ck_b"),
+            alter(&s, "app.f(integer)"),
+            alter(&s, "app.v0"),
+        ]);
+        assert_eq!(after_the_rebuilds(&mut cs), 4);
+        assert_eq!(
+            names(&cs),
+            [
+                "add index ix_unique",
+                "alter app.f(integer)",
+                "default n -> Some(\"app.f(1)\")",
+                "add check ck_a",
+                "add index ix_filtered",
+                "add check ck_b",
+                "alter app.v0",
+            ]
+        );
+    }
+
+    /// Negatives: no function rebuilt (a view rebuilt, or nothing), and a
+    /// default on a table whose rows the plan writes, which must be in place
+    /// before the insert that fills it.
+    #[test]
+    fn nothing_moves_without_a_rebuilt_function_or_ahead_of_its_rows() {
+        let (s, _) = declared();
+        for changes in [
+            vec![add_check("ck"), alter(&s, "app.v0")],
+            vec![add_check("ck")],
+        ] {
+            let mut cs = plan(changes);
+            let before = names(&cs);
+            assert_eq!(after_the_rebuilds(&mut cs), 0);
+            assert_eq!(names(&cs), before);
+        }
+        let mut cs = plan(vec![
+            set_default("u"),
+            Change::InsertRow {
+                table: TableName::new("app", "u"),
+                key_column: "id".into(),
+                identity_key: false,
+                key: pbps_model::RowKey::from("1"),
+                row: pbps_model::Row::default(),
+                defaults: BTreeMap::new(),
+                types: BTreeMap::new(),
+            },
+            add_check("ck"),
+            alter(&s, "app.f(integer)"),
+        ]);
+        assert_eq!(after_the_rebuilds(&mut cs), 1);
+        assert_eq!(
+            names(&cs),
+            [
+                "default n -> Some(\"app.f(1)\")",
+                "insert",
+                "alter app.f(integer)",
+                "add check ck",
+            ]
+        );
     }
 
     /// The case the issue names: a function edit, and a check and a default

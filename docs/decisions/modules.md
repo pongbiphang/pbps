@@ -1387,3 +1387,40 @@ the refusal (2026-09-25).
   definer's pinned path, which is what this entry fixes. A helper that is itself
   a definer is held to the same form only when the plan writes it.
 
+
+<a id="dec-942-1"></a>
+
+**DEC-942.1. When a PostgreSQL plan rebuilds a function, what the plan itself
+adds that can call one goes after the last function it creates (#942).** DEC-314.1
+places what the catalog says depends on a dropped module. An addition this plan
+makes is not in the catalog yet, so that pass never sees it. The differ puts a
+check or an index in class 13 and a default in class 9, ahead of every module
+in class 14. A check calling the rebuilt function was therefore created against
+the old one, and the rebuild's `DROP FUNCTION` was refused because of it.
+
+Which function an expression calls cannot be known without parsing it, and the
+planner does not parse expressions (DECISIONS 174). So the rule is positional
+rather than per call. When the plan rebuilds a function, these move after the
+last function the plan creates, keeping their order:
+
+- every check;
+- every index with a filter, since an index's columns are names and its filter
+  is the only place a call can be;
+- every default being set.
+
+A unique index with no filter stays where it is: it holds no expression, and a
+foreign key in its class may rest on it.
+
+Two shapes are left to the engine, and they fail loudly: the apply is refused
+and rolls back.
+
+- **A default on a table whose rows the plan writes.** Row writes come before
+  the modules, and a row inserted before the move would take the old default,
+  which records rows the declarations did not ask for.
+- **A column added with a default that calls the function.** The column has to
+  exist before any module that reads it.
+
+A plan that rebuilds no function keeps the differ's order. Measured on
+PostgreSQL: a function edit together with a new check, filtered index and
+default calling it applies, `verify` is clean, and planning again reports no
+changes. Before the move, the plan put the check ahead of `CREATE FUNCTION`.

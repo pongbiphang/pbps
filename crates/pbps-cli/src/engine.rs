@@ -1581,6 +1581,7 @@ pub async fn account_for_module_dependents(
     }
     let added = crate::dependents::weave(changes, &found, declared, ids, dialect)
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
+    let moved = crate::dependents::after_the_rebuilds(changes);
     let left = crate::dependents::unaccounted(changes, &found);
     if !left.is_empty() {
         anyhow::bail!(
@@ -1595,7 +1596,7 @@ pub async fn account_for_module_dependents(
         engine: "PostgreSQL",
         status: "passed",
         message: format!(
-            "{dependents} dependent(s) of {} dropped or rebuilt module(s) removed before the drop; {added} change(s) added to the plan for them",
+            "{dependents} dependent(s) of {} dropped or rebuilt module(s) removed before the drop; {added} change(s) added to the plan for them; {moved} addition(s) moved after the rebuilt function(s)",
             found.len()
         ),
     })
