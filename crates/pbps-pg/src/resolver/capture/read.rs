@@ -85,7 +85,7 @@ pub(super) async fn owned(
     // The witness cursor gets its own fresh snapshot after rendering has
     // closed. Its pages must never reuse the earlier snapshot or observe a
     // different snapshot per fetch.
-    let current = fresh_witnesses(conn).await?;
+    let current = fresh_witnesses(conn, read.major).await?;
     if !environment.unchanged(&super::session::observe(conn).await?) {
         return Err(Failure::EnvironmentChanged);
     }
@@ -174,13 +174,7 @@ async fn batch(
             return Ok(());
         };
         members.push(serde_json::from_str(body).map_err(|_| Failure::Incomplete)?);
-        if class == "pg_roles" {
-            if witness.is_some() {
-                return Err(Failure::Incomplete);
-            }
-        } else {
-            add_witness(&mut witnesses, class, witness)?;
-        }
+        add_witness(&mut witnesses, class, witness)?;
         Ok(())
     })
     .await?;
@@ -198,7 +192,6 @@ fn text<'a>(row: &'a pbps_db::Row, name: &str) -> Result<Option<&'a str>, Failur
 fn empty_witnesses() -> Witnesses {
     properties::CLASSES
         .iter()
-        .filter(|&&class| class != "pg_roles")
         .map(|class| ((*class).into(), BTreeSet::new()))
         .collect()
 }
@@ -211,7 +204,10 @@ fn add_witness(witnesses: &mut Witnesses, class: &str, value: Option<&str>) -> R
     Ok(())
 }
 
-async fn fresh_witnesses(conn: &mut impl QueryConnection) -> Result<Witnesses, Failure> {
+async fn fresh_witnesses(
+    conn: &mut impl QueryConnection,
+    major: u32,
+) -> Result<Witnesses, Failure> {
     conn.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .await
         .map_err(|_| Failure::Read)?;
@@ -221,7 +217,8 @@ async fn fresh_witnesses(conn: &mut impl QueryConnection) -> Result<Witnesses, F
             .map_err(|_| Failure::Read)?;
         let mut witnesses = empty_witnesses();
         let mut markers = BTreeSet::new();
-        cursor::read(conn, &queries::witness(), |row| {
+        let sql = queries::witness(major).map_err(|_| Failure::Incomplete)?;
+        cursor::read(conn, &sql, |row| {
             let class = text(&row, "part")?.ok_or(Failure::Incomplete)?;
             if !witnesses.contains_key(class) {
                 return Err(Failure::Incomplete);
@@ -549,3 +546,6 @@ mod merge_scalar_tests;
 
 #[cfg(test)]
 mod stored_tests;
+
+#[cfg(test)]
+mod role_tests;

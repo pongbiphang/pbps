@@ -790,3 +790,25 @@ vanishes. An opened but unreadable file never falls through to a later file.
 The selected candidate position and opaque resolution preserve comparison
 identity without exporting a path hash. No public verifier, provisioning code,
 source publication path or protected ledger storage is introduced.
+
+
+<a id="dec-882-1"></a>
+
+**DEC-882.1. Closing target capture compares the complete safe public role
+record without authentication-catalog access (#882).** `pg_roles` has no
+`xmin`, so the owned catalog read's physical witness did not cover an
+identity-preserving authorization change. Both supported PostgreSQL majors
+accept such changes during the first snapshot. Capture now projects the same
+qualified public role fields (excluding the masked password field) in its raw,
+rendered and fresh closing reads. The closing cursor shares one new snapshot
+across public role values, complete role membership/absence and the existing
+physical witnesses; unreadable input refuses rather than becoming empty.
+Canonical settings keep timestamp-valued properties comparable without changing
+the caller's settings. `pg_auth_members` retains its physical tuple witness.
+
+This public-value comparison preserves ordinary-reader support without
+requiring password-verifier access through `pg_authid`. It detects a changed
+closing role record, not every intervening ALTER ROLE: changing a public field
+and restoring it before the fresh snapshot can compare equal. That measured
+limit is explicit; this observation is not a continuous authorization-history
+proof or an enabled resolver-backed apply path.

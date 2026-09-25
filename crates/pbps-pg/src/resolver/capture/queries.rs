@@ -85,17 +85,7 @@ pub(super) fn batch(major: u32, selection: Option<&Selection>) -> Result<String>
             definitions.join(", ")
         ));
         let row = format!("pg_catalog.jsonb_build_object({})", columns.join(", "));
-        // MVCC tuple coordinates are a same-database, same-capture guard only.
-        // They never enter fingerprints or target/scratch identity matching.
-        let witness = if class == "pg_roles" {
-            // pg_roles exposes no xmin, and requiring pg_authid would turn a
-            // source read into access to password verifiers. Snapshot-based
-            // role names are used throughout; renderer role-valued constants
-            // need a separate qualified representation.
-            "NULL::jsonb".to_owned()
-        } else {
-            "pg_catalog.jsonb_build_array(c.ctid::text, c.xmin::text)".to_owned()
-        };
+        let witness = row_witness(class, major)?;
         let filter = filter(class);
         // A marker represents an empty but successfully read catalog. Each
         // following row is fetched through the same snapshot cursor; a large
@@ -105,10 +95,34 @@ pub(super) fn batch(major: u32, selection: Option<&Selection>) -> Result<String>
     Ok(parts.join("\nUNION ALL\n"))
 }
 
-pub(super) fn witness() -> String {
-    properties::CLASSES.iter().filter(|&&class| class != "pg_roles").map(|class| {
-        format!("SELECT '{class}' AS part, NULL::text AS witness UNION ALL SELECT '{class}', pg_catalog.jsonb_build_array(c.ctid::text, c.xmin::text)::text FROM pg_catalog.{class} c {}", filter(class))
-    }).collect::<Vec<_>>().join("\nUNION ALL\n")
+pub(super) fn witness(major: u32) -> Result<String> {
+    properties::CLASSES
+        .iter()
+        .map(|class| {
+            let witness = row_witness(class, major)?;
+            Ok(format!("SELECT '{class}' AS part, NULL::text AS witness UNION ALL SELECT '{class}', {witness}::text FROM pg_catalog.{class} c {}", filter(class)))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|parts| parts.join("\nUNION ALL\n"))
+}
+
+fn row_witness(class: &str, major: u32) -> Result<String> {
+    if class != "pg_roles" {
+        // MVCC coordinates detect change-and-restore within this capture.
+        // They never enter fingerprints or target/scratch identity matching.
+        return Ok("pg_catalog.jsonb_build_array(c.ctid::text, c.xmin::text)".into());
+    }
+    // The public view has no tuple version. Compare every qualified public
+    // value and complete membership in the same fresh cursor snapshot instead
+    // of requiring pg_authid/password access. This equality check does not
+    // certify a change-and-restore interval (DEC-882.1).
+    let columns = properties::fields(class, major)?
+        .iter()
+        .filter(|(name, _)| *name != "rolpassword")
+        .map(|(name, _)| format!("'{name}', c.{name}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!("pg_catalog.jsonb_build_object({columns})"))
 }
 
 fn filter(class: &str) -> &'static str {
