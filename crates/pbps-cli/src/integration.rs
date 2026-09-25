@@ -473,62 +473,159 @@ mod tests {
         assert!(!new_validator.is_valid(&envelope));
     }
 
-    /// An additive `data` field keeps the envelope's wire version only because
-    /// the published definitions are open: a consumer validating against the
-    /// older document still accepts the envelope that carries it (DEC-997.1).
-    /// A definition that closes itself turns every later addition into a
-    /// breaking change, so a new one must be named here on purpose.
+    /// An additive `data` field keeps the envelope's wire version only where
+    /// the published schema leaves an object open: a consumer validating
+    /// against the older document still accepts the envelope that carries it
+    /// (DEC-997.1). An object that constrains the properties it does not name —
+    /// `additionalProperties: false`, or a schema every unnamed value must
+    /// match — refuses some additions, so each one is named here on purpose.
     ///
     /// `ResolverProfile` is the configuration's own type, echoed by a connected
-    /// plan's resolver selection. It stays closed so `pbps.yml` refuses a
-    /// misspelt key, and a field added to it moves `output::SCHEMA_VERSION`.
+    /// plan's resolver selection, and stays closed so `pbps.yml` refuses a
+    /// misspelt key. `Discovery`'s two maps accept new keys whose values are
+    /// `Observation`s, and nothing else.
     #[test]
-    fn only_the_named_envelope_definitions_refuse_an_added_field() {
-        let closed = closed_definitions(&schema(SchemaKind::Envelope));
-        assert_eq!(closed, ["ResolverProfile"].map(str::to_owned).into());
+    fn only_the_named_envelope_objects_constrain_unnamed_properties() {
+        let constrained = constrained_objects(&schema(SchemaKind::Envelope));
+        let names: Vec<&str> = constrained.keys().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            [
+                "Discovery/properties/observations",
+                "Discovery/properties/qualification",
+                "ResolverProfile/oneOf/0",
+                "ResolverProfile/oneOf/1",
+            ]
+        );
+    }
+
+    /// Naming the constrained objects says where an addition is breaking; this
+    /// says that such a change moves the wire version. Every archived envelope
+    /// document stamped with the current `output::SCHEMA_VERSION` must hold
+    /// each constrained object this build still publishes exactly as it is now,
+    /// descriptions aside. The archives never change (DECISIONS 465), so
+    /// editing one of these objects fails here until the wire version and the
+    /// schema's `const` move with it (DECISIONS 224, DEC-997.1).
+    #[test]
+    fn a_constrained_object_changes_only_with_the_wire_version() {
+        let current = constrained_objects(&schema(SchemaKind::Envelope));
+        let archives = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/published-schemas");
+        let mut compared = 0;
+        for entry in std::fs::read_dir(&archives).unwrap() {
+            let name = entry.unwrap().file_name().into_string().unwrap();
+            let Ok(version) = name.parse::<u32>() else {
+                continue;
+            };
+            let archived = archived_schema(version, "envelope.schema.json");
+            let wire =
+                &archived["$defs"]["envelope.status"]["properties"]["schema_version"]["const"];
+            if *wire != serde_json::json!(crate::output::SCHEMA_VERSION) {
+                continue;
+            }
+            for (path, then) in constrained_objects(&archived) {
+                if let Some(now) = current.get(&path) {
+                    assert_eq!(
+                        now, &then,
+                        "`{path}` differs from schema set {version} under the same envelope \
+                         wire version; move output::SCHEMA_VERSION (DEC-997.1)"
+                    );
+                    compared += 1;
+                }
+            }
+        }
+        assert!(
+            compared > 0,
+            "no archive under this wire version was compared"
+        );
     }
 
     #[test]
-    fn a_nested_closed_object_marks_its_definition_closed() {
+    fn a_closed_or_schema_valued_object_is_constrained_and_an_open_one_is_not() {
         let document = serde_json::json!({
             "oneOf": [{ "additionalProperties": false }],
             "$defs": {
                 "Open": { "type": "object", "additionalProperties": true },
+                "Empty": { "type": "object", "additionalProperties": {} },
                 "Unset": { "type": "object", "properties": { "a": {} } },
                 "Map": { "type": "object", "additionalProperties": { "type": "string" } },
                 "Nested": { "oneOf": [{ "properties": {
-                    "inner": { "type": "object", "additionalProperties": false }
+                    "inner": {
+                        "description": "dropped before comparison",
+                        "type": "object",
+                        "additionalProperties": false
+                    }
                 } }] },
             }
         });
+        let constrained = constrained_objects(&document);
+        let names: Vec<&str> = constrained.keys().map(String::as_str).collect();
+        assert_eq!(names, ["Map", "Nested/oneOf/0/properties/inner"]);
         assert_eq!(
-            closed_definitions(&document),
-            ["Nested"].map(str::to_owned).into()
+            constrained["Nested/oneOf/0/properties/inner"],
+            serde_json::json!({ "type": "object", "additionalProperties": false })
         );
     }
 
-    /// The `$defs` whose body, at any depth, sets `additionalProperties: false`.
-    fn closed_definitions(document: &serde_json::Value) -> std::collections::BTreeSet<String> {
-        fn closes(value: &serde_json::Value) -> bool {
+    /// Every object under `$defs` that constrains the properties it does not
+    /// name, by path, with descriptions removed: they change no validation.
+    fn constrained_objects(
+        document: &serde_json::Value,
+    ) -> std::collections::BTreeMap<String, serde_json::Value> {
+        fn constrains(map: &serde_json::Map<String, serde_json::Value>) -> bool {
+            match map.get("additionalProperties") {
+                Some(serde_json::Value::Bool(false)) => true,
+                Some(serde_json::Value::Object(schema)) => !schema.is_empty(),
+                Some(_) | None => false,
+            }
+        }
+        fn without_descriptions(value: &serde_json::Value) -> serde_json::Value {
             match value {
-                serde_json::Value::Object(map) => {
-                    map.get("additionalProperties") == Some(&serde_json::Value::Bool(false))
-                        || map.values().any(closes)
-                }
-                serde_json::Value::Array(items) => items.iter().any(closes),
+                serde_json::Value::Object(map) => map
+                    .iter()
+                    .filter(|(key, _)| key.as_str() != "description")
+                    .map(|(key, v)| (key.clone(), without_descriptions(v)))
+                    .collect(),
+                serde_json::Value::Array(items) => items.iter().map(without_descriptions).collect(),
                 serde_json::Value::Null
                 | serde_json::Value::Bool(_)
                 | serde_json::Value::Number(_)
-                | serde_json::Value::String(_) => false,
+                | serde_json::Value::String(_) => value.clone(),
             }
         }
-        document["$defs"]
+        fn walk(
+            value: &serde_json::Value,
+            path: String,
+            found: &mut std::collections::BTreeMap<String, serde_json::Value>,
+        ) {
+            match value {
+                serde_json::Value::Object(map) if constrains(map) => {
+                    found.insert(path, without_descriptions(value));
+                }
+                serde_json::Value::Object(map) => {
+                    for (key, v) in map {
+                        walk(v, format!("{path}/{key}"), found);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for (i, v) in items.iter().enumerate() {
+                        walk(v, format!("{path}/{i}"), found);
+                    }
+                }
+                serde_json::Value::Null
+                | serde_json::Value::Bool(_)
+                | serde_json::Value::Number(_)
+                | serde_json::Value::String(_) => {}
+            }
+        }
+        let mut found = std::collections::BTreeMap::new();
+        for (name, body) in document["$defs"]
             .as_object()
             .expect("a published schema keeps its definitions in `$defs`")
-            .iter()
-            .filter(|(_, body)| closes(body))
-            .map(|(name, _)| name.clone())
-            .collect()
+        {
+            walk(body, name.clone(), &mut found);
+        }
+        found
     }
 
     /// `deny_unknown_fields` is what turns a typo into an error rather than a

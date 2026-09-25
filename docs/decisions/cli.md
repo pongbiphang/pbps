@@ -635,30 +635,49 @@ how to add an entry here.
 <a id="dec-997-1"></a>
 
 **DEC-997.1. The envelope's wire version moves when an envelope could fail the
-previously published schema, and an added field in an open `data` object does
-not.** SPEC §9.8 says `schema_version` "moves when a consumer would have to
-change". It did not say whether an added field is such a change, and #996's
-review read it as one. The test chosen is the published document itself: a
-consumer validating against it is the consumer the envelope schema serves. It
-leaves `data` objects open, so it accepts a newly added field. A removed or
-renamed field, a changed type or a new enum value fails it, and those move the
-version together with the schema's `const` (DECISIONS 224). The schema-set
-version still moves for every content change (DECISIONS 465), so an addition
-is never unrecorded.
+previously published schema, and not otherwise.** SPEC §9.8 says
+`schema_version` "moves when a consumer would have to change". It did not say
+whether an added field is such a change, and #996's review read it as one. The
+test chosen is the published document itself: a consumer validating against it
+is the consumer the envelope schema serves. The kind of change does not decide;
+the validation outcome does.
 
-Moving the wire version for every addition was the alternative. It would make
-every `data` addition a breaking change for consumers that only validate, and
-it contradicts the practice DECISIONS 465 records: many fields have been added
+- **Keeps the version.** A field added to an open object passes, because the
+  document leaves it open. So does an optional field removed from one, and a
+  field renamed there when the old name was optional. The schema-set version
+  still moves for every content change (DECISIONS 465), so these are never
+  unrecorded.
+- **Moves the version.** A required field removed or renamed, a changed type,
+  or a new enum value fails the old document. So does a change inside an
+  object that constrains the properties it does not name. Such an object's
+  `additionalProperties` is `false`, or a schema every unnamed value must
+  match. These move the version together with the schema's `const` (DECISIONS
+  224).
+
+Moving the version on every addition was the alternative. It would make every
+`data` addition a breaking change for consumers that only validate, and it
+contradicts the practice DECISIONS 465 records: many fields have been added
 under version 1. Some past changes would move the version under this rule, for
 example the timeline's `denied` variant (DECISIONS 435). They are not
 renumbered.
 
-The rule holds only while the definitions stay open. A closed definition turns
-every later addition into a breaking one. `integration`'s
-`only_the_named_envelope_definitions_refuse_an_added_field` therefore names
-the closed ones and fails when another appears. Today that is only
-`ResolverProfile`, the configuration's own type echoed by a connected plan. It
-stays closed so `pbps.yml` refuses a misspelt key, and a field added to it
-moves the wire version. `pbps-ui`'s contract types use `deny_unknown_fields` on
-purpose: they ship in the same binary as the CLI they read (ADR-0015 decision
-6), and each addition updates them in the same change.
+Two tests in `integration` hold the part a reviewer cannot see.
+
+- `only_the_named_envelope_objects_constrain_unnamed_properties` names the
+  constrained objects, and fails when another appears. Today there are four:
+  - `ResolverProfile`'s two variants. This is the configuration's own type,
+    echoed by a connected plan, and it stays closed so `pbps.yml` refuses a
+    misspelt key.
+  - `Discovery`'s `observations` and `qualification` maps. They accept new
+    keys whose values are `Observation`s, and nothing else.
+- `a_constrained_object_changes_only_with_the_wire_version` compares each
+  constrained object with every archived schema set stamped with the same wire
+  version, descriptions aside. Archives never change, so an edit to one of these
+  objects fails until `output::SCHEMA_VERSION` moves. The comparison is
+  conservative: it also refuses a change the old document would still accept,
+  such as removing an optional property from a closed object. Deciding JSON
+  Schema containment in general is not attempted (DECISIONS 465).
+
+`pbps-ui`'s contract types use `deny_unknown_fields` on purpose. They ship in
+the same binary as the CLI they read (ADR-0015 decision 6), and each addition
+updates them in the same change.

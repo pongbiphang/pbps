@@ -1940,12 +1940,18 @@ validation rather than being read as one it does (DECISIONS 224).
 
 A consumer "would have to change" exactly when an envelope the new build emits
 could fail validation against the envelope schema published before it
-(DEC-997.1). A field added to an open `data` object is not such a change, and
-keeps the wire version; the schema-set version records it instead (DECISIONS
-465). A removed or renamed field, a changed type, a new enum value, or a field
-added to one of the few definitions the schema closes with
-`additionalProperties: false` is such a change, and moves it. A consumer that
-parses `data` strictly accepts that it must update with the tool.
+(DEC-997.1). That test decides, not the kind of change:
+
+- These keep the wire version: a field added to an open object, or an optional
+  field removed from one. The schema-set version records them (DECISIONS
+  465).
+- These move it: a required field removed or renamed, a changed type, a new
+  enum value, or any change to one of the few objects that constrain the
+  properties they do not name. Those objects are the ones whose
+  `additionalProperties` is `false` or a schema.
+
+A consumer that parses `data` strictly accepts that it must update with the
+tool.
 
 `result` is `ok`, `findings` or **`unanswerable`** — the same three-way split as
 the exit codes below, and for the same reason. A pipe loses the producer's
