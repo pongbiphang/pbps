@@ -254,6 +254,122 @@ fn the_route_tables_are_the_whole_router() {
 /// `GIT_*` overrides from Git's environment by name, discarding each value.
 const NAMES_ONLY_SCRUB: &str = "for(name,_)instd::env::vars_os()";
 
+/// Rust source without its comments and whitespace, so a path or macro split
+/// by either (`std::env/**/::var`, `env ! (`) reads as one run of tokens.
+/// String, raw-string and char literals are kept, so a `//` inside
+/// `"http://"` is not taken for a comment.
+fn normalized(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    let at = |i: usize| chars.get(i).copied();
+    while let Some(c) = at(i) {
+        match c {
+            '/' if at(i + 1) == Some('/') => {
+                while at(i).is_some_and(|c| c != '\n') {
+                    i += 1;
+                }
+            }
+            '/' if at(i + 1) == Some('*') => {
+                let mut depth = 0;
+                while let Some(c) = at(i) {
+                    if c == '/' && at(i + 1) == Some('*') {
+                        depth += 1;
+                        i += 2;
+                    } else if c == '*' && at(i + 1) == Some('/') {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            'r' if {
+                let mut j = i + 1;
+                while at(j) == Some('#') {
+                    j += 1;
+                }
+                at(j) == Some('"')
+                    && !at(i.wrapping_sub(1)).is_some_and(|p| p.is_alphanumeric() || p == '_')
+            } =>
+            {
+                let mut hashes = 0;
+                i += 1;
+                while at(i) == Some('#') {
+                    hashes += 1;
+                    i += 1;
+                }
+                i += 1;
+                out.push('"');
+                while let Some(c) = at(i) {
+                    if c == '"' && (1..=hashes).all(|k| at(i + k) == Some('#')) {
+                        i += 1 + hashes;
+                        break;
+                    }
+                    if !c.is_whitespace() {
+                        out.push(c);
+                    }
+                    i += 1;
+                }
+                out.push('"');
+            }
+            '"' => {
+                out.push('"');
+                i += 1;
+                while let Some(c) = at(i) {
+                    i += 1;
+                    if c == '\\' {
+                        if let Some(escaped) = at(i) {
+                            out.push(c);
+                            out.push(escaped);
+                            i += 1;
+                        }
+                        continue;
+                    }
+                    if !c.is_whitespace() {
+                        out.push(c);
+                    }
+                    if c == '"' {
+                        break;
+                    }
+                }
+            }
+            // A char literal, which may hold a quote; a lifetime is copied.
+            '\'' if at(i + 1) == Some('\\') || at(i + 2) == Some('\'') => {
+                let end = (i + 2..chars.len())
+                    .find(|&j| chars[j] == '\'' && chars[j - 1] != '\\')
+                    .unwrap_or(chars.len() - 1);
+                out.extend(&chars[i..=end]);
+                i = end + 1;
+            }
+            c if c.is_whitespace() => i += 1,
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn normalizing_drops_comments_and_whitespace_but_keeps_literals() {
+    assert_eq!(normalized("std::env/**/::var(x)"), "std::env::var(x)");
+    assert_eq!(
+        normalized("std::env // note\n  ::var(x)"),
+        "std::env::var(x)"
+    );
+    assert_eq!(normalized("a /* outer /* inner */ still */ b"), "ab");
+    assert_eq!(normalized("f(\"http://x\"); g()"), "f(\"http://x\");g()");
+    assert_eq!(normalized("r#\"a // b\"# c"), "\"a//b\"c");
+    assert_eq!(normalized("let q = '\"'; env!(x)"), "letq='\"';env!(x)");
+    assert_eq!(normalized("let e = '\\''; /* c */ x"), "lete='\\'';x");
+    assert_eq!(normalized("fn f<'a>(x: &'a str) {}"), "fnf<'a>(x:&'astr){}");
+}
+
 /// Every place in `source` that could read an environment variable's value.
 /// The source is compared with all whitespace removed, since Rust accepts
 /// `env ! ("X")` and `std :: env :: var` split across lines. Conservative on
@@ -261,7 +377,7 @@ const NAMES_ONLY_SCRUB: &str = "for(name,_)instd::env::vars_os()";
 /// and only `env::temp_dir()` (a path) and `env!("CARGO_MANIFEST_DIR")` (a
 /// build path) pass.
 fn environment_reads(source: &str) -> Vec<String> {
-    let text: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    let text = normalized(source);
     let mut found = Vec::new();
     let mut each = |pattern: &str, allowed: &dyn Fn(&str) -> bool| {
         for (at, _) in text.match_indices(pattern) {
@@ -314,6 +430,9 @@ fn an_aliased_imported_or_spaced_environment_read_is_still_seen() {
         "const URL: &str = env\n!\n(\"PBPS_DB\");",
         "let url = option_env!(\"PBPS_DB\");",
         "let url = core::env!(\"PBPS_DB\");",
+        "let url = std::env/**/::var(\"PBPS_DB\");",
+        "let url = option_env/**/!(\"PBPS_DB\");",
+        "let url = std::env // why\n    ::var(\"PBPS_DB\");",
         "let _ = (env!(\"CARGO_MANIFEST_DIR\"), env!(\"PBPS_DB\"));",
     ] {
         assert!(!environment_reads(source).is_empty(), "{source}");
@@ -363,11 +482,7 @@ fn the_ui_reads_no_environment_value() {
             continue;
         }
         let name = file.strip_prefix(&root).unwrap().display().to_string();
-        let text: String = std::fs::read_to_string(&file)
-            .unwrap()
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
+        let text = normalized(&std::fs::read_to_string(&file).unwrap());
         let without = if name == "compose/git.rs" {
             scrubs += text.matches(NAMES_ONLY_SCRUB).count();
             text.replace(NAMES_ONLY_SCRUB, "")
