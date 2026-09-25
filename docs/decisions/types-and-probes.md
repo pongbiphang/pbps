@@ -1582,3 +1582,35 @@ to add an entry here.
      sits inside, and on 18.6 that `EXISTS` is pulled up into a join whose
      condition carries the cast — evaluated after the scan filter that carries
      the guard. Measured: the same fixture answers rather than raising.
+
+<a id="dec-399-1"></a>
+
+**DEC-399.1. Planned risks come from the selected dialect's `change_risks`, and
+`Change::intrinsic_risks` is kept only as the dialect-free default (#399;
+closes the gap DECISIONS 433 left to #343).** DECISIONS 433 recorded that the
+model's `Change::intrinsic_risks` read every dialect's defaults by SQL Server's
+identifier boundary. It called that a known gap and left it to #343. #397 closed
+it with the parameterized shape DECISIONS 433 and ADR-0011 Amendment 2 had
+already established for `normalize_definition` and the dependency scans:
+
+- `Change::intrinsic_risks_with(continues_ident)` takes the boundary.
+- `Dialect::change_risks` calls it with the engine's own
+  `Lexicon::identifier_continues` and adds the type-change risk.
+- Both halves that have to agree ask the one `Dialect::change_risks`: the
+  differ, which sets each `PlannedChange`'s risks (`pbps_diff::diff`), and
+  saved-plan validation, which re-derives them and refuses a plan whose file
+  says otherwise (`validate_saved_plan`). A plan cannot be classified by one
+  rule and checked by another. Every change a connected planner adds after the
+  diff is classified the same way, for the same reason (DEC-314.1).
+
+`Change::intrinsic_risks()` and `PlannedChange::new` keep SQL Server's boundary
+as their default. That is an API-compatibility role for dialect-free callers,
+not the classification any plan is saved with: every change that reaches a
+saved plan has its risks overwritten by the selected dialect's answer before
+the plan is written. The historical entry (433) keeps its wording, and this
+entry records that the gap is closed. Pinned by
+`required_add_risks_follow_the_dialects_identifier_boundary` and
+`planned_required_add_uses_postgres_default_identifier_boundaries` in
+`crates/pbps-pg/src/lib.rs` (planning), and by
+`saved_add_column_risks_use_the_selected_dialect_and_reject_edits` in
+`crates/pbps-cli/src/main.rs` (saved-plan validation).
