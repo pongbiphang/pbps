@@ -1327,6 +1327,32 @@ fn resolve_for_query<'a>(
     (safe, unresolvable)
 }
 
+/// Where the project now declares a recorded table, when that is in another
+/// schema: an identity-preserving move rather than a drop (#352).
+///
+/// Such a table does not keep its source schema managed. The move is `ALTER
+/// SCHEMA dest TRANSFER`, which needs `CONTROL` on the table and `ALTER` on
+/// the destination, and nothing on the source schema. Demanding the managed
+/// schema set there asked for access the plan never uses. SPEC §9.5 leaves the
+/// transfer's own `CONTROL` demand unmodelled, and this does not change that.
+///
+/// A recorded table the project no longer declares at all is a drop, and it
+/// keeps its schema managed until the drop is recorded, which is the
+/// recorded-management rule. So does a table whose uid the recorded ids do not
+/// name: without the identity there is no move to recognise, and the answer
+/// errs towards asking.
+fn moved_to<'a>(
+    recorded: &ObjectName,
+    project_ids: &'a pbps_model::IdsFile,
+    recorded_ids: &pbps_model::IdsFile,
+) -> Option<&'a ObjectName> {
+    let uid = recorded_ids.table_uid(recorded)?;
+    project_ids
+        .tables
+        .get(uid)
+        .filter(|declared| declared.schema != recorded.schema)
+}
+
 /// The name `declared` has in this environment, and whether the environment's
 /// own recorded ids confirm it.
 fn resolution(
@@ -1472,7 +1498,13 @@ pub async fn permissions(
         ),
     };
     let mut managed: BTreeSet<&str> = schemas.iter().map(String::as_str).collect();
-    managed.extend(recorded.tables.keys().map(|table| table.schema.as_str()));
+    managed.extend(
+        recorded
+            .tables
+            .keys()
+            .filter(|table| moved_to(table, project_ids, &recorded_ids).is_none())
+            .map(|table| table.schema.as_str()),
+    );
 
     // The ledger's schema is queried alongside the managed ones because it is
     // the fallback for the ledger requirements before those tables exist — but
@@ -3023,6 +3055,32 @@ mod tests {
     /// asking under it and keying by it once collapsed one of the two
     /// declarations' distinct demands into the other's map entry (issue #133
     /// round 2, `Preserve distinct demands when a rename source is reused`).
+    #[test]
+    fn only_a_recorded_table_declared_in_another_schema_is_a_move() {
+        let uid: pbps_model::Uid = "t_aaa111".parse().expect("a well-formed table uid");
+        let mut recorded_ids = pbps_model::IdsFile::default();
+        recorded_ids.tables.insert(uid.clone(), table("legacy.t"));
+        let moved = |declared: Option<&str>| {
+            let mut project_ids = pbps_model::IdsFile::default();
+            if let Some(name) = declared {
+                project_ids.tables.insert(uid.clone(), table(name));
+            }
+            moved_to(&table("legacy.t"), &project_ids, &recorded_ids).cloned()
+        };
+        assert_eq!(moved(Some("modern.t")), Some(table("modern.t")));
+        // Renamed within its schema: the schema is still the table's.
+        assert_eq!(moved(Some("legacy.renamed")), None);
+        // No longer declared: a drop, which keeps its schema managed.
+        assert_eq!(moved(None), None);
+        // A recorded table the recorded ids do not name is no move either.
+        let mut project_ids = pbps_model::IdsFile::default();
+        project_ids.tables.insert(uid, table("modern.t"));
+        assert_eq!(
+            moved_to(&table("legacy.other"), &project_ids, &recorded_ids),
+            None
+        );
+    }
+
     #[test]
     fn resolve_for_query_keeps_the_confirmed_claim_and_refuses_the_colliding_fallback() {
         let uid1: pbps_model::Uid = "t_aaa111".parse().expect("a well-formed table uid");
