@@ -1027,8 +1027,19 @@ changes.
   `search_path`, changes the set. The probes resolve names under the deployer's
   own path, not the DDL's write path (preflight.rs), so pinning one resolved
   binding would miss this.
-- *Closure.* Every body matched along the way, managed or not, is scanned in
-  turn, until no new name appears.
+- *Reached tables.* A table's name matters as much as a routine's. A trigger
+  or routine body that writes another table makes the engine run that table's
+  triggers and stored expressions. Telling a write from a read in a
+  PL/pgSQL body, or in a dynamic string, would mean parsing it. So any
+  identifier in scanned text, qualified or bare, that names a table in any
+  schema reaches that table, and the table reaches its write-producing closure
+  (DECISIONS 451). Each reached table adds its trigger functions and stored
+  expressions to the roots, exactly as a table the plan writes directly does.
+  An `INSERT INTO audit …` in a managed trigger's body therefore pins the
+  helpers that `audit`'s CHECKs and defaults call.
+- *Closure.* Every body and expression matched along the way, managed or not,
+  is scanned in turn, for calls and for table names, until no new name
+  appears.
 - *Aggregates.* An aggregate is in scope like any routine, but it has no body
   to deparse. `pg_get_functiondef` refuses one with SQLSTATE 42809 (measured on
   18.6, and in the live suite). Its definition is therefore its `pg_aggregate`
