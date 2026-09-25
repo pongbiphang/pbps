@@ -1050,6 +1050,57 @@ fn object_permissions_sql<'a>(
 /// numbers for the one thing the server actually enforces).
 pub(crate) const MAX_PARAMETERS: usize = 2098;
 
+/// The schema list cut into pieces each of which fits one statement beside
+/// `perms` permission names: every schema costs one slot, and every piece
+/// carries the whole permission list again.
+///
+/// Never an empty piece, and never an empty list of pieces for a non-empty
+/// list: a schema dropped from the question reads as a schema with nothing
+/// missing.
+fn schema_statements<'a, 'b>(schemas: &'a [&'b str], perms: usize) -> Vec<&'a [&'b str]> {
+    let per = MAX_PARAMETERS.saturating_sub(perms).max(1);
+    schemas.chunks(per).collect()
+}
+
+/// One schema-scope permission statement for `schemas`.
+///
+/// Both lists are bound, not pasted. The permission names are this crate's own
+/// constants and the schema names come from declarations or state, but SQL
+/// built by concatenation is the habit this codebase does not have.
+///
+/// The **requested** spelling comes back, not the catalog's. Matching is the
+/// server's job — `w.n = s.name` compares under the database's collation, so a
+/// case-insensitive database matches `App` to its `app` — but the caller then
+/// looks the answer up by the name it asked with. Selecting `s.name` returned
+/// `app` for a request of `App`, so the Rust-side lookup missed, and `doctor`
+/// reported the schema absent and advised creating one that already exists.
+///
+/// `QUOTENAME(s.name)` stays the catalog's spelling: that argument names a real
+/// securable, not a map key.
+fn schema_permissions_sql<'a>(schemas: &[&'a str], perms: &[&'a str]) -> (String, Vec<Param<'a>>) {
+    let mut params: Vec<Param<'a>> = Vec::new();
+    let mut perm_slots = Vec::new();
+    for p in perms {
+        params.push(Param::from(*p));
+        perm_slots.push(format!("(@P{})", params.len()));
+    }
+    let mut schema_slots = Vec::new();
+    for s in schemas {
+        params.push(Param::from(*s));
+        schema_slots.push(format!("(@P{})", params.len()));
+    }
+    let sql = format!(
+        "SELECT w.n AS [schema], p.n AS permission, \
+         HAS_PERMS_BY_NAME(QUOTENAME(s.name), 'SCHEMA', p.n) AS held \
+         FROM (VALUES {}) AS w(n) \
+         JOIN sys.schemas AS s ON s.name = w.n \
+         CROSS JOIN (VALUES {}) AS p(n);",
+        schema_slots.join(", "),
+        perm_slots.join(", ")
+    );
+    (sql, params)
+}
+
 /// The object list cut into pieces each of which fits one statement.
 ///
 /// Every object list is asked in pieces: a foreign-key list or a role's grants
@@ -1456,52 +1507,24 @@ pub async fn permissions(
         .map(|r| r.name)
         .collect();
 
-    // Both lists are bound, not pasted. The permission names are this crate's
-    // own constants and the schema names come from declarations or state, but SQL
-    // built by concatenation is the habit this codebase does not have.
-    let mut params: Vec<Param<'_>> = Vec::new();
-    let mut perm_slots = Vec::new();
-    for p in &schema_perms {
-        params.push(Param::from(*p));
-        perm_slots.push(format!("(@P{})", params.len()));
-    }
-    let mut schema_slots = Vec::new();
-    for s in &wanted {
-        params.push(Param::from(*s));
-        schema_slots.push(format!("(@P{})", params.len()));
-    }
-    // The **requested** spelling comes back, not the catalog's. Matching is the
-    // server's job — `w.n = s.name` compares under the database's collation, so
-    // a case-insensitive database matches `App` to its `app` — but the caller
-    // then looks the answer up by the name it asked with. Selecting `s.name`
-    // returned `app` for a request of `App`, so the Rust-side lookup missed,
-    // and `doctor` reported the schema absent and advised creating one that
-    // already exists.
-    //
-    // `QUOTENAME(s.name)` stays the catalog's spelling: that argument names a
-    // real securable, not a map key.
-    let sql = format!(
-        "SELECT w.n AS [schema], p.n AS permission, \
-         HAS_PERMS_BY_NAME(QUOTENAME(s.name), 'SCHEMA', p.n) AS held \
-         FROM (VALUES {}) AS w(n) \
-         JOIN sys.schemas AS s ON s.name = w.n \
-         CROSS JOIN (VALUES {}) AS p(n);",
-        schema_slots.join(", "),
-        perm_slots.join(", ")
-    );
-
+    // In pieces, as the object reads below are (#351): one statement for every
+    // declared and recorded schema passed the server's parameter ceiling on a
+    // large estate, and the whole schema answer came back as unreadable.
     let mut per_schema: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for row in &conn.query_with(&sql, &params).await? {
-        let schema: &str = get(row, "schema")?;
-        let permission: &str = get(row, "permission")?;
-        // A NULL means the class or the permission name was rejected, which
-        // for this crate's own constants would be a bug here. Read as "not
-        // held" rather than skipped: a gap the operator can check is a better
-        // wrong answer than a silence that reads as ready.
-        let held: i32 = row.try_get("held")?.unwrap_or(0);
-        let entry = per_schema.entry(schema.to_owned()).or_default();
-        if held != 0 {
-            entry.insert(permission.trim().to_ascii_uppercase());
+    for chunk in schema_statements(&wanted, schema_perms.len()) {
+        let (sql, params) = schema_permissions_sql(chunk, &schema_perms);
+        for row in &conn.query_with(&sql, &params).await? {
+            let schema: &str = get(row, "schema")?;
+            let permission: &str = get(row, "permission")?;
+            // A NULL means the class or the permission name was rejected, which
+            // for this crate's own constants would be a bug here. Read as "not
+            // held" rather than skipped: a gap the operator can check is a better
+            // wrong answer than a silence that reads as ready.
+            let held: i32 = row.try_get("held")?.unwrap_or(0);
+            let entry = per_schema.entry(schema.to_owned()).or_default();
+            if held != 0 {
+                entry.insert(permission.trim().to_ascii_uppercase());
+            }
         }
     }
 
@@ -1871,11 +1894,14 @@ pub async fn permissions(
                 }
             }
         }
-        // `IN ()` is not T-SQL: nothing to ask when no role is named.
-        if !roles.is_empty() {
+        // In pieces for the same ceiling as every other list here (#351).
+        // `IN ()` is not T-SQL, and an empty list is cut into no pieces, so
+        // nothing is asked when no role is named.
+        let roles: Vec<&String> = roles.iter().collect();
+        for chunk in roles.chunks(MAX_PARAMETERS) {
             let mut params: Vec<Param<'_>> = Vec::new();
             let mut role_slots = Vec::new();
-            for r in &roles {
+            for r in chunk {
                 params.push(Param::from(r.as_str()));
                 role_slots.push(format!("@P{}", params.len()));
             }
@@ -1916,33 +1942,20 @@ pub async fn permissions(
         )
         .await?;
         if !schemas_wanted.is_empty() {
-            let mut params: Vec<Param<'_>> = Vec::new();
-            let mut perm_slots = Vec::new();
-            for p in &granted_perms {
-                params.push(Param::from(*p));
-                perm_slots.push(format!("(@P{})", params.len()));
-            }
-            let mut schema_slots = Vec::new();
-            for s in &schemas_wanted {
-                params.push(Param::from(s.as_str()));
-                schema_slots.push(format!("(@P{})", params.len()));
-            }
-            let sql = format!(
-                "SELECT w.n AS [schema], p.n AS permission, \
-                 HAS_PERMS_BY_NAME(QUOTENAME(s.name), 'SCHEMA', p.n) AS held \
-                 FROM (VALUES {}) AS w(n) \
-                 JOIN sys.schemas AS s ON s.name = w.n \
-                 CROSS JOIN (VALUES {}) AS p(n);",
-                schema_slots.join(", "),
-                perm_slots.join(", ")
-            );
-            for row in &conn.query_with(&sql, &params).await? {
-                let schema: &str = get(row, "schema")?;
-                let permission: &str = get(row, "permission")?;
-                let held: i32 = row.try_get("held")?.unwrap_or(0);
-                let entry = granted_schemas.entry(schema.to_owned()).or_default();
-                if held != 0 {
-                    entry.insert(permission.trim().to_ascii_uppercase());
+            // The same statement as the managed-schema read, in the same
+            // pieces (#351): a role granted on more schemas than one
+            // statement can bind would otherwise read as unreadable.
+            let wanted: Vec<&str> = schemas_wanted.iter().map(String::as_str).collect();
+            for chunk in schema_statements(&wanted, granted_perms.len()) {
+                let (sql, params) = schema_permissions_sql(chunk, &granted_perms);
+                for row in &conn.query_with(&sql, &params).await? {
+                    let schema: &str = get(row, "schema")?;
+                    let permission: &str = get(row, "permission")?;
+                    let held: i32 = row.try_get("held")?.unwrap_or(0);
+                    let entry = granted_schemas.entry(schema.to_owned()).or_default();
+                    if held != 0 {
+                        entry.insert(permission.trim().to_ascii_uppercase());
+                    }
                 }
             }
             absent_granted.extend(
@@ -2690,6 +2703,32 @@ mod tests {
         assert!(!sql.contains("AS c(i, col)"), "{sql}");
         assert!(sql.contains("WHEN 1 = 0 THEN"), "{sql}");
         assert_eq!(params.len(), 1 + 2 * 2, "{sql}");
+    }
+
+    /// The schema read in pieces (#351): each piece fits beside the whole
+    /// permission list, every schema is asked once across them, and a list
+    /// that fits exactly is still one statement.
+    #[test]
+    fn schema_permission_reads_are_cut_to_the_parameter_ceiling() {
+        let perms = ["ALTER", "SELECT", "INSERT", "UPDATE", "DELETE"];
+        let names: Vec<String> = (0..5_000).map(|i| format!("s{i}")).collect();
+        let schemas: Vec<&str> = names.iter().map(String::as_str).collect();
+        let chunks = schema_statements(&schemas, perms.len());
+        assert!(chunks.len() > 1);
+        let mut seen = Vec::new();
+        for chunk in &chunks {
+            assert!(!chunk.is_empty());
+            let (sql, params) = schema_permissions_sql(chunk, &perms);
+            assert!(params.len() <= MAX_PARAMETERS, "{} params", params.len());
+            assert_eq!(params.len(), perms.len() + chunk.len());
+            assert!(sql.contains(&format!("(@P{})", params.len())));
+            seen.extend(chunk.iter().copied());
+        }
+        assert_eq!(seen, schemas, "every schema once, in order");
+        let per = MAX_PARAMETERS - perms.len();
+        assert_eq!(schema_statements(&schemas[..per], perms.len()).len(), 1);
+        assert_eq!(schema_statements(&schemas[..per + 1], perms.len()).len(), 2);
+        assert_eq!(schema_statements(&schemas[..1], perms.len()).len(), 1);
     }
 
     /// One statement per chunk, each within the server's parameter limit,
