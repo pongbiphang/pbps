@@ -805,6 +805,15 @@ impl Dialect for Postgres {
         true
     }
 
+    /// A check or foreign-key name is per table here, and the index behind a
+    /// primary key or unique constraint is the relation-namespace question
+    /// above (issue #496; measured on 18.6, two tables in one schema each
+    /// declaring `CONSTRAINT c CHECK (…)`, and a third declaring a foreign key
+    /// `c`, are all created).
+    fn constraints_share_namespace_with_tables(&self) -> bool {
+        false
+    }
+
     /// The project-schema portion of the write path: the object's own schema
     /// first, then the configured extras in order (DECISIONS 276 and 464).
     /// The implicit catalog and final temporary schema hold no declared

@@ -2769,6 +2769,54 @@ fn a_module_named_after_a_table_is_refused() {
     );
 }
 
+/// SQL Server keeps constraints in the same per-schema namespace as tables and
+/// modules, so two tables declaring a check of one name, or a foreign key named
+/// like another table's check, cannot both be created (issue #496, Msg 2714 then
+/// 1750 on the pinned server). `validate` refuses the pair before any
+/// connection, and a check of the same name in another schema is not one.
+#[test]
+fn two_tables_with_one_constraint_name_are_refused() {
+    let d = Demo::new("constraint-namespace");
+    d.table(
+        "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n\
+         primary_key: [id]\nchecks:\n  c: id > 0\n",
+    );
+    std::fs::write(
+        d.dir.join("schema/dbo.u.yml"),
+        "table: dbo.u\ncolumns:\n  id: {type: int, nullable: false}\n\
+         primary_key: [id]\nchecks:\n  c: id > 0\n",
+    )
+    .unwrap();
+    let o = d.run(&["validate"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("check constraint `dbo.t.c`")
+            && stderr(&o).contains("check constraint `dbo.u.c`"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(
+        stderr(&o).contains("one namespace per schema"),
+        "{}",
+        stderr(&o)
+    );
+
+    // The negative case: the same check name in another schema.
+    std::fs::remove_file(d.dir.join("schema/dbo.u.yml")).unwrap();
+    std::fs::write(
+        d.dir.join("schema/app.u.yml"),
+        "table: app.u\ncolumns:\n  id: {type: int, nullable: false}\n\
+         primary_key: [id]\nchecks:\n  c: id > 0\n",
+    )
+    .unwrap();
+    let o = d.run(&["validate"]);
+    assert!(
+        !stderr(&o).contains("one namespace per schema"),
+        "{}",
+        stderr(&o)
+    );
+}
+
 /// A trigger has to name a table that is actually managed here, or pbps would
 /// be maintaining a trigger on an object it knows nothing about.
 #[test]

@@ -1897,6 +1897,34 @@ pub trait Dialect {
         false
     }
 
+    /// Whether this engine keeps constraint names in one namespace per schema
+    /// with tables, views, routines and triggers, so that two tables may not
+    /// declare constraints of one name (issue #496).
+    ///
+    /// SQL Server does: every primary key, unique, check, foreign-key and
+    /// default constraint is a row in `sys.objects`, whose names are unique
+    /// per schema. Measured on 17.0.4075.5, each of these is refused (Msg 1750
+    /// after Msg 2714, or 2714 alone for a table):
+    ///
+    /// ```text
+    /// CREATE TABLE app.a (id int CONSTRAINT c CHECK (id > 0));
+    /// CREATE TABLE app.b (id int CONSTRAINT c CHECK (id > 0));        -- check vs check
+    /// CREATE TABLE app.b (pid int CONSTRAINT c REFERENCES app.p(id)); -- foreign key vs check
+    /// CREATE TABLE app.b (id int CONSTRAINT t PRIMARY KEY);           -- beside a table `app.t`
+    /// CREATE TABLE app.b (id int CONSTRAINT v UNIQUE);                -- beside a view `app.v`
+    /// CREATE TABLE app.b (id int CONSTRAINT p CHECK (id > 0));        -- beside a procedure, a
+    ///                                                                  -- function or a trigger
+    /// ```
+    ///
+    /// while `CREATE INDEX c ON app.b (id)` beside that check, and the same
+    /// check name in another schema, are both accepted. That is the default,
+    /// `true`. PostgreSQL keeps a check or foreign-key name per table and puts
+    /// only the index behind a key in its relation namespace, which
+    /// [`Dialect::indexes_share_namespace_with_tables`] already covers.
+    fn constraints_share_namespace_with_tables(&self) -> bool {
+        true
+    }
+
     /// Where `to` sits on the path a bare name in a definition in `from` is
     /// looked up along, or `None` where it is not on that path at all
     /// (DECISIONS 317).
@@ -2354,6 +2382,109 @@ pub fn check_index_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> 
                     "{} and {descriptor} are both named `{claim_name}`; {} keeps tables, \
                      views and indexes in one namespace per schema, so it can hold only one of \
                      them",
+                    existing.descriptor,
+                    dialect.name()
+                ));
+            }
+        }
+    }
+    problems
+}
+
+/// The whole-schema question of whether a declared constraint's name is taken
+/// in its schema, on an engine that keeps constraints in one namespace with
+/// tables, views, routines and triggers (issue #496).
+///
+/// `false` from [`Dialect::constraints_share_namespace_with_tables`] means
+/// there is nothing to check, the same short-circuit [`check_index_names`]
+/// takes. The namespace is seeded with every table and every module that
+/// shares it, and then each table's named primary key, unique constraints,
+/// foreign keys and checks are folded in, each checked against everything
+/// already claimed.
+///
+/// Two constraints of **one** table sharing a name are left to
+/// [`Table::constraint_name_conflicts`], which every dialect's
+/// `validate_table` runs, so one defect is not reported twice (issue #498's
+/// reasoning). A constraint named after its own table is reported here: the
+/// table-local rule does not compare against the table's name.
+///
+/// Compared exactly. Validation runs offline and cannot know the database's
+/// collation. A pair that differs only in a way a case- or accent-insensitive
+/// collation folds is still refused by the engine, loudly and before anything
+/// else of the statement runs; this rule exists so that the exact pair, which
+/// no collation separates, is refused before a plan is written.
+pub fn check_constraint_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> {
+    if !dialect.constraints_share_namespace_with_tables() {
+        return Vec::new();
+    }
+    /// A name already taken, by what, and — for a constraint — which table's
+    /// own rule already compares it.
+    struct Claim<'a> {
+        descriptor: String,
+        constraint_of: Option<&'a TableName>,
+    }
+    let mut claimed: BTreeMap<ObjectName, Claim<'_>> = BTreeMap::new();
+    for name in schema.tables.keys() {
+        claimed.insert(
+            name.clone(),
+            Claim {
+                descriptor: format!("table `{name}`"),
+                constraint_of: None,
+            },
+        );
+    }
+    for (id, module) in &schema.modules {
+        if dialect.shares_namespace_with_tables(module.kind) {
+            claimed.insert(
+                id.object_name(),
+                Claim {
+                    descriptor: format!("{} `{id}`", module.kind),
+                    constraint_of: None,
+                },
+            );
+        }
+    }
+    let mut problems = Vec::new();
+    for (table_name, table) in &schema.tables {
+        let named = table
+            .primary_key
+            .as_ref()
+            .and_then(|pk| pk.name.as_deref())
+            .map(|name| (name, "primary key"))
+            .into_iter()
+            .chain(
+                table
+                    .unique
+                    .keys()
+                    .map(|n| (n.as_str(), "unique constraint")),
+            )
+            .chain(
+                table
+                    .foreign_keys
+                    .keys()
+                    .map(|n| (n.as_str(), "foreign key")),
+            )
+            .chain(
+                table
+                    .checks
+                    .keys()
+                    .map(|n| (n.as_str(), "check constraint")),
+            );
+        for (name, kind) in named {
+            let claim_name = ObjectName::new(table_name.schema.clone(), name);
+            let descriptor = format!("{kind} `{table_name}.{name}`");
+            let claim = Claim {
+                descriptor: descriptor.clone(),
+                constraint_of: Some(table_name),
+            };
+            if let Some(existing) = claimed.insert(claim_name.clone(), claim) {
+                if existing.constraint_of == Some(table_name) {
+                    continue;
+                }
+                problems.push(format!(
+                    "{} and {descriptor} are both named `{claim_name}`; {} keeps tables, views, \
+                     routines, triggers and constraints in one namespace per schema, so it can \
+                     hold only one of them",
                     existing.descriptor,
                     dialect.name()
                 ));
@@ -2925,6 +3056,9 @@ mod tests {
         fn indexes_share_namespace_with_tables(&self) -> bool {
             true
         }
+        fn constraints_share_namespace_with_tables(&self) -> bool {
+            false
+        }
         /// The modifiers a column keeps: `varchar(10)` and `varchar(20)` are
         /// one function to this engine, and `f(varchar)` is what it calls
         /// both. Text in, text out — the argument of a routine identity is not
@@ -3147,6 +3281,93 @@ mod tests {
             schema.tables.insert(name.parse().unwrap(), table.clone());
         }
         schema
+    }
+
+    fn with_foreign_key(mut table: Table, name: &str) -> Table {
+        table.foreign_keys.insert(
+            name.to_owned(),
+            pbps_model::ForeignKey {
+                columns: vec!["n".to_owned()],
+                references_table: "coll.parent".parse().unwrap(),
+                references_columns: vec!["n".to_owned()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+        table
+    }
+
+    /// Issue #496, measured on SQL Server 17.0.4075.5: two tables in one
+    /// schema declaring checks of one name cannot both be created, and a
+    /// foreign key of that name collides with the check the same way.
+    /// PostgreSQL 18.6 creates all three.
+    #[test]
+    fn two_tables_constraints_of_one_name_collide_only_where_constraints_share_the_namespace() {
+        let schema = schema_of(&[
+            ("coll.t1", with_check(table(), "c")),
+            ("coll.t2", with_check(table(), "c")),
+            ("coll.t3", with_foreign_key(table(), "c")),
+        ]);
+        let problems = check_constraint_names(&schema, &MinimalDialect);
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(
+            problems[0].contains("check constraint `coll.t1.c`")
+                && problems[0].contains("check constraint `coll.t2.c`"),
+            "{problems:?}"
+        );
+        assert!(
+            problems[1].contains("foreign key `coll.t3.c`"),
+            "{problems:?}"
+        );
+        assert!(
+            check_constraint_names(&schema, &OverloadingDialect).is_empty(),
+            "a check or foreign-key name is per table on PostgreSQL"
+        );
+    }
+
+    /// The same namespace holds the tables, so a constraint named after
+    /// another table, or after its own, collides with it (#496).
+    #[test]
+    fn a_constraint_named_after_a_table_collides_where_constraints_share_the_namespace() {
+        let schema = schema_of(&[
+            ("coll.t1", table()),
+            ("coll.t2", with_primary_key(table(), "t1")),
+            ("coll.t3", with_unique(table(), "t3")),
+        ]);
+        let problems = check_constraint_names(&schema, &MinimalDialect);
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("table `coll.t1`") && p.contains("primary key `coll.t2.t1`")),
+            "{problems:?}"
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("table `coll.t3`")
+                    && p.contains("unique constraint `coll.t3.t3`")),
+            "{problems:?}"
+        );
+    }
+
+    /// The negative cases: another schema is another namespace, an index is
+    /// not in it (measured: `CREATE INDEX c` beside a check `c` is accepted),
+    /// and two constraints of one table are the table-local rule's to report,
+    /// once (#179, #498).
+    #[test]
+    fn constraint_names_in_other_schemas_indexes_and_one_tables_own_are_not_this_rules() {
+        let schema = schema_of(&[
+            ("coll.t1", with_check(table(), "c")),
+            ("other.t2", with_check(table(), "c")),
+            ("coll.t3", with_index(table(), "c")),
+            ("coll.t4", with_unique(with_check(table(), "k"), "k")),
+        ]);
+        assert!(
+            check_constraint_names(&schema, &MinimalDialect).is_empty(),
+            "{:?}",
+            check_constraint_names(&schema, &MinimalDialect)
+        );
     }
 
     /// Two tables in one schema declaring an index of the same name is the

@@ -2643,6 +2643,82 @@ async fn a_differently_cased_table_on_a_case_sensitive_database_is_not_the_ledge
     db.drop().await;
 }
 
+/// Issue #496's premise, pinned: every constraint is a schema object beside
+/// tables, views, routines and triggers, so `check_constraint_names` refuses
+/// what the engine would. An index is not in the namespace, and another schema
+/// is another namespace. A pair differing only in case collides where the
+/// collation folds it and not where it does not; validation compares exactly,
+/// and leaves that pair to this loud refusal.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn constraints_share_a_schemas_namespace_with_tables_and_routines() {
+    let mut db = TestDb::create("constraintns496").await;
+    for batch in [
+        "IF SCHEMA_ID(N'app') IS NULL EXEC(N'CREATE SCHEMA app;');",
+        "EXEC(N'CREATE SCHEMA other;');",
+        "CREATE TABLE app.p (id int PRIMARY KEY); CREATE TABLE app.t (id int);
+         CREATE TABLE app.a (id int CONSTRAINT c CHECK (id > 0)); CREATE TABLE app.b (id int);",
+        "EXEC(N'CREATE VIEW app.v AS SELECT 1 AS x;');",
+        "EXEC(N'CREATE PROCEDURE app.pr AS SELECT 1;');",
+    ] {
+        db.conn.execute(batch).await.expect(batch);
+    }
+    for (sql, refused) in [
+        (
+            "CREATE TABLE app.x1 (id int CONSTRAINT c CHECK (id > 0));",
+            true,
+        ),
+        (
+            "CREATE TABLE app.x2 (pid int CONSTRAINT c REFERENCES app.p(id));",
+            true,
+        ),
+        (
+            "CREATE TABLE app.x3 (id int CONSTRAINT t PRIMARY KEY);",
+            true,
+        ),
+        ("CREATE TABLE app.x4 (id int CONSTRAINT v UNIQUE);", true),
+        (
+            "CREATE TABLE app.x5 (id int CONSTRAINT pr CHECK (id > 0));",
+            true,
+        ),
+        (
+            "CREATE TABLE app.x6 (id int CONSTRAINT x6 PRIMARY KEY);",
+            true,
+        ),
+        ("CREATE INDEX c ON app.b (id);", false),
+        (
+            "CREATE TABLE other.x7 (id int CONSTRAINT c CHECK (id > 0));",
+            false,
+        ),
+        // The pinned default collation is case-insensitive.
+        (
+            "CREATE TABLE app.x8 (id int CONSTRAINT C CHECK (id > 0));",
+            true,
+        ),
+    ] {
+        let result = db.conn.execute(sql).await;
+        assert_eq!(result.is_err(), refused, "{sql}: {result:?}");
+    }
+    db.drop().await;
+
+    let mut db = TestDb::create("constraintns496cs").await;
+    db.conn
+        .execute(&format!(
+            "USE master; ALTER DATABASE [{0}] COLLATE Latin1_General_CS_AS; USE [{0}];",
+            db.name
+        ))
+        .await
+        .expect("a case-sensitive database");
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.a (id int CONSTRAINT c CHECK (id > 0));
+             CREATE TABLE dbo.b (id int CONSTRAINT C CHECK (id > 0));",
+        )
+        .await
+        .expect("constraint names differing in case are two names here");
+    db.drop().await;
+}
+
 /// SPEC §8.1: the whole state goes in and comes back out unchanged. Everything
 /// downstream — drift, the plan checksum, `status` — reads this row, so a
 /// serialization that lost a field would make every one of them quietly wrong.
