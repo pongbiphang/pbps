@@ -86,17 +86,28 @@ checksum-pinned, and state lives in the database itself.
   code review; wait for it. A security review is optional: if run, its findings
   use the same triage rules, but its completion is not a gate.
 - In the ready phase, a completed code review with no findings qualifies the PR
-  for CI immediately. Otherwise, obtain three consecutive completed code
-  reviews with no P0 or P1; P2/P3 findings do not reset the count, but each must
+  for CI immediately: approve the run on the head. Otherwise, obtain three
+  consecutive completed code reviews with no P0 or P1; P2/P3 findings do not reset the count, but each must
   be fixed or deferred under the finding rules. The latest counted review must
   name the current pushed head.
 - A P0 or P1 in a ready-phase code review resets the count: address it under the
   finding rules (P0 is always fixed; P1 is fixed or deferred according to the
   three-case list), move the PR back to draft, and resume the loop.
-- CI runs itself on every push to the branch, so by the time the ready-phase
-  gate qualifies there is a run on the head already. Wait for `ci-gate` on the
-  current head and read the run, not `check-runs`, which lists only the jobs
-  created so far. Retry a transient failure with `gh run rerun <run-id>`
+- **CI on a pull request runs only when approved** (DEC-1017.1). Every push
+  starts a run, but it stops at `approval`, held by the `ci-approval`
+  environment, and runs nothing; the next push cancels it. Do not approve
+  during the review loop. Approve exactly one run: the one on the current head,
+  once the ready-phase gate below qualifies it — or once the resulting-head
+  review of a rebase does. The primary agent approves it:
+  `gh api repos/{owner}/{repo}/actions/runs/<run-id>/pending_deployments -X POST
+  -F 'environment_ids[]=<id>' -f state=approved -f comment='review qualified'`,
+  with the id from `GET .../pending_deployments` on the same run. Until it is
+  approved `ci-gate` is pending and the pull request cannot be queued. The
+  merge group, `master` and dispatched runs name no environment and start by
+  themselves.
+- Wait for `ci-gate` on the approved run and read the run, not `check-runs`,
+  which lists only the jobs created so far. Retry a transient failure with
+  `gh run rerun <run-id>`
   (`--failed` for the failed jobs alone): a re-run keeps the run's pull-request
   association, so its `ci-gate` is the one the merge box reads. Never reach for
   `gh workflow run ci.yml` to do that — it starts a `workflow_dispatch` run
@@ -121,8 +132,8 @@ checksum-pinned, and state lives in the database itself.
   directly to a linked `deferred-review` issue. A P0 or P1 must be addressed
   and followed by another completed resulting-head code review. Once that
   review has no P0 or P1, the PR may proceed without repeating the draft or
-  ready three-review gates; all branch checks required on that head must still
-  be green.
+  ready three-review gates; approve the run on that head, and all branch checks
+  required on it must still be green.
 - Before **enqueueing**, the primary agent independently verifies the
   issue-to-diff match, architecture, local-test evidence, review counts and
   heads, thread dispositions, dependency order, and required CI checks. That
