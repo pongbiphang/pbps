@@ -75,6 +75,20 @@ pub(crate) fn order(
                 edges[i].extend(waiting);
             }
         }
+        // A table moved to another schema carries its indexes (PostgreSQL's
+        // SET SCHEMA) or constraints (SQL Server's TRANSFER) into it, where a
+        // name another object holds refuses the whole move. Measured on
+        // 17.0.4075.5: `ALTER SCHEMA s2 TRANSFER s1.old` is refused (Msg 15530)
+        // while `old` has a check `c` and `s2.c` is a table, and succeeds once
+        // the check is dropped. One this plan drops anyway has nothing to
+        // carry, so it goes first, addressed by the source name (review of
+        // #969).
+        if let Some((rename, _)) = owners.get(table)
+            && source.schema != table.schema
+        {
+            drops.insert(i);
+            edges[i].insert(*rename);
+        }
         if drops.contains(&i)
             && let Some(t) = before(table)
         {

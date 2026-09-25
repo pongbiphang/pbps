@@ -5685,6 +5685,85 @@ mod tests {
         );
     }
 
+    /// Review of #969: a table moved to another schema carries its constraints
+    /// (SQL Server) or indexes (PostgreSQL) there, and a name another object
+    /// holds in the destination refuses the whole move. Measured on
+    /// 17.0.4075.5: `ALTER SCHEMA s2 TRANSFER s1.old` is refused (Msg 15530)
+    /// while `old` has a check `c` and `s2.c` is a table. One the plan drops
+    /// anyway goes first, addressed by the source name. A rename within one
+    /// schema carries nothing, and its drop stays after it under the declared
+    /// name.
+    #[test]
+    fn a_moved_tables_dropped_constraint_or_index_runs_before_the_transfer() {
+        let mut old_t = table(&[("id", Column::new(ty("int")))]);
+        old_t.checks.insert(
+            "c".into(),
+            pbps_model::schema::CheckConstraint {
+                expression: "id > 0".into(),
+            },
+        );
+        old_t.indexes.insert(
+            "ix".into(),
+            Index {
+                columns: vec![IndexColumn {
+                    name: "id".into(),
+                    descending: false,
+                }],
+                include: vec![],
+                unique: false,
+                filter: None,
+            },
+        );
+        let bare = table(&[("id", Column::new(ty("int")))]);
+        let base = two_tables(("s1.old", old_t), ("s2.c", bare.clone()));
+        let declared = two_tables(("s2.new", bare.clone()), ("s2.c", bare.clone()));
+        let moved = [Intent::RenameTable {
+            from: "s1.old".parse().unwrap(),
+            to: "s2.new".parse().unwrap(),
+        }];
+        let first_before_rename = |cs: &ChangeSet, kind: &str| {
+            let at = |k: &str| kinds(cs).iter().position(|x| x == k).unwrap();
+            assert!(at(kind) < at("RenameTable"), "{kind} first: {cs:?}");
+            let table = cs.changes[at(kind)].change.table().unwrap().clone();
+            assert_eq!(
+                table,
+                "s1.old".parse().unwrap(),
+                "by the source name: {cs:?}"
+            );
+        };
+
+        let cs = run_with(&MinimalDialect, &base, &declared, &moved);
+        first_before_rename(&cs, "DropCheck");
+        let cs = run_with(&SharesIndexNamespace, &base, &declared, &moved);
+        first_before_rename(&cs, "DropIndex");
+
+        // Within one schema nothing is carried, and nothing moves.
+        let base = two_tables(
+            ("s1.old", {
+                let mut t = bare.clone();
+                t.checks.insert(
+                    "c".into(),
+                    pbps_model::schema::CheckConstraint {
+                        expression: "id > 0".into(),
+                    },
+                );
+                t
+            }),
+            ("s2.c", bare.clone()),
+        );
+        let declared = two_tables(("s1.new", bare.clone()), ("s2.c", bare));
+        let cs = run_with(
+            &MinimalDialect,
+            &base,
+            &declared,
+            &[Intent::RenameTable {
+                from: "s1.old".parse().unwrap(),
+                to: "s1.new".parse().unwrap(),
+            }],
+        );
+        assert_eq!(kinds(&cs), ["RenameTable", "DropCheck"], "{cs:?}");
+    }
+
     /// The same for a foreign key, the other constraint no index backs.
     #[test]
     fn a_dropped_foreign_key_that_frees_a_renamed_targets_name_precedes_the_rename() {

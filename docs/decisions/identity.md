@@ -526,6 +526,10 @@ Measured on 17.0.4075.5: `sp_rename 'dbo.old', 'c'` is refused (Msg 15335)
 while a check `c` exists, and succeeds after it is dropped. `rename_order` now
 takes the dialect's two answers: an index releases a name only where indexes
 share the namespace, and a check or foreign key only where constraints do.
+A table moved to another schema carries its constraints (SQL Server's
+`TRANSFER`) or indexes (PostgreSQL's `SET SCHEMA`) into it, and a name held
+there refuses the move (Msg 15530, measured). So each one the plan drops anyway
+goes before the move, addressed by the source name.
 
 The default constraints the emitter names itself are in that namespace too
 (#969), and `DF_{table}_{column}` did not say where the table ended:
