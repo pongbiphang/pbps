@@ -1951,7 +1951,7 @@ could fail validation against the envelope schema published before it
   value, or a field added to one of the few objects that constrain the
   properties they do not name. Those objects are the ones that restrict
   `additionalProperties`, `unevaluatedProperties` or `propertyNames`, or set
-  `maxProperties`.
+  `patternProperties` or `maxProperties`.
 
 A consumer that parses `data` strictly accepts that it must update with the
 tool.

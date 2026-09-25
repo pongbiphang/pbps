@@ -653,8 +653,8 @@ the validation outcome does.
   refused can be emitted, and so does a new enum value. A field added to an
   object that constrains the properties it does not name fails it as well.
   Such an object restricts `additionalProperties` or `unevaluatedProperties`
-  (to `false` or a schema), restricts `propertyNames`, or sets
-  `maxProperties`. These move the version together with the
+  (to `false` or a schema), sets `patternProperties`, restricts
+  `propertyNames`, or sets `maxProperties`. These move the version together with the
   schema's `const` (DECISIONS 224).
 
 Moving the version on every addition was the alternative. It would make every

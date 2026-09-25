@@ -478,8 +478,8 @@ mod tests {
     /// against the older document still accepts the envelope that carries it
     /// (DEC-997.1). An object that constrains the properties it does not name
     /// (through `additionalProperties`, `unevaluatedProperties`,
-    /// `propertyNames` or `maxProperties`) refuses some additions, so each one
-    /// is named here on purpose.
+    /// `patternProperties`, `propertyNames` or `maxProperties`) refuses some
+    /// additions, so each one is named here on purpose.
     ///
     /// `ResolverProfile` is the configuration's own type, echoed by a connected
     /// plan's resolver selection, and stays closed so `pbps.yml` refuses a
@@ -644,6 +644,10 @@ mod tests {
                 "Map": { "type": "object", "additionalProperties": { "type": "string" } },
                 "Named": { "type": "object", "propertyNames": { "pattern": "^a" } },
                 "Bounded": { "type": "object", "maxProperties": 2 },
+                "Patterned": {
+                    "type": "object",
+                    "patternProperties": { "^x": { "type": "string" } }
+                },
                 "Unevaluated": { "type": "object", "unevaluatedProperties": false },
                 "Nested": { "oneOf": [{ "properties": {
                     "inner": {
@@ -665,6 +669,7 @@ mod tests {
                 "Map",
                 "Named",
                 "Nested/oneOf/0/properties/inner",
+                "Patterned",
                 "Unevaluated"
             ]
         );
@@ -777,6 +782,10 @@ mod tests {
                 || restricts(map.get("unevaluatedProperties"))
                 || restricts(map.get("propertyNames"))
                 || map.contains_key("maxProperties")
+                || map
+                    .get("patternProperties")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|patterns| !patterns.is_empty())
         }
         fn walk(
             schema: &serde_json::Value,
