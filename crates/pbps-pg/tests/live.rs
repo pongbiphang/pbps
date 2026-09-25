@@ -23630,27 +23630,41 @@ async fn a_temporal_precision_change_is_estimated_as_the_engine_rebuilds_it() {
     fresh(&mut conn, &s).await;
 
     conn.execute(&format!(
-        "CREATE TABLE {s}.verdict (src text, dst text, populated boolean, rebuilt boolean);
+        "CREATE TABLE {s}.verdict (src text, dst text, populated boolean, rebuilt boolean,
+                                    indexes_rebuilt boolean);
          DO $do$
          DECLARE b text; f text; t text; pop boolean; before oid; after oid;
+                 ix_before oid; ix_after oid; pk_before oid; pk_after oid;
          BEGIN
            FOREACH b IN ARRAY ARRAY['time', 'timetz', 'timestamp', 'timestamptz'] LOOP
              FOREACH f IN ARRAY ARRAY['', '(0)', '(1)', '(2)', '(3)', '(4)', '(5)', '(6)'] LOOP
                FOREACH t IN ARRAY ARRAY['', '(0)', '(1)', '(2)', '(3)', '(4)', '(5)', '(6)'] LOOP
                  FOREACH pop IN ARRAY ARRAY[false, true] LOOP
                    EXECUTE 'DROP TABLE IF EXISTS {s}.m';
-                   EXECUTE format('CREATE TABLE {s}.m (id int PRIMARY KEY, c %s)', b || f);
+                   -- The altered column is indexed twice over, by a plain
+                   -- index and by the primary key's, so the index side of
+                   -- ADR-0012's boundary is measured with the table.
+                   EXECUTE format(
+                     'CREATE TABLE {s}.m (id int, c %s, CONSTRAINT m_pk PRIMARY KEY (c, id))',
+                     b || f);
+                   EXECUTE 'CREATE INDEX m_ix ON {s}.m (c)';
                    IF pop THEN
                      EXECUTE format(
-                       'INSERT INTO {s}.m SELECT g, %L::%s FROM generate_series(1, 50) g',
+                       'INSERT INTO {s}.m SELECT g, %L::%s + make_interval(secs => g)
+                          FROM generate_series(1, 50) g',
                        CASE WHEN b LIKE 'timestamp%' THEN '2026-09-25 12:34:56.123456'
                             ELSE '12:34:56.123456' END,
                        b || f);
                    END IF;
                    SELECT relfilenode INTO before FROM pg_class WHERE oid = '{s}.m'::regclass;
+                   SELECT relfilenode INTO ix_before FROM pg_class WHERE oid = '{s}.m_ix'::regclass;
+                   SELECT relfilenode INTO pk_before FROM pg_class WHERE oid = '{s}.m_pk'::regclass;
                    EXECUTE format('ALTER TABLE {s}.m ALTER COLUMN c TYPE %s', b || t);
                    SELECT relfilenode INTO after FROM pg_class WHERE oid = '{s}.m'::regclass;
-                   INSERT INTO {s}.verdict VALUES (b || f, b || t, pop, before <> after);
+                   SELECT relfilenode INTO ix_after FROM pg_class WHERE oid = '{s}.m_ix'::regclass;
+                   SELECT relfilenode INTO pk_after FROM pg_class WHERE oid = '{s}.m_pk'::regclass;
+                   INSERT INTO {s}.verdict VALUES (b || f, b || t, pop, before <> after,
+                                                   ix_before <> ix_after AND pk_before <> pk_after);
                  END LOOP;
                END LOOP;
              END LOOP;
@@ -23662,7 +23676,8 @@ async fn a_temporal_precision_change_is_estimated_as_the_engine_rebuilds_it() {
 
     let rows = conn
         .query(&format!(
-            "SELECT src, dst, populated, rebuilt FROM {s}.verdict ORDER BY src, dst, populated"
+            "SELECT src, dst, populated, rebuilt, indexes_rebuilt FROM {s}.verdict \
+             ORDER BY src, dst, populated"
         ))
         .await
         .expect("read the matrix");
@@ -23678,6 +23693,16 @@ async fn a_temporal_precision_change_is_estimated_as_the_engine_rebuilds_it() {
             .expect("populated")
             .expect("not null");
         let engine: bool = row.try_get("rebuilt").expect("rebuilt").expect("not null");
+        let indexes: bool = row
+            .try_get("indexes_rebuilt")
+            .expect("indexes_rebuilt")
+            .expect("not null");
+        // The indexes over the column move with the table and only with it:
+        // a precision that holds or widens rebuilds neither.
+        assert_eq!(
+            indexes, engine,
+            "{src} -> {dst} (populated={populated}): indexes rebuilt={indexes}, table={engine}"
+        );
         rebuilt += usize::from(engine);
         let change = Change::AlterColumnType {
             uid: "c_aaaaaa".parse().expect("a uid"),
@@ -23717,6 +23742,40 @@ async fn a_temporal_precision_change_is_estimated_as_the_engine_rebuilds_it() {
         4 * 27 * 2,
         "the narrowing pairs, and only they, rebuild"
     );
+
+    // And through the connected estimate, over an indexed column: a widening
+    // stays `No`, because the index is not rebuilt either (measured above), and
+    // a narrowing is still taken back to unknown by `against`, which ADR-0012
+    // keeps for an index dragged through a rebuild.
+    conn.execute(&format!(
+        "DROP TABLE IF EXISTS {s}.m;
+         CREATE TABLE {s}.m (id int, c timestamp(3), CONSTRAINT m_pk PRIMARY KEY (c, id));
+         CREATE INDEX m_ix ON {s}.m (c);"
+    ))
+    .await
+    .expect("an indexed temporal column");
+    for (to, widening) in [("timestamp(6)", true), ("timestamp(0)", false)] {
+        let change = Change::AlterColumnType {
+            uid: "c_aaaaaa".parse().expect("a uid"),
+            column: TableName::new(&s, "m").column("c"),
+            from: ty("timestamp(3)"),
+            to: ty(to),
+            from_nullable: false,
+            to_nullable: false,
+        };
+        let mut ours = one_estimate(&change, Strategy::default()).expect("an estimate");
+        pbps_pg::estimate::against(&mut conn, &mut ours)
+            .await
+            .expect("the connected estimate");
+        if widening {
+            assert_eq!(ours.rewrite, Rewrite::No, "timestamp(3) -> {to}: {ours:#?}");
+        } else {
+            assert!(
+                matches!(&ours.rewrite, Rewrite::Unknown(why) if why.contains("index")),
+                "timestamp(3) -> {to}: {ours:#?}"
+            );
+        }
+    }
 
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await

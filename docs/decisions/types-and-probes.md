@@ -1640,6 +1640,14 @@ precision is below the source's, counting an omitted precision as 6. So
 `timestamp -> timestamp(5)` rebuilds. Populated and empty tables agree: the
 rewrite is a property of the statement.
 
+The column's indexes were measured with it. The altered column carried both
+a plain index and a primary key's. Each index's `relfilenode` moved in exactly
+the 216 narrowing statements, and in none of the 296 that hold or widen the
+precision, on both engines. So the index side of ADR-0012's boundary needs no
+new answer. `against` takes an indexed column's estimate back to unknown only
+where the table is rebuilt, which drags the index along. A widening that
+rebuilds nothing rebuilds no index either, and its `No` stands.
+
 The estimator now answers this family by that rule, for the same base only. A
 change into another base keeps its existing answer, including the
 session-dependent `timestamp -> timestamptz`. `TypeChangeRisk` is untouched,
