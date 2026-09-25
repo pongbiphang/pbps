@@ -1515,13 +1515,19 @@ async fn isolated_pulls_and_read_backs_survive_continuous_foreign_ddl() {
     conn.execute("CREATE TABLE public.kept (id integer PRIMARY KEY)")
         .await
         .expect("our fixture");
+    // The writers get a database of their own, not the shared
+    // `PBPS_TEST_PG_DB`: the deliberate module and constraint race tests
+    // introspect that one and count any catalog-changed error toward their
+    // coverage, so this churn could satisfy them without the drop each one
+    // targets ever being seen (#417). The reader stays in its own database.
+    let neighbour = TestDb::create("pull_churn_writers").await;
     let stop = Arc::new(AtomicBool::new(false));
     let writes = Arc::new(AtomicUsize::new(0));
     let mut writers = Vec::new();
     let mut schemas = Vec::new();
     for writer in 0..4 {
         let schema = probe_schema(&format!("churn_{writer}"));
-        let mut other = connect().await;
+        let mut other = neighbour.second().await;
         build(
             &mut other,
             &schema,
@@ -1612,6 +1618,7 @@ async fn isolated_pulls_and_read_backs_survive_continuous_foreign_ddl() {
         started.elapsed()
     );
     conn.drop().await;
+    neighbour.drop().await;
 }
 
 /// The limitations this suite's own schema earned.
