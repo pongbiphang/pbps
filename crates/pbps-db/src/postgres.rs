@@ -241,7 +241,7 @@ impl Conn {
         // socket option (issue #113).
         let tcp = crate::open_socket(&addr, budget, shuffle).await?;
         tcp.set_nodelay(true)
-            .map_err(|source| DbError::Connect { addr, source })?;
+            .map_err(|reason| DbError::Connect { addr, reason })?;
         // `addr` was just moved above (see the note on `require_session`
         // below), so this and every later error in `connect` names the
         // endpoint through a freshly built string instead.
@@ -253,9 +253,9 @@ impl Conn {
         // place that does, and this seam does not call it (issue #113).
         apply_socket_options(&tcp, &config, tcp_user_timeout, &format!("{host}:{port}"))?;
         let endpoints =
-            crate::transport::TcpEndpoints::capture(&tcp).map_err(|source| DbError::Connect {
+            crate::transport::TcpEndpoints::capture(&tcp).map_err(|reason| DbError::Connect {
                 addr: format!("{host}:{port}"),
-                source,
+                reason,
             })?;
 
         // `connect_raw`, not `connect`: the driver's own `connect` opens the
@@ -666,18 +666,18 @@ fn apply_socket_options(
 
     if let Some(keepalive) = keepalive_settings(config) {
         sock.set_tcp_keepalive(&keepalive)
-            .map_err(|source| DbError::Connect {
+            .map_err(|reason| DbError::Connect {
                 addr: addr.to_owned(),
-                source,
+                reason,
             })?;
     }
 
     if let Some(timeout) = tcp_user_timeout {
         #[cfg(target_os = "linux")]
         sock.set_tcp_user_timeout(Some(timeout))
-            .map_err(|source| DbError::Connect {
+            .map_err(|reason| DbError::Connect {
                 addr: addr.to_owned(),
-                source,
+                reason,
             })?;
         #[cfg(not(target_os = "linux"))]
         unreachable!(

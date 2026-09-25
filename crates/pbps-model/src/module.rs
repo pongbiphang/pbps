@@ -598,12 +598,13 @@ pub enum ModuleIdError {
     )]
     NotARoutine(String),
 
-    #[error("`{argument}` in `{whole}` is not a type: {source}")]
+    /// `reason`, not `source`: the text already ends with it, and a chain
+    /// renderer would print it twice (#1018).
+    #[error("`{argument}` in `{whole}` is not a type: {reason}")]
     Argument {
         whole: String,
         argument: String,
-        #[source]
-        source: RoutineArgError,
+        reason: RoutineArgError,
     },
 }
 
@@ -733,7 +734,7 @@ impl FromStr for ModuleId {
                     types.push(arg.parse().map_err(|e| ModuleIdError::Argument {
                         whole: s.to_owned(),
                         argument: arg.trim().to_owned(),
-                        source: e,
+                        reason: e,
                     })?);
                 }
             }
@@ -1665,6 +1666,16 @@ pub fn check_dependencies(schema: &crate::schema::Schema, deps: &ModuleDeps) -> 
 mod tests {
     use super::*;
     use crate::schema::{Schema, Table};
+
+    /// A bad argument type is named once: inside the error's own text, not
+    /// again as its source, which a chain renderer would print twice (#1018).
+    #[test]
+    fn a_bad_routine_argument_names_its_reason_once() {
+        let error = "app.f(integer, )".parse::<ModuleId>().unwrap_err();
+        assert!(matches!(error, ModuleIdError::Argument { .. }), "{error:?}");
+        assert!(std::error::Error::source(&error).is_none(), "{error:?}");
+        assert!(error.to_string().contains("is not a type: "), "{error}");
+    }
 
     fn n(s: &str) -> ObjectName {
         s.parse().unwrap()
