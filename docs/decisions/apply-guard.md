@@ -1053,43 +1053,49 @@ owner, here the plain role, can run `ALTER EXTENSION … UPDATE`, whose trusted
 script replaces member routines and leaves their owner alone, or it can drop
 the extension and create it at another version. So an extension member is also
 in the set when a non-superuser holds its extension's owner's rights, by the
-same `USAGE` or `SET` test. Its pin input then carries the extension's name and
+same `USAGE` or `SET` test. Its pin input then carries the extension's OID and
 `extversion` beside the routine. A routine that changes owner,
 or whose owner's membership changes, can enter or leave the set, and that is a
 change like any other.
 
-*What a pin holds.* One entry per schema. Each is an HMAC under the
-environment's key (DEC-952.1), with rule `pbps/external-routine-pin/v1` and the
-schema name as component. The input is the canonical list, in identity order,
-of the schema's in-scope routines. Each routine contributes:
-- its name and `pg_get_function_identity_arguments`;
-- its **whole `pg_proc` row**, read with `to_jsonb` minus `oid`. The row
-  holds OID-valued columns such as `proowner`, `prolang`, `prorettype`, the
-  argument types and `prosupport`. Each keeps its OID, and its qualified name
-  is added beside it (`regrole`, `regtype`, `regprocedure`). A `regproc`
-  column renders as a bare, ambiguous name in `to_jsonb`: `aggtransfn` came
-  back as `acc`, measured on 18.6 as the deployer. So a routine rebuilt under
-  the same name still differs by OID, and a name moved to another routine
-  differs by name. That covers the body,
-  volatility, `proparallel`, strictness, `SECURITY DEFINER`, `proconfig`,
-  cost, `proacl` and the owner. The column list is not chosen property by
-  property: a property left off a hand-picked list is a replacement the pin
-  cannot see. An aggregate that changes only `PARALLEL` differs only in
-  `proparallel`, which no `pg_aggregate` column holds. The row is read with
-  `to_jsonb` over the catalog, so a column a later PostgreSQL release adds
-  joins the input without a code change. A plan and an apply on different
-  server versions refuse before any comparison, because the release is
-  recorded beside the pins;
-- for an aggregate, its **whole `pg_aggregate` row** too, rendered the same
-  way, which names every support function and the sort operator;
-- nothing deparsed. `pg_get_functiondef` renders what the row already holds,
-  and it refuses an aggregate (SQLSTATE 42809, measured on 18.6 and in the live
-  suite), so the rows alone are the input for every kind.
+*What a pin holds.* One entry per schema, keyed by the schema's OID. Each is
+an HMAC under the environment's key (DEC-952.1), with rule
+`pbps/external-routine-pin/v1` and the namespace OID as component. The input
+is the canonical list of the schema's in-scope routines, in OID order. Each
+routine contributes:
+- its OID and its **whole `pg_proc` row**, read with `to_jsonb` minus `oid`
+  and minus `proacl`. That covers the body, volatility, `proparallel`,
+  strictness, `SECURITY DEFINER`, `proconfig`, cost and the owner. The column
+  list is not chosen property by property, because a property left off a
+  hand-picked list is a replacement the pin cannot see. An aggregate that
+  changes only `PARALLEL` differs only in `proparallel`, which no
+  `pg_aggregate` column holds. A column a later PostgreSQL release adds joins
+  the input without a code change. A plan and an apply on different server
+  versions refuse before any comparison, because the release is recorded
+  beside the pins;
+- its `proacl` as `aclexplode` rows of grantor OID, grantee OID, privilege and
+  grant option;
+- for an aggregate, its **whole `pg_aggregate` row** too;
+- for a member of an extension a non-superuser controls, the extension's OID
+  and `extversion`.
+
+Every reference in the input is an OID and never a name. `regproc` columns
+(`prosupport`, the `pg_aggregate` support functions) are cast to `oid`,
+because `to_jsonb` renders them as bare names. A name is what an approved plan
+legitimately changes. Measured on 18.6: a routine taking a table's row type
+kept a byte-identical row, less `proacl`, while the plan-shaped `ALTER TABLE …
+RENAME` and `ALTER ROLE … RENAME` ran. Its `pg_get_function_identity_arguments`
+went from `t1` to `t2`, and its `proacl` text changed with the grantee's name.
+Pinning names would make the closing check blame an approved rename on an
+external change. The engine binds these references by OID, so the OID is also
+the faithful input. A routine re-pointed to a different object differs, and a
+renamed object does not. Nothing is deparsed: `pg_get_functiondef` renders
+what the row already holds, and it refuses an aggregate (SQLSTATE 42809).
 
 The deployer can read all of these for another role's routine, even one whose
-`EXECUTE` is revoked from it (measured on 18.6). The saved plan records the
-schema names, their digests, their routine counts and the key identifier, in a
-new plan version. The plan checksum covers them as it covers the rest of the
+`EXECUTE` is revoked from it (measured on 18.6). The saved plan records
+each namespace OID with its name at plan time (for messages only), its digest
+and its routine count, plus the key identifier, in a new plan version. The plan checksum covers them as it covers the rest of the
 file. One entry per schema keeps a plan small when an extension brings hundreds
 of routines. It still lets a refusal say where the change is.
 
@@ -1118,11 +1124,12 @@ and unreadable differ). Each refusal names the schema and gives the remedy,
 which is to replan.
 
 A staged plan is checked under the lock before pre-flight, and again before
-each step's statements. It gets no transaction that spans its steps. A step's
-statement is permanent once it commits, so a mismatch found after that is a
-post-commit guard failure under DECISIONS 159: the step's checkpoint is
+each step's statements and after each step, before its checkpoint is recorded.
+The last step is covered too. It gets no transaction that spans its steps. A
+step's statement is permanent once it commits, so a mismatch found after it is
+a post-commit guard failure under DECISIONS 159: the step's checkpoint is
 recorded, and then the apply stops with the refusal. A replacement is caught
-at the next step boundary, not rolled back past it.
+at the step it happened in, not rolled back past it.
 
 The price is over-inclusion. A change between plan and apply to any unmanaged,
 non-superuser routine refuses the apply, even one this plan never runs. The

@@ -939,8 +939,9 @@ the last observation. Plans without resolver evidence retain the existing guard.
 pins, under the environment's fingerprint key, every unmanaged routine that a
 non-superuser can replace. `apply` refuses a changed pin under the lock before
 pre-flight, again inside the transaction before the first statement, and again
-before recording. A staged plan is checked before each step; a mismatch
-found after a step committed records that step's checkpoint, then stops. This detects a replaced routine; it does not lock one.
+before recording. A staged plan is checked before and after each step; a
+mismatch found after a step committed records that step's checkpoint, then
+stops. This detects a replaced routine; it does not lock one.
 
 ---
 
