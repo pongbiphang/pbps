@@ -1,7 +1,7 @@
-//! Engine routing for the native target's read-only identity check. The
+//! Engine routing for the native target's read-only identity and capture. The
 //! analysis-scope reads route through `resolver::scope`.
 
-use pbps_db::resolver::InstanceObservation;
+use pbps_db::resolver::{InstanceObservation, capture::CaptureError};
 use pbps_db::transport::PeerVerifiedConn;
 use pbps_db::{DbError, Driver};
 
@@ -26,3 +26,35 @@ pub(super) async fn identity(
 pub(in crate::resolver::native) use pbps_pg::resolver::capture::{
     NativeLibrary, NativeLibraryReader, RuntimeInputs, RuntimeResolution, native_library_candidates,
 };
+
+// The request and opaque catalog are PostgreSQL-specific private state, like
+// the engine's held-lock state (DECISIONS 417). Source-free refusals and
+// comparison reports use pbps-db's shared answer types. No catalog can mint
+// the separate native source capability (DEC-974.1).
+pub(super) use pbps_pg::resolver::capture::{CaptureScope, CapturedInputs};
+
+pub(super) async fn capture_with_runtime_inputs(
+    connection: &mut PeerVerifiedConn,
+    scope: &CaptureScope,
+) -> Result<(CapturedInputs, RuntimeInputs), CaptureError> {
+    match connection.driver() {
+        Driver::Postgres => {
+            pbps_pg::resolver::capture::capture_with_runtime_inputs(connection, scope).await
+        }
+        Driver::Mssql => Err(CaptureError::Unsupported {
+            engine: "SQL Server",
+        }),
+    }
+}
+
+pub(super) async fn capture(
+    connection: &mut PeerVerifiedConn,
+    scope: &CaptureScope,
+) -> Result<CapturedInputs, CaptureError> {
+    match connection.driver() {
+        Driver::Postgres => pbps_pg::resolver::capture::capture(connection, scope).await,
+        Driver::Mssql => Err(CaptureError::Unsupported {
+            engine: "SQL Server",
+        }),
+    }
+}

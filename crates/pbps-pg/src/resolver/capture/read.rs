@@ -18,25 +18,7 @@ pub(super) struct Read {
     pub session: super::session::Facts,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum Failure {
-    #[error(transparent)]
-    Coverage(#[from] super::Uncovered),
-    #[error("PostgreSQL target capture requires its own transaction")]
-    CallerTransaction,
-    #[error("PostgreSQL target capture cannot qualify this engine version")]
-    Version,
-    #[error("PostgreSQL target capture could not read a required catalog")]
-    Read,
-    #[error("PostgreSQL target capture received incomplete catalog input")]
-    Incomplete,
-    #[error("PostgreSQL catalog changed while canonical definitions were rendered")]
-    Changed,
-    #[error("PostgreSQL session inputs changed during target capture")]
-    EnvironmentChanged,
-    #[error("PostgreSQL target capture could not close its read transaction")]
-    Close,
-}
+pub(super) use pbps_db::resolver::capture::CaptureError as Failure;
 
 /// The lifecycle owner must expire/drop the connection if this future is
 /// cancelled. Ordinary failures roll back the transaction here; an already

@@ -65,35 +65,10 @@ pub struct CaptureScope {
     pub candidates: BTreeSet<CandidateSet>,
 }
 
-/// A safe, named coverage refusal; no source or property value is included.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("PostgreSQL capture cannot cover {class}: {condition}")]
-pub struct Uncovered {
-    pub class: String,
-    pub object: Option<ObjectIdentity>,
-    pub condition: &'static str,
-}
-
-impl Uncovered {
-    fn class(class: &str, condition: &'static str) -> Self {
-        Self {
-            class: class.into(),
-            object: None,
-            condition,
-        }
-    }
-    fn object(object: &ObjectIdentity, condition: &'static str) -> Self {
-        Self {
-            class: object.class.clone(),
-            object: Some(object.clone()),
-            condition,
-        }
-    }
-}
+pub use pbps_db::resolver::capture::{CaptureError, Uncovered};
 
 mod manifest;
 pub use manifest::CapturedInputs;
-pub use read::Failure as CaptureError;
 
 /// Read coherent catalog inputs and release the transaction before returning.
 /// This does not qualify executable content or a scratch runtime. The native
