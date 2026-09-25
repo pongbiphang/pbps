@@ -153,16 +153,34 @@ fn later_names_are_what_became_nameable_after_the_module() {
     step.created = Some(routine("int4"));
     assert_eq!(
         reconstruction.later_names(&routine("int4")).unwrap(),
-        ["v", "ix"].into_iter().collect()
+        [(Nameable::Relation, "v"), (Nameable::Index, "ix")]
+            .into_iter()
+            .collect()
     );
     // Another overload of the same name was not compiled at that step.
     assert!(reconstruction.later_names(&routine("text")).is_none());
     assert_eq!(
         reconstruction.later_names(&relation("v")).unwrap(),
-        ["ix"].into_iter().collect()
+        [(Nameable::Index, "ix")].into_iter().collect()
     );
     // A table is not a module.
     assert!(reconstruction.later_names(&relation("t")).is_none());
+}
+
+/// A later object could only have taken a binding it can be resolved as:
+/// an index never a routine call, a routine never a relation.
+#[test]
+fn a_later_object_shadows_only_what_it_could_be_resolved_as() {
+    assert!(Nameable::Index.shadows("pg_class"));
+    assert!(!Nameable::Index.shadows("pg_proc"));
+    assert!(!Nameable::Index.shadows("pg_type"));
+    assert!(Nameable::Routine.shadows("pg_proc"));
+    assert!(Nameable::Routine.shadows("pg_type"));
+    assert!(!Nameable::Routine.shadows("pg_class"));
+    assert!(Nameable::Relation.shadows("pg_class"));
+    assert!(Nameable::Relation.shadows("pg_type"));
+    assert!(!Nameable::Relation.shadows("pg_proc"));
+    assert!(!Nameable::Relation.shadows("column"));
 }
 
 /// A plan that drops, renames or alters is not a bootstrap, and building a

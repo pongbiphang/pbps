@@ -911,8 +911,11 @@ and each default, CHECK, index and trigger last. The scan can miss a
 reference, and a module compiled before a same-named object it would have
 preferred binds the other one silently. That is detected from the captured
 bindings instead of prevented: a module that bound any name first made
-nameable later in the reconstruction is unresolved. The check is by name, so
-it is conservative — a qualified reference it cannot tell from a bare one is
+nameable later in the reconstruction, by an object that could have been
+resolved in its place, is unresolved: a later relation for a relation or row
+type, a later routine for a routine or a function-style cast, a later index
+for a relation only. The check is by name within those kinds, so it is
+conservative — a qualified reference it cannot tell from a bare one is
 flagged too — and a `depends_on` edge that moves the other object first
 removes it. Measured on PostgreSQL 16 and 18: f(integer) whose body calls
 `f('x'::text)` binds f(character varying) through an implicit cast when f(text)

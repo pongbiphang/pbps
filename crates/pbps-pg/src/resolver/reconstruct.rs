@@ -52,6 +52,32 @@ enum Phase {
     Expressions,
 }
 
+/// What kind of object a step makes nameable, and so which bindings it
+/// could have taken over had it existed earlier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Nameable {
+    /// A table or view: a relation, and a row type of the same name.
+    Relation,
+    /// An index: a relation with no row type.
+    Index,
+    /// A function or procedure. A call written `t(x)` is also how a type
+    /// named `t` is cast to, so a routine can take a type's place too.
+    Routine,
+}
+
+impl Nameable {
+    /// Whether an object of this kind could be what a binding of the
+    /// captured catalog `class` resolves to instead.
+    pub fn shadows(self, class: &str) -> bool {
+        matches!(
+            (self, class),
+            (Self::Relation, "pg_class" | "pg_type")
+                | (Self::Index, "pg_class")
+                | (Self::Routine, "pg_proc" | "pg_type")
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Step {
     phase: Phase,
@@ -59,7 +85,7 @@ struct Step {
     declaration: String,
     statements: Vec<String>,
     /// The names this step makes resolvable, for the order check.
-    names: Vec<String>,
+    names: Vec<(Nameable, String)>,
     /// The module this step compiles, if it is one.
     module: Option<ModuleId>,
     /// The routine the engine created for this step, as the capture names
@@ -104,7 +130,7 @@ impl Reconstruction {
                             name: name.clone(),
                             table: Box::new(bare),
                         },
-                        vec![name.name.clone()],
+                        vec![(Nameable::Relation, name.name.clone())],
                         None,
                     )?);
                     for (key, constraint) in keys {
@@ -162,7 +188,7 @@ impl Reconstruction {
                                 name: index.clone(),
                                 index: Box::new(spec),
                             },
-                            vec![index],
+                            vec![(Nameable::Index, index)],
                             None,
                         )?);
                     }
@@ -173,7 +199,16 @@ impl Reconstruction {
                     let (phase, names, compiled) = if module.kind == ModuleKind::Trigger {
                         (Phase::Expressions, Vec::new(), None)
                     } else {
-                        (Phase::Modules, vec![id.name().to_owned()], Some(id.clone()))
+                        let kind = if matches!(id, ModuleId::Routine(_)) {
+                            Nameable::Routine
+                        } else {
+                            Nameable::Relation
+                        };
+                        (
+                            Phase::Modules,
+                            vec![(kind, id.name().to_owned())],
+                            Some(id.clone()),
+                        )
                     };
                     steps.push(step(
                         dialect,
@@ -239,7 +274,10 @@ impl Reconstruction {
     /// overload the engine created for its step, since overloads of one name
     /// are compiled at different steps. `None` for an object no compiled
     /// module is.
-    pub fn later_names(&self, owner: &ObjectIdentity) -> Option<std::collections::BTreeSet<&str>> {
+    pub fn later_names(
+        &self,
+        owner: &ObjectIdentity,
+    ) -> Option<std::collections::BTreeSet<(Nameable, &str)>> {
         let at = self
             .steps
             .iter()
@@ -253,7 +291,7 @@ impl Reconstruction {
         Some(
             self.steps[at + 1..]
                 .iter()
-                .flat_map(|step| step.names.iter().map(String::as_str))
+                .flat_map(|step| step.names.iter().map(|(kind, name)| (*kind, name.as_str())))
                 .collect(),
         )
     }
@@ -378,7 +416,7 @@ fn step(
     phase: Phase,
     declaration: &str,
     change: &Change,
-    names: Vec<String>,
+    names: Vec<(Nameable, String)>,
     module: Option<ModuleId>,
 ) -> Result<Step, ReconstructError> {
     let statements = dialect

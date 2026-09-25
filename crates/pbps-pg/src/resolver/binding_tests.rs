@@ -1015,3 +1015,61 @@ async fn a_schema_the_deployer_cannot_use_holds_no_candidate() {
         );
     }
 }
+
+/// An index made nameable after a view cannot shadow the routine the view
+/// calls, even when the two share a name; the view's verdict stands.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_later_object_of_another_kind_is_no_candidate() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let declared = || {
+            let mut table = pbps_model::Table::default();
+            table.columns.insert(
+                "c".into(),
+                pbps_model::Column::new("integer".parse().unwrap()),
+            );
+            table.indexes.insert(
+                "ix".into(),
+                pbps_model::Index {
+                    columns: vec![pbps_model::IndexColumn {
+                        name: "c".into(),
+                        descending: false,
+                    }],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                },
+            );
+            Declared::default()
+                .table("app.t", table)
+                .function(
+                    "app.ix(integer)",
+                    "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1",
+                )
+                .view("app.v", "SELECT app.ix(1) AS x")
+        };
+        let assessment = analyze(
+            &server,
+            "kind",
+            Case {
+                schemas: &["app"],
+                extras: &[],
+                target: "
+                    CREATE TABLE app.t (c integer);
+                    CREATE INDEX ix ON app.t (c);
+                    CREATE FUNCTION app.ix(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1;
+                    CREATE VIEW app.v AS SELECT app.ix(1) AS x;",
+                base: declared(),
+                desired: declared(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            only(&assessment, "app", "v"),
+            Verdict::Unaffected,
+            "{variable}"
+        );
+    }
+}

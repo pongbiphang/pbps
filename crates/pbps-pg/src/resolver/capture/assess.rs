@@ -303,7 +303,6 @@ pub fn assess(
     paths: &Paths,
     order: &crate::resolver::reconstruct::Reconstruction,
 ) -> Assessment {
-    let empty = BTreeSet::new();
     // A set is faithful when scratch reproduced every target member that
     // could win: the engine's own objects identically, the managed ones as
     // declared. Missing from either capture is not faithful: an uncaptured
@@ -355,7 +354,7 @@ pub fn assess(
             Verdict::Unresolved {
                 condition: "a same-named candidate on the target was not reconstructed on scratch",
             }
-        } else if compiled_early(object, input, order, &empty) {
+        } else if compiled_early(object, input, order) {
             Verdict::Unresolved {
                 condition: "the declaration was compiled before an object sharing a name it bound",
             }
@@ -395,17 +394,18 @@ fn compiled_early(
     object: &ObjectIdentity,
     input: &super::manifest::Input,
     order: &crate::resolver::reconstruct::Reconstruction,
-    empty: &BTreeSet<&str>,
 ) -> bool {
-    let later = order.later_names(owner(object));
-    let later = later.as_ref().unwrap_or(empty);
+    let Some(later) = order.later_names(owner(object)) else {
+        return false;
+    };
+    // Only an object that could have been resolved instead counts: an index
+    // named like a routine a view calls could not have taken that call.
     input.bindings.iter().any(|binding| {
-        candidate_class(&binding.target.class).is_some()
-            && binding
-                .target
-                .name
-                .last()
-                .is_some_and(|bound| later.contains(bound.as_str()))
+        binding.target.name.last().is_some_and(|bound| {
+            later
+                .iter()
+                .any(|(kind, name)| *name == bound && kind.shadows(&binding.target.class))
+        })
     })
 }
 
