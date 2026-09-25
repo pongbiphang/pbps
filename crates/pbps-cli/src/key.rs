@@ -56,6 +56,11 @@ fn write_owner_only(path: &Path, text: &str) -> anyhow::Result<()> {
                 path.display()
             )
         })?;
+    // The mode passed to `open` is filtered by the umask; a CI umask of 0777
+    // would leave a key its own owner cannot read. Set it on the handle.
+    use std::os::unix::fs::PermissionsExt as _;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("cannot restrict `{}` to its owner", path.display()))?;
     writeln!(file, "{text}").with_context(|| format!("cannot write `{}`", path.display()))?;
     Ok(())
 }
