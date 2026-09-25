@@ -276,11 +276,14 @@ fn environment_reads(source: &str) -> Vec<String> {
     each("env::", &|rest| rest.starts_with("temp_dir("));
     // `std::env` as a module in a `use`, not followed by a path.
     each("::env", &|rest| rest.starts_with("::"));
-    // `use std::{env, ..}` and `use std::{.., env}`. A bare `{env}` is a
-    // format placeholder, so the group has to follow `::`.
-    for pattern in ["::{env,", "::{env}", ",env,", ",env}"] {
-        each(pattern, &|_| false);
-    }
+    // `env` in a `use` group, alone or aliased: `std::{env, ..}`,
+    // `std::{.., env}`, `std::{env as e}`. A bare `{env}` is a format
+    // placeholder, so a group has to follow `::`. With whitespace removed an
+    // alias reads `envas…`, so `as` after `env` counts as the end of the name.
+    let ends_a_name =
+        |rest: &str| rest.starts_with(',') || rest.starts_with('}') || rest.starts_with("as");
+    each("::{env", &|rest| !ends_a_name(rest));
+    each(",env", &|rest| !ends_a_name(rest));
     for word in ["getenv", "environ(", "var_os", "vars_os"] {
         each(word, &|_| false);
     }
@@ -295,6 +298,9 @@ fn an_aliased_imported_or_spaced_environment_read_is_still_seen() {
         "use std::{env, fs};",
         "use std::{fs, env};",
         "use std::{fs, env::var_os};",
+        "use std::{env as e};\nlet value = e::var(\"PBPS_DB\");",
+        "use std::{fs, env as e};",
+        "use std::{env as e, fs};",
         "use std::env::temp_dir;\nlet x = temp_dir();",
         "let url = std::env::var(\"PBPS_DB\");",
         "let url = std :: env :: var(\"PBPS_DB\");",
@@ -320,6 +326,8 @@ fn an_aliased_imported_or_spaced_environment_read_is_still_seen() {
         "let environment = run.environment.clone();",
         "(\"/api/drift\", Some(\"env\"), View::Drift),",
         "format!(\"--env={env}\")",
+        "use std::{environment_free, fs};",
+        "f(a, environment)",
         "let root = std::path::Path::new(env!(\"CARGO_MANIFEST_DIR\"));",
         "for (name, _) in std::env::vars_os() {",
     ] {
