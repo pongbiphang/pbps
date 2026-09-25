@@ -14216,3 +14216,77 @@ mod key_spelling;
 
 #[path = "live/doctor_select.rs"]
 mod doctor_select;
+
+/// #351. Every declared and recorded schema used to be bound into one
+/// schema-permission statement, so an estate with more schemas than the
+/// server's parameter ceiling read the whole schema answer as unreadable. The
+/// read is now asked in pieces, and each schema is answered exactly once.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn doctor_reads_the_permissions_of_more_schemas_than_one_statement_can_bind() {
+    let mut db = TestDb::create("schemachunks").await;
+    // Past the ceiling on its own, before the permission names are counted.
+    let count = 2_150;
+    db.conn
+        .execute(&format!(
+            "DECLARE @i int = 0; DECLARE @s nvarchar(100); \
+             WHILE @i < {count} BEGIN \
+               SET @s = N'CREATE SCHEMA [s' + CAST(@i AS nvarchar(10)) + N']'; \
+               EXEC (@s); \
+               SET @i += 1; \
+             END"
+        ))
+        .await
+        .expect("create the schemas");
+    let schemas: Vec<String> = (0..count).map(|i| format!("s{i}")).collect();
+    let held = pbps_mssql::doctor::permissions(
+        &mut db.conn,
+        &[],
+        &schemas,
+        &Default::default(),
+        &pbps_mssql::doctor::GrantTargets::default(),
+        &pbps_mssql::doctor::DataTables::new(),
+        &Default::default(),
+        &pbps_model::IdsFile::default(),
+    )
+    .await
+    .expect("the schema answer is readable however many schemas there are");
+    assert!(held.absent_schemas.is_empty(), "{:?}", held.absent_schemas);
+    for schema in &schemas {
+        let perms = held
+            .schemas
+            .get(schema)
+            .unwrap_or_else(|| panic!("{schema} was not asked about"));
+        // The administrator holds everything, so an empty set would be a
+        // schema whose rows went missing between the pieces.
+        assert!(perms.contains("ALTER"), "{schema}: {perms:?}");
+    }
+    assert!(pbps_mssql::doctor::missing(&held).is_empty());
+
+    // The same two lists on the grant side: schemas a role is granted on, and
+    // the managed roles themselves, each past the ceiling alone.
+    let granted = pbps_mssql::doctor::GrantTargets {
+        schemas: schemas.clone(),
+        roles: (0..count).map(|i| format!("r{i}")).collect(),
+        ..Default::default()
+    };
+    let held = pbps_mssql::doctor::permissions(
+        &mut db.conn,
+        &[],
+        &[],
+        &Default::default(),
+        &granted,
+        &pbps_mssql::doctor::DataTables::new(),
+        &Default::default(),
+        &pbps_model::IdsFile::default(),
+    )
+    .await
+    .expect("the grant-side answer is readable however many schemas and roles there are");
+    for schema in &schemas {
+        assert!(
+            held.granted_schemas.contains_key(schema),
+            "{schema} was not asked about"
+        );
+    }
+    db.drop().await;
+}
