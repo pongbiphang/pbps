@@ -1942,11 +1942,13 @@ A consumer "would have to change" exactly when an envelope the new build emits
 could fail validation against the envelope schema published before it
 (DEC-997.1). That test decides, not the kind of change:
 
-- These keep the wire version: a field added to an open object, or an optional
-  field removed from one. The schema-set version records them (DECISIONS
-  465).
-- These move it: a required field removed or renamed, a changed type, a new
-  enum value, or any change to one of the few objects that constrain the
+- These keep the wire version: a field added to an open object, an optional
+  field removed from one, and a type narrowed so that every value it now
+  allows was allowed before (`number` to `integer`, a string to an enum). The
+  schema-set version records them (DECISIONS 465).
+- These move it: a required field removed or renamed, a type widened or
+  changed so that a value the old schema refused can be emitted, a new enum
+  value, or a field added to one of the few objects that constrain the
   properties they do not name. Those objects are the ones whose
   `additionalProperties` is `false` or a schema.
 

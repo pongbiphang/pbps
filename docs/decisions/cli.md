@@ -644,15 +644,17 @@ the validation outcome does.
 
 - **Keeps the version.** A field added to an open object passes, because the
   document leaves it open. So does an optional field removed from one, and a
-  field renamed there when the old name was optional. The schema-set version
-  still moves for every content change (DECISIONS 465), so these are never
-  unrecorded.
-- **Moves the version.** A required field removed or renamed, a changed type,
-  or a new enum value fails the old document. So does a change inside an
-  object that constrains the properties it does not name. Such an object's
-  `additionalProperties` is `false`, or a schema every unnamed value must
-  match. These move the version together with the schema's `const` (DECISIONS
-  224).
+  field renamed there when the old name was optional. So does a type narrowed
+  so that every value it now allows was allowed before, such as `number` to
+  `integer` or a string to an enum. The schema-set version still moves for
+  every content change (DECISIONS 465), so these are never unrecorded.
+- **Moves the version.** A required field removed or renamed fails the old
+  document. So does a type widened or changed so that a value the old schema
+  refused can be emitted, and so does a new enum value. A field added to an
+  object that constrains the properties it does not name fails it as well.
+  Such an object's `additionalProperties` is `false`, or a schema every
+  unnamed value must match. These move the version together with the
+  schema's `const` (DECISIONS 224).
 
 Moving the version on every addition was the alternative. It would make every
 `data` addition a breaking change for consumers that only validate, and it
