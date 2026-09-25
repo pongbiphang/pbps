@@ -882,3 +882,15 @@ functions answer for every principal (measured on 17.0 as a user holding no
 permission), and they are what spells every grantee in the context already. A
 name with no principal behind it stays as planned, since the plan may create
 it.
+
+<a id="dec-1013-1"></a>
+
+**DEC-1013.1. Every planned principal's resolution is recorded, absence
+included (#1013, amending DEC-726.1).** DEC-726.1 recorded a spelling only
+where the catalog's differed from the plan's, so a principal spelled exactly
+as planned and one that did not exist both left nothing behind. Dropping such a
+principal after `qualify`, when nothing else in the context named it, then
+read back as the same empty answer, and requalification accepted the scope.
+`spellings` now maps every planned name to `Some(<catalog spelling>)` or to
+`None`, so presence and absence are sealed apart; the principal map still uses
+the planned spelling for `None`.

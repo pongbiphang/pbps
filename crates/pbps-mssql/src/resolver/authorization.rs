@@ -99,12 +99,14 @@ pub struct AuthorizationContext {
     /// see; one it cannot see is an owner or grantor it is not a member of,
     /// and is reproduced as a user.
     pub principals: BTreeMap<String, PrincipalKind>,
-    /// The catalog's spelling of each principal a planned grant names, keyed
-    /// by the plan's spelling, where the two differ ([`resolve_spellings`]).
-    /// Empty for a read that was given no planned grants, and then left out of
-    /// the canonical form.
+    /// Each principal a planned grant names, keyed by the plan's spelling:
+    /// the catalog's spelling of it, or `None` when the catalog has no such
+    /// principal ([`resolve_spellings`]). Every name is recorded, the ones the
+    /// catalog spells the same way included, so a principal that exists and
+    /// one that does not are sealed apart (#1013). Empty for a read that was
+    /// given no planned grants, and then left out of the canonical form.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub spellings: BTreeMap<String, String>,
+    pub spellings: BTreeMap<String, Option<String>>,
 }
 
 impl AuthorizationContext {
@@ -117,13 +119,14 @@ impl AuthorizationContext {
     /// resolved spelling, or the name as planned when the catalog has no such
     /// principal yet.
     fn catalog_name<'a>(&'a self, planned: &'a str) -> &'a str {
-        self.spellings.get(planned).map_or(planned, String::as_str)
+        spelled(&self.spellings, planned)
     }
 }
 
 /// Resolves each principal the plan's grants name to the catalog's spelling
-/// of it, as the deployer reading `context`, and records the ones that differ
-/// in `context.spellings` (#726).
+/// of it, as the deployer reading `context`, and records every answer in
+/// `context.spellings` (#726) — a name the catalog does not know as `None`,
+/// so its absence is sealed as distinctly as its presence (#1013).
 ///
 /// On a case-insensitive database a role catalogued as `Readers` and a grant
 /// planned to `readers` are one principal, and `PUBLIC` is `public`. Keyed as
@@ -157,13 +160,19 @@ pub async fn resolve_spellings(
                 "the catalog's spelling of the principal {name} expected one row"
             )));
         };
-        if let Some(catalog) = row.try_get::<&str>("name")?
-            && catalog != name
-        {
-            context.spellings.insert(name.clone(), catalog.to_owned());
-        }
+        let catalog = row.try_get::<&str>("name")?.map(str::to_owned);
+        context.spellings.insert(name.clone(), catalog);
     }
     Ok(())
+}
+
+/// The catalog's name for `planned`, or `planned` itself when the catalog
+/// has none (or the name was never resolved).
+fn spelled<'a>(spellings: &'a BTreeMap<String, Option<String>>, planned: &'a str) -> &'a str {
+    spellings
+        .get(planned)
+        .and_then(Option::as_deref)
+        .unwrap_or(planned)
 }
 
 /// A planned authorization change the plan performs before its DDL: a schema
@@ -469,7 +478,7 @@ pub struct PrincipalMap {
     to_run_local: BTreeMap<String, String>,
     /// The plan's spelling of a principal to the catalog's, so a planned
     /// grant finds the principal it names (#726).
-    spellings: BTreeMap<String, String>,
+    spellings: BTreeMap<String, Option<String>>,
 }
 
 impl PrincipalMap {
@@ -495,7 +504,7 @@ impl PrincipalMap {
     }
 
     fn run_local(&self, logical: &str) -> Option<String> {
-        let logical = self.spellings.get(logical).map_or(logical, String::as_str);
+        let logical = spelled(&self.spellings, logical);
         self.to_run_local.get(logical).cloned()
     }
 
@@ -1086,8 +1095,8 @@ mod tests {
         ];
         let mut resolved = context();
         resolved.spellings = [
-            ("READERS".to_owned(), "readers".to_owned()),
-            ("PUBLIC".to_owned(), "public".to_owned()),
+            ("READERS".to_owned(), Some("readers".to_owned())),
+            ("PUBLIC".to_owned(), Some("public".to_owned())),
         ]
         .into_iter()
         .collect();
