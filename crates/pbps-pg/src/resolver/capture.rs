@@ -165,6 +165,9 @@ mod session;
 /// use pbps_pg::resolver::capture::RuntimeInputs;
 /// fn report(inputs: RuntimeInputs) { let _ = serde_json::to_string(&inputs); }
 /// ```
+// Catalog capture is portable; only the Linux native lifecycle consumes these
+// private fields. Keep the same opaque transfer on the other platforms too.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct RuntimeInputs {
     libraries: Vec<String>,
     dynamic_library_path: String,
