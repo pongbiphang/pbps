@@ -66,6 +66,7 @@ pub struct Environment {
     pub description: Option<String>,
     pub state: String,
     pub detail: Option<String>,
+    #[serde(serialize_with = "decimal::optional")]
     pub last_entry: Option<i64>,
     pub last_kind: Option<String>,
     pub applied_at: Option<String>,
@@ -94,6 +95,7 @@ pub struct Drift {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Baseline {
+    #[serde(serialize_with = "decimal::required")]
     pub entry_id: i64,
     pub applied_at: String,
     pub checksum: String,
@@ -157,6 +159,7 @@ pub struct Timeline {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Entry {
+    #[serde(serialize_with = "decimal::required")]
     pub id: i64,
     pub applied_at: String,
     pub kind: String,
@@ -187,6 +190,33 @@ pub struct Staged {
 }
 
 /// Validate the whole envelope, including its route and exit-code contract.
+/// Ledger identifiers leave this process as decimal strings (#492).
+///
+/// The CLI's envelope carries them as JSON integers, the full `i64` range, and
+/// that contract stays: they are read here as numbers, strictly. What changes is
+/// the one hop only this viewer makes, to a page that reads JSON with
+/// `response.json()`. A JavaScript number holds integers exactly only up to
+/// 2^53 - 1, so `9007199254740993` arrived as `9007199254740992`, the id of a
+/// different entry, and an operator copying it from the page would name the
+/// wrong one. A string cannot be rounded. Only identifiers are spelled this
+/// way: a count is displayed, never copied back, and staying a number keeps it
+/// one.
+mod decimal {
+    use serde::Serializer;
+
+    pub fn required<S: Serializer>(id: &i64, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(id)
+    }
+
+    pub fn optional<S: Serializer>(id: &Option<i64>, serializer: S) -> Result<S::Ok, S::Error> {
+        match id {
+            Some(id) => serializer.collect_str(id),
+            // Absent stays absent: `null`, never `"null"` or `"0"`.
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
 pub fn parse(command: &str, bytes: &[u8], exit_code: i32) -> Result<Vec<u8>, String> {
     fn typed<T: serde::de::DeserializeOwned + Serialize>(
         command: &str,
@@ -217,6 +247,47 @@ pub fn parse(command: &str, bytes: &[u8], exit_code: i32) -> Result<Vec<u8>, Str
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Identifiers are served as decimal strings, from numbers the CLI wrote;
+    /// an absent one stays `null`, and a count stays a number (#492).
+    #[test]
+    fn ledger_identifiers_are_served_as_decimal_strings_and_nothing_else_is() {
+        let served = |command: &str, data: serde_json::Value| {
+            let cli = json!({"schema_version":1,"tool_version":"0.0.0","command":command,
+                "result":"ok","findings":[],"data":data});
+            let bytes = parse(command, &serde_json::to_vec(&cli).unwrap(), 0).unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["data"].clone()
+        };
+        let status = served(
+            "status",
+            json!([{"environment":"a","state":"ok","checked_at":"now","last_entry":i64::MAX},
+                   {"environment":"b","state":"ok","checked_at":"now"}]),
+        );
+        assert_eq!(status[0]["last_entry"], json!("9223372036854775807"));
+        assert_eq!(status[1]["last_entry"], json!(null));
+        let timeline = served(
+            "state list",
+            json!({"environment":"a","initialized":true,"limit":20,"entries":[
+                {"id":9_007_199_254_740_993_i64,"applied_at":"now","kind":"apply","operator":"ci",
+                 "tables":3}]}),
+        );
+        assert_eq!(timeline["entries"][0]["id"], json!("9007199254740993"));
+        assert_eq!(timeline["limit"], json!(20));
+        assert_eq!(timeline["entries"][0]["tables"], json!(3));
+        let drift = served(
+            "verify",
+            json!({"version":1,"environment":"a","checked_at":"now","baseline":{"entry_id":-3,
+                "applied_at":"now","checksum":"c"},"live_checksum":"c","changes":[]}),
+        );
+        assert_eq!(drift["baseline"]["entry_id"], json!("-3"));
+        assert_eq!(drift["version"], json!(1));
+        // The CLI side stays strict: an id sent as a string is not its contract.
+        let cli = json!({"schema_version":1,"tool_version":"0.0.0","command":"verify",
+            "result":"ok","findings":[],"data":{"version":1,"environment":"a","checked_at":"now",
+            "baseline":{"entry_id":"7","applied_at":"now","checksum":"c"},
+            "live_checksum":"c","changes":[]}});
+        assert!(parse("verify", &serde_json::to_vec(&cli).unwrap(), 0).is_err());
+    }
 
     #[test]
     fn unknown_fields_and_incompatible_envelopes_are_refused() {
