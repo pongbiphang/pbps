@@ -3012,7 +3012,7 @@ fn gone_row(table: &TableName, key: &RowKey, key_column: &str) -> Result<String,
 /// about *two* rows, and a predicate that matched two would otherwise pass.
 fn exactly_one_row(table: &TableName, key: &RowKey) -> String {
     format!(
-        "GET DIAGNOSTICS pbps_rows = ROW_COUNT;\nIF pbps_rows <> 1 THEN\n    {}\nEND IF;",
+        "GET DIAGNOSTICS pbps.pbps_rows = ROW_COUNT;\nIF pbps.pbps_rows <> 1 THEN\n    {}\nEND IF;",
         refuse(&format!(
             "{table} row `{key}` is not as the plan recorded it: changed or deleted since the \
              plan was made. Plan again."
@@ -3187,7 +3187,7 @@ fn update_row(
     }
     sql.push('\n');
     sql.push_str(&wrote_the_row(table, key, key_column, &cells)?);
-    Ok(format!("DECLARE\n    pbps_rows bigint;\nBEGIN\n{sql}\nEND"))
+    Ok(with_variables(&["pbps_rows"], &sql))
 }
 
 /// One `DELETE`, keyed *and* held to the row the plan recorded.
@@ -3214,15 +3214,11 @@ fn delete_row(
             Held::of(types.get(column), after_types.get(column)),
         )?);
     }
-    Ok(format!(
-        // The guard, the delete and the checks after it are one block: the row
-        // lock the guard takes has to be held through the delete it protects,
-        // and a staged apply runs each statement outside a transaction.
-        "DECLARE\n    pbps_rows bigint;\n    pbps_referencing bigint;\nBEGIN\n\
-         {}\n\
+    let sql = format!(
+        "{}\n\
          DELETE FROM {}\n WHERE {};\n\
          {}\n\
-         {}\nEND",
+         {}",
         crate::preflight::still_referenced(table, key_column, key)?,
         qualified(table)?,
         predicates.join("\n   AND "),
@@ -3230,7 +3226,29 @@ fn delete_row(
         // And the row stayed gone: a trigger that put it back would otherwise
         // be read back and recorded as this plan's result.
         gone_row(table, key, key_column)?,
-    ))
+    );
+    // The guard, the delete and the checks after it are one block: the row
+    // lock the guard takes has to be held through the delete it protects, and
+    // a staged apply runs each statement outside a transaction.
+    Ok(with_variables(&["pbps_rows", "pbps_referencing"], &sql))
+}
+
+/// A row block's body with its `bigint` variables declared.
+///
+/// The row writes name the table's columns unqualified, and a data table may
+/// have a column spelled like one of these variables. Under the default
+/// `plpgsql.variable_conflict = error` that statement then fails as ambiguous
+/// mid-apply. `use_column` makes an unqualified name in a statement mean the
+/// column, and every read or write of a variable goes through the block's
+/// label (`pbps.pbps_rows`), which a column cannot shadow. Renaming the
+/// variables to something less likely would only move the collision
+/// (DEC-976.1).
+fn with_variables(variables: &[&str], body: &str) -> String {
+    let declared: String = variables
+        .iter()
+        .map(|v| format!("    {v} bigint;\n"))
+        .collect();
+    format!("#variable_conflict use_column\n<<pbps>>\nDECLARE\n{declared}BEGIN\n{body}\nEND pbps")
 }
 
 fn row_statement(
@@ -5237,10 +5255,10 @@ mod tests {
         assert!(sql.contains("E'3'"), "{sql}");
         assert!(sql.contains("COLLATE \"C\""), "{sql}");
         assert!(
-            sql.contains("GET DIAGNOSTICS pbps_rows = ROW_COUNT"),
+            sql.contains("GET DIAGNOSTICS pbps.pbps_rows = ROW_COUNT"),
             "{sql}"
         );
-        assert!(sql.contains("IF pbps_rows <> 1 THEN"), "{sql}");
+        assert!(sql.contains("IF pbps.pbps_rows <> 1 THEN"), "{sql}");
     }
 
     /// A delete is keyed *and* held to the recorded row, and it asks whether
@@ -5300,5 +5318,22 @@ mod tests {
         );
         // And the row stayed gone.
         assert!(sql.contains("is back after this plan deleted it"), "{sql}");
+        // #976: a column spelled like a variable means the column, and the
+        // variables are reached only through the block label.
+        assert!(
+            sql.contains("#variable_conflict use_column\n<<pbps>>\nDECLARE\n"),
+            "{sql}"
+        );
+        assert!(sql.contains("END pbps\n$pbps$;"), "{sql}");
+        for variable in ["pbps_rows", "pbps_referencing"] {
+            let bare = sql.matches(variable).count();
+            let declared = sql.matches(&format!("    {variable} bigint;")).count();
+            let labelled = sql.matches(&format!("pbps.{variable}")).count();
+            assert_eq!(
+                bare,
+                declared + labelled,
+                "{variable} used unlabelled: {sql}"
+            );
+        }
     }
 }

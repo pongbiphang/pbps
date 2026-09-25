@@ -1027,3 +1027,18 @@ add an entry here.
      table already has (538's accepted shape), or remove the block, apply the
      key change, and declare the rows again. With this, 538's sentence holds
      as written; the refusal itself is unchanged.
+
+<a id="dec-976-1"></a>
+
+**DEC-976.1. A row block's variables are reached through its label, and an
+unqualified name in its statements means the column (#976).** The update and
+delete blocks declare `pbps_rows` and `pbps_referencing`, and their statements
+name the table's columns unqualified. A data table may have a column spelled
+like either variable, and under PostgreSQL's default
+`plpgsql.variable_conflict = error` that statement fails as ambiguous mid-apply,
+after validation and planning passed. Each block therefore opens with
+`#variable_conflict use_column` and the label `<<pbps>>`, and every read or
+write of a variable is written `pbps.<variable>`, which no column can shadow.
+Renaming the variables to something less likely was rejected: it would only
+move the collision to another spelling. Measured on PostgreSQL 16 and 18,
+including a user schema named `pbps` beside the label.

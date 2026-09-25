@@ -1131,8 +1131,8 @@ pub(crate) fn still_referenced(
     Ok(format!(
         "PERFORM 1 FROM {parent} AS p WHERE p.{} = {} FOR UPDATE;\n\
          IF {} THEN\n    {}\nEND IF;\n\
-         pbps_referencing := {};\n\
-         IF pbps_referencing > 0 THEN\n    {}\nEND IF;",
+         pbps.pbps_referencing := {};\n\
+         IF pbps.pbps_referencing > 0 THEN\n    {}\nEND IF;",
         quote(key_column)?,
         value_literal(key.as_str()),
         // Before the count, because the count is what it invalidates.
