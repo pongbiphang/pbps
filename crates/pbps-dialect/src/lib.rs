@@ -1925,6 +1925,18 @@ pub trait Dialect {
         true
     }
 
+    /// The relations this engine creates with `table` under names it
+    /// generates itself, as `(name, what it is)`: no declaration names them,
+    /// yet each takes a name in the schema's relation namespace (#465,
+    /// DEC-465.1).
+    ///
+    /// Asked by [`check_index_names`] only where
+    /// [`Dialect::indexes_share_namespace_with_tables`] says the namespace is
+    /// shared; the default, none, is right for an engine where it is not.
+    fn implicit_relation_names(&self, _name: &TableName, _table: &Table) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
     /// Where `to` sits on the path a bare name in a definition in `from` is
     /// looked up along, or `None` where it is not on that path at all
     /// (DECISIONS 317).
@@ -2382,6 +2394,32 @@ pub fn check_index_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> 
                     "{} and {descriptor} are both named `{claim_name}`; {} keeps tables, \
                      views and indexes in one namespace per schema, so it can hold only one of \
                      them",
+                    existing.descriptor,
+                    dialect.name()
+                ));
+            }
+        }
+    }
+    // The names the engine generates for what a table implies: the index
+    // behind an unnamed primary key, the sequence behind an identity column.
+    // Asked after every declared name is in, because which of two claimants
+    // the engine lets have a name depends on which is created first — a
+    // generated name the engine finds taken gets a numeric suffix instead,
+    // measured — and a plan's order is not one to depend on. So a generated
+    // name that meets a declared one is refused whichever comes first; two
+    // generated names that meet are not, because the engine resolves that
+    // itself (#465, DEC-465.1).
+    let declared_names: BTreeSet<ObjectName> = claimed.keys().cloned().collect();
+    for (table_name, table) in &schema.tables {
+        for (name, descriptor) in dialect.implicit_relation_names(table_name, table) {
+            let claim_name = ObjectName::new(table_name.schema.clone(), name);
+            if declared_names.contains(&claim_name) {
+                let existing = &claimed[&claim_name];
+                problems.push(format!(
+                    "{} and {descriptor} are both named `{claim_name}`; {} keeps tables, \
+                     views, indexes and sequences in one namespace per schema, so it can hold \
+                     only one of them, and which one depends on the order they are created in. \
+                     Name the primary key, or rename the other object",
                     existing.descriptor,
                     dialect.name()
                 ));

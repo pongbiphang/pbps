@@ -556,3 +556,24 @@ A short name never ends like a digested one (`_` and sixteen hex digits, in
 either case, since a case-insensitive database folds them). A name that would
 is digested as well, so that `dbo.a.b_c_<the digest of dbo.a_b.c>` cannot
 spell the digested name of `dbo.a_b.c`.
+
+<a id="dec-465-1"></a>
+
+**DEC-465.1. A declared name that meets a name PostgreSQL generates for an
+unnamed primary key or an identity sequence is refused offline, not predicted
+around.** The engine names those relations itself (`<table>_pkey`,
+`<table>_<column>_seq`, cut to 63 bytes by shortening the longer part first)
+and puts them in the schema's one relation namespace, so a declared index or
+table under the same name collides with them. Which claimant wins depends on
+creation order: created after the table, the declared index fails with
+`42P07`; created before it, the engine silently suffixes its own name
+(`taken_pkey1`), and the same declaration succeeds or fails by order alone.
+Predicting the suffix would make the result depend on apply order and
+on objects outside the declaration, so the check refuses the meeting and asks
+for a named primary key or another name. Two generated names that meet are
+left alone: the engine suffixes one of them, neither is declared, and nothing
+records it by name. SQL Server names these objects per table and reports no
+generated relation names. Measured on PostgreSQL 16 and 18: short, 60-byte and
+multibyte table names generate exactly the predicted names, the declared index
+created afterwards fails with `42P07`, and a name taken first yields
+`taken_pkey1`.
