@@ -1633,7 +1633,9 @@ since the typed ChangeSet already knows which tables changed.
 **`pbps verify --format json`** emits the drift diff in typed form, and found
 drift invokes the `on_drift` hook (13.5) with that JSON on stdin. pbps never
 speaks Slack or Teams: it execs a command and the command does the talking —
-no credentials to hold, no chat APIs to chase.
+no credentials to hold, no chat APIs to chase. Under `--format json` the
+hook's own stdout goes to stderr, so the envelope stays the only document on
+stdout; beside a human report it shares stdout as before.
 
 **`pbps status`** reads each configured environment's `__pbps_state` and
 prints one screen: environment, last apply, git sha, drift/policy/failed state,

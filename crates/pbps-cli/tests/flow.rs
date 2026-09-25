@@ -11455,6 +11455,121 @@ fn status_reports_the_unmanaged_error_policy() {
     });
 }
 
+/// `verify --format json` prints one envelope and nothing after it, even when
+/// `on_drift` prints (#493). The hook still runs, still gets its payload, and a
+/// failing one still leaves the drift verdict; its stdout goes to stderr under
+/// JSON and stays on stdout for the human report. The strict read the local
+/// viewer makes of this stream is `pbps_ui::contract::parse`, asserted here on
+/// the exact bytes.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_printing_drift_hook_leaves_the_json_envelope_whole() {
+    const MARKER: &str = "PBPS-493-HOOK-SAID-THIS";
+    let connection = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let d = Demo::new("drift-hook-stdout");
+    let payload = d.dir.join("drift-hook.json");
+    let hook = |script: &str| {
+        let config = std::fs::read_to_string(d.dir.join("pbps.yml")).unwrap();
+        let config = config.split("hooks:").next().unwrap().to_owned();
+        std::fs::write(
+            d.dir.join("pbps.yml"),
+            format!("{config}hooks:\n  on_drift: \"{script}\"\n"),
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&payload);
+    };
+    d.table("table: dbo.pbps_hook_stdout\ncolumns:\n  id: {type: int, nullable: false}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    rt.block_on(async {
+        let mut conn = connect_live(&connection).await.unwrap();
+        conn.execute(
+            "DROP TABLE IF EXISTS dbo.pbps_hook_stdout; DROP TABLE IF EXISTS dbo.__pbps_lock; \
+             DROP TABLE IF EXISTS dbo.__pbps_state; \
+             CREATE TABLE dbo.pbps_hook_stdout (id int NOT NULL);",
+        )
+        .await
+        .unwrap();
+    });
+    assert_eq!(
+        code(&d.run(&["baseline", "--db", &connection, "--reason", "test"])),
+        0
+    );
+    let printing = format!("cat > {}; echo {MARKER}", payload.display());
+
+    // No drift: the hook does not run at all.
+    hook(&printing);
+    let clean = d.run(&["verify", "--db", &connection, "--format", "json"]);
+    assert_eq!(code(&clean), 0, "{}", stderr(&clean));
+    assert!(!payload.exists(), "on_drift ran without drift");
+    assert!(!stdout(&clean).contains(MARKER));
+
+    rt.block_on(async {
+        let mut conn = connect_live(&connection).await.unwrap();
+        conn.execute("ALTER TABLE dbo.pbps_hook_stdout ADD drifted int NULL;")
+            .await
+            .unwrap();
+    });
+
+    // A printing hook, a quiet one, and one that prints and then fails.
+    for (script, fails) in [
+        (printing.clone(), false),
+        (format!("cat > {}", payload.display()), false),
+        (
+            format!("cat > {}; echo {MARKER}; exit 3", payload.display()),
+            true,
+        ),
+    ] {
+        hook(&script);
+        let verify = d.run(&["verify", "--db", &connection, "--format", "json"]);
+        assert_eq!(code(&verify), FINDING, "{script}: {}", stderr(&verify));
+        let out = stdout(&verify);
+        // One document: `from_str` refuses trailing characters.
+        let report: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("{script}: stdout is not one envelope ({e}): {out}"));
+        assert_eq!(report["command"], "verify");
+        assert!(!out.contains(MARKER), "{script}: {out}");
+        pbps_ui::contract::parse("verify", out.as_bytes(), FINDING)
+            .unwrap_or_else(|e| panic!("{script}: the viewer refuses this stream: {e}"));
+        // The hook still ran with the drift report, and its words were kept.
+        let sent: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&payload).unwrap()).unwrap();
+        assert!(sent.to_string().contains("drifted"), "{script}: {sent}");
+        assert_eq!(
+            stderr(&verify).contains(MARKER),
+            script.contains(MARKER),
+            "{script}: {}",
+            stderr(&verify)
+        );
+        assert_eq!(
+            stderr(&verify).contains("the on_drift hook exited with"),
+            fails,
+            "{script}: {}",
+            stderr(&verify)
+        );
+    }
+
+    // The human report keeps the hook beside it on stdout, as before.
+    hook(&printing);
+    let human = d.run(&["verify", "--db", &connection]);
+    assert_eq!(code(&human), FINDING, "{}", stderr(&human));
+    assert!(stdout(&human).contains(MARKER), "{}", stdout(&human));
+    assert!(payload.exists());
+
+    rt.block_on(async {
+        let mut conn = connect_live(&connection).await.unwrap();
+        conn.execute(
+            "DROP TABLE dbo.pbps_hook_stdout; DROP TABLE dbo.__pbps_lock; \
+             DROP TABLE dbo.__pbps_state;",
+        )
+        .await
+        .unwrap();
+    });
+}
+
 /// A module can be present in `sys.objects` while SQL Server withholds its
 /// definition. It is still an unmanaged object, so encryption must not turn
 /// `unmanaged: error` into an accidental allow-list escape in either estate
