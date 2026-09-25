@@ -346,12 +346,7 @@ fn compiled_early(
     order: &crate::resolver::reconstruct::Reconstruction,
     empty: &BTreeSet<&str>,
 ) -> bool {
-    let owner = owner(object);
-    let [schema, name] = owner.name.as_slice() else {
-        return false;
-    };
-    let routine = owner.class == "pg_proc";
-    let later = order.later_names(schema, name, routine);
+    let later = order.later_names(owner(object));
     let later = later.as_ref().unwrap_or(empty);
     input.bindings.iter().any(|binding| {
         candidate_class(&binding.target.class).is_some()

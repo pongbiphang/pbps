@@ -1,4 +1,5 @@
 use super::*;
+use pbps_db::resolver::capture::ObjectIdentity;
 use pbps_model::{
     CheckConstraint, Column, ForeignKey, GrantTarget, Index, IndexColumn, Module, Table, TableName,
     Uid, UidKind,
@@ -122,22 +123,46 @@ fn expressions_wait_for_every_module_and_modules_keep_the_differs_order() {
 }
 
 /// What was made nameable after a module: every later module and every
-/// index, measured from the first overload of a routine's name. The last
-/// module has only the indexes after it, and a name no module has, nothing.
+/// index. A view is found by name; a routine only by the overload its step
+/// created, never by the first of its name. An object no compiled module is
+/// has none.
 #[test]
 fn later_names_are_what_became_nameable_after_the_module() {
-    let reconstruction = Reconstruction::new(&crate::Postgres::new(), &bootstrap()).unwrap();
+    let mut reconstruction = Reconstruction::new(&crate::Postgres::new(), &bootstrap()).unwrap();
+    let routine = |argument: &str| ObjectIdentity {
+        class: "pg_proc".into(),
+        name: vec!["app".into(), "f".into()],
+        signature: vec![ObjectIdentity {
+            class: "pg_type".into(),
+            name: vec!["pg_catalog".into(), argument.into()],
+            signature: Vec::new(),
+        }],
+    };
+    let relation = |name: &str| ObjectIdentity {
+        class: "pg_class".into(),
+        name: vec!["app".into(), name.into()],
+        signature: Vec::new(),
+    };
+    // Nothing is known of a routine before its step has compiled.
+    assert!(reconstruction.later_names(&routine("int4")).is_none());
+    let step = reconstruction
+        .steps
+        .iter_mut()
+        .find(|step| step.declaration == "function app.f(integer)")
+        .unwrap();
+    step.created = Some(routine("int4"));
     assert_eq!(
-        reconstruction.later_names("app", "f", true).unwrap(),
+        reconstruction.later_names(&routine("int4")).unwrap(),
         ["v", "ix"].into_iter().collect()
     );
+    // Another overload of the same name was not compiled at that step.
+    assert!(reconstruction.later_names(&routine("text")).is_none());
     assert_eq!(
-        reconstruction.later_names("app", "v", false).unwrap(),
+        reconstruction.later_names(&relation("v")).unwrap(),
         ["ix"].into_iter().collect()
     );
-    // A view is not a routine of the same name, and a table is not a module.
-    assert!(reconstruction.later_names("app", "v", true).is_none());
-    assert!(reconstruction.later_names("app", "t", false).is_none());
+    // A table is not a module.
+    assert!(reconstruction.later_names(&relation("t")).is_none());
 }
 
 /// A plan that drops, renames or alters is not a bootstrap, and building a

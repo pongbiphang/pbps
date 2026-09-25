@@ -178,7 +178,7 @@ async fn analyze(server: &str, tag: &str, case: Case<'_>) -> Result<Assessment, 
             .await
             .map_err(|e| e.to_string())?;
         let pg = dialect(case.extras);
-        let reconstruction =
+        let mut reconstruction =
             Reconstruction::new(&pg, &bootstrap(&case.desired.schema, case.extras))
                 .map_err(|e| e.to_string())?;
         let mut scratch = databases.stream(&scratch_name).await;
@@ -822,6 +822,66 @@ async fn a_body_compiled_before_a_same_named_candidate_is_unresolved() {
             .map(|(_, verdict)| verdict.clone());
         assert!(
             matches!(early, Some(Verdict::Unresolved { condition }) if condition.contains("compiled before")),
+            "{variable}: {assessment:#?}"
+        );
+    }
+}
+
+/// The order check measures from the overload a step created, not from the
+/// first of its name. Here the name scan puts g() before f(text), whose body
+/// calls it, while f(integer) was compiled before both: f(text) bound
+/// nothing made nameable after it, and its verdict stands.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_later_overload_is_measured_from_its_own_step() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let declared = || {
+            Declared::default()
+                .function(
+                    "app.f(integer)",
+                    "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN 1",
+                )
+                .function(
+                    "app.g()",
+                    "() RETURNS integer LANGUAGE sql IMMUTABLE RETURN 2",
+                )
+                .function(
+                    "app.f(text)",
+                    "(text) RETURNS integer LANGUAGE sql IMMUTABLE RETURN g()",
+                )
+        };
+        let assessment = analyze(
+            &server,
+            "own_step",
+            Case {
+                schemas: &["app"],
+                extras: &[],
+                target: "
+                    SET search_path = app;
+                    CREATE FUNCTION f(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN 1;
+                    CREATE FUNCTION g() RETURNS integer LANGUAGE sql IMMUTABLE RETURN 2;
+                    CREATE FUNCTION f(text) RETURNS integer LANGUAGE sql IMMUTABLE RETURN g();",
+                base: declared(),
+                desired: declared(),
+            },
+        )
+        .await
+        .unwrap();
+        let text = assessment
+            .surfaces
+            .iter()
+            .find(|(object, _)| {
+                object.name == ["app", "f"]
+                    && object
+                        .signature
+                        .first()
+                        .is_some_and(|t| t.name == ["pg_catalog", "text"])
+            })
+            .map(|(_, verdict)| verdict.clone());
+        assert_eq!(
+            text,
+            Some(Verdict::Unaffected),
             "{variable}: {assessment:#?}"
         );
     }

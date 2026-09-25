@@ -1579,14 +1579,14 @@ impl ScratchRun {
                 "this run has already compiled a namespace; resolve on a fresh run".into(),
             ));
         }
-        let reconstruction =
+        let mut reconstruction =
             engine::reconstruction(self.inner.control.driver, &extras, request.bootstrap)
                 .map_err(Error::Binding)?;
         // Requalifies the scope and enters the reproduced deployer.
         self.check(target).await?;
         self.compiled = true;
         let outcome = self
-            .resolve_checked(target, request, &extras, &reconstruction)
+            .resolve_checked(target, request, &extras, &mut reconstruction)
             .await;
         if let Err(cause) = &outcome {
             self.inner.refuse(cause.clone());
@@ -1602,7 +1602,7 @@ impl ScratchRun {
         target: &mut NativeTarget,
         request: &BindingRequest<'_>,
         extras: &[String],
-        reconstruction: &engine::Reconstruction,
+        reconstruction: &mut engine::Reconstruction,
     ) -> Result<pbps_db::resolver::capture::Assessment, Error> {
         // In flight across the compilation: dropped part-way, the scratch
         // session is mid-transaction, and the next check must end the run.

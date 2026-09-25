@@ -24,6 +24,7 @@
 //! name binds to. What does — the deployer's schema privileges and path — is
 //! reproduced by the analysis scope before this runs (#610).
 
+use pbps_db::resolver::capture::ObjectIdentity;
 use pbps_dialect::Dialect;
 use pbps_model::{Change, ModuleId, ModuleKind, Strategy};
 
@@ -61,6 +62,12 @@ struct Step {
     names: Vec<String>,
     /// The module this step compiles, if it is one.
     module: Option<ModuleId>,
+    /// The routine the engine created for this step, as the capture names
+    /// it. A routine's declared signature is type spellings, not catalog
+    /// identities, so the step's own object is read back after it compiles:
+    /// the overload the order check measures from must be this one, not the
+    /// first of its name.
+    created: Option<ObjectIdentity>,
 }
 
 /// The ordered scratch statements for one desired schema.
@@ -225,24 +232,24 @@ impl Reconstruction {
         Ok(Self { steps })
     }
 
-    /// The names made resolvable after the module `schema.name` was compiled
-    /// (the earliest overload, for a routine): later modules and every index.
-    /// A binding of that module to an object of one of these names may have
-    /// been made before a better candidate existed. `None` for a name no
-    /// compiled module has.
-    pub fn later_names(
-        &self,
-        schema: &str,
-        name: &str,
-        routine: bool,
-    ) -> Option<std::collections::BTreeSet<&str>> {
-        let at = self.steps.iter().position(|step| {
-            step.module.as_ref().is_some_and(|id| {
-                matches!(id, ModuleId::Routine(_)) == routine
-                    && id.schema() == schema
-                    && id.name() == name
-            })
-        })?;
+    /// The names made resolvable after the module that `owner` belongs to
+    /// was compiled: later modules and every index. A binding of that module
+    /// to an object of one of these names may have been made before a better
+    /// candidate existed. A view is found by its name; a routine by the exact
+    /// overload the engine created for its step, since overloads of one name
+    /// are compiled at different steps. `None` for an object no compiled
+    /// module is.
+    pub fn later_names(&self, owner: &ObjectIdentity) -> Option<std::collections::BTreeSet<&str>> {
+        let at = self
+            .steps
+            .iter()
+            .position(|step| match owner.class.as_str() {
+                "pg_proc" => step.created.as_ref() == Some(owner),
+                "pg_class" => step.module.as_ref().is_some_and(|id| {
+                    matches!(id, ModuleId::Named(_)) && [id.schema(), id.name()] == *owner.name
+                }),
+                _ => false,
+            })?;
         Some(
             self.steps[at + 1..]
                 .iter()
@@ -256,7 +263,7 @@ impl Reconstruction {
     /// which the scope has entered. Committed only when all of it compiled;
     /// a failure leaves nothing behind and names its declaration.
     pub async fn compile(
-        &self,
+        &mut self,
         dialect: &crate::Postgres,
         conn: &mut pbps_db::transport::StreamConn,
     ) -> Result<(), ReconstructError> {
@@ -264,21 +271,97 @@ impl Reconstruction {
         conn.execute(framing.begin)
             .await
             .map_err(|_| ReconstructError::Transaction("begin"))?;
-        for step in &self.steps {
-            for statement in &step.statements {
-                if let Err(error) = conn.execute(statement).await {
-                    let _ = conn.execute(framing.rollback).await;
-                    return Err(ReconstructError::Compile {
-                        declaration: step.declaration.clone(),
-                        reason: error.to_string(),
-                    });
-                }
-            }
+        let outcome = self.compile_steps(conn).await;
+        if outcome.is_err() {
+            let _ = conn.execute(framing.rollback).await;
+            return outcome;
         }
         conn.execute(framing.commit)
             .await
             .map_err(|_| ReconstructError::Transaction("commit"))
     }
+
+    async fn compile_steps(
+        &mut self,
+        conn: &mut pbps_db::transport::StreamConn,
+    ) -> Result<(), ReconstructError> {
+        for step in &mut self.steps {
+            let failed = |reason: String| ReconstructError::Compile {
+                declaration: step.declaration.clone(),
+                reason,
+            };
+            let routine = match &step.module {
+                Some(id @ ModuleId::Routine(_)) => {
+                    Some((id.schema().to_owned(), id.name().to_owned()))
+                }
+                Some(ModuleId::Named(_) | ModuleId::Trigger { .. }) | None => None,
+            };
+            let before = match &routine {
+                Some((schema, name)) => routines(conn, schema, name).await.map_err(failed)?,
+                None => Vec::new(),
+            };
+            for statement in &step.statements {
+                conn.execute(statement)
+                    .await
+                    .map_err(|error| failed(error.to_string()))?;
+            }
+            if let Some((schema, name)) = &routine {
+                let mut after = routines(conn, schema, name).await.map_err(failed)?;
+                after.retain(|created| !before.contains(created));
+                let [created] = after.as_slice() else {
+                    return Err(failed(
+                        "the routine it created could not be told from its overloads".into(),
+                    ));
+                };
+                step.created = Some(created.clone());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Every routine of one schema-qualified name, named as the capture names
+/// them: schema and name, then each argument type by schema and name.
+async fn routines(
+    conn: &mut pbps_db::transport::StreamConn,
+    schema: &str,
+    name: &str,
+) -> Result<Vec<ObjectIdentity>, String> {
+    let literal = |value: &str| format!("'{}'", value.replace('\'', "''"));
+    let rows = conn
+        .query(&format!(
+            "SELECT p.proname AS name, COALESCE((SELECT pg_catalog.json_agg(pg_catalog.json_build_array(tn.nspname, t.typname) ORDER BY a.ord) \
+             FROM pg_catalog.unnest(p.proargtypes::pg_catalog.oid[]) WITH ORDINALITY AS a(typ, ord) \
+             JOIN pg_catalog.pg_type t ON t.oid = a.typ JOIN pg_catalog.pg_namespace tn ON tn.oid = t.typnamespace), '[]')::text AS args \
+             FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname = {} AND p.proname = {}",
+            literal(schema),
+            literal(name)
+        ))
+        .await
+        .map_err(|error| error.to_string())?;
+    rows.iter()
+        .map(|row| {
+            let args = row
+                .try_get::<&str>("args")
+                .ok()
+                .flatten()
+                .and_then(|args| serde_json::from_str::<Vec<[String; 2]>>(args).ok())
+                .ok_or("a created routine's argument types are unreadable")?;
+            Ok(ObjectIdentity {
+                class: "pg_proc".into(),
+                name: vec![schema.to_owned(), name.to_owned()],
+                signature: args
+                    .into_iter()
+                    .map(|type_name| ObjectIdentity {
+                        class: "pg_type".into(),
+                        name: type_name.into(),
+                        signature: Vec::new(),
+                    })
+                    .collect(),
+            })
+        })
+        .collect()
 }
 
 fn step(
@@ -304,6 +387,7 @@ fn step(
         statements,
         names,
         module,
+        created: None,
     })
 }
 

@@ -99,7 +99,7 @@ pub(super) fn reconstruction(
 
 /// Compiles the reconstruction as whatever role the session is.
 pub(super) async fn compile(
-    reconstruction: &Reconstruction,
+    reconstruction: &mut Reconstruction,
     extras: &[String],
     connection: &mut StreamConn,
 ) -> Result<(), String> {
