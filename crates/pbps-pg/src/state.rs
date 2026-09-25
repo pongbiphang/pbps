@@ -1147,7 +1147,8 @@ async fn migrate_timeline_columns(conn: &mut Conn) -> Result<(), DbError> {
 async fn migration_ownership_missing(conn: &mut Conn) -> Option<bool> {
     // 42501 also comes from event triggers. Only prescribe ownership when
     // the catalog establishes its absence; a failed diagnostic must retain
-    // the original migration error and leave the caller's transaction usable.
+    // the original migration error and leave the caller's transaction usable
+    // (DEC-463.1).
     let guard = Recoverable::take(conn).await.ok()?;
     let result = conn
         .query(

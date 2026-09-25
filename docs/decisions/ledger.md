@@ -969,3 +969,38 @@ as statements to run, with both role names quoted:
 
 A `NOLOGIN` group owner whose only login member is the deployment account
 remains accepted (DEC-834.1).
+
+<a id="dec-463-1"></a>
+
+**DEC-463.1. A PostgreSQL ledger migration that fails with SQLSTATE `42501`
+prescribes ownership only when the catalog shows ownership is missing, and
+keeps neutral guidance otherwise (#463).** The timeline-column migration
+(DECISIONS 435) runs an `ALTER TABLE` on `public.__pbps_state`, and PostgreSQL
+authorizes `ALTER TABLE` by ownership, not by a grantable privilege. A role that
+reads and writes the ledger without owning it therefore fails with `42501`, and
+telling it to obtain ownership, through `pbps doctor`'s migration readiness
+check, is the actionable answer.
+
+`42501` alone does not establish that cause. It is also what an event trigger
+raises when it rejects the `ALTER`, whatever the role owns. An owner blocked
+that way, told to go and obtain the ownership it already holds, is sent
+somewhere that cannot help. So on `42501` the migration asks the catalog one
+more question, whether `current_user` holds `USAGE` on the table's owner role
+(`pg_has_role(current_user, relowner, 'USAGE')`). It prescribes ownership only
+when the answer is that it does not.
+
+That diagnostic can itself fail or come back without an answer. It runs under
+a savepoint, so a failure leaves the caller's transaction usable. Its failure
+means "unknown", and unknown is not "missing"
+(`migration_ownership_missing` returns `None`). In that case, and for every
+code other than `42501`, the error carries neutral guidance: investigate the
+original database error, which stays in the chain. A diagnostic that guessed
+would replace a true error with a confident wrong one.
+
+Pinned by `only_verified_missing_ownership_recommends_obtaining_rights`
+(`crates/pbps-pg/src/state.rs`) for the three-way guidance, by
+`an_owner_trigger_permission_failure_does_not_claim_missing_ownership` for the
+owner an event trigger blocks, and by
+`a_role_without_ownership_is_refused_by_name_on_a_pre_migration_ledger` for
+the DML-only non-owner who is correctly told to obtain ownership (both in
+`crates/pbps-pg/tests/live.rs`).
