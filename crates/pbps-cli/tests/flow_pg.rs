@@ -12467,3 +12467,96 @@ fn a_staged_or_bootstrapped_definer_routine_without_a_pinned_path_is_refused_bef
         "the bootstrap left the database empty"
     );
 }
+
+/// #700: a revoke the engine did not carry out. A `REVOKE` that reports
+/// success and changes nothing (a third grantor's entry, the wide statement
+/// before DECISIONS 518, or a trigger that grants the permission straight
+/// back) must not be recorded as converged. The closing read holds the role
+/// to what the plan leaves it holding (DECISIONS 160). Measured here with an
+/// event trigger that re-grants on `REVOKE`: the apply exits non-zero, names
+/// the permission that survived, rolls back and records no apply entry. The
+/// same plan without the trigger lands and is recorded.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_revoke_that_does_not_land_is_refused_at_the_closing_read() {
+    for undone in [true, false] {
+        let slug = if undone {
+            "revoke-undone"
+        } else {
+            "revoke-lands"
+        };
+        let server = server();
+        let reader = format!("pbps_rv_{}_{}", std::process::id(), u8::from(undone));
+        let _roles = ClusterRoles {
+            server: server.clone(),
+            names: vec![reader.clone()],
+        };
+        on_server(&server, &format!("CREATE ROLE {reader} NOSUPERUSER"));
+        let own = OwnDatabase::new(&server, slug);
+        let connection = own.connection();
+        on_server(connection, "CREATE SCHEMA app");
+        let d = Demo::new(slug);
+        d.table(ONE_COLUMN);
+        let file = d.dir.join("schema/reader.yml");
+        let declaration = |permissions: &str| {
+            format!("role: {reader}\ngrants:\n  schema::app: [usage]\n  app.t: [{permissions}]\n")
+        };
+        std::fs::write(&file, declaration("select, insert")).unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", connection]));
+        if undone {
+            on_server(
+                connection,
+                &format!(
+                    "CREATE FUNCTION public.regrant() RETURNS event_trigger LANGUAGE plpgsql \
+                     AS $$ BEGIN EXECUTE 'GRANT INSERT ON app.t TO {reader}'; END $$; \
+                     CREATE EVENT TRIGGER regrant ON ddl_command_end WHEN TAG IN ('REVOKE') \
+                     EXECUTE FUNCTION public.regrant()"
+                ),
+            );
+        }
+        std::fs::write(&file, declaration("select")).unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let plan = d.dir.join("plan.json");
+        succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+        let recorded = || {
+            scalar(
+                connection,
+                "SELECT count(*) FROM public.__pbps_state WHERE kind <> 'failed'",
+            )
+        };
+        let inserts = || {
+            scalar(
+                connection,
+                &format!(
+                    "SELECT CASE WHEN has_table_privilege('{reader}', 'app.t', 'INSERT') \
+                     THEN 1 ELSE 0 END::bigint"
+                ),
+            )
+        };
+        let before = recorded();
+        let applied = approved_apply(&d, connection, &plan, &["--allow", "revoke"]);
+        if undone {
+            assert_eq!(
+                code(&applied),
+                1,
+                "{}{}",
+                stdout(&applied),
+                stderr(&applied)
+            );
+            assert!(
+                stderr(&applied).contains(&format!("role {reader} does not hold on app.t"))
+                    && stderr(&applied).contains("it still holds insert"),
+                "{}",
+                stderr(&applied)
+            );
+            assert_eq!(recorded(), before, "nothing was recorded as applied");
+        } else {
+            succeeds(applied);
+            assert_eq!(inserts(), 0, "the revoke landed");
+            assert_eq!(recorded(), before + 1, "and was recorded");
+        }
+    }
+}

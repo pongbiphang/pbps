@@ -2685,8 +2685,24 @@ fn refuse_unplanned_movement(
                 }
             }
             if expected != held {
+                // Which permission, both ways: a revoke that did not take and a
+                // grant that was taken away read the same without it (#700).
+                let listed =
+                    |set: std::collections::btree_set::Difference<'_, pbps_model::Permission>| {
+                        set.map(ToString::to_string).collect::<Vec<_>>().join(", ")
+                    };
+                let mut detail = Vec::new();
+                let surplus = listed(held.difference(&expected));
+                if !surplus.is_empty() {
+                    detail.push(format!("it still holds {surplus}"));
+                }
+                let missing = listed(expected.difference(&held));
+                if !missing.is_empty() {
+                    detail.push(format!("it lacks {missing}"));
+                }
                 moved.push(format!(
-                    "role {now_name} does not hold on {target} what this plan leaves it holding"
+                    "role {now_name} does not hold on {target} what this plan leaves it holding: {}",
+                    detail.join("; ")
                 ));
             }
         }
@@ -7150,9 +7166,14 @@ mod tests {
         let e = refuse(&plan_granting(Permission::Insert), &before, &before)
             .expect_err("the grant this plan asked for did not take");
         assert!(e.contains("role app"), "{e}");
+        // #700: and which permission, in either direction.
+        assert!(e.contains("it lacks insert"), "{e}");
+        assert!(!e.contains("still holds"), "{e}");
         let e = refuse(&revoking, &before, &before)
             .expect_err("the revoke this plan asked for did not take");
         assert!(e.contains("role app"), "{e}");
+        assert!(e.contains("it still holds select"), "{e}");
+        assert!(!e.contains("lacks"), "{e}");
     }
 
     /// A table's rename forwards the grants on the table and nothing else.
