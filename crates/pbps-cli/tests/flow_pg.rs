@@ -1528,6 +1528,73 @@ fn a_new_tables_expressions_calling_a_rebuilt_function_follow_it() {
     succeeds(d.run(&["verify", "--db", connection]));
 }
 
+/// A new default calling a function the revision rebuilds, on a table whose
+/// row the same plan updates in another column: the update takes nothing from
+/// the default, so the default follows `CREATE FUNCTION` and the plan applies
+/// (#1030). Only a row that takes the default holds it back.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_default_follows_a_rebuilt_function_past_an_update_that_does_not_take_it() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "default-past-update");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE TABLE app.u (id integer PRIMARY KEY, n integer, other integer); \
+         INSERT INTO app.u VALUES (1, 7, 5)",
+    );
+    let d = Demo::new("default-past-update");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    let function = d.dir.join("schema/app.f%28integer%29.function.yml");
+    let text = std::fs::read_to_string(&function).unwrap();
+    std::fs::write(&function, text.replace("SELECT x", "SELECT x + 0")).unwrap();
+    std::fs::write(
+        d.dir.join("schema/app.u.yml"),
+        "table: app.u\ncolumns:\n  id: {type: integer, nullable: false}\n  \
+         \"n\": {type: integer, default: 'app.f(1)'}\n  other: {type: integer}\n\
+         primary_key: {name: u_pkey, columns: [id]}\n\
+         data:\n  mode: ensure\n  rows:\n    1: {\"n\": 7, other: 6}\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    assert!(at("UPDATE \"app\".\"u\"") < at("DROP FUNCTION"), "{script}");
+    assert!(
+        at("CREATE FUNCTION") < at("ALTER TABLE \"app\".\"u\" ALTER COLUMN \"n\" SET DEFAULT"),
+        "{script}"
+    );
+    let allow = ["--allow", "data-update", "--allow", "grant-widen"];
+    succeeds(approved_apply(&d, connection, &plan, &allow));
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    assert_eq!(
+        scalar(connection, "SELECT other::bigint FROM app.u WHERE id = 1"),
+        6
+    );
+}
+
 /// A check, a filtered index and a default the same revision adds, each calling
 /// a function that revision rebuilds, are created after the rebuild (#942,
 /// DEC-942.1). `modules::dependents` reads the catalog, where none of them

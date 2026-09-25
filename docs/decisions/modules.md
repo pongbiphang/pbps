@@ -1417,9 +1417,12 @@ foreign key in its class may rest on it.
 Two shapes are left to the engine, and they fail loudly: the apply is refused
 and rolls back.
 
-- **A default on a table whose rows the plan writes.** Row writes come before
-  the modules, and a row inserted before the move would take the old default,
-  which records rows the declarations did not ask for.
+- **A default a row the plan writes takes.** That is an insert that omits the
+  column, or an update that sets it back to its default. Row writes come
+  before the modules, and such a row would take the old default, which records
+  rows the declarations did not ask for. A write that spells the column, or
+  touches only other columns, takes nothing from it, and the default moves
+  (#1030).
 - **A column added with a default that calls the function.** The column has to
   exist before any module that reads it.
 
@@ -1433,7 +1436,7 @@ the last function create is split first (#1027):
 - its column defaults become `AlterColumnDefault`.
 
 The rule above then places them. A default stays inside the `CREATE TABLE`
-when the plan writes that table's rows, or when no ids file names the column.
+when a row the plan writes takes it, or when no ids file names the column.
 A split-out check asks for `--allow constraint`, as any added check does. The
 apply's read-back holds a created column to the default a later change of the
 same plan sets, once every statement has run. At a staged checkpoint before

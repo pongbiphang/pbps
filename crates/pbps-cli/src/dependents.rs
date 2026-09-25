@@ -557,6 +557,36 @@ pub(crate) fn weave(
     Ok(cs.changes.len() - before)
 }
 
+/// The columns whose default a row this plan writes takes: an insert that
+/// omits the column (its `defaults`), and an update that sets it back to its
+/// default (#1030). A default these rows need has to be in place before them.
+/// Any other write, an update of another column or an insert that spells this
+/// one, leaves the default free to move after a rebuilt function.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn defaults_taken_by_rows(cs: &ChangeSet) -> std::collections::BTreeSet<ColumnRef> {
+    let mut out = std::collections::BTreeSet::new();
+    for p in &cs.changes {
+        match &p.change {
+            Change::InsertRow {
+                table, defaults, ..
+            } => {
+                for column in defaults.keys() {
+                    out.insert(ColumnRef::new(table.clone(), column.clone()));
+                }
+            }
+            Change::UpdateRow { table, columns, .. } => {
+                for (column, (_, after)) in columns {
+                    if matches!(after, pbps_model::Cell::Default(_)) {
+                        out.insert(ColumnRef::new(table.clone(), column.clone()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Where the last function create is, when the plan rebuilds a function;
 /// `None` when it rebuilds none, and nothing has to follow a create.
 #[allow(clippy::wildcard_enum_match_arm)]
@@ -599,9 +629,10 @@ fn last_function_create(cs: &ChangeSet) -> Option<usize> {
 /// checks become `AddCheck`, its filtered indexes `AddIndex`, and its column
 /// defaults `AlterColumnDefault`, each right after the table. The same rule
 /// as for an existing table then places them. An unfiltered index stays in
-/// the table: it holds no expression. A default stays when the plan writes
-/// the table's rows, which would otherwise be inserted without it, and when
-/// no ids file names the column, since `AlterColumnDefault` needs its uid.
+/// the table: it holds no expression. A default stays when a row the plan
+/// writes takes it (an insert that omits the column, an update that sets it
+/// back to its default, #1030), and when no ids file names the column, since
+/// `AlterColumnDefault` needs its uid.
 ///
 /// Split this way, the table's check is added to an empty table, and it asks
 /// for `--allow constraint` as any added check does. The approver sees the
@@ -616,16 +647,7 @@ pub(crate) fn split_new_tables(
     let Some(last) = last_function_create(cs) else {
         return 0;
     };
-    let writes_rows: std::collections::BTreeSet<pbps_model::TableName> = cs
-        .changes
-        .iter()
-        .filter_map(|p| match &p.change {
-            Change::InsertRow { table, .. } | Change::UpdateRow { table, .. } => {
-                Some(table.clone())
-            }
-            _ => None,
-        })
-        .collect();
+    let taken = defaults_taken_by_rows(cs);
     let mut added = 0;
     for i in (0..last).rev() {
         let Change::CreateTable { name, table, .. } = &mut cs.changes[i].change else {
@@ -655,20 +677,21 @@ pub(crate) fn split_new_tables(
                 });
             }
         }
-        if !writes_rows.contains(&name) {
-            for (column, spec) in table.columns.iter_mut() {
-                let column_ref = ColumnRef::new(name.clone(), column.clone());
-                let Some(uid) = ids.iter().find_map(|ids| ids.column_uid(&column_ref)) else {
-                    continue;
-                };
-                if let Some(to) = spec.default.take() {
-                    parts.push(Change::AlterColumnDefault {
-                        uid: uid.clone(),
-                        column: column_ref,
-                        from: None,
-                        to: Some(to),
-                    });
-                }
+        for (column, spec) in table.columns.iter_mut() {
+            let column_ref = ColumnRef::new(name.clone(), column.clone());
+            if taken.contains(&column_ref) {
+                continue;
+            }
+            let Some(uid) = ids.iter().find_map(|ids| ids.column_uid(&column_ref)) else {
+                continue;
+            };
+            if let Some(to) = spec.default.take() {
+                parts.push(Change::AlterColumnDefault {
+                    uid: uid.clone(),
+                    column: column_ref,
+                    from: None,
+                    to: Some(to),
+                });
             }
         }
         if parts.is_empty() {
@@ -706,9 +729,11 @@ pub(crate) fn split_new_tables(
 /// being set. A unique index with no filter stays where it is, since a
 /// foreign key in its class may rest on it and holds no expression anyway.
 ///
-/// One default does not move: a default on a table whose rows this plan
-/// writes. Row writes come before the modules, and a row the plan inserts
-/// would take the old default instead of the declared one. Leaving it in
+/// One default does not move: a default a row this plan writes takes, an
+/// insert that omits the column or an update that sets it back to its
+/// default (#1030). Row writes come before the modules, and such a row would
+/// take the old default instead of the declared one. A write that spells the
+/// column, or touches only others, takes nothing from it. Leaving it in
 /// place means a default that calls the rebuilt function still meets the
 /// `DROP` there, and the apply fails and rolls back. That is loud, where
 /// moving it would record rows the declarations did not ask for. A column
@@ -719,12 +744,7 @@ pub(crate) fn after_the_rebuilds(cs: &mut ChangeSet) -> usize {
     let Some(last) = last_function_create(cs) else {
         return 0;
     };
-    let writes_rows = |table: &pbps_model::TableName| {
-        cs.changes.iter().any(|p| match &p.change {
-            Change::InsertRow { table: t, .. } | Change::UpdateRow { table: t, .. } => t == table,
-            _ => false,
-        })
-    };
+    let taken = defaults_taken_by_rows(cs);
     let moves: Vec<bool> = cs.changes[..last]
         .iter()
         .map(|p| match &p.change {
@@ -734,7 +754,7 @@ pub(crate) fn after_the_rebuilds(cs: &mut ChangeSet) -> usize {
                 column,
                 to: Some(_),
                 ..
-            } => !writes_rows(&column.table),
+            } => !taken.contains(column),
             _ => false,
         })
         .collect();
@@ -1124,14 +1144,14 @@ mod tests {
             ]
         );
 
-        // Rows written to the new table: the default stays for them.
+        // A row that omits `v` takes its default: the default stays for it.
         let insert = Change::InsertRow {
             table: n.clone(),
             key_column: "id".into(),
             identity_key: false,
             key: pbps_model::RowKey::from("1"),
             row: pbps_model::Row::default(),
-            defaults: BTreeMap::new(),
+            defaults: BTreeMap::from([("v".to_owned(), "app.f(1)".to_owned())]),
             types: BTreeMap::new(),
         };
         let mut cs = plan(vec![create.clone(), insert, alter(&s, "app.f(integer)")]);
@@ -1148,8 +1168,8 @@ mod tests {
     }
 
     /// Negatives: no function rebuilt (a view rebuilt, or nothing), and a
-    /// default on a table whose rows the plan writes, which must be in place
-    /// before the insert that fills it.
+    /// default a row the plan inserts takes, which must be in place before
+    /// the insert that fills it.
     #[test]
     fn nothing_moves_without_a_rebuilt_function_or_ahead_of_its_rows() {
         let (s, _) = declared();
@@ -1170,7 +1190,7 @@ mod tests {
                 identity_key: false,
                 key: pbps_model::RowKey::from("1"),
                 row: pbps_model::Row::default(),
-                defaults: BTreeMap::new(),
+                defaults: BTreeMap::from([("n".to_owned(), "app.f(1)".to_owned())]),
                 types: BTreeMap::new(),
             },
             add_check("ck"),
@@ -1185,6 +1205,64 @@ mod tests {
                 "alter app.f(integer)",
                 "add check ck",
             ]
+        );
+    }
+
+    /// #1030: only a row that takes the default holds it back. An insert
+    /// that spells the column and an update of another column take nothing
+    /// from it, and it moves; an update that sets the column back to its
+    /// default takes it, and it stays.
+    #[test]
+    fn a_default_is_held_back_only_by_a_row_that_takes_it() {
+        let (s, _) = declared();
+        let insert = |defaults: &[&str]| Change::InsertRow {
+            table: TableName::new("app", "u"),
+            key_column: "id".into(),
+            identity_key: false,
+            key: pbps_model::RowKey::from("1"),
+            row: pbps_model::Row::default(),
+            defaults: defaults
+                .iter()
+                .map(|c| ((*c).to_owned(), "app.f(1)".to_owned()))
+                .collect(),
+            types: BTreeMap::new(),
+        };
+        let update = |column: &str, after: pbps_model::Cell| Change::UpdateRow {
+            table: TableName::new("app", "u"),
+            key_column: "id".into(),
+            key: pbps_model::RowKey::from("1"),
+            columns: BTreeMap::from([(
+                column.to_owned(),
+                (pbps_model::Cell::Value(pbps_model::Value::Null), after),
+            )]),
+            unchanged: BTreeMap::new(),
+            types: BTreeMap::new(),
+            after_types: BTreeMap::new(),
+        };
+        let moved = |write: Change| {
+            let mut cs = plan(vec![set_default("u"), write, alter(&s, "app.f(integer)")]);
+            after_the_rebuilds(&mut cs) == 1
+        };
+        assert!(moved(insert(&[])), "an insert that spells `n`");
+        assert!(
+            moved(insert(&["other"])),
+            "an insert defaulting another column"
+        );
+        assert!(
+            moved(update("other", pbps_model::Cell::Default("0".into()))),
+            "an update of another column"
+        );
+        assert!(
+            moved(update(
+                "n",
+                pbps_model::Cell::Value(pbps_model::Value::Null)
+            )),
+            "an update that spells `n`"
+        );
+        assert!(!moved(insert(&["n"])), "an insert that omits `n`");
+        assert!(
+            !moved(update("n", pbps_model::Cell::Default("app.f(1)".into()))),
+            "an update that sets `n` back to its default"
         );
     }
 
