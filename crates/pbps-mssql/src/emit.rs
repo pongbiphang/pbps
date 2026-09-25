@@ -1566,7 +1566,9 @@ fn create_table(name: &TableName, table: &Table) -> Sql {
 /// name `table` has now) to `new`, if it still has that name: an adopted
 /// default under a name `pbps` never chose keeps it (#975). `None` when the
 /// two names are the same. The `|` keeps padding out of the comparison
-/// (DEC-954.1).
+/// (DEC-954.1). A target name something else in the schema already holds is
+/// left alone too, and the default keeps its old name: renaming onto it would
+/// fail the whole table or column rename it follows (review of #988).
 fn rename_generated_default(
     table: &TableName,
     old: &str,
@@ -1578,10 +1580,12 @@ fn rename_generated_default(
     Ok(Some(format!(
         "IF EXISTS (SELECT 1 FROM sys.default_constraints \
          WHERE parent_object_id = OBJECT_ID({}, N'U') \
-         AND (name + N'|') COLLATE Latin1_General_BIN2 = {})\n    \
+         AND (name + N'|') COLLATE Latin1_General_BIN2 = {}) \
+         AND OBJECT_ID({}) IS NULL\n    \
          EXEC sp_rename {}, {}, 'OBJECT';",
         literal(&qualified(table)?),
         literal(&format!("{old}|")),
+        literal(&format!("{}.{}", quote(&table.schema)?, quote(new)?)),
         literal(&format!("{}.{}", quote(&table.schema)?, quote(old)?)),
         literal(new)
     )))

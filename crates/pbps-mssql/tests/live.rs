@@ -2512,6 +2512,25 @@ async fn a_renamed_tables_and_columns_generated_defaults_follow_them() {
     )
     .await;
 
+    // Review of #988: a target name another object already holds is left
+    // alone, and the rename it follows still runs.
+    db.conn
+        .execute("CREATE TABLE dbo.DF_pbps_w_c (id int);")
+        .await
+        .unwrap();
+    apply(
+        &mut db.conn,
+        &ChangeSet {
+            changes: vec![PlannedChange::new(Change::RenameTable {
+                uid: "t_aaa001".parse().unwrap(),
+                from: "dbo.u".parse().unwrap(),
+                to: "dbo.w".parse().unwrap(),
+                defaults: vec!["c".into()],
+            })],
+        },
+    )
+    .await;
+
     // A default under a hand-written name is left as it is.
     db.conn
         .execute("CREATE TABLE dbo.legacy (c int NOT NULL CONSTRAINT DF_legacy_c DEFAULT 0);")
@@ -2554,7 +2573,7 @@ async fn a_renamed_tables_and_columns_generated_defaults_follow_them() {
             ("dbo.adopted.c".to_owned(), "DF_legacy_c".to_owned()),
             ("dbo.t.c".to_owned(), "DF_pbps_t_c".to_owned()),
             ("dbo.t.d".to_owned(), "DF_pbps_t_d".to_owned()),
-            ("dbo.u.c".to_owned(), "DF_pbps_u_c".to_owned()),
+            ("dbo.w.c".to_owned(), "DF_pbps_u_c".to_owned()),
         ]
     );
     db.drop().await;
