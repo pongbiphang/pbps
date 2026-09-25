@@ -2016,6 +2016,82 @@ fn a_declaration_may_reopen_a_closed_routine_on_its_next_rebuild() {
     succeeds(d.run(&["verify", "--db", connection]));
 }
 
+/// #691: EXECUTE that a third role granted to PUBLIC is something no
+/// `REVOKE ... FROM PUBLIC` from this connection takes away. It never reaches
+/// one. Closing a routine is a rebuild on this engine, and that role can only
+/// have granted to PUBLIC while holding the grant option on the routine,
+/// which the declarations have no flag for. So `before_a_rebuild` refuses the
+/// plan, naming the role, before a statement runs, and the ACL is untouched.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn closing_a_routine_a_third_role_opened_to_public_is_refused_before_it_runs() {
+    let admin = server();
+    let mid = format!("pbps_pub_mid_{}", std::process::id());
+    let _roles = ClusterRoles {
+        server: admin.clone(),
+        names: vec![mid.clone()],
+    };
+    on_server(&admin, &format!("CREATE ROLE {mid} NOSUPERUSER"));
+    let own = OwnDatabase::new(&admin, "third-public");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("third-public");
+    let file = d.dir.join("schema/shut.yml");
+    let declaration = |value: u8, open: bool| {
+        format!(
+            "function: app.shut()\ndefinition: () RETURNS integer LANGUAGE sql AS $$ SELECT {value} $$\n{}",
+            if open { "public_execute: true\n" } else { "" }
+        )
+    };
+    std::fs::write(&file, declaration(1, true)).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    on_server(
+        connection,
+        &format!(
+            "GRANT USAGE ON SCHEMA app TO {mid}; \
+             GRANT EXECUTE ON FUNCTION app.shut() TO {mid} WITH GRANT OPTION; \
+             SET ROLE {mid}; GRANT EXECUTE ON FUNCTION app.shut() TO PUBLIC; RESET ROLE"
+        ),
+    );
+    let by_mid = || {
+        scalar(
+            connection,
+            &format!(
+                "SELECT count(*)::bigint FROM pg_proc p, aclexplode(p.proacl) a \
+                  WHERE p.oid = 'app.shut()'::regprocedure AND a.grantee = 0 \
+                    AND a.grantor = '{mid}'::regrole::oid"
+            ),
+        )
+    };
+    assert_eq!(
+        by_mid(),
+        1,
+        "PUBLIC's entry has to carry the third role's grantor"
+    );
+
+    std::fs::write(&file, declaration(2, false)).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let refused = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("before_a_rebuild") && stderr(&refused).contains(&mid),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!plan.exists(), "a refused plan writes no artifact");
+    assert_eq!(by_mid(), 1, "nothing ran");
+}
+
 /// `--staged` applies one logical change (ADR-0003), and the decision the
 /// differ appends to a routine it creates is not a second one. Creating one
 /// routine in a staged revision was legal before issue #318, and the routine
@@ -3481,18 +3557,42 @@ fn a_grant_a_third_role_made_is_kept_and_only_its_removal_is_refused() {
         "{}",
         stderr(&refused)
     );
+    // #707: the remedy sends the operator to the grantor, never to the owner.
+    assert!(
+        stderr(&refused).contains(&format!("Have `{third}` revoke it"))
+            && stderr(&refused).contains(&format!("SET ROLE {third}")),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!stderr(&refused).contains(&owner), "{}", stderr(&refused));
     assert!(!plan.exists(), "a refused plan writes no artifact");
-    assert_eq!(
+    let reads = || {
         scalar(
             connection,
             &format!(
                 "SELECT CASE WHEN has_table_privilege('{reader}', 'app.t', 'SELECT') \
                  THEN 1 ELSE 0 END::bigint"
             ),
+        )
+    };
+    assert_eq!(reads(), 1, "nothing ran");
+
+    // And the advice agrees with the engine. The owner's `REVOKE`, which the
+    // message used to offer, reports success and leaves the entry standing;
+    // the grantor's takes it away (#707).
+    on_server(
+        connection,
+        &format!(
+            "GRANT USAGE ON SCHEMA app TO {owner}; \
+             SET ROLE {owner}; REVOKE SELECT ON app.t FROM {reader}; RESET ROLE"
         ),
-        1,
-        "nothing ran"
     );
+    assert_eq!(reads(), 1, "the owner's revoke left the third role's entry");
+    on_server(
+        connection,
+        &format!("SET ROLE {third}; REVOKE SELECT ON app.t FROM {reader}; RESET ROLE"),
+    );
+    assert_eq!(reads(), 0, "the grantor's revoke took it away");
 }
 
 /// Issue #251, the rename the check has to see through. A plan that renames a

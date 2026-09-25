@@ -1102,16 +1102,19 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
                 target: target.clone(),
                 permission,
                 why: format!(
+                    // The grantor, never the owner: the owner's `REVOKE` leaves
+                    // another grantor's entry standing and reports success
+                    // (measured on 18.6, DECISIONS 483; #707).
                     "{} on {} was granted by `{}`, and a `REVOKE` from `{}` would not \
                      carry that grantor — so nothing this tool can run takes it away. \
-                     Select `{}` explicitly, or have its owner `{}` revoke it \
+                     Have `{}` revoke it, or `SET ROLE {}` and revoke it \
                      (ADR-0010 §1, DECISIONS 483, measured)",
                     g.permission,
                     target_label(g, &signatures),
                     g.grantor,
                     raw.session_role,
                     g.grantor,
-                    g.owner
+                    g.grantor
                 ),
             });
         }
@@ -3174,6 +3177,15 @@ mod tests {
         );
         assert!(found.why.contains("granted by `app_mid`"), "{}", found.why);
         assert!(found.why.contains("`deployer`"), "{}", found.why);
+        // #707: the remedy names the grantor, and never the owner, whose
+        // `REVOKE` would leave this entry standing and report success.
+        assert!(
+            found.why.contains("Have `app_mid` revoke it")
+                && found.why.contains("SET ROLE app_mid"),
+            "{}",
+            found.why
+        );
+        assert!(!found.why.contains("owner"), "{}", found.why);
         assert!(
             found
                 .why
