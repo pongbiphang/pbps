@@ -15,13 +15,15 @@ pub(super) struct Git {
 
 /// The names of the variables the UI inherited. Each value is dropped here
 /// and never leaves: this is the only environment read the UI makes, and
-/// the exception is scoped to it (ADR-0015 decision 4, DEC-1050.1).
-#[expect(
-    clippy::disallowed_methods,
-    reason = "reads only the names of inherited variables and discards every value"
-)]
+/// the exception covers this one statement (ADR-0015 decision 4,
+/// DEC-1050.1), so any other read, even in this function, is an error.
 fn inherited_names() -> impl Iterator<Item = OsString> {
-    std::env::vars_os().map(|(name, _)| name)
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "reads only the names of inherited variables and discards every value"
+    )]
+    let variables = std::env::vars_os();
+    variables.map(|(name, _)| name)
 }
 
 impl Git {
