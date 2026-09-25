@@ -28,6 +28,18 @@ pub use schema_diff::{
 #[allow(clippy::wildcard_enum_match_arm)]
 mod tests {
     use super::*;
+
+    /// Resolves as `plan` does when every intent came from a declaration's
+    /// `renamed_from:` annotation: the provenance these tests describe.
+    /// `resolve` alone now reads every intent as a current decision (#403).
+    fn annotated(
+        declared: &Schema,
+        ids: &IdsFile,
+        intents: &[Intent],
+        ctx: &Context,
+    ) -> Result<Resolution, Vec<Blocker>> {
+        resolve_with_annotations(declared, ids, intents, intents.len(), ctx)
+    }
     use indexmap::IndexMap;
     use pbps_model::{Column, ColumnType, IdsFile, Intent, Schema, Table, TableName};
 
@@ -1471,7 +1483,7 @@ mod tests {
     fn a_stale_annotation_does_not_contend_with_a_live_rename() {
         let (_, ids) = baseline(&[("dbo.old", &["id"]), ("dbo.zzz", &["id"])]);
         let s = schema(&[("dbo.aaa", &["id"]), ("dbo.zzz", &["id"])]);
-        let r = resolve(
+        let r = annotated(
             &s,
             &ids,
             &[
@@ -1499,7 +1511,7 @@ mod tests {
     fn a_stale_column_annotation_does_not_contend_with_a_live_rename() {
         let (_, ids) = baseline(&[("dbo.t", &["id", "old", "zzz"])]);
         let s = schema(&[("dbo.t", &["id", "aaa", "zzz"])]);
-        let r = resolve(
+        let r = annotated(
             &s,
             &ids,
             &[
@@ -1526,9 +1538,9 @@ mod tests {
     #[test]
     fn a_stale_role_annotation_does_not_contend_with_a_live_rename() {
         let s = with_roles(&[("dbo.t", &["id"])], &["old", "zzz"]);
-        let ids = resolve(&s, &IdsFile::default(), &[], &ctx()).unwrap().ids;
+        let ids = annotated(&s, &IdsFile::default(), &[], &ctx()).unwrap().ids;
         let s = with_roles(&[("dbo.t", &["id"])], &["aaa", "zzz"]);
-        let r = resolve(
+        let r = annotated(
             &s,
             &ids,
             &[
