@@ -14397,3 +14397,114 @@ async fn a_moved_table_does_not_keep_its_source_schema_managed_but_a_dropped_one
     );
     db.drop().await;
 }
+
+/// #355. A recorded view, procedure or function that the declarations no
+/// longer name is a pending `DROP` in its schema, as a recorded table is. When
+/// it is the last managed object there, `doctor` must still ask for `ALTER` on
+/// that schema. Once the drop is recorded, the schema is no longer managed.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_recorded_module_keeps_its_schema_in_the_readiness_check_until_its_drop() {
+    for (kind, name, create) in [
+        (
+            pbps_model::ModuleKind::View,
+            "legacy.v",
+            "CREATE VIEW legacy.v AS SELECT 1 AS x",
+        ),
+        (
+            pbps_model::ModuleKind::Procedure,
+            "legacy.p",
+            "CREATE PROCEDURE legacy.p AS SELECT 1",
+        ),
+        (
+            pbps_model::ModuleKind::Function,
+            "legacy.f",
+            "CREATE FUNCTION legacy.f() RETURNS int AS BEGIN RETURN 1 END",
+        ),
+    ] {
+        let mut db = TestDb::create("doctorrecordedmodule").await;
+        db.conn
+            .execute(
+                "EXEC('CREATE SCHEMA legacy'); CREATE USER deployer WITHOUT LOGIN; \
+                 GRANT VIEW DEFINITION TO deployer;",
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(&format!("EXEC('{}')", create.replace('\'', "''")))
+            .await
+            .unwrap();
+        pbps_mssql::state::ensure_tables(&mut db.conn)
+            .await
+            .unwrap();
+        // Readable, or the recorded state is invisible and the check below
+        // would pass for the wrong reason.
+        db.conn
+            .execute("GRANT SELECT ON SCHEMA::dbo TO deployer;")
+            .await
+            .unwrap();
+        let mut recorded = Schema::default();
+        recorded.modules.insert(
+            pbps_model::ModuleId::Named(name.parse().unwrap()),
+            pbps_model::Module {
+                kind,
+                description: None,
+                definition: create.to_owned(),
+            },
+        );
+        pbps_mssql::state::record(
+            &mut db.conn,
+            &StateSnapshot::new(
+                pbps_model::StateKind::Apply,
+                recorded,
+                IdsFile::default(),
+                "live-test",
+            ),
+        )
+        .await
+        .unwrap();
+        let held = doctor_as_deployer(&mut db.conn).await;
+        assert!(
+            pbps_mssql::doctor::missing(&held)
+                .iter()
+                .any(|gap| gap.permission == "ALTER" && gap.securable() == "SCHEMA::[legacy]"),
+            "{name}: {held:?}"
+        );
+
+        // The drop is recorded: the schema is no longer this project's.
+        pbps_mssql::state::record(
+            &mut db.conn,
+            &StateSnapshot::new(
+                pbps_model::StateKind::Apply,
+                Schema::default(),
+                IdsFile::default(),
+                "live-test",
+            ),
+        )
+        .await
+        .unwrap();
+        let held = doctor_as_deployer(&mut db.conn).await;
+        assert!(!held.schemas.contains_key("legacy"), "{name}: {held:?}");
+        db.drop().await;
+    }
+}
+
+/// `doctor::permissions` for a project that declares nothing, asked as the
+/// `deployer` user.
+async fn doctor_as_deployer(conn: &mut Conn) -> pbps_mssql::doctor::Held {
+    conn.execute("EXECUTE AS USER = 'deployer';").await.unwrap();
+    let held = pbps_mssql::doctor::permissions(
+        conn,
+        &[],
+        &[],
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &IdsFile::default(),
+    )
+    .await
+    .unwrap();
+    conn.execute("REVERT;").await.unwrap();
+    held
+}
