@@ -12975,6 +12975,90 @@ async fn a_hand_edited_row_is_seen_and_the_update_holds_what_the_plan_recorded()
     conn.drop().await;
 }
 
+/// #976: a data table may have columns spelled like the variables the row
+/// blocks declare. Under the default `plpgsql.variable_conflict = error` the
+/// update and delete would fail as ambiguous mid-apply; the blocks resolve an
+/// unqualified name to the column and reach their own variables through the
+/// block label, so every row write lands.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_data_table_with_columns_named_like_the_row_blocks_variables_is_written() {
+    let mut conn = TestDb::create("pull_data_varnames").await;
+    let s = data_schema("varnames");
+    fresh(&mut conn, &s).await;
+
+    let name = TableName::new(&s, "status");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    for column in ["pbps_rows", "pbps_referencing"] {
+        table
+            .columns
+            .insert(column.into(), Column::new(ty("integer")));
+    }
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+    });
+    let cells = |n: i64| {
+        row(&[
+            ("pbps_rows", Value::Int(n)),
+            ("pbps_referencing", Value::Int(n)),
+        ])
+    };
+    let mut declared = Schema::default();
+    declared.tables.insert(name.clone(), table.clone());
+    with_data(
+        declared.tables.get_mut(&name).expect("the table"),
+        DataMode::Exact,
+        &[("a", cells(1)), ("b", cells(2))],
+    );
+    let ids = mint_ids(&declared, &IdsFile::default(), &[]);
+    let pg = Postgres::new();
+    apply(
+        &mut conn,
+        &pg,
+        &plan(&Schema::default(), &IdsFile::default(), &declared, &ids),
+    )
+    .await;
+
+    // One row changed, one gone, one new: an update, a delete and an insert.
+    let mut next = Schema::default();
+    next.tables.insert(name.clone(), table);
+    with_data(
+        next.tables.get_mut(&name).expect("the table"),
+        DataMode::Exact,
+        &[("a", cells(10)), ("c", cells(3))],
+    );
+    let base = connected_base(&mut conn, &next, &s).await;
+    let cs = plan(&base, &ids, &next, &ids);
+    for kind in ["UpdateRow", "DeleteRow", "InsertRow"] {
+        assert!(
+            cs.changes
+                .iter()
+                .any(|p| format!("{:?}", p.change).starts_with(kind)),
+            "{kind}: {cs:#?}"
+        );
+    }
+    apply(&mut conn, &pg, &cs).await;
+    assert_eq!(
+        text(
+            &mut conn,
+            &format!(
+                "SELECT string_agg(code || ':' || pbps_rows || ':' || pbps_referencing, ',' \
+                 ORDER BY code) FROM {s}.status"
+            )
+        )
+        .await,
+        "a:10:10,c:3:3"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+    conn.drop().await;
+}
+
 /// ADR-0013 §1: `NOT VALID` is not `NOCHECK`, and the probe that assumed it
 /// was would let a delete through that this engine refuses.
 ///
