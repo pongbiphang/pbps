@@ -4,6 +4,13 @@ pub mod authorization;
 pub mod capture;
 pub mod compatibility;
 pub mod environment;
+pub mod reconstruct;
+
+// Live, and in the library target on purpose: a capture refuses any
+// catalog write it did not make, including another test's on the same
+// server, so these run in the serial suite beside the capture's own.
+#[cfg(test)]
+mod binding_tests;
 
 use pbps_db::resolver::environment::{CatalogFacts, DatabaseRecipe, LocaleProvider};
 use pbps_db::resolver::{

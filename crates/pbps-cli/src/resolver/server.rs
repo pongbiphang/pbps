@@ -9,8 +9,9 @@
 //! the target's, reaches it through a run-owned forwarder the way the Docker
 //! profile does, proves nothing else can reach it, and only then creates its
 //! own uniquely named resources. None of this is binding qualification:
-//! engine build compatibility, deployment context and source handling remain
-//! the later #595 steps, and no declaration is transferred here.
+//! engine build compatibility and deployment context are `qualify`'s, the
+//! managed declarations cross only in `resolve` (#613), and source handling
+//! remains a later #595 step.
 
 use crate::resolver::docker::{CandidateImage, LocalApi, forwarder::Forwarder};
 use crate::resolver::native::{
@@ -87,6 +88,8 @@ pub enum Error {
     Consumed,
     #[error("the analysis scope could not be qualified or changed under the run: {0}")]
     Scope(String),
+    #[error("the desired bindings could not be resolved on this run: {0}")]
+    Binding(String),
 }
 
 /// Which premise of the named profile a refusal is about.
@@ -952,6 +955,7 @@ impl DedicatedServer {
             in_flight: false,
             removed: false,
             scope: None,
+            compiled: false,
         })
     }
 
@@ -1071,6 +1075,10 @@ pub struct ScratchRun {
     /// The qualified analysis scope, once `qualify` has established it. Bound
     /// to the scratch session, so a reopened session cannot inherit it.
     scope: Option<QualifiedScope>,
+    /// Set once `resolve` has started compiling: the scratch database then
+    /// holds a namespace, and a second compilation into it would build on
+    /// what the first left rather than on the scope alone.
+    compiled: bool,
 }
 
 /// What a run is asked to qualify: the schemas its plan writes to, the extras
@@ -1081,6 +1089,17 @@ pub struct ScopeRequest {
     pub schemas: Vec<String>,
     pub write_path_extras: Vec<String>,
     pub planned: Vec<PlannedGrant>,
+}
+
+/// What a run compiles and compares. Pure data supplied by the planner.
+#[derive(Debug, Clone, Copy)]
+pub struct BindingRequest<'a> {
+    /// The plan from an empty schema to `desired`, as the differ produces it.
+    pub bootstrap: &'a [pbps_model::Change],
+    /// The declarations. Scratch's user schemas hold these and nothing else.
+    pub desired: &'a pbps_model::Schema,
+    /// The target's managed side, by the names pbps's own model gives it.
+    pub base: &'a pbps_model::Schema,
 }
 
 /// A scope the run has qualified: the compatibility report, the deployment
@@ -1213,36 +1232,7 @@ impl ScratchRun {
         // maintenance database and its `CREATE SCHEMA`/`GRANT ON SCHEMA` would
         // land there instead (finding on #688). Open an admin session to the
         // scratch database for it; the run login cannot, being unprivileged.
-        let admin_login = self.inner.control.endpoint.login(self.names.database());
-        let reconstruction = {
-            let analysis = self.inner.live()?;
-            let control_pair = &self
-                .inner
-                .control
-                .session
-                .as_ref()
-                .ok_or(Error::Cancelled)?
-                .pair;
-            let scratch_pair = &self.scratch.as_ref().ok_or(Error::Cancelled)?.pair;
-            Session::open(
-                self.inner.control.channel(),
-                &analysis.runtime,
-                admin_login,
-                &[control_pair, scratch_pair],
-            )
-            .await
-            .map_err(|failure| {
-                let cause = self.inner.control.retain_failure(failure);
-                self.inner.refuse(cause.clone());
-                cause
-            })?
-        };
-        // The admin session moved the engine's cumulative counter; it stays
-        // moved after the session closes, so the run accounts for it.
-        if let Some(analysis) = self.inner.analysis.as_mut() {
-            analysis.opened += 1;
-        }
-        let mut reconstruction = reconstruction;
+        let mut reconstruction = self.admin_session().await?;
         let outcome = scope::prepare(
             &mut reconstruction.connection,
             &map,
@@ -1520,10 +1510,136 @@ impl ScratchRun {
         Ok(())
     }
 
+    /// Opens an administrative session on the run's own scratch database.
+    /// Database-local DDL and privileged catalog reads must run *in* that
+    /// database, and the run login cannot make them, being unprivileged. The
+    /// session moves the engine's cumulative counter, which stays moved after
+    /// it closes, so the run accounts for it; the caller retires it.
+    async fn admin_session(&mut self) -> Result<Session, Error> {
+        let admin_login = self.inner.control.endpoint.login(self.names.database());
+        let session = {
+            let analysis = self.inner.live()?;
+            let control_pair = &self
+                .inner
+                .control
+                .session
+                .as_ref()
+                .ok_or(Error::Cancelled)?
+                .pair;
+            let scratch_pair = &self.scratch.as_ref().ok_or(Error::Cancelled)?.pair;
+            Session::open(
+                self.inner.control.channel(),
+                &analysis.runtime,
+                admin_login,
+                &[control_pair, scratch_pair],
+            )
+            .await
+            .map_err(|failure| {
+                let cause = self.inner.control.retain_failure(failure);
+                self.inner.refuse(cause.clone());
+                cause
+            })?
+        };
+        if let Some(analysis) = self.inner.analysis.as_mut() {
+            analysis.opened += 1;
+        }
+        Ok(session)
+    }
+
+    /// Compiles the desired declarations on this run's scratch database as
+    /// the reproduced deployer, captures what they bound and what the target
+    /// binds under one scope derived from scratch's bindings, and compares
+    /// the two per surface (ADR-0016 decision 2; #613). Only a scope that
+    /// qualified as `Verified` may be resolved on, every step is bracketed by
+    /// a full check, and any failure ends the analysis: a namespace that
+    /// changed under the run, or a compilation that stopped part-way, cannot
+    /// supply a verdict. A run resolves once; another question needs a fresh
+    /// run and a fresh scratch database.
+    ///
+    /// Only managed declarations are transferred. A retained external object
+    /// the declarations could bind is not reconstructed (#617); the surfaces
+    /// it could reach come back unresolved.
+    pub async fn resolve(
+        &mut self,
+        target: &mut NativeTarget,
+        request: &BindingRequest<'_>,
+    ) -> Result<pbps_db::resolver::capture::Assessment, Error> {
+        let extras = match self.scope.as_ref() {
+            Some(scope) if scope.report.verdict() == Verdict::Verified => {
+                scope.write_path_extras.clone()
+            }
+            _ => {
+                return Err(Error::Binding(
+                    "the analysis scope has not been qualified as verified".into(),
+                ));
+            }
+        };
+        if self.compiled {
+            return Err(Error::Binding(
+                "this run has already compiled a namespace; resolve on a fresh run".into(),
+            ));
+        }
+        let reconstruction =
+            engine::reconstruction(self.inner.control.driver, &extras, request.bootstrap)
+                .map_err(Error::Binding)?;
+        // Requalifies the scope and enters the reproduced deployer.
+        self.check(target).await?;
+        self.compiled = true;
+        let outcome = self
+            .resolve_checked(target, request, &extras, &reconstruction)
+            .await;
+        if let Err(cause) = &outcome {
+            self.inner.refuse(cause.clone());
+            if let Some(scratch) = self.scratch.take() {
+                self.inner.control.retire(scratch);
+            }
+        }
+        outcome
+    }
+
+    async fn resolve_checked(
+        &mut self,
+        target: &mut NativeTarget,
+        request: &BindingRequest<'_>,
+        extras: &[String],
+        reconstruction: &engine::Reconstruction,
+    ) -> Result<pbps_db::resolver::capture::Assessment, Error> {
+        // In flight across the compilation: dropped part-way, the scratch
+        // session is mid-transaction, and the next check must end the run.
+        let scratch = self.scratch.as_mut().ok_or(Error::Cancelled)?;
+        self.in_flight = true;
+        let compiled = engine::compile(reconstruction, extras, &mut scratch.connection).await;
+        self.in_flight = false;
+        compiled.map_err(Error::Binding)?;
+        self.check(target).await?;
+        let base = engine::Managed::from_schema(request.base);
+        let desired = engine::Managed::from_schema(request.desired);
+        // Scratch is read through an administrative session: the capture
+        // reads settings a least-privilege deployer need not see, and which
+        // role reads a catalog row does not change what was bound.
+        let mut admin = self.admin_session().await?;
+        let captured =
+            engine::capture_desired(&mut admin.connection, &base, &desired, extras).await;
+        self.inner.control.retire(admin);
+        let (compiled, scope) = captured.map_err(Error::Binding)?;
+        self.check(target).await?;
+        let current = target
+            .capture_postgres(&scope)
+            .await
+            .map_err(|error| Error::Binding(error.to_string()))?;
+        self.check(target).await?;
+        Ok(engine::assess(
+            current.catalog(),
+            &compiled,
+            &base,
+            extras,
+            reconstruction,
+        ))
+    }
+
     /// Re-qualifies the supplied server, the channels, exclusivity and the
-    /// target binding. Later delivery steps compile declarations only through
-    /// a session this has just re-qualified; no SQL surface is exposed here,
-    /// because this step enables no declaration transfer.
+    /// target binding. Declarations are compiled only by `resolve`, between
+    /// two of these; no SQL surface is exposed.
     ///
     /// A failure is terminal for the analysis but not for cleanup: the run
     /// keeps answering with the same cause, and `close` still removes what it

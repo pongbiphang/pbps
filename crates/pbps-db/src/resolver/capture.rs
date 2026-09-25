@@ -37,6 +37,28 @@ pub struct CaptureDifference {
     pub change: InputChange,
 }
 
+/// What comparing one surface's observed target bindings with its bindings
+/// compiled on scratch proves (ADR-0016 decision 2). Identities only: no
+/// definition, property or verifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// The target already binds what a fresh creation would.
+    Unaffected,
+    /// A fresh creation binds differently; the object must be rebuilt.
+    Rebuild,
+    /// No sound answer: the condition names what is missing.
+    Unresolved { condition: &'static str },
+}
+
+/// The comparison of every managed surface both captures hold.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Assessment {
+    pub surfaces: std::collections::BTreeMap<ObjectIdentity, Verdict>,
+    /// Routines whose body is runtime-bound: their header and defaults are
+    /// compared, their body is outside this proof (ADR-0016 decision 3).
+    pub runtime_bound: std::collections::BTreeSet<ObjectIdentity>,
+}
+
 /// A safe, named coverage refusal; no source or property value is included.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("target capture cannot cover {class}: {condition}")]

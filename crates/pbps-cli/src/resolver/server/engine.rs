@@ -1,7 +1,8 @@
 //! Engine routing for the dedicated-server profile.
 //!
 //! Instance SQL stays in the engine crates; this file only chooses which one
-//! answers. Nothing here consumes declarations or produces binding evidence.
+//! answers. The binding calls below hand the PostgreSQL adapter the managed
+//! declarations and return its comparison; nothing here seals evidence.
 
 use pbps_db::resolver::environment::DatabaseRecipe;
 use pbps_db::resolver::{
@@ -68,4 +69,82 @@ pub(super) async fn drop_scratch(
         Driver::Postgres => pbps_pg::resolver::drop_scratch(connection, names).await,
         Driver::Mssql => pbps_mssql::resolver::drop_scratch(connection, names).await,
     }
+}
+
+// Binding resolution has one adapter, PostgreSQL's (#613); SQL Server's is
+// designed and built separately (#619, #620). The reconstruction, the
+// managed-name inventory and both captures are that adapter's private state,
+// as the target capture's are.
+pub(super) use pbps_pg::resolver::capture::{CaptureScope, CapturedInputs, Managed};
+pub(super) use pbps_pg::resolver::reconstruct::Reconstruction;
+
+const NO_BINDING_ADAPTER: &str =
+    "SQL Server has no binding adapter yet; its design and implementation are #619 and #620";
+
+/// The desired namespace's scratch statements, for this engine.
+pub(super) fn reconstruction(
+    driver: Driver,
+    extras: &[String],
+    bootstrap: &[pbps_model::Change],
+) -> Result<Reconstruction, String> {
+    match driver {
+        Driver::Postgres => Reconstruction::new(
+            &pbps_pg::Postgres::with_write_path_extras(extras.to_vec()),
+            bootstrap,
+        )
+        .map_err(|error| error.to_string()),
+        Driver::Mssql => Err(NO_BINDING_ADAPTER.into()),
+    }
+}
+
+/// Compiles the reconstruction as whatever role the session is.
+pub(super) async fn compile(
+    reconstruction: &Reconstruction,
+    extras: &[String],
+    connection: &mut StreamConn,
+) -> Result<(), String> {
+    match connection.driver() {
+        Driver::Postgres => reconstruction
+            .compile(
+                &pbps_pg::Postgres::with_write_path_extras(extras.to_vec()),
+                connection,
+            )
+            .await
+            .map_err(|error| error.to_string()),
+        Driver::Mssql => Err(NO_BINDING_ADAPTER.into()),
+    }
+}
+
+/// Captures scratch twice: its managed objects, and then the scope their
+/// bindings derive, which is the scope the target is captured under too.
+pub(super) async fn capture_desired(
+    connection: &mut StreamConn,
+    base: &Managed,
+    desired: &Managed,
+    extras: &[String],
+) -> Result<(CapturedInputs, CaptureScope), String> {
+    use pbps_pg::resolver::capture;
+    match connection.driver() {
+        Driver::Postgres => {
+            let first = capture::capture(connection, &capture::managed_scope(desired))
+                .await
+                .map_err(|error| error.to_string())?;
+            let scope = capture::scope(&first, &[base, desired], extras);
+            let captured = capture::capture(connection, &scope)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok((captured, scope))
+        }
+        Driver::Mssql => Err(NO_BINDING_ADAPTER.into()),
+    }
+}
+
+pub(super) fn assess(
+    target: &CapturedInputs,
+    desired: &CapturedInputs,
+    base: &Managed,
+    extras: &[String],
+    reconstruction: &Reconstruction,
+) -> pbps_db::resolver::capture::Assessment {
+    pbps_pg::resolver::capture::assess(target, desired, base, extras, reconstruction)
 }

@@ -894,3 +894,60 @@ read back as the same empty answer, and requalification accepted the scope.
 `spellings` now maps every planned name to `Some(<catalog spelling>)` or to
 `None`, so presence and absence are sealed apart; the principal map still uses
 the planned spelling for `None`.
+
+<a id="dec-613-1"></a>
+
+**DEC-613.1. The desired namespace is the emitter's bootstrap, reordered only
+so that expressions wait for modules, and its order is qualified afterwards
+from what the engine bound (#613).** The plan's class order creates tables with
+their defaults, checks and indexes before any module (`order_key`), so an
+expression calling a managed function either fails or, worse, binds whatever
+else of that name already exists; a scratch compiled that way answers the
+wrong question without an error. Parsing references to order the compile is
+the grammar work ADR-0016 refuses. So scratch runs the differ's bootstrap of
+the declarations through the ordinary emitter, with a table created bare, its
+foreign keys after every table, the modules in the differ's name-scan order,
+and each default, CHECK, index and trigger last. The scan can miss a
+reference, and a module compiled before a same-named object it would have
+preferred binds the other one silently. That is detected from the captured
+bindings instead of prevented: a module that bound any name first made
+nameable later in the reconstruction is unresolved. The check is by name, so
+it is conservative — a qualified reference it cannot tell from a bare one is
+flagged too — and a `depends_on` edge that moves the other object first
+removes it. Measured on PostgreSQL 16 and 18: f(integer) whose body calls
+`f('x'::text)` binds f(character varying) through an implicit cast when f(text)
+is compiled after it. Scratch order builds the namespace; it fixes no
+deployment order (#614). Grants, roles and rows are not reproduced, since none
+changes a binding; the deployer's path and schema privileges are the analysis
+scope's (DECISIONS 520). A run compiles once, into its own database, as the
+reproduced deployer, and is read back through an administrative session,
+because the capture reads settings a least-privilege deployer need not see and
+the reading role changes no stored binding. A failed or cancelled compile ends
+the analysis; a second question needs a fresh run.
+
+
+<a id="dec-613-2"></a>
+
+**DEC-613.2. A binding verdict holds only where scratch reproduced every
+candidate for the names the surface bound; everything else is unresolved
+rather than guessed (#613).** Equal bindings prove nothing if the target has a
+candidate scratch lacks: the target would pick it on the next creation. The
+candidate sets are derived from what scratch bound — each bound relation,
+routine, type, operator, collation or operator class/family name, looked up in
+every schema of the surface's write path after `pg_catalog` and in the schema
+it bound into — plus every cast, which resolution consults with no name. A
+declaration the plan leaves unchanged has the same text on both sides and
+resolves the same names; only the selected objects can differ, and that is
+what the bindings carry. On the target each member must be an engine object
+scratch has with the same properties, role references removed because the
+bootstrap superuser's name is the installation's, or one of the project's
+managed objects by name; a routine name holds only as many overloads as the
+model declares. An unmanaged overload beside a managed one, a routine planted
+in `pg_catalog` and a built-in cast whose context was changed each leave the
+surface unresolved, measured on both majors; so does an extension's object,
+because nothing but managed declarations is reconstructed until retained
+external input is handled privately (#617). Capturing whole schemas instead
+would refuse on unmanaged objects no surface can reach, and would pull their
+arbitrary closures into a capture that must refuse what it cannot qualify.
+Runtime-bound bodies are compared by header only and are named, never counted
+as proven by silence (ADR-0016 decision 3).

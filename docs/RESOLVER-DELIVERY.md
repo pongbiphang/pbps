@@ -112,11 +112,48 @@ namespace reconstruction/compilation, complete planning and protected artifact
 integration remain subsequent steps; no resolver-backed CLI plan/apply path is
 enabled by this library.
 
+## PostgreSQL desired namespace and binding comparison (#613)
+
+`ScratchRun::resolve` compiles the declarations on a qualified run's own
+scratch database, as the reproduced deployer, and compares what they bind with
+the target's observed bindings. Only a scope that qualified as verified can
+resolve; a full run check brackets the compile and both captures, any failure
+ends the analysis, and a run resolves once. SQL Server is refused by name until
+its adapter exists (#619, #620).
+
+The namespace is the differ's bootstrap through the ordinary emitter. Tables
+are created bare, foreign keys follow every table, modules keep the differ's
+name-scan order, and defaults, CHECKs, index predicates and triggers come last,
+when every routine they can name exists. A module that bound a name first made
+nameable later is unresolved, not trusted (DEC-613.1). Grants, roles and rows
+are not reproduced; none changes a binding.
+
+Both sides are captured by the #612 rule under one scope derived from what
+scratch bound: every candidate for those names along each surface's write path
+and in the schema it bound into, plus every cast. Each shared surface is then
+**unaffected** (equal logical bindings), **rebuild** (different bindings) or
+**unresolved** with a named condition: a target candidate scratch did not
+reproduce, an engine object whose properties differ, a role in a binding or a
+compile-order ambiguity (DEC-613.2). Runtime-bound bodies are compared by
+header and listed separately. The analysis is managed-only: retained external
+objects, including extension members, are not reconstructed until private
+source handling exists (#617), so surfaces that could reach them are
+unresolved rather than guessed. The comparison is an in-memory report of
+logical identities; it publishes no plan, evidence or SQL (#614, #615).
+
+The adapter's live suite runs on PostgreSQL 16 and 18: the motivating pair
+with an unmanaged dependent, earlier-path candidates, other overloads,
+qualified references, historical binding against a fresh bootstrap, object
+number and rename controls, every expression surface, unmanaged and planted
+candidates, a changed built-in cast, a missing prerequisite, a creation cycle
+and a compile-order ambiguity. The dedicated-server fixture resolves through
+the qualified lifecycle.
+
 ## Ordered implementation issues
 
 Each issue describes its scope, ADR acceptance cases, positive/negative tests
 and dependencies. The issue loop is sequential: the current PR must merge
-before the next issue is claimed. #597 is complete; #606 through #611 are delivered.
+before the next issue is claimed. #597 is complete; #606 through #613 are delivered.
 
 | Step | Issue | Required outcome |
 |---|---|---|

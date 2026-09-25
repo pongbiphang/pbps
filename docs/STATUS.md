@@ -167,8 +167,12 @@ on one owned snapshot. Fresh recapture compares private versioned fingerprints,
 keyed under a per-process key (DEC-952.1);
 native capture additionally qualifies executable content and expires canceled
 connections. Unknown required coverage refuses. This is a library boundary,
-not enabled CLI resolution or a saved-plan/apply path; reconstruction and
-sealing (#614) remain required. See [the capture contract and fixtures](RESOLVER-CAPTURE.md).
+not enabled CLI resolution or a saved-plan/apply path. Desired-namespace
+reconstruction and the managed-only binding comparison (#613) compile the
+declarations on a qualified run's scratch database and return, per surface,
+unaffected, rebuild or unresolved; sealing (#614) and planning integration
+(#615) remain required. See [the capture contract and fixtures](RESOLVER-CAPTURE.md)
+and [delivery tracking](RESOLVER-DELIVERY.md).
 
 Delivery is split into three stages:
 

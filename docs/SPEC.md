@@ -1488,7 +1488,9 @@ compatibility and deployment-context qualification is implemented for
 PostgreSQL (#610) and SQL Server (#611). PostgreSQL target-input capture and fresh
 comparison are available as a private library boundary (#612), including actual
 historical bindings and complete requested prerequisites; see
-[the capture contract](RESOLVER-CAPTURE.md). CLI resolution, saved binding evidence
+[the capture contract](RESOLVER-CAPTURE.md). A qualified dedicated-server run can
+compile managed declarations on its scratch database and compare what they bind
+with the target's observed bindings, surface by surface (#613). CLI resolution, saved binding evidence
 and the remaining steps stay planned under #595; the requirements below still
 govern their delivery. See [delivery tracking](RESOLVER-DELIVERY.md).
 

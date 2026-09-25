@@ -4,10 +4,11 @@
   named selection/policy (#606); run-owned Docker environments acquired and
   contained (#608); dedicated scratch-server lifecycle and exclusivity
   qualified (#609), and analysis-scope and deployment-context qualification
-  implemented for PostgreSQL (#610) and SQL Server (#611). Binding resolution,
-  source handling and the evidence a
-  plan may rest on remain unimplemented, and no qualification yet changes what
-  a plan is allowed to claim. See [delivery tracking](RESOLVER-DELIVERY.md).
+  implemented for PostgreSQL (#610) and SQL Server (#611); PostgreSQL target
+  input capture (#612) and managed-only desired-namespace reconstruction and
+  binding comparison through a qualified run (#613). Planning integration,
+  source handling and the evidence a plan may rest on remain unimplemented,
+  and no qualification yet changes what a plan is allowed to claim. See [delivery tracking](RESOLVER-DELIVERY.md).
 - Date: 2026-09-15
 - Related: [SPEC §9.3](SPEC.md#93-the-dev-database-optional), §7.3, §7.6,
   §8.2, §9.8 and §11.5; [ARCHITECTURE.md](ARCHITECTURE.md);
