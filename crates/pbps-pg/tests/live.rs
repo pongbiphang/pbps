@@ -23082,6 +23082,101 @@ fn one_estimate(
     .pop()
 }
 
+/// #465: what the dialect predicts PostgreSQL generates for an unnamed
+/// primary key and an identity column is what the engine generates, for
+/// short, long and multibyte names alike; a declared index created after the
+/// table under that name is refused with `42P07`; and a name already taken
+/// when the table is created gets a numeric suffix instead — the order
+/// dependence the check refuses rather than predicts (DEC-465.1).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn the_generated_relation_names_are_the_ones_the_engine_uses() {
+    use pbps_model::{Column, Identity, PrimaryKey, Table, TableName};
+
+    let mut conn = connect().await;
+    let s = probe_schema_9("generated_names");
+    fresh(&mut conn, &s).await;
+    let pg = Postgres::new();
+    let names = |schema: &str| {
+        format!(
+            "SELECT string_agg(c.relname, ',' ORDER BY c.relname) FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = '{schema}' \
+         AND c.relkind IN ('i', 'S')"
+        )
+    };
+    for table in [
+        "widget".to_owned(),
+        "aaaaaaaaaabbbbbbbbbbccccccccccddddddddddeeeeeeeeeeffffffffff".to_owned(),
+        "é".repeat(31),
+    ] {
+        conn.execute(&format!(
+            "DROP TABLE IF EXISTS {s}.\"{table}\";
+             CREATE TABLE {s}.\"{table}\" (id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY)"
+        ))
+        .await
+        .expect("a table with an unnamed key and an identity");
+        let mut declared = Table::default();
+        let mut id = Column::new("integer".parse().expect("a type")).not_null();
+        id.identity = Some(Identity {
+            seed: 1,
+            increment: 1,
+        });
+        declared.columns.insert("id".into(), id);
+        declared.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        let mut predicted: Vec<String> = pg
+            .implicit_relation_names(&TableName::new(&s, &table), &declared)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        predicted.sort();
+        let actual = text(&mut conn, &names(&s)).await;
+        assert_eq!(predicted.join(","), actual, "for `{table}`");
+        // Created after the table, a declared index under a generated name is
+        // the engine's refusal the check exists to move offline.
+        let refused = conn
+            .execute(&format!(
+                "CREATE INDEX \"{}\" ON {s}.\"{table}\" (id)",
+                predicted[0]
+            ))
+            .await
+            .expect_err("the generated name is taken");
+        assert_eq!(
+            refused.server_error_code().as_deref(),
+            Some("42P07"),
+            "{refused:?}"
+        );
+        conn.execute(&format!("DROP TABLE {s}.\"{table}\""))
+            .await
+            .expect("drop");
+    }
+
+    // Taken first, the generated name moves aside: the engine suffixes it.
+    // Which claimant gets a name depends on the order they are created in,
+    // which is why the check refuses the meeting instead of predicting it.
+    conn.execute(&format!(
+        "CREATE TABLE {s}.taken_pkey (x int); CREATE TABLE {s}.taken (n int PRIMARY KEY)"
+    ))
+    .await
+    .expect("a name taken before the key");
+    assert!(
+        truth(
+            &mut conn,
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n \
+                 ON n.oid = c.relnamespace WHERE n.nspname = '{s}' AND c.relname = 'taken_pkey1')"
+            )
+        )
+        .await
+    );
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
 /// between a table somebody wrote down and one that cannot go stale without a
 /// red build.
 ///

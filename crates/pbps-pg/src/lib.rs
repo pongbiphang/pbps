@@ -814,6 +814,41 @@ impl Dialect for Postgres {
         false
     }
 
+    /// The index behind an unnamed primary key, `<table>_pkey`, and the
+    /// sequence behind each identity column, `<table>_<column>_seq`: the
+    /// names the engine generates for what a `CREATE TABLE` implies (#465,
+    /// DEC-465.1). A unique constraint is always named in a declaration and a
+    /// `serial` column is refused (`types::refuse_serial`), so neither of
+    /// their generated names can arise.
+    fn implicit_relation_names(&self, name: &TableName, table: &Table) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        if table
+            .primary_key
+            .as_ref()
+            .is_some_and(|pk| pk.name.is_none())
+        {
+            out.push((
+                generated_name(&name.name, None, "pkey"),
+                format!(
+                    "the index {} generates for `{name}`'s unnamed primary key",
+                    types::DIALECT
+                ),
+            ));
+        }
+        for (column, spec) in &table.columns {
+            if spec.identity.is_some() {
+                out.push((
+                    generated_name(&name.name, Some(column), "seq"),
+                    format!(
+                        "the sequence {} generates for identity column `{name}.{column}`",
+                        types::DIALECT
+                    ),
+                ));
+            }
+        }
+        out
+    }
+
     /// The project-schema portion of the write path: the object's own schema
     /// first, then the configured extras in order (DECISIONS 276 and 464).
     /// The implicit catalog and final temporary schema hold no declared
@@ -987,8 +1022,173 @@ impl Dialect for Postgres {
     }
 }
 
+/// The name the engine generates for an implicit relation: `makeObjectName`
+/// in PostgreSQL's `src/backend/commands/indexcmds.c`, ported and measured on
+/// 18.6 (#465, DEC-465.1).
+///
+/// `<name1>_<name2>_<label>`, or `<name1>_<label>` without a `name2`, fitted
+/// into `NAMEDATALEN - 1` = 63 bytes by shortening the longer of the two names
+/// a byte at a time and then cutting each at a character boundary. Measured:
+/// a 60-byte table gives `…ffffff_id_seq` with the table cut to 56 bytes, and a
+/// 62-byte table of two-byte characters is cut to 58 and 56 bytes for `_pkey`
+/// and `_id_seq`. A name the engine finds taken gets a numeric suffix instead
+/// (`ChooseRelationName`); that is the order-dependent case the caller refuses
+/// rather than predicts.
+fn generated_name(name1: &str, name2: Option<&str>, label: &str) -> String {
+    const MAX: usize = 63;
+    let overhead = label.len() + 1 + usize::from(name2.is_some());
+    let available = MAX - overhead;
+    let mut n1 = name1.len();
+    let mut n2 = name2.map_or(0, str::len);
+    while n1 + n2 > available {
+        if n1 > n2 {
+            n1 -= 1;
+        } else {
+            n2 -= 1;
+        }
+    }
+    let clip = |s: &str, mut n: usize| {
+        while !s.is_char_boundary(n) {
+            n -= 1;
+        }
+        s[..n].to_owned()
+    };
+    let mut out = clip(name1, n1);
+    if let Some(name2) = name2 {
+        out.push('_');
+        out.push_str(&clip(name2, n2));
+    }
+    out.push('_');
+    out.push_str(label);
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    /// #465: the generated names are the engine's own, measured on 18.6 —
+    /// the short forms, a long table cut to fit 63 bytes, a long table and a
+    /// long column shortened in turn, and two-byte characters cut at a
+    /// character boundary.
+    #[test]
+    fn generated_names_are_the_ones_the_engine_measured() {
+        use super::generated_name;
+        assert_eq!(generated_name("widget", None, "pkey"), "widget_pkey");
+        assert_eq!(generated_name("gadget", Some("id"), "seq"), "gadget_id_seq");
+        let long = "aaaaaaaaaabbbbbbbbbbccccccccccddddddddddeeeeeeeeeeffffffffff";
+        assert_eq!(
+            generated_name(long, None, "pkey"),
+            "aaaaaaaaaabbbbbbbbbbccccccccccddddddddddeeeeeeeeeeffffffff_pkey"
+        );
+        assert_eq!(
+            generated_name(long, Some("id"), "seq"),
+            "aaaaaaaaaabbbbbbbbbbccccccccccddddddddddeeeeeeeeeeffffff_id_seq"
+        );
+        assert_eq!(
+            generated_name(&"t".repeat(30), Some(&"c".repeat(46)), "seq"),
+            format!("{}_{}_seq", "t".repeat(29), "c".repeat(29))
+        );
+        let wide = "é".repeat(31);
+        assert_eq!(
+            generated_name(&wide, None, "pkey"),
+            format!("{}_pkey", "é".repeat(29))
+        );
+        assert_eq!(
+            generated_name(&wide, Some("id"), "seq"),
+            format!("{}_id_seq", "é".repeat(28))
+        );
+        for n in [
+            generated_name(long, Some("id"), "seq"),
+            generated_name(&wide, None, "pkey"),
+        ] {
+            assert!(n.len() <= 63, "{n}");
+        }
+    }
+
+    /// #465: a declared index named for what an unnamed primary key or an
+    /// identity column makes the engine generate is refused, because which
+    /// of the two gets the name depends on the order they are created in. A
+    /// named primary key generates nothing, and two generated names that meet
+    /// are the engine's to resolve with a suffix. (An engine whose indexes do
+    /// not share the table namespace is never asked: the hook's default is
+    /// empty, and `check_index_names` returns before it for such a dialect.)
+    #[test]
+    fn a_declared_name_meeting_a_generated_one_is_refused() {
+        use pbps_model::{Column, Identity, Index, IndexColumn, PrimaryKey, Schema, Table};
+        let index = |col: &str| Index {
+            columns: vec![IndexColumn {
+                name: col.into(),
+                descending: false,
+            }],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+        };
+        let table = |pk_name: Option<&str>, identity: bool, index_name: Option<&str>| {
+            let mut t = Table::default();
+            let mut id = Column::new("integer".parse().unwrap()).not_null();
+            if identity {
+                id.identity = Some(Identity {
+                    seed: 1,
+                    increment: 1,
+                });
+            }
+            t.columns.insert("id".into(), id);
+            t.primary_key = Some(PrimaryKey {
+                name: pk_name.map(str::to_owned),
+                columns: vec!["id".into()],
+            });
+            if let Some(n) = index_name {
+                t.indexes.insert(n.into(), index("id"));
+            }
+            t
+        };
+        let one = |t: Table| {
+            let mut s = Schema::default();
+            s.tables.insert(TableName::new("app", "widget"), t);
+            s
+        };
+        let pg = super::Postgres::new();
+
+        let found =
+            pbps_dialect::check_index_names(&one(table(None, false, Some("widget_pkey"))), &pg);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("unnamed primary key"), "{found:?}");
+
+        let found = pbps_dialect::check_index_names(
+            &one(table(Some("pk_w"), true, Some("widget_id_seq"))),
+            &pg,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("identity column `app.widget.id`"),
+            "{found:?}"
+        );
+
+        // A named primary key generates no index name to meet.
+        assert!(
+            pbps_dialect::check_index_names(
+                &one(table(Some("pk_w"), false, Some("widget_pkey"))),
+                &pg
+            )
+            .is_empty()
+        );
+
+        // Two generated names that meet: a table named `widget_id_seq`'s own
+        // `_pkey` cannot collide, but two long tables cut to the same prefix
+        // can, and the engine suffixes the second.
+        let long = "x".repeat(60);
+        let mut s = Schema::default();
+        s.tables.insert(
+            TableName::new("app", format!("{long}a")),
+            table(None, false, None),
+        );
+        s.tables.insert(
+            TableName::new("app", format!("{long}b")),
+            table(None, false, None),
+        );
+        assert!(pbps_dialect::check_index_names(&s, &pg).is_empty());
+    }
+
     #[test]
     fn an_empty_postgres_script_does_not_change_session_settings() {
         assert!(pbps_dialect::render_script(&[], &super::Postgres::new()).is_empty());
