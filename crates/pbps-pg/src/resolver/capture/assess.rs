@@ -244,12 +244,22 @@ fn derived(
         else {
             continue;
         };
+        // `t(x)` is a routine call first and a cast to type `t` only when no
+        // routine of that name fits, so a type binding may have been written
+        // as a call that a same-named routine would now take.
+        let classes: &[CandidateClass] = if class == CandidateClass::Type {
+            &[CandidateClass::Type, CandidateClass::Routine]
+        } else {
+            &[class]
+        };
         for space in paths.of(schema).into_iter().chain([namespace.clone()]) {
-            sets.insert(CandidateSet {
-                class,
-                namespace: Some(space),
-                name: Some(name.clone()),
-            });
+            for &class in classes {
+                sets.insert(CandidateSet {
+                    class,
+                    namespace: Some(space.clone()),
+                    name: Some(name.clone()),
+                });
+            }
         }
     }
     sets

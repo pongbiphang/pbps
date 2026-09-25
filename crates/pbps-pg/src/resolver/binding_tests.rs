@@ -1073,3 +1073,35 @@ async fn a_later_object_of_another_kind_is_no_candidate() {
         );
     }
 }
+
+/// A function-style cast binds a type, but a same-named routine that fits
+/// is what the same call would bind if created now. One arriving on the path
+/// after the view is a candidate scratch never reproduced.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_routine_that_would_take_a_function_style_cast_is_a_candidate() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let declared = || Declared::default().view("app.v", "SELECT int4('1'::text) AS x");
+        let assessment = analyze(
+            &server,
+            "cast_call",
+            Case {
+                schemas: &["app"],
+                extras: &[],
+                target: "
+                    SET search_path = app;
+                    CREATE VIEW app.v AS SELECT int4('1'::text) AS x;
+                    CREATE FUNCTION app.int4(text) RETURNS integer LANGUAGE sql IMMUTABLE RETURN 7;",
+                base: declared(),
+                desired: declared(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(only(&assessment, "app", "v"), Verdict::Unresolved { .. }),
+            "{variable}: {assessment:#?}"
+        );
+    }
+}
