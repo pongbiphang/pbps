@@ -581,7 +581,7 @@ mod recon611 {
             format!(
                 "CREATE LOGIN [{dep}] WITH PASSWORD = 'Pbps!Recon726', CHECK_POLICY = OFF; \
                  CREATE USER [{dep}] FOR LOGIN [{dep}]; CREATE USER app_owner WITHOUT LOGIN; \
-                 CREATE ROLE Readers; CREATE ROLE Hidden; \
+                 CREATE ROLE Readers; CREATE ROLE Hidden; CREATE ROLE watchers; \
                  ALTER ROLE Readers ADD MEMBER [{dep}];"
             ),
             "CREATE SCHEMA app AUTHORIZATION app_owner;".to_owned(),
@@ -632,14 +632,15 @@ mod recon611 {
             context
                 .spellings
                 .iter()
-                .map(|(a, b)| (a.as_str(), b.as_str()))
+                .map(|(a, b)| (a.as_str(), b.as_deref()))
                 .collect::<Vec<_>>(),
             [
-                ("PUBLIC", "public"),
-                ("hidden", "Hidden"),
-                ("readers", "Readers")
+                ("PUBLIC", Some("public")),
+                ("auditors", None),
+                ("hidden", Some("Hidden")),
+                ("readers", Some("Readers"))
             ],
-            "a name with no principal behind it stays as planned"
+            "a name with no principal behind it is recorded as absent"
         );
 
         // The combined read resolves them inside its bracket, so both halves
@@ -653,8 +654,8 @@ mod recon611 {
         .await
         .unwrap();
         assert_eq!(
-            bracketed.spellings.get("readers").map(String::as_str),
-            Some("Readers")
+            bracketed.spellings.get("readers"),
+            Some(&Some("Readers".to_owned()))
         );
 
         let planned: Vec<PlannedGrant> = ["readers", "PUBLIC"]
@@ -725,6 +726,31 @@ mod recon611 {
         assert_eq!(
             names(scratch.conn.query(&grantees("REFERENCES")).await.unwrap()),
             expected
+        );
+
+        // #1013: a planned principal the catalog spells exactly as planned is
+        // recorded too, so dropping it after the scope was read moves the
+        // sealed context instead of reading back as the same empty answer.
+        let watched = ["watchers".to_owned()];
+        let scope = pbps_mssql::resolver::environment::Scope { schemas: &schemas };
+        let (_, before) =
+            pbps_mssql::resolver::scope_facts(&mut planning, &scope, &schemas, &watched)
+                .await
+                .unwrap();
+        assert_eq!(
+            before.spellings.get("watchers"),
+            Some(&Some("watchers".to_owned()))
+        );
+        target.conn.execute("DROP ROLE watchers;").await.unwrap();
+        let (_, after) =
+            pbps_mssql::resolver::scope_facts(&mut planning, &scope, &schemas, &watched)
+                .await
+                .unwrap();
+        assert_eq!(after.spellings.get("watchers"), Some(&None));
+        assert_ne!(
+            before.canonical(),
+            after.canonical(),
+            "a planned principal that was dropped must move the sealed context"
         );
 
         drop(run);
