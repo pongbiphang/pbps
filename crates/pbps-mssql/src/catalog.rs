@@ -52,6 +52,11 @@ pub(crate) fn is_ours(name: &pbps_model::TableName) -> bool {
     .contains(&format!("{}.{}", name.schema, name.name).as_str())
 }
 
+// The `|` appended to both sides is what makes the comparison exact: SQL Server
+// pads `=` and `IN` operands with trailing spaces even under
+// `Latin1_General_BIN2`, so a project's `dbo.[__pbps_state ]` compared equal to
+// the ledger's name and was hidden from the pull (#954, measured on the pinned
+// server). A trailing space now sits before the `|`, where padding cannot reach.
 const TABLES: &str = "\
 SELECT t.object_id, s.name AS schema_name, t.name AS table_name, t.temporal_type,
        CONVERT(bit, CASE WHEN p.object_id IS NULL THEN 0 ELSE 1 END) AS has_period
@@ -59,9 +64,9 @@ SELECT t.object_id, s.name AS schema_name, t.name AS table_name, t.temporal_type
   JOIN sys.schemas s ON s.schema_id = t.schema_id
   LEFT JOIN sys.periods p ON p.object_id = t.object_id
  WHERE t.is_ms_shipped = 0
-   AND NOT (s.name COLLATE Latin1_General_BIN2 = 'dbo'
-            AND t.name COLLATE Latin1_General_BIN2
-                IN ('__pbps_state', '__pbps_lock', '__pbps_state_confidential'))
+   AND NOT ((s.name + N'|') COLLATE Latin1_General_BIN2 = N'dbo|'
+            AND (t.name + N'|') COLLATE Latin1_General_BIN2
+                IN (N'__pbps_state|', N'__pbps_lock|', N'__pbps_state_confidential|'))
  ORDER BY s.name, t.name;";
 
 // SQL Server added both `sys.tables.temporal_type` and `sys.periods` in 2016.
@@ -73,9 +78,9 @@ SELECT t.object_id, s.name AS schema_name, t.name AS table_name,
   FROM sys.tables t
   JOIN sys.schemas s ON s.schema_id = t.schema_id
  WHERE t.is_ms_shipped = 0
-   AND NOT (s.name COLLATE Latin1_General_BIN2 = 'dbo'
-            AND t.name COLLATE Latin1_General_BIN2
-                IN ('__pbps_state', '__pbps_lock', '__pbps_state_confidential'))
+   AND NOT ((s.name + N'|') COLLATE Latin1_General_BIN2 = N'dbo|'
+            AND (t.name + N'|') COLLATE Latin1_General_BIN2
+                IN (N'__pbps_state|', N'__pbps_lock|', N'__pbps_state_confidential|'))
  ORDER BY s.name, t.name;";
 
 fn tables_query(product_version: &str, edition: &str) -> String {
@@ -1032,15 +1037,17 @@ mod tests {
         ] {
             let (schema, name) = qualified.split_once('.').expect("a qualified name");
             assert!(
-                TABLES.contains(&format!("s.name COLLATE Latin1_General_BIN2 = '{schema}'")),
+                TABLES.contains(&format!(
+                    "(s.name + N'|') COLLATE Latin1_General_BIN2 = N'{schema}|'"
+                )),
                 "the schema is part of what this tool owns: {qualified}"
             );
-            assert!(TABLES.contains(&format!("'{name}'")), "{qualified}");
+            assert!(TABLES.contains(&format!("N'{name}|'")), "{qualified}");
         }
         // Both filters compare the spelling exactly, as `is_ours` reserves it.
         for query in [TABLES, LEGACY_TABLES] {
             assert!(
-                query.contains("t.name COLLATE Latin1_General_BIN2"),
+                query.contains("(t.name + N'|') COLLATE Latin1_General_BIN2"),
                 "a collation-dependent filter hides a project's differently cased table"
             );
         }
