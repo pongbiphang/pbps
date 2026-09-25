@@ -971,7 +971,7 @@ which says how to add an entry here.
 
 **DEC-319.1. A PostgreSQL plan pins every unmanaged routine not held only by
 superusers, under the environment's key, and `apply` refuses a changed pin before its
-probes, before its DDL and before it commits (#319; planned).** The drift check
+probes, before its DDL and before it commits (#319).** The drift check
 (SPEC §7.6) covers the managed set, and SPEC §8.2 leaves everything else out of
 the comparison. It says nothing about the code a plan runs. A CHECK the plan adds
 can call `ext.helper(x)`, which the plan does not manage. The helper's owner can
@@ -1184,3 +1184,17 @@ exactly what an operator should look at before running approved DDL.
 - #322, which is about binding at run time. A `SECURITY DEFINER` routine the
   plan created binds its unqualified helpers when a user calls it, long after
   `apply` has checked anything.
+
+*As built.* Three details the design did not fix are settled in the code.
+- A check outside the apply transaction runs in a `READ COMMITTED READ ONLY`
+  transaction of its own. A check inside it runs under a savepoint that is
+  rolled back, so the empty `search_path` it sets for `format_type` leaves with
+  it (DECISIONS 418).
+- A bare `--db` target names no environment and so no key. A plan against it
+  that must pin a routine is refused with the `--env` remedy.
+- A staged `--resume` after the last checkpoint runs no step, so the run also
+  checks the pins before its closing entry.
+
+The live tests are in `crates/pbps-cli/tests/flow_pg.rs`. Each check was
+disabled in turn, and so was the `READ COMMITTED` framing, and the test for it
+failed each time.

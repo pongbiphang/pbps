@@ -129,7 +129,15 @@ fn with_dbname(connection: &str, name: &str) -> String {
 
 struct Demo {
     dir: PathBuf,
+    /// A connection string this project reaches through a keyed environment
+    /// instead of `--db` (see [`Demo::keyed`]).
+    keyed: std::cell::RefCell<Option<String>>,
 }
+
+/// The environment [`Demo::keyed`] writes, and the variables it reads.
+const KEYED_ENV: &str = "keyed";
+const KEYED_URL: &str = "PBPS_FLOW_PG_KEYED_URL";
+const KEYED_KEY: &str = "PBPS_FLOW_PG_KEYED_KEY";
 
 impl Demo {
     fn new(name: &str) -> Self {
@@ -137,7 +145,10 @@ impl Demo {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("schema")).unwrap();
         std::fs::write(dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
-        let d = Self { dir };
+        let d = Self {
+            dir,
+            keyed: std::cell::RefCell::new(None),
+        };
         d.git(&["init", "-q"]);
         d.git(&["config", "user.email", "d@e.f"]);
         d.git(&["config", "user.name", "demo"]);
@@ -168,13 +179,46 @@ impl Demo {
     }
 
     fn run_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+        let keyed = self.keyed.borrow().clone();
+        let mut args: Vec<&str> = args.to_vec();
+        let mut extra: Vec<(&str, String)> = Vec::new();
+        if let Some(connection) = &keyed
+            && let Some(at) = args
+                .windows(2)
+                .position(|w| w[0] == "--db" && w[1] == connection.as_str())
+        {
+            args.splice(at..at + 2, ["--env", KEYED_ENV]);
+            extra.push((KEYED_URL, connection.clone()));
+            extra.push((KEYED_KEY, fingerprint_key(9)));
+        }
         Command::new(BIN)
             .arg("--project")
             .arg(&self.dir)
-            .args(args)
+            .args(&args)
             .envs(env.iter().copied())
+            .envs(extra.iter().map(|(k, v)| (*k, v.as_str())))
             .output()
             .unwrap()
+    }
+
+    /// Routes every later `--db connection` through an environment with a
+    /// fingerprint key, for a test whose database holds a routine a role short
+    /// of a superuser can replace: a plan against it pins that routine, and a
+    /// bare `--db` target has no key to pin it under (DEC-319.1). Appends to
+    /// whatever `pbps.yml` already says.
+    fn keyed(&self, connection: &str) {
+        let path = self.dir.join("pbps.yml");
+        let mut config = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !config.contains("environments:"),
+            "a keyed demo writes its own environments"
+        );
+        config.push_str(&format!(
+            "environments:\n  {KEYED_ENV}:\n    url_env: {KEYED_URL}\n    \
+             fingerprint_key_env: {KEYED_KEY}\n"
+        ));
+        std::fs::write(&path, config).unwrap();
+        *self.keyed.borrow_mut() = Some(connection.to_owned());
     }
 }
 
@@ -7663,11 +7707,22 @@ fn unapproved_data_triggers_cannot_use_the_deployers_privileges() {
                 ),
             )
             .unwrap();
+            d.keyed(&deployment);
             let declared = "table: app.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n  label: {type: text, nullable: false}\nprimary_key: {name: pk_t, columns: [code]}\n";
             d.table(&format!("{declared}{before}"));
             succeeds(d.run(&["plan"]));
             d.commit();
             succeeds(d.run(&["bootstrap", "--db", &deployment]));
+            // The function exists before approval and is pinned with it
+            // (DEC-319.1). What arrives afterwards is only the trigger that
+            // calls it: a new call site on an unchanged routine, which is this
+            // guard's to refuse (DECISIONS 445), not the pins'.
+            on_server(
+                &attack,
+                "CREATE FUNCTION attacker.steal() RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER AS \
+                 $$BEGIN INSERT INTO attacker.leaked SELECT value FROM public.secret; \
+                 IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF; END$$",
+            );
             d.table(&format!("{declared}{after}"));
             let plan = connected_artifact(&d, &deployment, staged);
             // Installed after approval by a role that cannot read the secret.
@@ -7676,10 +7731,7 @@ fn unapproved_data_triggers_cannot_use_the_deployers_privileges() {
             on_server(
                 &attack,
                 &format!(
-                    "CREATE FUNCTION attacker.steal() RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER AS \
-                 $$BEGIN INSERT INTO attacker.leaked SELECT value FROM public.secret; \
-                 IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF; END$$; \
-                 CREATE TRIGGER steal BEFORE {operation} ON app.t FOR EACH {level} EXECUTE FUNCTION attacker.steal()"
+                    "CREATE TRIGGER steal BEFORE {operation} ON app.t FOR EACH {level} EXECUTE FUNCTION attacker.steal()"
                 ),
             );
             if operation == "INSERT" && !staged {
@@ -8426,6 +8478,7 @@ fn an_inherited_trigger_function_owner_cannot_use_the_deployers_privileges() {
             "dialect: postgres\nunmanaged: ignore\n",
         )
         .unwrap();
+        d.keyed(&deployment);
         d.table(declared);
         succeeds(d.run(&["plan"]));
         d.commit();
@@ -8545,8 +8598,11 @@ fn an_inherited_trigger_function_owner_cannot_use_the_deployers_privileges() {
             stdout(&refused),
             stderr(&refused)
         );
+        // The body was replaced after approval, so the routine pins refuse
+        // before the probes, ahead of this guard (DEC-319.1). The guard's own
+        // refusal is what stopped the plan above.
         assert!(
-            stderr(&refused).contains("unsafe data trigger") && stderr(&refused).contains("audit"),
+            stderr(&refused).contains("pinned routines changed in `hook`"),
             "{}",
             stderr(&refused)
         );
@@ -8664,6 +8720,7 @@ fn referential_actions_cannot_reach_an_unapproved_trigger() {
             ),
         )
         .unwrap();
+        d.keyed(&deployment);
         // The referenced key is a UNIQUE column and not the primary key: a
         // declared row is identified by its key, so only another column of it
         // can change under an UPDATE at all.
@@ -8746,6 +8803,14 @@ fn referential_actions_cannot_reach_an_unapproved_trigger() {
             declared.to_owned()
         };
         d.table(&after);
+        // The function is there before approval and pinned with it
+        // (DEC-319.1); only the trigger that calls it arrives afterwards.
+        on_server(
+            &attack,
+            "CREATE FUNCTION attacker.steal() RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER AS \
+             $$BEGIN INSERT INTO attacker.leaked SELECT value FROM public.secret; \
+             IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF; END$$",
+        );
         let plan = connected_artifact(&d, &deployment, staged);
         // Installed after approval by a role that cannot read the secret and
         // owns neither the table it writes through nor the one it lands on.
@@ -8756,10 +8821,7 @@ fn referential_actions_cannot_reach_an_unapproved_trigger() {
         on_server(
             &attack,
             &format!(
-                "CREATE FUNCTION attacker.steal() RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER AS \
-             $$BEGIN INSERT INTO attacker.leaked SELECT value FROM public.secret; \
-             IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF; END$$; \
-             CREATE TRIGGER steal BEFORE {fires} ON {reached} FOR EACH {level} EXECUTE FUNCTION attacker.steal()"
+                "CREATE TRIGGER steal BEFORE {fires} ON {reached} FOR EACH {level} EXECUTE FUNCTION attacker.steal()"
             ),
         );
         let blocked = d.run(&["plan", "--db", &deployment]);
@@ -11380,4 +11442,431 @@ fn doctor_asks_about_an_undeclared_foreign_key_parent_in_a_managed_schema() {
         try_on_server(&login, "SELECT count(*) FROM app.parent").is_err(),
         "SELECT on the parent is what authorizes the probe's read"
     );
+}
+
+/// A fingerprint key for the routine-pin tests: base64 of 32 copies of `byte`.
+fn fingerprint_key(byte: u8) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode([byte; 32])
+}
+
+/// The routine-pin setup (DEC-319.1): a bootstrapped project whose database
+/// also holds `ext.helper(integer)`, owned by a role short of a superuser and
+/// managed by nothing, and an environment that names a fingerprint key.
+struct PinnedHelper {
+    db: OwnDatabase,
+    demo: Demo,
+    owner: String,
+}
+
+impl PinnedHelper {
+    const URL: &'static str = "PBPS_319_PIN_DB";
+    const KEY: &'static str = "PBPS_319_PIN_KEY";
+
+    fn new(slug: &str) -> Self {
+        let db = OwnDatabase::new(&server(), slug);
+        let owner = format!("pbps_pin_owner_{}", std::process::id());
+        let _ = try_on_server(db.connection(), &format!("DROP ROLE IF EXISTS {owner}"));
+        on_server(
+            db.connection(),
+            &format!(
+                "CREATE ROLE {owner} NOSUPERUSER; CREATE SCHEMA ext AUTHORIZATION {owner}; \
+                 SET ROLE {owner}; \
+                 CREATE FUNCTION ext.helper(integer) RETURNS boolean LANGUAGE sql \
+                   AS 'SELECT $1 > 0'; \
+                 RESET ROLE"
+            ),
+        );
+        let demo = bootstrapped_demo(db.connection(), slug, ONE_COLUMN);
+        std::fs::write(
+            demo.dir.join("pbps.yml"),
+            format!(
+                "dialect: postgres\nenvironments:\n  dev:\n    url_env: {}\n    \
+                 fingerprint_key_env: {}\n",
+                Self::URL,
+                Self::KEY
+            ),
+        )
+        .unwrap();
+        demo.table(TWO_COLUMNS);
+        succeeds(demo.run(&["plan"]));
+        demo.commit();
+        Self { db, demo, owner }
+    }
+
+    fn run(&self, args: &[&str], key: Option<&str>) -> Output {
+        let mut env = vec![(Self::URL, self.db.connection())];
+        if let Some(key) = key {
+            env.push((Self::KEY, key));
+        }
+        self.demo.run_with_env(args, &env)
+    }
+
+    fn plan(&self, staged: bool, key: &str) -> PathBuf {
+        let path = self.demo.dir.join("pinned-plan.json");
+        let mut args = vec!["plan", "--env", "dev", "--out", path.to_str().unwrap()];
+        if staged {
+            args.push("--staged");
+        }
+        succeeds(self.run(&args, Some(key)));
+        path
+    }
+
+    fn apply(&self, plan: &std::path::Path, staged: bool, key: &str) -> Output {
+        let checksum = plan_checksum(plan);
+        let mut args = vec![
+            "apply",
+            "--env",
+            "dev",
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+        ];
+        if staged {
+            args.push("--staged");
+        }
+        self.run(&args, Some(key))
+    }
+
+    fn replace_helper(&self) {
+        on_server(
+            self.db.connection(),
+            &format!(
+                "SET ROLE {}; CREATE OR REPLACE FUNCTION ext.helper(integer) RETURNS boolean \
+                 LANGUAGE sql AS 'SELECT true'; RESET ROLE",
+                self.owner
+            ),
+        );
+    }
+
+    fn label_exists(&self) -> bool {
+        scalar(
+            self.db.connection(),
+            "SELECT count(*) FROM information_schema.columns \
+             WHERE table_schema = 'app' AND table_name = 't' AND column_name = 'label'",
+        ) == 1
+    }
+}
+
+impl Drop for PinnedHelper {
+    fn drop(&mut self) {
+        let _ = try_on_server(
+            &self.db.server,
+            &format!("DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)", self.db.name),
+        );
+        let _ = try_on_server(
+            &self.db.server,
+            &format!("DROP ROLE IF EXISTS {}", self.owner),
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn a_routine_replaced_after_approval_refuses_the_apply_before_its_first_statement() {
+    let h = PinnedHelper::new("pin_replaced");
+    let key = fingerprint_key(1);
+    let plan = h.plan(false, &key);
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+    let pins = saved.routine_pins.expect("the helper is pinned");
+    assert_eq!(
+        pins.schemas
+            .iter()
+            .map(|s| s.schema.as_str())
+            .collect::<Vec<_>>(),
+        ["ext"],
+        "only the unmanaged, non-superuser routine is pinned"
+    );
+    let raw = std::fs::read_to_string(&plan).unwrap();
+    assert!(!raw.contains("$1 > 0"), "the plan carries no routine body");
+
+    h.replace_helper();
+    let refused = h.apply(&plan, false, &key);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        stderr(&refused).contains("pinned routines changed in `ext`")
+            && stderr(&refused).contains("before the pre-flight probes"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!h.label_exists(), "no statement ran");
+
+    // Negative: planned again against the replaced helper, the same change
+    // applies.
+    let plan = h.plan(false, &key);
+    succeeds(h.apply(&plan, false, &key));
+    assert!(h.label_exists());
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn a_plan_that_must_pin_a_routine_is_refused_without_a_key_and_names_the_remedy() {
+    let h = PinnedHelper::new("pin_no_key");
+    let refused = h.run(&["plan", "--env", "dev"], None);
+    assert_ne!(code(&refused), 0);
+    assert!(
+        stderr(&refused).contains("`ext` (1)")
+            && stderr(&refused).contains("pbps key generate")
+            && stderr(&refused).contains("fingerprint_key_env"),
+        "{}",
+        stderr(&refused)
+    );
+    let bare = h.demo.run(&["plan", "--db", h.db.connection()]);
+    assert_ne!(code(&bare), 0);
+    assert!(stderr(&bare).contains("--env"), "{}", stderr(&bare));
+
+    // Negative: once the helper belongs to a superuser nobody else holds,
+    // nothing is pinned and no key is needed.
+    on_server(
+        h.db.connection(),
+        "ALTER FUNCTION ext.helper(integer) OWNER TO CURRENT_USER",
+    );
+    succeeds(h.run(&["plan", "--env", "dev"], None));
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn a_plan_pinned_under_one_key_is_refused_under_another() {
+    let h = PinnedHelper::new("pin_other_key");
+    let plan = h.plan(false, &fingerprint_key(1));
+    let refused = h.apply(&plan, false, &fingerprint_key(2));
+    assert_ne!(code(&refused), 0);
+    assert!(
+        stderr(&refused).contains("no evidence under another"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!h.label_exists());
+}
+
+/// A superuser's event trigger replaces the helper while the plan's own
+/// `ALTER TABLE` runs, which is the window only the closing check sees.
+fn replace_helper_during_alter_table(h: &PinnedHelper) {
+    on_server(
+        h.db.connection(),
+        "CREATE FUNCTION public.pbps_319_swap() RETURNS event_trigger LANGUAGE plpgsql AS $$ \
+         BEGIN \
+           CREATE OR REPLACE FUNCTION ext.helper(integer) RETURNS boolean \
+             LANGUAGE sql AS 'SELECT false'; \
+         END $$; \
+         CREATE EVENT TRIGGER pbps_319_swap ON ddl_command_end \
+           WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION public.pbps_319_swap()",
+    );
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn a_routine_replaced_while_the_statements_run_rolls_the_apply_back() {
+    let h = PinnedHelper::new("pin_during_ddl");
+    let key = fingerprint_key(1);
+    let plan = h.plan(false, &key);
+    replace_helper_during_alter_table(&h);
+    let refused = h.apply(&plan, false, &key);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        stderr(&refused).contains("after the statements, before recording")
+            && stderr(&refused).contains("rolled back"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!h.label_exists(), "the transaction was rolled back");
+    assert_eq!(
+        text_of(
+            h.db.connection(),
+            "SELECT prosrc FROM pg_proc WHERE oid = 'ext.helper(integer)'::regprocedure"
+        ),
+        "SELECT $1 > 0",
+        "the replacement rolled back with the DDL"
+    );
+}
+
+/// Another session replaces the helper while the apply's `ALTER TABLE` waits
+/// on a lock, after the in-transaction check before the first statement has
+/// already read `pg_proc`. Under a `repeatable read` default, a bare `BEGIN`
+/// would keep that first snapshot for the closing check, which would then pass
+/// (DEC-319.1).
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn a_concurrent_replacement_is_seen_under_a_repeatable_read_default() {
+    let h = PinnedHelper::new("pin_rr_default");
+    let key = fingerprint_key(1);
+    let plan = h.plan(false, &key);
+    on_server(
+        h.db.connection(),
+        &format!(
+            "ALTER DATABASE \"{}\" SET default_transaction_isolation = 'repeatable read'",
+            h.db.name
+        ),
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let connect = || async {
+        pbps_db::Conn::connect(pbps_db::Driver::Postgres, h.db.connection())
+            .await
+            .unwrap()
+    };
+    let mut holder = rt.block_on(async {
+        let mut c = connect().await;
+        c.execute("BEGIN ISOLATION LEVEL READ COMMITTED")
+            .await
+            .unwrap();
+        c.execute("LOCK TABLE app.t IN ACCESS SHARE MODE")
+            .await
+            .unwrap();
+        c
+    });
+    let checksum = plan_checksum(&plan);
+    let child = Command::new(BIN)
+        .arg("--project")
+        .arg(&h.demo.dir)
+        .args([
+            "apply",
+            "--env",
+            "dev",
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+        ])
+        .env(PinnedHelper::URL, h.db.connection())
+        .env(PinnedHelper::KEY, &key)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Wait until the apply's ALTER TABLE is queued behind the lock.
+    let mut waited = 0;
+    while scalar(
+        h.db.connection(),
+        "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation \
+         WHERE c.relname = 't' AND NOT l.granted AND l.mode = 'AccessExclusiveLock'",
+    ) == 0
+    {
+        waited += 1;
+        assert!(waited < 600, "the apply never reached its ALTER TABLE");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    h.replace_helper();
+    rt.block_on(async { holder.execute("COMMIT").await.unwrap() });
+    let refused = child.wait_with_output().unwrap();
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        stderr(&refused).contains("after the statements, before recording"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!h.label_exists(), "the transaction was rolled back");
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn a_routine_replaced_during_a_staged_step_is_caught_after_its_checkpoint() {
+    let h = PinnedHelper::new("pin_staged_step");
+    let key = fingerprint_key(1);
+    let plan = h.plan(true, &key);
+    replace_helper_during_alter_table(&h);
+    let refused = h.apply(&plan, true, &key);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    let err = stderr(&refused);
+    assert!(
+        err.contains("after statement 1 of 1 committed")
+            && err.contains("checkpoint #")
+            && err.contains("pinned routines changed in `ext`"),
+        "{err}"
+    );
+    assert!(h.label_exists(), "the step committed");
+    let latest = latest_snapshot(h.db.connection());
+    assert_eq!(
+        latest.staged.map(|s| s.completed),
+        Some(1),
+        "the checkpoint was recorded before the run stopped"
+    );
+    // A resume checks the same pins, so it refuses too.
+    let resumed = h.run(
+        &[
+            "apply",
+            "--env",
+            "dev",
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &plan_checksum(&plan),
+            "--staged",
+            "--resume",
+        ],
+        Some(&key),
+    );
+    assert_ne!(code(&resumed), 0, "{}", stdout(&resumed));
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn an_unchanged_pinned_routine_lets_both_apply_modes_through() {
+    for staged in [false, true] {
+        let h = PinnedHelper::new(if staged {
+            "pin_same_staged"
+        } else {
+            "pin_same"
+        });
+        let key = fingerprint_key(1);
+        let plan = h.plan(staged, &key);
+        succeeds(h.apply(&plan, staged, &key));
+        assert!(h.label_exists());
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn another_sessions_temporary_routine_is_not_pinned() {
+    let db = OwnDatabase::new(&server(), "pin_temp");
+    let role = format!("pbps_pin_temp_{}", std::process::id());
+    let password = "pbps-pin-temp";
+    let _ = try_on_server(db.connection(), &format!("DROP ROLE IF EXISTS {role}"));
+    on_server(
+        db.connection(),
+        &format!(
+            "CREATE ROLE {role} LOGIN PASSWORD '{password}' NOSUPERUSER; \
+             GRANT TEMPORARY ON DATABASE \"{}\" TO {role}",
+            db.name
+        ),
+    );
+    let d = bootstrapped_demo(db.connection(), "pin_temp", ONE_COLUMN);
+    d.table(TWO_COLUMNS);
+    let as_role: String = db
+        .connection()
+        .split_whitespace()
+        .filter(|w| !w.starts_with("user=") && !w.starts_with("password="))
+        .chain([
+            format!("user={role}").as_str(),
+            format!("password={password}").as_str(),
+        ])
+        .collect::<Vec<_>>()
+        .join(" ");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut session = rt.block_on(async {
+        let mut c = pbps_db::Conn::connect(pbps_db::Driver::Postgres, &as_role)
+            .await
+            .unwrap();
+        c.execute("CREATE FUNCTION pg_temp.scratch() RETURNS integer LANGUAGE sql AS 'SELECT 1'")
+            .await
+            .unwrap();
+        c
+    });
+    // Planned while the temporary routine exists, with no key configured:
+    // it is another session's and is not pinned.
+    let plan = connected_artifact(&d, db.connection(), false);
+    rt.block_on(async { session.execute("SELECT 1").await.unwrap() });
+    drop(session);
+    // Its session ends, the engine drops it, and the apply still goes through.
+    succeeds(approved_apply(&d, db.connection(), &plan, &[]));
+    drop(d);
+    drop(db);
+    let _ = try_on_server(&server(), &format!("DROP ROLE IF EXISTS {role}"));
 }

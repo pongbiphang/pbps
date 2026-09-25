@@ -935,13 +935,17 @@ resolution-input fingerprints, not general managed-expression wording, and adds
 neither staged guarantees nor protection against arbitrary external writes after
 the last observation. Plans without resolver evidence retain the existing guard.
 
-**Planned external-routine pins (DEC-319.1):** every PostgreSQL plan also
+**External-routine pins (DEC-319.1):** every PostgreSQL plan also
 pins, under the environment's fingerprint key, every unmanaged routine not
 held only by superusers. `apply` refuses a changed pin under the lock before
 pre-flight, again inside the transaction before the first statement, and again
 before recording. A staged plan is checked before and after each step; a
 mismatch found after a step committed records that step's checkpoint, then
-stops. This detects a replaced routine; it does not lock one.
+stops. This detects a replaced routine; it does not lock one. A plan that must pin
+a routine is refused unless its environment has a fingerprint key, and a bare
+`--db` target, which names no environment, cannot supply one. The apply
+transaction opens `READ COMMITTED` whatever the database default is, so each
+check reads the rows the statements ran.
 
 ---
 
@@ -1658,7 +1662,8 @@ Without connecting, it also reads each environment's fingerprint key
 - a key that loads is reported by its identifier;
 - one that is configured but missing, short, malformed, or in a file others can
   read is an error;
-- none configured is a note, since only engine-assisted planning needs one.
+- none configured is a note. A PostgreSQL plan needs one only when it pins
+  routines (DEC-319.1), and engine-assisted planning will too.
 
 Two rules hold it in place:
 

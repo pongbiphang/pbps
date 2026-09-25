@@ -106,7 +106,14 @@ use crate::schema::Schema;
 /// it away as a stale format, and the remedy is the one that was always
 /// right for a stale artifact: run `plan --db` again and take the new plan
 /// through the gate.
-pub const CURRENT_VERSION: u32 = 9;
+///
+/// Bumped to 10 for `routine_pins` (DEC-319.1). A version 9 reader would drop
+/// the field and apply without checking a single pinned routine, which is the
+/// replacement the pins exist to catch. A version 9 plan read by this build
+/// has no pins and says nothing about the routines it can reach, and a missing
+/// field would read as "nothing to pin". The number turns it away as stale
+/// instead.
+pub const CURRENT_VERSION: u32 = 10;
 
 /// Where a plan came from, and therefore whether it may be applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -243,6 +250,49 @@ pub struct SavedPlan {
     /// declarations' scope at plan time, so `apply` needs no checkout.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub data: crate::data::DataScopes,
+
+    /// The PostgreSQL routines this plan was approved beside, pinned against
+    /// replacement until it has run (DEC-319.1).
+    ///
+    /// `None` means the pin set was *empty* at plan time: every routine was
+    /// managed or held only by superusers. It does not mean "unchecked".
+    /// `apply` still recomputes the set, and a routine that has joined it
+    /// since is a change like any other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routine_pins: Option<RoutinePins>,
+}
+
+/// The routines a plan pins, keyed per schema (DEC-319.1).
+///
+/// Each digest is an HMAC under the environment's fingerprint key over the
+/// schema's routines as the catalog holds them. The key is not in the file
+/// (DEC-952.1), and without it a digest tests no guess about a body.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutinePins {
+    /// The identifier of the key the digests were made under. `apply` under
+    /// another key refuses with a replan remedy rather than reporting every
+    /// schema as changed.
+    pub key_id: String,
+    /// `server_version_num` at plan time. Another release renders the same
+    /// catalog row differently, so a mismatch refuses before any digest does.
+    pub server_version: String,
+    /// One entry per schema, in namespace OID order.
+    pub schemas: Vec<SchemaPin>,
+}
+
+/// One schema's pinned routines.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SchemaPin {
+    /// `pg_namespace.oid`, the key: a schema the plan renames keeps it.
+    pub namespace: i64,
+    /// The schema's name at plan time. For messages only.
+    pub schema: String,
+    /// How many routines the digest covers.
+    pub routines: usize,
+    /// Hex HMAC-SHA256.
+    pub digest: String,
 }
 
 impl SavedPlan {
@@ -266,6 +316,7 @@ impl SavedPlan {
             module_deps: ModuleDeps::default(),
             ids,
             data: BTreeMap::new(),
+            routine_pins: None,
         }
     }
 
@@ -472,7 +523,47 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 9);
+        assert_eq!(CURRENT_VERSION, 10);
+    }
+
+    /// `None` is written as no field at all, and a plan carrying pins reads
+    /// back with them, digests and key id intact: the checksum covers them
+    /// only if they survive the file.
+    #[test]
+    fn routine_pins_survive_the_plan_file_and_change_its_checksum() {
+        let plan = SavedPlan::new(
+            PlanOrigin::Database,
+            "postgres",
+            "2026-09-25T00:00:00Z",
+            PlanBaseline {
+                description: "d".into(),
+                checksum: "c".into(),
+            },
+            ChangeSet::default(),
+            IdsFile::default(),
+        );
+        let unpinned = serde_json::to_string(&plan).unwrap();
+        assert!(!unpinned.contains("routine_pins"));
+        let mut pinned = plan.clone();
+        pinned.routine_pins = Some(RoutinePins {
+            key_id: "0011223344556677".into(),
+            server_version: "180006".into(),
+            schemas: vec![SchemaPin {
+                namespace: 2200,
+                schema: "ext".into(),
+                routines: 1,
+                digest: "ab".repeat(32),
+            }],
+        });
+        let text = serde_json::to_string(&pinned).unwrap();
+        assert_eq!(serde_json::from_str::<SavedPlan>(&text).unwrap(), pinned);
+        assert_ne!(plan.checksum(), pinned.checksum());
+        let mut other = pinned.clone();
+        other.routine_pins.as_mut().unwrap().schemas[0].digest = "cd".repeat(32);
+        assert_ne!(pinned.checksum(), other.checksum());
+        // An unknown field in a pin is a broken file, not an ignorable extra.
+        let tampered = text.replace("\"routines\":1", "\"routines\":1,\"extra\":true");
+        assert!(serde_json::from_str::<SavedPlan>(&tampered).is_err());
     }
 
     /// Sorting the keys must not sort away a difference. The same three

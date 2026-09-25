@@ -248,7 +248,9 @@ fn fingerprint_key_findings(project: &Project, names: &[String]) -> Vec<output::
                     return output::Finding::note(
                         "environment.no-fingerprint-key",
                         format!(
-                            "environment `{name}` configures no fingerprint key;                              engine-assisted planning (--resolve-with) will need one"
+                            "environment `{name}` configures no fingerprint key; a PostgreSQL plan \
+                             needs one when it pins routines (DEC-319.1), and so will \
+                             engine-assisted planning (--resolve-with)"
                         ),
                     )
                     .remedy(format!(

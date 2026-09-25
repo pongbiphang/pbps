@@ -16,6 +16,7 @@ mod init;
 mod integration;
 mod key;
 mod output;
+mod pins;
 mod prompt;
 mod report;
 mod state_list;
