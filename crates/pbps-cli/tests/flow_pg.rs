@@ -1287,6 +1287,122 @@ fn module_rebuilds_refuse_carried_state_before_planning_and_before_recording() {
 /// The objects are created on the server and adopted with `pull`, because a
 /// table whose check calls a function cannot be bootstrapped: tables are built
 /// before modules.
+/// A check, a filtered index and a default the same revision adds, each calling
+/// a function that revision rebuilds, are created after the rebuild (#942,
+/// DEC-942.1). `modules::dependents` reads the catalog, where none of them
+/// exists yet, so #941's weaving never saw them; the differ's own order put
+/// them before `AlterModule`, and the rebuild's `DROP FUNCTION` was refused by
+/// the object just created against it. Controls: the same additions with no
+/// rebuild, and a default on a table whose rows the plan writes, which stays
+/// ahead of the rows it has to fill.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn additions_calling_a_rebuilt_function_are_created_after_it() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "additions-after-rebuild");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE TABLE app.t (id integer PRIMARY KEY, n integer); \
+         CREATE TABLE app.u (id integer PRIMARY KEY, n integer)",
+    );
+    let d = Demo::new("additions-after-rebuild");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    let function = d.dir.join("schema/app.f%28integer%29.function.yml");
+    let table = |name: &str, extra: &str| {
+        std::fs::write(
+            d.dir.join(format!("schema/app.{name}.yml")),
+            format!(
+                "table: app.{name}\ncolumns:\n  id: {{type: integer, nullable: false}}\n  \
+                 \"n\": {{type: integer, default: 'app.f(1)'}}\n\
+                 primary_key: {{name: {name}_pkey, columns: [id]}}\n{extra}"
+            ),
+        )
+        .unwrap();
+    };
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    let planned = |d: &Demo| {
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&[
+            "plan",
+            "--db",
+            connection,
+            "--out",
+            plan.to_str().unwrap(),
+            "--sql",
+            sql.to_str().unwrap(),
+        ]));
+        std::fs::read_to_string(&sql).unwrap()
+    };
+    let at = |script: &str, needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    let allow = ["--allow", "constraint", "--allow", "grant-widen"];
+
+    // The additions and the rebuild in one revision. `u` also takes a row the
+    // plan writes, so its default has to be in place before that insert.
+    let text = std::fs::read_to_string(&function).unwrap();
+    std::fs::write(&function, text.replace("SELECT x", "SELECT x + 0")).unwrap();
+    table(
+        "t",
+        "checks:\n  ck_f: 'app.f(id) >= 0'\nindexes:\n  ix_f: {columns: [id], where: 'app.f(id) > 0'}\n",
+    );
+    table("u", "data:\n  mode: ensure\n  rows:\n    1: {}\n");
+    let script = planned(&d);
+    let create = at(&script, "CREATE FUNCTION");
+    assert!(create < at(&script, "ADD CONSTRAINT \"ck_f\""), "{script}");
+    assert!(create < at(&script, "CREATE INDEX \"ix_f\""), "{script}");
+    let t_default = at(
+        &script,
+        "ALTER TABLE \"app\".\"t\" ALTER COLUMN \"n\" SET DEFAULT",
+    );
+    assert!(create < t_default, "{script}");
+    // `u`'s default stays ahead of the row that needs it, so the rebuild's
+    // `DROP` meets it: the one shape the positional rule leaves to the engine.
+    let u_default = at(
+        &script,
+        "ALTER TABLE \"app\".\"u\" ALTER COLUMN \"n\" SET DEFAULT",
+    );
+    assert!(
+        u_default < at(&script, "INSERT INTO \"app\".\"u\""),
+        "{script}"
+    );
+    std::fs::remove_file(&plan).unwrap();
+
+    // Without `u`'s row the revision applies whole and converges.
+    table("u", "");
+    let _ = planned(&d);
+    succeeds(approved_apply(&d, connection, &plan, &allow));
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_constraint WHERE conrelid = 'app.t'::regclass AND conname = 'ck_f'"
+        ),
+        1
+    );
+    std::fs::remove_file(&plan).unwrap();
+
+    // Control: the same kind of addition with no rebuild keeps the differ's
+    // order, class 13 ahead of the modules, and applies.
+    table("u", "checks:\n  ck_u: 'app.f(id) >= 0'\n");
+    let script = planned(&d);
+    assert!(!script.contains("DROP FUNCTION"), "{script}");
+    assert!(script.contains("ADD CONSTRAINT \"ck_u\""), "{script}");
+    succeeds(approved_apply(&d, connection, &plan, &allow));
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn module_dependents_are_dropped_and_restored_around_the_rebuild_or_refused_by_name() {
