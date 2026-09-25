@@ -156,6 +156,7 @@ pub(crate) async fn read_target(
     schemas: &[String],
     extras: &[String],
     authorization_schemas: &[String],
+    planned: &[PlannedGrant],
 ) -> Result<(CatalogFacts, Authorization), DbError> {
     match driver {
         Driver::Postgres => {
@@ -169,9 +170,16 @@ pub(crate) async fn read_target(
         }
         Driver::Mssql => {
             let scope = pbps_mssql::resolver::environment::Scope { schemas };
-            let (catalog, authorization) =
-                pbps_mssql::resolver::scope_facts(connection, &scope, authorization_schemas)
-                    .await?;
+            // The planned grants' principals are resolved to the catalog's
+            // spelling within each bracketed read (#726).
+            let names: Vec<String> = planned.iter().map(|g| g.principal.clone()).collect();
+            let (catalog, authorization) = pbps_mssql::resolver::scope_facts(
+                connection,
+                &scope,
+                authorization_schemas,
+                &names,
+            )
+            .await?;
             Ok((catalog, Authorization::Mssql(authorization)))
         }
     }

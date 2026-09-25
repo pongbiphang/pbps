@@ -99,6 +99,12 @@ pub struct AuthorizationContext {
     /// see; one it cannot see is an owner or grantor it is not a member of,
     /// and is reproduced as a user.
     pub principals: BTreeMap<String, PrincipalKind>,
+    /// The catalog's spelling of each principal a planned grant names, keyed
+    /// by the plan's spelling, where the two differ ([`resolve_spellings`]).
+    /// Empty for a read that was given no planned grants, and then left out of
+    /// the canonical form.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub spellings: BTreeMap<String, String>,
 }
 
 impl AuthorizationContext {
@@ -106,6 +112,58 @@ impl AuthorizationContext {
     pub fn canonical(&self) -> Vec<u8> {
         serde_json::to_vec(self).expect("authorization context serialises")
     }
+
+    /// The catalog's name for a principal a planned grant names: the
+    /// resolved spelling, or the name as planned when the catalog has no such
+    /// principal yet.
+    fn catalog_name<'a>(&'a self, planned: &'a str) -> &'a str {
+        self.spellings.get(planned).map_or(planned, String::as_str)
+    }
+}
+
+/// Resolves each principal the plan's grants name to the catalog's spelling
+/// of it, as the deployer reading `context`, and records the ones that differ
+/// in `context.spellings` (#726).
+///
+/// On a case-insensitive database a role catalogued as `Readers` and a grant
+/// planned to `readers` are one principal, and `PUBLIC` is `public`. Keyed as
+/// planned they were two: the reconstruction made a second run-local
+/// principal for the plan's spelling, the planned grant landed on it instead
+/// of on the role, and a built-in name in another casing was cloned as a user.
+/// Which spellings are one principal is the engine's answer, read here, not a
+/// comparison repeated in Rust.
+///
+/// `USER_NAME(USER_ID(..))`, not a lookup in `sys.database_principals`: that
+/// view shows a deployer only the principals it may see, so for an ordinary
+/// deployer a role it merely grants to has no row and would stay as planned,
+/// while the metadata functions answer for every principal (measured on 17.0,
+/// as a user holding no permission). They are also what spells every grantee
+/// in the context, so the two agree. A name with no principal behind it stays
+/// as planned: the plan may be the one that creates it (DEC-726.1).
+pub async fn resolve_spellings(
+    conn: &mut impl QueryConnection,
+    context: &mut AuthorizationContext,
+    planned: &[String],
+) -> Result<(), DbError> {
+    for name in planned {
+        let rows = conn
+            .query(&format!(
+                "SELECT USER_NAME(USER_ID({})) AS name;",
+                literal(name)
+            ))
+            .await?;
+        let [row] = rows.as_slice() else {
+            return Err(DbError::BadRow(format!(
+                "the catalog's spelling of the principal {name} expected one row"
+            )));
+        };
+        if let Some(catalog) = row.try_get::<&str>("name")?
+            && catalog != name
+        {
+            context.spellings.insert(name.clone(), catalog.to_owned());
+        }
+    }
+    Ok(())
 }
 
 /// A planned authorization change the plan performs before its DDL: a schema
@@ -215,6 +273,7 @@ pub async fn read(
         roles,
         impersonation: BTreeSet::new(),
         principals: BTreeMap::new(),
+        spellings: BTreeMap::new(),
     };
     if !context.principal.superuser {
         context.database_grants = grants(
@@ -373,7 +432,11 @@ fn named_principals(context: &AuthorizationContext, planned: &[PlannedGrant]) ->
             named.insert(grant.grantor.clone());
         }
     }
-    named.extend(planned.iter().map(|grant| grant.principal.clone()));
+    named.extend(
+        planned
+            .iter()
+            .map(|grant| context.catalog_name(&grant.principal).to_owned()),
+    );
     named
 }
 
@@ -404,6 +467,9 @@ fn is_fixed_role(name: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct PrincipalMap {
     to_run_local: BTreeMap<String, String>,
+    /// The plan's spelling of a principal to the catalog's, so a planned
+    /// grant finds the principal it names (#726).
+    spellings: BTreeMap<String, String>,
 }
 
 impl PrincipalMap {
@@ -422,10 +488,14 @@ impl PrincipalMap {
                 (name, run_local)
             })
             .collect();
-        Self { to_run_local }
+        Self {
+            to_run_local,
+            spellings: context.spellings.clone(),
+        }
     }
 
     fn run_local(&self, logical: &str) -> Option<String> {
+        let logical = self.spellings.get(logical).map_or(logical, String::as_str);
         self.to_run_local.get(logical).cloned()
     }
 
@@ -989,7 +1059,60 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            spellings: BTreeMap::new(),
         }
+    }
+
+    /// #726: a planned grant that spells a catalogued principal differently
+    /// is the same principal once the engine has named the catalog's
+    /// spelling. It gets no run-local principal of its own, the grant lands on
+    /// the one the catalog's spelling maps to, and a built-in in another
+    /// casing keeps its identity instead of being cloned as a user.
+    #[test]
+    fn a_planned_principal_in_another_casing_is_the_catalogs_principal() {
+        let planned = [
+            PlannedGrant {
+                principal: "READERS".into(),
+                schema: "app".into(),
+                permission: "SELECT".into(),
+                revoke: false,
+            },
+            PlannedGrant {
+                principal: "PUBLIC".into(),
+                schema: "app".into(),
+                permission: "SELECT".into(),
+                revoke: false,
+            },
+        ];
+        let mut resolved = context();
+        resolved.spellings = [
+            ("READERS".to_owned(), "readers".to_owned()),
+            ("PUBLIC".to_owned(), "public".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+        let map = PrincipalMap::generate(&resolved, &planned, "tok");
+        assert_eq!(map.run_local("READERS"), map.run_local("readers"));
+        assert_eq!(map.run_local("PUBLIC").as_deref(), Some("public"));
+        // dep, readers, app_owner, other: nothing for either planned spelling.
+        assert_eq!(
+            map.run_local_names().len(),
+            4,
+            "{:?}",
+            map.run_local_names()
+        );
+
+        // Unresolved, the same plan names two more principals, which is the
+        // clone the grant used to land on.
+        let map = PrincipalMap::generate(&context(), &planned, "tok");
+        assert_ne!(map.run_local("READERS"), map.run_local("readers"));
+        assert_ne!(map.run_local("PUBLIC").as_deref(), Some("public"));
+        assert_eq!(
+            map.run_local_names().len(),
+            6,
+            "{:?}",
+            map.run_local_names()
+        );
     }
 
     #[test]

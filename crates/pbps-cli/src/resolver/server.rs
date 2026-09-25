@@ -1171,7 +1171,12 @@ impl ScratchRun {
             scope::scope_schemas(driver, &request.schemas, &request.write_path_extras)
                 .map_err(Error::Scope)?;
         let (mut target_facts, target_auth) = target
-            .scope_facts(&request.schemas, &request.write_path_extras, &scope_schemas)
+            .scope_facts(
+                &request.schemas,
+                &request.write_path_extras,
+                &scope_schemas,
+                &request.planned,
+            )
             .await
             .map_err(read)?;
         // A planned grant whose grantor the engine would pick among several
@@ -1435,7 +1440,7 @@ impl ScratchRun {
         let scope_schemas =
             scope::scope_schemas(driver, &schemas, &extras).map_err(Error::Scope)?;
         let (mut target_facts, target_auth) = target
-            .scope_facts(&schemas, &extras, &scope_schemas)
+            .scope_facts(&schemas, &extras, &scope_schemas, &planned)
             .await
             .map_err(read)?;
         let target_authorization = target_auth.digest();

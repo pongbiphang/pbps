@@ -32,6 +32,7 @@ pub async fn scope_facts(
     conn: &mut impl pbps_db::transport::QueryConnection,
     scope: &environment::Scope<'_>,
     authorization_schemas: &[String],
+    planned_principals: &[String],
 ) -> Result<
     (
         pbps_db::resolver::environment::CatalogFacts,
@@ -41,7 +42,11 @@ pub async fn scope_facts(
 > {
     let mut reads = Vec::with_capacity(2);
     for _ in 0..2 {
-        let authorization = authorization::read(conn, authorization_schemas).await?;
+        let mut authorization = authorization::read(conn, authorization_schemas).await?;
+        // Inside the bracket, so a principal renamed while the scope is read
+        // is a difference between the two reads, not a spelling sealed from a
+        // later state than the rest of the context (review of #1010).
+        authorization::resolve_spellings(conn, &mut authorization, planned_principals).await?;
         let catalog = environment::read(conn, scope).await?;
         reads.push((catalog, authorization));
     }
