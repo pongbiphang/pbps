@@ -14,7 +14,7 @@
 
 use crate::resolver::docker::{CandidateImage, LocalApi, forwarder::Forwarder};
 use crate::resolver::native::{
-    FORWARDER_PRIVILEGES, NativeTarget, ProcessLease, TargetWitness, guarded_tasks,
+    FORWARDER_PRIVILEGES, MqueueLease, NativeTarget, ProcessLease, TargetWitness, guarded_tasks,
 };
 use crate::resolver::scope::{self, PlannedGrant};
 use pbps_db::Driver;
@@ -457,6 +457,8 @@ struct Session {
     /// namespace is the one place outside the engine's allowed to share its
     /// network namespace.
     guard: ProcessLease,
+    /// The fixed process policy alone cannot identify an exposed IPC filesystem.
+    mqueue: MqueueLease,
     pair: TcpPair,
     /// The engine process holding the server end of this session.
     backend: ProcessLease,
@@ -497,6 +499,8 @@ impl Session {
         // through the fallible steps and is closed on failure; only complete
         // success moves it into the returned session. An unconfirmed close
         // carries its generated name separately from the original refusal.
+        #[cfg(test)]
+        live_tests::forwarder_mqueue::after_open(&forwarder);
         let prepared = async {
             let guard = forwarder
                 .pid()
@@ -506,10 +510,15 @@ impl Session {
                         Error::Channel("the forwarder's init process is unreadable".into())
                     })
                 })?;
+            let mqueue = MqueueLease::capture(&guard).map_err(|_| {
+                Error::Channel(
+                    "the forwarder's mqueue does not belong to its held IPC namespace".into(),
+                )
+            })?;
             let (pair, backend) =
                 exclusivity::bind(runtime.init(), &guard, channel.profile.port, known)
                     .map_err(|reason| Error::Channel(reason.to_owned()))?;
-            check_kernel_parts(runtime.init(), &guard, &pair, &backend)?;
+            check_kernel_parts(runtime.init(), &guard, &mqueue, &pair, &backend)?;
             let own = engine::own_session(&mut connection)
                 .await
                 .map_err(|error| Error::Identity(error.to_string()))?;
@@ -517,14 +526,16 @@ impl Session {
             // server end of our session must be that backend. SQL Server has
             // no such mapping and its engine process is the holder.
             correlate(&own.process, backend.namespace_pid(), runtime.engine())?;
-            Ok::<_, Error>((guard, pair, backend, own.key))
+            check_kernel_parts(runtime.init(), &guard, &mqueue, &pair, &backend)?;
+            Ok::<_, Error>((guard, mqueue, pair, backend, own.key))
         }
         .await;
         match prepared {
-            Ok((guard, pair, backend, session_key)) => Ok(Self {
+            Ok((guard, mqueue, pair, backend, session_key)) => Ok(Self {
                 connection,
                 forwarder,
                 guard,
+                mqueue,
                 pair,
                 backend,
                 session_key,
@@ -537,7 +548,7 @@ impl Session {
     /// the session's two ends are still where they were, held by whom they
     /// were held by.
     fn check_kernel(&self, init: &ProcessLease) -> Result<(), Error> {
-        check_kernel_parts(init, &self.guard, &self.pair, &self.backend)
+        check_kernel_parts(init, &self.guard, &self.mqueue, &self.pair, &self.backend)
     }
 
     async fn check(&self, init: &ProcessLease) -> Result<(), Error> {
@@ -555,6 +566,7 @@ impl Session {
 fn check_kernel_parts(
     init: &ProcessLease,
     forwarder_guard: &ProcessLease,
+    mqueue: &MqueueLease,
     pair: &TcpPair,
     backend: &ProcessLease,
 ) -> Result<(), Error> {
@@ -562,6 +574,9 @@ fn check_kernel_parts(
     guarded_tasks(forwarder_guard, FORWARDER_PRIVILEGES).map_err(|_| {
         channel("a forwarder task does not meet the fixed privilege and descriptor limits")
     })?;
+    mqueue
+        .check(forwarder_guard)
+        .map_err(|_| channel("the forwarder's mqueue does not belong to its held IPC namespace"))?;
     exclusivity::still_bound(init, pair, backend)
         .map_err(|_| channel("the session's kernel endpoints changed"))
 }
@@ -891,7 +906,8 @@ impl DedicatedServer {
             .map_err(|_| Error::Unqualified("the target binding this run was aimed at changed"))
             .and_then(|()| {
                 let session = inner.control.session.as_ref().ok_or(Error::Cancelled)?;
-                analysis.runtime.check(&[&session.guard])
+                analysis.runtime.check(&[&session.guard])?;
+                session.check_kernel(analysis.runtime.init())
             });
         if let Err(cause) = &outcome {
             inner.refuse(cause.clone());
@@ -1210,7 +1226,11 @@ impl ScratchRun {
                 &[control_pair, scratch_pair],
             )
             .await
-            .map_err(|failure| self.inner.control.retain_failure(failure))?
+            .map_err(|failure| {
+                let cause = self.inner.control.retain_failure(failure);
+                self.inner.refuse(cause.clone());
+                cause
+            })?
         };
         // The admin session moved the engine's cumulative counter; it stays
         // moved after the session closes, so the run accounts for it.
@@ -1262,7 +1282,11 @@ impl ScratchRun {
                     &[control_pair],
                 )
                 .await
-                .map_err(|failure| self.inner.control.retain_failure(failure))?
+                .map_err(|failure| {
+                    let cause = self.inner.control.retain_failure(failure);
+                    self.inner.refuse(cause.clone());
+                    cause
+                })?
             };
             if let Some(analysis) = self.inner.analysis.as_mut() {
                 analysis.opened += 1;

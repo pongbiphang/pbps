@@ -87,13 +87,7 @@ async fn kernel_name_loss_refuses_admission_and_discards_each_live_view() {
                     } else {
                         scratch
                     };
-                    check_kernel_parts(
-                        analysis.runtime.init(),
-                        &session.guard,
-                        &session.pair,
-                        &session.backend,
-                    )
-                    .is_err()
+                    session.check_kernel(analysis.runtime.init()).is_err()
                 };
                 let refused_run = run.check(&mut target).await.is_err();
                 changed.restore_or_confirm_removed(&mut api).await;

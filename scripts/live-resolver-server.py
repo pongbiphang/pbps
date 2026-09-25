@@ -37,6 +37,8 @@ EXECUTABLE = {"pg": "postgres", "mssql": "sqlservr"}
 QUIET = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
 TESTS = [
     "admission_recovery::failed_admission_names_every_unconfirmed_forwarder",
+    "forwarder_mqueue::every_session_qualifies_its_forwarders_mqueue_before_returning",
+    "forwarder_mqueue::a_foreign_forwarder_mqueue_discards_each_live_view_permanently",
     "host_files::host_file_loss_refuses_admission_and_discards_live_analysis",
     "uts::kernel_name_loss_refuses_admission_and_discards_each_live_view",
     "pseudo::foreign_pseudo_roots_refuse_admission_and_discard_live_analysis",
