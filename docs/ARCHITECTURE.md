@@ -157,8 +157,10 @@ scratch-resource SQL stays in the engine crates behind that same seam.
 See [the runtime boundary](RESOLVER-RUNTIME.md) for its staged startup,
 supported profiles and the remaining environment/binding gates.
 
-Native capture transfers source-bearing library requirements through opaque
-engine operations (DEC-876.1). The PostgreSQL adapter owns its loader rules and
+Native capture transfers source-bearing library requirements through an opaque
+engine capability issued separately to the producer of a fresh connected read
+(DEC-974.1). Ordinary captured evidence cannot recover this capability. Its
+operations still require the CLI's qualified native observations (DEC-876.1). The PostgreSQL adapter owns its loader rules and
 opens one candidate beneath a root capability supplied by the CLI. It returns
 a mapping index or a reader with no path/raw-handle getter, Debug or Serialize.
 CLI still owns process/root qualification, mapping observation, content hashing,

@@ -123,7 +123,16 @@ before its first await. Failure or cancellation drops it and expires existing
 weak target witnesses. A canceled read cannot leave a transaction or cached
 qualification available to a later scratch operation.
 
-An initial coherent read supplies native-file requirements only. These include
+The initial coherent read uses `capture_with_runtime_inputs` to give its
+producer a separate, opaque `RuntimeInputs` source capability. Ordinary
+`capture`/`recapture` results and `CapturedTargetInputs::catalog()` cannot
+recover it. Only a fresh read through an actual query connection can issue
+another capability; that producer already has authority to query the source.
+The native owner retains it privately for its executable checks and drops it
+before returning ordinary evidence. It is not a native-admission certificate:
+process/root/mapping qualification remains mandatory (DEC-974.1).
+
+This initial read supplies native-file requirements only. These include
 C routines outside extension membership, extension libraries, preload settings
 and the library search path. The lifecycle observes actual loaded content and
 required late-load files, obtains a **fresh** coherent catalog capture, checks
@@ -153,6 +162,11 @@ verifier getter or persistence constructor. Ordinary comparisons return only
 logical affected objects and failed conditions. These reports live outside
 semantic `Schema` equality. Native-file requirements transfer privately to the
 lifecycle; source-bearing data and guessing verifiers are not public output.
+A capability holder's loader operations necessarily observe source-dependent
+results. The API therefore prevents ordinary result recipients from acquiring
+that capability, rather than treating an opaque value or arbitrary root File
+as proof of authority. This boundary does not restrict a producer with its own
+database read access or a source capability deliberately delegated to it.
 
 The capture closes before returning. A fresh recapture can invalidate it even
 when managed declarations and historical bindings remain unchanged. Producing

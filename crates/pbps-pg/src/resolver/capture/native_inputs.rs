@@ -1,7 +1,8 @@
 //! Source-bearing loader names stay with the engine that interpreted them.
-//! The lifecycle supplies a held root and mapping inventory; only a mapping
-//! index or an opaque reader crosses back. No path, file handle, formatter or
-//! input verifier is exported (DEC-876.1).
+//! The source capability's owner supplies a held root and mapping inventory;
+//! only a mapping index or an opaque reader crosses back. These operations
+//! observe source, so ordinary captured evidence cannot acquire this capability
+//! (DEC-974.1). Paths and raw handles remain opaque (DEC-876.1).
 
 use super::{RuntimeInputs, Uncovered};
 use std::fs::File;
@@ -110,8 +111,9 @@ impl RuntimeResolution {
 
     /// Resolve exactly one requirement so the lifecycle can hash and release
     /// its reader before opening another. This keeps the previous FD bound.
-    /// A caller must bracket this operation with its process/root lease checks;
-    /// an arbitrary File is not native runtime admission.
+    /// This is a source-authorized operation, not a public captured-result
+    /// accessor. Its capability holder must still bracket it with process/root
+    /// lease checks; an arbitrary File is not native runtime admission.
     pub fn open(
         &self,
         index: usize,

@@ -105,8 +105,11 @@ impl NativeTarget {
             return Err(CaptureFailure::Binding);
         }
         check(&mut bound).await?;
-        let hints = pbps_pg::resolver::capture::capture(&mut bound.connection, scope).await?;
-        let required = hints.runtime_inputs().map_err(CaptureError::Coverage)?;
+        // Native-input authority comes only from our own fresh connected read.
+        // The returned catalog alone cannot recreate it (DEC-974.1).
+        let (hints, required) =
+            pbps_pg::resolver::capture::capture_with_runtime_inputs(&mut bound.connection, scope)
+                .await?;
         let before = executables::captured_executables(bound.lease.owner(), &required)
             .await
             .map_err(|_| CaptureFailure::Executables)?;
