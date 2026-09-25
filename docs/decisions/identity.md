@@ -519,6 +519,14 @@ collation. A pair differing only in case is refused by a case-insensitive
 engine loudly, before anything else of the statement runs, and is a legal pair
 on a case-sensitive one, both pinned live.
 
+The same namespace orders a plan. A table renamed onto a name that another
+table's dropped check, foreign key, unique or primary key releases has to wait
+for that drop, as it waits for a freed index on PostgreSQL (DECISIONS 496).
+Measured on 17.0.4075.5: `sp_rename 'dbo.old', 'c'` is refused (Msg 15335)
+while a check `c` exists, and succeeds after it is dropped. `rename_order` now
+takes the dialect's two answers: an index releases a name only where indexes
+share the namespace, and a check or foreign key only where constraints do.
+
 The default constraints the emitter names itself are in that namespace too
 (#969), and `DF_{table}_{column}` did not say where the table ended:
 `dbo.a_b.c` and `dbo.a.b_c` both spelled `DF_a_b_c`, and the second
