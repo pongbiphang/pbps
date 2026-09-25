@@ -23613,6 +23613,116 @@ async fn the_estimate_says_what_the_engine_does_about_rebuilding_the_table() {
         .expect("drop");
 }
 
+/// #415: every ordered pair of an omitted precision and `(0)`..`(6)`, for
+/// `time`, `timetz`, `timestamp` and `timestamptz`, on an empty and on a
+/// populated table — 512 `ALTER COLUMN … TYPE` statements — and the estimate
+/// agrees with `relfilenode` on every one. The matrix above spells each type
+/// once, with no precision, so this family was the estimate's untested
+/// fall-through to `Rewrite::Yes`.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_temporal_precision_change_is_estimated_as_the_engine_rebuilds_it() {
+    use pbps_model::Change;
+    use pbps_pg::estimate::Rewrite;
+
+    let mut conn = connect().await;
+    let s = probe_schema_9("tprecision");
+    fresh(&mut conn, &s).await;
+
+    conn.execute(&format!(
+        "CREATE TABLE {s}.verdict (src text, dst text, populated boolean, rebuilt boolean);
+         DO $do$
+         DECLARE b text; f text; t text; pop boolean; before oid; after oid;
+         BEGIN
+           FOREACH b IN ARRAY ARRAY['time', 'timetz', 'timestamp', 'timestamptz'] LOOP
+             FOREACH f IN ARRAY ARRAY['', '(0)', '(1)', '(2)', '(3)', '(4)', '(5)', '(6)'] LOOP
+               FOREACH t IN ARRAY ARRAY['', '(0)', '(1)', '(2)', '(3)', '(4)', '(5)', '(6)'] LOOP
+                 FOREACH pop IN ARRAY ARRAY[false, true] LOOP
+                   EXECUTE 'DROP TABLE IF EXISTS {s}.m';
+                   EXECUTE format('CREATE TABLE {s}.m (id int PRIMARY KEY, c %s)', b || f);
+                   IF pop THEN
+                     EXECUTE format(
+                       'INSERT INTO {s}.m SELECT g, %L::%s FROM generate_series(1, 50) g',
+                       CASE WHEN b LIKE 'timestamp%' THEN '2026-09-25 12:34:56.123456'
+                            ELSE '12:34:56.123456' END,
+                       b || f);
+                   END IF;
+                   SELECT relfilenode INTO before FROM pg_class WHERE oid = '{s}.m'::regclass;
+                   EXECUTE format('ALTER TABLE {s}.m ALTER COLUMN c TYPE %s', b || t);
+                   SELECT relfilenode INTO after FROM pg_class WHERE oid = '{s}.m'::regclass;
+                   INSERT INTO {s}.verdict VALUES (b || f, b || t, pop, before <> after);
+                 END LOOP;
+               END LOOP;
+             END LOOP;
+           END LOOP;
+         END $do$;"
+    ))
+    .await
+    .expect("measure the temporal precision matrix");
+
+    let rows = conn
+        .query(&format!(
+            "SELECT src, dst, populated, rebuilt FROM {s}.verdict ORDER BY src, dst, populated"
+        ))
+        .await
+        .expect("read the matrix");
+    assert_eq!(rows.len(), 512, "every statement is accepted and recorded");
+
+    let mut disagreed = Vec::new();
+    let mut rebuilt = 0;
+    for row in &rows {
+        let src: &str = row.try_get("src").expect("src").expect("not null");
+        let dst: &str = row.try_get("dst").expect("dst").expect("not null");
+        let populated: bool = row
+            .try_get("populated")
+            .expect("populated")
+            .expect("not null");
+        let engine: bool = row.try_get("rebuilt").expect("rebuilt").expect("not null");
+        rebuilt += usize::from(engine);
+        let change = Change::AlterColumnType {
+            uid: "c_aaaaaa".parse().expect("a uid"),
+            column: TableName::new(&s, "m").column("c"),
+            from: ty(src),
+            to: ty(dst),
+            from_nullable: true,
+            to_nullable: true,
+        };
+        let ours = one_estimate(&change, Strategy::default())
+            .expect("every column change has an estimate")
+            .rewrite;
+        let agrees = match &ours {
+            Rewrite::Yes => engine,
+            Rewrite::No => !engine,
+            Rewrite::Unknown(_) => false,
+        };
+        if !agrees {
+            disagreed.push(format!(
+                "{src} -> {dst} (populated={populated}): engine rebuilt={engine}, dialect={ours:?}"
+            ));
+        }
+    }
+    assert!(
+        disagreed.is_empty(),
+        "the estimate and the engine part company on {} of {} statements:\n  {}",
+        disagreed.len(),
+        rows.len(),
+        disagreed.join("\n  ")
+    );
+    // Both answers occur, and exactly the narrowing ones rebuild. Per type,
+    // the seven distinct precisions give 21 narrowing pairs, and an omitted
+    // precision — the engine's 6 — narrows to each of (0)..(5) for six more:
+    // 27 of the 64, twice over for empty and populated.
+    assert_eq!(
+        rebuilt,
+        4 * 27 * 2,
+        "the narrowing pairs, and only they, rebuild"
+    );
+
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
 /// `relfilenode` is exact about the rebuild and says nothing about a scan, and
 /// the estimate keeps those apart because one of them is invisible to the other.
 ///
