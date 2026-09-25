@@ -52,29 +52,6 @@ impl Dialect for Mssql {
         types::DIALECT
     }
 
-    /// The default constraint `emit` creates for every column that declares a
-    /// default (#969). An adopted column's existing default keeps whatever name
-    /// it has and is not recreated, but its generated name is listed all the
-    /// same: the declarations cannot tell the two apart, and the only thing
-    /// the listing can refuse is a declared constraint spelled `DF_pbps_…`.
-    fn generated_constraint_names(
-        &self,
-        name: &pbps_model::TableName,
-        table: &pbps_model::schema::Table,
-    ) -> Vec<(String, String)> {
-        table
-            .columns
-            .iter()
-            .filter(|(_, column)| column.default.is_some())
-            .map(|(column, _)| {
-                (
-                    emit::default_constraint_name(name, column),
-                    format!("the default of `{name}.{column}`"),
-                )
-            })
-            .collect()
-    }
-
     /// `[…]` and `"…"` both quote an identifier here, and neither of
     /// PostgreSQL's two extensions to the string literal exists: there is no
     /// `E'…'`, and `$` is an ordinary identifier character (`total$`) and the

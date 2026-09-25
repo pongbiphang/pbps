@@ -530,9 +530,14 @@ the first `_` after the prefix the boundary. Otherwise it is
 that a name too long to fit already carried. `pbps_` marks the name as this
 tool's, apart from the `DF_<table>_<column>` many teams write by hand. No
 environment had been deployed under the old shape, and nothing reads a
-generated name back: a drop looks the name up in the catalog. The dialect also
-lists these names (`Dialect::generated_constraint_names`), so a declared
-constraint spelled like one is refused by `check_constraint_names` too.
+generated name back: a drop looks the name up in the catalog. The generated
+names are deliberately **not** folded into `check_constraint_names`.
+Validation is offline, and cannot tell a column whose default `pbps` will
+create from an adopted one whose default already has another name. Claiming
+the would-be name for every defaulted column refused a valid database that
+held a constraint of that spelling (review of #969). What is left is a declared
+constraint spelled `DF_pbps_…` beside a default `pbps` does create, which the
+engine refuses at apply; `pbps_` is what makes it unlikely.
 A short name never ends like a digested one (`_` and sixteen hex digits, in
 either case, since a case-insensitive database folds them). A name that would
 is digested as well, so that `dbo.a.b_c_<the digest of dbo.a_b.c>` cannot

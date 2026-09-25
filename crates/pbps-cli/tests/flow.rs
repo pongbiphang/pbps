@@ -2801,23 +2801,6 @@ fn two_tables_with_one_constraint_name_are_refused() {
         stderr(&o)
     );
 
-    // #969: the default `pbps` names itself is in the same namespace, so a
-    // declared check spelled like it is refused too.
-    std::fs::write(
-        d.dir.join("schema/dbo.u.yml"),
-        "table: dbo.u\ncolumns:\n  id: {type: int, nullable: false}\n  \
-         status: {type: int, nullable: false, default: '0'}\nprimary_key: [id]\n\
-         checks:\n  DF_pbps_u_status: id > 0\n",
-    )
-    .unwrap();
-    let o = d.run(&["validate"]);
-    assert_ne!(code(&o), 0, "{}", stdout(&o));
-    assert!(
-        stderr(&o).contains("the default of `dbo.u.status`"),
-        "{}",
-        stderr(&o)
-    );
-
     // The negative case: the same check name in another schema.
     std::fs::remove_file(d.dir.join("schema/dbo.u.yml")).unwrap();
     std::fs::write(
