@@ -378,6 +378,10 @@ run per environment, polled for its outcome.** The viewer's server answers one
 request at a time, and an apply can run for minutes. The child is therefore
 spawned, its output drained by two threads, and the request answered at once.
 The page asks `POST /api/trigger/runs` every two seconds while a run is going.
+- A run is reported as ended only when the child has exited and both of its
+  output streams are closed. The page stops asking about an ended run, and an
+  exit seen before the last output was drained would lose the refusal's own
+  words.
 - Closing the tab or dropping the connection cannot stop the child, because
   nothing ties it to them.
 - A second run against an environment is refused with 409 until the first

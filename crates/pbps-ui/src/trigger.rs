@@ -177,26 +177,39 @@ fn value(name: &str, value: String) -> Result<String, String> {
 struct Captured {
     bytes: Vec<u8>,
     truncated: bool,
+    /// The stream reached its end, or could no longer be read.
+    closed: bool,
 }
 
 struct Run {
     action: &'static str,
     arguments: Vec<String>,
     child: Child,
+    exited: Option<Option<i32>>,
     ended: Option<Option<i32>>,
     stdout: Arc<Mutex<Captured>>,
     stderr: Arc<Mutex<Captured>>,
 }
 
 impl Run {
+    /// A run has ended once the child has exited *and* both streams are
+    /// closed. The exit can be seen before the readers have drained what the
+    /// child wrote last, and the page stops asking about an ended run, so
+    /// ending on the exit alone could lose a refusal's own words for good.
     fn poll(&mut self) -> Result<(), String> {
-        if self.ended.is_none() {
+        if self.exited.is_none() {
             match self.child.try_wait() {
-                Ok(Some(status)) => self.ended = Some(status.code()),
+                Ok(Some(status)) => self.exited = Some(status.code()),
                 Ok(None) => {}
                 // Unknown is not ended: the run stays reported as running.
                 Err(_) => return Err("The run's state could not be read".into()),
             }
+        }
+        let closed = |captured: &Arc<Mutex<Captured>>| {
+            captured.lock().unwrap_or_else(|e| e.into_inner()).closed
+        };
+        if self.ended.is_none() && closed(&self.stdout) && closed(&self.stderr) {
+            self.ended = self.exited;
         }
         Ok(())
     }
@@ -280,6 +293,7 @@ impl Trigger {
                 action: invocation.action(),
                 arguments,
                 child,
+                exited: None,
                 ended: None,
                 stdout,
                 stderr,
@@ -347,6 +361,7 @@ fn capture(mut stream: impl Read + Send + 'static) -> Arc<Mutex<Captured>> {
                 captured.truncated = true;
             }
         }
+        sink.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
     });
     captured
 }
@@ -537,6 +552,45 @@ mod tests {
         assert_eq!(prod["stderr"], "diagnostics\n");
         // Once the run has ended, the environment takes another.
         assert!(trigger.answer("apply", &body("prod")).is_ok());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The child exits at once, but a process it left behind still holds its
+    /// output open and writes last. The run must not be reported as ended
+    /// until that output is in, because the page stops asking then.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_is_not_ended_before_its_output_is_complete() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory =
+            std::env::temp_dir().join(format!("pbps-ui-trigger-drain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let script = directory.join("pbps-stand-in");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n(sleep 1; echo 'the last words' >&2) &\nexit 2\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut trigger = Trigger::new(script, directory.clone());
+        trigger
+            .answer(
+                "apply",
+                br#"{"environment":"prod","plan":"p.json","checksum":"c","allow":[],"staged":false,"resume":false}"#,
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let run = loop {
+            let run = runs(&mut trigger).remove(0);
+            if run["ended"] == true {
+                break run;
+            }
+            assert!(std::time::Instant::now() < deadline, "the run never ended");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(run["code"], 2);
+        assert_eq!(run["stderr"], "the last words\n");
         let _ = std::fs::remove_dir_all(&directory);
     }
 
