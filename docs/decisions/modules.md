@@ -1340,3 +1340,50 @@ one the approver never saw, so the plan is refused rather than extended. A
 staged apply runs outside a transaction and cannot ask this. It is covered at
 planning: staged plans already refuse rebuilds, and a plain drop's dependents
 are put in order before the plan is saved.
+
+<a id="dec-322-1"></a>
+
+**DEC-322.1. A `SECURITY DEFINER` routine a plan writes must set
+`search_path` with `pg_temp` last, checked from the stored `proconfig` inside
+the transaction that wrote it (#322).** A definer routine runs with its
+owner's privileges. An unqualified name in its body binds when a caller
+invokes it, through the `search_path` in force then, which is the caller's
+unless the routine pins its own. `pg_temp` is searched first unless the path
+names it. So a caller who can create in any schema on their own path, or in
+their own temporary schema, can supply the helper that the owner's privileges
+then run. PostgreSQL's manual prescribes the remedy under "Writing SECURITY
+DEFINER Functions Safely": a `SET search_path` on the routine, with `pg_temp`
+named and last. That form is required, and nothing weaker.
+
+*Why the stored setting and not the declaration.* The declaration is the
+user's text, passed to the engine verbatim (`create_module`). Finding
+`SECURITY DEFINER` and a `SET` clause in it would mean parsing a header this
+tool never parses (DECISIONS 517 gives the same reason for closing every
+routine to `PUBLIC`). The engine's own answer is `prosecdef` and `proconfig`
+after the `CREATE`. The check therefore runs inside the transaction that
+wrote the routine, and a refusal rolls it back:
+- a transactional apply, after its statements;
+- `bootstrap`, after its statements;
+- a staged run, in a transaction of its own for each transactional step of a
+  plan that writes a routine, so that nothing unsafe commits.
+
+A path value is split as the engine writes it, so a quoted schema holding a
+comma is one entry, and `"pg_temp"` and `pg_temp` are the same.
+
+*Why not pin the bindings instead.* #322 asked for either this refusal or
+pinning a definer's external dependencies. A binding is made at run time, long
+after `apply` has checked anything. DEC-319.1 pins what an apply can observe,
+and a caller's later path is not one of those things. The maintainer chose
+the refusal (2026-09-25).
+
+*What it does not judge.*
+- Whether a role other than the owner can create in a schema the pinned path
+  names. That would re-derive the engine's authorization (DECISIONS 521), and
+  it is #1004.
+- A definer routine the plan does not write. One already in the database in
+  the unsafe form is not this plan's change, and refusing an unrelated plan
+  for it would refuse a valid plan.
+- Transitive helpers. A helper that a definer calls is resolved on the
+  definer's pinned path, which is what this entry fixes. A helper that is itself
+  a definer is held to the same form only when the plan writes it.
+

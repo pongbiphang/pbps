@@ -54,6 +54,11 @@ by #745–#748. Its fixed `POST /api/compose/<action>` requests are the viewer's
 only writes. It is Linux-only until #471 qualifies other platforms. Deployment
 actions remain step 5 of #64. See [UI.md](UI.md).
 
+A PostgreSQL `SECURITY DEFINER` routine that a plan or `bootstrap` writes must
+pin `search_path` with `pg_temp` last. The stored `proconfig` is checked
+inside the writing transaction (DEC-322.1, #322). Schemas on that path that
+other roles can create in are #1004.
+
 ## Live tests
 
 **Live tests**: the SPEC §11.5 invariants plus the Phase 3, 3.5 and 3.1 ones (the

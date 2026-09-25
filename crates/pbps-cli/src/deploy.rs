@@ -3424,6 +3424,14 @@ pub fn cmd_bootstrap(
 
             transaction_attempted = true;
             execute_transaction_body(&mut conn, dialect.as_ref(), &statements).await?;
+            // Bootstrap creates routines as `apply` does, so the same form is
+            // required of a definer among them (#322).
+            crate::engine::refuse_unsafe_definers(
+                &mut conn,
+                &crate::engine::written_routines(&cs),
+                crate::engine::Absent::Refused,
+            )
+            .await?;
 
             // Read-back and the success ledger row are part of the same
             // transaction as the DDL. If either fails, the database is still
@@ -4709,6 +4717,12 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         .await?;
         execute_statements(conn, statements, &data_guard).await?;
         crate::engine::check_module_rebuilds(conn, &plan.changes, true).await?;
+        crate::engine::refuse_unsafe_definers(
+            conn,
+            &crate::engine::written_routines(&plan.changes),
+            crate::engine::Absent::Refused,
+        )
+        .await?;
         crate::engine::external_role_renames(conn, &original_ids, &plan.ids).await?;
 
         // What gets recorded is the database read back, not the plan applied to
@@ -5126,6 +5140,7 @@ async fn apply_staged_under_lock(
     // A resume starts from a checkpoint, whose modules include what earlier
     // steps created; the union keeps those managed too.
     let pinned_managed = pinned_managed(&entry.snapshot, &plan.changes);
+    let written_routines = crate::engine::written_routines(&plan.changes);
     for (i, stmt) in statements.iter().enumerate().skip(start) {
         // Before each step, including the first after a resume, which skips
         // the check before the probes along with the probes.
@@ -5154,6 +5169,23 @@ async fn apply_staged_under_lock(
                 crate::engine::check_data_write(conn, stmt, &guard).await?;
                 conn.execute(&stmt.sql).await?;
                 Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            finish_transaction(conn, dialect, result).await
+        } else if stmt.transactional && !written_routines.is_empty() {
+            // A step of a plan that writes routines runs in a transaction of
+            // its own, so that a SECURITY DEFINER routine outside the safe
+            // form is refused before its step commits rather than after
+            // (#322). A routine a later step creates is not there yet.
+            conn.begin(dialect.transaction_framing()).await?;
+            let result = async {
+                conn.execute(&stmt.sql).await?;
+                crate::engine::refuse_unsafe_definers(
+                    conn,
+                    &written_routines,
+                    crate::engine::Absent::NotYetCreated,
+                )
+                .await
             }
             .await;
             finish_transaction(conn, dialect, result).await

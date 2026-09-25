@@ -299,6 +299,12 @@ Two more rules, both consequences of the model rather than choices:
   holds is never compared, so it says what the plan should *write* rather than
   what the two sides should agree on. The key is refused on a view or a
   trigger, neither of which has an `EXECUTE` privilege.
+- **A PostgreSQL `SECURITY DEFINER` routine pins its own `search_path`,
+  with `pg_temp` last** (DEC-322.1). This is the engine manual's safe form. A
+  definer body binds unqualified names when a caller runs it, through the
+  caller's path unless it sets one. `apply` and `bootstrap` read back the
+  stored `proconfig` of every routine they write and roll back one that lacks
+  the form. The schemas the path names are not judged (#1004).
 
   The consequence of being an annotation is worth stating: adding or removing
   the key is not itself a change, because nothing compares it. It takes effect
