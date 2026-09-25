@@ -966,3 +966,105 @@ which says how to add an entry here.
     own uncommitted `CREATE TABLE` and the row it inserted, which is the
     whole reason it exists. Reverting the CLI's two `InsideOwnTransaction`
     sites to `Snapshot` brings the original refusal back in both flow tests.
+
+<a id="dec-319-1"></a>
+
+**DEC-319.1. A PostgreSQL plan pins every unmanaged routine its statements,
+probes and fired triggers can call by name, under the environment's key, and
+`apply` refuses a changed pin before its probes, before its DDL and before it
+commits (#319; planned).** The drift check (SPEC §7.6) covers the managed set,
+and SPEC §8.2 leaves everything else out of the comparison. It says nothing
+about the code a plan runs. A CHECK the plan adds can call `ext.helper(x)`, which
+the plan does not manage. The helper's owner can replace it after approval, and
+the deployer runs the new body twice: once in a pre-flight probe, and again in
+the DDL that validates the constraint. #805 made the probe read-only (DECISIONS
+537), so a write from the probe no longer persists. The DDL runs inside the
+apply transaction, though, and whatever it writes commits with the approved
+changes.
+
+*Why not the obvious fixes.*
+- *Lock the routines.* A deployer that is not a superuser cannot: `SELECT …
+  FROM pg_proc … FOR SHARE` is `permission denied for table pg_proc`, measured
+  on 18.6 for this entry and earlier for module rebuilds (DECISIONS 420). The
+  apply can only detect a replacement, not prevent one.
+- *Compare the text a plan saw.* A plan file that carries an external routine's
+  body, or a bare SHA-256 of it, publishes a guessing oracle for any literal in
+  that body. DEC-952.1 answers exactly this: the fingerprint is an HMAC under the
+  environment's key.
+- *Resolve bindings as the engine does.* A declaration the plan has not created
+  yet has no bindings to read, and a PL/pgSQL body binds when it runs. Engine
+  resolution belongs to the resolver (SPEC §9.3.2, #614), which needs its own
+  scratch database. This check is for every plan, so it matches names instead.
+  Over-inclusion costs a replan when an unrelated same-named routine changes.
+  Under-inclusion would miss the attack. The name rule errs toward the first.
+
+*What is pinned.*
+- *Scope.* Every routine in `pg_proc` that is not managed, outside `pg_catalog`
+  and `information_schema`. Extension members count as unmanaged here, though the
+  pull skips them.
+- *Roots.* Collection starts from three kinds of text, all scanned with literal
+  contents kept, so that `EXECUTE 'SELECT helper()'` is a call:
+  - the plan's statements and the probe SQL derived from it;
+  - the functions of triggers on every table the plan writes rows to, extending
+    DECISIONS 445/450's direct trigger-function check to transitive calls;
+  - the functions of enabled event triggers, which the DDL fires.
+- *Calls.* A call is an identifier, qualified or bare, followed by `(`, or the
+  name after `CALL`. Names match case-insensitively.
+- *Name sets.* A name pins the set of **every** in-scope routine with that
+  name, in every schema and every overload. A routine added later anywhere with
+  that name, including one that would shadow the first through a caller's
+  `search_path`, changes the set. The probes resolve names under the deployer's
+  own path, not the DDL's write path (preflight.rs), so pinning one resolved
+  binding would miss this.
+- *Closure.* Every body matched along the way, managed or not, is scanned in
+  turn, until no new name appears.
+
+*What a pin holds.* One entry per name. Each is an HMAC under the
+environment's key (DEC-952.1), with rule `pbps/external-routine-pin/v1` and the
+name as component. The input is the canonical list of that name's routines,
+each with:
+- its schema and `pg_get_function_identity_arguments`;
+- its `pg_get_functiondef`, which carries the body, the language, `SECURITY
+  DEFINER`, volatility and every `SET` clause (DECISIONS 306);
+- its owner's name, which the definition does not contain (measured);
+- its `proacl`.
+
+The deployer can read all of these for another role's routine, even one whose
+`EXECUTE` is revoked from it (measured on 18.6). The saved plan records the
+names, their digests and the key identifier, in a new plan version. The plan
+checksum covers them the way it covers the rest of the file.
+
+*When the plan has no key.* `plan` refuses a database-origin plan whose pin set
+is not empty when its environment has no fingerprint key. The remedy names
+`pbps key generate` and `fingerprint_key_env` / `fingerprint_key_file`. A plan
+that reaches no unmanaged routine needs no key and records no pins. Under
+`unmanaged: error` a plan with unmanaged routines is already refused, so pins
+matter only under `ignore` and `warn`.
+
+*When `apply` checks.* `apply` recomputes the pins from the plan's own roots,
+then compares them in three places:
+- under the deployment lock, after the drift check and before `preflight`, in
+  a snapshot read of its own;
+- inside the apply transaction, after `BEGIN` and before the first statement;
+- after the read-back and before `record`, so a replacement during the DDL
+  rolls the apply back.
+
+A digest mismatch, a name that gained or lost a routine, an unreadable
+definition and a key identifier that is not the plan's all refuse. None of them
+reads as "nothing changed" (AGENTS.md: absent, empty and unreadable differ).
+Each refusal names the routine name and the remedy, which is to replan. A
+staged plan gets the first check, plus one before its first statement. As SPEC
+§7.6's binding-evidence guard says of itself, this adds no guarantee between stages.
+
+*What it does not cover.*
+- Routines reached with no call syntax: operators, casts, a type's I/O
+  functions, and names assembled at run time (`EXECUTE 'hel' || 'per()'`). The
+  resolver's node-tree capture covers the first three for resolver plans (#614).
+- A replace-and-restore that falls entirely between two checks. Probes are
+  read-only and the last check precedes the commit, so what such a body can
+  still do is non-transactional: the SPEC §7.6 limit, "protection against
+  arbitrary external writes after the last observation".
+- SQL Server. A CHECK there can call a scalar UDF too; its pins are #984.
+- #322, which is about binding at run time. A `SECURITY DEFINER` routine the
+  plan created binds its unqualified helpers when a user calls it, long after
+  `apply` has checked anything.

@@ -935,6 +935,14 @@ resolution-input fingerprints, not general managed-expression wording, and adds
 neither staged guarantees nor protection against arbitrary external writes after
 the last observation. Plans without resolver evidence retain the existing guard.
 
+**Planned external-routine pins (DEC-319.1):** every PostgreSQL plan also
+pins, under the environment's fingerprint key, each unmanaged routine that its
+statements, probes and fired triggers can call by name. `apply` refuses a
+changed pin under the lock before pre-flight, again inside the transaction
+before the first statement, and again before recording. This detects a
+replaced helper; it does not lock one, and it does not cover routines reached
+without call syntax.
+
 ---
 
 ## 8. Environment state and drift
