@@ -244,13 +244,23 @@ fn derived(
         else {
             continue;
         };
-        // `t(x)` is a routine call first and a cast to type `t` only when no
-        // routine of that name fits, so a type binding may have been written
-        // as a call that a same-named routine would now take.
-        let classes: &[CandidateClass] = if class == CandidateClass::Type {
-            &[CandidateClass::Type, CandidateClass::Routine]
-        } else {
-            &[class]
+        // `t(x)` is either: a call when a routine fits exactly, a cast to
+        // type `t` when one of that name exists and no exact match does, a
+        // call to the best-matching routine otherwise. So a type binding may
+        // be a call a same-named routine would now take, and a routine
+        // binding one a same-named type would now take (measured on 16 and
+        // 18: `foo('x')` calls foo(text) until a type `foo` exists).
+        let classes: &[CandidateClass] = match class {
+            CandidateClass::Type | CandidateClass::Routine => {
+                &[CandidateClass::Type, CandidateClass::Routine]
+            }
+            CandidateClass::Relation
+            | CandidateClass::Operator
+            | CandidateClass::Collation
+            | CandidateClass::OperatorClass
+            | CandidateClass::OperatorFamily
+            | CandidateClass::Cast
+            | CandidateClass::Extension => std::slice::from_ref(&class),
         };
         for space in paths.of(schema).into_iter().chain([namespace.clone()]) {
             for &class in classes {
@@ -568,6 +578,10 @@ mod tests {
                 set(CandidateClass::Routine, Some("app"), Some("f")),
                 set(CandidateClass::Routine, Some("shared"), Some("f")),
                 set(CandidateClass::Routine, Some("util"), Some("f")),
+                set(CandidateClass::Type, Some("pg_catalog"), Some("f")),
+                set(CandidateClass::Type, Some("app"), Some("f")),
+                set(CandidateClass::Type, Some("shared"), Some("f")),
+                set(CandidateClass::Type, Some("util"), Some("f")),
             ])
         );
         // An extra the deployer cannot use is not on its measured path, so

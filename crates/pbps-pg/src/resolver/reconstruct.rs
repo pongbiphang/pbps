@@ -56,7 +56,8 @@ enum Phase {
 /// could have taken over had it existed earlier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Nameable {
-    /// A table or view: a relation, and a row type of the same name.
+    /// A table or view: a relation, and a row type of the same name, which
+    /// can also turn a call `t(x)` without an exact match into a cast.
     Relation,
     /// An index: a relation with no row type.
     Index,
@@ -71,7 +72,7 @@ impl Nameable {
     pub fn shadows(self, class: &str) -> bool {
         matches!(
             (self, class),
-            (Self::Relation, "pg_class" | "pg_type")
+            (Self::Relation, "pg_class" | "pg_type" | "pg_proc")
                 | (Self::Index, "pg_class")
                 | (Self::Routine, "pg_proc" | "pg_type")
         )

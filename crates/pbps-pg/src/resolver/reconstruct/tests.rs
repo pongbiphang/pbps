@@ -168,7 +168,8 @@ fn later_names_are_what_became_nameable_after_the_module() {
 }
 
 /// A later object could only have taken a binding it can be resolved as:
-/// an index never a routine call, a routine never a relation.
+/// an index never a routine call, a routine never a relation, while a
+/// relation's row type can take a call.
 #[test]
 fn a_later_object_shadows_only_what_it_could_be_resolved_as() {
     assert!(Nameable::Index.shadows("pg_class"));
@@ -179,7 +180,9 @@ fn a_later_object_shadows_only_what_it_could_be_resolved_as() {
     assert!(!Nameable::Routine.shadows("pg_class"));
     assert!(Nameable::Relation.shadows("pg_class"));
     assert!(Nameable::Relation.shadows("pg_type"));
-    assert!(!Nameable::Relation.shadows("pg_proc"));
+    // A relation's row type can turn a call without an exact match into a
+    // cast to it.
+    assert!(Nameable::Relation.shadows("pg_proc"));
     assert!(!Nameable::Relation.shadows("column"));
 }
 

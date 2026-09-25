@@ -1105,3 +1105,43 @@ async fn a_routine_that_would_take_a_function_style_cast_is_a_candidate() {
         );
     }
 }
+
+/// The reverse: a call that bound a routine without an exact match becomes a
+/// cast once a type of that name exists. A type arriving on the path after
+/// the view is a candidate scratch never reproduced.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_type_that_would_take_a_routine_call_is_a_candidate() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let declared = || {
+            Declared::default()
+                .function(
+                    "app.foo(text)",
+                    "(text) RETURNS text LANGUAGE sql IMMUTABLE RETURN 'routine'",
+                )
+                .view("app.v", "SELECT foo('x')::text AS x")
+        };
+        let assessment = analyze(
+            &server,
+            "call_cast",
+            Case {
+                schemas: &["app"],
+                extras: &[],
+                target: "
+                    SET search_path = app;
+                    CREATE FUNCTION foo(text) RETURNS text LANGUAGE sql IMMUTABLE RETURN 'routine';
+                    CREATE VIEW app.v AS SELECT foo('x')::text AS x;
+                    CREATE TYPE app.foo AS ENUM ('x');",
+                base: declared(),
+                desired: declared(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(only(&assessment, "app", "v"), Verdict::Unresolved { .. }),
+            "{variable}: {assessment:#?}"
+        );
+    }
+}
