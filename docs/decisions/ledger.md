@@ -815,3 +815,24 @@ case-sensitive databases, where `dbo.__PBPS_STATE` is a different table and
 `OBJECT_ID` is exact (measured on the pinned server, both collations). Reads
 are not gated. A folded table without the ledger's columns fails them loudly,
 and the next write refuses by name.
+
+<a id="dec-954-1"></a>
+
+**DEC-954.1. SQL Server ledger names are compared with a `|` appended to both
+sides, because `=`, `<>` and `IN` pad trailing spaces even under
+`Latin1_General_BIN2` (#954; completes DEC-878.1 and DEC-894.1).** Measured on
+the pinned server: with a project table `dbo.[__pbps_state ]`, `OBJECT_ID(N'dbo.__pbps_state')`
+resolves to it on every collation, `OBJECT_NAME(…) COLLATE Latin1_General_BIN2
+<> N'__pbps_state'` is false, and an `INSERT INTO dbo.__pbps_state` lands in
+it. So the spelling checks passed a padded name, and the pull's filter hid the
+project's table as the ledger. Appending the same character to both sides puts
+any trailing space before it, where padding cannot reach. It is one idiom for
+all three comparisons. A `DATALENGTH` test would work too, but only paired
+with its own name: an `IN` list of lengths lets `'__pbps_lock '` through,
+because it is exactly as long as `'__pbps_state'`.
+
+The object-name side is tested `IS NOT NULL` before the sentinel is appended.
+Under `CONCAT_NULL_YIELDS_NULL OFF`, which a server's `user options` can make
+the default and pbps does not pin, `NULL + N'|'` is `N'|'` (measured), so an
+absent table would otherwise read as misspelt and refuse creating the ledger.
+The pull's filter compares `sys` names, which are never NULL.
