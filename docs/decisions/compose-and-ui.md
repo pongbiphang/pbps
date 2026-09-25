@@ -434,8 +434,9 @@ hand, though, passes for a route added after it was written.
     paths after macro expansion, and CI runs it with `-D warnings`.
   - A source scan, with comments and whitespace removed, is a second net that
     names the site it finds.
-  Compose's names-only `GIT_*` scrub is the one allowed site, marked with
-  `#[expect]` and a reason. A test pins the clippy configuration, so deleting
+  Compose's names-only `GIT_*` scrub is the one allowed site. It lives in a
+  helper that returns names alone, and only that helper carries the
+  `#[expect]`, so a read added anywhere else is still an error. A test pins the clippy configuration, so deleting
   it fails.
 - The real-CLI test searches every response, served asset and file the
   session leaves (git's compressed objects included) for the password marker
