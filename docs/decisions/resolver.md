@@ -1004,4 +1004,5 @@ external input is handled privately (#617). Capturing whole schemas instead
 would refuse on unmanaged objects no surface can reach, and would pull their
 arbitrary closures into a capture that must refuse what it cannot qualify.
 Runtime-bound bodies are compared by header only and are named, never counted
-as proven by silence (ADR-0016 decision 3).
+as proven by silence (ADR-0016 decision 3); one the plan creates is named too,
+though the target has nothing to compare it with (#1064).
