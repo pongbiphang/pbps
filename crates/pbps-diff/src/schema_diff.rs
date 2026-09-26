@@ -68,6 +68,22 @@ pub enum DiffError {
     )]
     DataBaselineKeyAbsent { table: TableName },
 
+    /// Column renames on one table that trade names in a cycle, which skipped
+    /// revisions can produce (`a -> c`, then `b -> a`, then `c -> b`). No
+    /// order of the renames is one an engine performs: each target is still
+    /// held when its rename runs. It takes a temporary name, which is the
+    /// deployer's to choose (DEC-541.1).
+    #[error(
+        "{table} renames columns {} into each other's names in a cycle, and no order of those \
+         renames is one the engine performs. Apply the revisions that form it in separate \
+         deployments, or rename one of the columns through a temporary name first",
+        columns.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", ")
+    )]
+    ColumnRenameCycle {
+        table: TableName,
+        columns: BTreeSet<String>,
+    },
+
     /// A baseline without a primary key, restored by this plan on a column
     /// the baseline does not have. Not [`Self::DataKeyColumnChanged`]: there
     /// was no key to move, and "rename the column instead" does not apply.
@@ -599,6 +615,47 @@ fn diff_partial_rebuilding(
             | Change::PublicExecution { .. } => false,
         }
     };
+    // A column rename into a name another rename of the same table vacates
+    // runs after it: skipped revisions that rename `b` to `c` and then `a` to
+    // `b` leave a chain the uids would otherwise order, and `a -> b` while `b`
+    // still stands is refused by both engines (DEC-541.1). Its depth is how many
+    // links it waits on; the chain's far end, whose target is free, goes
+    // first. A cycle, two columns trading names, has no order an engine takes
+    // without a temporary name, so the plan says so instead of emitting one.
+    let vacates: BTreeMap<(TableName, String), String> = planned
+        .iter()
+        .filter_map(|p| {
+            if let Change::RenameColumn {
+                table, from, to, ..
+            } = &p.change
+            {
+                Some(((table.clone(), from.clone()), to.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let mut chain_depth: BTreeMap<(TableName, String), u8> = BTreeMap::new();
+    let mut cycles: BTreeSet<(TableName, BTreeSet<String>)> = BTreeSet::new();
+    for ((table, from), to) in &vacates {
+        let mut depth = 0u8;
+        let mut path = vec![from.clone()];
+        let mut next = to;
+        while let Some(after) = vacates.get(&(table.clone(), next.clone())) {
+            // Only the links that close the loop: a chain can lead into one.
+            if let Some(start) = path.iter().position(|seen| seen == next) {
+                cycles.insert((table.clone(), path[start..].iter().cloned().collect()));
+                break;
+            }
+            path.push(next.clone());
+            depth = depth.saturating_add(1);
+            next = after;
+        }
+        chain_depth.insert((table.clone(), from.clone()), depth);
+    }
+    for (table, columns) in cycles {
+        errs.push(DiffError::ColumnRenameCycle { table, columns });
+    }
     // The class, and a rank inside it, so a change can sit between two
     // classes without a new ordinal shifting every one below it — the cost
     // `order_key`'s own doc names.
@@ -621,6 +678,12 @@ fn diff_partial_rebuilding(
             // property `a_single_revision_cannot_rename_into_an_occupied_baseline_name`
             // holds.
             (2, 2)
+        } else if let Change::RenameColumn { table, from, .. } = c {
+            let depth = chain_depth
+                .get(&(table.clone(), from.clone()))
+                .copied()
+                .unwrap_or(0);
+            (order_key(c), 1u8.saturating_add(depth))
         } else {
             (order_key(c), 1)
         }
@@ -4462,6 +4525,131 @@ mod tests {
 
     /// Revisions resolved in turn from `base`, each with its own intents,
     /// then diffed from the undeployed baseline.
+    /// The base schema and every revision resolved in turn, without the
+    /// diff: for a case whose diff reports an error rather than a plan.
+    fn revisions_diffed(base: &Schema, revisions: &[(Schema, Vec<Intent>)]) -> Diffed {
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let mut ids = base_ids.clone();
+        for (schema, intents) in revisions {
+            ids = crate::resolve(schema, &ids, intents, &ctx()).unwrap().ids;
+        }
+        diff_partial_rebuilding(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &revisions.last().unwrap().0,
+                ids: &ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+            &BTreeSet::new(),
+        )
+    }
+
+    /// #541: a column rename into a name another rename of the same table
+    /// vacates runs after it. Two minted uids used to decide, and `a -> b`
+    /// ran while `b` still stood — `Msg 15335` on SQL Server and `column "b"
+    /// of relation "t" already exists` on PostgreSQL.
+    #[test]
+    fn a_column_rename_into_a_name_another_rename_vacates_runs_after_it() {
+        let cols = |c: &[(&str, &str)]| {
+            schema_of(
+                "dbo.t",
+                table(
+                    &c.iter()
+                        .map(|(n, t)| (*n, Column::new(ty(t))))
+                        .collect::<Vec<_>>(),
+                ),
+            )
+        };
+        let rename = |from: &str, to: &str| Intent::RenameColumn {
+            table: "dbo.t".parse().unwrap(),
+            from: from.into(),
+            to: to.into(),
+        };
+        let order = |cs: &ChangeSet| -> Vec<String> {
+            cs.changes
+                .iter()
+                .filter_map(|p| match &p.change {
+                    Change::RenameColumn { from, to, .. } => Some(format!("{from} -> {to}")),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Resolved afresh each time: the uids are minted, so without the
+        // chain order the renames came out in either order, and one
+        // resolution alone would pass half the time for the wrong reason.
+        for _ in 0..32 {
+            let cs = across_revisions(
+                &cols(&[("a", "int"), ("b", "bigint")]),
+                &[
+                    (
+                        cols(&[("a", "int"), ("c", "bigint")]),
+                        vec![rename("b", "c")],
+                    ),
+                    (
+                        cols(&[("b", "int"), ("c", "bigint")]),
+                        vec![rename("a", "b")],
+                    ),
+                ],
+            );
+            assert_eq!(order(&cs), ["b -> c", "a -> b"], "{cs:?}");
+
+            // Three links: the far end first, whatever the uids say.
+            let cs = across_revisions(
+                &cols(&[("a", "int"), ("b", "bigint"), ("c", "text")]),
+                &[
+                    (
+                        cols(&[("a", "int"), ("b", "bigint"), ("d", "text")]),
+                        vec![rename("c", "d")],
+                    ),
+                    (
+                        cols(&[("a", "int"), ("c", "bigint"), ("d", "text")]),
+                        vec![rename("b", "c")],
+                    ),
+                    (
+                        cols(&[("b", "int"), ("c", "bigint"), ("d", "text")]),
+                        vec![rename("a", "b")],
+                    ),
+                ],
+            );
+            assert_eq!(order(&cs), ["c -> d", "b -> c", "a -> b"], "{cs:?}");
+        }
+
+        // Two columns trading names through a third across three revisions:
+        // `resolve` accepts every step, and no order of the net renames runs.
+        // The plan says so instead of emitting one.
+        let diffed = revisions_diffed(
+            &cols(&[("a", "int"), ("b", "bigint")]),
+            &[
+                (
+                    cols(&[("c", "int"), ("b", "bigint")]),
+                    vec![rename("a", "c")],
+                ),
+                (
+                    cols(&[("c", "int"), ("a", "bigint")]),
+                    vec![rename("b", "a")],
+                ),
+                (
+                    cols(&[("b", "int"), ("a", "bigint")]),
+                    vec![rename("c", "b")],
+                ),
+            ],
+        );
+        assert!(
+            diffed.errors.iter().any(|e| matches!(e,
+                DiffError::ColumnRenameCycle { table, columns }
+                    if table.to_string() == "dbo.t"
+                        && columns == &BTreeSet::from(["a".to_owned(), "b".to_owned()]))),
+            "{:?}",
+            diffed.errors
+        );
+    }
+
     fn across_revisions(base: &Schema, revisions: &[(Schema, Vec<Intent>)]) -> ChangeSet {
         let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
             .unwrap()

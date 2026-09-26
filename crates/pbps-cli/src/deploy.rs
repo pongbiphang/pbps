@@ -1724,6 +1724,74 @@ fn differing(
     out
 }
 
+/// One of a plan's column changes to a table, in the plan's order.
+enum ColumnStep<'a> {
+    Rename(&'a str, &'a str),
+    Add(&'a str),
+    Drop(&'a str),
+}
+
+/// Whether a name changes hands within the plan: one rename gives it up and
+/// another rename, or a new column, takes it.
+fn names_change_hands(steps: &[ColumnStep<'_>]) -> bool {
+    let sources: BTreeSet<&str> = steps
+        .iter()
+        .filter_map(|step| match step {
+            ColumnStep::Rename(from, _) => Some(*from),
+            ColumnStep::Add(_) | ColumnStep::Drop(_) => None,
+        })
+        .collect();
+    steps.iter().any(|step| match step {
+        ColumnStep::Rename(_, to) => sources.contains(to),
+        ColumnStep::Add(name) => sources.contains(name),
+        ColumnStep::Drop(_) => false,
+    })
+}
+
+/// Every name the plan's column changes touch, mapped to the baseline column
+/// it holds afterwards: `Some` for one that kept or moved its identity, `None`
+/// for a new column or a name left empty. A name the steps do not touch is
+/// not in the map and keeps its own column.
+fn net_columns(steps: &[ColumnStep<'_>]) -> BTreeMap<String, Option<String>> {
+    let mut net: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for step in steps {
+        match step {
+            ColumnStep::Rename(from, to) => {
+                let moving = net
+                    .remove(*from)
+                    .unwrap_or_else(|| Some((*from).to_owned()));
+                net.insert((*from).to_owned(), None);
+                net.insert((*to).to_owned(), moving);
+            }
+            ColumnStep::Add(name) | ColumnStep::Drop(name) => {
+                net.insert((*name).to_owned(), None);
+            }
+        }
+    }
+    net
+}
+
+/// `was`, its columns keyed by the names the plan leaves them under: a moved
+/// column under its new name, and a name that ends up empty or new left out.
+fn realign_columns(
+    was: &pbps_model::Table,
+    net: &BTreeMap<String, Option<String>>,
+) -> pbps_model::Table {
+    let mut table = was.clone();
+    table.columns = was
+        .columns
+        .iter()
+        .filter(|(name, _)| !net.contains_key(name.as_str()))
+        .map(|(name, column)| (name.clone(), column.clone()))
+        .collect();
+    for (now, held) in net {
+        if let Some(column) = held.as_ref().and_then(|b| was.columns.get(b)) {
+            table.columns.insert(now.clone(), column.clone());
+        }
+    }
+    table
+}
+
 fn refuse_unplanned_movement(
     dialect: &dyn pbps_dialect::Dialect,
     changes: &pbps_model::ChangeSet,
@@ -2008,12 +2076,52 @@ fn refuse_unplanned_movement(
             .get(table)
             .is_some_and(|t| t.columns.contains_key(a) && t.columns.contains_key(b))
     };
+    // A table whose column names change hands within this plan: a name one
+    // rename gives up is taken by another rename or by a new column. Both
+    // reads then hold that name for two different columns, and no rule about
+    // names can say which is which (DEC-541.1). Such a plan makes at least two
+    // changes, and `--staged` applies one (ADR-0003), so it is transactional:
+    // the earlier read is from before its first statement and the later one
+    // from after its last. The plan's own column changes, in its order, then
+    // say which baseline column each final name holds.
+    let mut column_steps: BTreeMap<&TableName, Vec<ColumnStep<'_>>> = BTreeMap::new();
+    for p in &changes.changes {
+        let (table, step) = if let pbps_model::Change::RenameColumn {
+            table, from, to, ..
+        } = &p.change
+        {
+            (table, ColumnStep::Rename(from, to))
+        } else if let pbps_model::Change::AddColumn { table, name, .. } = &p.change {
+            (table, ColumnStep::Add(name))
+        } else if let pbps_model::Change::DropColumn { column, .. } = &p.change {
+            (&column.table, ColumnStep::Drop(&column.name))
+        } else {
+            continue;
+        };
+        column_steps.entry(table).or_default().push(step);
+    }
+    let changing_hands: BTreeMap<&TableName, BTreeMap<String, Option<String>>> = column_steps
+        .iter()
+        .filter(|(_, steps)| names_change_hands(steps))
+        .map(|(table, steps)| (*table, net_columns(steps)))
+        .collect();
     for ((table, to), from) in &renamed_columns {
+        if changing_hands.contains_key(table) {
+            continue;
+        }
         if holds_column(before, table, from, to) || holds_column(after, table, from, to) {
             continue;
         }
         for undo in [&mut undo_before, &mut undo_after] {
             undo.rename_column(pbps_model::ColumnRef::new((*table).clone(), *to), *from);
+        }
+    }
+    // The earlier read has run nothing, so only the later one is undone.
+    for (table, net) in &changing_hands {
+        for (now, was) in net {
+            if let Some(was) = was.as_deref().filter(|was| *was != now) {
+                undo_after.rename_column(pbps_model::ColumnRef::new((*table).clone(), now), was);
+            }
         }
     }
 
@@ -2281,6 +2389,16 @@ fn refuse_unplanned_movement(
             // lands in the same spelling.
             let was = &undo_before.apply(was, name);
             let now = &undo_after.apply(now, now_name);
+            // Each baseline column under the name the plan leaves it with, so
+            // the loop below compares a column with itself (DEC-541.1).
+            let realigned;
+            let was: &pbps_model::Table = match changing_hands.get(now_name) {
+                Some(net) => {
+                    realigned = realign_columns(was, net);
+                    &realigned
+                }
+                None => was,
+            };
             let no_fields = BTreeMap::new();
             let moved_columns = redefined.get(now_name).unwrap_or(&no_fields);
             let no_names = BTreeSet::new();
@@ -8201,6 +8319,104 @@ mod tests {
         )
         .expect_err("the module is still there");
         assert!(format!("{e:#}").contains("is still there"), "{e:#}");
+    }
+
+    /// #541: a name that changes hands within the plan. Both reads hold it,
+    /// for two different columns, so the comparison follows the plan's own
+    /// column changes from each baseline column to the name it ends under.
+    /// Each case gives the columns different types, so comparing two of them
+    /// by name is a type difference no change excuses.
+    #[test]
+    fn a_column_name_that_changes_hands_is_compared_by_the_column_holding_it() {
+        let table = |columns: &[(&str, &str)]| {
+            let mut t = pbps_model::Table::default();
+            for (name, spec) in columns {
+                t.columns.insert(
+                    (*name).to_owned(),
+                    pbps_model::Column::new(spec.parse().unwrap()),
+                );
+            }
+            let mut s = Schema::default();
+            s.tables.insert("dbo.t".parse().unwrap(), t);
+            s
+        };
+        let named: TableName = "dbo.t".parse().unwrap();
+        let rename = |uid: &str, from: &str, to: &str| {
+            pbps_model::PlannedChange::new(pbps_model::Change::RenameColumn {
+                uid: uid.parse().unwrap(),
+                table: named.clone(),
+                from: from.to_owned(),
+                to: to.to_owned(),
+                table_was: None,
+            })
+        };
+        let add = |uid: &str, name: &str, spec: &str| {
+            pbps_model::PlannedChange::new(pbps_model::Change::AddColumn {
+                uid: uid.parse().unwrap(),
+                table: named.clone(),
+                name: name.to_owned(),
+                column: Box::new(pbps_model::Column::new(spec.parse().unwrap())),
+            })
+        };
+        let drop = |uid: &str, name: &str| {
+            pbps_model::PlannedChange::new(pbps_model::Change::DropColumn {
+                uid: uid.parse().unwrap(),
+                column: named.column(name),
+            })
+        };
+        let check = |changes: Vec<pbps_model::PlannedChange>,
+                     before: &[(&str, &str)],
+                     after: &[(&str, &str)]| {
+            refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                &pbps_model::ChangeSet { changes },
+                &table(before),
+                &table(after),
+                "prod",
+                Settled::Whole,
+            )
+        };
+
+        // A chain, in the order the differ now emits it.
+        check(
+            vec![rename("c_aaaaaa", "b", "c"), rename("c_bbbbbb", "a", "b")],
+            &[("a", "int"), ("b", "bigint")],
+            &[("b", "int"), ("c", "bigint")],
+        )
+        .expect("`b` is the renamed `a` and `c` the renamed `b`");
+
+        // A source name reclaimed by a new column.
+        check(
+            vec![
+                rename("c_aaaaaa", "a", "b"),
+                add("c_bbbbbb", "a", "smallint"),
+            ],
+            &[("a", "int")],
+            &[("b", "int"), ("a", "smallint")],
+        )
+        .expect("`b` is the renamed `a`, and `a` is the new column");
+
+        // And with a drop in front: `drop b`, `a -> b`, `add a`.
+        check(
+            vec![
+                drop("c_cccccc", "b"),
+                rename("c_aaaaaa", "a", "b"),
+                add("c_bbbbbb", "a", "smallint"),
+            ],
+            &[("a", "int"), ("b", "bigint")],
+            &[("b", "int"), ("a", "smallint")],
+        )
+        .expect("the dropped `b`, the renamed `a`, and the new `a` are three columns");
+
+        // Negative: the identity is followed, not excused. The column the
+        // chain carries from `a` to `b` came back retyped.
+        let e = check(
+            vec![rename("c_aaaaaa", "b", "c"), rename("c_bbbbbb", "a", "b")],
+            &[("a", "int"), ("b", "bigint")],
+            &[("b", "text"), ("c", "bigint")],
+        )
+        .expect_err("the renamed `a` is not what the plan was approved over");
+        assert!(format!("{e:#}").contains("`b`"), "{e:#}");
     }
 
     /// A name that belongs to two columns across one plan: the one this plan
