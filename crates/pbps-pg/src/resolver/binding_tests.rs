@@ -1259,3 +1259,48 @@ async fn an_operators_implementation_is_no_named_candidate() {
         );
     }
 }
+
+/// COALESCE's type is the operands' common type; no name was looked up to
+/// find it. A same-named unmanaged type is no candidate, and the view's
+/// verdict stands.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_common_type_the_operands_decide_is_no_named_candidate() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let declared = || {
+            let mut table = pbps_model::Table::default();
+            for column in ["a", "b"] {
+                table.columns.insert(
+                    column.into(),
+                    pbps_model::Column::new("text".parse().unwrap()),
+                );
+            }
+            Declared::default()
+                .table("app.t", table)
+                .view("app.v", "SELECT COALESCE(a, b) AS x FROM t")
+        };
+        let assessment = analyze(
+            &server,
+            "common",
+            Case {
+                schemas: &["app"],
+                extras: &[],
+                target: "
+                    CREATE TABLE app.t (a text, b text);
+                    SET search_path = app;
+                    CREATE VIEW app.v AS SELECT COALESCE(a, b) AS x FROM t;
+                    CREATE TYPE app.text AS ENUM ('x');",
+                base: declared(),
+                desired: declared(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            only(&assessment, "app", "v"),
+            Verdict::Unaffected,
+            "{variable}"
+        );
+    }
+}

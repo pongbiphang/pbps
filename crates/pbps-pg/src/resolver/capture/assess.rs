@@ -421,12 +421,19 @@ fn properties_equal(left: &BTreeMap<String, Value>, right: &BTreeMap<String, Val
     strip(left) == strip(right)
 }
 
-/// Node fields whose object follows from another binding of the same node,
-/// never from looking a name up: an operator's implementation from the
-/// operator, a call's or operator's result and transition types from the
-/// routine, a column reference's type from the column, a collation from its
-/// inputs. The binding that decided each is compared in its own right; a
+/// Node fields whose object follows from other parts of the tree, never
+/// from looking a name up: an operator's implementation from the operator; a
+/// call's, operator's or aggregate's result and transition types from the
+/// routine; a column reference's type from the column; the common type of a
+/// CASE, COALESCE, GREATEST/LEAST or array from its operands; a subscript's
+/// container and element types from its input; a parameter's and a
+/// placeholder's type from the declaration they stand for; a collation from
+/// its inputs. What decided each is compared in its own right, and a
 /// same-named object cannot displace these.
+///
+/// Not here: a constant's type and a coercion's or row constructor's result,
+/// which can be a name written in the source (`'x'::t`, `ROW(..)::t`) and
+/// are stored the same way when they were not (#1062).
 const DETERMINED: &[&str] = &[
     "opfuncid",
     "funcresulttype",
@@ -436,6 +443,16 @@ const DETERMINED: &[&str] = &[
     "aggtranstype",
     "aggargtypes",
     "vartype",
+    "casetype",
+    "coalescetype",
+    "minmaxtype",
+    "array_typeid",
+    "element_typeid",
+    "refcontainertype",
+    "refelemtype",
+    "refrestype",
+    "paramtype",
+    "typeId",
 ];
 
 /// Whether a binding's object was selected by name resolution, so that a
@@ -701,7 +718,7 @@ mod tests {
         // by name, so neither derives a candidate.
         let determined = Input {
             properties: BTreeMap::new(),
-            bindings: ["opfuncid", "vartype", "inputcollid"]
+            bindings: ["opfuncid", "vartype", "inputcollid", "coalescetype"]
                 .into_iter()
                 .map(|field| Binding {
                     path: vec!["ev_action".into(), "0".into(), field.into()],

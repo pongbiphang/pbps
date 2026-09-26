@@ -945,8 +945,10 @@ reach (its declared count less defaults, or variadic) as a type, since `t(x)` is
 best-matching call, and a cast takes exactly one argument —
 plus every cast. Only a binding some name lookup selected counts: an
 operator's implementation, a result or transition type, a column reference's
-type and a derived collation follow from another binding, which is compared
-itself, which resolution consults with no name. A
+type, the operands' common type of a CASE, COALESCE, GREATEST/LEAST or array, a
+subscript's types and a derived collation follow from other parts of the tree,
+which are compared themselves; a constant's or coercion's type can be a written
+name stored no differently, so it counts (#1062), which resolution consults with no name. A
 declaration the plan leaves unchanged has the same text on both sides and
 resolves the same names; only the selected objects can differ, and that is
 what the bindings carry. On the target each member must be an engine object
