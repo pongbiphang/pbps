@@ -498,6 +498,17 @@ annotation cases through `resolve` now say so through
 lenient default. Pinned by
 `a_rename_handed_to_resolve_is_a_current_decision_and_an_annotation_is_not`.
 
+The unused-intent sweep still excused a current rename by absorption, and
+absorption reads a source that is absent from the ids file as already vacated
+(#973). A `pbps rename` from a name the declarations had only just added,
+onto one already identified, therefore reported success. The new name was
+minted as an addition, and the rename did nothing. A rename decided in the
+current run that the run did not perform is now always an `UnusedIntent`.
+Absorption excuses only an annotation, which is a rename recorded on an earlier
+run. A current drop still asks the ids file. Pinned by
+`a_current_rename_from_a_new_name_onto_an_identified_one_is_unused` and
+`a_rename_from_a_newly_declared_name_onto_an_identified_one_writes_nothing`.
+
 <a id="dec-496-1"></a>
 
 **DEC-496.1. On SQL Server a declared constraint name must be free in its
