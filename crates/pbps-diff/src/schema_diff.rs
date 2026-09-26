@@ -4379,6 +4379,87 @@ mod tests {
         assert!(drop < rename && rename < add, "{:?}", cs.changes);
     }
 
+    /// A key on another table this plan drops, pointing at the doomed one, is
+    /// that table's own key and is dropped separately like any other; it
+    /// still has to go before the doomed table does, and the other table's
+    /// drop keeps its class.
+    #[test]
+    fn another_dropped_tables_key_to_the_reused_name_goes_first() {
+        let keyed = || table(&[("id", Column::new(ty("int")).not_null())]);
+        let mut other = table(&[("target_id", Column::new(ty("int")))]);
+        other.foreign_keys.insert(
+            "fk_other_target".into(),
+            fk(&["target_id"], "app.target", &["id"]),
+        );
+        let mut base = two_tables(("app.old", keyed()), ("app.target", keyed()));
+        base.tables.insert("app.other".parse().unwrap(), other);
+        let intermediate = schema_of("app.old", keyed());
+        let declared = schema_of("app.target", keyed());
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let intermediate_ids = crate::resolve(
+            &intermediate,
+            &base_ids,
+            &[
+                Intent::DropTable {
+                    table: "app.target".parse().unwrap(),
+                    reason: "gone".into(),
+                },
+                Intent::DropTable {
+                    table: "app.other".parse().unwrap(),
+                    reason: "gone".into(),
+                },
+            ],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let declared_ids = crate::resolve(
+            &declared,
+            &intermediate_ids,
+            &[Intent::RenameTable {
+                from: "app.old".parse().unwrap(),
+                to: "app.target".parse().unwrap(),
+            }],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let cs = diff_with(
+            Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+        );
+        let at = |f: &dyn Fn(&Change) -> bool| {
+            cs.changes
+                .iter()
+                .position(|p| f(&p.change))
+                .unwrap_or_else(|| panic!("{:?}", cs.changes))
+        };
+        let key = at(&|c| {
+            matches!(c, Change::DropForeignKey { table, name }
+                if table.to_string() == "app.other" && name == "fk_other_target")
+        });
+        let target = at(
+            &|c| matches!(c, Change::DropTable { name, .. } if name.to_string() == "app.target"),
+        );
+        let rename = at(&|c| matches!(c, Change::RenameTable { .. }));
+        let other =
+            at(&|c| matches!(c, Change::DropTable { name, .. } if name.to_string() == "app.other"));
+        assert!(
+            key < target && target < rename && rename < other,
+            "{:?}",
+            cs.changes
+        );
+    }
+
     /// Only a drop whose name a rename claims moves. Another table's drop
     /// keeps its class, after the renames.
     #[test]

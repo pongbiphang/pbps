@@ -182,7 +182,16 @@ pub(crate) fn order(
                 continue;
             };
             let references = if own.contains(&j) {
-                if table != doomed {
+                // A dropped table's own key, under its baseline name: the
+                // doomed table's, or another dropped table's that references
+                // it. Either keeps its address.
+                let names_it = base
+                    .schema
+                    .tables
+                    .get(table)
+                    .and_then(|t| t.foreign_keys.get(name))
+                    .is_some_and(|fk| &fk.references_table == doomed);
+                if table != doomed && !names_it {
                     continue;
                 }
                 fixed.insert(j);

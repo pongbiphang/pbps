@@ -765,8 +765,9 @@ nothing claims keeps its class.
 
 The drop cannot run while another table's key names it, so every foreign-key
 drop that references it moves ahead with it. Its own key drops, which the
-differ emits separately, move too. Those carry the doomed table's name, which a
-rename into that name also carries once it has run, so they keep the doomed
+differ emits separately, move too, as do the keys another dropped table has on
+it. A dropped table's own keys carry its baseline name, which for the doomed
+table a rename into that name also carries once it has run, so they keep that
 address and are never rekeyed to the rename's source. Where both tables have a
 key of one name (PostgreSQL scopes constraint names to the table), the two
 changes are identical, and the first is taken as the doomed table's. Which key

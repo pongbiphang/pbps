@@ -13454,6 +13454,14 @@ fn a_table_drop_and_a_later_rename_that_reuses_its_name_apply_together() {
         "child",
         Some(keyed("pk_child", "  target_id: {type: bigint}\n") + child_key),
     );
+    // `other` goes before `target` does, in a revision of its own.
+    declare(
+        "other",
+        Some(
+            keyed("pk_other", "  target_id: {type: bigint}\n")
+                + &child_key.replace("fk_child_target", "fk_other_target"),
+        ),
+    );
     // `keeper` is untouched: its key follows `old` through the rename.
     declare(
         "keeper",
@@ -13464,6 +13472,13 @@ fn a_table_drop_and_a_later_rename_that_reuses_its_name_apply_together() {
     d.commit();
     let o = d.run(&["bootstrap", "--db", connection]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // v1b: `other` goes, and its key to `target` with it. Never deployed.
+    declare("other", None);
+    let o = d.run(&["drop-table", "app.other", "--reason", "no longer used"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
 
     // v2: `target` goes, and `child`'s key to it. Committed, never deployed.
     declare("target", None);
