@@ -282,6 +282,9 @@ record](../DECISIONS.md), which says how to add an entry here.
     SPEC §8.1 defines the two, and a step that adds a third adds it to `OURS`,
     where the filter and the validation both read it.
 
+    *Narrowed by [DEC-507.1](#dec-507-1): since #185 the two names are
+    reserved only at the ledger's own qualified spelling, not in every schema.*
+
 <a id="decision-444"></a>
 
 444. **A name containing pbps's own `.` separator is refused where it enters,
@@ -605,3 +608,35 @@ a uid instead would have left
 names that no longer say which table and column they belong to, which is the
 reason `pbps` names defaults at all. Both fields are `#[serde(default)]`; per
 DECISIONS 145 no plan format bump is needed before the first release.
+
+<a id="dec-507-1"></a>
+
+**DEC-507.1. The ledger names are reserved only as the two qualified tables
+the ledger is: `public.__pbps_state` and `public.__pbps_lock` on PostgreSQL,
+`dbo.__pbps_state` and `dbo.__pbps_lock` on SQL Server (#185, #507; narrows
+DECISIONS 274).** DECISIONS 274 reserved the two names in every schema,
+because the reader hid them wherever they appeared, and a declaration it hid
+was created and then invisible. That was a statement about the filter, not
+about the ledger. DECISIONS 284 then fixed where the PostgreSQL ledger lives,
+the schema `LEDGER_SCHEMA`, `public`, and left the qualification of the pull's
+filter to #185. With #185 done, the filter and the validation read the same
+qualified names (`catalog::is_ours` on each engine, which compares schema and
+name together). So `app.__pbps_state` is an ordinary project table again: the
+pull shows it, and a declaration of it is valid.
+
+DECISIONS 274's two rules still hold, now on the qualified names:
+- **by name and never by prefix**, so `public.__pbps_customers` is visible and
+  valid;
+- **the filter and the validation are one list read two ways**, so neither
+  can hide or refuse what the other does not.
+
+The case is exact too. PostgreSQL's `Public.__pbps_state` is another
+schema's table. On SQL Server the comparison is made exact against trailing
+space padding (#954).
+
+`the_filter_hides_exactly_the_qualified_names_the_validation_refuses`
+(`crates/pbps-pg/src/catalog.rs`, the renamed form of the test DECISIONS 274
+names) ties the two together. `the_pull_keeps_project_ledger_names_beside_the_real_ledger`
+(PostgreSQL live suite) checks that only the two `public` ledger tables are
+hidden, and that a project's same-named tables in another schema stay visible
+and valid.
