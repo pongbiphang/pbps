@@ -1196,6 +1196,92 @@ fn fmt_strips_a_renamed_from_only_after_plan_absorbs_it() {
     assert_eq!(code(&d.run(&["plan", "--check"])), 0);
 }
 
+/// #404: a table's `renamed_from` names another file's table, so `fmt` has to
+/// judge it against every file. After an applied `dbo.old -> dbo.new`, a new
+/// `dbo.old` declared in another file makes the annotation redundant. `plan`
+/// said so and asked for `fmt`, and a per-file `fmt` then kept the line for
+/// ever.
+#[test]
+fn fmt_strips_a_table_rename_whose_source_name_another_file_reuses() {
+    let d = Demo::new("reused_source");
+    let old = |cols: &str| format!("table: dbo.old\ncolumns:\n{cols}");
+    std::fs::write(d.dir.join("schema/dbo.old.yml"), old("  id: {type: int}\n")).unwrap();
+    d.run(&["plan"]);
+    d.commit();
+
+    // The rename, absorbed into the ids file by plan.
+    std::fs::remove_file(d.dir.join("schema/dbo.old.yml")).unwrap();
+    let renamed = d.dir.join("schema/dbo.new.yml");
+    std::fs::write(
+        &renamed,
+        "table: dbo.new\nrenamed_from: dbo.old\ncolumns:\n  id: {type: int}\n",
+    )
+    .unwrap();
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    d.commit();
+
+    // A fresh table under the vacated name, in a file of its own.
+    std::fs::write(
+        d.dir.join("schema/dbo.old.yml"),
+        old("  code: {type: int}\n"),
+    )
+    .unwrap();
+    let o = d.run(&["plan", "--format", "json"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stdout(&o).contains("fmt.redundant-annotation"),
+        "the premise: plan calls the annotation redundant: {}",
+        stdout(&o)
+    );
+
+    let o = d.run(&["fmt", "--format", "json"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stdout(&o).contains("fmt.annotation-dropped") && stdout(&o).contains("dbo.old"),
+        "{}",
+        stdout(&o)
+    );
+    let after = std::fs::read_to_string(&renamed).unwrap();
+    assert!(!after.contains("renamed_from"), "{after}");
+
+    // And the loop closes: plan no longer asks for fmt.
+    let o = d.run(&["plan", "--format", "json"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        !stdout(&o).contains("fmt.redundant-annotation"),
+        "{}",
+        stdout(&o)
+    );
+}
+
+/// The negative: with the project-wide view, a table rename that `plan` has
+/// not absorbed yet is still pending, and `fmt` keeps its annotation.
+#[test]
+fn fmt_keeps_a_table_rename_plan_has_not_absorbed_yet() {
+    let d = Demo::new("pending_table_rename");
+    std::fs::write(
+        d.dir.join("schema/dbo.old.yml"),
+        "table: dbo.old\ncolumns:\n  id: {type: int}\n",
+    )
+    .unwrap();
+    d.run(&["plan"]);
+    d.commit();
+    std::fs::remove_file(d.dir.join("schema/dbo.old.yml")).unwrap();
+    let renamed = d.dir.join("schema/dbo.new.yml");
+    std::fs::write(
+        &renamed,
+        "table: dbo.new\nrenamed_from: dbo.old\ncolumns:\n  id: {type: int}\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["fmt"])), 0);
+    assert!(
+        std::fs::read_to_string(&renamed)
+            .unwrap()
+            .contains("renamed_from: dbo.old")
+    );
+}
+
 /// SPEC §5.3: two branches each add a same-named column, each hands out its own
 /// uid, and git auto-merges the two lines cleanly. validate is the only thing
 /// that can catch the result.
