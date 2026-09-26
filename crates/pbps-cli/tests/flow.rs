@@ -4119,8 +4119,30 @@ fn doctor_asks_about_a_column_under_the_name_a_pending_rename_has_not_changed_ye
         "EXEC sp_rename 'app.t.caption', 'label', 'COLUMN';",
     );
 
+    // A column the environment still records but the declaration no longer
+    // projects keeps its name, and its grants, until the plan runs. Here the
+    // renamed column is dropped and a new `label` declared: it must not be
+    // credited with the recorded `label`'s column grants.
+    project.table(
+        "table: app.t\ncolumns:\n  code: {type: int, nullable: false}\n\
+         primary_key: [code]\ndata:\n  mode: ensure\n  rows:\n    1: {}\n",
+    );
+    ok(project.run(&[
+        "drop",
+        "app.t.caption",
+        "--reason",
+        "replaced by a new label",
+    ]));
+    ok(project.run(&["plan"]));
+    project.commit();
+    project.table(&declared("label", ""));
+    ok(project.run(&["plan"]));
+    project.commit();
+    let reused = diagnose();
+    assert!(!on_the_table(&reused).is_empty(), "{reused:?}");
+
     // A column this plan adds has no grant yet, and still needs one.
-    project.table(&declared("caption", "  note: {type: int}\n"));
+    project.table(&declared("label", "  note: {type: int}\n"));
     ok(project.run(&["plan"]));
     project.commit();
     let added = diagnose();

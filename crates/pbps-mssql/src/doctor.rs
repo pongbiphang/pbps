@@ -1362,7 +1362,9 @@ fn resolve_columns(
 ///
 /// A rename can free a name the same plan reuses: `label` renamed to `caption`
 /// beside a new `label`. The new column would then be asked about under the
-/// renamed column's physical name and inherit its answer. The list is
+/// renamed column's physical name and inherit its answer. The same holds for
+/// any column the environment records on the table, projected by the data
+/// demand or not. The list is
 /// positional in the generated statement, so that collision is settled before
 /// it is built: such a table gets no column list, and only an object-level
 /// grant counts, the one grant that can cover a column that does not exist
@@ -1392,12 +1394,21 @@ async fn resolved_column_lists(
         let row = resolve_columns(declared, demand.row_columns(), project_ids, recorded_ids);
         let read = resolve_columns(declared, demand.data_columns(), project_ids, recorded_ids);
         for (name, known) in row.iter().chain(&read) {
-            if *known {
-                recorded.push((i, name.clone()));
-            } else {
+            if !*known {
                 added.push((i, name.clone()));
             }
         }
+        // Every column the environment records on this table, not only the
+        // ones the data demand projects: a non-key identity column or one the
+        // plan drops still holds its name, and its grants, until the plan
+        // runs.
+        recorded.extend(
+            recorded_ids
+                .columns
+                .values()
+                .filter(|c| &c.table == query)
+                .map(|c| (i, c.name.clone())),
+        );
         rows.push((i, query.clone(), row, read));
     }
     let reused = crate::catalog::tables_reusing_a_column_name(conn, &added, &recorded).await?;
