@@ -27940,6 +27940,170 @@ async fn doctor_data_grant_targets_resolve_the_same_pending_table_identity() {
     );
 }
 
+/// #568: a grant the declarations dropped but the environment still records
+/// is revoked by the next plan, by its recorded physical name. When that
+/// object is gone, the `REVOKE` fails, so doctor has to say the recorded target
+/// is absent, as it does for a declared one. The recorded grant on an object
+/// that is there raises nothing.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn doctor_reports_an_absent_target_of_a_recorded_only_grant() {
+    let mut db = TestDb::create("doctor_rec568").await;
+    let (role, mut theirs) = grant_deployer(&mut db, "rec568").await;
+    let reader = least_privilege_role(&mut db, "rec568_reader").await;
+    db.conn
+        .execute(&format!(
+            "CREATE TABLE public.kept(id integer);
+             GRANT SELECT ON public.kept TO {role} WITH GRANT OPTION"
+        ))
+        .await
+        .unwrap();
+    let mut recorded = Schema::default();
+    let mut grants = std::collections::BTreeMap::new();
+    for table in ["public.kept", "public.gone"] {
+        grants.insert(
+            table.parse().unwrap(),
+            [pbps_model::Permission::Select].into_iter().collect(),
+        );
+    }
+    recorded.roles.insert(
+        reader.clone(),
+        pbps_model::Role {
+            grants,
+            ..Default::default()
+        },
+    );
+    state::record(
+        &mut theirs,
+        &StateSnapshot::new(
+            StateKind::Baseline,
+            recorded,
+            IdsFile::default(),
+            "doctor-live",
+        ),
+    )
+    .await
+    .unwrap();
+    // The declarations grant nothing: both grants are the ledger's alone.
+    let empty = pbps_db::doctor::GrantTargets::default();
+    let ask = doctor::Ask {
+        managed_schemas: &[],
+        managed_tables: &[],
+        referenced: &[],
+        referenced_columns: &Default::default(),
+        declared_keys: &Default::default(),
+        granted: &empty,
+        data: &Default::default(),
+    };
+    let gaps = doctor::permissions(&mut theirs, &ask, &IdsFile::default())
+        .await
+        .unwrap()
+        .declaration_gaps;
+    cleanup_role(&mut db, &reader).await;
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+    let absent: Vec<_> = gaps
+        .iter()
+        .filter(|g| g.why.contains("recorded grant target is absent"))
+        .map(|g| g.securable())
+        .collect();
+    assert_eq!(absent, ["TABLE \"public\".\"gone\"".to_owned()], "{gaps:?}");
+}
+
+/// #569: a new identity reusing a departing one's name is not asked about in
+/// the catalog, whose occupant is the departing object. What does not depend
+/// on that object is still asked: `MAINTAIN` needs PostgreSQL 17, and a
+/// declared `MAINTAIN` on the reused name is reported on 16 exactly as on a
+/// name nobody uses. On 18 it is not.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+async fn doctor_reports_maintain_on_an_old_server_for_a_reused_table_name() {
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("the PostgreSQL 16 fixture");
+    let name = format!("pbps_test_maint569_{}", std::process::id());
+    for connection in [conn_str(), old] {
+        let mut admin = Conn::connect(Driver::Postgres, &connection).await.unwrap();
+        let _ = admin
+            .execute(&format!("DROP DATABASE IF EXISTS {name}"))
+            .await;
+        admin
+            .execute(&format!("CREATE DATABASE {name}"))
+            .await
+            .unwrap();
+        let target: String = connection
+            .split_whitespace()
+            .map(|w| {
+                if w.starts_with("dbname=") {
+                    format!("dbname={name}")
+                } else {
+                    w.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut conn = Conn::connect(Driver::Postgres, &target).await.unwrap();
+        let version = server_version_num(&mut conn).await;
+        conn.execute("CREATE TABLE public.t(id integer)")
+            .await
+            .unwrap();
+        state::ensure_tables(&mut conn).await.unwrap();
+        // `t` is being renamed to `moved`, and a new identity takes `t`.
+        let (moving, arriving) = (
+            pbps_model::Uid::generate(pbps_model::UidKind::Table),
+            pbps_model::Uid::generate(pbps_model::UidKind::Table),
+        );
+        let mut recorded = IdsFile::default();
+        recorded
+            .tables
+            .insert(moving.clone(), "public.t".parse().unwrap());
+        doctor_record_ids(&mut conn, &recorded).await;
+        let mut project = recorded.clone();
+        project
+            .tables
+            .insert(moving, "public.moved".parse().unwrap());
+        project.tables.insert(arriving, "public.t".parse().unwrap());
+        let grants = pbps_db::doctor::GrantTargets {
+            permissions: [(
+                "public.t".parse().unwrap(),
+                [pbps_model::Permission::Maintain].into_iter().collect(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let ask = doctor::Ask {
+            managed_schemas: &[],
+            managed_tables: &[],
+            referenced: &[],
+            referenced_columns: &Default::default(),
+            declared_keys: &Default::default(),
+            granted: &grants,
+            data: &Default::default(),
+        };
+        let gaps = doctor::permissions(&mut conn, &ask, &project)
+            .await
+            .unwrap()
+            .declaration_gaps;
+        drop(conn);
+        admin
+            .execute(&format!("DROP DATABASE {name} WITH (FORCE)"))
+            .await
+            .unwrap();
+        let flagged = gaps
+            .iter()
+            .any(|g| g.why.contains("MAINTAIN requires PostgreSQL 17 or later"));
+        assert_eq!(flagged, version < 170_000, "{version}: {gaps:?}");
+    }
+}
+
+async fn server_version_num(conn: &mut Conn) -> i64 {
+    conn.query("SELECT current_setting('server_version_num')::bigint AS v")
+        .await
+        .unwrap()[0]
+        .try_get::<i64>("v")
+        .unwrap()
+        .unwrap()
+}
+
 /// #396, #842: `prune` and `unlock` delete, and a DELETE fires a trigger and
 /// follows a view exactly as `lock`'s INSERT does. Both now ask the integrity
 /// check before their DELETE, so neither writes through a decoy view into its

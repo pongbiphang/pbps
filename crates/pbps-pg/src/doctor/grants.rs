@@ -44,6 +44,10 @@ pub(super) async fn missing(
     let granted = ask.granted;
     let mut demands = std::collections::BTreeMap::<_, BTreeSet<_>>::new();
     let mut recorded_targets = BTreeSet::new();
+    // A new identity reusing a departing one's name. Kept apart from
+    // `demands`: that name is the departing identity's too, and its recorded
+    // grants must still be asked about under it.
+    let mut future = std::collections::BTreeMap::<_, BTreeSet<_>>::new();
     for (target, permissions) in &granted.permissions {
         let target = if let GrantTarget::Object(name) = target {
             match identities.table(name) {
@@ -54,7 +58,13 @@ pub(super) async fn missing(
                 // The old occupant belongs to another identity. The new
                 // table's creator retains grant options even after revoking
                 // ordinary DML from themselves; never inspect that occupant.
-                Table::Future => continue,
+                Table::Future => {
+                    future
+                        .entry(target.clone())
+                        .or_default()
+                        .extend(permissions.iter().copied());
+                    continue;
+                }
                 Table::Unrecorded(_) => target.clone(),
             }
         } else {
@@ -82,12 +92,40 @@ pub(super) async fn missing(
         for (name, role) in recorded.snapshot.schema.roles {
             roles.insert(name);
             for (target, permissions) in role.grants {
+                // Recorded by its physical name, which a removed grant's
+                // `REVOKE` names too: absent, its authority cannot be
+                // established, exactly as for a declared recorded target
+                // (#568).
+                if matches!(target, GrantTarget::Object(_)) {
+                    recorded_targets.insert(target.clone());
+                }
                 demands.entry(target).or_default().extend(permissions);
             }
         }
     }
     let mut gaps = Vec::new();
     let mut absent_schemas = BTreeSet::new();
+    // What a future target needs that does not depend on its occupant: the
+    // server has to know the privilege at all (#569). Its catalog is not asked,
+    // since that would answer about the departing identity's object.
+    for (target, permissions) in &future {
+        if permissions.contains(&Permission::Maintain)
+            && crate::roles::server_version_num(conn).await? < crate::roles::MAINTAIN_ARRIVED_IN
+        {
+            let (securable, _, _) = question(target, Permission::Maintain);
+            let Some(permission) = crate::emit::permission_sql(Permission::Maintain)
+                .ok()
+                .and_then(permission)
+            else {
+                continue;
+            };
+            gaps.push(Gap {
+                permission,
+                why: "MAINTAIN requires PostgreSQL 17 or later".to_owned(),
+                securable,
+            });
+        }
+    }
     for (target, permissions) in &demands {
         for right in permissions {
             let Ok(word) = crate::emit::permission_sql(*right) else {
