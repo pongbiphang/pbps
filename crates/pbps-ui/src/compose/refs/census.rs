@@ -38,7 +38,7 @@ fn git_file(directory: &Directory, entry: &str, limit: u64) -> Result<Option<Vec
                 entry,
                 OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
                 Mode::empty(),
-                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
             ) {
                 Ok(fd) => fd,
                 Err(rustix::io::Errno::NOENT) => return Ok(None),

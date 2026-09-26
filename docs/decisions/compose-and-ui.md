@@ -465,7 +465,18 @@ the WSL filesystem.
   the common directory in `durable::store`. It also runs on each captured
   input file, on every store subdirectory `Directory::child` opens, and on
   the common directory's `objects` and `refs`, which compose writes through.
-  A mount point beneath a qualified directory can lead onto 9p. A path prefix like `/mnt/` would
+- **No mount below a checked directory.** A mount point beneath a qualified
+  directory can lead onto 9p at any depth, so checking directories one by one
+  cannot finish. Every descendant lookup, capture and store alike, uses
+  `RESOLVE_NO_XDEV`. Crossing any mount below the root is then an error, and
+  cannot be read as absence: an empty 9p-mounted declarations directory can
+  no longer pass as "every declaration deleted". Git's own ref and object
+  writes cannot take that flag. So compose opens `objects`, `refs`,
+  `refs/heads`, `refs/heads/pbps-compose` and `refs/pbps-compose` from the
+  common directory with it, and a directory that does not exist yet is
+  created by Git on its parent's filesystem. The cost is that a checkout with
+  any mount inside it is refused, even a qualified one. Nothing measured
+  shows such layouts in use, and the refusal names the directory. A path prefix like `/mnt/` would
   miss other mount points and misfire on a native Linux path with that name.
   A handle cannot be swapped between the check and its use.
 - **Measured.** On WSL2 6.6, `/mnt/c` is `9p` with `aname=drvfs`, and

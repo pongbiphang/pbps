@@ -130,7 +130,7 @@ impl Root {
             name,
             OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
             Mode::empty(),
-            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
         ) {
             Ok(fd) => fd,
             // A former descendant also becomes absent when an ancestor is
@@ -194,7 +194,7 @@ impl Root {
             directory,
             OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
-            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
         )
         .map_err(|_| Error::new("Could not enumerate the contained declarations directory"))?;
         let mut names = Vec::new();
@@ -255,7 +255,7 @@ impl Root {
                         name,
                         OFlags::DIRECTORY | OFlags::CLOEXEC,
                         Mode::empty(),
-                        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+                        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
                     )
                     .map_err(|_| Error::new("A declaration directory changed during capture"))?;
                     Self::walk(&child, &full, names, depth + 1, count)?;
