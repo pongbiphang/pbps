@@ -147,6 +147,11 @@ schemars = { version = "1", features = ["indexmap2"] }
 # keeps the network resolver and its TLS stack out; nothing here fetches a
 # remote `$ref`. It never reaches the shipped binary (SPEC 11.4).
 jsonschema = { version = "0.54", default-features = false }
+# Test-only, in pbps-ui: its guardrails read the lint levels Cargo resolves,
+# and quoted, dotted or inline-table keys all mean the same thing to Cargo, so
+# a parser is the only reading that agrees with it (#1065). It never reaches
+# the shipped binary.
+toml = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

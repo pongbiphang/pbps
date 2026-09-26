@@ -596,28 +596,73 @@ mod tests {
 
     #[test]
     fn the_ui_crate_has_no_workspace_dependency_and_embeds_no_remote_assets() {
-        let manifest = include_str!("../Cargo.toml");
-        let dependencies = manifest
-            .split("[dependencies]")
-            .nth(1)
-            .unwrap()
-            .split("[lints]")
-            .next()
-            .unwrap();
-        assert!(!dependencies.contains("pbps-"));
-        for line in dependencies
-            .lines()
-            .filter(|line| line.contains('=') && !line.starts_with('[') && !line.starts_with('#'))
-        {
-            assert!(matches!(
-                line.split('=').next().unwrap().trim(),
-                "serde.workspace"
-                    | "serde_json.workspace"
-                    | "tiny_http.workspace"
-                    | "sha2.workspace"
-                    | "rustix"
-            ));
+        // Parsed, and each dependency resolved to the package it names, so a
+        // dependency cannot hide behind a spelling, a section or a rename
+        // (`serde = { package = "pbps-model", .. }`), including through the
+        // workspace table (#1065). Shipped dependencies are `[dependencies]`
+        // and every `[target.*.dependencies]`; the one dev-dependency never
+        // reaches the binary.
+        fn names(table: Option<&toml::Value>) -> Vec<&str> {
+            table
+                .and_then(toml::Value::as_table)
+                .map(|t| t.keys().map(String::as_str).collect())
+                .unwrap_or_default()
         }
+        let manifest: toml::Table = include_str!("../Cargo.toml").parse().unwrap();
+        let root: toml::Table = include_str!("../../../Cargo.toml").parse().unwrap();
+        let workspace = &root["workspace"]["dependencies"];
+        let mut sections = vec![manifest.get("dependencies")];
+        for target in manifest
+            .get("target")
+            .and_then(toml::Value::as_table)
+            .into_iter()
+            .flat_map(|targets| targets.values())
+        {
+            sections.push(target.get("dependencies"));
+        }
+        let mut shipped = Vec::new();
+        for section in sections.into_iter().flatten() {
+            for (name, spec) in section.as_table().unwrap() {
+                // `workspace = true` takes its source from the root table.
+                let spec = if spec.get("workspace") == Some(&toml::Value::Boolean(true)) {
+                    &workspace[name.as_str()]
+                } else {
+                    spec
+                };
+                for local in ["path", "git"] {
+                    assert!(
+                        spec.get(local).is_none(),
+                        "{name} comes from a {local} source"
+                    );
+                }
+                let package = spec
+                    .get("package")
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or(name);
+                shipped.push(package.to_owned());
+            }
+        }
+        // A build script and its dependencies also run as part of this crate,
+        // and could generate code for it; the UI has neither.
+        assert!(manifest.get("build-dependencies").is_none());
+        for target in manifest
+            .get("target")
+            .and_then(toml::Value::as_table)
+            .into_iter()
+            .flat_map(|targets| targets.values())
+        {
+            assert!(target.get("build-dependencies").is_none());
+        }
+        assert!(manifest["package"].get("build").is_none());
+        // Tests run in the package root, where Cargo finds a `build.rs`.
+        assert!(!std::path::Path::new("build.rs").exists());
+        shipped.sort_unstable();
+        assert_eq!(
+            shipped,
+            ["rustix", "serde", "serde_json", "sha2", "tiny_http"],
+            "no workspace crate, and nothing new, ships in the UI"
+        );
+        assert_eq!(names(manifest.get("dev-dependencies")), ["toml"]);
         assert!(!HTML.contains("<script>"));
         assert!(!JS.contains("innerHTML"));
         assert!(!COMPOSE_JS.contains("innerHTML"));
