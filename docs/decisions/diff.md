@@ -782,3 +782,12 @@ drops the occupant: that is the plan's own order, and refusing it reported an
 untouched child's key, which follows the rename, as moved. A single revision
 that renames into a surviving table's name is still refused by `resolve`.
 `DropModule` needs no change: it sorts before every table rename already.
+
+A key that reads the same by name in the first and last revision can still
+point at two tables: it referenced the doomed table, went with it, and a later
+revision re-added it under the same name to the table renamed into that name.
+Compared by name alone nothing changed, yet the standing key blocks the drop
+(Msg 3726 on SQL Server) and the engine would never bind it to the new
+occupant. The differ compares the referenced table's uid on the two sides, read
+from the baseline as spelled there, and plans a visible drop and re-add when
+they differ.

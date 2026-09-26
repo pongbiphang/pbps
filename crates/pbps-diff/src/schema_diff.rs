@@ -335,6 +335,7 @@ fn diff_partial_rebuilding(
 
     recreate_retyped_dependents(base, declared, &renames, dialect, &mut changes);
     recreate_referenced_foreign_keys(base, declared, &renames, &mut changes);
+    rebind_foreign_keys_to_a_new_occupant(base, declared, &mut changes);
 
     diff_modules(base.schema, declared.schema, dialect, &mut changes);
     // A module declaration can stay byte-for-byte identical while a new
@@ -945,6 +946,66 @@ fn recreate_referenced_foreign_keys(
             });
         }
     }
+}
+
+/// A foreign key that reads the same by name on both sides can still point at
+/// two tables: across skipped revisions, the table it referenced is dropped and
+/// another is renamed into that name (DEC-536.1). The standing key blocks the
+/// drop, and the engine never binds it to the new occupant, so the plan drops
+/// and re-adds it visibly. Identity is compared by uid, read from the baseline
+/// as spelled there, not through the plan's renames.
+fn rebind_foreign_keys_to_a_new_occupant(
+    base: Side<'_>,
+    declared: Side<'_>,
+    changes: &mut Vec<Change>,
+) {
+    let base_uid: BTreeMap<&TableName, &pbps_model::Uid> = base
+        .ids
+        .tables
+        .iter()
+        .map(|(uid, name)| (name, uid))
+        .collect();
+    let declared_uid: BTreeMap<&TableName, &pbps_model::Uid> = declared
+        .ids
+        .tables
+        .iter()
+        .map(|(uid, name)| (name, uid))
+        .collect();
+    let mut pairs = Vec::new();
+    for (uid, old_name) in &base.ids.tables {
+        let (Some(new_name), Some(before)) = (
+            declared.ids.tables.get(uid),
+            base.schema.tables.get(old_name),
+        ) else {
+            continue;
+        };
+        let Some(after) = declared.schema.tables.get(new_name) else {
+            continue;
+        };
+        for (name, fk) in &before.foreign_keys {
+            let Some(wanted) = after.foreign_keys.get(name) else {
+                continue;
+            };
+            if base_uid.get(&fk.references_table) == declared_uid.get(&wanted.references_table)
+                || changes.iter().any(|c| {
+                    matches!(c, Change::DropForeignKey { table, name: n }
+                        if table == new_name && n == name)
+                })
+            {
+                continue;
+            }
+            pairs.push(Change::DropForeignKey {
+                table: new_name.clone(),
+                name: name.clone(),
+            });
+            pairs.push(Change::AddForeignKey {
+                table: new_name.clone(),
+                name: name.clone(),
+                constraint: Box::new(wanted.clone()),
+            });
+        }
+    }
+    changes.extend(pairs);
 }
 
 /// Dependency maintenance is visible in the saved plan, including its ordinary
@@ -4190,6 +4251,59 @@ mod tests {
         assert!(child_key < drop, "{:?}", cs.changes);
         assert!(own_key < drop, "{:?}", cs.changes);
         assert!(drop < rename, "{:?}", cs.changes);
+    }
+
+    /// A key that reads the same by name in the first and last revision can
+    /// point at two tables: `child`'s key referenced the doomed `target`, is
+    /// dropped with it, and a later revision re-adds it under the same name to
+    /// the table renamed into `target`. Compared by name alone, nothing
+    /// changed, and the standing key would block the drop. It is dropped
+    /// ahead of the doomed table and added back after the rename.
+    #[test]
+    fn a_key_to_a_reused_name_is_rebound_to_its_new_occupant() {
+        let keyed = || table(&[("id", Column::new(ty("int")).not_null())]);
+        let mut child = table(&[("target_id", Column::new(ty("int")))]);
+        child.foreign_keys.insert(
+            "fk_child_target".into(),
+            fk(&["target_id"], "app.target", &["id"]),
+        );
+        let bare_child = table(&[("target_id", Column::new(ty("int")))]);
+
+        let mut base = two_tables(("app.old", keyed()), ("app.target", keyed()));
+        base.tables
+            .insert("app.child".parse().unwrap(), child.clone());
+        let intermediate = two_tables(("app.old", keyed()), ("app.child", bare_child));
+        let declared = two_tables(("app.target", keyed()), ("app.child", child));
+
+        let cs = a_dropped_tables_name_reused_by_a_later_rename(
+            &MinimalDialect,
+            &base,
+            &intermediate,
+            &declared,
+        );
+        let at = |f: &dyn Fn(&Change) -> bool| {
+            cs.changes
+                .iter()
+                .position(|p| f(&p.change))
+                .unwrap_or_else(|| panic!("{:?}", cs.changes))
+        };
+        let drop_key =
+            at(&|c| matches!(c, Change::DropForeignKey { name, .. } if name == "fk_child_target"));
+        let drop = at(&|c| matches!(c, Change::DropTable { .. }));
+        let rename = at(&|c| matches!(c, Change::RenameTable { .. }));
+        let add_key =
+            at(&|c| matches!(c, Change::AddForeignKey { name, .. } if name == "fk_child_target"));
+        assert!(
+            drop_key < drop && drop < rename && rename < add_key,
+            "{:?}",
+            cs.changes
+        );
+
+        // A key whose table keeps its identity is left alone.
+        let mut kept = base.clone();
+        kept.tables.remove(&"app.old".parse::<TableName>().unwrap());
+        let cs = run(&kept, &kept, &[]);
+        assert!(cs.changes.is_empty(), "{:?}", cs.changes);
     }
 
     /// Only a drop whose name a rename claims moves. Another table's drop

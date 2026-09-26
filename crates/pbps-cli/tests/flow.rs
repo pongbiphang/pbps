@@ -15851,6 +15851,11 @@ fn a_table_drop_and_a_later_rename_that_reuses_its_name_apply_together() {
         "target",
         Some(keyed("pk_old", "  label: {type: nvarchar(50)}\n")),
     );
+    // And `child` points a key of the same name at the new occupant.
+    declare(
+        "child",
+        Some(keyed("pk_child", "  target_id: {type: bigint}\n") + child_key),
+    );
     let o = d.run(&["rename-table", "dbo.old", "dbo.target"]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
     assert_eq!(code(&d.run(&["plan"])), 0);
@@ -15870,7 +15875,7 @@ fn a_table_drop_and_a_later_rename_that_reuses_its_name_apply_together() {
         "--checksum",
         &checksum,
         "--allow",
-        "rename,destructive",
+        "rename,destructive,constraint",
     ];
     let o = d.run(&args);
     assert_eq!(
