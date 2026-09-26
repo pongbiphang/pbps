@@ -10,6 +10,11 @@
 //! DEC-496.1). Measured on 17.0.4075.5: `sp_rename 'dbo.old', 'c'` is refused
 //! (Msg 15335) while another table still has a check `c`, and succeeds once the
 //! check is dropped.
+//!
+//! A dropped table releases its own name on every dialect, and with it the
+//! names it carries. It runs after the foreign-key drops that name it or that
+//! it owns (DEC-536.1): measured, `sp_rename` into a doomed table's name is Msg
+//! 15335 and `ALTER TABLE … RENAME` is `42P07`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -26,9 +31,8 @@ pub(crate) fn order(
 ) {
     let indexes = dialect.indexes_share_namespace_with_tables();
     let constraints = dialect.constraints_share_namespace_with_tables();
-    if !indexes && !constraints {
-        return;
-    }
+    // No early return when neither answer is yes: a dropped table releases
+    // its own name regardless of what else shares the namespace.
     let mut owners = BTreeMap::new();
     let mut claims: BTreeMap<TableName, BTreeSet<usize>> = BTreeMap::new();
     for (i, p) in planned.iter().enumerate() {
@@ -73,7 +77,48 @@ pub(crate) fn order(
     let mut edges = vec![BTreeSet::new(); planned.len()];
     let mut drops = BTreeSet::new();
     let mut keys = Vec::new();
+    // A dropped table's own foreign-key drops carry its name, which a rename
+    // into that name also carries once it has run. They are addressed by the
+    // doomed table and never rekeyed. Where both tables have a key of one
+    // name (PostgreSQL), the two changes are identical, and the first is
+    // taken as the doomed table's.
+    let mut own = BTreeSet::new();
+    for p in planned.iter() {
+        if let Change::DropTable { name, .. } = &p.change
+            && let Some(t) = base.schema.tables.get(name)
+        {
+            let mut remaining: BTreeSet<&String> = t.foreign_keys.keys().collect();
+            for (j, q) in planned.iter().enumerate() {
+                if let Change::DropForeignKey { table, name: fk } = &q.change
+                    && table == name
+                    && remaining.remove(fk)
+                {
+                    own.insert(j);
+                }
+            }
+        }
+    }
+    let mut doomed = Vec::new();
     for (i, p) in planned.iter().enumerate() {
+        if let Change::DropTable { name, .. } = &p.change {
+            let mut released = vec![name.name.clone()];
+            if let Some(t) = base.schema.tables.get(name) {
+                released.extend(carried_names(t, indexes, constraints));
+            }
+            for one in released {
+                if let Some(waiting) = claims.get(&TableName::new(name.schema.clone(), one)) {
+                    drops.insert(i);
+                    edges[i].extend(waiting);
+                }
+            }
+            if drops.contains(&i) {
+                doomed.push((i, name.clone()));
+            }
+            continue;
+        }
+        if own.contains(&i) {
+            continue;
+        }
         let Some((table, name)) = dropped_relation(&p.change, indexes, constraints) else {
             continue;
         };
@@ -127,7 +172,38 @@ pub(crate) fn order(
     if drops.is_empty() {
         return;
     }
+    // Before the doomed table goes: its own keys, and every key on another
+    // table that references it. The referenced name is read from the
+    // baseline, where a table renamed into the doomed name is still its source.
+    let mut fixed = BTreeSet::new();
+    for (drop, doomed) in &doomed {
+        for (j, p) in planned.iter().enumerate() {
+            let Change::DropForeignKey { table, name } = &p.change else {
+                continue;
+            };
+            let references = if own.contains(&j) {
+                if table != doomed {
+                    continue;
+                }
+                fixed.insert(j);
+                true
+            } else {
+                base.schema
+                    .tables
+                    .get(&original_name(table))
+                    .and_then(|t| t.foreign_keys.get(name))
+                    .is_some_and(|fk| &fk.references_table == doomed)
+            };
+            if references {
+                drops.insert(j);
+                edges[j].insert(*drop);
+            }
+        }
+    }
     for (i, p) in planned.iter().enumerate() {
+        if own.contains(&i) {
+            continue;
+        }
         if let Change::DropForeignKey { table, name } = &p.change
             && let Some(t) = before(table)
             && let Some(fk) = t.foreign_keys.get(name)
@@ -150,6 +226,9 @@ pub(crate) fn order(
     let mut selected = drops.clone();
     selected.extend(owners.values().map(|(i, _)| *i));
     for &drop in &drops {
+        if fixed.contains(&drop) || matches!(planned[drop].change, Change::DropTable { .. }) {
+            continue;
+        }
         let table = planned[drop].change.table().expect("a relation or FK drop");
         if let Some((rename, _)) = owners.get(table) {
             // Prefer the declared spelling, allowing a drop between two
@@ -175,6 +254,9 @@ pub(crate) fn order(
     }
     let positions: BTreeMap<_, _> = ordered.iter().enumerate().map(|(i, n)| (*n, i)).collect();
     for &drop in &drops {
+        if fixed.contains(&drop) {
+            continue;
+        }
         let table = planned[drop].change.table().expect("a relation or FK drop");
         if let Some((rename, source)) = owners.get(table)
             && positions[&drop] < positions[rename]

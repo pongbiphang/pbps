@@ -4047,6 +4047,202 @@ mod tests {
         assert!(errors.iter().any(|error| matches!(error, crate::Blocker::RenameTargetExists { target } if target == "dbo.s.note")), "{errors:?}");
     }
 
+    /// Two revisions resolved in turn, one dropping `app.target` and the next
+    /// renaming `app.old` into its name, then diffed from the undeployed
+    /// baseline as a plan that carries both (#536).
+    fn a_dropped_tables_name_reused_by_a_later_rename(
+        dialect: &dyn Dialect,
+        base: &Schema,
+        intermediate: &Schema,
+        declared: &Schema,
+    ) -> ChangeSet {
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let intermediate_ids = crate::resolve(
+            intermediate,
+            &base_ids,
+            &[Intent::DropTable {
+                table: "app.target".parse().unwrap(),
+                reason: "gone".into(),
+            }],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let declared_ids = crate::resolve(
+            declared,
+            &intermediate_ids,
+            &[Intent::RenameTable {
+                from: "app.old".parse().unwrap(),
+                to: "app.target".parse().unwrap(),
+            }],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        diff_with(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            dialect,
+        )
+    }
+
+    fn diff_with(base: Side<'_>, declared: Side<'_>, dialect: &dyn Dialect) -> ChangeSet {
+        diff(base, declared, dialect, &Hints::default()).unwrap()
+    }
+
+    /// Measured on both engines, the rename is refused while the doomed table
+    /// still holds the name: Msg 15335 on SQL Server, `42P07` on PostgreSQL.
+    /// So the drop moves ahead of it, on a dialect where nothing else shares
+    /// the namespace as well as on one where indexes do.
+    #[test]
+    fn a_dropped_tables_name_is_free_before_a_later_rename_reuses_it() {
+        let old_t = table(&[("id", Column::new(ty("int")))]);
+        let target_t = table(&[("n", Column::new(ty("varchar(10)")))]);
+        let base = two_tables(("app.old", old_t.clone()), ("app.target", target_t));
+        let intermediate = schema_of("app.old", old_t.clone());
+        let declared = schema_of("app.target", old_t);
+        for dialect in [&MinimalDialect as &dyn Dialect, &SharesIndexNamespace] {
+            let cs = a_dropped_tables_name_reused_by_a_later_rename(
+                dialect,
+                &base,
+                &intermediate,
+                &declared,
+            );
+            assert_eq!(
+                kinds(&cs),
+                ["DropTable", "RenameTable"],
+                "{}: the drop must free the name first: {cs:?}",
+                dialect.name()
+            );
+        }
+    }
+
+    /// The doomed table cannot go while another table's key still names it,
+    /// and its own keys are dropped first as they always are. Both move with
+    /// it. Its own key keeps the doomed table's address: the rename would
+    /// otherwise rekey it onto the renamed table, which never had it.
+    #[test]
+    fn the_keys_around_a_reused_tables_drop_move_ahead_of_it() {
+        let old_t = table(&[("id", Column::new(ty("int")).not_null())]);
+        let mut target_t = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("parent_id", Column::new(ty("int"))),
+        ]);
+        target_t.foreign_keys.insert(
+            "fk_target_parent".into(),
+            fk(&["parent_id"], "app.parent", &["id"]),
+        );
+        let parent = table(&[("id", Column::new(ty("int")).not_null())]);
+        let mut child = table(&[("target_id", Column::new(ty("int")))]);
+        child.foreign_keys.insert(
+            "fk_child_target".into(),
+            fk(&["target_id"], "app.target", &["id"]),
+        );
+        let bare_child = table(&[("target_id", Column::new(ty("int")))]);
+
+        let mut base = two_tables(("app.old", old_t.clone()), ("app.target", target_t));
+        base.tables
+            .insert("app.parent".parse().unwrap(), parent.clone());
+        base.tables.insert("app.child".parse().unwrap(), child);
+        let mut intermediate = two_tables(("app.old", old_t.clone()), ("app.parent", parent));
+        intermediate
+            .tables
+            .insert("app.child".parse().unwrap(), bare_child);
+        let mut declared = intermediate.clone();
+        let renamed = declared
+            .tables
+            .remove(&"app.old".parse::<TableName>().unwrap())
+            .unwrap();
+        declared
+            .tables
+            .insert("app.target".parse().unwrap(), renamed);
+
+        let cs = a_dropped_tables_name_reused_by_a_later_rename(
+            &MinimalDialect,
+            &base,
+            &intermediate,
+            &declared,
+        );
+        let at = |f: &dyn Fn(&Change) -> bool| {
+            cs.changes
+                .iter()
+                .position(|p| f(&p.change))
+                .unwrap_or_else(|| panic!("{:?}", cs.changes))
+        };
+        let child_key = at(&|c| {
+            matches!(c, Change::DropForeignKey { table, name }
+                if table.to_string() == "app.child" && name == "fk_child_target")
+        });
+        let own_key = at(&|c| {
+            matches!(c, Change::DropForeignKey { table, name }
+                if table.to_string() == "app.target" && name == "fk_target_parent")
+        });
+        let drop = at(&|c| matches!(c, Change::DropTable { .. }));
+        let rename = at(&|c| matches!(c, Change::RenameTable { .. }));
+        assert!(child_key < drop, "{:?}", cs.changes);
+        assert!(own_key < drop, "{:?}", cs.changes);
+        assert!(drop < rename, "{:?}", cs.changes);
+    }
+
+    /// Only a drop whose name a rename claims moves. Another table's drop
+    /// keeps its class, after the renames.
+    #[test]
+    fn a_dropped_table_nothing_renames_into_stays_after_the_renames() {
+        let old_t = table(&[("id", Column::new(ty("int")))]);
+        let base = two_tables(("app.old", old_t.clone()), ("app.gone", old_t.clone()));
+        let declared = schema_of("app.new", old_t);
+        let cs = run(
+            &base,
+            &declared,
+            &[
+                Intent::DropTable {
+                    table: "app.gone".parse().unwrap(),
+                    reason: "gone".into(),
+                },
+                Intent::RenameTable {
+                    from: "app.old".parse().unwrap(),
+                    to: "app.new".parse().unwrap(),
+                },
+            ],
+        );
+        assert_eq!(kinds(&cs), ["RenameTable", "DropTable"], "{cs:?}");
+    }
+
+    /// And a name still held by a surviving table is refused, not implicitly
+    /// freed: only a drop some revision recorded can release it.
+    #[test]
+    fn a_rename_into_a_surviving_tables_name_is_refused() {
+        let old_t = table(&[("id", Column::new(ty("int")))]);
+        let base = two_tables(("app.old", old_t.clone()), ("app.target", old_t.clone()));
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared = schema_of("app.target", old_t);
+        let errors = crate::resolve(
+            &declared,
+            &base_ids,
+            &[Intent::RenameTable {
+                from: "app.old".parse().unwrap(),
+                to: "app.target".parse().unwrap(),
+            }],
+            &ctx(),
+        )
+        .unwrap_err();
+        assert!(
+            errors.iter().any(|error| matches!(error,
+                crate::Blocker::RenameTargetExists { target } if target == "app.target")),
+            "{errors:?}"
+        );
+    }
+
     /// And the same for a delete: `AlterColumnType` sorts before the row
     /// changes, so a cell whose column this plan retypes carries both types —
     /// the one its recorded text was read in and the one the column has when

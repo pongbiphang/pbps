@@ -1759,6 +1759,9 @@ fn refuse_unplanned_movement(
     // across one plan: the occupant this plan removes and the column it
     // renames into the name that leaves (DECISIONS 474).
     let mut dropped_columns: BTreeMap<&TableName, BTreeSet<&str>> = BTreeMap::new();
+    // And the tables it drops, for the same reason one level up: a later
+    // revision can rename another table into the name one leaves (DEC-536.1).
+    let mut dropped_tables: BTreeSet<&TableName> = BTreeSet::new();
     let mut written: BTreeMap<&TableName, BTreeSet<&pbps_model::RowKey>> = BTreeMap::new();
     // The permissions this plan moves, keyed by the role it moves them on and
     // the target they sit on. A role can be both granted and revoked on one
@@ -1847,6 +1850,9 @@ fn refuse_unplanned_movement(
         } = &p.change
         {
             renamed_columns.insert((table, to), from);
+        }
+        if let pbps_model::Change::DropTable { name, .. } = &p.change {
+            dropped_tables.insert(name);
         }
         if let pbps_model::Change::DropColumn { column, .. } = &p.change {
             dropped_columns
@@ -1951,9 +1957,11 @@ fn refuse_unplanned_movement(
     let holds = |s: &Schema, a: &TableName, b: &TableName| {
         s.tables.contains_key(a) && s.tables.contains_key(b)
     };
+    // Except the name's occupant this plan drops: holding both spellings is
+    // then the plan's own order, the drop not having run yet (DEC-536.1).
     let mut undo = pbps_model::Renames::default();
     for (from, to) in &renamed {
-        if holds(before, from, to) || holds(after, from, to) {
+        if (holds(before, from, to) && !dropped_tables.contains(to)) || holds(after, from, to) {
             continue;
         }
         undo.rename_table((*to).clone(), (*from).clone());
@@ -2022,6 +2030,16 @@ fn refuse_unplanned_movement(
     for (name, was_rows) in touched_tables {
         if !named(name) {
             // Already compared whole, rows included.
+            continue;
+        }
+        // A table this plan drops, read while a table it renames into that
+        // name was still under its own: the later read's occupant is the
+        // renamed one, which its own entry compares (DEC-536.1).
+        if dropped_tables.contains(name)
+            && renamed
+                .iter()
+                .any(|(from, to)| *to == name && before.tables.contains_key(*from))
+        {
             continue;
         }
         let now_name = renamed.get(name).copied().unwrap_or(name);

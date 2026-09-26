@@ -13406,3 +13406,116 @@ fn a_routine_with_a_continued_escape_string_default_plans_and_applies() {
     );
     succeeds(d.run(&["verify", "--db", connection]));
 }
+/// Two revisions deployed at once, where the second renames a table into the
+/// name the first dropped (#536). The drop ran in its own class after every
+/// rename, and the engine refused the rename while the doomed table still held
+/// the name (`42P07`). The doomed table cannot go while `child`'s key still
+/// names it, and its own key to `parent` is dropped first as it always is, so
+/// both keys move ahead with it.
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn a_table_drop_and_a_later_rename_that_reuses_its_name_apply_together() {
+    let slug = "reusedtable536";
+    let own = OwnDatabase::new(&server(), slug);
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new(slug);
+    let declare = |name: &str, body: Option<String>| {
+        let path = d.dir.join(format!("schema/app.{name}.yml"));
+        match body {
+            Some(body) => std::fs::write(path, format!("table: app.{name}\n{body}")).unwrap(),
+            None => std::fs::remove_file(path).unwrap(),
+        }
+    };
+    let keyed = |pk: &str, rest: &str| {
+        format!(
+            "columns:\n  id: {{type: bigint, nullable: false}}\n{rest}\
+             primary_key: {{name: {pk}, columns: [id]}}\n"
+        )
+    };
+    let target_key = "foreign_keys:\n  fk_target_parent:\n    columns: [parent_id]\n    \
+                      references: app.parent(id)\n";
+    let keeper_key = |to: &str| {
+        format!(
+            "foreign_keys:\n  fk_keeper_old:\n    columns: [old_id]\n    \
+             references: {to}(id)\n"
+        )
+    };
+    let child_key = "foreign_keys:\n  fk_child_target:\n    columns: [target_id]\n    \
+                     references: app.target(id)\n";
+
+    // v1, and the only revision this database ever gets deployed.
+    declare("parent", Some(keyed("pk_parent", "")));
+    declare(
+        "target",
+        Some(keyed("pk_target", "  parent_id: {type: bigint}\n") + target_key),
+    );
+    declare(
+        "child",
+        Some(keyed("pk_child", "  target_id: {type: bigint}\n") + child_key),
+    );
+    // `keeper` is untouched: its key follows `old` through the rename.
+    declare(
+        "keeper",
+        Some(keyed("pk_keeper", "  old_id: {type: bigint}\n") + &keeper_key("app.old")),
+    );
+    declare("old", Some(keyed("pk_old", "  label: {type: text}\n")));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // v2: `target` goes, and `child`'s key to it. Committed, never deployed.
+    declare("target", None);
+    declare(
+        "child",
+        Some(keyed("pk_child", "  target_id: {type: bigint}\n")),
+    );
+    let o = d.run(&["drop-table", "app.target", "--reason", "no longer used"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // v3: `old` takes the name `target` just vacated.
+    declare("old", None);
+    declare(
+        "keeper",
+        Some(keyed("pk_keeper", "  old_id: {type: bigint}\n") + &keeper_key("app.target")),
+    );
+    declare("target", Some(keyed("pk_old", "  label: {type: text}\n")));
+    let o = d.run(&["rename-table", "app.old", "app.target"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // The database is still at v1, so this one plan carries both revisions.
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let checksum = plan_checksum(&plan);
+    let args = [
+        "apply",
+        "--db",
+        connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+        "--allow",
+        "rename,destructive",
+    ];
+    let o = d.run(&args);
+    assert_eq!(
+        code(&o),
+        0,
+        "the drop and the rename must apply together: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+
+    // The database really is in the declared shape, not merely un-errored.
+    let o = d.run(&["verify", "--db", connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["plan", "--db", connection]);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+}

@@ -749,3 +749,36 @@ How a difference becomes an ordered list of changes and statements. Part of the
     retention, and absence/definition negatives. Historical table-name reuse and
     column rename chains remain separate scopes (#536 and #541); this graph adds
     no implicit drop or rename intent and no connected I/O to the differ.
+
+<a id="dec-536-1"></a>
+
+**DEC-536.1. A dropped table releases its name in the DECISIONS 496 graph, with
+the foreign-key drops it needs.** Two revisions deployed together can drop
+`app.target` and then rename `app.old` into its name. `DropTable` ran in its own
+class after every rename, so the plan was one neither engine performs: measured,
+`sp_rename` into the doomed name is Msg 15335 on SQL Server 17.0.4075.5 and
+`ALTER TABLE … RENAME` is `42P07` on PostgreSQL 18.6. A dropped table releases
+its own name on every dialect, so the graph no longer returns early when the
+dialect shares neither indexes nor constraints with tables. The table also
+releases the names it carries, by the dialect's two answers. A drop whose name
+nothing claims keeps its class.
+
+The drop cannot run while another table's key names it, so every foreign-key
+drop that references it moves ahead with it. Its own key drops, which the
+differ emits separately, move too. Those carry the doomed table's name, which a
+rename into that name also carries once it has run, so they keep the doomed
+address and are never rekeyed to the rename's source. Where both tables have a
+key of one name (PostgreSQL scopes constraint names to the table), the two
+changes are identical, and the first is taken as the doomed table's. Which key
+references the doomed table is read from the baseline, where a table renamed
+into its name is still under its source.
+
+The apply movement check keys both reads by table name, and that name now
+belongs to two tables across one plan, as a column name did in DECISIONS 474.
+A read that still holds the rename's source holds the doomed table under the
+name; its entry is skipped, and the renamed table's own entry compares it.
+Holding both spellings no longer stops the rename being undone when this plan
+drops the occupant: that is the plan's own order, and refusing it reported an
+untouched child's key, which follows the rename, as moved. A single revision
+that renames into a surviving table's name is still refused by `resolve`.
+`DropModule` needs no change: it sorts before every table rename already.
