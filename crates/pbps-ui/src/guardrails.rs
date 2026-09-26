@@ -545,6 +545,41 @@ fn clippy_forbids_every_environment_read_in_this_crate() {
     assert!(config.contains("disallowed-methods") && config.contains("disallowed-macros"));
 }
 
+/// A Cargo lint level overrides CI's `-D warnings`, so the manifests are a
+/// second place these lints could be silenced. This crate inherits the
+/// workspace's lints and sets none of its own, and the workspace names none
+/// of these lints, their `style` or `all` group, or `warnings` at any level.
+#[test]
+fn no_manifest_lowers_the_environment_lints() {
+    let crate_manifest = include_str!("../Cargo.toml");
+    let lints = crate_manifest
+        .split("[lints")
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join("[lints");
+    assert_eq!(lints.trim(), "]\nworkspace = true", "{crate_manifest}");
+    let workspace = include_str!("../../../Cargo.toml");
+    for line in workspace
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+    {
+        let key = line.split('=').next().unwrap_or("").trim();
+        assert!(
+            !matches!(
+                key,
+                "disallowed_methods"
+                    | "disallowed-methods"
+                    | "disallowed_macros"
+                    | "disallowed-macros"
+                    | "style"
+                    | "all"
+                    | "warnings"
+            ),
+            "the workspace manifest sets {line:?}"
+        );
+    }
+}
+
 /// ADR-0015 decision 4: the UI process never holds a connection string. The
 /// child reads `url_env` itself, and the UI must not read any environment
 /// value. The one read is compose's names-only scrub, removed by its exact
