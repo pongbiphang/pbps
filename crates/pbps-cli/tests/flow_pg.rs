@@ -1759,6 +1759,27 @@ fn a_sequence_or_index_at_a_new_tables_name_refuses_the_plan() {
         assert!(!plan.exists(), "a refused plan wrote {}", plan.display());
     }
 
+    // A unique constraint the same revision drops frees its index's name
+    // for a new table there (#1082 review): a valid plan, and applied.
+    on_server(
+        connection,
+        "CREATE TABLE app.u (id integer, CONSTRAINT uq UNIQUE (id))",
+    );
+    let d = adopted("unique");
+    std::fs::write(
+        d.dir.join("schema/app.u.yml"),
+        "table: app.u\ncolumns:\n  id: {type: integer}\n",
+    )
+    .unwrap();
+    let plan = declare(&d, "uq");
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "destructive"],
+    ));
+
     let d = adopted("free");
     let plan = declare(&d, "free");
     succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));

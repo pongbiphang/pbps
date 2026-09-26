@@ -23171,6 +23171,70 @@ fn one_estimate(
     .pop()
 }
 
+/// #951: the relation-namespace occupants at a set of names, with the table
+/// an index is on, and the table and column that own a sequence. The owning
+/// column is what lets a plan that drops it count the name as freed.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn relation_name_occupants_name_each_kind_and_its_owner() {
+    use pbps_pg::catalog::relation_name_occupants;
+    let mut conn = connect().await;
+    let s = probe_schema_9("occupants");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.t (id integer, n integer GENERATED ALWAYS AS IDENTITY);
+         CREATE INDEX ix ON {s}.t (id);
+         CREATE SEQUENCE {s}.loose;
+         CREATE TYPE {s}.pair AS (a integer, b integer)"
+    ))
+    .await
+    .expect("the occupants");
+    let name = |n: &str| TableName::new(&s, n);
+    let mut found = relation_name_occupants(
+        &mut conn,
+        &[
+            name("t_n_seq"),
+            name("ix"),
+            name("loose"),
+            name("pair"),
+            name("free"),
+            name("t"),
+        ],
+    )
+    .await
+    .expect("the read");
+    found.sort_by(|a, b| a.name.cmp(&b.name));
+    let seen: Vec<(String, &str, Option<String>, Option<String>)> = found
+        .iter()
+        .map(|o| {
+            (
+                o.name.name.clone(),
+                o.kind,
+                o.owner.as_ref().map(|t| t.name.clone()),
+                o.owner_column.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("ix".into(), "index", Some("t".into()), None),
+            ("loose".into(), "sequence", None, None),
+            ("pair".into(), "composite type", None, None),
+            (
+                "t_n_seq".into(),
+                "sequence",
+                Some("t".into()),
+                Some("n".into())
+            ),
+        ],
+        "a table and a free name are not occupants here"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
 /// #465: what the dialect predicts PostgreSQL generates for an unnamed
 /// primary key and an identity column is what the engine generates, for
 /// short, long and multibyte names alike; a declared index created after the

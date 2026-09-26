@@ -331,32 +331,63 @@ fn refuse_uninventoried_occupants(
     label: &str,
 ) -> anyhow::Result<()> {
     use pbps_model::Change;
+    // Names this plan frees before it creates anything: an index it drops,
+    // and the index behind a unique constraint or a primary key it drops,
+    // which PostgreSQL names after the constraint (an unnamed key's is
+    // `<table>_pkey`).
     let freed: BTreeSet<TableName> = cs
         .changes
         .iter()
         .filter_map(|p| match &p.change {
-            Change::DropIndex { table, name } => {
+            Change::DropIndex { table, name } | Change::DropUnique { table, name, .. } => {
                 Some(TableName::new(table.schema.clone(), name.clone()))
             }
+            Change::SetPrimaryKey {
+                table,
+                from: Some(key),
+                ..
+            } => Some(TableName::new(
+                table.schema.clone(),
+                key.name
+                    .clone()
+                    .unwrap_or_else(|| pbps_pg::implicit_primary_key_name(&table.name)),
+            )),
             _ => None,
         })
         .collect();
-    let dropped_tables: BTreeSet<&TableName> = cs
+    // Owners whose indexes and sequences leave the schema first: a table it
+    // drops, and one it moves to another schema, which `SET SCHEMA` takes
+    // them along with.
+    let released: BTreeSet<&TableName> = cs
         .changes
         .iter()
         .filter_map(|p| match &p.change {
             Change::DropTable { name, .. } => Some(name),
+            Change::RenameTable { from, to, .. } if from.schema != to.schema => Some(from),
             _ => None,
         })
         .collect();
+    // And a sequence whose owning column it drops, which goes with the column.
+    let dropped_columns: BTreeSet<(&TableName, &str)> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::DropColumn { column, .. } => Some((&column.table, column.name.as_str())),
+            _ => None,
+        })
+        .collect();
+    let gone = |o: &pbps_pg::catalog::NameOccupant| {
+        freed.contains(&o.name)
+            || o.owner.as_ref().is_some_and(|t| released.contains(t))
+            || matches!((&o.owner, &o.owner_column), (Some(t), Some(c)) if dropped_columns.contains(&(t, c.as_str())))
+    };
     let taken: Vec<String> = created_relation_names(cs)
         .iter()
         .flat_map(|name| {
             occupants
                 .iter()
                 .filter(move |o| &o.name == name)
-                .filter(|o| !freed.contains(&o.name))
-                .filter(|o| !o.owner.as_ref().is_some_and(|t| dropped_tables.contains(t)))
+                .filter(|o| !gone(o))
                 .map(move |o| match &o.owner {
                     Some(owner) => format!(
                         "`{name}`: the database already has {} `{name}` on `{owner}`",
@@ -6352,6 +6383,7 @@ mod tests {
             name: x.clone(),
             kind,
             owner: owner.cloned(),
+            owner_column: None,
         };
         let plan = |changes: Vec<PlannedChange>| ChangeSet { changes };
 
@@ -6408,6 +6440,92 @@ mod tests {
             )
             .expect("it goes with the table the plan drops");
         }
+        // The index behind a unique constraint or a primary key the plan
+        // drops, named after the constraint (#1082 review).
+        let drop_unique = PlannedChange::new(Change::DropUnique {
+            table: owner.clone(),
+            name: "x".into(),
+        });
+        let drop_key = |name: Option<&str>| {
+            PlannedChange::new(Change::SetPrimaryKey {
+                table: TableName::new("app", if name.is_some() { "old" } else { "x" }),
+                from: Some(pbps_model::PrimaryKey {
+                    name: name.map(Into::into),
+                    columns: vec!["id".into()],
+                }),
+                to: None,
+            })
+        };
+        for dropped in [drop_unique, drop_key(Some("x"))] {
+            refuse_uninventoried_occupants(
+                &plan(vec![dropped, create_table()]),
+                &[occupant("index", Some(&owner))],
+                "prod",
+            )
+            .expect("a constraint's index the plan drops first");
+        }
+        // An unnamed key's index is `<table>_pkey`: freeing `app.x_pkey`
+        // frees nothing at `app.x`.
+        assert!(
+            refuse_uninventoried_occupants(
+                &plan(vec![drop_key(None), create_table()]),
+                &[occupant("index", Some(&owner))],
+                "prod"
+            )
+            .is_err()
+        );
+        // An owner moved to another schema takes its index along; one renamed
+        // within the schema does not.
+        let rename = |to: TableName| {
+            PlannedChange::new(Change::RenameTable {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "app.old", 0),
+                from: owner.clone(),
+                to,
+                defaults: Vec::new(),
+            })
+        };
+        refuse_uninventoried_occupants(
+            &plan(vec![
+                rename(TableName::new("archive", "old")),
+                create_table(),
+            ]),
+            &[occupant("index", Some(&owner))],
+            "prod",
+        )
+        .expect("the index moves to `archive` with its table");
+        assert!(
+            refuse_uninventoried_occupants(
+                &plan(vec![rename(TableName::new("app", "older")), create_table()]),
+                &[occupant("index", Some(&owner))],
+                "prod"
+            )
+            .is_err()
+        );
+        // A sequence whose owning column the plan drops goes with it; one
+        // owned by another column stays.
+        let owned_by = |column: &str| NameOccupant {
+            owner_column: Some(column.into()),
+            ..occupant("sequence", Some(&owner))
+        };
+        let drop_column = PlannedChange::new(Change::DropColumn {
+            uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "app.old.id", 0),
+            column: pbps_model::ColumnRef::new(owner.clone(), "id"),
+        });
+        refuse_uninventoried_occupants(
+            &plan(vec![drop_column.clone(), create_table()]),
+            &[owned_by("id")],
+            "prod",
+        )
+        .expect("the sequence goes with its column");
+        assert!(
+            refuse_uninventoried_occupants(
+                &plan(vec![drop_column, create_table()]),
+                &[owned_by("other")],
+                "prod"
+            )
+            .is_err()
+        );
+
         // A view dropped and created is a rebuild: its name is its own.
         let drop_view = PlannedChange::new(Change::DropModule {
             id: ModuleId::Named(x.clone()),

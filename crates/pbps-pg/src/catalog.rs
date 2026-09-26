@@ -2312,6 +2312,8 @@ pub struct NameOccupant {
     pub kind: &'static str,
     /// The table an index is on, or the table whose column owns a sequence.
     pub owner: Option<TableName>,
+    /// The column that owns a sequence, which dropping frees its name.
+    pub owner_column: Option<String>,
 }
 
 /// The [`NameOccupant`]s at `names`, read in the caller's transaction.
@@ -2333,7 +2335,8 @@ pub async fn relation_name_occupants(
         "WITH wanted(schema_name, relation_name) AS (VALUES {})\n\
          SELECT n.nspname AS schema_name, c.relname AS relation_name,\n       \
                 c.relkind::text AS relkind,\n       \
-                ownns.nspname AS owner_schema, own.relname AS owner_name\n  \
+                ownns.nspname AS owner_schema, own.relname AS owner_name,\n       \
+                att.attname AS owner_column\n  \
            FROM wanted w\n  \
            JOIN pg_catalog.pg_namespace n ON n.nspname = w.schema_name\n  \
            JOIN pg_catalog.pg_class c\n    \
@@ -2347,7 +2350,9 @@ pub async fn relation_name_occupants(
             AND d.deptype IN ('a', 'i')\n  \
            LEFT JOIN pg_catalog.pg_class own\n    \
              ON own.oid = COALESCE(i.indrelid, d.refobjid)\n  \
-           LEFT JOIN pg_catalog.pg_namespace ownns ON ownns.oid = own.relnamespace\n \
+           LEFT JOIN pg_catalog.pg_namespace ownns ON ownns.oid = own.relnamespace\n  \
+           LEFT JOIN pg_catalog.pg_attribute att\n    \
+             ON att.attrelid = d.refobjid AND att.attnum = d.refobjsubid AND d.refobjsubid > 0\n \
           WHERE c.relkind IN ('S', 'i', 'I', 'c')",
         values.join(", ")
     );
@@ -2382,6 +2387,7 @@ pub async fn relation_name_occupants(
             name: TableName::new(text("schema_name")?, text("relation_name")?),
             kind,
             owner,
+            owner_column: row.try_get::<&str>("owner_column")?.map(str::to_owned),
         });
     }
     Ok(out)
