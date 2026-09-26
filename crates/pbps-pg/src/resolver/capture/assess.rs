@@ -101,14 +101,12 @@ impl Managed {
             CandidateClass::Relation => {
                 self.relations.contains(&key(name)) || self.indexes.contains(&key(name))
             }
-            // A table's or view's row type has its name, and its array type is
-            // the name with an underscore in front; an index has neither.
-            CandidateClass::Type => {
-                self.relations.contains(&key(name))
-                    || name
-                        .strip_prefix('_')
-                        .is_some_and(|element| self.relations.contains(&key(element)))
-            }
+            // A table's or view's row type has its name, which no other type
+            // can hold while the relation exists; an index has none. Its
+            // array type's name is only the engine's first choice, taken by
+            // an earlier type of that name, so the array is the project's
+            // only through its internal dependency on the row type (#1041).
+            CandidateClass::Type => self.relations.contains(&key(name)),
             // A declared overload the desired schema keeps was compiled on
             // scratch, which gives its catalog identity, and only that
             // identity is it: a count would let an unmanaged overload stand
@@ -359,6 +357,38 @@ pub fn assess(
     paths: &Paths,
     order: &crate::resolver::reconstruct::Reconstruction,
 ) -> Assessment {
+    // What made each target member, as the target recorded it: the other end
+    // of an internal dependency, which the engine alone creates for a part of
+    // an object (an identity column's sequence, a row or array type). An
+    // automatic one does not say that: any index depends automatically on
+    // the columns it covers. A constraint's index is not taken either, since
+    // an unmanaged constraint on a managed table makes one too.
+    let mut makers: BTreeMap<&ObjectIdentity, Vec<&ObjectIdentity>> = BTreeMap::new();
+    for dependency in target.inputs.keys() {
+        if let ("pg_depend", [kind], [made, maker]) = (
+            dependency.class.as_str(),
+            dependency.name.as_slice(),
+            dependency.signature.as_slice(),
+        ) && kind == "i"
+            && maker.class != "pg_constraint"
+        {
+            makers.entry(made).or_default().push(maker);
+        }
+    }
+    // A target member is the project's own when the model names it, or when
+    // an object the model names made it. A same identity on scratch is not
+    // enough: scratch made its copy from a declaration, while the target's
+    // may be an unmanaged object that holds the name, such as one a plan
+    // creates or one that took a generated name first (#1041).
+    let own = |class: CandidateClass, member: &ObjectIdentity, members| {
+        managed.holds(class, member, members, order)
+            || makers.get(member).into_iter().flatten().any(|maker| {
+                let maker = owner(maker);
+                candidate_class(&maker.class).is_some_and(|class| {
+                    managed.holds(class, maker, &BTreeSet::from([maker.clone()]), order)
+                })
+            })
+    };
     // A set is faithful when scratch reproduced every target member that
     // could win: the engine's own objects identically, the managed ones as
     // declared. Missing from either capture is not faithful: an uncaptured
@@ -392,13 +422,10 @@ pub fn assess(
                 };
             }
             // Scratch's user schemas hold only the declarations and what
-            // creating them made — an identity column's sequence, a key's
-            // index, a relation's row type — so a member scratch has too was
-            // reproduced, whatever the model calls it. What only the target
-            // has must be one of the project's own objects the plan drops.
-            !on_target.contains(member)
-                || on_scratch.contains(member)
-                || managed.holds(set.class, member, on_target, order)
+            // creating them made, so a member only scratch has was
+            // reproduced. A target member, whether scratch has the same
+            // identity or the plan drops it, must be the project's own.
+            !on_target.contains(member) || own(set.class, member, on_target)
         })
     };
     let mut assessment = Assessment::default();
@@ -692,7 +719,9 @@ mod tests {
             &none,
             &order
         ));
-        assert!(managed.holds(
+        // The array type's name is not the project's: an earlier type may
+        // hold it. The array is taken through its dependency instead.
+        assert!(!managed.holds(
             CandidateClass::Type,
             &id("pg_type", &["app", "_t"], Vec::new()),
             &none,
