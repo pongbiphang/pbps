@@ -28822,3 +28822,38 @@ async fn timestamp_precision_narrowing_rounds_past_the_upper_bound_without_refus
     }
     db.drop().await;
 }
+
+/// #539: an `E'…'` prefix carries to every piece continued after it, so a
+/// backslash there escapes, and an escaped quote is data rather than the
+/// piece's end. No escape reaches across a piece boundary, though, and
+/// without an `E'…'` first a backslash escapes nothing. `is_a_bare_literal`
+/// in `emit.rs` scans a continuation with the first piece's escapes on this
+/// measurement, and its unit test holds the same texts.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn an_escape_strings_prefix_carries_to_its_continued_pieces() {
+    let mut conn = connect().await;
+    for (literal, value) in [
+        ("E'a'\n'b\\'c'", "ab'c"),
+        ("E'a'\r\n'b\\'c'", "ab'c"),
+        ("E'a'\r'b\\'c'", "ab'c"),
+        ("E'a' -- c\n'b\\'c'", "ab'c"),
+        ("E'a'\n'b'\n'\\''", "ab'"),
+        ("E'a'\n'\\x63'", "ac"),
+        ("E'a'\r\n'\\n'", "a\n"),
+        ("E'\\x'\n'63'", "x63"),
+    ] {
+        assert_eq!(
+            text(&mut conn, &format!("SELECT {literal}")).await,
+            value,
+            "{literal:?}"
+        );
+    }
+    for unterminated in ["'a'\n'b\\'c'", "N'a'\n'b\\'c'", "E'a'\n'x\\'\n'y'"] {
+        assert_eq!(
+            refused(&mut conn, &format!("SELECT {unterminated}")).await,
+            SYNTAX_ERROR,
+            "{unterminated:?}"
+        );
+    }
+}

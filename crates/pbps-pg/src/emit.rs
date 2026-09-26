@@ -354,14 +354,17 @@ pub(crate) fn is_a_bare_literal(expression: &str) -> bool {
     // 'a' ⏎ 'b'      -> ab          E'a' ⏎ 'b'   -> ab      U&'a' ⏎ 'b' -> ab
     // 'a' ⏎ E'b'     -> syntax error
     // $$a$$ ⏎ $$b$$  -> syntax error
-    // 'a' ⏎ 'b\'c'   -> unterminated: the backslash does not escape here,
-    //                   even when the first piece was an `E'…'`
+    // 'a' ⏎ 'b\'c'   -> unterminated: the backslash does not escape here
+    // E'a' ⏎ 'b\'c'  -> ab'c: it does when the first piece was an `E'…'`,
+    //                   across CR, LF, CRLF or a line comment alike
+    // E'\x' ⏎ '63'   -> x63: but no escape reaches across a piece boundary
     // ```
     //
-    // So a continuation is a plain `'…'`, scanned without escapes whatever the
-    // first piece was, and it must be preceded by whitespace containing a
-    // newline — on one line the same text is a syntax error, which is why the
-    // newline is checked rather than assumed.
+    // So a continuation is spelled as a plain `'…'`, and it is scanned with
+    // the first piece's escapes: an `E'…'`'s prefix carries to every piece
+    // after it (#539). It must be preceded by whitespace containing a newline
+    // — on one line the same text is a syntax error, which is why the newline
+    // is checked rather than assumed.
     while !tail.is_empty() {
         let (after_gap, continues) = after_the_gap(tail);
         // Nothing but whitespace and comments left: the expression is that one
@@ -406,7 +409,7 @@ pub(crate) fn is_a_bare_literal(expression: &str) -> bool {
         let Some(next) = after_gap.strip_prefix('\'') else {
             return false;
         };
-        let Some(end) = end_of_literal(next, false) else {
+        let Some(end) = end_of_literal(next, escapes) else {
             return false;
         };
         tail = &next[end..];
@@ -4637,6 +4640,13 @@ mod tests {
             "'01/02/'\n'2026'",
             "E'01/02/'\n'2026'",
             "U&'01/02/'\n'2026'",
+            // An `E'…'`'s escapes carry to its continuations, so an escaped
+            // quote there is data, not the piece's end — measured, each of
+            // these is the one constant `ab'c` (#539).
+            "E'a'\n'b\\'c'",
+            "E'a'\r\n'b\\'c'",
+            "E'a' -- c\n'b\\'c'",
+            "E'a'\n'b'\n'\\''",
             "'01/02/'\n  \n  '2026'",
             "'01/'\n'02/'\n'2026'",
             "  ( ( '01/02/2026' ) )  ",
@@ -4726,6 +4736,12 @@ mod tests {
             // does not continue at all: both are syntax errors, measured.
             "'01/02/'\nE'2026'",
             "$$01/02/$$\n$$2026$$",
+            // Without an `E'…'` first, a backslash escapes nothing, and the
+            // quote after it ends the piece; with one, the quote is data and
+            // the piece runs on. Measured, both are unterminated (#539).
+            "'a'\n'b\\'c'",
+            "N'a'\n'b\\'c'",
+            "E'a'\n'x\\'\n'y'",
             // Still two literals with an operator between them, newline or
             // not.
             "'a'\n|| 'b'",
