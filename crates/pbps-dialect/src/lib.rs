@@ -2503,20 +2503,19 @@ pub fn check_index_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> 
             }
             // A claimant's own remedy takes that one claimant out. It is
             // the remedy only if the name is then out of every claimant's
-            // reach; otherwise only moving the declared object is. Prefer a
-            // claimant it works for, so the refusal names one.
-            let lands = |j: &usize| reach[*j].iter().skip(1).any(|n| n == claim_name);
-            let frees = |j: &usize| {
-                !fallback_reach(&claimants, Some(*j), dialect)
-                    .iter()
-                    .flatten()
-                    .any(|n| n == claim_name)
+            // reach; otherwise only moving the declared object is. Asked of
+            // the first claimant that lands there alone: the fixpoint is
+            // not cheap, and claimants meeting at one name are alike.
+            let frees = !fallback_reach(&claimants, Some(k), dialect)
+                .iter()
+                .flatten()
+                .any(|n| n == claim_name);
+            let remedy = if frees {
+                claimants[k].relation.remedy
+            } else {
+                "Rename the other object."
             };
-            let (landing, remedy) = match (k..reach.len()).filter(lands).find(frees) {
-                Some(j) => (j, claimants[j].relation.remedy),
-                None => (k, "Rename the other object."),
-            };
-            let descriptor = &claimants[landing].relation.descriptor;
+            let descriptor = &claimants[k].relation.descriptor;
             let existing = &claimed[claim_name];
             problems.push(format!(
                 "{} and {descriptor} may both be named `{claim_name}`: {descriptor} \
@@ -2555,6 +2554,10 @@ struct Claimant<'a> {
 /// Each claimant's reach is judged against the others' separately, not as
 /// one creation order, so it may over-approximate. With `without`, the
 /// fixpoint runs as if that claimant generated nothing.
+///
+/// Reaches only grow, so a claimant's matching stays valid as they do: each
+/// keeps its own and matches only the names added since, which keeps
+/// hundreds of names meeting at one first choice cheap.
 fn fallback_reach(
     claimants: &[Claimant<'_>],
     without: Option<usize>,
@@ -2563,29 +2566,33 @@ fn fallback_reach(
     let live: Vec<usize> = (0..claimants.len())
         .filter(|k| Some(*k) != without)
         .collect();
-    let mut reach: Vec<Vec<ObjectName>> = claimants
-        .iter()
-        .enumerate()
-        .map(|(k, c)| {
-            if Some(k) == without {
-                Vec::new()
-            } else {
-                vec![c.first.clone()]
-            }
-        })
-        .collect();
+    let mut reach: Vec<Vec<ObjectName>> = vec![Vec::new(); claimants.len()];
+    let mut holders: BTreeMap<ObjectName, Vec<usize>> = BTreeMap::new();
+    for &k in &live {
+        reach[k].push(claimants[k].first.clone());
+        holders
+            .entry(claimants[k].first.clone())
+            .or_default()
+            .push(k);
+    }
+    // Per claimant: which other claimant takes which of its names.
+    let mut takers: Vec<BTreeMap<usize, usize>> = vec![BTreeMap::new(); claimants.len()];
     loop {
-        let mut holders: BTreeMap<ObjectName, Vec<usize>> = BTreeMap::new();
-        for &k in &live {
-            for name in &reach[k] {
-                holders.entry(name.clone()).or_default().push(k);
-            }
-        }
         let mut grew = false;
         for &k in &live {
             let retry = reach[k].len();
             // `retry` names to take needs `retry` other claimants.
-            if retry >= live.len() || !taken_by_others(&reach[k], k, &holders) {
+            if retry >= live.len() {
+                continue;
+            }
+            let taker = &mut takers[k];
+            while taker.len() < retry {
+                let t = taker.len();
+                if !augment(t, &reach[k], k, &holders, &mut BTreeSet::new(), taker) {
+                    break;
+                }
+            }
+            if taker.len() < retry {
                 continue;
             }
             let claimant = &claimants[k];
@@ -2597,10 +2604,9 @@ fn fallback_reach(
             }) else {
                 continue;
             };
-            reach[k].push(ObjectName::new(
-                claimant.table_name.schema.clone(),
-                fallback,
-            ));
+            let fallback = ObjectName::new(claimant.table_name.schema.clone(), fallback);
+            holders.entry(fallback.clone()).or_default().push(k);
+            reach[k].push(fallback);
             grew = true;
         }
         if !grew {
@@ -2609,39 +2615,37 @@ fn fallback_reach(
     }
 }
 
-/// Whether each of `names` can be taken by a different claimant other than
-/// `k`, among those that reach it: a bipartite matching, found by
-/// augmenting paths.
-fn taken_by_others(
+/// Match `names[t]` to a claimant other than `k` that reaches it, moving
+/// earlier matches along an augmenting path if every such claimant is
+/// taken. A free one is tried first, which is nearly always there.
+fn augment(
+    t: usize,
     names: &[ObjectName],
     k: usize,
     holders: &BTreeMap<ObjectName, Vec<usize>>,
+    seen: &mut BTreeSet<usize>,
+    taker: &mut BTreeMap<usize, usize>,
 ) -> bool {
-    fn augment(
-        t: usize,
-        names: &[ObjectName],
-        k: usize,
-        holders: &BTreeMap<ObjectName, Vec<usize>>,
-        seen: &mut BTreeSet<usize>,
-        taker: &mut BTreeMap<usize, usize>,
-    ) -> bool {
-        for &j in holders.get(&names[t]).into_iter().flatten() {
-            if j == k || !seen.insert(j) {
-                continue;
-            }
-            let free = match taker.get(&j) {
-                None => true,
-                Some(&u) => augment(u, names, k, holders, seen, taker),
-            };
-            if free {
-                taker.insert(j, t);
-                return true;
-            }
-        }
-        false
+    let Some(reaching) = holders.get(&names[t]) else {
+        return false;
+    };
+    if let Some(&j) = reaching
+        .iter()
+        .find(|&&j| j != k && !taker.contains_key(&j))
+    {
+        taker.insert(j, t);
+        return true;
     }
-    let mut taker = BTreeMap::new();
-    (0..names.len()).all(|t| augment(t, names, k, holders, &mut BTreeSet::new(), &mut taker))
+    for &j in reaching {
+        if j == k || !seen.insert(j) {
+            continue;
+        }
+        if augment(taker[&j], names, k, holders, seen, taker) {
+            taker.insert(j, t);
+            return true;
+        }
+    }
+    false
 }
 
 /// The whole-schema question of whether a declared constraint's name is taken

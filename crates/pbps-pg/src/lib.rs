@@ -1379,6 +1379,73 @@ mod tests {
         );
     }
 
+    /// #1111: the reach fixpoint stays cheap when many generated names meet
+    /// at one first choice, and exact at the edge. A hundred 63-byte tables
+    /// sharing 58 bytes form one chain, whose last claimant reaches
+    /// `_pkey99` and no further. Rebuilding every matching each round made
+    /// this minutes long; it must stay well inside a test run.
+    #[test]
+    fn a_long_chain_of_generated_names_is_judged_exactly_and_quickly() {
+        use pbps_model::{Column, Index, IndexColumn, PrimaryKey, Schema, Table};
+        let schema = |index_name: &str| {
+            let mut s = Schema::default();
+            for k in 0..100 {
+                let mut t = Table::default();
+                t.columns.insert(
+                    "id".into(),
+                    Column::new("integer".parse().unwrap()).not_null(),
+                );
+                t.primary_key = Some(PrimaryKey {
+                    name: None,
+                    columns: vec!["id".into()],
+                });
+                if k == 0 {
+                    t.indexes.insert(
+                        index_name.into(),
+                        Index {
+                            columns: vec![IndexColumn {
+                                name: "id".into(),
+                                descending: false,
+                            }],
+                            include: Vec::new(),
+                            unique: false,
+                            filter: None,
+                        },
+                    );
+                }
+                s.tables.insert(
+                    TableName::new("app", format!("{}{k:05}", "a".repeat(58))),
+                    t,
+                );
+            }
+            s
+        };
+        let pg = super::Postgres::new();
+        // A longer label cuts the table name shorter: `_pkey99` keeps 56
+        // bytes, not 57, so ask the dialect rather than spell it.
+        let keyed =
+            &schema("unused").tables[&TableName::new("app", format!("{}00001", "a".repeat(58)))];
+        let at = |n: u32| {
+            pg.implicit_relation_fallbacks(
+                &TableName::new("app", format!("{}00001", "a".repeat(58))),
+                keyed,
+                n,
+            )[0]
+            .clone()
+        };
+        assert_eq!(at(99), format!("{}_pkey99", "a".repeat(56)));
+        let found = pbps_dialect::check_index_names(&schema(&at(99)), &pg);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("Name the primary key"), "{found:?}");
+        let found = pbps_dialect::check_index_names(&schema(&at(98)), &pg);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].ends_with("Rename the other object."), "{found:?}");
+        assert!(
+            pbps_dialect::check_index_names(&schema(&at(100)), &pg).is_empty(),
+            "a hundred claimants retry at most 99 times"
+        );
+    }
+
     #[test]
     fn a_declared_name_meeting_a_generated_one_is_refused() {
         use pbps_model::{Column, Identity, Index, IndexColumn, PrimaryKey, Schema, Table};

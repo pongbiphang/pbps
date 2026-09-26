@@ -608,8 +608,9 @@ claimant can reach its `s`th fallback when its first choice and the fallbacks
 before it can each be taken by a different other claimant that reaches them.
 Each claimant is judged against the others' reach separately, not as one
 creation order, so this may over-approximate. A declared name in any reach is
-refused. Its remedy is a claimant's own only when taking that claimant out puts
-the name out of every reach. With `c` names meeting at one first choice, that
+refused. Its remedy is the first landing claimant's own only when taking that
+claimant out puts the name out of every reach; claimants meeting at one name
+are alike, and asking each of them would rerun the fixpoint per claimant. With `c` names meeting at one first choice, that
 is the last fallback, `c - 1`, since the `c - 1` left retry only up to
 `c - 2`. Otherwise the refusal says to rename the other object alone. SQL
 Server names these objects per table and reports no
