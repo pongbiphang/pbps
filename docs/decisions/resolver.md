@@ -948,8 +948,9 @@ best-matching call, and a cast takes exactly one argument —
 plus every cast. Only a binding some name lookup selected counts: an
 operator's implementation, a result or transition type, a column reference's
 type, the operands' common type of a CASE, COALESCE, GREATEST/LEAST or array, a
-subscript's types, a CTE's or VALUES list's output types and a derived
-collation follow from other parts of the tree,
+subscript's types, a CTE's or VALUES list's output types, a grouping's,
+DISTINCT's or set operation's inferred operators and a derived collation follow
+from other parts of the tree,
 which are compared themselves; a constant's or coercion's type can be a written
 name stored no differently, so it counts (#1062), which resolution consults with no name. A
 declaration the plan leaves unchanged has the same text on both sides and

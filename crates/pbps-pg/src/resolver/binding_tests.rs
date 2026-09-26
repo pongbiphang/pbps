@@ -1544,3 +1544,37 @@ async fn a_clipped_array_type_name_is_read_back() {
         );
     }
 }
+
+/// A set operation's equality operator comes from the type's default
+/// operator class, never a name lookup, so a same-named unmanaged operator
+/// is no candidate for it.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_set_operations_inferred_operators_are_no_named_candidates() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let declared = || Declared::default().view("app.v", "SELECT 1 AS a UNION SELECT 2");
+        let assessment = analyze(
+            &server,
+            "set_operation",
+            Case {
+                schemas: &["app"],
+                extras: &[],
+                target: "
+                    SET search_path = app;
+                    CREATE VIEW app.v AS SELECT 1 AS a UNION SELECT 2;
+                    CREATE FUNCTION app.never(integer, integer) RETURNS boolean LANGUAGE sql IMMUTABLE RETURN false;
+                    CREATE OPERATOR app.= (LEFTARG = integer, RIGHTARG = integer, FUNCTION = app.never);",
+                base: declared(),
+                desired: declared(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            only(&assessment, "app", "v"),
+            Verdict::Unaffected,
+            "{variable}"
+        );
+    }
+}

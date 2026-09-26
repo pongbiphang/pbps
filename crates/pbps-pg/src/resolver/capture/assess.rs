@@ -472,10 +472,19 @@ fn resolved_by_name(binding: &super::bindings::Binding) -> bool {
     // A range-table entry's column types are its VALUES', CTE's or
     // tuplestore's output, inferred; a table function's written column
     // types sit under its own `tablefunc` node instead.
-    let range_columns =
-        field == "coltypes" && named.next().is_some_and(|parent| parent == "rtable");
+    let range_columns = field == "coltypes"
+        && named
+            .clone()
+            .next()
+            .is_some_and(|parent| parent == "rtable");
+    // A grouping, DISTINCT or set operation's equality and ordering
+    // operators come from the type's default operator class; no syntax names
+    // them. An ORDER BY's, a window's included, can name its ordering
+    // operator (`USING <`), stored no differently from an inferred one.
+    let ordered = named.any(|step| step == "sortClause" || step == "orderClause");
+    let inferred_operator = field == "eqop" || field == "sortop" && !ordered;
     let collation = field.ends_with("collid") || field == "collation";
-    !range_columns && !collation && !DETERMINED.contains(&field.as_str())
+    !range_columns && !inferred_operator && !collation && !DETERMINED.contains(&field.as_str())
 }
 
 /// Whether a call with exactly one argument can reach `routine`: its
