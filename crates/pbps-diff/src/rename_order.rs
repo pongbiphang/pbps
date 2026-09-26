@@ -169,7 +169,21 @@ pub(crate) fn order(
             }
         }
     }
-    if drops.is_empty() {
+    // A rename releases its source name as it runs, so a rename into that
+    // name runs after it: skipped revisions that rename `z` to `a` and then
+    // `y` to `z` leave a chain the alphabet would otherwise order (DEC-536.1).
+    // A cycle, two tables trading names, has no order an engine takes without
+    // a third name; its edge is left out and the engine refuses it as before.
+    let mut chained = false;
+    for (rename, from) in owners.values() {
+        for &claimant in claims.get(from).into_iter().flatten() {
+            if claimant != *rename && !reaches(&edges, claimant, *rename) {
+                edges[*rename].insert(claimant);
+                chained = true;
+            }
+        }
+    }
+    if drops.is_empty() && !chained {
         return;
     }
     // Before the doomed table goes: its own keys, and every key on another

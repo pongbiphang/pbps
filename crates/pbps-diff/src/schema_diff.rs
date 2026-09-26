@@ -4460,6 +4460,123 @@ mod tests {
         );
     }
 
+    /// Revisions resolved in turn from `base`, each with its own intents,
+    /// then diffed from the undeployed baseline.
+    fn across_revisions(base: &Schema, revisions: &[(Schema, Vec<Intent>)]) -> ChangeSet {
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let mut ids = base_ids.clone();
+        for (schema, intents) in revisions {
+            ids = crate::resolve(schema, &ids, intents, &ctx()).unwrap().ids;
+        }
+        diff_with(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &revisions.last().unwrap().0,
+                ids: &ids,
+            },
+            &MinimalDialect,
+        )
+    }
+
+    /// A rename releases its source name as it runs, so a later revision's
+    /// rename into that name runs after it. `y` sorts before `z`, so without
+    /// the edge the alphabet ran `y -> z` while `z` still stood.
+    #[test]
+    fn a_rename_into_a_name_another_rename_vacates_runs_after_it() {
+        let t = |n: &str| table(&[(n, Column::new(ty("int")))]);
+        let rename = |from: &str, to: &str| Intent::RenameTable {
+            from: from.parse().unwrap(),
+            to: to.parse().unwrap(),
+        };
+        let schema = |tables: &[(&str, &str)]| {
+            let mut s = Schema::default();
+            for (name, column) in tables {
+                s.tables.insert(name.parse().unwrap(), t(column));
+            }
+            s
+        };
+        let order = |cs: &ChangeSet| -> Vec<String> {
+            cs.changes
+                .iter()
+                .filter_map(|p| match &p.change {
+                    Change::DropTable { name, .. } => Some(format!("drop {name}")),
+                    Change::RenameTable { from, to, .. } => Some(format!("{from} -> {to}")),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // With a drop at the head of the chain.
+        let cs = across_revisions(
+            &schema(&[("app.a", "doomed"), ("app.z", "zed"), ("app.y", "why")]),
+            &[
+                (
+                    schema(&[("app.z", "zed"), ("app.y", "why")]),
+                    vec![Intent::DropTable {
+                        table: "app.a".parse().unwrap(),
+                        reason: "gone".into(),
+                    }],
+                ),
+                (
+                    schema(&[("app.a", "zed"), ("app.y", "why")]),
+                    vec![rename("app.z", "app.a")],
+                ),
+                (
+                    schema(&[("app.a", "zed"), ("app.z", "why")]),
+                    vec![rename("app.y", "app.z")],
+                ),
+            ],
+        );
+        assert_eq!(
+            order(&cs),
+            ["drop app.a", "app.z -> app.a", "app.y -> app.z"],
+            "{cs:?}"
+        );
+
+        // And without one: a chain of renames alone.
+        let cs = across_revisions(
+            &schema(&[("app.z", "zed"), ("app.y", "why")]),
+            &[
+                (
+                    schema(&[("app.a", "zed"), ("app.y", "why")]),
+                    vec![rename("app.z", "app.a")],
+                ),
+                (
+                    schema(&[("app.a", "zed"), ("app.z", "why")]),
+                    vec![rename("app.y", "app.z")],
+                ),
+            ],
+        );
+        assert_eq!(order(&cs), ["app.z -> app.a", "app.y -> app.z"], "{cs:?}");
+
+        // Two tables trading names through a third across three revisions
+        // net to a cycle. No order serves it, and the graph must not loop or
+        // panic looking for one: both renames are still planned.
+        let cs = across_revisions(
+            &schema(&[("app.a", "ay"), ("app.b", "bee")]),
+            &[
+                (
+                    schema(&[("app.c", "ay"), ("app.b", "bee")]),
+                    vec![rename("app.a", "app.c")],
+                ),
+                (
+                    schema(&[("app.c", "ay"), ("app.a", "bee")]),
+                    vec![rename("app.b", "app.a")],
+                ),
+                (
+                    schema(&[("app.b", "ay"), ("app.a", "bee")]),
+                    vec![rename("app.c", "app.b")],
+                ),
+            ],
+        );
+        assert_eq!(order(&cs).len(), 2, "{cs:?}");
+    }
+
     /// Only a drop whose name a rename claims moves. Another table's drop
     /// keeps its class, after the renames.
     #[test]

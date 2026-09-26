@@ -792,3 +792,12 @@ Compared by name alone nothing changed, yet the standing key blocks the drop
 occupant. The differ compares the referenced table's uid on the two sides, read
 from the baseline as spelled there, and plans a visible drop and re-add when
 they differ.
+
+A rename releases its source name as it runs, so a rename into that name runs
+after it. Skipped revisions that rename `z` into `a` and then `y` into `z` form
+a chain the alphabet otherwise ordered (`y -> z` first, Msg 15335). A cycle —
+two tables trading names through a third — has no order an engine takes
+without a temporary name; its edge is left out, and the engine refuses it as
+before. The apply movement check likewise undoes a rename whose target this
+plan renames away, as it does one whose occupant it drops: an untouched
+child's key follows `y` to `z` and is not movement.

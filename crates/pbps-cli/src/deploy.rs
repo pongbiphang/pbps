@@ -1957,11 +1957,13 @@ fn refuse_unplanned_movement(
     let holds = |s: &Schema, a: &TableName, b: &TableName| {
         s.tables.contains_key(a) && s.tables.contains_key(b)
     };
-    // Except the name's occupant this plan drops: holding both spellings is
-    // then the plan's own order, the drop not having run yet (DEC-536.1).
+    // Except an occupant this plan drops or renames away: holding both
+    // spellings is then the plan's own order, that statement not having run
+    // yet (DEC-536.1).
     let mut undo = pbps_model::Renames::default();
     for (from, to) in &renamed {
-        if (holds(before, from, to) && !dropped_tables.contains(to)) || holds(after, from, to) {
+        let vacated = dropped_tables.contains(to) || renamed.contains_key(to);
+        if (holds(before, from, to) && !vacated) || holds(after, from, to) {
             continue;
         }
         undo.rename_table((*to).clone(), (*from).clone());
