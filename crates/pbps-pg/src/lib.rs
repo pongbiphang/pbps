@@ -846,20 +846,23 @@ impl Dialect for Postgres {
                     "the index {} generates for `{name}`'s unnamed primary key",
                     types::DIALECT
                 ),
-                remedy: "Name the primary key, or rename the other object",
+                remedy: "Name the primary key, or rename the other object.",
             });
         }
         for (column, spec) in &table.columns {
             if spec.identity.is_some() {
                 // Named after the table and the column: naming the key moves
-                // nothing here (#990).
+                // nothing here (#990). Renaming the column does not either
+                // once the sequence exists: `RENAME COLUMN` keeps the owned
+                // sequence's name, so offline validation would predict a new
+                // name that apply never gets.
                 out.push(pbps_dialect::ImplicitRelation {
                     name: generated_name(&name.name, Some(column), "seq"),
                     descriptor: format!(
                         "the sequence {} generates for identity column `{name}.{column}`",
                         types::DIALECT
                     ),
-                    remedy: "Rename the other object, or the identity column",
+                    remedy: "Rename the other object.",
                 });
             }
         }
@@ -1353,12 +1356,10 @@ mod tests {
             "{found:?}"
         );
         // #990: the key is already named, and naming it moves nothing here;
-        // the sequence moves with its table or column.
+        // nor does renaming an existing column, whose sequence keeps its name.
         assert!(!found[0].contains("Name the primary key"), "{found:?}");
-        assert!(
-            found[0].contains("Rename the other object, or the identity column"),
-            "{found:?}"
-        );
+        assert!(!found[0].contains("or the identity column"), "{found:?}");
+        assert!(found[0].ends_with("Rename the other object."), "{found:?}");
 
         // A named primary key generates no index name to meet.
         assert!(

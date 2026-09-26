@@ -587,7 +587,9 @@ on objects outside the declaration, so the check refuses the meeting. The
 refusal names the remedy that fits the generated relation (#990). For the index
 behind an unnamed primary key, name the key or rename the other object. For an
 identity sequence, which is named after its table and column and not after the
-key, rename the other object or the column. Two generated names that meet are
+key, rename the other object: renaming the column moves nothing once the
+sequence exists, because `RENAME COLUMN` keeps the owned sequence's name (measured on 16 and
+18). Two generated names that meet are
 left alone: the engine suffixes one of them, neither is declared, and nothing
 records it by name. The suffix is not left alone (#987). When `c` generated
 names meet, the engine gives the later ones its fallbacks, 1 to `c - 1`. It

@@ -132,8 +132,9 @@ pub struct ImplicitRelation {
     /// What it is, as a refusal names it.
     pub descriptor: String,
     /// What the author can change so a declared name stops meeting it. Naming
-    /// the primary key moves only its index; an identity sequence is named
-    /// after its table and column, so it moves with those.
+    /// the primary key moves only its index. An identity sequence is named
+    /// after its table and column when it is created, but keeps that name
+    /// when either is renamed later, so only the other object can move.
     pub remedy: &'static str,
 }
 
