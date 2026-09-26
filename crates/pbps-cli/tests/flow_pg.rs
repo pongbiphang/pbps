@@ -12953,11 +12953,13 @@ fn a_trigger_function_replaced_between_the_check_and_the_row_write_is_rolled_bac
     let admin = server();
     let declared = "table: app.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n  \
                     label: {type: text, nullable: false}\nprimary_key: {name: pk_t, columns: [code]}\n";
-    for staged in [false, true] {
-        let slug = if staged {
-            "window428_staged"
-        } else {
-            "window428"
+    // The deferred case holds the commit rather than the row statement: its
+    // triggers run when the transaction settles, after the row write.
+    for (staged, deferred) in [(false, false), (true, false), (true, true)] {
+        let slug = match (staged, deferred) {
+            (_, true) => "window428_deferred",
+            (true, false) => "window428_staged",
+            (false, false) => "window428",
         };
         let topology = inherited_owner_topology(&admin, slug);
         let connection = topology.connection().to_owned();
@@ -12973,14 +12975,23 @@ fn a_trigger_function_replaced_between_the_check_and_the_row_write_is_rolled_bac
         succeeds(d.run(&["plan"]));
         d.commit();
         succeeds(d.run(&["bootstrap", "--db", &deployment]));
-        on_server(
-            &deployment,
-            "CREATE FUNCTION public.hold428() RETURNS trigger LANGUAGE plpgsql AS \
-             $$BEGIN PERFORM pg_advisory_xact_lock(428); RETURN NULL; END$$; \
-             CREATE TRIGGER a_hold BEFORE INSERT ON app.t FOR EACH STATEMENT \
+        let triggers = if deferred {
+            "CREATE CONSTRAINT TRIGGER a_hold AFTER INSERT ON app.t \
+               DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.hold428(); \
+             CREATE CONSTRAINT TRIGGER audit AFTER INSERT ON app.t \
+               DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION hook.audit()"
+        } else {
+            "CREATE TRIGGER a_hold BEFORE INSERT ON app.t FOR EACH STATEMENT \
                EXECUTE FUNCTION public.hold428(); \
              CREATE TRIGGER audit BEFORE INSERT ON app.t FOR EACH ROW \
-               EXECUTE FUNCTION hook.audit()",
+               EXECUTE FUNCTION hook.audit()"
+        };
+        on_server(
+            &deployment,
+            &format!(
+                "CREATE FUNCTION public.hold428() RETURNS trigger LANGUAGE plpgsql AS \
+                 $$BEGIN PERFORM pg_advisory_xact_lock(428); RETURN NULL; END$$; {triggers}"
+            ),
         );
         // Both triggers adopted in the engine's own spelling; the functions
         // stay unmanaged, so the pins are what watch them.

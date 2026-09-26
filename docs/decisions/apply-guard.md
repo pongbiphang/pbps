@@ -1200,8 +1200,10 @@ exactly what an operator should look at before running approved DDL.
   function replaced between them has already run by the time the statement
   returns, and only a check before the commit can still take its write back.
   After the commit, the check after the step can only record the step and
-  stop. A transactional apply needed nothing new here: its check before
-  `record` already runs inside the transaction that wrote.
+  stop. Deferred triggers are settled first, as a transactional apply settles
+  them before its read-back (473); otherwise they would run at the commit,
+  after the check. A transactional apply needed nothing new here: its check
+  before `record` already runs inside the transaction that wrote.
 
 The live tests are in `crates/pbps-cli/tests/flow_pg.rs`. Each check was
 disabled in turn, and so was the `READ COMMITTED` framing, and the test for it

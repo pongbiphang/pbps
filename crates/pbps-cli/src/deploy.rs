@@ -5249,6 +5249,12 @@ async fn apply_staged_under_lock(
                 .await?;
                 crate::engine::check_data_write(conn, stmt, &guard).await?;
                 conn.execute(&stmt.sql).await?;
+                // A deferred trigger would otherwise run at COMMIT, after the
+                // check below, and a function replaced while an earlier one
+                // held the commit would run unchecked. The step commits right
+                // after, so settling here refuses nothing the commit would
+                // have allowed (473).
+                crate::engine::settle_data_writes(conn).await?;
                 // Before this step commits, not after (#428). The trigger
                 // check and the row statement are two server commands, and a
                 // trigger function replaced between them has already run by
