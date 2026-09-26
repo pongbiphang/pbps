@@ -160,17 +160,27 @@ again, without acquiring Docker resources.
 ## Private comparison and delivery limits
 
 Rule `postgres-catalog-inputs-v1` defines the complete property and binding
-representations. Comparisons use domain-framed SHA-256 fingerprints over
-canonical properties, full engine definitions including literals, logical
-bindings, recorded baseline and effective session inputs. Membership/absence
-is explicit. Identity equality alone cannot hide a changed cast context, type
-property, operator implementation/estimator, extension property or grant.
+representations. Comparisons use HMAC-SHA256 fingerprints, framed by the rule
+and the input's component, over canonical properties, full engine definitions
+including literals, logical bindings, recorded baseline and effective session
+inputs. Membership/absence is explicit. Identity equality alone cannot hide a
+changed cast context, type property, operator implementation/estimator,
+extension property or grant.
+
+The key is `FingerprintKey::process()`: random, generated once per process and
+never written anywhere (DEC-952.1). A capture's fingerprints are compared and
+dropped inside the process that made them, so no fingerprint of a private input
+exists that anyone without that key could test a guess against. A fingerprint
+that is kept, such as sealed plan evidence, is made under the target
+environment's key instead, loaded from `fingerprint_key_env` or
+`fingerprint_key_file` (#614). A process-key fingerprint is never persisted,
+and never compared with one made in another process.
 
 `CapturedInputs` and `CapturedTargetInputs` have no `Debug`, `Serialize`, public
-verifier getter or persistence constructor. Ordinary comparisons return only
+fingerprint getter or persistence constructor. Ordinary comparisons return only
 logical affected objects and failed conditions. These reports live outside
 semantic `Schema` equality. Native-file requirements transfer privately to the
-lifecycle; source-bearing data and guessing verifiers are not public output.
+lifecycle; source-bearing data and fingerprints are not public output.
 A capability holder's loader operations necessarily observe source-dependent
 results. The API therefore prevents ordinary result recipients from acquiring
 that capability, rather than treating an opaque value or arbitrary root File

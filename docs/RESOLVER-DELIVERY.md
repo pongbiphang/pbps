@@ -103,7 +103,7 @@ The private library captures actual target bindings, complete requested
 candidate/property closures, recorded identity/state and authorization on an
 owned PostgreSQL 16/18 snapshot. Fresh rendering/session checks and native
 executable qualification bound inputs outside that snapshot. Fresh recapture
-reports changed logical inputs without exposing source or guessing verifiers.
+reports changed logical inputs without exposing source or fingerprints.
 See [the capture boundary](RESOLVER-CAPTURE.md) for supported surfaces, named
 refusals, confidentiality and verification.
 
