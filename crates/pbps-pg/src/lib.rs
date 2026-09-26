@@ -858,6 +858,37 @@ impl Dialect for Postgres {
         out
     }
 
+    /// `ChooseRelationName` retries with the number on the *label*, and cuts
+    /// the table name again to fit it. Measured on 18.6, three 60-byte tables
+    /// that generate one `_pkey` get `…_pkey`, then a 57-byte cut with
+    /// `_pkey1` and `_pkey2`; two identity columns, `…_id_seq` and
+    /// `…_id_seq1` (#987).
+    fn implicit_relation_fallbacks(
+        &self,
+        name: &TableName,
+        table: &Table,
+        suffix: u32,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        if table
+            .primary_key
+            .as_ref()
+            .is_some_and(|pk| pk.name.is_none())
+        {
+            out.push(generated_name(&name.name, None, &format!("pkey{suffix}")));
+        }
+        for (column, spec) in &table.columns {
+            if spec.identity.is_some() {
+                out.push(generated_name(
+                    &name.name,
+                    Some(column),
+                    &format!("seq{suffix}"),
+                ));
+            }
+        }
+        out
+    }
+
     /// The project-schema portion of the write path: the object's own schema
     /// first, then the configured extras in order (DECISIONS 276 and 464).
     /// The implicit catalog and final temporary schema hold no declared
@@ -1127,6 +1158,114 @@ mod tests {
     /// are the engine's to resolve with a suffix. (An engine whose indexes do
     /// not share the table namespace is never asked: the hook's default is
     /// empty, and `check_index_names` returns before it for such a dialect.)
+    /// #987: the fallbacks `ChooseRelationName` retries with, as measured on
+    /// 18.6: the number goes on the label and the table name is cut again.
+    #[test]
+    fn generated_fallbacks_are_the_ones_the_engine_measured() {
+        use pbps_model::{Column, Identity, PrimaryKey, Table};
+        let long = format!("{}x", "a".repeat(59));
+        let mut t = Table::default();
+        let mut id = Column::new("integer".parse().unwrap()).not_null();
+        id.identity = Some(Identity {
+            seed: 1,
+            increment: 1,
+        });
+        t.columns.insert("id".into(), id);
+        t.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        let pg = super::Postgres::new();
+        let name = TableName::new("app", &long);
+        assert_eq!(
+            pg.implicit_relation_fallbacks(&name, &t, 1),
+            [
+                format!("{}_pkey1", "a".repeat(57)),
+                format!("{}_id_seq1", "a".repeat(55)),
+            ]
+        );
+        assert_eq!(
+            pg.implicit_relation_fallbacks(&name, &t, 2)[0],
+            format!("{}_pkey2", "a".repeat(57))
+        );
+    }
+
+    /// #987: two tables whose unnamed keys generate one `_pkey` leave the
+    /// engine a fallback, `_pkey1`, for whichever is created second, and a
+    /// declared index there meets it in one order or the other. Negatives: a
+    /// single table has no fallback in play, and two claimants use only the
+    /// first fallback, never `_pkey2`.
+    #[test]
+    fn a_declared_name_at_a_generated_fallback_is_refused() {
+        use pbps_model::{Column, Index, IndexColumn, PrimaryKey, Schema, Table};
+        let keyed = |index_name: Option<&str>| {
+            let mut t = Table::default();
+            t.columns.insert(
+                "id".into(),
+                Column::new("integer".parse().unwrap()).not_null(),
+            );
+            t.primary_key = Some(PrimaryKey {
+                name: None,
+                columns: vec!["id".into()],
+            });
+            if let Some(n) = index_name {
+                t.indexes.insert(
+                    n.into(),
+                    Index {
+                        columns: vec![IndexColumn {
+                            name: "id".into(),
+                            descending: false,
+                        }],
+                        include: Vec::new(),
+                        unique: false,
+                        filter: None,
+                    },
+                );
+            }
+            t
+        };
+        let long = |c: char| format!("{}{c}", "a".repeat(59));
+        let pkey = |n: &str| format!("{}_pkey{n}", "a".repeat(57));
+        let pg = super::Postgres::new();
+        let schema = |tables: Vec<(String, Table)>| {
+            let mut s = Schema::default();
+            for (name, t) in tables {
+                s.tables.insert(TableName::new("app", &name), t);
+            }
+            s
+        };
+
+        let found = pbps_dialect::check_index_names(
+            &schema(vec![
+                (long('x'), keyed(None)),
+                (long('y'), keyed(Some(&pkey("1")))),
+            ]),
+            &pg,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("may both be named"), "{found:?}");
+
+        assert!(
+            pbps_dialect::check_index_names(
+                &schema(vec![(long('y'), keyed(Some(&pkey("1"))))]),
+                &pg
+            )
+            .is_empty(),
+            "one table: its first choice is its own, and no fallback is in play"
+        );
+        assert!(
+            pbps_dialect::check_index_names(
+                &schema(vec![
+                    (long('x'), keyed(None)),
+                    (long('y'), keyed(Some(&pkey("2")))),
+                ]),
+                &pg,
+            )
+            .is_empty(),
+            "two claimants retry once"
+        );
+    }
+
     #[test]
     fn a_declared_name_meeting_a_generated_one_is_refused() {
         use pbps_model::{Column, Identity, Index, IndexColumn, PrimaryKey, Schema, Table};

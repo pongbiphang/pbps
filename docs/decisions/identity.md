@@ -575,7 +575,14 @@ Predicting the suffix would make the result depend on apply order and
 on objects outside the declaration, so the check refuses the meeting and asks
 for a named primary key or another name. Two generated names that meet are
 left alone: the engine suffixes one of them, neither is declared, and nothing
-records it by name. SQL Server names these objects per table and reports no
+records it by name. The suffix is not left alone (#987). When `c` generated
+names meet, the engine gives the later ones its fallbacks, 1 to `c - 1`. It
+retries with the number on the label and cuts the table name again to fit, so
+a 60-byte table's key falls back to a 57-byte cut plus `_pkey1` (measured on 16
+and 18). A declared name equal to one of those fallbacks lands by creation
+order: created after both tables it fails with `42P07`, and created between
+them it pushes the second key to the next fallback. It is refused like a
+declared name that meets a first choice. SQL Server names these objects per table and reports no
 generated relation names. Measured on PostgreSQL 16 and 18: short, 60-byte and
 multibyte table names generate exactly the predicted names, the declared index
 created afterwards fails with `42P07`, and a name taken first yields
