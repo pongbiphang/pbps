@@ -4005,6 +4005,131 @@ fn doctor_against_a_real_server_reads_its_edition_and_permissions() {
     );
 }
 
+/// #676: doctor asks about a declared column under the name its environment
+/// has for it. A plan about to rename `label` to `caption` has not reached the
+/// database yet, and `sp_rename` keeps a column's grants with it, so the
+/// account holding `SELECT` and `UPDATE` on `label` is ready. Asked about
+/// `caption`, which the catalog does not hold yet, doctor reported a gap the
+/// account does not have and named a column that does not exist.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB"]
+fn doctor_asks_about_a_column_under_the_name_a_pending_rename_has_not_changed_yet() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB");
+    let db = OwnDatabase::new(&server, "doctorcol676");
+    let login = format!("pbps_flow_col676_{}", std::process::id());
+    let password = "pbpsLeastPrivilege!1";
+    on_server(
+        &server,
+        &format!("CREATE LOGIN [{login}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;"),
+    );
+    let ok = |o: std::process::Output| {
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    };
+    let project = Demo::new("doctorcol676");
+    let var = format!("PBPS_DOCTOR_COL676_{}", std::process::id());
+    std::fs::write(
+        project.dir.join("pbps.yml"),
+        format!("dialect: mssql\nenvironments:\n  test:\n    url_env: {var}\n"),
+    )
+    .unwrap();
+    let declared = |label: &str, extra: &str| {
+        format!(
+            "table: app.t\ncolumns:\n  code: {{type: int, nullable: false}}\n  \
+             {label}: {{type: int}}\n{extra}primary_key: [code]\n\
+             data:\n  mode: ensure\n  rows:\n    1: {{{label}: 1}}\n"
+        )
+    };
+    on_server(db.connection(), "EXEC(N'CREATE SCHEMA app;');");
+    project.table(&declared("label", ""));
+    ok(project.run(&["plan"]));
+    project.commit();
+    ok(project.run(&["bootstrap", "--db", db.connection()]));
+    on_server(
+        db.connection(),
+        &format!(
+            "CREATE USER [{login}] FOR LOGIN [{login}];
+             GRANT VIEW DEFINITION, ALTER, REFERENCES ON SCHEMA::app TO [{login}];
+             GRANT SELECT, INSERT, UPDATE, DELETE, ALTER ON SCHEMA::dbo TO [{login}];
+             GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}];
+             GRANT INSERT, DELETE ON OBJECT::app.t TO [{login}];
+             GRANT SELECT ON app.t(code, label) TO [{login}];
+             GRANT UPDATE ON app.t(label) TO [{login}];"
+        ),
+    );
+    let base = db
+        .connection()
+        .split(';')
+        .filter(|part| {
+            let key = part.split('=').next().unwrap_or("").trim();
+            !["user id", "uid", "password", "pwd"]
+                .iter()
+                .any(|credential| key.eq_ignore_ascii_case(credential))
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let as_login = with_key(&with_key(&base, "User Id", &login), "Password", password);
+    let diagnose = || {
+        let output = Command::new(BIN)
+            .arg("--project")
+            .arg(&project.dir)
+            .args(["doctor", "--format", "json"])
+            .env(&var, &as_login)
+            .output()
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+        value["data"]["environments"][0]["missing_permissions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no permission list: {value}"))
+            .iter()
+            .map(|gap| gap.as_str().unwrap().to_owned())
+            .collect::<Vec<String>>()
+    };
+    let on_the_table = |gaps: &[String]| -> Vec<String> {
+        gaps.iter()
+            .filter(|g| g.contains("[app].[t]") || g.contains("app.t"))
+            .filter(|g| g.starts_with("SELECT") || g.starts_with("UPDATE"))
+            .cloned()
+            .collect()
+    };
+
+    // The declaration renames `label`; the environment has not been changed.
+    project.table(&declared("caption", ""));
+    ok(project.run(&["rename", "app.t.label", "caption"]));
+    ok(project.run(&["plan"]));
+    project.commit();
+    let pending = diagnose();
+    assert!(on_the_table(&pending).is_empty(), "{pending:?}");
+    assert!(
+        !pending.iter().any(|g| g.contains("caption")),
+        "{pending:?}"
+    );
+
+    // The grants follow the column through `sp_rename`, so the account really
+    // was ready: the read-back and the `UPDATE` run under the new name.
+    on_server(
+        db.connection(),
+        "EXEC sp_rename 'app.t.label', 'caption', 'COLUMN';",
+    );
+    on_server(
+        &as_login,
+        "SELECT code, caption FROM app.t; UPDATE app.t SET caption = caption WHERE code = 1;",
+    );
+    on_server(
+        db.connection(),
+        "EXEC sp_rename 'app.t.caption', 'label', 'COLUMN';",
+    );
+
+    // A column this plan adds has no grant yet, and still needs one.
+    project.table(&declared("caption", "  note: {type: int}\n"));
+    ok(project.run(&["plan"]));
+    project.commit();
+    let added = diagnose();
+    assert!(!on_the_table(&added).is_empty(), "{added:?}");
+
+    after_test_on_server(&server, &format!("DROP LOGIN [{login}];"));
+    drop(db);
+}
+
 /// The managed-table list must reach the SQL Server readiness query, including
 /// for a declaration with no data block. Schema grants cannot answer whether
 /// a narrower object/column grant or denial authorizes the actual probe.
