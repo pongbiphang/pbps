@@ -119,12 +119,12 @@ mod contained611 {
         let pid = std::process::id();
         let target = format!("pbps_contained611_t_{pid}");
         let scratch = format!("pbps_contained611_s_{pid}");
-        admin
-            .execute(&format!(
-                "CREATE DATABASE [{target}] CONTAINMENT = PARTIAL;"
-            ))
-            .await
-            .unwrap();
+        crate::create_database(
+            &mut admin,
+            &format!("CREATE DATABASE [{target}] CONTAINMENT = PARTIAL;"),
+        )
+        .await
+        .unwrap();
         let mut planning = connect_live(&format!("{};Database={target}", conn_str()))
             .await
             .unwrap();
