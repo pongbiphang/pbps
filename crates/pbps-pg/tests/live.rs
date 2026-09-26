@@ -8403,6 +8403,55 @@ async fn rollback(conn: &mut Conn) {
     conn.execute("ROLLBACK").await.expect("rollback");
 }
 
+/// #534: a rebuild read that recovers from its routine lock must leave no
+/// `pbps_routine_lock` marker behind, whether it falls back or fails. A caller
+/// holding a savepoint of that name then rolls back to its own checkpoint, and
+/// its remaining work commits. `setup` runs first in each transaction.
+///
+/// Returns what the read answered with the caller's savepoint in place.
+async fn a_callers_routine_lock_savepoint_is_the_one_rolled_back_to(
+    conn: &mut Conn,
+    table: &str,
+    setup: &str,
+    id: &pbps_model::ModuleId,
+    kind: pbps_model::ModuleKind,
+    changes: &pbps_model::ChangeSet,
+) -> Result<pbps_pg::modules::Rebuild, pbps_db::DbError> {
+    in_a_transaction(conn).await;
+    conn.execute(&format!(
+        "{setup}; DELETE FROM {table}; INSERT INTO {table} VALUES (1); \
+         SAVEPOINT pbps_routine_lock; INSERT INTO {table} VALUES (2)"
+    ))
+    .await
+    .expect("the caller's work and checkpoint");
+    let answered = pbps_pg::modules::before_a_rebuild(conn, id, kind, changes).await;
+    conn.execute("ROLLBACK TO SAVEPOINT pbps_routine_lock; RELEASE SAVEPOINT pbps_routine_lock")
+        .await
+        .expect("the caller's checkpoint is still there");
+    conn.execute("COMMIT")
+        .await
+        .expect("the caller's work commits");
+    // Row 2 went after the caller's checkpoint; a marker the read left behind
+    // would sit after it, and rolling back to that one would keep row 2.
+    assert_eq!(
+        number(conn, &format!("SELECT count(*)::int FROM {table}")).await,
+        1,
+        "{id}: the rollback reached the read's own marker, not the caller's"
+    );
+
+    // Without a caller savepoint, there is nothing of that name left to end.
+    in_a_transaction(conn).await;
+    conn.execute(setup).await.expect("setup");
+    let _ = pbps_pg::modules::before_a_rebuild(conn, id, kind, changes).await;
+    let left = conn
+        .execute("RELEASE SAVEPOINT pbps_routine_lock")
+        .await
+        .expect_err("the read left its marker standing");
+    assert_eq!(left.server_error_code().as_deref(), Some("3B001"), "{left}");
+    rollback(conn).await;
+    answered
+}
+
 /// ADR-0009 §3's whole finding, measured end to end: `CREATE OR ALTER` was
 /// buying grant preservation, and this engine will not sell it — so an object
 /// carrying anything the declarations cannot reproduce refuses the rebuild
@@ -9465,6 +9514,26 @@ async fn an_account_that_cannot_lock_a_routine_says_so_and_the_reads_after_it_st
     // ran" because the reads did run.
     assert_eq!(rebuild.refusal(), None, "{:?}", rebuild.carries);
 
+    // The fallback recovers the same way, and leaves the caller's own
+    // checkpoint of that name as the one it rolls back to (#534).
+    conn.execute(&format!("CREATE TABLE {s}.caller_rows (n int)"))
+        .await
+        .expect("the deploying account creates in its schema");
+    let fallback = a_callers_routine_lock_savepoint_is_the_one_rolled_back_to(
+        &mut conn,
+        &format!("{s}.caller_rows"),
+        "SELECT 1",
+        &id,
+        pbps_model::ModuleKind::Function,
+        &pbps_model::ChangeSet::default(),
+    )
+    .await
+    .expect("a missing privilege is a fallback, not an error");
+    assert!(
+        matches!(fallback.serialized, pbps_pg::modules::Serialized::Not(_)),
+        "this account still cannot lock `pg_proc`"
+    );
+
     drop(conn);
     admin
         .execute(&format!("DROP SCHEMA {s} CASCADE"))
@@ -9483,7 +9552,8 @@ async fn routine_lock_timeouts_are_errors_and_leave_the_callers_transaction_usab
     db.conn
         .execute(
             "CREATE FUNCTION public.f(n int) RETURNS int LANGUAGE sql AS $$ SELECT n $$;
-             CREATE PROCEDURE public.p(n int) LANGUAGE sql AS $$ SELECT n $$;",
+             CREATE PROCEDURE public.p(n int) LANGUAGE sql AS $$ SELECT n $$;
+             CREATE TABLE public.caller_rows (n int);",
         )
         .await
         .unwrap();
@@ -9523,6 +9593,18 @@ async fn routine_lock_timeouts_are_errors_and_leave_the_callers_transaction_usab
             rollback(&mut probe).await;
             let error = result.expect_err("a timeout is not an unavailable privilege");
             assert_eq!(error.server_error_code().as_deref(), Some(code), "{error}");
+
+            let again = a_callers_routine_lock_savepoint_is_the_one_rolled_back_to(
+                &mut probe,
+                "public.caller_rows",
+                &format!("SET LOCAL {setting} = '200ms'"),
+                &id,
+                kind,
+                &changes,
+            )
+            .await
+            .expect_err("still contended");
+            assert_eq!(again.server_error_code().as_deref(), Some(code), "{again}");
         }
         rollback(&mut db.conn).await;
     }

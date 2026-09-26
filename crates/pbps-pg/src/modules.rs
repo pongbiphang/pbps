@@ -435,6 +435,11 @@ async fn serialize(
                 Err(e) => {
                     conn.execute("ROLLBACK TO SAVEPOINT pbps_routine_lock")
                         .await?;
+                    // Released as well as rolled back, like the schema pin's
+                    // marker: `ROLLBACK TO` keeps it, and a marker left
+                    // standing shadows a caller's own savepoint of the same
+                    // name on the error path and the fallback alike (#534).
+                    conn.execute("RELEASE SAVEPOINT pbps_routine_lock").await?;
                     // Only missing privileges permit an unserialized read
                     // (ADR-0009 §3). A cancellation or another engine failure
                     // must still abort the probe after recovering its caller.
@@ -540,8 +545,7 @@ async fn pin_the_namespace(conn: &mut Conn, schema: &str) -> Result<SchemaPin, D
                 .await?;
             // Released as well as rolled back: `ROLLBACK TO` keeps the marker,
             // and a marker left standing shadows a caller's own savepoint of
-            // the same name. (The routine arm's marker beside this one has the
-            // same gap and is issue #534, which owns that fix.)
+            // the same name.
             conn.execute("RELEASE SAVEPOINT pbps_namespace_pin").await?;
             // Only missing privileges permit an unpinned name (ADR-0009 §3).
             // A cancellation or another engine failure must still abort.
