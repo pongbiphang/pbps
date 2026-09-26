@@ -282,6 +282,9 @@ impl Directory {
             observer: self.observer.clone(),
         };
         result.private()?;
+        // A child can be a mount point onto another filesystem; check the
+        // handle that will actually hold records and locks (DEC-1070.1).
+        super::files::qualified_filesystem(&result.file, "compose storage directory")?;
         self.check()?;
         Ok(result)
     }

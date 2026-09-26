@@ -462,7 +462,9 @@ layer. So compose refuses there, with the remedy of moving the checkout into
 the WSL filesystem.
 - **Decided by type, not path.** The check runs `fstatfs` on the handle
   compose has already opened: the capture root in `files::Root::open`, and
-  the common directory in `durable::store`. A path prefix like `/mnt/` would
+  the common directory in `durable::store`. It also runs on each captured
+  input file and on every store subdirectory `Directory::child` opens,
+  because a mount point beneath a qualified directory can lead onto 9p. A path prefix like `/mnt/` would
   miss other mount points and misfire on a native Linux path with that name.
   A handle cannot be swapped between the check and its use.
 - **Measured.** On WSL2 6.6, `/mnt/c` is `9p` with `aname=drvfs`, and

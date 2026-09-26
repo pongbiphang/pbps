@@ -143,6 +143,8 @@ impl Root {
                 ));
             }
         };
+        // An input can sit on a mount beneath a qualified root (DEC-1070.1).
+        qualified_filesystem(&fd, "compose input")?;
         let before = fstat(&fd).map_err(|_| Error::new("Could not inspect a compose input"))?;
         // The recursive loader treats a directory ending in .yml as a
         // directory. It has no declaration blob at its own pathname.
