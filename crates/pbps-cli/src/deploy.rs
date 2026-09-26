@@ -2720,16 +2720,30 @@ fn refuse_unplanned_movement(
             if expected != held {
                 // Which permission, both ways: a revoke that did not take and a
                 // grant that was taken away read the same without it (#700).
-                let listed =
-                    |set: std::collections::btree_set::Difference<'_, pbps_model::Permission>| {
-                        set.map(ToString::to_string).collect::<Vec<_>>().join(", ")
-                    };
+                let listed = |set: &Permissions| {
+                    set.iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
                 let mut detail = Vec::new();
-                let surplus = listed(held.difference(&expected));
+                // A surplus the plan revoked is a revoke that did not take;
+                // any other was neither held nor granted by the plan, so
+                // another session put it there, and "still" would misdescribe
+                // it (#1052).
+                let (survived, arrived): (Permissions, Permissions) = held
+                    .difference(&expected)
+                    .cloned()
+                    .partition(|p| removes.contains(p));
+                let surplus = listed(&survived);
                 if !surplus.is_empty() {
                     detail.push(format!("it still holds {surplus}"));
                 }
-                let missing = listed(expected.difference(&held));
+                let unplanned = listed(&arrived);
+                if !unplanned.is_empty() {
+                    detail.push(format!("it unexpectedly holds {unplanned}"));
+                }
+                let missing = listed(&expected.difference(&held).cloned().collect());
                 if !missing.is_empty() {
                     detail.push(format!("it lacks {missing}"));
                 }
@@ -7207,6 +7221,18 @@ mod tests {
         assert!(e.contains("role app"), "{e}");
         assert!(e.contains("it still holds select"), "{e}");
         assert!(!e.contains("lacks"), "{e}");
+        // #1052: and a permission nobody planned is not called a revoke that
+        // did not take. `INSERT` arrived from another session beside the
+        // `SELECT` this plan failed to revoke.
+        let e = refuse(
+            &revoking,
+            &before,
+            &schema(&[Permission::Select, Permission::Insert]),
+        )
+        .expect_err("a revoke that did not take, and a grant nobody planned");
+        assert!(e.contains("it still holds select"), "{e}");
+        assert!(e.contains("it unexpectedly holds insert"), "{e}");
+        assert!(!e.contains("still holds insert"), "{e}");
     }
 
     /// A table's rename forwards the grants on the table and nothing else.
