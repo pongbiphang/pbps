@@ -64,6 +64,9 @@ pub enum Nameable {
     /// A function or procedure. A call written `t(x)` is also how a type
     /// named `t` is cast to, so a routine can take a type's place too.
     Routine,
+    /// A type alone, such as a relation's generated array type: never a
+    /// relation, and a call only as a cast.
+    Type,
 }
 
 impl Nameable {
@@ -77,6 +80,8 @@ impl Nameable {
             (Self::Relation, class) => matches!(class, "pg_class" | "pg_type"),
             (Self::Index, class) => class == "pg_class",
             (Self::Routine, class) => matches!(class, "pg_proc" | "pg_type"),
+            (Self::Type, "pg_proc") => one_argument,
+            (Self::Type, class) => class == "pg_type",
         }
     }
 }
@@ -360,6 +365,17 @@ impl Reconstruction {
                     .await
                     .map_err(|error| failed(error.to_string()))?;
             }
+            let relation = step
+                .names
+                .iter()
+                .find(|(kind, _, _)| *kind == Nameable::Relation)
+                .map(|(_, schema, name)| (schema.clone(), name.clone()));
+            if let Some((schema, name)) = relation
+                && let Some((array_schema, array)) =
+                    array_type(conn, &schema, &name).await.map_err(failed)?
+            {
+                step.names.push((Nameable::Type, array_schema, array));
+            }
             if let Some((schema, name)) = &routine {
                 let mut after = routines(conn, schema, name).await.map_err(failed)?;
                 after.retain(|created| !before.contains(created));
@@ -419,14 +435,50 @@ async fn routines(
         .collect()
 }
 
-/// What creating a table or view makes nameable: the relation with its row
-/// type, and the array type of that row type, which the engine names with a
-/// leading underscore.
+/// What creating a table or view makes nameable before it compiles: the
+/// relation with its row type, which always has its name. Its array type is
+/// read back once it exists ([`array_type`]).
 fn relation(schema: &str, name: &str) -> Vec<(Nameable, String, String)> {
-    vec![
-        (Nameable::Relation, schema.to_owned(), name.to_owned()),
-        (Nameable::Relation, schema.to_owned(), format!("_{name}")),
-    ]
+    vec![(Nameable::Relation, schema.to_owned(), name.to_owned())]
+}
+
+/// The array type the engine generated for a relation's row type, by the
+/// name it chose: `_name` usually, but clipped to the identifier limit, or
+/// another spelling when that one was taken. `None` when it made none.
+async fn array_type(
+    conn: &mut pbps_db::transport::StreamConn,
+    schema: &str,
+    name: &str,
+) -> Result<Option<(String, String)>, String> {
+    let literal = |value: &str| format!("'{}'", value.replace('\'', "''"));
+    let rows = conn
+        .query(&format!(
+            "SELECT an.nspname AS schema, a.typname AS name \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             JOIN pg_catalog.pg_type r ON r.oid = c.reltype \
+             JOIN pg_catalog.pg_type a ON a.oid = r.typarray \
+             JOIN pg_catalog.pg_namespace an ON an.oid = a.typnamespace \
+             WHERE n.nspname = {} AND c.relname = {}",
+            literal(schema),
+            literal(name)
+        ))
+        .await
+        .map_err(|error| error.to_string())?;
+    match rows.as_slice() {
+        [] => Ok(None),
+        [row] => {
+            let text = |field| {
+                row.try_get::<&str>(field)
+                    .ok()
+                    .flatten()
+                    .map(str::to_owned)
+                    .ok_or("a relation's array type is unreadable")
+            };
+            Ok(Some((text("schema")?, text("name")?)))
+        }
+        _ => Err("a relation's array type is ambiguous".into()),
+    }
 }
 
 fn step(

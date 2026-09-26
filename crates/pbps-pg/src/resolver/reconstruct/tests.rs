@@ -155,7 +155,6 @@ fn later_names_are_what_became_nameable_after_the_module() {
         reconstruction.later_names(&routine("int4")).unwrap(),
         [
             (Nameable::Relation, "app", "v"),
-            (Nameable::Relation, "app", "_v"),
             (Nameable::Index, "app", "ix")
         ]
         .into_iter()
@@ -189,6 +188,12 @@ fn a_later_object_shadows_only_what_it_could_be_resolved_as() {
     assert!(Nameable::Relation.shadows("pg_proc", true));
     assert!(!Nameable::Relation.shadows("pg_proc", false));
     assert!(!Nameable::Relation.shadows("column", false));
+    // A generated array type is a type only: never a relation, and a call
+    // only as a cast.
+    assert!(Nameable::Type.shadows("pg_type", false));
+    assert!(!Nameable::Type.shadows("pg_class", false));
+    assert!(Nameable::Type.shadows("pg_proc", true));
+    assert!(!Nameable::Type.shadows("pg_proc", false));
 }
 
 /// A plan that drops, renames or alters is not a bootstrap, and building a

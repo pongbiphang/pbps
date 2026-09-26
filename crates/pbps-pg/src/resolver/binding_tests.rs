@@ -1449,3 +1449,98 @@ async fn a_later_relations_array_type_is_a_later_name() {
         );
     }
 }
+
+/// A later view's generated array type is a type, never a relation: a view
+/// that read the relation `shared._x` before `app.x` existed would still
+/// read it, and its verdict stands.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_later_array_type_does_not_shadow_a_relation() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let declared = || {
+            let mut table = pbps_model::Table::default();
+            table.columns.insert(
+                "id".into(),
+                pbps_model::Column::new("integer".parse().unwrap()),
+            );
+            Declared::default()
+                .table("shared._x", table)
+                .view("app.a", "SELECT id FROM _x")
+                .view("app.x", "SELECT 1 AS id")
+        };
+        let assessment = analyze(
+            &server,
+            "array_relation",
+            Case {
+                schemas: &["app", "shared"],
+                extras: &["shared"],
+                target: "
+                    CREATE TABLE shared._x (id integer);
+                    SET search_path = app, shared;
+                    CREATE VIEW app.a AS SELECT id FROM _x;
+                    CREATE VIEW app.x AS SELECT 1 AS id;",
+                base: declared(),
+                desired: declared(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            only(&assessment, "app", "a"),
+            Verdict::Unaffected,
+            "{variable}"
+        );
+    }
+}
+
+/// The engine clips a generated array type's name to the identifier limit,
+/// so the name is read back rather than spelled: a view of a 63-byte name
+/// makes `_` and its first 62 bytes nameable, which a view compiled before
+/// it may have bound elsewhere on the path.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_clipped_array_type_name_is_read_back() {
+    let long = "v".repeat(63);
+    let array = format!("_{}", "v".repeat(62));
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let declared = || {
+            let mut table = pbps_model::Table::default();
+            table.columns.insert(
+                "id".into(),
+                pbps_model::Column::new("integer".parse().unwrap()),
+            );
+            Declared::default()
+                .table(&format!("shared.{long}"), table)
+                .view("app.a", &format!("SELECT NULL::{array} AS v"))
+                .view(&format!("app.{long}"), "SELECT 1 AS id")
+        };
+        let target = format!(
+            "CREATE TABLE shared.{long} (id integer);
+             SET search_path = app, shared;
+             CREATE VIEW app.a AS SELECT NULL::{array} AS v;
+             CREATE VIEW app.{long} AS SELECT 1 AS id;"
+        );
+        let assessment = analyze(
+            &server,
+            "array_clipped",
+            Case {
+                schemas: &["app", "shared"],
+                extras: &["shared"],
+                target: &target,
+                base: declared(),
+                desired: declared(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                only(&assessment, "app", "a"),
+                Verdict::Unresolved { condition } if condition.contains("compiled before")
+            ),
+            "{variable}: {assessment:#?}"
+        );
+    }
+}
