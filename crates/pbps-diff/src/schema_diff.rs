@@ -4554,6 +4554,24 @@ mod tests {
         );
         assert_eq!(order(&cs), ["app.z -> app.a", "app.y -> app.z"], "{cs:?}");
 
+        // Across schemas: a move passes through its source name in the
+        // destination schema, so `s1.z -> s2.a` holds `s2.z` for a moment,
+        // and `s1.y -> s2.z` waits for it.
+        let cs = across_revisions(
+            &schema(&[("s1.z", "zed"), ("s1.y", "why")]),
+            &[
+                (
+                    schema(&[("s2.a", "zed"), ("s1.y", "why")]),
+                    vec![rename("s1.z", "s2.a")],
+                ),
+                (
+                    schema(&[("s2.a", "zed"), ("s2.z", "why")]),
+                    vec![rename("s1.y", "s2.z")],
+                ),
+            ],
+        );
+        assert_eq!(order(&cs), ["s1.z -> s2.a", "s1.y -> s2.z"], "{cs:?}");
+
         // Two tables trading names through a third across three revisions
         // net to a cycle. No order serves it, and the graph must not loop or
         // panic looking for one: both renames are still planned.

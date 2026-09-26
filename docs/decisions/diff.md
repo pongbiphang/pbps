@@ -795,7 +795,10 @@ they differ.
 
 A rename releases its source name as it runs, so a rename into that name runs
 after it. Skipped revisions that rename `z` into `a` and then `y` into `z` form
-a chain the alphabet otherwise ordered (`y -> z` first, Msg 15335). A cycle —
+a chain the alphabet otherwise ordered (`y -> z` first, Msg 15335). A move to
+another schema also releases the intermediate name it passes through, its
+source name in the destination schema: `s1.z -> s2.a` holds `s2.z` for a
+moment, so `s1.y -> s2.z` waits for it (Msg 15530, `42P07`). A cycle —
 two tables trading names through a third — has no order an engine takes
 without a temporary name; its edge is left out, and the engine refuses it as
 before. The apply movement check likewise undoes a rename whose target this

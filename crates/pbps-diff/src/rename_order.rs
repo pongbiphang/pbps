@@ -174,12 +174,23 @@ pub(crate) fn order(
     // `y` to `z` leave a chain the alphabet would otherwise order (DEC-536.1).
     // A cycle, two tables trading names, has no order an engine takes without
     // a third name; its edge is left out and the engine refuses it as before.
+    // A move to another schema also passes through an intermediate name, its
+    // source name in the destination schema, which it takes and then gives
+    // up; a rename into that name waits for it too.
     let mut chained = false;
-    for (rename, from) in owners.values() {
-        for &claimant in claims.get(from).into_iter().flatten() {
-            if claimant != *rename && !reaches(&edges, claimant, *rename) {
-                edges[*rename].insert(claimant);
-                chained = true;
+    for (to, (rename, from)) in &owners {
+        let intermediate = TableName::new(to.schema.clone(), from.name.clone());
+        let released = if from.schema == to.schema {
+            vec![from]
+        } else {
+            vec![from, &intermediate]
+        };
+        for name in released {
+            for &claimant in claims.get(name).into_iter().flatten() {
+                if claimant != *rename && !reaches(&edges, claimant, *rename) {
+                    edges[*rename].insert(claimant);
+                    chained = true;
+                }
             }
         }
     }
