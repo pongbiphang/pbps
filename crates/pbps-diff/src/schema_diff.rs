@@ -635,10 +635,10 @@ fn diff_partial_rebuilding(
             }
         })
         .collect();
-    let mut chain_depth: BTreeMap<(TableName, String), u8> = BTreeMap::new();
+    let mut chain_depth: BTreeMap<(TableName, String), usize> = BTreeMap::new();
     let mut cycles: BTreeSet<(TableName, BTreeSet<String>)> = BTreeSet::new();
     for ((table, from), to) in &vacates {
-        let mut depth = 0u8;
+        let mut depth = 0usize;
         let mut path = vec![from.clone()];
         let mut next = to;
         while let Some(after) = vacates.get(&(table.clone(), next.clone())) {
@@ -648,7 +648,7 @@ fn diff_partial_rebuilding(
                 break;
             }
             path.push(next.clone());
-            depth = depth.saturating_add(1);
+            depth += 1;
             next = after;
         }
         chain_depth.insert((table.clone(), from.clone()), depth);
@@ -659,7 +659,7 @@ fn diff_partial_rebuilding(
     // The class, and a rank inside it, so a change can sit between two
     // classes without a new ordinal shifting every one below it — the cost
     // `order_key`'s own doc names.
-    let sort_class = |c: &Change| -> (u8, u8) {
+    let sort_class = |c: &Change| -> (u8, usize) {
         if frees_a_renamed_column(c) {
             // Between the constraint and index drops of class 2 — a column a
             // check or an index names cannot be dropped while they stand —
@@ -683,7 +683,7 @@ fn diff_partial_rebuilding(
                 .get(&(table.clone(), from.clone()))
                 .copied()
                 .unwrap_or(0);
-            (order_key(c), 1u8.saturating_add(depth))
+            (order_key(c), 1 + depth)
         } else {
             (order_key(c), 1)
         }
@@ -4525,6 +4525,53 @@ mod tests {
 
     /// Revisions resolved in turn from `base`, each with its own intents,
     /// then diffed from the undeployed baseline.
+    /// A chain longer than a byte counts: each link keeps its own rank, so a
+    /// rename never runs before the one that vacates its target.
+    #[test]
+    fn a_column_rename_chain_longer_than_a_byte_keeps_every_link_in_order() {
+        const LINKS: usize = 300;
+        let cols = |names: &[String]| {
+            schema_of(
+                "dbo.t",
+                table(
+                    &names
+                        .iter()
+                        .map(|n| (n.as_str(), Column::new(ty("int"))))
+                        .collect::<Vec<_>>(),
+                ),
+            )
+        };
+        let name = |i: usize| format!("c{i:03}");
+        // Baseline `c000`..`c299`. Revision k renames `c(299-k)` to
+        // `c(300-k)`, the name the revision before it vacated.
+        let mut names: Vec<String> = (0..LINKS).map(name).collect();
+        let base = cols(&names);
+        let mut revisions = Vec::new();
+        for k in 0..LINKS {
+            let from = LINKS - 1 - k;
+            names[from] = name(from + 1);
+            revisions.push((
+                cols(&names),
+                vec![Intent::RenameColumn {
+                    table: "dbo.t".parse().unwrap(),
+                    from: name(from),
+                    to: name(from + 1),
+                }],
+            ));
+        }
+        let cs = across_revisions(&base, &revisions);
+        let order: Vec<String> = cs
+            .changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::RenameColumn { from, .. } => Some(from.clone()),
+                _ => None,
+            })
+            .collect();
+        let expected: Vec<String> = (0..LINKS).rev().map(name).collect();
+        assert_eq!(order, expected);
+    }
+
     /// The base schema and every revision resolved in turn, without the
     /// diff: for a case whose diff reports an error rather than a plan.
     fn revisions_diffed(base: &Schema, revisions: &[(Schema, Vec<Intent>)]) -> Diffed {
