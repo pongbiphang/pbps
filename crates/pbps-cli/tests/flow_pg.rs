@@ -1610,7 +1610,8 @@ fn a_view_kept_on_a_function_dropped_for_good_refuses_the_plan_by_name() {
         connection,
         "CREATE SCHEMA app; \
          CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
-         CREATE VIEW app.v AS SELECT app.f(1) AS one",
+         CREATE FUNCTION app.g(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE VIEW app.v AS SELECT app.f(1) AS one, app.g(1) AS two",
     );
     let d = Demo::new("view-on-dropped-function");
     succeeds(d.run(&["pull", "--db", connection]));
@@ -1625,6 +1626,23 @@ fn a_view_kept_on_a_function_dropped_for_good_refuses_the_plan_by_name() {
     let err = stderr(&o);
     assert!(err.contains("app.v"), "{err}");
     assert!(err.contains("app.f(integer)"), "{err}");
+    assert!(!plan.exists(), "a refused plan wrote {}", plan.display());
+
+    // The view also calls `g`, and this revision edits `g`: the view is on a
+    // rebuilt function too, and still refused for the dropped one rather than
+    // rebuilt through the other (#1069 review).
+    let g = d.dir.join("schema/app.g%28integer%29.function.yml");
+    let text = std::fs::read_to_string(&g).unwrap();
+    std::fs::write(&g, text.replace("SELECT x", "SELECT x + 0")).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    let err = stderr(&o);
+    assert!(
+        err.contains("app.v") && err.contains("app.f(integer)"),
+        "{err}"
+    );
     assert!(!plan.exists(), "a refused plan wrote {}", plan.display());
 
     std::fs::remove_file(d.dir.join("schema/app.v.view.yml")).unwrap();

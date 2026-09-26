@@ -85,12 +85,30 @@ pub(crate) fn untouched_module_dependents(
             _ => false,
         })
     };
-    found
+    // Left out wherever else it is found: a view on a dropped function and
+    // on a rebuilt one is still a view on the dropped function, and rebuilding
+    // it for the second would hand `weave` a create to take as its
+    // restoration from the first.
+    let on_a_dropped_root: std::collections::BTreeSet<&ModuleId> = found
         .iter()
-        .filter(|(root, _)| recreated(root))
+        .filter(|(root, _)| !recreated(root))
         .flat_map(|(_, deps)| deps)
         .filter_map(|d| match &d.holds {
-            Holds::Module(x) if declared.modules.contains_key(x) && !touched(x) => Some(x.clone()),
+            Holds::Module(x) => Some(x),
+            Holds::TablePart { .. } | Holds::Unrepresentable(_) => None,
+        })
+        .collect();
+    found
+        .values()
+        .flatten()
+        .filter_map(|d| match &d.holds {
+            Holds::Module(x)
+                if declared.modules.contains_key(x)
+                    && !touched(x)
+                    && !on_a_dropped_root.contains(x) =>
+            {
+                Some(x.clone())
+            }
             Holds::Module(_) | Holds::TablePart { .. } | Holds::Unrepresentable(_) => None,
         })
         .collect()
@@ -1591,6 +1609,18 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         assert_eq!(back, ["app.v0"]);
+
+        // The same view also on a module the plan rebuilds: it is still on
+        // the dropped function, and not handed back through the other root
+        // (#1069 review). `weave` refuses it.
+        let both = BTreeMap::from([
+            (id("app.f(integer)"), vec![view("app.v0")]),
+            (id("app.v1"), vec![view("app.v0")]),
+        ]);
+        let mut cs = plan(vec![drop(), alter(&s, "app.v1")]);
+        assert!(untouched_module_dependents(&cs, &both, &s).is_empty());
+        let refused = weave(&mut cs, &both, &s, &[&ids], pg().as_ref()).unwrap_err();
+        assert!(refused.contains("view app.v0"), "{refused}");
     }
 
     /// A plan that drops a function and replaces the table its check lives on
