@@ -23317,6 +23317,100 @@ async fn relation_name_occupants_name_each_kind_and_its_owner() {
         .expect("drop");
 }
 
+/// #987: two tables whose unnamed keys generate one `_pkey` get the engine's
+/// first choice and its first fallback, as the dialect predicts. A declared
+/// index at that fallback lands differently by order: created after both
+/// tables it is refused with `42P07`, created between them it pushes the
+/// second key to the next fallback. That order dependence is why the check
+/// refuses the declaration.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_generated_fallback_is_the_one_the_engine_uses_and_order_decides_it() {
+    use pbps_model::{Column, PrimaryKey, Table};
+    let mut conn = connect().await;
+    let s = probe_schema_9("fallbacks");
+    let long = |c: char| format!("{}{c}", "a".repeat(59));
+    let mut keyed = Table::default();
+    keyed.columns.insert(
+        "id".into(),
+        Column::new("integer".parse().unwrap()).not_null(),
+    );
+    keyed.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+    });
+    let pg = Postgres::new();
+    let first = pg.implicit_relation_names(&TableName::new(&s, long('x')), &keyed)[0]
+        .0
+        .clone();
+    let fallback =
+        |n| pg.implicit_relation_fallbacks(&TableName::new(&s, long('y')), &keyed, n)[0].clone();
+    let keys = |schema: &str| {
+        format!(
+            "SELECT string_agg(c.relname, ',' ORDER BY c.oid) FROM pg_class c JOIN pg_namespace n \
+             ON n.oid = c.relnamespace WHERE n.nspname = '{schema}' AND c.relkind = 'i'"
+        )
+    };
+
+    // Both tables, nothing declared between them: first choice, then fallback 1.
+    fresh(&mut conn, &s).await;
+    for c in ['x', 'y'] {
+        conn.execute(&format!(
+            "CREATE TABLE {s}.\"{}\" (id integer PRIMARY KEY)",
+            long(c)
+        ))
+        .await
+        .expect("a table");
+    }
+    assert_eq!(
+        text(&mut conn, &keys(&s)).await,
+        format!("{first},{}", fallback(1))
+    );
+    // A declared index at fallback 1, created now: refused.
+    let refused = conn
+        .execute(&format!(
+            "CREATE INDEX \"{}\" ON {s}.\"{}\" (id)",
+            fallback(1),
+            long('x')
+        ))
+        .await
+        .expect_err("fallback 1 is taken");
+    assert_eq!(
+        refused.server_error_code().as_deref(),
+        Some("42P07"),
+        "{refused:?}"
+    );
+
+    // The same index created between the two tables: the second key moves on.
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.\"{}\" (id integer PRIMARY KEY)",
+        long('x')
+    ))
+    .await
+    .expect("the first table");
+    conn.execute(&format!(
+        "CREATE INDEX \"{}\" ON {s}.\"{}\" (id)",
+        fallback(1),
+        long('x')
+    ))
+    .await
+    .expect("fallback 1 is free yet");
+    conn.execute(&format!(
+        "CREATE TABLE {s}.\"{}\" (id integer PRIMARY KEY)",
+        long('y')
+    ))
+    .await
+    .expect("the second table");
+    assert_eq!(
+        text(&mut conn, &keys(&s)).await,
+        format!("{first},{},{}", fallback(1), fallback(2))
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
 /// #465: what the dialect predicts PostgreSQL generates for an unnamed
 /// primary key and an identity column is what the engine generates, for
 /// short, long and multibyte names alike; a declared index created after the

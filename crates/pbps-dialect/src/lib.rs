@@ -1944,6 +1944,22 @@ pub trait Dialect {
         Vec::new()
     }
 
+    /// The name the engine falls back to for each of
+    /// [`Dialect::implicit_relation_names`], in the same order, when its first
+    /// choice is taken and this is its `suffix`-th retry (#987). Two tables
+    /// whose generated names meet do not fail: the engine suffixes the later
+    /// one, and which one is later is the plan's order. A declared name equal
+    /// to a fallback is the same order dependence as one equal to the first
+    /// choice. The default is none, like the first choices.
+    fn implicit_relation_fallbacks(
+        &self,
+        _name: &TableName,
+        _table: &Table,
+        _suffix: u32,
+    ) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Where `to` sits on the path a bare name in a definition in `from` is
     /// looked up along, or `None` where it is not on that path at all
     /// (DECISIONS 317).
@@ -2415,11 +2431,22 @@ pub fn check_index_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> 
     // measured — and a plan's order is not one to depend on. So a generated
     // name that meets a declared one is refused whichever comes first; two
     // generated names that meet are not, because the engine resolves that
-    // itself (#465, DEC-465.1).
+    // itself (#465, DEC-465.1). It resolves it by suffixing the later one,
+    // so the names it may fall back to are in play as well (#987).
     let declared_names: BTreeSet<ObjectName> = claimed.keys().cloned().collect();
+    let mut generated: BTreeMap<ObjectName, Vec<(&TableName, usize, String)>> = BTreeMap::new();
     for (table_name, table) in &schema.tables {
-        for (name, descriptor) in dialect.implicit_relation_names(table_name, table) {
+        for (i, (name, descriptor)) in dialect
+            .implicit_relation_names(table_name, table)
+            .into_iter()
+            .enumerate()
+        {
             let claim_name = ObjectName::new(table_name.schema.clone(), name);
+            generated.entry(claim_name.clone()).or_default().push((
+                table_name,
+                i,
+                descriptor.clone(),
+            ));
             if declared_names.contains(&claim_name) {
                 let existing = &claimed[&claim_name];
                 problems.push(format!(
@@ -2430,6 +2457,37 @@ pub fn check_index_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> 
                     existing.descriptor,
                     dialect.name()
                 ));
+            }
+        }
+    }
+    // `c` generated names meeting at one name: the engine keeps it for the
+    // first created and gives the others its 1st to `c - 1`th fallback, in an
+    // order the plan decides. Any of them may be where any claimant lands.
+    for claimants in generated.values().filter(|c| c.len() > 1) {
+        let retries = u32::try_from(claimants.len() - 1).unwrap_or(u32::MAX);
+        let mut reported = BTreeSet::new();
+        for (table_name, i, descriptor) in claimants {
+            let table = &schema.tables[*table_name];
+            for suffix in 1..=retries {
+                let Some(fallback) = dialect
+                    .implicit_relation_fallbacks(table_name, table, suffix)
+                    .into_iter()
+                    .nth(*i)
+                else {
+                    continue;
+                };
+                let claim_name = ObjectName::new(table_name.schema.clone(), fallback);
+                if declared_names.contains(&claim_name) && reported.insert(claim_name.clone()) {
+                    let existing = &claimed[&claim_name];
+                    problems.push(format!(
+                        "{} and {descriptor} may both be named `{claim_name}`: {descriptor} \
+                         meets another generated name, and {} gives one of them this name \
+                         instead, which one depending on the order they are created in. \
+                         Name the primary key, or rename the other object",
+                        existing.descriptor,
+                        dialect.name()
+                    ));
+                }
             }
         }
     }
