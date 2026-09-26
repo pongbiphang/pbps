@@ -749,3 +749,62 @@ How a difference becomes an ordered list of changes and statements. Part of the
     retention, and absence/definition negatives. Historical table-name reuse and
     column rename chains remain separate scopes (#536 and #541); this graph adds
     no implicit drop or rename intent and no connected I/O to the differ.
+
+<a id="dec-536-1"></a>
+
+**DEC-536.1. A dropped table releases its name in the DECISIONS 496 graph, with
+the foreign-key drops it needs.** Two revisions deployed together can drop
+`app.target` and then rename `app.old` into its name. `DropTable` ran in its own
+class after every rename, so the plan was one neither engine performs: measured,
+`sp_rename` into the doomed name is Msg 15335 on SQL Server 17.0.4075.5 and
+`ALTER TABLE … RENAME` is `42P07` on PostgreSQL 18.6. A dropped table releases
+its own name on every dialect, so the graph no longer returns early when the
+dialect shares neither indexes nor constraints with tables. The table also
+releases the names it carries, by the dialect's two answers. A drop whose name
+nothing claims keeps its class.
+
+The drop cannot run while another table's key names it, so every foreign-key
+drop that references it moves ahead with it. Its own key drops, which the
+differ emits separately, move too, as do the keys another dropped table has on
+it. A dropped table's own keys carry its baseline name, which for the doomed
+table a rename into that name also carries once it has run, so they keep that
+address and are never rekeyed to the rename's source. Where both tables have a
+key of one name (PostgreSQL scopes constraint names to the table), the two
+changes are identical, and the first is taken as the doomed table's. Which key
+references the doomed table is read from the baseline, where a table renamed
+into its name is still under its source.
+
+The apply movement check keys both reads by table name, and that name now
+belongs to two tables across one plan, as a column name did in DECISIONS 474.
+A read that still holds the rename's source holds the doomed table under the
+name; its entry is skipped, and the renamed table's own entry compares it.
+Holding both spellings no longer stops the rename being undone when this plan
+drops the occupant: that is the plan's own order, and refusing it reported an
+untouched child's key, which follows the rename, as moved. A single revision
+that renames into a surviving table's name is still refused by `resolve`.
+`DropModule` needs no change: it sorts before every table rename already.
+
+A key that reads the same by name in the first and last revision can still
+point at two tables: it referenced the doomed table, went with it, and a later
+revision re-added it under the same name to the table renamed into that name.
+Compared by name alone nothing changed, yet the standing key blocks the drop
+(Msg 3726 on SQL Server) and the engine would never bind it to the new
+occupant. The differ compares the referenced table's uid on the two sides, read
+from the baseline as spelled there, and plans a visible drop and re-add when
+they differ.
+
+A rename releases its source name as it runs, so a rename into that name runs
+after it. Skipped revisions that rename `z` into `a` and then `y` into `z` form
+a chain the alphabet otherwise ordered (`y -> z` first, Msg 15335). A move to
+another schema also releases the intermediate name it passes through, its
+source name in the destination schema: `s1.z -> s2.a` holds `s2.z` for a
+moment, so `s1.y -> s2.z` waits for it (Msg 15530, `42P07`). A cycle —
+two tables trading names through a third — has no order an engine takes
+without a temporary name; its edge is left out, and the engine refuses it as
+before. The apply movement check likewise undoes a rename whose target this
+plan renames away, as it does one whose occupant it drops: an untouched
+child's key follows `y` to `z` and is not movement. Each read undoes only the
+renames that had run when it was taken — a rename has run when its source name
+is gone, or holds the next link, whose rename has run. One map for both reads
+rewrote the earlier read's `z`, still the original table, to `y`, and a key
+that followed the chain's head from `z` to `a` read as moved.
