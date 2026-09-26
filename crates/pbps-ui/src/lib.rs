@@ -642,6 +642,20 @@ mod tests {
                 shipped.push(package.to_owned());
             }
         }
+        // A build script and its dependencies also run as part of this crate,
+        // and could generate code for it; the UI has neither.
+        assert!(manifest.get("build-dependencies").is_none());
+        for target in manifest
+            .get("target")
+            .and_then(toml::Value::as_table)
+            .into_iter()
+            .flat_map(|targets| targets.values())
+        {
+            assert!(target.get("build-dependencies").is_none());
+        }
+        assert!(manifest["package"].get("build").is_none());
+        // Tests run in the package root, where Cargo finds a `build.rs`.
+        assert!(!std::path::Path::new("build.rs").exists());
         shipped.sort_unstable();
         assert_eq!(
             shipped,

@@ -684,6 +684,7 @@ fn the_ui_reads_no_environment_value() {
     let mut scrubs = 0;
     let mut suppressions = Vec::new();
     let mut macros = Vec::new();
+    let mut outside = Vec::new();
     for file in files {
         if file.ends_with("guardrails.rs") {
             continue;
@@ -702,8 +703,14 @@ fn the_ui_reads_no_environment_value() {
             suppressions.push((name.clone(), suppression));
         }
         let text = normalized(&source);
-        if code_only(&source).contains("macro_rules!") {
+        let code = code_only(&source);
+        if code.contains("macro_rules!") {
             macros.push(name.clone());
+        }
+        // `#[path]` and `include!` compile source this walk of `src` never
+        // reads. `include_str!`/`include_bytes!` embed data, not code.
+        if code.contains("#[path=") || code.contains("include!(") {
+            outside.push(name.clone());
         }
         let without = if name == "compose/git.rs" {
             scrubs += text.matches(NAMES_ONLY_SCRUB).count();
@@ -721,6 +728,11 @@ fn the_ui_reads_no_environment_value() {
     // sees, and the lint it would silence cannot flag its own suppression.
     // The crate defines none, and keeps it that way (#1065).
     assert_eq!(macros, Vec::<String>::new(), "pbps-ui defines no macros");
+    assert_eq!(
+        outside,
+        Vec::<String>::new(),
+        "pbps-ui compiles no source from outside src"
+    );
     // The lints in `clippy.toml` are silenced in exactly one place: the scrub
     // statement. Any other `allow` or `expect` would let a read the source
     // scan cannot see, such as one a macro assembles, through CI's clippy.
