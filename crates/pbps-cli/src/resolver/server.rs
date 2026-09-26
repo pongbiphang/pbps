@@ -1661,14 +1661,17 @@ impl ScratchRun {
     ) -> Result<pbps_db::resolver::capture::Assessment, Error> {
         // In flight across the compilation: dropped part-way, the scratch
         // session is mid-transaction, and the next check must end the run.
+        let base = engine::Managed::from_schema(request.base);
+        let desired = engine::Managed::from_schema(request.desired);
+        // An overload the plan drops is identified by the deployer the
+        // compile runs as, since that is who resolves the plan's DROP.
+        reconstruction.drops(base.dropped_by(&desired));
         let scratch = self.scratch.as_mut().ok_or(Error::Cancelled)?;
         self.in_flight = true;
         let compiled = engine::compile(reconstruction, extras, &mut scratch.connection).await;
         self.in_flight = false;
         compiled.map_err(Error::Binding)?;
         self.check(target).await?;
-        let base = engine::Managed::from_schema(request.base);
-        let desired = engine::Managed::from_schema(request.desired);
         // Scratch is read through an administrative session: the capture
         // reads settings a least-privilege deployer need not see, and which
         // role reads a catalog row does not change what was bound.

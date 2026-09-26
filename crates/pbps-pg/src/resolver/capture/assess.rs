@@ -66,6 +66,17 @@ impl Managed {
         managed
     }
 
+    /// Declared routines these managed objects hold and `desired` does not:
+    /// the overloads a plan from this side to `desired` drops.
+    pub fn dropped_by(&self, desired: &Managed) -> Vec<pbps_model::ModuleId> {
+        self.routines
+            .values()
+            .flatten()
+            .filter(|id| !desired.routines.values().any(|kept| kept.contains(*id)))
+            .cloned()
+            .collect()
+    }
+
     /// The scope that captures every managed object of these names with its
     /// bindings, and every same-named object beside it.
     fn scope(&self) -> BTreeSet<CandidateSet> {
@@ -90,7 +101,6 @@ impl Managed {
         &self,
         class: CandidateClass,
         member: &ObjectIdentity,
-        members: &BTreeSet<ObjectIdentity>,
         order: &crate::resolver::reconstruct::Reconstruction,
     ) -> bool {
         let [schema, name] = member.name.as_slice() else {
@@ -108,30 +118,16 @@ impl Managed {
             // only through its internal dependency on the row type (#1041).
             CandidateClass::Type => self.relations.contains(&key(name)),
             // A declared overload the desired schema keeps was compiled on
-            // scratch, which gives its catalog identity, and only that
-            // identity is it: a count would let an unmanaged overload stand
-            // in for a declared one the target lacks. An overload the plan
-            // drops was never compiled, so those alone are counted, against
-            // the target members no compiled identity accounts for.
-            CandidateClass::Routine => {
-                let Some(declared) = self.routines.get(&key(name)) else {
-                    return false;
-                };
-                let known: BTreeSet<&ObjectIdentity> =
-                    declared.iter().filter_map(|id| order.created(id)).collect();
-                if known.contains(member) {
-                    return true;
-                }
-                let dropped = declared
+            // scratch, which gives its catalog identity; one the plan drops is
+            // identified from its declared signature. Only those identities
+            // are it: a count would let an unmanaged overload stand in for a
+            // declared one the target lacks (#1063).
+            CandidateClass::Routine => self.routines.get(&key(name)).is_some_and(|declared| {
+                declared
                     .iter()
-                    .filter(|id| order.created(id).is_none())
-                    .count();
-                let unaccounted = members
-                    .iter()
-                    .filter(|other| other.name == member.name && !known.contains(other))
-                    .count();
-                unaccounted <= dropped
-            }
+                    .filter_map(|id| order.created(id).or_else(|| order.dropped(id)))
+                    .any(|known| known == member)
+            }),
             CandidateClass::Operator
             | CandidateClass::Collation
             | CandidateClass::OperatorClass
@@ -380,13 +376,12 @@ pub fn assess(
     // enough: scratch made its copy from a declaration, while the target's
     // may be an unmanaged object that holds the name, such as one a plan
     // creates or one that took a generated name first (#1041).
-    let own = |class: CandidateClass, member: &ObjectIdentity, members| {
-        managed.holds(class, member, members, order)
+    let own = |class: CandidateClass, member: &ObjectIdentity| {
+        managed.holds(class, member, order)
             || makers.get(member).into_iter().flatten().any(|maker| {
                 let maker = owner(maker);
-                candidate_class(&maker.class).is_some_and(|class| {
-                    managed.holds(class, maker, &BTreeSet::from([maker.clone()]), order)
-                })
+                candidate_class(&maker.class)
+                    .is_some_and(|class| managed.holds(class, maker, order))
             })
     };
     // A set is faithful when scratch reproduced every target member that
@@ -425,7 +420,7 @@ pub fn assess(
             // creating them made, so a member only scratch has was
             // reproduced. A target member, whether scratch has the same
             // identity or the plan drops it, must be the project's own.
-            !on_target.contains(member) || own(set.class, member, on_target)
+            !on_target.contains(member) || own(set.class, member)
         })
     };
     let mut assessment = Assessment::default();
@@ -706,17 +701,15 @@ mod tests {
             },
         );
         let managed = Managed::from_schema(&schema);
-        let none = BTreeSet::new();
-        // Nothing compiled: every declared overload counts as one the plan
-        // drops. The compiled-identity half is pinned on real engines.
+        // Nothing compiled or identified: a declared routine holds no
+        // overload by its name alone. Identities are pinned on real engines.
         let order = crate::resolver::reconstruct::Reconstruction::new(&crate::Postgres::new(), &[])
             .unwrap();
         let relation = id("pg_class", &["app", "t"], Vec::new());
-        assert!(managed.holds(CandidateClass::Relation, &relation, &none, &order));
+        assert!(managed.holds(CandidateClass::Relation, &relation, &order));
         assert!(managed.holds(
             CandidateClass::Type,
             &id("pg_type", &["app", "t"], Vec::new()),
-            &none,
             &order
         ));
         // The array type's name is not the project's: an earlier type may
@@ -724,13 +717,11 @@ mod tests {
         assert!(!managed.holds(
             CandidateClass::Type,
             &id("pg_type", &["app", "_t"], Vec::new()),
-            &none,
             &order
         ));
         assert!(!managed.holds(
             CandidateClass::Relation,
             &id("pg_class", &["other", "t"], Vec::new()),
-            &none,
             &order
         ));
         // An index is a relation with no row or array type.
@@ -750,19 +741,16 @@ mod tests {
         assert!(with_index.holds(
             CandidateClass::Relation,
             &id("pg_class", &["app", "ix"], Vec::new()),
-            &none,
             &order
         ));
         assert!(!with_index.holds(
             CandidateClass::Type,
             &id("pg_type", &["app", "ix"], Vec::new()),
-            &none,
             &order
         ));
         assert!(!managed.holds(
             CandidateClass::Operator,
             &id("pg_operator", &["app", "t"], Vec::new()),
-            &none,
             &order
         ));
         let integer = id(
@@ -770,15 +758,7 @@ mod tests {
             &["app", "f"],
             vec![id("pg_type", &["pg_catalog", "int4"], Vec::new())],
         );
-        let text = id(
-            "pg_proc",
-            &["app", "f"],
-            vec![id("pg_type", &["pg_catalog", "text"], Vec::new())],
-        );
-        let one = BTreeSet::from([integer.clone()]);
-        let two = BTreeSet::from([integer.clone(), text]);
-        assert!(managed.holds(CandidateClass::Routine, &integer, &one, &order));
-        assert!(!managed.holds(CandidateClass::Routine, &integer, &two, &order));
+        assert!(!managed.holds(CandidateClass::Routine, &integer, &order));
     }
 
     /// A surface depends on every name it bound, looked up along its own
