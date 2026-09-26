@@ -1263,13 +1263,17 @@ mod recon611 {
             format!(
                 "CREATE LOGIN [{dep}] WITH PASSWORD = 'Pbps!Recon1011', CHECK_POLICY = OFF; \
                  CREATE USER [{dep}] FOR LOGIN [{dep}]; CREATE USER app_owner WITHOUT LOGIN; \
-                 CREATE ROLE Readers; CREATE ROLE Writers; CREATE USER auditor WITHOUT LOGIN;"
+                 CREATE ROLE Readers; CREATE ROLE Writers; CREATE USER auditor WITHOUT LOGIN; \
+                 CREATE ROLE Leads; ALTER ROLE Leads ADD MEMBER [{dep}]; \
+                 CREATE ROLE Owned AUTHORIZATION Leads;"
             ),
             "CREATE SCHEMA app AUTHORIZATION app_owner;".to_owned(),
             format!(
                 "GRANT SELECT ON SCHEMA::app TO Readers; GRANT INSERT ON SCHEMA::app TO Writers; \
                  GRANT SELECT ON SCHEMA::app TO [{dep}]; \
                  GRANT VIEW DEFINITION ON ROLE::Readers TO [{dep}]; \
+                 GRANT DELETE ON SCHEMA::app TO Owned; \
+                 GRANT VIEW DEFINITION ON ROLE::Owned TO [{dep}]; \
                  DENY VIEW DEFINITION ON USER::auditor TO [{dep}];"
             ),
         ] {
@@ -1298,25 +1302,29 @@ mod recon611 {
                 (
                     g.on.as_str(),
                     context.principals.get(&g.on).copied(),
+                    g.grant.grantor.as_str(),
                     g.grant.permission.as_str(),
                     g.grant.state.as_str(),
                 )
             })
             .collect();
+        let role = Some(PrincipalKind::Role);
         assert_eq!(
             on,
             [
-                (
-                    "Readers",
-                    Some(PrincipalKind::Role),
-                    "VIEW DEFINITION",
-                    "GRANT"
-                ),
+                // Granted by `sa`, recorded under the role's owner (measured):
+                // the row a `dbo`-owned role on scratch could not replay
+                // without a grant-option row the deployer would see.
+                ("Owned", role, "Leads", "VIEW DEFINITION", "GRANT"),
+                ("Readers", role, "dbo", "VIEW DEFINITION", "GRANT"),
                 // A DENY does not make the principal's row visible
-                // (measured), so its kind is unknown to the deployer.
-                ("auditor", None, "VIEW DEFINITION", "DENY"),
+                // (measured), so its kind is unknown to the deployer. A user
+                // owns itself, and is recorded as the grantor.
+                ("auditor", None, "auditor", "VIEW DEFINITION", "DENY"),
             ]
         );
+        assert_eq!(context.principal_owners["Owned"], "Leads");
+        assert_eq!(context.principal_owners["Readers"], "dbo");
 
         scratch
             .conn
