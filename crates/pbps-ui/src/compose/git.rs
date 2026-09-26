@@ -13,12 +13,27 @@ pub(super) struct Git {
     pub deadline: Duration,
 }
 
+/// The names of the variables the UI inherited. Each value is dropped here
+/// and never leaves: this is the only environment read the UI makes, and
+/// the exception covers this one statement (ADR-0015 decision 4,
+/// DEC-1050.1), so any other read, even in this function, is an error.
+fn inherited_names() -> impl Iterator<Item = OsString> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "reads only the names of inherited variables and discards every value"
+    )]
+    // The value is dropped in the excepted statement itself, so what it
+    // binds can hold names only.
+    let names = std::env::vars_os().map(|(name, _)| name);
+    names
+}
+
 impl Git {
     pub fn command(&self) -> Command {
         let mut command = Command::new("git");
         // Keep the user's authentication mechanism, but never repository,
         // config-injection or trace-output overrides inherited by the UI.
-        for (name, _) in std::env::vars_os() {
+        for name in inherited_names() {
             if name.to_string_lossy().starts_with("GIT_")
                 && !matches!(
                     name.to_str(),

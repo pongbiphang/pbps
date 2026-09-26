@@ -132,39 +132,23 @@ impl Viewer {
         if !matches!(request.method().as_str(), "GET" | "HEAD") {
             return plain(405, "This viewer accepts reads only");
         }
-        match request.url() {
-            "/" => (200, "text/html; charset=utf-8", HTML.as_bytes().to_vec()),
-            "/app.js" => (
-                200,
-                "text/javascript; charset=utf-8",
-                JS.as_bytes().to_vec(),
-            ),
-            "/compose.js" => (
-                200,
-                "text/javascript; charset=utf-8",
-                COMPOSE_JS.as_bytes().to_vec(),
-            ),
-            "/trigger.js" => (
-                200,
-                "text/javascript; charset=utf-8",
-                TRIGGER_JS.as_bytes().to_vec(),
-            ),
-            "/style.css" => (200, "text/css; charset=utf-8", CSS.as_bytes().to_vec()),
-            url => match route(url) {
-                Ok(view) => match self.client.read(&view) {
-                    Ok(bytes) => (
-                        200,
-                        if matches!(view, View::Docs) {
-                            "text/html; charset=utf-8"
-                        } else {
-                            "application/json"
-                        },
-                        bytes,
-                    ),
-                    Err(message) => plain(502, &message),
-                },
-                Err(message) => plain(400, message),
+        if let Some((_, mime, body)) = SHELL.iter().find(|(path, ..)| *path == request.url()) {
+            return (200, mime, body.as_bytes().to_vec());
+        }
+        match route(request.url()) {
+            Ok(view) => match self.client.read(&view) {
+                Ok(bytes) => (
+                    200,
+                    if matches!(view, View::Docs) {
+                        "text/html; charset=utf-8"
+                    } else {
+                        "application/json"
+                    },
+                    bytes,
+                ),
+                Err(message) => plain(502, &message),
             },
+            Err(message) => plain(400, message),
         }
     }
 }
@@ -222,6 +206,51 @@ const COMPOSE_ACTIONS: [&str; 11] = [
     "recover-resources",
     "forget",
 ];
+
+/// The immutable shell: served without the token (ADR-0015 decision 3), and
+/// the only routes that are. Serving and authorizing both read this table,
+/// so the two cannot disagree about which files are public.
+const SHELL: [(&str, &str, &str); 5] = [
+    ("/", "text/html; charset=utf-8", HTML),
+    ("/app.js", "text/javascript; charset=utf-8", JS),
+    ("/compose.js", "text/javascript; charset=utf-8", COMPOSE_JS),
+    ("/trigger.js", "text/javascript; charset=utf-8", TRIGGER_JS),
+    ("/style.css", "text/css; charset=utf-8", CSS),
+];
+
+/// Every read view: its path, the one parameter it takes, and the view it
+/// becomes. The router is this table, so a read cannot exist without being
+/// in it, and the guardrail tests enumerate it (#1050).
+type ReadView = fn(String) -> View;
+const READS: [(&str, Option<&str>, ReadView); 5] = [
+    ("/api/status", None, |_| View::Status),
+    ("/api/drift", Some("env"), View::Drift),
+    ("/api/plan", Some("path"), View::Plan),
+    ("/api/timeline", Some("env"), View::Timeline),
+    ("/api/docs", None, |_| View::Docs),
+];
+
+/// Every route the viewer answers besides the shell, as the router reads
+/// them: each read path with the one parameter it takes, then each write
+/// path. For the guardrail tests (#1050), which must cover a route the day it
+/// is added; not an API.
+#[doc(hidden)]
+pub fn routes() -> (Vec<(&'static str, Option<&'static str>)>, Vec<String>) {
+    let reads = READS
+        .iter()
+        .map(|(path, parameter, _)| (*path, *parameter))
+        .collect();
+    let writes = COMPOSE_ACTIONS
+        .iter()
+        .map(|action| format!("/api/compose/{action}"))
+        .chain(
+            trigger::ACTIONS
+                .iter()
+                .map(|action| format!("/api/trigger/{action}")),
+        )
+        .collect();
+    (reads, writes)
+}
 
 /// The complete write vocabulary: a fixed action name, no query, no path
 /// parameters. Anything else is an ordinary (read) route or refused.
@@ -317,10 +346,7 @@ fn authorized(
         Ok(None) if matches!(method, "GET" | "HEAD") => {}
         _ => return false,
     }
-    if matches!(
-        url,
-        "/" | "/app.js" | "/compose.js" | "/trigger.js" | "/style.css"
-    ) {
+    if SHELL.iter().any(|(path, ..)| *path == url) {
         return true;
     }
     one(TOKEN_HEADER) == Ok(Some(token))
@@ -343,14 +369,14 @@ fn route(url: &str) -> Result<View, &'static str> {
             .filter(|v| !v.is_empty())
             .ok_or("A named environment or saved plan path is required")
     };
-    let view = match path {
-        "/api/status" => View::Status,
-        "/api/drift" => View::Drift(value("env")?),
-        "/api/plan" => View::Plan(value("path")?),
-        "/api/timeline" => View::Timeline(value("env")?),
-        "/api/docs" => View::Docs,
-        _ => return Err("Unknown read view"),
-    };
+    let (_, parameter, view) = READS
+        .iter()
+        .find(|(known, ..)| *known == path)
+        .ok_or("Unknown read view")?;
+    let view = view(match parameter {
+        Some(key) => value(*key)?,
+        None => String::new(),
+    });
     if parameters.is_empty() {
         Ok(view)
     } else {
@@ -385,6 +411,9 @@ fn decode(value: &str) -> Result<String, &'static str> {
         Ok(text)
     }
 }
+
+#[cfg(test)]
+mod guardrails;
 
 #[cfg(test)]
 mod tests {

@@ -40,7 +40,7 @@ pub enum Intent {
 }
 
 impl Intent {
-    fn arguments(&self, base: &str) -> Vec<String> {
+    pub(crate) fn arguments(&self, base: &str) -> Vec<String> {
         match self {
             Self::Rename { from, to } => {
                 vec!["rename".into(), "--".into(), from.clone(), to.clone()]

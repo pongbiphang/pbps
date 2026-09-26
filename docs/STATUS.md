@@ -53,8 +53,9 @@ output branch, following [ADR-0017](ADR-0017-isolated-compose.md) as qualified
 by #745–#748. Its fixed `POST /api/compose/<action>` requests are the viewer's
 only writes besides step 5's. Compose is Linux-only until #471 qualifies other
 platforms. Phase 6 step 5 (#1025) adds **Plan & apply**, which runs `plan --env
---out` and `apply --plan --checksum` with a checksum a person types. See
-[UI.md](UI.md).
+--out` and `apply --plan --checksum` with a checksum a person types. Phase 6
+step 6 (#1050) tests ADR-0006's refusals across every route the router's tables
+hold (DEC-1050.1). See [UI.md](UI.md).
 
 A PostgreSQL `SECURITY DEFINER` routine that a plan or `bootstrap` writes must
 pin `search_path` with `pg_temp` last. The stored `proconfig` is checked

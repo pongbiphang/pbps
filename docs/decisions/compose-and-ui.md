@@ -410,3 +410,43 @@ The page asks `POST /api/trigger/runs` every two seconds while a run is going.
   and it is gone when the viewer exits. A remembered checksum is only a
   record of what ran, and it cannot authorize the next run.
 
+<a id="dec-1050-1"></a>
+
+**DEC-1050.1. The viewer's routes are tables the router reads, and ADR-0006's
+guardrail tests enumerate those tables.** ADR-0006 asks that the UI's refusals
+hold "structurally rather than by discipline": no endpoint takes raw SQL,
+nothing stores an approval, no connection string reaches the UI or the
+browser. Each of steps 3–5 tested its own routes. A test that lists routes by
+hand, though, passes for a route added after it was written.
+- The router reads four tables: `SHELL`, `READS`, `COMPOSE_ACTIONS` and
+  `trigger::ACTIONS`. Serving and the token exemption both read `SHELL`, so
+  they cannot disagree about which files are public.
+- The guardrail tests iterate those tables. `pbps_ui::routes()` exposes them
+  to the HTTP test (`#[doc(hidden)]`, not an API), so a route cannot exist
+  without being covered.
+- The HTTP test runs a viewer against a stand-in `pbps` that logs every
+  argument vector. SQL sent through every route and every field reaches a
+  child only as the value of one fixed option, never as an argument of its
+  own.
+- `pbps-ui` reads no environment *value*. Two checks hold this.
+  - `crates/pbps-ui/clippy.toml` disallows `std::env::var`, `var_os`,
+    `vars`, `vars_os` and the `env!`/`option_env!` macros. Clippy resolves
+    paths after macro expansion, and CI runs it with `-D warnings`.
+  - A source scan, with comments and whitespace removed, is a second net that
+    names the site it finds.
+  Compose's names-only `GIT_*` scrub is the one allowed site. The
+  `#[expect]` sits on the single `let` that calls `vars_os()` and drops each
+  value in the same statement, so what it binds holds names only. Any other
+  read is still an error, even one in the same helper. Because a local `allow`
+  or `expect` could silence the lints anywhere, the source test also requires
+  that single `#[expect]` to be the crate's only suppression of them, whether
+  by name, by the `style` or `all` group, or with `warnings`. A test pins the clippy configuration, so deleting
+  it fails.
+- The real-CLI test searches every response, served asset and file the
+  session leaves (git's compressed objects included) for the password marker
+  and the typed checksum.
+
+A route list kept beside the router, with a test comparing the two, was the
+alternative. It is refused because the comparison is itself a list someone
+has to remember to update.
+
