@@ -1188,6 +1188,10 @@ impl ScratchRun {
         target: &mut NativeTarget,
         request: &ScopeRequest,
     ) -> Result<Verdict, Error> {
+        // A cancelled step's session, or a refusal already recorded, ends
+        // the run before anything below records new cleanup state.
+        self.refuse_held_admin()?;
+        self.inner.live()?;
         let driver = self.inner.control.driver;
         let read =
             |error: crate::resolver::native::EnvironmentError| Error::Scope(error.to_string());
@@ -1230,7 +1234,13 @@ impl ScratchRun {
         let login = self.names.login().to_owned();
         let token = login[login.len().saturating_sub(16)..].to_owned();
         let map = scope::Principals::generate(&target_auth, &request.planned, &login, &token);
-        self.inner.control.roles = map.server_wide_names();
+        // Added to, never replaced: a role an earlier attempt may have
+        // created must stay among the names cleanup drops.
+        for role in map.server_wide_names() {
+            if !self.inner.control.roles.contains(&role) {
+                self.inner.control.roles.push(role);
+            }
+        }
         // The mapped deployer runs the plan's grants on scratch and is the
         // principal every scratch read below runs as; its name follows from
         // the principal alone, which the planned grants do not change. `None`

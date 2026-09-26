@@ -485,10 +485,30 @@ async fn a_cancelled_step_leaves_its_admin_session_to_cleanup() {
         // With the daemon reachable again, retrying the same step would
         // open a new administrative session in place of the held one; qualify
         // reaches it past every check. The retry must end the run instead.
+        // A retry naming another principal would record other run-local
+        // roles; the refused retry must leave the cleanup list as it was.
+        let roles = run.inner.control.roles.clone();
+        let other = ScopeRequest {
+            planned: vec![PlannedGrant {
+                principal: "pbps_retry_1031".into(),
+                schema: if driver() == Driver::Postgres {
+                    "public".into()
+                } else {
+                    "dbo".into()
+                },
+                privilege: "USAGE".into(),
+                revoke: false,
+            }],
+            ..ScopeRequest::default()
+        };
         let retried = match stage {
-            "qualify" => run.qualify(&mut target, &request).await.map(|_| ()),
+            "qualify" => run.qualify(&mut target, &other).await.map(|_| ()),
             _ => run.resolve(&mut target, &binding).await.map(|_| ()),
         };
+        assert_eq!(
+            run.inner.control.roles, roles,
+            "{stage}: a refused retry kept the recorded run-local roles"
+        );
         assert!(
             matches!(retried, Err(Error::Cancelled)),
             "{stage}: a retry after cancellation ends the run: {retried:?}"
