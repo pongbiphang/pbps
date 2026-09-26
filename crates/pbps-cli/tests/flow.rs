@@ -13105,6 +13105,59 @@ fn envelope_schema() -> serde_json::Value {
 /// schema is that a consumer can trust every key in it, and a test that checked
 /// three of them would let the fourth drift the moment somebody adds a field
 /// without describing it.
+/// The first schema set published under DEC-997.1's rule: the envelope wire
+/// version moves whenever an envelope could fail a schema published before.
+/// Earlier sets under the same wire version predate the rule (DECISIONS
+/// 435's `denied` variant), so they are not held to it.
+const FIRST_SET_UNDER_THE_WIRE_RULE: u32 = 16;
+
+/// Every archived envelope schema, from `FIRST_SET_UNDER_THE_WIRE_RULE` on,
+/// stamped with the wire version the current document pins (#1038). An
+/// envelope this build emits must validate against each of them: if it does
+/// not, the change was breaking, and `output::SCHEMA_VERSION` should have
+/// moved. This checks what DEC-997.1 promises, on real output, without
+/// deciding JSON Schema containment (DECISIONS 465).
+fn archived_validators() -> &'static [(u32, jsonschema::Validator)] {
+    static VALIDATORS: std::sync::OnceLock<Vec<(u32, jsonschema::Validator)>> =
+        std::sync::OnceLock::new();
+    VALIDATORS.get_or_init(|| {
+        let wire = |document: &serde_json::Value| {
+            document["$defs"]["envelope.status"]["properties"]["schema_version"]["const"].clone()
+        };
+        let current = wire(&envelope_schema());
+        assert!(
+            current.is_u64(),
+            "the current envelope pins its wire version"
+        );
+        let archives = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("published-schemas");
+        let mut validators = Vec::new();
+        for entry in std::fs::read_dir(&archives).unwrap() {
+            let name = entry.unwrap().file_name().into_string().unwrap();
+            let Ok(set) = name.parse::<u32>() else {
+                continue;
+            };
+            if set < FIRST_SET_UNDER_THE_WIRE_RULE {
+                continue;
+            }
+            let path = archives.join(&name).join("envelope.schema.json");
+            let document: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            if wire(&document) == current {
+                validators.push((set, jsonschema::validator_for(&document).unwrap()));
+            }
+        }
+        validators.sort_by_key(|(set, _)| *set);
+        assert!(
+            !validators.is_empty(),
+            "no archived schema set shares the current wire version"
+        );
+        validators
+    })
+}
+
 #[track_caller]
 fn envelope_matches_schema(validator: &jsonschema::Validator, label: &str, out: &Output) {
     let text = stdout(out);
@@ -13112,6 +13165,15 @@ fn envelope_matches_schema(validator: &jsonschema::Validator, label: &str, out: 
         .unwrap_or_else(|e| panic!("{label}: stdout is not JSON ({e}): {text}"));
     if let Err(e) = validator.validate(&value) {
         panic!("{label}: the envelope does not match the published schema: {e}\n{text}");
+    }
+    for (set, archived) in archived_validators() {
+        if let Err(e) = archived.validate(&value) {
+            panic!(
+                "{label}: schema set {set}, published under the same envelope wire version, \
+                 refuses this envelope ({e}); a breaking change moves output::SCHEMA_VERSION \
+                 (DEC-997.1)\n{text}"
+            );
+        }
     }
     if matches!(label, "status" | "verify" | "explain" | "state list") {
         pbps_ui::contract::parse(label, &out.stdout, code(out)).unwrap_or_else(|e| {
