@@ -960,7 +960,19 @@ value function's fixed type, a grouping's inferred operators and a derived
 collation follow from other parts of the tree, which are compared themselves.
 A constant's or coercion's type, a written column definition and a named
 operator or routine can be a name in the source, stored no differently when
-they were not, so they count (#1062). A declaration the plan leaves unchanged has the same text on both sides and
+they were not, so they count. The same holds for a call's form: a stored tree
+does not say whether `foo('x'::text)` matched `foo(text)` exactly, which a
+type `foo` cannot displace, or was written `foo('x')`, which it can; nor
+whether `1` was written `'1'::int4`. Both forms are therefore treated as
+looked up, and a same-named type the target alone holds leaves either
+unresolved. This is a known limitation, kept on purpose: the written form is
+not in the catalog, the engine exposes no raw parse tree (measured on 16 and
+18), and recovering it would take a SQL parser (ADR-0016 refuses grammar work)
+or probe types planted on scratch. The conservative answer records nothing
+wrongly, but it does block a plan whose affected surface only an exact call or
+a cast constant binds, since an unresolved verdict prevents a deployable plan
+(SPEC §9.3.2). The remedy is the operator's: remove or rename the unmanaged
+type the target alone holds (#1062). A declaration the plan leaves unchanged has the same text on both sides and
 resolves the same names; only the selected objects can differ, and that is
 what the bindings carry. On the target each member must be an engine object
 scratch has with the same properties, role references removed because the
