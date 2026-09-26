@@ -22,8 +22,10 @@ fn inherited_names() -> impl Iterator<Item = OsString> {
         clippy::disallowed_methods,
         reason = "reads only the names of inherited variables and discards every value"
     )]
-    let variables = std::env::vars_os();
-    variables.map(|(name, _)| name)
+    // The value is dropped in the excepted statement itself, so what it
+    // binds can hold names only.
+    let names = std::env::vars_os().map(|(name, _)| name);
+    names
 }
 
 impl Git {

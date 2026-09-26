@@ -435,9 +435,9 @@ hand, though, passes for a route added after it was written.
   - A source scan, with comments and whitespace removed, is a second net that
     names the site it finds.
   Compose's names-only `GIT_*` scrub is the one allowed site. The
-  `#[expect]` sits on the single `let` that calls `vars_os()`, inside a
-  helper that returns names alone, so any other read is still an error,
-  even one in that helper. A test pins the clippy configuration, so deleting
+  `#[expect]` sits on the single `let` that calls `vars_os()` and drops each
+  value in the same statement, so what it binds holds names only. Any other
+  read is still an error, even one in the same helper. A test pins the clippy configuration, so deleting
   it fails.
 - The real-CLI test searches every response, served asset and file the
   session leaves (git's compressed objects included) for the password marker

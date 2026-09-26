@@ -262,7 +262,7 @@ fn the_route_tables_are_the_whole_router() {
 
 /// The one environment read the UI makes: compose removing inherited
 /// `GIT_*` overrides from Git's environment by name, discarding each value.
-const NAMES_ONLY_SCRUB: &str = "letvariables=std::env::vars_os();";
+const NAMES_ONLY_SCRUB: &str = "letnames=std::env::vars_os().map(|(name,_)|name);";
 
 /// Rust source without its comments and whitespace, so a path or macro split
 /// by either (`std::env/**/::var`, `env ! (`) reads as one run of tokens.
@@ -468,7 +468,7 @@ fn an_aliased_imported_or_spaced_environment_read_is_still_seen() {
         "use std::{environment_free, fs};",
         "f(a, environment)",
         "let root = std::path::Path::new(env!(\"CARGO_MANIFEST_DIR\"));",
-        "let variables = std::env::vars_os();",
+        "let names = std::env::vars_os().map(|(name, _)| name);",
     ] {
         let source = normalized(source).replace(NAMES_ONLY_SCRUB, "");
         assert!(environment_reads(&source).is_empty(), "{source}");
