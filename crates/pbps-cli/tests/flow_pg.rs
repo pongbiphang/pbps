@@ -12935,3 +12935,186 @@ fn a_revoke_that_does_not_land_is_refused_at_the_closing_read() {
         }
     }
 }
+
+/// #428. The trigger check and the row statement are two server commands. A
+/// membership granted and a trigger function replaced *between* them run the
+/// replacement inside the approved write. The routine pins (DEC-319.1) catch
+/// it before the write can commit: a transactional apply re-reads them before
+/// recording, and a staged row write re-reads them inside its own transaction,
+/// before its commit. Either way the replacement's row is rolled back and no
+/// apply is recorded.
+///
+/// The window is held open by an approved statement-level trigger that waits
+/// on an advisory lock. It fires after the check and before the row trigger,
+/// so the replacement lands exactly there.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_trigger_function_replaced_between_the_check_and_the_row_write_is_rolled_back() {
+    let admin = server();
+    let declared = "table: app.t\ncolumns:\n  code: {type: varchar(20), nullable: false}\n  \
+                    label: {type: text, nullable: false}\nprimary_key: {name: pk_t, columns: [code]}\n";
+    for staged in [false, true] {
+        let slug = if staged {
+            "window428_staged"
+        } else {
+            "window428"
+        };
+        let topology = inherited_owner_topology(&admin, slug);
+        let connection = topology.connection().to_owned();
+        let deployment = topology.deployment.clone();
+        let d = Demo::new(slug);
+        std::fs::write(
+            d.dir.join("pbps.yml"),
+            "dialect: postgres\nunmanaged: ignore\n",
+        )
+        .unwrap();
+        d.keyed(&deployment);
+        d.table(declared);
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", &deployment]));
+        on_server(
+            &deployment,
+            "CREATE FUNCTION public.hold428() RETURNS trigger LANGUAGE plpgsql AS \
+             $$BEGIN PERFORM pg_advisory_xact_lock(428); RETURN NULL; END$$; \
+             CREATE TRIGGER a_hold BEFORE INSERT ON app.t FOR EACH STATEMENT \
+               EXECUTE FUNCTION public.hold428(); \
+             CREATE TRIGGER audit BEFORE INSERT ON app.t FOR EACH ROW \
+               EXECUTE FUNCTION hook.audit()",
+        );
+        // Both triggers adopted in the engine's own spelling; the functions
+        // stay unmanaged, so the pins are what watch them.
+        let pulled = Demo::new(&format!("{slug}-pull"));
+        succeeds(pulled.run(&["pull", "--db", &deployment]));
+        let mut pending = vec![pulled.dir.join("schema")];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                let body = std::fs::read_to_string(&path).unwrap();
+                if body.lines().any(|line| line.starts_with("trigger:")) {
+                    std::fs::write(d.dir.join("schema").join(path.file_name().unwrap()), body)
+                        .unwrap();
+                }
+            }
+        }
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&[
+            "baseline",
+            "--db",
+            &deployment,
+            "--reason",
+            "adopt the triggers",
+        ]));
+        d.table(&format!(
+            "{declared}data:\n  mode: exact\n  rows:\n    new: {{label: New}}\n"
+        ));
+        let plan = connected_artifact(&d, &deployment, staged);
+        let applies = scalar(
+            &connection,
+            "SELECT count(*) FROM public.__pbps_state WHERE kind IN ('apply', 'staged')",
+        );
+
+        // Hold the window, start the apply, and wait until it sits in it.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut holder = rt.block_on(async {
+            let mut c = pbps_db::Conn::connect(pbps_db::Driver::Postgres, &connection)
+                .await
+                .unwrap();
+            c.execute("SELECT pg_advisory_lock(428)").await.unwrap();
+            c
+        });
+        let checksum = plan_checksum(&plan);
+        let mut args = vec![
+            "apply",
+            "--env",
+            KEYED_ENV,
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+        ];
+        if staged {
+            args.push("--staged");
+        }
+        let child = Command::new(BIN)
+            .arg("--project")
+            .arg(&d.dir)
+            .args(&args)
+            .env(KEYED_URL, &deployment)
+            .env(KEYED_KEY, fingerprint_key(9))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut waited = 0;
+        while scalar(
+            &connection,
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 428 \
+             AND NOT granted",
+        ) == 0
+        {
+            waited += 1;
+            assert!(
+                waited < 3000,
+                "{slug}: the apply never reached the row write"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // Inside the window: the membership that lets the inheritor replace
+        // the function, and the replacement.
+        on_server(
+            &connection,
+            &format!(
+                "GRANT {} TO {} WITH INHERIT TRUE, SET FALSE",
+                topology.owner, topology.inheritor
+            ),
+        );
+        on_server(
+            &as_role(&connection, &topology.inheritor),
+            "CREATE OR REPLACE FUNCTION hook.audit() RETURNS trigger LANGUAGE plpgsql AS \
+             $$BEGIN INSERT INTO hook.calls VALUES (428); RETURN NEW; END$$",
+        );
+        rt.block_on(async {
+            holder
+                .execute("SELECT pg_advisory_unlock(428)")
+                .await
+                .unwrap()
+        });
+        let refused = child.wait_with_output().unwrap();
+        assert_ne!(code(&refused), 0, "{slug}: {}", stdout(&refused));
+        assert!(
+            stderr(&refused).contains("pinned routines changed in `hook`"),
+            "{slug}: {}",
+            stderr(&refused)
+        );
+        assert_eq!(
+            scalar(
+                &connection,
+                "SELECT count(*) FROM hook.calls WHERE value = 428"
+            ),
+            0,
+            "{slug}: the replacement ran, and its write must not survive"
+        );
+        assert_eq!(
+            scalar(&connection, "SELECT count(*) FROM app.t"),
+            0,
+            "{slug}: the approved row did not commit either"
+        );
+        assert_eq!(
+            scalar(
+                &connection,
+                "SELECT count(*) FROM public.__pbps_state WHERE kind IN ('apply', 'staged')"
+            ),
+            applies,
+            "{slug}: nothing was recorded as applied"
+        );
+    }
+}

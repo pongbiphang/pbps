@@ -35,6 +35,9 @@ pub enum Check {
     BeforeStep { step: usize, total: usize },
     /// A staged step, after its statement committed and before its checkpoint.
     AfterStep { step: usize, total: usize },
+    /// A staged row write, inside its own transaction, after the statement
+    /// and before the commit (#428).
+    BeforeStepCommits { step: usize, total: usize },
     /// A staged run's closing read, before the ordinary entry that says it
     /// finished. A `--resume` with no step left reaches only this one.
     BeforeClosing,
@@ -43,7 +46,7 @@ pub enum Check {
 impl Check {
     fn within(self) -> pbps_pg::pins::Within {
         match self {
-            Check::BeforeStatements | Check::BeforeRecording => {
+            Check::BeforeStatements | Check::BeforeRecording | Check::BeforeStepCommits { .. } => {
                 pbps_pg::pins::Within::CallersTransaction
             }
             Check::BeforeProbes
@@ -63,6 +66,9 @@ impl Check {
                 format!("after statement {step} of {total} committed")
             }
             Check::BeforeClosing => "before the staged run's closing entry".to_owned(),
+            Check::BeforeStepCommits { step, total } => {
+                format!("after statement {step} of {total} ran, before it committed")
+            }
         }
     }
 }

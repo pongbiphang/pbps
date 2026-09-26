@@ -1194,6 +1194,14 @@ exactly what an operator should look at before running approved DDL.
   that must pin a routine is refused with the `--env` remedy.
 - A staged `--resume` after the last checkpoint runs no step, so the run also
   checks the pins before its closing entry.
+- A staged row write runs in a transaction of its own, and the pins are also
+  checked inside it, after the statement and before the commit (#428). The
+  trigger check and the row statement are two server commands. A trigger
+  function replaced between them has already run by the time the statement
+  returns, and only a check before the commit can still take its write back.
+  After the commit, the check after the step can only record the step and
+  stop. A transactional apply needed nothing new here: its check before
+  `record` already runs inside the transaction that wrote.
 
 The live tests are in `crates/pbps-cli/tests/flow_pg.rs`. Each check was
 disabled in turn, and so was the `READ COMMITTED` framing, and the test for it
