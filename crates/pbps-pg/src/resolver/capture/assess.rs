@@ -427,13 +427,14 @@ fn properties_equal(left: &BTreeMap<String, Value>, right: &BTreeMap<String, Val
 /// routine; a column reference's type from the column; the common type of a
 /// CASE, COALESCE, GREATEST/LEAST or array from its operands; a subscript's
 /// container and element types from its input; a parameter's and a
-/// placeholder's type from the declaration they stand for; a collation from
-/// its inputs. What decided each is compared in its own right, and a
+/// placeholder's type from the declaration they stand for; a CTE's output
+/// types from its query; a collation from its inputs. What decided each is compared in its own right, and a
 /// same-named object cannot displace these.
 ///
 /// Not here: a constant's type and a coercion's or row constructor's result,
 /// which can be a name written in the source (`'x'::t`, `ROW(..)::t`) and
-/// are stored the same way when they were not (#1062).
+/// are stored the same way when they were not (#1062); nor a routine's or
+/// table function's column types, which a column definition list names.
 const DETERMINED: &[&str] = &[
     "opfuncid",
     "funcresulttype",
@@ -453,22 +454,28 @@ const DETERMINED: &[&str] = &[
     "refrestype",
     "paramtype",
     "typeId",
+    "ctecoltypes",
 ];
 
 /// Whether a binding's object was selected by name resolution, so that a
 /// same-named object could have been selected instead. The field is the
 /// binding path's last named step; a trailing number is a list position.
 fn resolved_by_name(binding: &super::bindings::Binding) -> bool {
-    let Some(field) = binding
+    let mut named = binding
         .path
         .iter()
         .rev()
-        .find(|step| step.parse::<usize>().is_err())
-    else {
+        .filter(|step| step.parse::<usize>().is_err());
+    let Some(field) = named.next() else {
         return true;
     };
+    // A range-table entry's column types are its VALUES', CTE's or
+    // tuplestore's output, inferred; a table function's written column
+    // types sit under its own `tablefunc` node instead.
+    let range_columns =
+        field == "coltypes" && named.next().is_some_and(|parent| parent == "rtable");
     let collation = field.ends_with("collid") || field == "collation";
-    !collation && !DETERMINED.contains(&field.as_str())
+    !range_columns && !collation && !DETERMINED.contains(&field.as_str())
 }
 
 /// Whether a call with exactly one argument can reach `routine`: its

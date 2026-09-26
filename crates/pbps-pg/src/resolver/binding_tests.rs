@@ -1362,3 +1362,44 @@ async fn a_later_object_outside_the_path_is_no_candidate() {
         );
     }
 }
+
+/// A CTE's output types follow from its query; no name is looked up to
+/// find them. A same-named unmanaged type is no candidate for them.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_ctes_output_types_are_no_named_candidates() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let declared = || {
+            let mut table = pbps_model::Table::default();
+            table
+                .columns
+                .insert("a".into(), pbps_model::Column::new("text".parse().unwrap()));
+            Declared::default()
+                .table("app.t", table)
+                .view("app.v", "WITH c AS (SELECT a FROM t) SELECT a FROM c")
+        };
+        let assessment = analyze(
+            &server,
+            "cte",
+            Case {
+                schemas: &["app"],
+                extras: &[],
+                target: "
+                    CREATE TABLE app.t (a text);
+                    SET search_path = app;
+                    CREATE VIEW app.v AS WITH c AS (SELECT a FROM t) SELECT a FROM c;
+                    CREATE TYPE app.text AS ENUM ('x');",
+                base: declared(),
+                desired: declared(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            only(&assessment, "app", "v"),
+            Verdict::Unaffected,
+            "{variable}"
+        );
+    }
+}
