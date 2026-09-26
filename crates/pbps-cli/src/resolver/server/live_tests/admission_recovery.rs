@@ -436,7 +436,10 @@ async fn a_cancelled_step_leaves_its_admin_session_to_cleanup() {
     let configured = endpoint("PBPS_SERVER_ENDPOINT");
     let mut target = native_target().await;
     let mut missing = Vec::new();
-    for stage in ["qualify", "resolve"] {
+    // A retry takes the held session itself, so a direct close after the
+    // cancellation is a case of its own: there cleanup must find the
+    // session in the run's state.
+    for (stage, retry) in [("qualify", true), ("resolve", true), ("qualify", false)] {
         // Resolution has a PostgreSQL adapter only; SQL Server refuses it
         // before any administrative session opens.
         if stage == "resolve" && driver() != Driver::Postgres {
@@ -482,47 +485,49 @@ async fn a_cancelled_step_leaves_its_admin_session_to_cleanup() {
             state.restore().unwrap();
             (state.name.clone().unwrap(), state.id.clone().unwrap())
         };
-        // With the daemon reachable again, retrying the same step would
-        // open a new administrative session in place of the held one; qualify
-        // reaches it past every check. The retry must end the run instead.
-        // A retry naming another principal would record other run-local
-        // roles; the refused retry must leave the cleanup list as it was.
-        let roles = run.inner.control.roles.clone();
-        let other = ScopeRequest {
-            planned: vec![PlannedGrant {
-                principal: "pbps_retry_1031".into(),
-                schema: if driver() == Driver::Postgres {
-                    "public".into()
-                } else {
-                    "dbo".into()
-                },
-                privilege: "USAGE".into(),
-                revoke: false,
-            }],
-            ..ScopeRequest::default()
-        };
-        let retried = match stage {
-            "qualify" => run.qualify(&mut target, &other).await.map(|_| ()),
-            _ => run.resolve(&mut target, &binding).await.map(|_| ()),
-        };
-        assert_eq!(
-            run.inner.control.roles, roles,
-            "{stage}: a refused retry kept the recorded run-local roles"
-        );
-        assert!(
-            matches!(retried, Err(Error::Cancelled)),
-            "{stage}: a retry after cancellation ends the run: {retried:?}"
-        );
-        // The first retry took the held session; a second finds none held
-        // and must still meet the recorded refusal, not a later guard.
-        let again = match stage {
-            "qualify" => run.qualify(&mut target, &other).await.map(|_| ()),
-            _ => run.resolve(&mut target, &binding).await.map(|_| ()),
-        };
-        assert!(
-            matches!(again, Err(Error::Cancelled)),
-            "{stage}: every later retry keeps the recorded cancellation: {again:?}"
-        );
+        if retry {
+            // With the daemon reachable again, retrying the same step would
+            // open a new administrative session in place of the held one; qualify
+            // reaches it past every check. The retry must end the run instead.
+            // A retry naming another principal would record other run-local
+            // roles; the refused retry must leave the cleanup list as it was.
+            let roles = run.inner.control.roles.clone();
+            let other = ScopeRequest {
+                planned: vec![PlannedGrant {
+                    principal: "pbps_retry_1031".into(),
+                    schema: if driver() == Driver::Postgres {
+                        "public".into()
+                    } else {
+                        "dbo".into()
+                    },
+                    privilege: "USAGE".into(),
+                    revoke: false,
+                }],
+                ..ScopeRequest::default()
+            };
+            let retried = match stage {
+                "qualify" => run.qualify(&mut target, &other).await.map(|_| ()),
+                _ => run.resolve(&mut target, &binding).await.map(|_| ()),
+            };
+            assert_eq!(
+                run.inner.control.roles, roles,
+                "{stage}: a refused retry kept the recorded run-local roles"
+            );
+            assert!(
+                matches!(retried, Err(Error::Cancelled)),
+                "{stage}: a retry after cancellation ends the run: {retried:?}"
+            );
+            // The first retry took the held session; a second finds none held
+            // and must still meet the recorded refusal, not a later guard.
+            let again = match stage {
+                "qualify" => run.qualify(&mut target, &other).await.map(|_| ()),
+                _ => run.resolve(&mut target, &binding).await.map(|_| ()),
+            };
+            assert!(
+                matches!(again, Err(Error::Cancelled)),
+                "{stage}: every later retry keeps the recorded cancellation: {again:?}"
+            );
+        }
         let closed = run.close().await;
         let named = closed
             .as_ref()
@@ -530,11 +535,13 @@ async fn a_cancelled_step_leaves_its_admin_session_to_cleanup() {
             .is_some_and(|error| error.recovery_names.contains(&name));
         let mut api = LocalApi::connect_native(&configured.daemon).await.unwrap();
         let leftover = api.inspect_container(&id).await.unwrap().is_some();
-        eprintln!("cancelled {stage}: close_names_admin_forwarder={named} leftover={leftover}");
+        eprintln!(
+            "cancelled {stage} retry={retry}: close_names_admin_forwarder={named} leftover={leftover}"
+        );
         // Cleanup either confirmed the forwarder gone or said it could not.
         // Silence with the container still there is the defect.
         if leftover && !named {
-            missing.push(stage);
+            missing.push((stage, retry));
         }
         fault.borrow_mut().remove_owned();
         let mut gone = false;
