@@ -407,3 +407,122 @@ async fn failed_admission_names_every_unconfirmed_forwarder() {
         "unconfirmed forwarders missing from returned errors: {missing:?}"
     );
 }
+
+// A step held at its administrative session, with that session's forwarder
+// paused and this observer's daemon connections cut, so that nothing can
+// remove the forwarder unless cleanup still holds it (#1031).
+tokio::task_local! {
+    static HOLD: Rc<RefCell<Fault>>;
+}
+
+pub(in crate::resolver::server) fn after_admin_open(forwarder: &Forwarder) {
+    let _ = HOLD.try_with(|fault| fault.borrow_mut().apply(forwarder));
+}
+
+pub(in crate::resolver::server) async fn hold() {
+    if HOLD.try_with(|_| ()).is_ok() {
+        std::future::pending::<()>().await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires task-owned dedicated servers and a private observer mount namespace"]
+async fn a_cancelled_step_leaves_its_admin_session_to_cleanup() {
+    fixture();
+    assert_eq!(
+        std::env::var("PBPS_ADMISSION_RECOVERY_FIXTURE").as_deref(),
+        Ok("1")
+    );
+    let configured = endpoint("PBPS_SERVER_ENDPOINT");
+    let mut target = native_target().await;
+    let mut missing = Vec::new();
+    for stage in ["qualify", "resolve"] {
+        // Resolution has a PostgreSQL adapter only; SQL Server refuses it
+        // before any administrative session opens.
+        if stage == "resolve" && driver() != Driver::Postgres {
+            continue;
+        }
+        let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
+        let mut run = server
+            .open_scratch(&scratch_recipe(&mut target).await)
+            .await
+            .unwrap();
+        let request = ScopeRequest::default();
+        let empty = pbps_model::Schema::default();
+        let binding = BindingRequest {
+            bootstrap: &[],
+            desired: &empty,
+            base: &empty,
+        };
+        if stage == "resolve" {
+            run.qualify(&mut target, &request).await.unwrap();
+        }
+        let fault = Rc::new(RefCell::new(Fault::new(
+            configured.daemon.clone(),
+            true,
+            false,
+        )));
+        let held = HOLD
+            .scope(fault.clone(), async {
+                let step = async {
+                    match stage {
+                        "qualify" => run.qualify(&mut target, &request).await.map(|_| ()),
+                        _ => run.resolve(&mut target, &binding).await.map(|_| ()),
+                    }
+                };
+                tokio::time::timeout(std::time::Duration::from_secs(60), step).await
+            })
+            .await;
+        assert!(
+            held.is_err(),
+            "{stage}: the step was held at its admin session"
+        );
+        let (name, id) = {
+            let mut state = fault.borrow_mut();
+            state.restore().unwrap();
+            (state.name.clone().unwrap(), state.id.clone().unwrap())
+        };
+        let closed = run.close().await;
+        let named = closed
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.recovery_names.contains(&name));
+        let mut api = LocalApi::connect_native(&configured.daemon).await.unwrap();
+        let leftover = api.inspect_container(&id).await.unwrap().is_some();
+        eprintln!("cancelled {stage}: close_names_admin_forwarder={named} leftover={leftover}");
+        // Cleanup either confirmed the forwarder gone or said it could not.
+        // Silence with the container still there is the defect.
+        if leftover && !named {
+            missing.push(stage);
+        }
+        fault.borrow_mut().remove_owned();
+        let mut gone = false;
+        for _ in 0..100 {
+            if api.inspect_container(&id).await.unwrap().is_none() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(gone, "the exact owned forwarder was removed");
+        fault.borrow_mut().id = None;
+        let _ = run.close().await;
+        drop(run);
+        drop(server);
+        let mut admin = session(&configured, maintenance()).await;
+        assert_eq!(
+            exists(&mut admin.connection, "pbps_scratch_").await,
+            (false, false)
+        );
+        assert_eq!(
+            exists(&mut admin.connection, "pbps_run_").await,
+            (false, false)
+        );
+        admin.close().await;
+    }
+    target.check().await.unwrap();
+    assert!(
+        missing.is_empty(),
+        "a cancelled step's admin forwarder was neither removed nor named: {missing:?}"
+    );
+}
