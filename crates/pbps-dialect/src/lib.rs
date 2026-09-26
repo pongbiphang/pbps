@@ -582,6 +582,9 @@ impl Lexicon {
         // measured, `E'a' ⏎ 'b\'c'` is `ab'c` (#539). Read as a plain
         // string, the escaped quote closed it and the rest collapsed as code.
         let mut escape_continues = false;
+        // And the gap since has held a line break, which the continuation
+        // needs: on one line, `E'a' 'b'` is a syntax error, not one literal.
+        let mut gap_breaks = false;
 
         for (i, ch) in text.char_indices() {
             if i < consumed_to {
@@ -616,6 +619,7 @@ impl Lexicon {
                             }
                         } else {
                             escape_continues = true;
+                            gap_breaks = false;
                             At::Code
                         }
                     } else {
@@ -697,13 +701,15 @@ impl Lexicon {
                 At::Code => {
                     if self.is_definition_whitespace(ch) {
                         in_space = true;
+                        gap_breaks |= matches!(ch, '\r' | '\n');
                         continue;
                     }
                     if in_space && !out.is_empty() && !out.ends_with('\n') {
                         out.push(' ');
                     }
                     in_space = false;
-                    let continues = std::mem::take(&mut escape_continues);
+                    let armed = std::mem::take(&mut escape_continues);
+                    let continues = armed && gap_breaks;
                     // A `$` opens a literal only when it opens a *tag*. On an
                     // engine without dollar quoting, and on one where the run
                     // of characters after the `$` is not a tag, it is ordinary
@@ -725,7 +731,9 @@ impl Lexicon {
                     }
                     let next = bytes.get(i + ch.len_utf8()).copied();
                     at = if ch == '-' && next == Some(b'-') {
-                        escape_continues = continues;
+                        // A line comment ends at a line break, so it is one.
+                        escape_continues = armed;
+                        gap_breaks = true;
                         At::Line
                     } else if ch == '/' && next == Some(b'*') {
                         At::Block { depth: 1, seen: 0 }
@@ -2990,6 +2998,13 @@ mod tests {
                 "{gap:?}"
             );
         }
+        // On one line there is no continuation: the engine refuses
+        // `E'a' 'b'` as a syntax error, so the second string is not the
+        // first's, and a newline turned into a space is a change.
+        assert_ne!(
+            PG.normalize_definition(r"SELECT E'a' 'b\'c  d'"),
+            PG.normalize_definition("SELECT E'a'\n'b\\'c  d'")
+        );
         // Code between the two ends it: the second string is plain again.
         assert_eq!(
             PG.normalize_definition(r"SELECT E'a' , 'b\'   ,   x  y"),
