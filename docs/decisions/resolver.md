@@ -914,7 +914,8 @@ bindings instead of prevented: a module that bound any name first made
 nameable later in the reconstruction, by an object that could have been
 resolved in its place, is unresolved: a later relation for a relation, a row
 type or a call a single argument can reach (its row type can take `t(x)`), a later routine for a routine
-or a function-style cast, a later index for a relation only. The check is by name within those kinds, so it is
+or a function-style cast, a later index for a relation only, and only one in
+the schema the binding named or on the declaration's path. The check is by name within those kinds, so it is
 conservative — a qualified reference it cannot tell from a bare one is
 flagged too — and a `depends_on` edge that moves the other object first
 removes it. Measured on PostgreSQL 16 and 18: f(integer) whose body calls

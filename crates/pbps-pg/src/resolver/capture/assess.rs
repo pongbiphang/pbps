@@ -387,7 +387,7 @@ pub fn assess(
             Verdict::Unresolved {
                 condition: "a same-named candidate on the target was not reconstructed on scratch",
             }
-        } else if compiled_early(object, input, order, &desired.inputs) {
+        } else if compiled_early(object, input, order, &desired.inputs, paths) {
             Verdict::Unresolved {
                 condition: "the declaration was compiled before an object sharing a name it bound",
             }
@@ -501,26 +501,37 @@ fn compiled_early(
     input: &super::manifest::Input,
     order: &crate::resolver::reconstruct::Reconstruction,
     routines: &BTreeMap<ObjectIdentity, super::manifest::Input>,
+    paths: &Paths,
 ) -> bool {
-    let Some(later) = order.later_names(owner(object)) else {
+    let owner = owner(object);
+    let Some(later) = order.later_names(owner) else {
         return false;
     };
-    // Only an object that could have been resolved instead counts: an index
-    // named like a routine a view calls could not have taken that call.
+    let path = owner
+        .name
+        .first()
+        .map(|schema| paths.of(schema))
+        .unwrap_or_default();
+    // Only an object that could have been resolved instead counts: of a
+    // kind that can take the binding, in the schema the binding named or on
+    // the declaration's path. An index named like a routine a view calls,
+    // or a relation in a schema the declaration never searches, could not.
     input
         .bindings
         .iter()
         .filter(|binding| resolved_by_name(binding))
         .any(|binding| {
-            binding.target.name.last().is_some_and(|bound| {
-                later.iter().any(|(kind, name)| {
-                    *name == bound
-                        && kind.shadows(
-                            &binding.target.class,
-                            binding.target.class == "pg_proc"
-                                && callable_with_one(routines, &binding.target),
-                        )
-                })
+            let [bound_schema, bound] = binding.target.name.as_slice() else {
+                return false;
+            };
+            later.iter().any(|(kind, schema, name)| {
+                *name == bound
+                    && (*schema == bound_schema || path.iter().any(|visible| visible == schema))
+                    && kind.shadows(
+                        &binding.target.class,
+                        binding.target.class == "pg_proc"
+                            && callable_with_one(routines, &binding.target),
+                    )
             })
         })
 }
@@ -718,13 +729,30 @@ mod tests {
         // by name, so neither derives a candidate.
         let determined = Input {
             properties: BTreeMap::new(),
-            bindings: ["opfuncid", "vartype", "inputcollid", "coalescetype"]
-                .into_iter()
-                .map(|field| Binding {
-                    path: vec!["ev_action".into(), "0".into(), field.into()],
-                    target: id("pg_proc", &["pg_catalog", "int4pl"], Vec::new()),
-                })
-                .collect(),
+            bindings: [
+                (
+                    "opfuncid",
+                    id("pg_proc", &["pg_catalog", "int4pl"], Vec::new()),
+                ),
+                (
+                    "vartype",
+                    id("pg_type", &["pg_catalog", "text"], Vec::new()),
+                ),
+                (
+                    "coalescetype",
+                    id("pg_type", &["pg_catalog", "text"], Vec::new()),
+                ),
+                (
+                    "inputcollid",
+                    id("pg_collation", &["pg_catalog", "default"], Vec::new()),
+                ),
+            ]
+            .into_iter()
+            .map(|(field, target)| Binding {
+                path: vec!["ev_action".into(), "0".into(), field.into(), "0".into()],
+                target,
+            })
+            .collect(),
         };
         assert_eq!(
             derived(&view, &determined, &paths, &BTreeMap::new()),

@@ -153,15 +153,18 @@ fn later_names_are_what_became_nameable_after_the_module() {
     step.created = Some(routine("int4"));
     assert_eq!(
         reconstruction.later_names(&routine("int4")).unwrap(),
-        [(Nameable::Relation, "v"), (Nameable::Index, "ix")]
-            .into_iter()
-            .collect()
+        [
+            (Nameable::Relation, "app", "v"),
+            (Nameable::Index, "app", "ix")
+        ]
+        .into_iter()
+        .collect()
     );
     // Another overload of the same name was not compiled at that step.
     assert!(reconstruction.later_names(&routine("text")).is_none());
     assert_eq!(
         reconstruction.later_names(&relation("v")).unwrap(),
-        [(Nameable::Index, "ix")].into_iter().collect()
+        [(Nameable::Index, "app", "ix")].into_iter().collect()
     );
     // A table is not a module.
     assert!(reconstruction.later_names(&relation("t")).is_none());

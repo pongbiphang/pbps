@@ -87,8 +87,9 @@ struct Step {
     /// What an error names: the declaration, never the statement text.
     declaration: String,
     statements: Vec<String>,
-    /// The names this step makes resolvable, for the order check.
-    names: Vec<(Nameable, String)>,
+    /// What this step makes resolvable, for the order check: its kind,
+    /// schema and name.
+    names: Vec<(Nameable, String, String)>,
     /// The module this step compiles, if it is one.
     module: Option<ModuleId>,
     /// The routine the engine created for this step, as the capture names
@@ -133,7 +134,7 @@ impl Reconstruction {
                             name: name.clone(),
                             table: Box::new(bare),
                         },
-                        vec![(Nameable::Relation, name.name.clone())],
+                        vec![(Nameable::Relation, name.schema.clone(), name.name.clone())],
                         None,
                     )?);
                     for (key, constraint) in keys {
@@ -191,7 +192,7 @@ impl Reconstruction {
                                 name: index.clone(),
                                 index: Box::new(spec),
                             },
-                            vec![(Nameable::Index, index)],
+                            vec![(Nameable::Index, name.schema.clone(), index)],
                             None,
                         )?);
                     }
@@ -209,7 +210,7 @@ impl Reconstruction {
                         };
                         (
                             Phase::Modules,
-                            vec![(kind, id.name().to_owned())],
+                            vec![(kind, id.schema().to_owned(), id.name().to_owned())],
                             Some(id.clone()),
                         )
                     };
@@ -280,7 +281,7 @@ impl Reconstruction {
     pub fn later_names(
         &self,
         owner: &ObjectIdentity,
-    ) -> Option<std::collections::BTreeSet<(Nameable, &str)>> {
+    ) -> Option<std::collections::BTreeSet<(Nameable, &str, &str)>> {
         let at = self
             .steps
             .iter()
@@ -294,7 +295,11 @@ impl Reconstruction {
         Some(
             self.steps[at + 1..]
                 .iter()
-                .flat_map(|step| step.names.iter().map(|(kind, name)| (*kind, name.as_str())))
+                .flat_map(|step| {
+                    step.names
+                        .iter()
+                        .map(|(kind, schema, name)| (*kind, schema.as_str(), name.as_str()))
+                })
                 .collect(),
         )
     }
@@ -419,7 +424,7 @@ fn step(
     phase: Phase,
     declaration: &str,
     change: &Change,
-    names: Vec<(Nameable, String)>,
+    names: Vec<(Nameable, String, String)>,
     module: Option<ModuleId>,
 ) -> Result<Step, ReconstructError> {
     let statements = dialect

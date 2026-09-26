@@ -1304,3 +1304,61 @@ async fn a_common_type_the_operands_decide_is_no_named_candidate() {
         );
     }
 }
+
+/// A later object in a schema the declaration never searches, and not the
+/// one its binding named, could not have been resolved in its place: an
+/// index `z.t` compiled after a view in `app` reading `app.t` leaves the
+/// view's verdict standing.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_later_object_outside_the_path_is_no_candidate() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let declared = || {
+            let column = || pbps_model::Column::new("integer".parse().unwrap());
+            let mut t = pbps_model::Table::default();
+            t.columns.insert("id".into(), column());
+            let mut o = pbps_model::Table::default();
+            o.columns.insert("id".into(), column());
+            o.indexes.insert(
+                "t".into(),
+                pbps_model::Index {
+                    columns: vec![pbps_model::IndexColumn {
+                        name: "id".into(),
+                        descending: false,
+                    }],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                },
+            );
+            Declared::default()
+                .table("app.t", t)
+                .table("z.o", o)
+                .view("app.v", "SELECT id FROM t")
+        };
+        let assessment = analyze(
+            &server,
+            "outside",
+            Case {
+                schemas: &["app", "z"],
+                extras: &[],
+                target: "
+                    CREATE TABLE app.t (id integer);
+                    CREATE TABLE z.o (id integer);
+                    CREATE INDEX t ON z.o (id);
+                    SET search_path = app;
+                    CREATE VIEW app.v AS SELECT id FROM t;",
+                base: declared(),
+                desired: declared(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            only(&assessment, "app", "v"),
+            Verdict::Unaffected,
+            "{variable}"
+        );
+    }
+}
