@@ -693,9 +693,13 @@ changes elsewhere: a new enum value such as an `Outcome` variant, a changed
 referenced definition, or a required field renamed or removed from an open
 object. It also demanded a bump for compatible narrowings.
 
-`flow.rs`'s `envelope_matches_schema` now also validates each emitted
-envelope against every archived envelope schema, from set 16 on, stamped
-with the same wire version. That is exactly the rule, on real output, and
+Every emitted envelope is now also validated against every archived
+envelope schema, from set 16 on, stamped with the same wire version. The
+check lives in `tests/support/envelope_archives.rs` and is called wherever
+the tests validate an envelope: `flow.rs`'s `envelope_matches_schema`, the
+resolver selection and discovery supports, which carry the closed
+`ResolverProfile` and `Discovery` shapes, and `flow_pg.rs`'s connected
+plan. That is exactly the rule, on real output, and
 it needs no general JSON Schema containment (DECISIONS 465).
 - **Starts at set 16.** Earlier sets under version 1 predate the rule, for
   example DECISIONS 435's `denied` variant.

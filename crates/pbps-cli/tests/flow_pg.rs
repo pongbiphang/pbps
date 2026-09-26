@@ -18,6 +18,9 @@ use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
+#[path = "support/envelope_archives.rs"]
+mod envelope_archives;
+
 #[path = "support/resolver_selection.rs"]
 mod resolver_selection;
 
@@ -882,6 +885,7 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
         .unwrap()
         .validate(&report)
         .unwrap();
+    envelope_archives::assert_accepted_by_archives(&report, "connected plan");
     let cost = &report["data"]["cost"];
     assert_eq!(cost["engine"], "postgres");
     assert_eq!(cost["status"], "available");
