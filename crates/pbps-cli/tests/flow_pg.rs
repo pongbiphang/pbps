@@ -12711,13 +12711,27 @@ fn a_definer_routine_a_plan_writes_must_pin_search_path_with_pg_temp_last() {
             "no_temp",
             "SECURITY DEFINER SET search_path = app",
             false,
-            "does not name pg_temp last",
+            "does not name pg_temp once and last",
         ),
         (
             "temp_first",
             "SECURITY DEFINER SET search_path = pg_temp, app",
             false,
-            "does not name pg_temp last",
+            "does not name pg_temp once and last",
+        ),
+        // #1009: a quoted trailing space names another schema.
+        (
+            "temp_spaced",
+            "SECURITY DEFINER SET search_path = app, \"pg_temp \"",
+            false,
+            "does not name pg_temp once and last",
+        ),
+        // #1012: an earlier pg_temp is searched first however the path ends.
+        (
+            "temp_twice",
+            "SECURITY DEFINER SET search_path = pg_temp, app, pg_temp",
+            false,
+            "does not name pg_temp once and last",
         ),
         ("invoker", "", true, ""),
         (

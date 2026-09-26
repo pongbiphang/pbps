@@ -1368,7 +1368,12 @@ wrote the routine, and a refusal rolls it back:
   plan that writes a routine, so that nothing unsafe commits.
 
 A path value is split as the engine writes it, so a quoted schema holding a
-comma is one entry, and `"pg_temp"` and `pg_temp` are the same.
+comma is one entry, and `"pg_temp"` and `pg_temp` are the same. Only
+whitespace outside quotes separates entries: `"pg_temp "` names another
+schema and leaves the real `pg_temp` implicit (#1009). `pg_temp` must also
+appear exactly once. The engine searches in order, so `pg_temp, app, pg_temp`
+searches the caller's temporary schema before `app` however the path ends
+(#1012). Both were measured on 18.6.
 
 *Why not pin the bindings instead.* #322 asked for either this refusal or
 pinning a definer's external dependencies. A binding is made at run time, long
