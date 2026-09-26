@@ -2933,36 +2933,63 @@ fn definer_path_problem(search_path: Option<&str>) -> Option<String> {
                 .to_owned(),
         );
     };
+    // Exactly once, and last. The engine searches the path in order, so an
+    // earlier `pg_temp` puts a caller's temporary schema ahead of every schema
+    // after it however the path ends (#1012, measured on 18.6:
+    // `pg_temp, public, pg_temp` searches `pg_temp_N` before `public`).
     let entries = path_entries(path);
-    if entries.last().map(String::as_str) == Some("pg_temp") {
+    let temps = entries.iter().filter(|e| e.as_str() == "pg_temp").count();
+    if temps == 1 && entries.last().map(String::as_str) == Some("pg_temp") {
         return None;
     }
     Some(format!(
-        "it is SECURITY DEFINER with search_path `{path}`, which does not name pg_temp last, \
-         so a caller's temporary objects are searched before it ends"
+        "it is SECURITY DEFINER with search_path `{path}`, which does not name pg_temp once \
+         and last, so a caller's temporary objects are searched before its own schemas"
     ))
 }
 
 /// The schema names in a stored `search_path` value, unquoted: the engine
 /// writes `app, "pg_temp"` or `app, pg_temp` for the same path.
+///
+/// Only whitespace **outside** quotes separates. Inside quotes it is part of
+/// the name: the engine stores `app, "pg_temp "` as written, and that trailing
+/// space names a different schema, so the real `pg_temp` stays implicit and
+/// is searched first (#1009, measured on 18.6). Trimming it away read that
+/// path as safe.
 fn path_entries(path: &str) -> Vec<String> {
-    let mut entries = Vec::new();
-    let mut current = String::new();
+    // Each character with whether it came from inside quotes, so that the
+    // trim below can tell a separator's space from a name's.
+    let mut entries: Vec<Vec<(char, bool)>> = Vec::new();
+    let mut current: Vec<(char, bool)> = Vec::new();
     let mut quoted = false;
     let mut chars = path.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
             '"' if quoted && chars.peek() == Some(&'"') => {
-                current.push('"');
+                current.push(('"', true));
                 chars.next();
             }
             '"' => quoted = !quoted,
-            ',' if !quoted => entries.push(std::mem::take(&mut current).trim().to_owned()),
-            _ => current.push(c),
+            ',' if !quoted => entries.push(std::mem::take(&mut current)),
+            _ => current.push((c, quoted)),
         }
     }
-    entries.push(current.trim().to_owned());
+    entries.push(current);
     entries
+        .into_iter()
+        .map(|entry| {
+            let unquoted_space = |&(c, quoted): &(char, bool)| !quoted && c.is_whitespace();
+            let start = entry
+                .iter()
+                .position(|c| !unquoted_space(c))
+                .unwrap_or(entry.len());
+            let end = entry
+                .iter()
+                .rposition(|c| !unquoted_space(c))
+                .map_or(start, |i| i + 1);
+            entry[start..end].iter().map(|&(c, _)| c).collect()
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2978,6 +3005,30 @@ mod definer_path_tests {
         assert!(definer_path_problem(Some("app")).is_some());
         assert!(definer_path_problem(Some("pg_temp, app")).is_some());
         assert!(definer_path_problem(Some("")).is_some());
+    }
+
+    /// #1009: whitespace inside quotes is part of the name, so
+    /// `"pg_temp "` is not `pg_temp`; separator whitespace outside quotes is
+    /// not.
+    #[test]
+    fn whitespace_inside_quotes_belongs_to_the_schema_name() {
+        assert_eq!(path_entries("app, \"pg_temp \""), vec!["app", "pg_temp "]);
+        assert!(definer_path_problem(Some("app, \"pg_temp \"")).is_some());
+        assert!(definer_path_problem(Some("app, \" pg_temp\"")).is_some());
+        assert_eq!(definer_path_problem(Some("app,  pg_temp")), None);
+        assert_eq!(definer_path_problem(Some(" app ,\tpg_temp ")), None);
+        assert_eq!(definer_path_problem(Some("app, \"pg_temp\"")), None);
+    }
+
+    /// #1012: `pg_temp` must appear once, and last; an earlier one is searched
+    /// first whatever the path ends with.
+    #[test]
+    fn pg_temp_named_before_the_end_is_unsafe_even_when_it_also_ends_the_path() {
+        assert!(definer_path_problem(Some("pg_temp, app, pg_temp")).is_some());
+        assert!(definer_path_problem(Some("app, pg_temp, pg_temp")).is_some());
+        assert_eq!(definer_path_problem(Some("app, pg_temp")), None);
+        // A quoted uppercase name is another schema, not `pg_temp`.
+        assert!(definer_path_problem(Some("app, \"PG_TEMP\"")).is_some());
     }
 
     #[test]
