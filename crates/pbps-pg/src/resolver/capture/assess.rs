@@ -360,15 +360,19 @@ pub fn assess(
     order: &crate::resolver::reconstruct::Reconstruction,
 ) -> Assessment {
     // What made each target member, as the target recorded it: the other end
-    // of its internal and automatic dependencies (an identity column's
-    // sequence, a key's index, a relation's row type).
+    // of an internal dependency, which the engine alone creates for a part of
+    // an object (an identity column's sequence, a row or array type). An
+    // automatic one does not say that: any index depends automatically on
+    // the columns it covers. A constraint's index is not taken either, since
+    // an unmanaged constraint on a managed table makes one too.
     let mut makers: BTreeMap<&ObjectIdentity, Vec<&ObjectIdentity>> = BTreeMap::new();
     for dependency in target.inputs.keys() {
         if let ("pg_depend", [kind], [made, maker]) = (
             dependency.class.as_str(),
             dependency.name.as_slice(),
             dependency.signature.as_slice(),
-        ) && matches!(kind.as_str(), "i" | "a")
+        ) && kind == "i"
+            && maker.class != "pg_constraint"
         {
             makers.entry(made).or_default().push(maker);
         }

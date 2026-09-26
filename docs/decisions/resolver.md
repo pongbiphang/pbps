@@ -962,8 +962,11 @@ scratch has with the same properties, role references removed because the
 bootstrap superuser's name is the installation's; or a member of a user schema
 that is the project's own: one of its managed objects by name (a type only for
 a table or view, never for an index), or an object the target records, through
-an internal or automatic dependency, as made by one (an identity column's
-sequence, a key's index, a row type). The same identity on scratch is not
+an internal dependency, as made by one (an identity column's sequence, a row or
+array type). An automatic dependency does not say that, since any index has one
+on the columns it covers, and neither does a constraint's index, since an
+unmanaged constraint on a managed table makes one; an unnamed key's index is
+therefore not accepted. The same identity on scratch is not
 enough: an unmanaged routine the plan creates again, or an unmanaged sequence
 that took an identity column's generated name first, shares scratch's identity
 without being what scratch made (#1041). A routine is managed only as the exact overload

@@ -974,7 +974,9 @@ async fn an_object_a_declaration_creates_is_reproduced_with_it() {
 /// A member both sides hold under one identity is reproduced only when the
 /// target's is the project's own too. An unmanaged routine the plan creates
 /// again, or an unmanaged sequence that took an identity column's generated
-/// name first, shares the identity with scratch's copy without being it.
+/// name first, shares the identity with scratch's copy without being it. An
+/// unmanaged index, or an unmanaged constraint's, depends on a managed table
+/// without being made by it.
 #[tokio::test]
 #[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
 async fn a_shared_identity_the_target_did_not_get_from_a_managed_object_is_unresolved() {
@@ -997,7 +999,18 @@ async fn a_shared_identity_the_target_did_not_get_from_a_managed_object_is_unres
                 .table("app.t", identity_table())
                 .view("app.v", "SELECT last_value FROM t_id_seq")
         };
-        for (tag, target, base, desired) in [
+        let indexed = || {
+            let mut table = pbps_model::Table::default();
+            table.columns.insert(
+                "x".into(),
+                pbps_model::Column::new("integer".parse().unwrap()),
+            );
+            Declared::default()
+                .table("util.t", table.clone())
+                .table("app.owner", table)
+                .view("app.v", "SELECT x FROM t")
+        };
+        for (tag, target, base, desired, extras) in [
             (
                 "created_routine",
                 "CREATE FUNCTION app.f(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1;
@@ -1008,6 +1021,7 @@ async fn a_shared_identity_the_target_did_not_get_from_a_managed_object_is_unres
                     "app.f(integer)",
                     "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1",
                 ),
+                &[][..],
             ),
             (
                 "taken_sequence",
@@ -1017,14 +1031,37 @@ async fn a_shared_identity_the_target_did_not_get_from_a_managed_object_is_unres
                  CREATE VIEW app.v AS SELECT last_value FROM t_id_seq;",
                 sequence(),
                 sequence(),
+                &[][..],
+            ),
+            (
+                "automatic_index",
+                "CREATE TABLE util.t (x integer);
+                 CREATE TABLE app.owner (x integer);
+                 SET search_path = app, util;
+                 CREATE VIEW app.v AS SELECT x FROM t;
+                 CREATE INDEX t ON app.owner (x);",
+                indexed(),
+                indexed(),
+                &["util"][..],
+            ),
+            (
+                "constraint_index",
+                "CREATE TABLE util.t (x integer);
+                 CREATE TABLE app.owner (x integer);
+                 SET search_path = app, util;
+                 CREATE VIEW app.v AS SELECT x FROM t;
+                 ALTER TABLE app.owner ADD CONSTRAINT t UNIQUE (x);",
+                indexed(),
+                indexed(),
+                &["util"][..],
             ),
         ] {
             let assessment = analyze(
                 &server,
                 tag,
                 Case {
-                    schemas: &["app"],
-                    extras: &[],
+                    schemas: &["app", "util"],
+                    extras,
                     target,
                     base,
                     desired,
