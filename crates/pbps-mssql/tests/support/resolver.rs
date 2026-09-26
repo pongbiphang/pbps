@@ -119,12 +119,12 @@ mod contained611 {
         let pid = std::process::id();
         let target = format!("pbps_contained611_t_{pid}");
         let scratch = format!("pbps_contained611_s_{pid}");
-        admin
-            .execute(&format!(
-                "CREATE DATABASE [{target}] CONTAINMENT = PARTIAL;"
-            ))
-            .await
-            .unwrap();
+        crate::create_database(
+            &mut admin,
+            &format!("CREATE DATABASE [{target}] CONTAINMENT = PARTIAL;"),
+        )
+        .await
+        .unwrap();
         let mut planning = connect_live(&format!("{};Database={target}", conn_str()))
             .await
             .unwrap();
@@ -171,8 +171,13 @@ mod contained611 {
             "0123456789abcdef0123456789abcdef".to_owned(),
         )
         .unwrap();
+        // The first statement is the scratch's own `CREATE DATABASE`, open to
+        // the same `model` contention as the target's above. Only Msg 1807 is
+        // retried, which no other statement here can raise (#1055).
         for statement in scratch_database_ddl(&names, &recipe).unwrap() {
-            admin.execute(&statement).await.unwrap();
+            crate::create_database(&mut admin, &statement)
+                .await
+                .unwrap();
         }
         let rows = admin
             .query(&format!(

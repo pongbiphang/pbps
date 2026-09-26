@@ -947,6 +947,64 @@ async fn signed_default_arrivals_compare_the_assigned_foreign_key() {
     db.drop().await;
 }
 
+/// How long to wait before trying `CREATE DATABASE` again after `error` on
+/// attempt `attempt`, or `None` to give up and report it (#1055).
+///
+/// `CREATE DATABASE` copies `model` under an exclusive lock on it, and this
+/// binary's cases run in parallel against one server, so two creates at the
+/// same moment collide: "Could not obtain exclusive lock on database 'model'.
+/// Retry the operation later." The server's own advice is to retry, so this
+/// does, and only for that code: any other failure, or 1807 past the bound,
+/// is the test's to report.
+fn model_lock_retry(error: &pbps_db::DbError, attempt: u64) -> Option<std::time::Duration> {
+    const ATTEMPTS: u64 = 10;
+    (error.server_error_code().as_deref() == Some("1807") && attempt < ATTEMPTS)
+        .then(|| std::time::Duration::from_millis(200 * attempt))
+}
+
+/// `CREATE DATABASE`, retried past `model` lock contention (#1055).
+async fn create_database(conn: &mut Conn, sql: &str) -> Result<(), pbps_db::DbError> {
+    let mut attempt = 1;
+    loop {
+        match conn.execute(sql).await {
+            Ok(_) => return Ok(()),
+            Err(e) => match model_lock_retry(&e, attempt) {
+                // A blocking sleep: the runtime here is the test's own, and
+                // nothing else on it has to run while this one waits.
+                Some(wait) => std::thread::sleep(wait),
+                None => return Err(e),
+            },
+        }
+        attempt += 1;
+    }
+}
+
+/// #1055: only Msg 1807 is retried, and only a bounded number of times;
+/// every other failure is reported on the first attempt.
+#[test]
+fn only_model_lock_contention_is_retried_and_only_so_often() {
+    let driver = |code: &str| pbps_db::DbError::Driver {
+        message: "server text".into(),
+        code: Some(code.into()),
+    };
+    let contention = driver("1807");
+    assert!(model_lock_retry(&contention, 1).is_some());
+    assert!(model_lock_retry(&contention, 9).is_some());
+    assert!(model_lock_retry(&contention, 10).is_none(), "the bound");
+    assert!(
+        model_lock_retry(&driver("1801"), 1).is_none(),
+        "database already exists"
+    );
+    assert!(
+        model_lock_retry(&pbps_db::DbError::Refused("own".into()), 1).is_none(),
+        "no server code"
+    );
+    assert!(
+        model_lock_retry(&contention.context("guidance"), 1).is_some(),
+        "the code is read through a context"
+    );
+}
+
 /// A throwaway database that removes itself.
 struct TestDb {
     name: String,
@@ -958,7 +1016,7 @@ impl TestDb {
         // The pid keeps two concurrent `cargo test` runs apart.
         let name = format!("pbps_test_{tag}_{}", std::process::id());
         let mut conn = connect_live(&conn_str()).await.expect("connect");
-        conn.execute(&format!("CREATE DATABASE [{name}];"))
+        create_database(&mut conn, &format!("CREATE DATABASE [{name}];"))
             .await
             .expect("create database");
         conn.execute(&format!("USE [{name}];")).await.expect("use");
