@@ -584,6 +584,7 @@ fn same_filesystem_tree(
     directory: &impl std::os::fd::AsFd,
     prefix: &str,
     links_are_evidence: bool,
+    what: &str,
 ) -> Result<()> {
     let mut stream = rustix::fs::Dir::read_from(directory)
         .map_err(|_| Error::new("Could not enumerate the Git directory"))?;
@@ -616,10 +617,10 @@ fn same_filesystem_tree(
             Mode::empty(),
             ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
         ) {
-            Ok(child) => same_filesystem_tree(&child, &relative, links_are_evidence)?,
+            Ok(child) => same_filesystem_tree(&child, &relative, links_are_evidence, what)?,
             Err(rustix::io::Errno::XDEV) => {
                 return Err(Error::new(&format!(
-                    "The Git directory's {relative} is another filesystem mounted inside the \
+                    "The {what}'s {relative} is another filesystem mounted inside the \
                      repository; compose writes there and has not qualified it"
                 )));
             }
@@ -630,7 +631,7 @@ fn same_filesystem_tree(
             // refusal. Special entries are not directories Git writes into.
             Err(rustix::io::Errno::LOOP) if !links_are_evidence => {
                 return Err(Error::new(&format!(
-                    "The Git directory's {relative} is a symbolic link; Git would write \
+                    "The {what}'s {relative} is a symbolic link; Git would write \
                      through it, so compose refuses"
                 )));
             }
@@ -640,7 +641,7 @@ fn same_filesystem_tree(
                         == rustix::fs::FileType::Directory
                 }) {
                     return Err(Error::new(&format!(
-                        "The Git directory's {relative} is a symbolic link to a directory; \
+                        "The {what}'s {relative} is a symbolic link to a directory; \
                          Git would write through it, so compose refuses"
                     )));
                 }
@@ -653,13 +654,78 @@ fn same_filesystem_tree(
             // through a directory this walk cannot list.
             Err(_) => {
                 return Err(Error::new(&format!(
-                    "The Git directory's {relative} cannot be inspected for mounts; \
+                    "The {what}'s {relative} cannot be inspected for mounts; \
                      compose refuses rather than assume there are none"
                 )));
             }
         }
     }
     Ok(())
+}
+
+/// The checks of DEC-1070.1 for one Git directory: every tree Git writes
+/// during compose is qualified and walked for mounts and links before use.
+/// `what` names the directory in a refusal.
+fn qualify_git_trees(common: &impl std::os::fd::AsFd, what: &str, trees: &[&str]) -> Result<()> {
+    for &tree in trees {
+        match openat2(
+            common,
+            tree,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
+        ) {
+            Ok(fd) => {
+                super::files::qualified_filesystem(&fd, &format!("{what}'s {tree}"))?;
+                // Only reflogs are appended through a link to a file; links
+                // elsewhere are ref or store evidence reported as before.
+                same_filesystem_tree(&fd, tree, tree != "logs", what)?;
+            }
+            Err(rustix::io::Errno::XDEV) => {
+                return Err(Error::new(&format!(
+                    "The {what}'s {tree} is another filesystem mounted inside the \
+                     repository; compose writes there and has not qualified it"
+                )));
+            }
+            Err(rustix::io::Errno::LOOP) => {
+                return Err(Error::new(&format!(
+                    "The {what}'s {tree} is a symbolic link; Git would write through \
+                     it, so compose refuses"
+                )));
+            }
+            // Absent: Git creates it later on the common directory's
+            // filesystem, checked above.
+            Err(rustix::io::Errno::NOENT) => {}
+            // Unreadable is not "no mount".
+            Err(_) => {
+                return Err(Error::new(&format!(
+                    "The {what}'s {tree} cannot be inspected for mounts; compose \
+                     refuses rather than assume there are none"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The same checks for a local push destination's Git common directory
+/// (#1074): compose writes objects and the output ref there, so it is held to
+/// what compose's own repository is.
+pub(super) fn qualify_git_directory(common: &Path) -> Result<()> {
+    let fd = openat2(
+        rustix::fs::CWD,
+        common,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS,
+    )
+    .map_err(|_| Error::new("Could not open the destination's Git directory"))?;
+    super::files::qualified_filesystem(&fd, "destination's Git directory")?;
+    qualify_git_trees(
+        &fd,
+        "destination's Git directory",
+        &["objects", "refs", "logs"],
+    )
 }
 
 pub(super) fn store(common: &Path, observer: ResourceObserver) -> Result<Directory> {
@@ -672,44 +738,11 @@ pub(super) fn store(common: &Path, observer: ResourceObserver) -> Result<Directo
     // parent's filesystem, which this walk has checked (DEC-1070.1).
     // Only the trees written during compose are walked: a symlinked hooks
     // directory, for example, is ordinary and compose never writes hooks.
-    for tree in ["objects", "refs", "logs", "pbps-compose-v2"] {
-        match openat2(
-            &common.file,
-            tree,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
-        ) {
-            Ok(fd) => {
-                super::files::qualified_filesystem(&fd, &format!("Git directory's {tree}"))?;
-                // Only reflogs are appended through a link to a file; links
-                // elsewhere are ref or store evidence reported as before.
-                same_filesystem_tree(&fd, tree, tree != "logs")?;
-            }
-            Err(rustix::io::Errno::XDEV) => {
-                return Err(Error::new(&format!(
-                    "The Git directory's {tree} is another filesystem mounted inside the \
-                     repository; compose writes there and has not qualified it"
-                )));
-            }
-            Err(rustix::io::Errno::LOOP) => {
-                return Err(Error::new(&format!(
-                    "The Git directory's {tree} is a symbolic link; Git would write through \
-                     it, so compose refuses"
-                )));
-            }
-            // Absent: Git creates it later on the common directory's
-            // filesystem, checked above.
-            Err(rustix::io::Errno::NOENT) => {}
-            // Unreadable is not "no mount".
-            Err(_) => {
-                return Err(Error::new(&format!(
-                    "The Git directory's {tree} cannot be inspected for mounts; compose \
-                     refuses rather than assume there are none"
-                )));
-            }
-        }
-    }
+    qualify_git_trees(
+        &common.file,
+        "Git directory",
+        &["objects", "refs", "logs", "pbps-compose-v2"],
+    )?;
     common.child("pbps-compose-v2", true)
 }
 
@@ -876,7 +909,7 @@ mod write_tree_tests {
             ResolveFlags::NO_SYMLINKS,
         )
         .unwrap();
-        same_filesystem_tree(&fd, "refs", true)
+        same_filesystem_tree(&fd, "refs", true, "Git directory")
     }
 
     #[test]
@@ -920,6 +953,22 @@ mod write_tree_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A local push destination's Git directory is held to the same checks
+    /// (#1074): a clean one passes, and a link to a directory in its refs is
+    /// refused before any push.
+    #[test]
+    fn a_local_destination_git_directory_is_qualified_like_compose_own() {
+        let root = tree("destination");
+        std::fs::create_dir_all(root.join("objects")).unwrap();
+        assert!(qualify_git_directory(&root).is_ok());
+        std::os::unix::fs::symlink(root.join("elsewhere"), root.join("refs/heads/pbps-compose"))
+            .unwrap();
+        let refused = qualify_git_directory(&root).unwrap_err().to_string();
+        assert!(refused.contains("destination's Git directory"), "{refused}");
+        assert!(refused.contains("refs/heads/pbps-compose"), "{refused}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Under `logs` a link has no evidence role, and Git appends a reflog
     /// through a link to a file, so any link there is refused.
     #[test]
@@ -936,7 +985,7 @@ mod write_tree_tests {
                 ResolveFlags::NO_SYMLINKS,
             )
             .unwrap();
-            same_filesystem_tree(&fd, "logs", false)
+            same_filesystem_tree(&fd, "logs", false, "Git directory")
         };
         assert!(logs(&root).is_ok());
         std::os::unix::fs::symlink(

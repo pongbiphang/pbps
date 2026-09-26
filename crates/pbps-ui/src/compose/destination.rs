@@ -102,6 +102,10 @@ impl Destination {
         (self.transport == "file").then(|| Path::new(&self.repository))
     }
 
+    pub(super) fn repository_identity(&self) -> Option<&RepositoryIdentity> {
+        self.repository_identity.as_ref()
+    }
+
     pub(super) fn endpoint(&self) -> Result<String> {
         let host = self.host.as_deref().unwrap_or_default();
         let port = self.port.map(|p| format!(":{p}")).unwrap_or_default();
@@ -177,11 +181,15 @@ pub(super) fn resolve(git: &Git, remote: &str) -> Result<Destination> {
         // A path can be reused for another repository with the same base tip.
         // Bind both its directory and effective Git common directory; a normal
         // checkout can keep its inode while its .git directory is replaced.
-        destination.repository_identity = Some(RepositoryIdentity::capture(&Git {
+        let identity = RepositoryIdentity::capture(&Git {
             root: destination.repository.clone().into(),
             hooks: git.hooks.clone(),
             deadline: git.deadline,
-        })?);
+        })?;
+        // Compose writes objects and the output ref into a local destination,
+        // so its Git directory is held to what compose's own is (#1074).
+        super::durable::qualify_git_directory(&identity.common)?;
+        destination.repository_identity = Some(identity);
     }
     Ok(destination)
 }
