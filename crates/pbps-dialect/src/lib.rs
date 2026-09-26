@@ -577,6 +577,14 @@ impl Lexicon {
         let mut consumed_to = 0usize;
         let text = definition.trim_matches(|ch| self.is_definition_whitespace(ch));
         let bytes = text.as_bytes();
+        // An `E'…'` just closed, with only layout or a line comment since: a
+        // `'` now continues it, and the `E` carries to the continuation —
+        // measured, `E'a' ⏎ 'b\'c'` is `ab'c` (#539). Read as a plain
+        // string, the escaped quote closed it and the rest collapsed as code.
+        let mut escape_continues = false;
+        // And the gap since has held a line break, which the continuation
+        // needs: on one line, `E'a' 'b'` is a syntax error, not one literal.
+        let mut gap_breaks = false;
 
         for (i, ch) in text.char_indices() {
             if i < consumed_to {
@@ -610,6 +618,8 @@ impl Lexicon {
                                 after_backslash: false,
                             }
                         } else {
+                            escape_continues = true;
+                            gap_breaks = false;
                             At::Code
                         }
                     } else {
@@ -691,12 +701,15 @@ impl Lexicon {
                 At::Code => {
                     if self.is_definition_whitespace(ch) {
                         in_space = true;
+                        gap_breaks |= matches!(ch, '\r' | '\n');
                         continue;
                     }
                     if in_space && !out.is_empty() && !out.ends_with('\n') {
                         out.push(' ');
                     }
                     in_space = false;
+                    let armed = std::mem::take(&mut escape_continues);
+                    let continues = armed && gap_breaks;
                     // A `$` opens a literal only when it opens a *tag*. On an
                     // engine without dollar quoting, and on one where the run
                     // of characters after the `$` is not a tag, it is ordinary
@@ -718,11 +731,14 @@ impl Lexicon {
                     }
                     let next = bytes.get(i + ch.len_utf8()).copied();
                     at = if ch == '-' && next == Some(b'-') {
+                        // A line comment ends at a line break, so it is one.
+                        escape_continues = armed;
+                        gap_breaks = true;
                         At::Line
                     } else if ch == '/' && next == Some(b'*') {
                         At::Block { depth: 1, seen: 0 }
                     } else if ch == '\'' {
-                        if self.escape_strings && opens_escape_string(text, i) {
+                        if self.escape_strings && (continues || opens_escape_string(text, i)) {
                             At::Escape {
                                 after_backslash: false,
                             }
@@ -2970,6 +2986,29 @@ mod tests {
         assert_ne!(
             PG.normalize_definition(r"SELECT E'a''b\'c  d'"),
             PG.normalize_definition(r"SELECT E'a''b\'c d'")
+        );
+        // A piece continued across a newline takes the `E` with it, so its
+        // escaped quote is data too, and the spacing after it is the
+        // literal's — measured, `E'a' ⏎ 'b\'c  d'` is `ab'c  d` (#539). A
+        // line comment in the gap does not end the continuation.
+        for gap in ["\n", "\r\n", " -- c\n"] {
+            assert_ne!(
+                PG.normalize_definition(&format!(r"SELECT E'a'{gap}'b\'c  d'")),
+                PG.normalize_definition(&format!(r"SELECT E'a'{gap}'b\'c d'")),
+                "{gap:?}"
+            );
+        }
+        // On one line there is no continuation: the engine refuses
+        // `E'a' 'b'` as a syntax error, so the second string is not the
+        // first's, and a newline turned into a space is a change.
+        assert_ne!(
+            PG.normalize_definition(r"SELECT E'a' 'b\'c  d'"),
+            PG.normalize_definition("SELECT E'a'\n'b\\'c  d'")
+        );
+        // Code between the two ends it: the second string is plain again.
+        assert_eq!(
+            PG.normalize_definition(r"SELECT E'a' , 'b\'   ,   x  y"),
+            r"SELECT E'a' , 'b\' , x y"
         );
     }
 

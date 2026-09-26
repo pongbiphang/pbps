@@ -13320,3 +13320,89 @@ fn a_trigger_function_replaced_between_the_check_and_the_row_write_is_rolled_bac
         );
     }
 }
+
+/// A view whose only change is the spacing after an escaped quote in a
+/// continued `E'…'` piece: the `E` carries to the continuation, so that
+/// spacing is the literal's, and the plan has to rebuild the view (#539).
+/// Normalized as a plain string, the two definitions compared equal, and the
+/// plan recorded the new one over the old view without touching it.
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn a_continued_escape_strings_spacing_is_a_change_to_the_view() {
+    let own = OwnDatabase::new(&server(), "continued539");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "continued539", ONE_COLUMN);
+    let view = |spacing: &str| {
+        std::fs::write(
+            d.dir.join("schema/app.v.view.yml"),
+            format!("view: app.v\ndefinition: |-\n  SELECT E'a'\n  'b\\'c{spacing}d' AS x\n"),
+        )
+        .unwrap();
+    };
+    let apply = |d: &Demo| {
+        let plan = d.dir.join("plan.json");
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+        let checksum = plan_checksum(&plan);
+        succeeds(d.run(&[
+            "apply",
+            "--db",
+            connection,
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+        ]));
+    };
+    view("  ");
+    apply(&d);
+    assert_eq!(scalar(connection, "SELECT length(x)::int8 FROM app.v"), 7);
+
+    view(" ");
+    apply(&d);
+    assert_eq!(
+        scalar(connection, "SELECT length(x)::int8 FROM app.v"),
+        6,
+        "the view still returns the old literal"
+    );
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
+/// A routine whose parameter default is an `E'…'` continued across a line
+/// break, with an escaped quote in the continuation. The parameter scan has
+/// to read the quote as data, or it finds no end to the list and the plan is
+/// refused as having none (#539). Measured, the engine creates it and stores
+/// the default as `'xy''z'::text`.
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn a_routine_with_a_continued_escape_string_default_plans_and_applies() {
+    let own = OwnDatabase::new(&server(), "continueddefault539");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "continueddefault539", ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("schema/app.f.function.yml"),
+        "function: app.f(text, integer)\ndefinition: |-\n  (a text DEFAULT E'x'\n  'y\\'z', b integer DEFAULT 1) RETURNS text LANGUAGE sql AS $$ SELECT a $$\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    let checksum = plan_checksum(&plan);
+    succeeds(d.run(&[
+        "apply",
+        "--db",
+        connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+    ]));
+    assert_eq!(
+        scalar(connection, "SELECT length(app.f())::int8"),
+        4,
+        "the default is the one constant `xy'z`"
+    );
+    succeeds(d.run(&["verify", "--db", connection]));
+}
