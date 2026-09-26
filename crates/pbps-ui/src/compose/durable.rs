@@ -645,7 +645,18 @@ fn same_filesystem_tree(
                     )));
                 }
             }
-            Err(_) => {}
+            // Listed but no longer there, or not a directory after all
+            // (a special entry, or an unknown type that is a file): nothing
+            // for Git to write beneath.
+            Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR) => {}
+            // Unreadable is not "no mount": Git can still write a known path
+            // through a directory this walk cannot list.
+            Err(_) => {
+                return Err(Error::new(&format!(
+                    "The Git directory's {relative} cannot be inspected for mounts; \
+                     compose refuses rather than assume there are none"
+                )));
+            }
         }
     }
     Ok(())
@@ -687,9 +698,16 @@ pub(super) fn store(common: &Path, observer: ResourceObserver) -> Result<Directo
                      it, so compose refuses"
                 )));
             }
-            // Absent or unreadable: not a mount. The operations that use it
-            // refuse or report it as before.
-            Err(_) => {}
+            // Absent: Git creates it later on the common directory's
+            // filesystem, checked above.
+            Err(rustix::io::Errno::NOENT) => {}
+            // Unreadable is not "no mount".
+            Err(_) => {
+                return Err(Error::new(&format!(
+                    "The Git directory's {tree} cannot be inspected for mounts; compose \
+                     refuses rather than assume there are none"
+                )));
+            }
         }
     }
     common.child("pbps-compose-v2", true)
@@ -878,6 +896,27 @@ mod write_tree_tests {
             refused.contains("symbolic link to a directory"),
             "{refused}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A directory Git can write through but this walk cannot list is not
+    /// proof that no mount lies beneath it.
+    #[test]
+    fn an_unreadable_directory_in_a_write_tree_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().is_root() {
+            // Root reads a mode-0300 directory anyway; nothing to observe.
+            return;
+        }
+        let root = tree("unreadable");
+        let hidden = root.join("refs/heads/hidden");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let refused = walk(&root).map_err(|e| e.to_string());
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let refused = refused.unwrap_err();
+        assert!(refused.contains("refs/heads/hidden"), "{refused}");
+        assert!(refused.contains("cannot be inspected"), "{refused}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -480,7 +480,9 @@ the WSL filesystem.
   compose store, a link to a file, or to nothing, is evidence the census and
   store operations report, and it is left there; `objects` files are never
   appended to. In `logs`, where Git appends a reflog through any link, every
-  link is refused. Other entries,
+  link is refused. A directory the walk cannot open or list is refused as
+  well: unreadable is not "no mount", and Git can still write a known path
+  through it. Other entries,
   such as a symlinked `hooks`, are ordinary and are not written. A directory Git creates later is
   made on its parent's filesystem, which the walk has checked. The cost is that a checkout with
   any mount inside it is refused, even a qualified one. Nothing measured
