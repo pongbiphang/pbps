@@ -111,10 +111,11 @@ pub struct AuthorizationContext {
     /// fingerprint it had before these were read.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub principal_grants: Vec<PrincipalGrant>,
-    /// The owner of each role a [`principal_grants`](Self::principal_grants)
-    /// row is on, where the deployer can see the role. The engine records a
-    /// role's owner as the grantor of a grant on it that `dbo` makes
-    /// (measured on 17.0), so the owner is what those rows replay under.
+    /// The owner of each role the context names and the deployer can see,
+    /// where that owner is not `dbo`. Owning a role shows its grant rows with
+    /// no grant on it, and the engine records the owner as the grantor of
+    /// what `dbo` grants on the role (measured on 17.0); so scratch gives the
+    /// role the same owner, and replays the rows on it under that owner.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub principal_owners: BTreeMap<String, String>,
     /// The kind of every principal the context names that the deployer can
@@ -354,31 +355,6 @@ pub async fn read(
             });
         }
         context.principal_grants.sort();
-        let on: BTreeSet<&str> = context
-            .principal_grants
-            .iter()
-            .map(|held| held.on.as_str())
-            .collect();
-        if !on.is_empty() {
-            let on_list = on
-                .iter()
-                .map(|name| literal(name))
-                .collect::<Vec<_>>()
-                .join(", ");
-            for row in conn
-                .query(&format!(
-                    "SELECT p.name AS name, USER_NAME(p.owning_principal_id) AS owner \
-                     FROM sys.database_principals p \
-                     WHERE p.type = 'R' AND p.name IN ({on_list});"
-                ))
-                .await?
-            {
-                context.principal_owners.insert(
-                    required(&row, "name", "a role's name")?,
-                    required(&row, "owner", "a role's owner")?,
-                );
-            }
-        }
     }
     for schema in schemas {
         let rows = conn
@@ -441,7 +417,11 @@ pub async fn read(
     // see it.
     let named = named_principals(&context, &[]);
     for row in conn
-        .query("SELECT p.name AS name, p.type AS kind FROM sys.database_principals p;")
+        .query(
+            "SELECT p.name AS name, p.type AS kind, \
+                    USER_NAME(p.owning_principal_id) AS owner \
+             FROM sys.database_principals p;",
+        )
         .await?
     {
         let name = required(&row, "name", "a principal's name")?;
@@ -450,6 +430,19 @@ pub async fn read(
                 "R" => PrincipalKind::Role,
                 _ => PrincipalKind::User,
             };
+            // A role's owner sees its rows with no grant on it, and is the
+            // grantor recorded for what `dbo` grants on it (#1011). `dbo`
+            // owns every role scratch creates, so only another owner is kept,
+            // which leaves the context of a database whose roles `dbo` owns
+            // as it was.
+            if kind == PrincipalKind::Role
+                && let Some(owner) = row.try_get::<&str>("owner")?
+                && owner != "dbo"
+            {
+                context
+                    .principal_owners
+                    .insert(name.clone(), owner.to_owned());
+            }
             context.principals.insert(name, kind);
         }
     }
@@ -646,9 +639,6 @@ pub async fn reconstruct(
     // Before any grant is replayed on a role, so the rows its owner granted
     // are replayed under that owner, as on the target (#1011).
     for (role, owner) in &context.principal_owners {
-        if owner == "dbo" {
-            continue;
-        }
         admin
             .query(&format!(
                 "ALTER AUTHORIZATION ON ROLE::{} TO {};",
@@ -715,10 +705,11 @@ pub async fn reconstruct(
     }
     replay(admin, map, "dbo", &context.database_grants, "").await?;
     // Grouped by the principal they are on, each group a securable of its
-    // own for `replay_order`, under that principal's owner. A role's is read;
-    // a user owns itself, and the engine records it as the grantor of what
-    // `dbo` grants on it (measured on 17.0). A role the deployer cannot see
-    // was created as a user above, so it owns itself on scratch too.
+    // own for `replay_order`, under that principal's owner. A role's is the
+    // one read, or `dbo`; a user owns itself, and the engine records it as
+    // the grantor of what `dbo` grants on it (measured on 17.0). A principal
+    // the deployer cannot see was created as a user above, so it owns itself
+    // on scratch too.
     let mut on_principal: BTreeMap<&str, Vec<Grant>> = BTreeMap::new();
     for held in &context.principal_grants {
         on_principal
@@ -737,10 +728,11 @@ pub async fn reconstruct(
             Some(PrincipalKind::User) | None => "USER",
         };
         let on = format!(" ON {class}::{}", bracket(&run));
-        let owner = context
-            .principal_owners
-            .get(logical)
-            .map_or(logical, String::as_str);
+        let owner = match (context.principal_owners.get(logical), class) {
+            (Some(owner), _) => owner.as_str(),
+            (None, "ROLE") => "dbo",
+            (None, _) => logical,
+        };
         replay(admin, map, owner, &grants, &on).await?;
     }
     // The scratch session speaks the run login's default language, as the

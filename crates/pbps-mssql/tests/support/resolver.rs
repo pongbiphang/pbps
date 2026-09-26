@@ -1265,7 +1265,8 @@ mod recon611 {
                  CREATE USER [{dep}] FOR LOGIN [{dep}]; CREATE USER app_owner WITHOUT LOGIN; \
                  CREATE ROLE Readers; CREATE ROLE Writers; CREATE USER auditor WITHOUT LOGIN; \
                  CREATE ROLE Leads; ALTER ROLE Leads ADD MEMBER [{dep}]; \
-                 CREATE ROLE Owned AUTHORIZATION Leads;"
+                 CREATE ROLE Owned AUTHORIZATION Leads; \
+                 CREATE ROLE Kept AUTHORIZATION [{dep}]; CREATE ROLE Led AUTHORIZATION Leads;"
             ),
             "CREATE SCHEMA app AUTHORIZATION app_owner;".to_owned(),
             format!(
@@ -1273,6 +1274,7 @@ mod recon611 {
                  GRANT SELECT ON SCHEMA::app TO [{dep}]; \
                  GRANT VIEW DEFINITION ON ROLE::Readers TO [{dep}]; \
                  GRANT DELETE ON SCHEMA::app TO Owned; \
+                 GRANT UPDATE ON SCHEMA::app TO Kept; GRANT REFERENCES ON SCHEMA::app TO Led; \
                  GRANT VIEW DEFINITION ON ROLE::Owned TO [{dep}]; \
                  DENY VIEW DEFINITION ON USER::auditor TO [{dep}];"
             ),
@@ -1295,6 +1297,14 @@ mod recon611 {
             !app.iter().any(|g| g.grantee == "Writers"),
             "a role the deployer holds nothing on is hidden: {app:?}"
         );
+        // Owning a role shows its rows with no grant on it at all, whether
+        // the deployer owns it or a role the deployer is in does.
+        for owned in ["Kept", "Led"] {
+            assert!(
+                app.iter().any(|g| g.grantee == owned),
+                "{owned}'s row is visible through ownership: {app:?}"
+            );
+        }
         let on: Vec<_> = context
             .principal_grants
             .iter()
@@ -1324,7 +1334,10 @@ mod recon611 {
             ]
         );
         assert_eq!(context.principal_owners["Owned"], "Leads");
-        assert_eq!(context.principal_owners["Readers"], "dbo");
+        assert_eq!(context.principal_owners["Kept"], dep);
+        assert_eq!(context.principal_owners["Led"], "Leads");
+        // `dbo` owns every role scratch creates, so it is not recorded.
+        assert!(!context.principal_owners.contains_key("Readers"));
 
         scratch
             .conn
