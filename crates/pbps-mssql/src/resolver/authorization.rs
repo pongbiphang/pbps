@@ -65,6 +65,15 @@ pub struct SchemaAuthorization {
     pub grants: Vec<Grant>,
 }
 
+/// A permission row on a database principal (class 4), such as
+/// `VIEW DEFINITION ON ROLE::Readers`, held by the deployer or a role it is in.
+/// `on` is the principal the permission is on.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub struct PrincipalGrant {
+    pub on: String,
+    pub grant: Grant,
+}
+
 /// Whether a referenced principal is a role or a user, which decides how it
 /// is created on scratch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -95,6 +104,13 @@ pub struct AuthorizationContext {
     pub roles: BTreeMap<String, bool>,
     /// Users the deployer may `EXECUTE AS`.
     pub impersonation: BTreeSet<String>,
+    /// Every other row on a database principal held by the deployer or a
+    /// role it is in (#1011, DEC-1011.1). Such a row decides what the deployer sees:
+    /// `VIEW DEFINITION` on a role shows that role's grant rows. Left out of
+    /// the canonical form when empty, so a context without any keeps the
+    /// fingerprint it had before these were read.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub principal_grants: Vec<PrincipalGrant>,
     /// The kind of every principal the context names that the deployer can
     /// see; one it cannot see is an owner or grantor it is not a member of,
     /// and is reproduced as a user.
@@ -281,6 +297,7 @@ pub async fn read(
         schemas: BTreeMap::new(),
         roles,
         impersonation: BTreeSet::new(),
+        principal_grants: Vec::new(),
         principals: BTreeMap::new(),
         spellings: BTreeMap::new(),
     };
@@ -305,6 +322,31 @@ pub async fn read(
                 .impersonation
                 .insert(required(&row, "target", "an impersonation target")?);
         }
+        // Everything else on a principal, a DENY of IMPERSONATE included: the
+        // granted IMPERSONATE rows are the list above, replayed as that.
+        for row in conn
+            .query(&format!(
+                "SELECT USER_NAME(p.major_id) AS target, \
+                        USER_NAME(p.grantee_principal_id) AS grantee, \
+                        USER_NAME(p.grantor_principal_id) AS grantor, \
+                        p.permission_name AS permission, p.state_desc AS state \
+                 FROM sys.database_permissions p \
+                 WHERE p.class = 4 AND USER_NAME(p.grantee_principal_id) IN ({holder_list}) \
+                   AND NOT (p.permission_name = N'IMPERSONATE' AND p.state IN ('G', 'W'));"
+            ))
+            .await?
+        {
+            context.principal_grants.push(PrincipalGrant {
+                on: required(&row, "target", "the principal a permission is on")?,
+                grant: Grant {
+                    grantee: required(&row, "grantee", "a grantee")?,
+                    grantor: required(&row, "grantor", "a grantor")?,
+                    permission: required(&row, "permission", "a permission")?,
+                    state: required(&row, "state", "a permission's state")?,
+                },
+            });
+        }
+        context.principal_grants.sort();
     }
     for schema in schemas {
         let rows = conn
@@ -430,6 +472,11 @@ fn named_principals(context: &AuthorizationContext, planned: &[PlannedGrant]) ->
     named.insert(context.principal.effective.clone());
     named.extend(context.roles.keys().cloned());
     named.extend(context.impersonation.iter().cloned());
+    for held in &context.principal_grants {
+        named.insert(held.on.clone());
+        named.insert(held.grant.grantee.clone());
+        named.insert(held.grant.grantor.clone());
+    }
     for grant in &context.database_grants {
         named.insert(grant.grantee.clone());
         named.insert(grant.grantor.clone());
@@ -616,9 +663,34 @@ pub async fn reconstruct(
         if !(name == "dbo" && owner == "dbo") {
             admin.query(&statement).await?;
         }
-        replay(admin, map, &schema.owner, &schema.grants, Some(name)).await?;
+        let on = format!(" ON SCHEMA::{}", bracket(name));
+        replay(admin, map, &schema.owner, &schema.grants, &on).await?;
     }
-    replay(admin, map, "dbo", &context.database_grants, None).await?;
+    replay(admin, map, "dbo", &context.database_grants, "").await?;
+    // Grouped by the principal they are on, each group a securable of its
+    // own for `replay_order`. The run-local principals are created by the
+    // administrative connection, so `dbo` is the grantor that needs no grant
+    // option there.
+    let mut on_principal: BTreeMap<&str, Vec<Grant>> = BTreeMap::new();
+    for held in &context.principal_grants {
+        on_principal
+            .entry(held.on.as_str())
+            .or_default()
+            .push(held.grant.clone());
+    }
+    for (logical, grants) in on_principal {
+        let run = map.run_local(logical).ok_or_else(|| missing(logical))?;
+        // A principal the deployer cannot see was created as a user above,
+        // as every unseen owner and grantor is. Measured on 17.0: a DENY on a
+        // principal does not make its row visible, where a GRANT does, so
+        // only a DENY can name one, and a DENY shows the deployer nothing.
+        let class = match context.principals.get(logical) {
+            Some(PrincipalKind::Role) => "ROLE",
+            Some(PrincipalKind::User) | None => "USER",
+        };
+        let on = format!(" ON {class}::{}", bracket(&run));
+        replay(admin, map, "dbo", &grants, &on).await?;
+    }
     // The scratch session speaks the run login's default language, as the
     // deployment session speaks the deployment login's.
     admin
@@ -724,7 +796,7 @@ async fn replay(
     map: &PrincipalMap,
     owner: &str,
     grants: &[Grant],
-    schema: Option<&str>,
+    on: &str,
 ) -> Result<(), DbError> {
     // `dbo` owns the database-level securable and is named by no row of a
     // context that grants nothing through it, so it may be absent from the map.
@@ -738,9 +810,6 @@ async fn replay(
             ))
         })
     };
-    let on = schema.map_or(String::new(), |name| {
-        format!(" ON SCHEMA::{}", bracket(name))
-    });
     for step in replay_order(owner, grants)? {
         let statement = match step {
             Step::Enable {
@@ -925,6 +994,18 @@ fn differences(
     if impersonation != target.impersonation {
         found.push("impersonation".to_owned());
     }
+    let mut principal_grants: Vec<PrincipalGrant> = reproduced
+        .principal_grants
+        .iter()
+        .map(|held| PrincipalGrant {
+            on: logical(&held.on),
+            grant: mapped(std::slice::from_ref(&held.grant)).remove(0),
+        })
+        .collect();
+    principal_grants.sort();
+    if principal_grants != target.principal_grants {
+        found.push("principal:grants".to_owned());
+    }
     found
 }
 
@@ -1061,6 +1142,7 @@ mod tests {
             .into_iter()
             .collect(),
             impersonation: ["other".to_owned()].into_iter().collect(),
+            principal_grants: Vec::new(),
             principals: [
                 ("dep".to_owned(), PrincipalKind::User),
                 ("readers".to_owned(), PrincipalKind::Role),
@@ -1171,7 +1253,11 @@ mod tests {
 
     #[test]
     fn a_faithful_reproduction_has_no_differences_and_each_field_is_named_when_it_moves() {
-        let target = context();
+        let mut target = context();
+        target.principal_grants = vec![PrincipalGrant {
+            on: "watched".into(),
+            grant: grant("dep", "dbo", "VIEW DEFINITION", "GRANT"),
+        }];
         let map = PrincipalMap::generate(&target, &[], "tok");
         let run = |name: &str| map.run_local(name).unwrap();
         // The reproduction as scratch reports it: run-local names throughout.
@@ -1183,6 +1269,10 @@ mod tests {
             .into_iter()
             .collect();
         reproduced.impersonation = [run("other")].into_iter().collect();
+        reproduced.principal_grants = vec![PrincipalGrant {
+            on: run("watched"),
+            grant: grant(&run("dep"), "dbo", "VIEW DEFINITION", "GRANT"),
+        }];
         let schema = reproduced.schemas.get_mut("app").unwrap();
         schema.owner = run("app_owner");
         schema.grants = vec![
@@ -1247,6 +1337,17 @@ mod tests {
             ["role:db_owner"]
         );
         assert_eq!(moved(&|c| c.impersonation.clear()), ["impersonation"]);
+        // #1011: the row is compared through the map on all three names, so a
+        // grant on another principal, or a DENY for a GRANT, is a difference.
+        assert_eq!(
+            moved(&|c| c.principal_grants[0].on = run("other")),
+            ["principal:grants"]
+        );
+        assert_eq!(
+            moved(&|c| c.principal_grants[0].grant.state = "DENY".into()),
+            ["principal:grants"]
+        );
+        assert_eq!(moved(&|c| c.principal_grants.clear()), ["principal:grants"]);
         assert_eq!(
             moved(&|c| {
                 c.principal.effective = "dbo".into();
@@ -1268,5 +1369,19 @@ mod tests {
         let mut other = context();
         other.impersonation.clear();
         assert_ne!(other.canonical(), base);
+        let mut other = context();
+        other.principal_grants.push(PrincipalGrant {
+            on: "readers".into(),
+            grant: grant("dep", "dbo", "VIEW DEFINITION", "GRANT"),
+        });
+        assert_ne!(other.canonical(), base);
+    }
+
+    /// A context with no rows on principals serialises exactly as it did
+    /// before #1011 read them, so a fingerprint sealed then still matches.
+    #[test]
+    fn a_context_without_principal_grants_keeps_its_canonical_form() {
+        let canonical = String::from_utf8(context().canonical()).unwrap();
+        assert!(!canonical.contains("principal_grants"), "{canonical}");
     }
 }
