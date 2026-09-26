@@ -574,45 +574,87 @@ impl Directory {
     }
 }
 
-pub(super) fn store(common: &Path, observer: ResourceObserver) -> Result<Directory> {
-    let common = Directory::open(common, observer)?;
-    super::files::qualified_filesystem(&common.file, "Git directory holding compose's records")?;
-    // Compose also writes Git objects and refs through the common directory,
-    // and any directory on the way can be a mount of its own. Each is opened
-    // without crossing a mount (`NO_XDEV`), so a mount anywhere on these
-    // paths is refused, whatever its type (DEC-1070.1). A directory that does
-    // not exist yet is created by Git on its parent's filesystem, already
-    // checked here.
-    for (storage, required) in [
-        ("objects", true),
-        ("refs", true),
-        ("refs/heads", false),
-        ("refs/heads/pbps-compose", false),
-        ("refs/pbps-compose", false),
-    ] {
+/// Refuses when any directory beneath `directory` is a mount of its own or a
+/// symbolic link, walking every existing directory once.
+fn same_filesystem_tree(directory: &impl std::os::fd::AsFd, prefix: &str) -> Result<()> {
+    let mut stream = rustix::fs::Dir::read_from(directory)
+        .map_err(|_| Error::new("Could not enumerate the Git directory"))?;
+    while let Some(entry) = stream.read() {
+        let entry = entry.map_err(|_| Error::new("Git directory enumeration is incomplete"))?;
+        let Ok(name) = entry.file_name().to_str() else {
+            return Err(Error::new("A Git directory entry has an unsupported name"));
+        };
+        if name == "." || name == ".." {
+            continue;
+        }
+        let kind = entry.file_type();
+        let relative = if prefix.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if !matches!(
+            kind,
+            rustix::fs::FileType::Directory
+                | rustix::fs::FileType::Symlink
+                | rustix::fs::FileType::Unknown
+        ) {
+            continue;
+        }
         match openat2(
-            &common.file,
-            storage,
+            directory,
+            name,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
             ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
         ) {
-            Ok(fd) => super::files::qualified_filesystem(
-                &fd,
-                &format!("repository's {storage} directory"),
-            )?,
-            Err(rustix::io::Errno::NOENT) if !required => {}
+            Ok(child) => same_filesystem_tree(&child, &relative)?,
             Err(rustix::io::Errno::XDEV) => {
                 return Err(Error::new(&format!(
-                    "The repository's {storage} directory is another filesystem mounted inside \
-                     the repository; compose writes there and has not qualified it"
+                    "The Git directory's {relative} is another filesystem mounted inside the \
+                     repository; compose writes there and has not qualified it"
                 )));
             }
-            Err(_) => {
+            // A link or special entry is not a mount. The ref census and the
+            // no-follow store operations report it as evidence; refusing here
+            // would hide that evidence behind a generic refusal.
+            Err(_) => {}
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn store(common: &Path, observer: ResourceObserver) -> Result<Directory> {
+    let common = Directory::open(common, observer)?;
+    super::files::qualified_filesystem(&common.file, "Git directory holding compose's records")?;
+    // Git writes objects, packs, refs and reflogs anywhere beneath the common
+    // directory, through paths no `NO_XDEV` lookup of compose's can cover. So
+    // every directory that exists there is reopened without crossing a mount
+    // or following a link. One that Git creates later is made on its
+    // parent's filesystem, which this walk has checked (DEC-1070.1).
+    // Only the trees written during compose are walked: a symlinked hooks
+    // directory, for example, is ordinary and compose never writes hooks.
+    for tree in ["objects", "refs", "logs", "pbps-compose-v2"] {
+        match openat2(
+            &common.file,
+            tree,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
+        ) {
+            Ok(fd) => {
+                super::files::qualified_filesystem(&fd, &format!("Git directory's {tree}"))?;
+                same_filesystem_tree(&fd, tree)?;
+            }
+            Err(rustix::io::Errno::XDEV) => {
                 return Err(Error::new(&format!(
-                    "Could not inspect the repository's {storage} directory"
+                    "The Git directory's {tree} is another filesystem mounted inside the \
+                     repository; compose writes there and has not qualified it"
                 )));
             }
+            // Absent, a link or unreadable: not a mount. The operations that
+            // use it refuse or report it as before.
+            Err(_) => {}
         }
     }
     common.child("pbps-compose-v2", true)

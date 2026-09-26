@@ -471,10 +471,15 @@ the WSL filesystem.
   `RESOLVE_NO_XDEV`. Crossing any mount below the root is then an error, and
   cannot be read as absence: an empty 9p-mounted declarations directory can
   no longer pass as "every declaration deleted". Git's own ref and object
-  writes cannot take that flag. So compose opens `objects`, `refs`,
-  `refs/heads`, `refs/heads/pbps-compose` and `refs/pbps-compose` from the
-  common directory with it, and a directory that does not exist yet is
-  created by Git on its parent's filesystem. The cost is that a checkout with
+  writes cannot take that flag, and they reach objects, packs, refs and
+  reflogs at any depth. So before compose uses a repository, it walks every
+  existing directory in the trees written during compose (`objects`,
+  `refs`, `logs` and its own store), reopening each without crossing a mount
+  or following a link. Only a mount crossing is refused there. A link or
+  special entry inside those trees is left to the ref census and the
+  no-follow store operations, which report it as evidence. Other entries,
+  such as a symlinked `hooks`, are ordinary and are not written. A directory Git creates later is
+  made on its parent's filesystem, which the walk has checked. The cost is that a checkout with
   any mount inside it is refused, even a qualified one. Nothing measured
   shows such layouts in use, and the refusal names the directory. A path prefix like `/mnt/` would
   miss other mount points and misfire on a native Linux path with that name.
