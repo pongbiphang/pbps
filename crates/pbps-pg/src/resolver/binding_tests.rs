@@ -192,6 +192,9 @@ async fn analyze_on(
         let mut reconstruction =
             Reconstruction::new(&pg, &bootstrap(&case.desired.schema, case.extras))
                 .map_err(|e| e.to_string())?;
+        let desired_managed = Managed::from_schema(&case.desired.schema);
+        let base_managed = Managed::from_schema(&case.base.schema);
+        reconstruction.drops(base_managed.dropped_by(&desired_managed));
         let mut scratch = databases.stream(&scratch_name).await;
         reconstruction
             .compile(&pg, &mut scratch)
@@ -201,8 +204,6 @@ async fn analyze_on(
             Conn::connect(Driver::Postgres, &format!("{server} dbname={scratch_name}"))
                 .await
                 .unwrap();
-        let desired_managed = Managed::from_schema(&case.desired.schema);
-        let base_managed = Managed::from_schema(&case.base.schema);
         let first = capture::capture(&mut scratch, &capture::managed_scope(&desired_managed))
             .await
             .map_err(|e| e.to_string())?;
@@ -754,6 +755,66 @@ async fn a_candidate_scratch_did_not_reproduce_leaves_the_surface_unresolved() {
             .await
             .unwrap();
             assert!(unresolved(&assessment), "{variable} {tag}: {assessment:#?}");
+        }
+    }
+}
+
+/// An overload the plan drops is never compiled, so it is identified from its
+/// declared signature, and only that identity is it. The target keeping it
+/// leaves the view's verdict standing; the target having lost it and gained
+/// an unmanaged overload of the same name leaves the view unresolved, though
+/// the count of overloads is the same.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_dropped_overload_is_held_by_its_declared_identity_not_by_a_count() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let desired = || numeric_f().view("app.v", "SELECT f(1) AS x");
+        let base = || {
+            desired().function(
+                "app.f(boolean)",
+                "(boolean) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN 0",
+            )
+        };
+        for (tag, extra, unresolved) in [
+            (
+                "kept",
+                "CREATE FUNCTION app.f(boolean) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN 0;",
+                false,
+            ),
+            (
+                "swapped",
+                "CREATE FUNCTION app.f(integer) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;",
+                true,
+            ),
+        ] {
+            let assessment = analyze(
+                &server,
+                tag,
+                Case {
+                    schemas: &["app"],
+                    extras: &[],
+                    target: &format!(
+                        "CREATE FUNCTION app.f(numeric) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;
+                         SET search_path = app;
+                         CREATE VIEW app.v AS SELECT f(1) AS x;
+                         {extra}"
+                    ),
+                    base: base(),
+                    desired: desired(),
+                },
+            )
+            .await
+            .unwrap();
+            let verdict = only(&assessment, "app", "v");
+            if unresolved {
+                assert!(
+                    matches!(verdict, Verdict::Unresolved { condition } if condition.contains("not reconstructed")),
+                    "{variable} {tag}: {assessment:#?}"
+                );
+            } else {
+                assert_eq!(verdict, Verdict::Unaffected, "{variable} {tag}");
+            }
         }
     }
 }
