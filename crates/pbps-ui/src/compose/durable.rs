@@ -721,10 +721,12 @@ pub(super) fn qualify_git_directory(common: &Path) -> Result<()> {
     )
     .map_err(|_| Error::new("Could not open the destination's Git directory"))?;
     super::files::qualified_filesystem(&fd, "destination's Git directory")?;
+    // A destination may use either ref backend: `reftable` holds its refs
+    // and reflogs when it is not `files`, so both layouts' trees are walked.
     qualify_git_trees(
         &fd,
         "destination's Git directory",
-        &["objects", "refs", "logs"],
+        &["objects", "refs", "logs", "reftable"],
     )
 }
 
@@ -966,6 +968,20 @@ mod write_tree_tests {
         let refused = qualify_git_directory(&root).unwrap_err().to_string();
         assert!(refused.contains("destination's Git directory"), "{refused}");
         assert!(refused.contains("refs/heads/pbps-compose"), "{refused}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A reftable destination writes its refs under `reftable`, which is
+    /// walked like `refs` (#1074).
+    #[test]
+    fn a_reftable_destination_tree_is_walked_too() {
+        let root = tree("reftable");
+        std::fs::create_dir_all(root.join("objects")).unwrap();
+        std::fs::create_dir_all(root.join("reftable")).unwrap();
+        assert!(qualify_git_directory(&root).is_ok());
+        std::os::unix::fs::symlink(root.join("elsewhere"), root.join("reftable/linked")).unwrap();
+        let refused = qualify_git_directory(&root).unwrap_err().to_string();
+        assert!(refused.contains("reftable/linked"), "{refused}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
