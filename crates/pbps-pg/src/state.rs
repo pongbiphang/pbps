@@ -470,10 +470,12 @@ pub async fn ensure_tables(conn: &mut Conn) -> Result<(), DbError> {
             Ok(()) => guard.release(conn).await?,
             // `IF NOT EXISTS` is not atomic against a concurrent creator:
             // measured, two sessions creating the same table at once leave
-            // one of them with `23505` on `pg_type_typname_nsp_index` or
-            // `42P07`, because the check and the create are two steps under
-            // one lock the second session does not hold. Both mean the table
-            // is there now, which is what the caller asked for.
+            // one of them with `23505` on `pg_type_typname_nsp_index`,
+            // `42P07`, or `42710` on the table's row type when the other
+            // committed between this session's relation check and its type
+            // insert (#898), because the check and the create are separate
+            // steps under a lock the second session does not hold. Each means
+            // the table may be there now, which is what the caller asked for.
             //
             // **Tolerating it is not enough**, twice over.
             //
@@ -1550,6 +1552,10 @@ const UNDEFINED_TABLE: &str = "42P01";
 /// behind. See [`ensure_tables`].
 const DUPLICATE_TABLE: &str = "42P07";
 const UNIQUE_VIOLATION: &str = "23505";
+/// `duplicate_object`: a concurrent creator's `CREATE TABLE` made the table's
+/// composite row type between this session's relation check and its own type
+/// insert (#898, DEC-898.1).
+const DUPLICATE_OBJECT: &str = "42710";
 
 /// Whether a failure means "that table does not exist".
 ///
@@ -1578,7 +1584,7 @@ fn is_select_denied(e: &DbError) -> bool {
 fn made_by_someone_else(e: &DbError) -> bool {
     matches!(
         e.server_error_code().as_deref(),
-        Some(DUPLICATE_TABLE | UNIQUE_VIOLATION)
+        Some(DUPLICATE_TABLE | UNIQUE_VIOLATION | DUPLICATE_OBJECT)
     )
 }
 
@@ -1865,6 +1871,23 @@ fn number(row: &Row, column: &str) -> Result<i64, DbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #898: the three ways a concurrent creator's `CREATE TABLE` surfaces in
+    /// the loser are all handed to the catalog recheck, which alone decides
+    /// success. Any other failure, and one with no code, is not.
+    #[test]
+    fn a_concurrent_creator_is_recognised_by_each_code_it_can_surface_as() {
+        let with = |code: Option<&str>| DbError::Driver {
+            message: "raced".into(),
+            code: code.map(str::to_owned),
+        };
+        for code in ["42P07", "23505", "42710"] {
+            assert!(made_by_someone_else(&with(Some(code))), "{code}");
+        }
+        for code in [Some("42501"), Some("42P01"), None] {
+            assert!(!made_by_someone_else(&with(code)), "{code:?}");
+        }
+    }
 
     #[test]
     fn only_verified_missing_ownership_recommends_obtaining_rights() {
