@@ -807,6 +807,60 @@ async fn a_missing_prerequisite_or_a_cycle_refuses_the_reconstruction_by_declara
     }
 }
 
+/// A module can name an index at creation only through an OID-alias
+/// constant, which the capture cannot cover. The refusal is the capture's,
+/// naming the constant's type, not a compile error from an index scratch had
+/// not made yet: an index with no predicate needs only its table.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_module_naming_an_index_is_refused_for_its_oid_alias_constant() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let declared = || {
+            let mut table = pbps_model::Table::default();
+            table.columns.insert(
+                "c".into(),
+                pbps_model::Column::new("integer".parse().unwrap()),
+            );
+            table.indexes.insert(
+                "ix".into(),
+                pbps_model::Index {
+                    columns: vec![pbps_model::IndexColumn {
+                        name: "c".into(),
+                        descending: false,
+                    }],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                },
+            );
+            Declared::default()
+                .table("app.t", table)
+                .view("app.v", "SELECT 'app.ix'::regclass AS r")
+        };
+        let refused = analyze(
+            &server,
+            "oid_alias",
+            Case {
+                schemas: &["app"],
+                extras: &[],
+                target: "
+                    CREATE TABLE app.t (c integer);
+                    CREATE INDEX ix ON app.t (c);
+                    CREATE VIEW app.v AS SELECT 'app.ix'::regclass AS r;",
+                base: declared(),
+                desired: declared(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            refused.contains("cannot cover pg_type [\"pg_catalog\", \"regclass\"]"),
+            "{variable}: {refused}"
+        );
+    }
+}
+
 /// Overloads of one name are ordered only by `depends_on`, so scratch may
 /// compile a body before the overload it would have preferred. f(integer)
 /// then binds f(character varying) through an implicit cast although
@@ -1173,7 +1227,8 @@ async fn a_later_object_of_another_kind_is_no_candidate() {
                     }],
                     include: Vec::new(),
                     unique: false,
-                    filter: None,
+                    // A predicate keeps the index after every module.
+                    filter: Some("c > 0".into()),
                 },
             );
             Declared::default()
@@ -1192,7 +1247,7 @@ async fn a_later_object_of_another_kind_is_no_candidate() {
                 extras: &[],
                 target: "
                     CREATE TABLE app.t (c integer);
-                    CREATE INDEX ix ON app.t (c);
+                    CREATE INDEX ix ON app.t (c) WHERE c > 0;
                     CREATE FUNCTION app.ix(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1;
                     CREATE VIEW app.v AS SELECT app.ix(1) AS x;",
                 base: declared(),
@@ -1464,7 +1519,8 @@ async fn a_later_object_outside_the_path_is_no_candidate() {
                     }],
                     include: Vec::new(),
                     unique: false,
-                    filter: None,
+                    // A predicate keeps the index after every module.
+                    filter: Some("id > 0".into()),
                 },
             );
             Declared::default()
@@ -1481,7 +1537,7 @@ async fn a_later_object_outside_the_path_is_no_candidate() {
                 target: "
                     CREATE TABLE app.t (id integer);
                     CREATE TABLE z.o (id integer);
-                    CREATE INDEX t ON z.o (id);
+                    CREATE INDEX t ON z.o (id) WHERE id > 0;
                     SET search_path = app;
                     CREATE VIEW app.v AS SELECT id FROM t;",
                 base: declared(),

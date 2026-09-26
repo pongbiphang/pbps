@@ -28,6 +28,18 @@ fn table() -> Table {
             filter: Some("c > app.f(1)".into()),
         },
     );
+    table.indexes.insert(
+        "plain".into(),
+        Index {
+            columns: vec![IndexColumn {
+                name: "c".into(),
+                descending: false,
+            }],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+        },
+    );
     table.foreign_keys.insert(
         "fk".into(),
         ForeignKey {
@@ -78,10 +90,11 @@ fn bootstrap() -> Vec<Change> {
     ]
 }
 
-/// A table is created bare; its keys follow every table, the modules follow
-/// the keys in the differ's order, and each expression and trigger comes
-/// last, when every routine it can name exists. A grant changes no binding
-/// and is not reproduced.
+/// A table is created bare; its keys and its indexes without a predicate
+/// follow every table, the modules follow them in the differ's order, and
+/// each expression, predicated index and trigger comes last, when every
+/// routine it can name exists. A grant changes no binding and is not
+/// reproduced.
 #[test]
 fn expressions_wait_for_every_module_and_modules_keep_the_differs_order() {
     let reconstruction = Reconstruction::new(&crate::Postgres::new(), &bootstrap()).unwrap();
@@ -95,6 +108,7 @@ fn expressions_wait_for_every_module_and_modules_keep_the_differs_order() {
         [
             (Phase::Tables, "table app.t"),
             (Phase::Keys, "table app.t"),
+            (Phase::Keys, "index plain on app.t"),
             (Phase::Modules, "function app.f(integer)"),
             (Phase::Modules, "view app.v"),
             (Phase::Expressions, "the default of app.t.c"),
@@ -123,7 +137,7 @@ fn expressions_wait_for_every_module_and_modules_keep_the_differs_order() {
 }
 
 /// What was made nameable after a module: every later module and every
-/// index. A view is found by name; a routine only by the overload its step
+/// index with a predicate; one without exists before any module. A view is found by name; a routine only by the overload its step
 /// created, never by the first of its name. An object no compiled module is
 /// has none.
 #[test]

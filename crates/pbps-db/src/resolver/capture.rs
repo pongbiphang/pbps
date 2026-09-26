@@ -60,12 +60,22 @@ pub struct Assessment {
 }
 
 /// A safe, named coverage refusal; no source or property value is included.
+/// The object is named when known, so that a refusal says which one, such as
+/// the OID-alias type of a constant (#1042).
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("target capture cannot cover {class}: {condition}")]
+#[error("target capture cannot cover {class}{}: {condition}", named(.object))]
 pub struct Uncovered {
     pub class: String,
     pub object: Option<ObjectIdentity>,
     pub condition: &'static str,
+}
+
+/// Name components are listed, never joined with dots, for the reason
+/// [`ObjectIdentity`] keeps them apart.
+fn named(object: &Option<ObjectIdentity>) -> String {
+    object
+        .as_ref()
+        .map_or_else(String::new, |object| format!(" {:?}", object.name))
 }
 
 impl Uncovered {
