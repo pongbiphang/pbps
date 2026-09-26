@@ -1595,6 +1595,110 @@ fn a_default_follows_a_rebuilt_function_past_an_update_that_does_not_take_it() {
     );
 }
 
+/// A function dropped for good, a view edited to stop calling it, and an
+/// unchanged view over that view: the plan is valid, and the second view is
+/// rebuilt around the first (#1069 review). Its path to the function goes
+/// through the edited view, so it is not refused as a dependent of the drop.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_view_over_a_view_edited_off_a_dropped_function_is_rebuilt() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "cut-path-to-dropped-function");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE VIEW app.v1 AS SELECT app.f(1) AS one; \
+         CREATE VIEW app.v2 AS SELECT one FROM app.v1",
+    );
+    let d = Demo::new("cut-path-to-dropped-function");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    std::fs::remove_file(d.dir.join("schema/app.f%28integer%29.function.yml")).unwrap();
+    let v1 = d.dir.join("schema/app.v1.view.yml");
+    let text = std::fs::read_to_string(&v1).unwrap();
+    assert!(text.contains("app.f(1)"), "{text}");
+    std::fs::write(&v1, text.replace("app.f(1)", "1")).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "destructive"],
+    ));
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
+/// Declarations that drop a function for good while keeping a view that
+/// calls it are refused by name at `plan --db`, and no plan is written
+/// (#947). The view used to be rebuilt around the drop, and the plan failed at
+/// apply on a `CREATE VIEW` against a function that was gone. Control: the
+/// same drop with the view removed too plans and applies.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_view_kept_on_a_function_dropped_for_good_refuses_the_plan_by_name() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "view-on-dropped-function");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE FUNCTION app.g(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE VIEW app.v AS SELECT app.f(1) AS one, app.g(1) AS two",
+    );
+    let d = Demo::new("view-on-dropped-function");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    std::fs::remove_file(d.dir.join("schema/app.f%28integer%29.function.yml")).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    let err = stderr(&o);
+    assert!(err.contains("app.v"), "{err}");
+    assert!(err.contains("app.f(integer)"), "{err}");
+    assert!(!plan.exists(), "a refused plan wrote {}", plan.display());
+
+    // The view also calls `g`, and this revision edits `g`: the view is on a
+    // rebuilt function too, and still refused for the dropped one rather than
+    // rebuilt through the other (#1069 review).
+    let g = d.dir.join("schema/app.g%28integer%29.function.yml");
+    let text = std::fs::read_to_string(&g).unwrap();
+    std::fs::write(&g, text.replace("SELECT x", "SELECT x + 0")).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    let err = stderr(&o);
+    assert!(
+        err.contains("app.v") && err.contains("app.f(integer)"),
+        "{err}"
+    );
+    assert!(!plan.exists(), "a refused plan wrote {}", plan.display());
+
+    std::fs::remove_file(d.dir.join("schema/app.v.view.yml")).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "destructive"],
+    ));
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
 /// A check, a filtered index and a default the same revision adds, each calling
 /// a function that revision rebuilds, are created after the rebuild (#942,
 /// DEC-942.1). `modules::dependents` reads the catalog, where none of them
