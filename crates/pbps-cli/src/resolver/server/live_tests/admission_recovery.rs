@@ -513,6 +513,16 @@ async fn a_cancelled_step_leaves_its_admin_session_to_cleanup() {
             matches!(retried, Err(Error::Cancelled)),
             "{stage}: a retry after cancellation ends the run: {retried:?}"
         );
+        // The first retry took the held session; a second finds none held
+        // and must still meet the recorded refusal, not a later guard.
+        let again = match stage {
+            "qualify" => run.qualify(&mut target, &other).await.map(|_| ()),
+            _ => run.resolve(&mut target, &binding).await.map(|_| ()),
+        };
+        assert!(
+            matches!(again, Err(Error::Cancelled)),
+            "{stage}: every later retry keeps the recorded cancellation: {again:?}"
+        );
         let closed = run.close().await;
         let named = closed
             .as_ref()

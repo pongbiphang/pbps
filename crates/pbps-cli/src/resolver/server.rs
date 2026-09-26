@@ -1615,7 +1615,10 @@ impl ScratchRun {
         target: &mut NativeTarget,
         request: &BindingRequest<'_>,
     ) -> Result<pbps_db::resolver::capture::Assessment, Error> {
+        // A held session, or a refusal already recorded, ends the run before
+        // the scope and compiled guards below can answer in its place.
         self.refuse_held_admin()?;
+        self.inner.live()?;
         let extras = match self.scope.as_ref() {
             Some(scope) if scope.report.verdict() == Verdict::Verified => {
                 scope.write_path_extras.clone()
