@@ -257,20 +257,13 @@ async fn failed_admission_names_every_unconfirmed_forwarder() {
                 late_admission,
             )));
             fault.borrow_mut().skip_sessions = usize::from(stage == "reopened");
-            let mut server = if scratch || qualify {
+            let mut server = if scratch {
                 Some(admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await)
             } else {
                 None
             };
             let mut run = if qualify {
-                Some(
-                    server
-                        .as_mut()
-                        .unwrap()
-                        .open_scratch(&scratch_recipe(&mut target).await)
-                        .await
-                        .unwrap(),
-                )
+                Some(open_when_exclusive(&mut target).await)
             } else {
                 None
             };
