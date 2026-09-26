@@ -626,7 +626,8 @@ Remaining limits, stated precisely: SIGKILL and injected refusals do not
 exercise a kernel or filesystem that loses acknowledged writes, so power-loss
 durability rests on the explicit `fsync` ordering above, not on a test. Only
 Linux with Git's files ref backend is qualified; reftable, macOS and Windows
-(#471) are not. Remote transport is qualified against local and loopback
+(#471) are not. Nor is a 9p mount, such as a Windows drive under WSL: compose
+refuses a checkout or common directory there (DEC-1070.1). Remote transport is qualified against local and loopback
 smart-HTTP destinations served by `git http-backend`, not TLS, proxies or
 hosting services. The browser family runs the shipped script against a Node
 DOM harness, not a browser engine. A concurrent same-user process that

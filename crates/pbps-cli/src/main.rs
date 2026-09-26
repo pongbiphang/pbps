@@ -699,7 +699,11 @@ fn run() -> anyhow::Result<()> {
                 if cfg!(target_os = "linux") {
                     "Local viewer: read views; Compose change can commit a reviewed change to a new branch and push it; Plan & apply can run plan and apply with the checksum your deployment gate approved. Press Ctrl-C to stop; it also interrupts a running plan or apply."
                 } else {
-                    "Local viewer: read views; Plan & apply can run plan and apply with the checksum your deployment gate approved (compose requires Linux). Press Ctrl-C to stop; it also interrupts a running plan or apply."
+                    if cfg!(windows) {
+                        "Local viewer: read views; Plan & apply can run plan and apply with the checksum your deployment gate approved (compose requires Linux: run pbps ui inside WSL, with the project in the WSL filesystem). Press Ctrl-C to stop; it also interrupts a running plan or apply."
+                    } else {
+                        "Local viewer: read views; Plan & apply can run plan and apply with the checksum your deployment gate approved (compose requires Linux). Press Ctrl-C to stop; it also interrupts a running plan or apply."
+                    }
                 }
             );
             viewer.serve()?;

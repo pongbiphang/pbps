@@ -79,7 +79,7 @@ fn open(root: &File, path: &str) -> Result<Option<File>> {
         path,
         OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
-        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
     ) {
         Ok(fd) => Ok(Some(File::from(fd))),
         Err(rustix::io::Errno::NOENT) => Ok(None),

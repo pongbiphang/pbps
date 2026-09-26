@@ -598,5 +598,11 @@ fn the_launch_banner_discloses_whether_the_viewer_can_write() {
             "{}",
             viewer.banner
         );
+        assert_eq!(
+            viewer.banner.contains("inside WSL"),
+            cfg!(windows),
+            "{}",
+            viewer.banner
+        );
     }
 }

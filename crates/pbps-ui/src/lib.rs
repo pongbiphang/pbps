@@ -182,12 +182,18 @@ impl Viewer {
 
     #[cfg(not(target_os = "linux"))]
     fn compose_answer(&self, _action: &str, _body: &[u8]) -> (u16, &'static str, Vec<u8>) {
-        plain(
-            501,
-            "Compose is qualified on Linux only; use the CLI on this platform (#471)",
-        )
+        plain(501, COMPOSE_UNQUALIFIED)
     }
 }
+
+/// Compose is qualified on Linux only (ADR-0017). On Windows the qualified
+/// build is one WSL away, with the checkout on the WSL filesystem (#1070);
+/// native Windows is #471.
+#[cfg(windows)]
+pub const COMPOSE_UNQUALIFIED: &str = "Compose is qualified on Linux only. On Windows, run pbps ui inside WSL with the project in the WSL filesystem (for example ~/project, not /mnt/c), and open the printed URL in your Windows browser; or use the CLI (native Windows: #471)";
+#[cfg(not(windows))]
+pub const COMPOSE_UNQUALIFIED: &str =
+    "Compose is qualified on Linux only; use the CLI on this platform (#471)";
 
 #[cfg(target_os = "linux")]
 const COMPOSE_BODY_LIMIT: u64 = compose_http::BODY_LIMIT;
@@ -530,6 +536,15 @@ mod tests {
         ] {
             assert!(route(path).is_err(), "{path}");
         }
+    }
+
+    /// Where compose is refused, the answer names the qualified route: WSL on
+    /// Windows (#1070), and the native-Windows issue everywhere (#471).
+    #[test]
+    fn the_unqualified_compose_answer_names_wsl_only_on_windows() {
+        assert_eq!(COMPOSE_UNQUALIFIED.contains("inside WSL"), cfg!(windows));
+        assert!(COMPOSE_UNQUALIFIED.contains("#471"));
+        assert!(COMPOSE_UNQUALIFIED.contains("CLI"));
     }
 
     #[test]

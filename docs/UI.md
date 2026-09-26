@@ -101,7 +101,26 @@ read-only. HTTP and SSH destinations must use ordinary branches, as stated
 before confirmation ([DECISIONS 534](decisions/compose-and-ui.md#decision-534)).
 
 Compose is qualified on Linux with Git's files ref backend. On other platforms
-the viewer refuses compose actions, so use the CLI there (#471).
+the viewer refuses compose actions, so use the CLI there (native Windows:
+#471). A project on a 9p mount, such as a Windows drive under WSL, is refused
+too (DEC-1070.1).
+
+### On Windows, through WSL
+
+Windows users get compose by running the Linux build inside WSL (#1070):
+
+1. Keep the project in the WSL filesystem, for example `~/project`, not under
+   `/mnt/c`. A checkout on a Windows drive reaches NTFS through WSL's 9p
+   translation layer, where compose's durability and locking guarantees are
+   not qualified, so compose refuses it and says why.
+2. Set the environments' `url_env` variables and your Git identity inside WSL,
+   then run `pbps ui` there.
+3. Open the printed URL, fragment included, in your Windows browser. Measured
+   on WSL2 with default networking (localhost forwarding), the viewer sees
+   the request from `127.0.0.1` with the exact `Host` it bound, so its checks
+   pass. Mirrored networking has not been measured.
+
+Reads and Plan & apply need none of this; they work on any platform.
 
 ## Plan and apply
 

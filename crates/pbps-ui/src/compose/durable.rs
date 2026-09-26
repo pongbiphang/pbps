@@ -189,7 +189,7 @@ impl Directory {
             entry,
             OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
             Mode::empty(),
-            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
         ) {
             Ok(fd) => File::from(fd),
             Err(rustix::io::Errno::NOENT) => return Ok(None),
@@ -273,7 +273,7 @@ impl Directory {
             child,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
-            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
         )
         .map_err(|_| Error::new("Cannot open contained private compose storage"))?;
         let result = Self {
@@ -282,6 +282,9 @@ impl Directory {
             observer: self.observer.clone(),
         };
         result.private()?;
+        // A child can be a mount point onto another filesystem; check the
+        // handle that will actually hold records and locks (DEC-1070.1).
+        super::files::qualified_filesystem(&result.file, "compose storage directory")?;
         self.check()?;
         Ok(result)
     }
@@ -330,7 +333,7 @@ impl Directory {
                 entry,
                 OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
                 Mode::empty(),
-                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
             )
             .map_err(|_| {
                 Error::new("Cannot reopen compose evidence for revision verification")
@@ -383,7 +386,7 @@ impl Directory {
             entry,
             OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
             Mode::empty(),
-            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
         ) {
             Ok(fd) => fd,
             Err(rustix::io::Errno::NOENT) => {
@@ -442,7 +445,7 @@ impl Directory {
                 entry,
                 OFlags::RDWR | OFlags::CREATE | OFlags::NONBLOCK | OFlags::CLOEXEC,
                 Mode::RUSR | Mode::WUSR,
-                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
             )
             .map_err(|_| Error::new("Cannot open compose ownership evidence"))?,
         );
@@ -503,7 +506,7 @@ impl Directory {
                 &temporary,
                 OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
                 Mode::RUSR | Mode::WUSR,
-                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
             )
             .map_err(|_| Error::new("Cannot create compose persistence evidence"))?,
         );
@@ -542,7 +545,7 @@ impl Directory {
                 entry,
                 OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
                 Mode::empty(),
-                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
             ) {
                 Ok(fd) => {
                     let file = File::from(fd);
@@ -571,8 +574,143 @@ impl Directory {
     }
 }
 
+/// Refuses when any directory beneath `directory` is a mount of its own or a
+/// symbolic link, walking every existing directory once.
+/// `links_are_evidence` is false only for `logs`, where Git appends a reflog
+/// through any link. In `refs` and the compose store a link to a file is
+/// evidence the census and store operations report, and `objects` files are
+/// never appended to.
+fn same_filesystem_tree(
+    directory: &impl std::os::fd::AsFd,
+    prefix: &str,
+    links_are_evidence: bool,
+) -> Result<()> {
+    let mut stream = rustix::fs::Dir::read_from(directory)
+        .map_err(|_| Error::new("Could not enumerate the Git directory"))?;
+    while let Some(entry) = stream.read() {
+        let entry = entry.map_err(|_| Error::new("Git directory enumeration is incomplete"))?;
+        let Ok(name) = entry.file_name().to_str() else {
+            return Err(Error::new("A Git directory entry has an unsupported name"));
+        };
+        if name == "." || name == ".." {
+            continue;
+        }
+        let kind = entry.file_type();
+        let relative = if prefix.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if !matches!(
+            kind,
+            rustix::fs::FileType::Directory
+                | rustix::fs::FileType::Symlink
+                | rustix::fs::FileType::Unknown
+        ) {
+            continue;
+        }
+        match openat2(
+            directory,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
+        ) {
+            Ok(child) => same_filesystem_tree(&child, &relative, links_are_evidence)?,
+            Err(rustix::io::Errno::XDEV) => {
+                return Err(Error::new(&format!(
+                    "The Git directory's {relative} is another filesystem mounted inside the \
+                     repository; compose writes there and has not qualified it"
+                )));
+            }
+            // Git's files backend follows a link to a directory, so writes
+            // beneath one could land anywhere, 9p included: refuse it. A link
+            // to a file, or to nothing, is a ref the census reports as
+            // evidence, and refusing here would hide that behind a generic
+            // refusal. Special entries are not directories Git writes into.
+            Err(rustix::io::Errno::LOOP) if !links_are_evidence => {
+                return Err(Error::new(&format!(
+                    "The Git directory's {relative} is a symbolic link; Git would write \
+                     through it, so compose refuses"
+                )));
+            }
+            Err(rustix::io::Errno::LOOP) => {
+                if rustix::fs::statat(directory, name, AtFlags::empty()).is_ok_and(|target| {
+                    rustix::fs::FileType::from_raw_mode(target.st_mode)
+                        == rustix::fs::FileType::Directory
+                }) {
+                    return Err(Error::new(&format!(
+                        "The Git directory's {relative} is a symbolic link to a directory; \
+                         Git would write through it, so compose refuses"
+                    )));
+                }
+            }
+            // Listed but no longer there, or not a directory after all
+            // (a special entry, or an unknown type that is a file): nothing
+            // for Git to write beneath.
+            Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR) => {}
+            // Unreadable is not "no mount": Git can still write a known path
+            // through a directory this walk cannot list.
+            Err(_) => {
+                return Err(Error::new(&format!(
+                    "The Git directory's {relative} cannot be inspected for mounts; \
+                     compose refuses rather than assume there are none"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn store(common: &Path, observer: ResourceObserver) -> Result<Directory> {
-    Directory::open(common, observer)?.child("pbps-compose-v2", true)
+    let common = Directory::open(common, observer)?;
+    super::files::qualified_filesystem(&common.file, "Git directory holding compose's records")?;
+    // Git writes objects, packs, refs and reflogs anywhere beneath the common
+    // directory, through paths no `NO_XDEV` lookup of compose's can cover. So
+    // every directory that exists there is reopened without crossing a mount
+    // or following a link. One that Git creates later is made on its
+    // parent's filesystem, which this walk has checked (DEC-1070.1).
+    // Only the trees written during compose are walked: a symlinked hooks
+    // directory, for example, is ordinary and compose never writes hooks.
+    for tree in ["objects", "refs", "logs", "pbps-compose-v2"] {
+        match openat2(
+            &common.file,
+            tree,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
+        ) {
+            Ok(fd) => {
+                super::files::qualified_filesystem(&fd, &format!("Git directory's {tree}"))?;
+                // Only reflogs are appended through a link to a file; links
+                // elsewhere are ref or store evidence reported as before.
+                same_filesystem_tree(&fd, tree, tree != "logs")?;
+            }
+            Err(rustix::io::Errno::XDEV) => {
+                return Err(Error::new(&format!(
+                    "The Git directory's {tree} is another filesystem mounted inside the \
+                     repository; compose writes there and has not qualified it"
+                )));
+            }
+            Err(rustix::io::Errno::LOOP) => {
+                return Err(Error::new(&format!(
+                    "The Git directory's {tree} is a symbolic link; Git would write through \
+                     it, so compose refuses"
+                )));
+            }
+            // Absent: Git creates it later on the common directory's
+            // filesystem, checked above.
+            Err(rustix::io::Errno::NOENT) => {}
+            // Unreadable is not "no mount".
+            Err(_) => {
+                return Err(Error::new(&format!(
+                    "The Git directory's {tree} cannot be inspected for mounts; compose \
+                     refuses rather than assume there are none"
+                )));
+            }
+        }
+    }
+    common.child("pbps-compose-v2", true)
 }
 
 pub(super) fn refuse_legacy(git: &super::git::Git) -> Result<()> {
@@ -585,7 +723,7 @@ pub(super) fn refuse_legacy(git: &super::git::Git) -> Result<()> {
             "pbps-ui",
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
-            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
         ) {
             Err(rustix::io::Errno::NOENT) => continue,
             Ok(fd) => {
@@ -712,5 +850,102 @@ mod tests {
         next.release().unwrap();
         assert!(path.join("owner.lock").exists());
         std::fs::remove_dir_all(&path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod write_tree_tests {
+    use super::*;
+
+    fn tree(name: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("pbps-write-tree-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("refs/heads")).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        std::fs::write(root.join("refs/heads/master"), "0\n").unwrap();
+        root
+    }
+
+    fn walk(root: &Path) -> Result<()> {
+        let fd = openat2(
+            rustix::fs::CWD,
+            root.join("refs"),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS,
+        )
+        .unwrap();
+        same_filesystem_tree(&fd, "refs", true)
+    }
+
+    #[test]
+    fn a_link_to_a_directory_in_a_write_tree_is_refused_and_a_link_to_a_file_is_not() {
+        let root = tree("dir-link");
+        assert!(walk(&root).is_ok());
+        // A ref that links to another ref, or to nothing, is census evidence.
+        std::os::unix::fs::symlink("master", root.join("refs/heads/alias")).unwrap();
+        std::os::unix::fs::symlink("gone", root.join("refs/heads/dangling")).unwrap();
+        assert!(walk(&root).is_ok());
+        // A directory Git would write through, wherever it points.
+        std::os::unix::fs::symlink(root.join("elsewhere"), root.join("refs/heads/pbps-compose"))
+            .unwrap();
+        let refused = walk(&root).unwrap_err().to_string();
+        assert!(refused.contains("refs/heads/pbps-compose"), "{refused}");
+        assert!(
+            refused.contains("symbolic link to a directory"),
+            "{refused}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A directory Git can write through but this walk cannot list is not
+    /// proof that no mount lies beneath it.
+    #[test]
+    fn an_unreadable_directory_in_a_write_tree_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().is_root() {
+            // Root reads a mode-0300 directory anyway; nothing to observe.
+            return;
+        }
+        let root = tree("unreadable");
+        let hidden = root.join("refs/heads/hidden");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let refused = walk(&root).map_err(|e| e.to_string());
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let refused = refused.unwrap_err();
+        assert!(refused.contains("refs/heads/hidden"), "{refused}");
+        assert!(refused.contains("cannot be inspected"), "{refused}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Under `logs` a link has no evidence role, and Git appends a reflog
+    /// through a link to a file, so any link there is refused.
+    #[test]
+    fn any_link_in_the_reflog_tree_is_refused() {
+        let root = tree("reflog-link");
+        std::fs::create_dir_all(root.join("logs/refs/heads")).unwrap();
+        std::fs::write(root.join("elsewhere/log"), "").unwrap();
+        let logs = |root: &Path| {
+            let fd = openat2(
+                rustix::fs::CWD,
+                root.join("logs"),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::NO_SYMLINKS,
+            )
+            .unwrap();
+            same_filesystem_tree(&fd, "logs", false)
+        };
+        assert!(logs(&root).is_ok());
+        std::os::unix::fs::symlink(
+            root.join("elsewhere/log"),
+            root.join("logs/refs/heads/master"),
+        )
+        .unwrap();
+        let refused = logs(&root).unwrap_err().to_string();
+        assert!(refused.contains("logs/refs/heads/master"), "{refused}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -450,3 +450,54 @@ A route list kept beside the router, with a test comparing the two, was the
 alternative. It is refused because the comparison is itself a list someone
 has to remember to update.
 
+<a id="dec-1070-1"></a>
+
+**DEC-1070.1. Compose refuses a checkout or Git directory on a 9p mount,
+decided from the open handle's filesystem type.** Windows users get compose
+by running the Linux build inside WSL (#1070). A checkout under `/mnt/c`,
+though, reaches NTFS through WSL2's drvfs, served over 9p. ADR-0017's
+guarantees rest on directory fsync, `flock`, rename over open files and
+stable inode identity, and none of these has been qualified through that
+layer. So compose refuses there, with the remedy of moving the checkout into
+the WSL filesystem.
+- **Decided by type, not path.** The check runs `fstatfs` on the handle
+  compose has already opened: the capture root in `files::Root::open`, and
+  the common directory in `durable::store`. It also runs on each captured
+  input file, on every store subdirectory `Directory::child` opens, and on
+  the common directory's `objects` and `refs`, which compose writes through.
+- **No mount below a checked directory.** A mount point beneath a qualified
+  directory can lead onto 9p at any depth, so checking directories one by one
+  cannot finish. Every descendant lookup, capture and store alike, uses
+  `RESOLVE_NO_XDEV`. Crossing any mount below the root is then an error, and
+  cannot be read as absence: an empty 9p-mounted declarations directory can
+  no longer pass as "every declaration deleted". Git's own ref and object
+  writes cannot take that flag, and they reach objects, packs, refs and
+  reflogs at any depth. So before compose uses a repository, it walks every
+  existing directory in the trees written during compose (`objects`,
+  `refs`, `logs` and its own store), reopening each without crossing a mount
+  or following a link. A mount crossing is refused, and so is a link to a
+  directory, because Git's files backend writes through it. In `refs` and the
+  compose store, a link to a file, or to nothing, is evidence the census and
+  store operations report, and it is left there; `objects` files are never
+  appended to. In `logs`, where Git appends a reflog through any link, every
+  link is refused. A directory the walk cannot open or list is refused as
+  well: unreadable is not "no mount", and Git can still write a known path
+  through it. Other entries,
+  such as a symlinked `hooks`, are ordinary and are not written. A directory Git creates later is
+  made on its parent's filesystem, which the walk has checked. The cost is that a checkout with
+  any mount inside it is refused, even a qualified one. Nothing measured
+  shows such layouts in use, and the refusal names the directory. A path prefix like `/mnt/` would
+  miss other mount points and misfire on a native Linux path with that name.
+  A handle cannot be swapped between the check and its use.
+- **Measured.** On WSL2 6.6, `/mnt/c` is `9p` with `aname=drvfs`, and
+  `statfs` reports `0x01021997`. With the check, opening `/mnt/c/Windows` as
+  a capture root is refused; without it, it opens.
+- **Only 9p is refused.** It is the one type measured to be the WSL route to
+  a Windows drive, and 9p is unqualified wherever it appears. Other
+  filesystems keep their existing checks. An allow list of qualified types
+  was the alternative. It was not taken, because nothing measured says
+  which of ext4, xfs, btrfs, overlayfs or tmpfs would be wrongly refused.
+- **The refusal is not definite.** A repository can move to a 9p mount after
+  a publication, so a refusal here must not tell recovery that nothing was
+  published.
+
