@@ -656,7 +656,7 @@ fn no_manifest_lowers_the_environment_lints() {
     }
 }
 
-/// Every `.rs` file rustc compiled into this test binary, canonicalized,
+/// Every file rustc read to compile this test binary, canonicalized,
 /// read from the dep-info file Cargo writes beside it. Paths in it are
 /// relative to the workspace root, where rustc runs. A missing or unreadable
 /// list panics: it is not evidence that nothing was compiled.
@@ -694,10 +694,11 @@ fn compiled_rust_sources(workspace: &std::path::Path) -> Vec<PathBuf> {
             (false, other) => current.push(other),
         }
     }
+    // Every entry counts, whatever its extension: `#[path]` accepts a module
+    // file named anything, so filtering on `.rs` would drop one.
     sources
         .into_iter()
         .map(PathBuf::from)
-        .filter(|path| path.extension().is_some_and(|e| e == "rs"))
         .map(|path| {
             let path = if path.is_absolute() {
                 path
@@ -744,7 +745,25 @@ fn the_ui_reads_no_environment_value() {
         compiled.iter().any(|file| file.ends_with("lib.rs")),
         "the dep-info source list is missing or empty: {compiled:?}"
     );
+    // What `include_str!` embeds is data, never compiled. Each is named, so
+    // a module smuggled in under another name is not mistaken for one.
+    let data: Vec<PathBuf> = [
+        "assets/index.html",
+        "assets/app.js",
+        "assets/compose.js",
+        "assets/trigger.js",
+        "assets/style.css",
+        "clippy.toml",
+        "Cargo.toml",
+        "../../Cargo.toml",
+    ]
+    .iter()
+    .map(|name| manifest.join(name).canonicalize().unwrap())
+    .collect();
     for file in compiled {
+        if data.contains(&file) {
+            continue;
+        }
         assert!(
             file.starts_with(&root),
             "{} is compiled into pbps-ui from outside src",
