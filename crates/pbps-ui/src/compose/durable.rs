@@ -577,6 +577,23 @@ impl Directory {
 pub(super) fn store(common: &Path, observer: ResourceObserver) -> Result<Directory> {
     let common = Directory::open(common, observer)?;
     super::files::qualified_filesystem(&common.file, "Git directory holding compose's records")?;
+    // Compose also writes Git objects and refs through the common directory.
+    // Either can be a mount of its own, so check the directories themselves.
+    for storage in ["objects", "refs"] {
+        let fd = openat2(
+            &common.file,
+            storage,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+        )
+        .map_err(|_| {
+            Error::new(&format!(
+                "Could not inspect the repository's {storage} directory"
+            ))
+        })?;
+        super::files::qualified_filesystem(&fd, &format!("repository's {storage} directory"))?;
+    }
     common.child("pbps-compose-v2", true)
 }
 
