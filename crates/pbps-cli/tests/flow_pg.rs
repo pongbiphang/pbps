@@ -3984,7 +3984,7 @@ fn a_grant_a_third_role_made_is_kept_and_only_its_removal_is_refused() {
     // #707: the remedy sends the operator to the grantor, never to the owner.
     assert!(
         stderr(&refused).contains(&format!("Have `{third}` revoke it"))
-            && stderr(&refused).contains(&format!("SET ROLE {third}")),
+            && stderr(&refused).contains(&format!("SET ROLE \"{third}\"")),
         "{}",
         stderr(&refused)
     );

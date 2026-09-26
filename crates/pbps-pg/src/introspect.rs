@@ -1096,6 +1096,15 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
         // narrowing plan would be built and run, and only the apply's closing
         // read would refuse it, after its statements ran (#700).
         if !g.revocable {
+            // As a statement the operator can paste, so the role is quoted:
+            // `SET ROLE AppGrantor` folds to another role and `SET ROLE Grant
+            // Role` does not parse (#1037). A catalog role name always
+            // quotes; were one not to, the statement is left out rather than
+            // printed wrong.
+            let set_role = crate::quote(&g.grantor).map_or_else(
+                |_| String::new(),
+                |quoted| format!(", or `SET ROLE {quoted}` and revoke it"),
+            );
             pulled.unrevocable.push(pbps_db::catalog::Unrevocable {
                 role: grantee.to_owned(),
                 target: target.clone(),
@@ -1106,14 +1115,13 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
                     // (measured on 18.6, DECISIONS 483; #707).
                     "{} on {} was granted by `{}`, and a `REVOKE` from `{}` would not \
                      carry that grantor — so nothing this tool can run takes it away. \
-                     Have `{}` revoke it, or `SET ROLE {}` and revoke it \
+                     Have `{}` revoke it{set_role} \
                      (ADR-0010 §1, DECISIONS 483, measured)",
                     g.permission,
                     target_label(g, &signatures),
                     g.grantor,
                     raw.session_role,
                     g.grantor,
-                    g.grantor
                 ),
             });
         }
@@ -3180,11 +3188,21 @@ mod tests {
         // `REVOKE` would leave this entry standing and report success.
         assert!(
             found.why.contains("Have `app_mid` revoke it")
-                && found.why.contains("SET ROLE app_mid"),
+                && found.why.contains("SET ROLE \"app_mid\""),
             "{}",
             found.why
         );
         assert!(!found.why.contains("owner"), "{}", found.why);
+        // #1037: and the role in that statement is quoted, so a grantor whose
+        // name needs quoting is the role the pasted statement selects.
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![third("AppGrantor", false)],
+            ..declaring('f', &[])
+        });
+        let why = &pulled.unrevocable[0].why;
+        assert!(why.contains("`SET ROLE \"AppGrantor\"`"), "{why}");
+        assert!(!why.contains("SET ROLE AppGrantor"), "{why}");
         assert!(
             found
                 .why
