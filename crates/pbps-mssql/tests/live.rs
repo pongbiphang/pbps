@@ -509,6 +509,83 @@ async fn a_variant_that_renders_like_its_default_is_still_drift() {
     db.drop().await;
 }
 
+/// #530: a spatial cell whose SRID alone differs from its default is drift.
+/// The well-known text both sides render drops the SRID, so the two rows below
+/// read the same `ToString()`, and only the SRID conjunct tells them apart.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_spatial_cell_whose_srid_alone_differs_from_its_default_is_still_drift() {
+    use pbps_model::{RowKey, RowScope};
+    // A default the reader compares is a literal (`confirms_default`), and a
+    // spatial literal is text that converts with the type's default SRID:
+    // 0 for `geometry`, 4326 for `geography`. The second row stores the same
+    // point in another reference.
+    for (base, other_srid) in [("geometry", 4326), ("geography", 4269)] {
+        let mut db = TestDb::create(&format!("srid530_{base}")).await;
+        let default = "('POINT (1 2)')".to_owned();
+        db.conn
+            .execute(&format!(
+                "CREATE TABLE dbo.t (id int PRIMARY KEY, g {base} DEFAULT {default}); \
+                 INSERT dbo.t(id) VALUES(1); \
+                 INSERT dbo.t(id,g) VALUES(2, {base}::STGeomFromText('POINT (1 2)', {other_srid}));"
+            ))
+            .await
+            .unwrap();
+        // The premise, measured: the same text, two SRIDs.
+        let rendered = db
+            .conn
+            .query(
+                "SELECT CASE WHEN (SELECT g.ToString() FROM dbo.t WHERE id = 1) \
+                 = (SELECT g.ToString() FROM dbo.t WHERE id = 2) THEN 1 ELSE 0 END AS same_text, \
+                 CASE WHEN (SELECT g.STSrid FROM dbo.t WHERE id = 1) \
+                 = (SELECT g.STSrid FROM dbo.t WHERE id = 2) THEN 1 ELSE 0 END AS same_srid",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rendered[0].try_get::<i32>("same_text").unwrap().unwrap(),
+            1,
+            "{base}"
+        );
+        assert_eq!(
+            rendered[0].try_get::<i32>("same_srid").unwrap().unwrap(),
+            0,
+            "{base}"
+        );
+
+        let name = TableName::new("dbo", "t");
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("id".into(), Column::new(ty("int")).not_null());
+        let mut column = Column::new(ty(base));
+        column.default = Some(default.clone());
+        table.columns.insert("g".into(), column);
+        table.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        for (key, at_default) in [("1", true), ("2", false)] {
+            let query = pbps_mssql::rows::query(
+                &name,
+                &table,
+                &RowScope::Keys([RowKey::from(key)].into_iter().collect()),
+            )
+            .unwrap()
+            .unwrap();
+            let rows = db.conn.query(&query.sql).await.unwrap();
+            let (_, observed) = pbps_mssql::rows::decode(&name, &query, &rows[0]).unwrap();
+            assert_eq!(
+                observed.at_default.contains("g"),
+                at_default,
+                "{base} row {key}"
+            );
+            assert!(!observed.unknown.contains("g"), "{base} row {key}");
+        }
+        db.drop().await;
+    }
+}
+
 /// The guard that asked "does this type have `=`?" outlived every native `=`
 /// it guarded, and took six types with it: a cell of one was never asked about
 /// its default, so it read back as one nobody can tell from its default and a
