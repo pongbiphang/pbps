@@ -475,9 +475,10 @@ the WSL filesystem.
   reflogs at any depth. So before compose uses a repository, it walks every
   existing directory in the trees written during compose (`objects`,
   `refs`, `logs` and its own store), reopening each without crossing a mount
-  or following a link. Only a mount crossing is refused there. A link or
-  special entry inside those trees is left to the ref census and the
-  no-follow store operations, which report it as evidence. Other entries,
+  or following a link. A mount crossing is refused, and so is a link to a
+  directory, because Git's files backend writes through it. A link to a
+  file, or to nothing, is a ref the census reports as evidence, and it is
+  left there. Other entries,
   such as a symlinked `hooks`, are ordinary and are not written. A directory Git creates later is
   made on its parent's filesystem, which the walk has checked. The cost is that a checkout with
   any mount inside it is refused, even a qualified one. Nothing measured

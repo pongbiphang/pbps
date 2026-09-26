@@ -615,9 +615,22 @@ fn same_filesystem_tree(directory: &impl std::os::fd::AsFd, prefix: &str) -> Res
                      repository; compose writes there and has not qualified it"
                 )));
             }
-            // A link or special entry is not a mount. The ref census and the
-            // no-follow store operations report it as evidence; refusing here
-            // would hide that evidence behind a generic refusal.
+            // Git's files backend follows a link to a directory, so writes
+            // beneath one could land anywhere, 9p included: refuse it. A link
+            // to a file, or to nothing, is a ref the census reports as
+            // evidence, and refusing here would hide that behind a generic
+            // refusal. Special entries are not directories Git writes into.
+            Err(rustix::io::Errno::LOOP) => {
+                if rustix::fs::statat(directory, name, AtFlags::empty()).is_ok_and(|target| {
+                    rustix::fs::FileType::from_raw_mode(target.st_mode)
+                        == rustix::fs::FileType::Directory
+                }) {
+                    return Err(Error::new(&format!(
+                        "The Git directory's {relative} is a symbolic link to a directory; \
+                         Git would write through it, so compose refuses"
+                    )));
+                }
+            }
             Err(_) => {}
         }
     }
@@ -652,8 +665,14 @@ pub(super) fn store(common: &Path, observer: ResourceObserver) -> Result<Directo
                      repository; compose writes there and has not qualified it"
                 )));
             }
-            // Absent, a link or unreadable: not a mount. The operations that
-            // use it refuse or report it as before.
+            Err(rustix::io::Errno::LOOP) => {
+                return Err(Error::new(&format!(
+                    "The Git directory's {tree} is a symbolic link; Git would write through \
+                     it, so compose refuses"
+                )));
+            }
+            // Absent or unreadable: not a mount. The operations that use it
+            // refuse or report it as before.
             Err(_) => {}
         }
     }
@@ -797,5 +816,52 @@ mod tests {
         next.release().unwrap();
         assert!(path.join("owner.lock").exists());
         std::fs::remove_dir_all(&path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod write_tree_tests {
+    use super::*;
+
+    fn tree(name: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("pbps-write-tree-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("refs/heads")).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        std::fs::write(root.join("refs/heads/master"), "0\n").unwrap();
+        root
+    }
+
+    fn walk(root: &Path) -> Result<()> {
+        let fd = openat2(
+            rustix::fs::CWD,
+            root.join("refs"),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS,
+        )
+        .unwrap();
+        same_filesystem_tree(&fd, "refs")
+    }
+
+    #[test]
+    fn a_link_to_a_directory_in_a_write_tree_is_refused_and_a_link_to_a_file_is_not() {
+        let root = tree("dir-link");
+        assert!(walk(&root).is_ok());
+        // A ref that links to another ref, or to nothing, is census evidence.
+        std::os::unix::fs::symlink("master", root.join("refs/heads/alias")).unwrap();
+        std::os::unix::fs::symlink("gone", root.join("refs/heads/dangling")).unwrap();
+        assert!(walk(&root).is_ok());
+        // A directory Git would write through, wherever it points.
+        std::os::unix::fs::symlink(root.join("elsewhere"), root.join("refs/heads/pbps-compose"))
+            .unwrap();
+        let refused = walk(&root).unwrap_err().to_string();
+        assert!(refused.contains("refs/heads/pbps-compose"), "{refused}");
+        assert!(
+            refused.contains("symbolic link to a directory"),
+            "{refused}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
