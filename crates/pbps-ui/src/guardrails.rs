@@ -656,6 +656,60 @@ fn no_manifest_lowers_the_environment_lints() {
     }
 }
 
+/// Every `.rs` file rustc compiled into this test binary, canonicalized,
+/// read from the dep-info file Cargo writes beside it. Paths in it are
+/// relative to the workspace root, where rustc runs. A missing or unreadable
+/// list panics: it is not evidence that nothing was compiled.
+fn compiled_rust_sources(workspace: &std::path::Path) -> Vec<PathBuf> {
+    let binary = std::env::current_exe().expect("the test binary's path");
+    let listing = binary.with_extension("d");
+    let text = std::fs::read_to_string(&listing)
+        .unwrap_or_else(|e| panic!("{} could not be read: {e}", listing.display()));
+    // The first rule is `<dep-info file>: <source> <source> ...`, with a
+    // space inside a path escaped as `\ `.
+    let first = text.lines().next().unwrap_or_default();
+    let (_, dependencies) = first
+        .split_once(": ")
+        .unwrap_or_else(|| panic!("unexpected dep-info: {first}"));
+    let mut sources = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for c in dependencies.chars().chain([' ']) {
+        match (escaped, c) {
+            (false, '\\') => escaped = true,
+            (true, ' ') => {
+                current.push(' ');
+                escaped = false;
+            }
+            (true, other) => {
+                current.push('\\');
+                current.push(other);
+                escaped = false;
+            }
+            (false, ' ') => {
+                if !current.is_empty() {
+                    sources.push(std::mem::take(&mut current));
+                }
+            }
+            (false, other) => current.push(other),
+        }
+    }
+    sources
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|path| path.extension().is_some_and(|e| e == "rs"))
+        .map(|path| {
+            let path = if path.is_absolute() {
+                path
+            } else {
+                workspace.join(path)
+            };
+            path.canonicalize()
+                .unwrap_or_else(|e| panic!("{} could not be resolved: {e}", path.display()))
+        })
+        .collect()
+}
+
 /// ADR-0015 decision 4: the UI process never holds a connection string. The
 /// child reads `url_env` itself, and the UI must not read any environment
 /// value. The one read is compose's names-only scrub, removed by its exact
@@ -676,10 +730,30 @@ fn the_ui_reads_no_environment_value() {
             }
         }
     }
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest.join("src").canonicalize().unwrap();
     let mut files = Vec::new();
     sources(&root, &mut files);
     assert!(files.len() > 10, "the source walk found {files:?}");
+    // The compiler's own list of what it compiled into this test binary
+    // (#1087): a module brought in by `#[path]`, `cfg_attr` or `include!`
+    // appears here whatever its spelling. Every compiled `.rs` file must be
+    // under `src`, and each is scanned below even if the walk missed it.
+    let compiled = compiled_rust_sources(&manifest.join("../.."));
+    assert!(
+        compiled.iter().any(|file| file.ends_with("lib.rs")),
+        "the dep-info source list is missing or empty: {compiled:?}"
+    );
+    for file in compiled {
+        assert!(
+            file.starts_with(&root),
+            "{} is compiled into pbps-ui from outside src",
+            file.display()
+        );
+        if !files.contains(&file) {
+            files.push(file);
+        }
+    }
     let mut reads = Vec::new();
     let mut scrubs = 0;
     let mut suppressions = Vec::new();

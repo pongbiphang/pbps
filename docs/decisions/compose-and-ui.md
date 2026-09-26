@@ -445,7 +445,13 @@ hand, though, passes for a route added after it was written.
   assemble a path or a lint attribute no scan of unexpanded source sees. The
   manifests' lint tables are read with a TOML parser (a test-only `toml`
   dependency), so a quoted, dotted or inline-table key cannot lower these
-  lints unseen (#1065). A test pins the clippy configuration, so deleting
+  lints unseen (#1065). The files scanned are not only a walk of `src`: the scan also
+  reads the dep-info file Cargo writes beside the test binary. That is the
+  compiler's own list of what it compiled, so a module included by
+  `#[path]`, `cfg_attr` or `include!` is found whatever its spelling, and any
+  compiled `.rs` file outside `src` fails (#1087). The list is the test
+  build's, so a `#[cfg(not(test))]` module is not in it; the walk and the
+  `#[path]`/`include!` refusals remain for that case. A test pins the clippy configuration, so deleting
   it fails.
 - The real-CLI test searches every response, served asset and file the
   session leaves (git's compressed objects included) for the password marker
