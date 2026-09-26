@@ -718,3 +718,25 @@ The live regressions are `recorded_last_table_keeps_its_schema_in_the_readiness_
 (a table, and the tombstone negative) and
 `a_recorded_module_keeps_its_schema_in_the_readiness_check_until_its_drop` (a
 view, a procedure and a function, each with the completed-drop negative).
+
+<a id="dec-392-1"></a>
+
+**DEC-392.1. On PostgreSQL, a managed table's `SELECT` gap is dropped only when
+every column the catalog has answers `has_column_privilege` (#392; extends
+DECISIONS 440).** The gap arises only for an owner who revoked its own
+object-level `SELECT`, and that owner can grant it back column by column.
+Measured on 18.6: after `REVOKE SELECT ON app.t` and `GRANT SELECT (id, label,
+n) ON app.t` by the owner, `has_table_privilege` answers `false` and every
+column answers `true`. The probe shapes (`count(*)`, a `WHERE n IS NULL`
+count, a `GROUP BY` duplicate count, `SELECT *`) all run as that owner, and
+one column short, the probe that reads the missing column is `permission
+denied`.
+
+DECISIONS 440 rescues a referenced target over the columns a declared key
+names. A managed table has no such list, because the columns a probe reads
+depend on a plan that `doctor` never sees. So every column is asked, which is
+`pbps_mssql::doctor`'s `Columns::Catalog` rescue. It can only turn a false gap
+into "ready": an object-level grant answers every column anyway, a table one
+column short keeps its gap, and a table whose column read returned nothing
+keeps it too.
+
