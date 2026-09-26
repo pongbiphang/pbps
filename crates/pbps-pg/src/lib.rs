@@ -1301,6 +1301,84 @@ mod tests {
         );
     }
 
+    /// #1111: groups with different first choices can share a fallback.
+    /// Four 60-byte tables that agree on 57 bytes but not on the 58th form
+    /// two `_pkey` groups of two, and both groups retry as the same 57-byte
+    /// `_pkey1`, so the group that retries second can reach `_pkey2`. A
+    /// declared index there is refused, though neither group alone has three
+    /// members. Negative: groups that differ within the 57 bytes have
+    /// different fallbacks, and `_pkey2` is out of either's reach.
+    #[test]
+    fn groups_that_share_a_fallback_reach_past_it_together() {
+        use pbps_model::{Column, Index, IndexColumn, PrimaryKey, Schema, Table};
+        let keyed = |index_name: Option<&str>| {
+            let mut t = Table::default();
+            t.columns.insert(
+                "id".into(),
+                Column::new("integer".parse().unwrap()).not_null(),
+            );
+            t.primary_key = Some(PrimaryKey {
+                name: None,
+                columns: vec!["id".into()],
+            });
+            if let Some(n) = index_name {
+                t.indexes.insert(
+                    n.into(),
+                    Index {
+                        columns: vec![IndexColumn {
+                            name: "id".into(),
+                            descending: false,
+                        }],
+                        include: Vec::new(),
+                        unique: false,
+                        filter: None,
+                    },
+                );
+            }
+            t
+        };
+        let pg = super::Postgres::new();
+        // `shared` bytes in common, then the group, then padding to 60.
+        let schema = |shared: usize, index_name: &str| {
+            let mut s = Schema::default();
+            for (group, member) in [('x', 'p'), ('x', 'q'), ('y', 'p'), ('y', 'q')] {
+                let name = format!(
+                    "{}{group}{}{member}",
+                    "a".repeat(shared),
+                    "b".repeat(58 - shared)
+                );
+                let index = (group, member) == ('x', 'p');
+                s.tables.insert(
+                    TableName::new("app", &name),
+                    keyed(index.then_some(index_name)),
+                );
+            }
+            s
+        };
+
+        let pkey2 = format!("{}_pkey2", "a".repeat(57));
+        let found = pbps_dialect::check_index_names(&schema(57, &pkey2), &pg);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("may both be named"), "{found:?}");
+        // Taking one key out leaves one group of two and a lone table, and
+        // they reach `_pkey1` at most.
+        assert!(found[0].contains("Name the primary key"), "{found:?}");
+
+        // Differing at byte 57, inside what the fallback keeps: two
+        // fallbacks, one per group, and each group reaches its own `_pkey1`.
+        let own = format!("{}x_pkey2", "a".repeat(56));
+        assert!(
+            pbps_dialect::check_index_names(&schema(56, &own), &pg).is_empty(),
+            "a group of two never reaches its second fallback"
+        );
+        let own = format!("{}x_pkey1", "a".repeat(56));
+        assert_eq!(
+            pbps_dialect::check_index_names(&schema(56, &own), &pg).len(),
+            1,
+            "its first fallback it does reach"
+        );
+    }
+
     #[test]
     fn a_declared_name_meeting_a_generated_one_is_refused() {
         use pbps_model::{Column, Identity, Index, IndexColumn, PrimaryKey, Schema, Table};
