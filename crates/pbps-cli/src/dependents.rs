@@ -73,9 +73,22 @@ pub(crate) fn untouched_module_dependents(
             _ => false,
         })
     };
+    // A root the plan drops and never creates again is gone for good. A
+    // declared module still depending on it cannot be rebuilt around it: the
+    // rebuild would create it against a module that no longer exists, and
+    // the plan would fail at apply. Left out here, it reaches `weave`'s
+    // refusal of a kept dependent of a module dropped for good, by name
+    // (DEC-314.1, #947).
+    let recreated = |root: &ModuleId| {
+        changes.changes.iter().any(|p| match &p.change {
+            Change::AlterModule { id, .. } | Change::CreateModule { id, .. } => id == root,
+            _ => false,
+        })
+    };
     found
-        .values()
-        .flatten()
+        .iter()
+        .filter(|(root, _)| recreated(root))
+        .flat_map(|(_, deps)| deps)
         .filter_map(|d| match &d.holds {
             Holds::Module(x) if declared.modules.contains_key(x) && !touched(x) => Some(x.clone()),
             Holds::Module(_) | Holds::TablePart { .. } | Holds::Unrepresentable(_) => None,
@@ -1550,6 +1563,34 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         assert_eq!(back, ["app.v2"]);
+    }
+
+    /// #947: a declared view still calling a function the plan drops for
+    /// good is not handed back to be rebuilt around it (the rebuild would
+    /// create the view against nothing); `weave` refuses the plan and names
+    /// it. Control: the same view beside a function the plan rebuilds is
+    /// handed back as before.
+    #[test]
+    fn a_kept_dependent_of_a_function_dropped_for_good_is_refused_not_rebuilt() {
+        let (s, ids) = declared();
+        let found = BTreeMap::from([(id("app.f(integer)"), vec![view("app.v0")])]);
+        let drop = || Change::DropModule {
+            id: id("app.f(integer)"),
+            kind: ModuleKind::Function,
+        };
+
+        let mut cs = plan(vec![drop()]);
+        assert!(untouched_module_dependents(&cs, &found, &s).is_empty());
+        let refused = weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).unwrap_err();
+        assert!(refused.contains("view app.v0"), "{refused}");
+        assert!(refused.contains("app.f(integer)"), "{refused}");
+
+        let rebuilt = plan(vec![alter(&s, "app.f(integer)")]);
+        let back: Vec<String> = untouched_module_dependents(&rebuilt, &found, &s)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(back, ["app.v0"]);
     }
 
     /// A plan that drops a function and replaces the table its check lives on

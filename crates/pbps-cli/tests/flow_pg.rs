@@ -1595,6 +1595,51 @@ fn a_default_follows_a_rebuilt_function_past_an_update_that_does_not_take_it() {
     );
 }
 
+/// Declarations that drop a function for good while keeping a view that
+/// calls it are refused by name at `plan --db`, and no plan is written
+/// (#947). The view used to be rebuilt around the drop, and the plan failed at
+/// apply on a `CREATE VIEW` against a function that was gone. Control: the
+/// same drop with the view removed too plans and applies.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_view_kept_on_a_function_dropped_for_good_refuses_the_plan_by_name() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "view-on-dropped-function");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE VIEW app.v AS SELECT app.f(1) AS one",
+    );
+    let d = Demo::new("view-on-dropped-function");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    std::fs::remove_file(d.dir.join("schema/app.f%28integer%29.function.yml")).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    let err = stderr(&o);
+    assert!(err.contains("app.v"), "{err}");
+    assert!(err.contains("app.f(integer)"), "{err}");
+    assert!(!plan.exists(), "a refused plan wrote {}", plan.display());
+
+    std::fs::remove_file(d.dir.join("schema/app.v.view.yml")).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "destructive"],
+    ));
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
 /// A check, a filtered index and a default the same revision adds, each calling
 /// a function that revision rebuilds, are created after the rebuild (#942,
 /// DEC-942.1). `modules::dependents` reads the catalog, where none of them
