@@ -986,9 +986,13 @@ fn rebind_foreign_keys_to_a_new_occupant(
             let Some(wanted) = after.foreign_keys.get(name) else {
                 continue;
             };
+            // Already replaced when the diff added it back. Matched by the add,
+            // not the drop: a dropped table this plan's rename takes the name
+            // of emits a drop of its own key at the same address, and on
+            // PostgreSQL that key can share this one's name.
             if base_uid.get(&fk.references_table) == declared_uid.get(&wanted.references_table)
                 || changes.iter().any(|c| {
-                    matches!(c, Change::DropForeignKey { table, name: n }
+                    matches!(c, Change::AddForeignKey { table, name: n, .. }
                         if table == new_name && n == name)
                 })
             {
@@ -4304,6 +4308,75 @@ mod tests {
         kept.tables.remove(&"app.old".parse::<TableName>().unwrap());
         let cs = run(&kept, &kept, &[]);
         assert!(cs.changes.is_empty(), "{:?}", cs.changes);
+    }
+
+    /// The same, where the doomed table has a key of that name too — a key
+    /// name is the table's own on PostgreSQL — and the renamed table's key
+    /// pointed at the doomed one. Two identical drops at one address are two
+    /// keys, and the renamed table's still has to go and come back.
+    #[test]
+    fn a_rebound_key_is_not_mistaken_for_the_doomed_tables_key_of_its_name() {
+        let keyed = || table(&[("id", Column::new(ty("int")).not_null())]);
+        let mut old = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("target_id", Column::new(ty("int"))),
+        ]);
+        old.foreign_keys
+            .insert("fk".into(), fk(&["target_id"], "app.target", &["id"]));
+        let mut target = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("parent_id", Column::new(ty("int"))),
+        ]);
+        target
+            .foreign_keys
+            .insert("fk".into(), fk(&["parent_id"], "app.parent", &["id"]));
+        let mut base = two_tables(("app.old", old.clone()), ("app.target", target));
+        base.tables.insert("app.parent".parse().unwrap(), keyed());
+        let mut bare = old.clone();
+        bare.foreign_keys.clear();
+        let intermediate = two_tables(("app.old", bare), ("app.parent", keyed()));
+        // The renamed table's key now points at itself, under its new name.
+        let declared = two_tables(("app.target", old), ("app.parent", keyed()));
+
+        let cs = a_dropped_tables_name_reused_by_a_later_rename(
+            &SharesIndexNamespace,
+            &base,
+            &intermediate,
+            &declared,
+        );
+        let drops: Vec<usize> = cs
+            .changes
+            .iter()
+            .enumerate()
+            .filter(
+                |(_, p)| matches!(&p.change, Change::DropForeignKey { name, .. } if name == "fk"),
+            )
+            .map(|(i, _)| i)
+            .collect();
+        let at = |f: &dyn Fn(&Change) -> bool| {
+            cs.changes
+                .iter()
+                .position(|p| f(&p.change))
+                .unwrap_or_else(|| panic!("{:?}", cs.changes))
+        };
+        let drop = at(&|c| matches!(c, Change::DropTable { .. }));
+        let rename = at(&|c| matches!(c, Change::RenameTable { .. }));
+        let add = at(&|c| matches!(c, Change::AddForeignKey { name, .. } if name == "fk"));
+        assert_eq!(drops.len(), 2, "{:?}", cs.changes);
+        // One at each table's address as it stands when it runs: the doomed
+        // table's, and the renamed table's source.
+        let addresses: BTreeSet<String> = drops
+            .iter()
+            .filter_map(|d| cs.changes[*d].change.table().map(ToString::to_string))
+            .collect();
+        assert_eq!(
+            addresses,
+            BTreeSet::from(["app.old".to_owned(), "app.target".to_owned()]),
+            "{:?}",
+            cs.changes
+        );
+        assert!(drops.iter().all(|d| *d < drop), "{:?}", cs.changes);
+        assert!(drop < rename && rename < add, "{:?}", cs.changes);
     }
 
     /// Only a drop whose name a rename claims moves. Another table's drop

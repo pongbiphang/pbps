@@ -13524,3 +13524,92 @@ fn a_table_drop_and_a_later_rename_that_reuses_its_name_apply_together() {
     let o = d.run(&["plan", "--db", connection]);
     assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
 }
+
+/// The same reuse, where the renamed table's key and the doomed table's key
+/// share a name, which a key name may on this engine (it is the table's own),
+/// and the renamed table's key pointed at the doomed table. The two drops are
+/// one address apart only in time: the doomed table's runs under its name,
+/// the renamed table's under its source, and the key comes back pointing at
+/// the table's new self (DEC-536.1).
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn a_reused_tables_key_and_the_renamed_tables_key_of_one_name_both_go() {
+    let own = OwnDatabase::new(&server(), "reusedfk536");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("reusedfk536");
+    let declare = |name: &str, body: Option<String>| {
+        let path = d.dir.join(format!("schema/app.{name}.yml"));
+        match body {
+            Some(body) => std::fs::write(path, format!("table: app.{name}\n{body}")).unwrap(),
+            None => std::fs::remove_file(path).unwrap(),
+        }
+    };
+    let keyed = |pk: &str, rest: &str| {
+        format!(
+            "columns:\n  id: {{type: bigint, nullable: false}}\n{rest}\
+             primary_key: {{name: {pk}, columns: [id]}}\n"
+        )
+    };
+    let key = |column: &str, to: &str| {
+        format!("foreign_keys:\n  fk:\n    columns: [{column}]\n    references: {to}(id)\n")
+    };
+
+    declare("parent", Some(keyed("pk_parent", "")));
+    declare(
+        "target",
+        Some(keyed("pk_target", "  parent_id: {type: bigint}\n") + &key("parent_id", "app.parent")),
+    );
+    declare(
+        "old",
+        Some(keyed("pk_old", "  target_id: {type: bigint}\n") + &key("target_id", "app.target")),
+    );
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+
+    declare("target", None);
+    declare(
+        "old",
+        Some(keyed("pk_old", "  target_id: {type: bigint}\n")),
+    );
+    succeeds(d.run(&["drop-table", "app.target", "--reason", "no longer used"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+
+    declare("old", None);
+    declare(
+        "target",
+        Some(keyed("pk_old", "  target_id: {type: bigint}\n") + &key("target_id", "app.target")),
+    );
+    succeeds(d.run(&["rename-table", "app.old", "app.target"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    let checksum = plan_checksum(&plan);
+    succeeds(d.run(&[
+        "apply",
+        "--db",
+        connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+        "--allow",
+        "rename,destructive,constraint",
+    ]));
+    succeeds(d.run(&["verify", "--db", connection]));
+    let o = d.run(&["plan", "--db", connection]);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_constraint WHERE conname = 'fk' \
+             AND conrelid = 'app.target'::regclass AND confrelid = 'app.target'::regclass"
+        ),
+        1,
+        "the key points at the table's new self"
+    );
+}
