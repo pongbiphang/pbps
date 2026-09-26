@@ -101,14 +101,12 @@ impl Managed {
             CandidateClass::Relation => {
                 self.relations.contains(&key(name)) || self.indexes.contains(&key(name))
             }
-            // A table's or view's row type has its name, and its array type is
-            // the name with an underscore in front; an index has neither.
-            CandidateClass::Type => {
-                self.relations.contains(&key(name))
-                    || name
-                        .strip_prefix('_')
-                        .is_some_and(|element| self.relations.contains(&key(element)))
-            }
+            // A table's or view's row type has its name, which no other type
+            // can hold while the relation exists; an index has none. Its
+            // array type's name is only the engine's first choice, taken by
+            // an earlier type of that name, so the array is the project's
+            // only through its internal dependency on the row type (#1041).
+            CandidateClass::Type => self.relations.contains(&key(name)),
             // A declared overload the desired schema keeps was compiled on
             // scratch, which gives its catalog identity, and only that
             // identity is it: a count would let an unmanaged overload stand
@@ -721,7 +719,9 @@ mod tests {
             &none,
             &order
         ));
-        assert!(managed.holds(
+        // The array type's name is not the project's: an earlier type may
+        // hold it. The array is taken through its dependency instead.
+        assert!(!managed.holds(
             CandidateClass::Type,
             &id("pg_type", &["app", "_t"], Vec::new()),
             &none,

@@ -960,8 +960,9 @@ resolves the same names; only the selected objects can differ, and that is
 what the bindings carry. On the target each member must be an engine object
 scratch has with the same properties, role references removed because the
 bootstrap superuser's name is the installation's; or a member of a user schema
-that is the project's own: one of its managed objects by name (a type only for
-a table or view, never for an index), or an object the target records, through
+that is the project's own: one of its managed objects by name (a type only as
+a table's or view's row type, never for an index, and never an array type,
+whose generated name an earlier type may hold), or an object the target records, through
 an internal dependency, as made by one (an identity column's sequence, a row or
 array type). An automatic dependency does not say that, since any index has one
 on the columns it covers, and neither does a constraint's index, since an
