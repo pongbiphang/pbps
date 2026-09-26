@@ -188,9 +188,20 @@ impl Reconstruction {
                     for (index, spec) in indexes {
                         // An index is a relation: it can shadow a name a
                         // module bound, so its name joins the order check.
+                        // Its key columns are plain names, so without a
+                        // predicate it needs only its table and exists
+                        // before any module, which can then name it through
+                        // an OID-alias constant and be refused by the
+                        // capture for that constant rather than fail to
+                        // compile (#1042). A predicate can call a module.
+                        let phase = if spec.filter.is_some() {
+                            Phase::Expressions
+                        } else {
+                            Phase::Keys
+                        };
                         steps.push(step(
                             dialect,
-                            Phase::Expressions,
+                            phase,
                             &format!("index {index} on {name}"),
                             &Change::AddIndex {
                                 table: name.clone(),

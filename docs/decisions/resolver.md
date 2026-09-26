@@ -906,8 +906,13 @@ else of that name already exists; a scratch compiled that way answers the
 wrong question without an error. Parsing references to order the compile is
 the grammar work ADR-0016 refuses. So scratch runs the differ's bootstrap of
 the declarations through the ordinary emitter, with a table created bare, its
-foreign keys after every table, the modules in the differ's name-scan order,
-and each default, CHECK, index and trigger last. The scan can miss a
+foreign keys and its indexes without a predicate after every table, the
+modules in the differ's name-scan order, and each default, CHECK, predicated
+index and trigger last. An index's key columns are plain names, so without a
+predicate it needs only its table; created before the modules, it lets a
+module that names it through an OID-alias constant compile and be refused by
+the capture for that constant, naming the constant's type, not for a missing
+relation (#1042). The scan can miss a
 reference, and a module compiled before a same-named object it would have
 preferred binds the other one silently. That is detected from the captured
 bindings instead of prevented: a module that bound any name first made
