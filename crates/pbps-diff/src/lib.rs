@@ -913,8 +913,58 @@ mod tests {
         );
     }
 
+    /// #973, for a table and for a role: a rename decided this run, from a
+    /// newly declared name onto one already identified, did nothing and is
+    /// reported; the same statement as an annotation is absorbed, and the new
+    /// name is an addition.
+    #[test]
+    fn a_current_rename_from_a_new_name_onto_an_identified_one_is_unused() {
+        let (_, ids) = baseline(&[("dbo.b", &["id"])]);
+        let declared = schema(&[("dbo.a", &["id"]), ("dbo.b", &["id"])]);
+        let table = Intent::RenameTable {
+            from: t("dbo.a"),
+            to: t("dbo.b"),
+        };
+        assert_eq!(
+            resolve(&declared, &ids, std::slice::from_ref(&table), &ctx()).unwrap_err(),
+            vec![Blocker::UnusedIntent {
+                intent: table.clone()
+            }]
+        );
+        let absorbed = annotated(&declared, &ids, &[table], &ctx()).unwrap();
+        assert!(absorbed.renamed_tables.is_empty());
+        assert_eq!(absorbed.created_tables.len(), 1);
+
+        let mut before = Schema::default();
+        before
+            .roles
+            .insert("reader".into(), pbps_model::role::Role::default());
+        let ids = resolve(&before, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let mut declared = before.clone();
+        declared
+            .roles
+            .insert("fresh".into(), pbps_model::role::Role::default());
+        let role = Intent::RenameRole {
+            from: "fresh".into(),
+            to: "reader".into(),
+        };
+        assert_eq!(
+            resolve(&declared, &ids, std::slice::from_ref(&role), &ctx()).unwrap_err(),
+            vec![Blocker::UnusedIntent {
+                intent: role.clone()
+            }]
+        );
+        let absorbed = annotated(&declared, &ids, &[role], &ctx()).unwrap();
+        assert!(absorbed.renamed_roles.is_empty());
+        assert_eq!(absorbed.created_roles.len(), 1);
+    }
+
     /// Intents must be idempotent: after a successful rename, the renamed_from
-    /// annotation still sitting in the file must not fail the next run.
+    /// annotation still sitting in the file must not fail the next run. It is
+    /// the *annotation* that is excused: the same rename decided again as a
+    /// command changed nothing, and says so (#973).
     #[test]
     fn an_already_applied_intent_is_not_an_error() {
         let (_, ids) = baseline(&[("dbo.customer", &["id", "customer_name"])]);
@@ -929,11 +979,13 @@ mod tests {
             .ids;
 
         // The annotation is still in the file; run again.
-        let again = resolve(&s, &after, std::slice::from_ref(&intent), &ctx()).unwrap();
+        let again = annotated(&s, &after, std::slice::from_ref(&intent), &ctx()).unwrap();
         assert!(
             again.renamed_columns.is_empty(),
             "the rename must not be applied twice"
         );
+        let repeated = resolve(&s, &after, std::slice::from_ref(&intent), &ctx()).unwrap_err();
+        assert_eq!(repeated, vec![Blocker::UnusedIntent { intent }]);
     }
 
     /// `pbps fmt` keeps or strips a `renamed_from` annotation on exactly this

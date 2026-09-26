@@ -1059,6 +1059,38 @@ fn a_command_typo_reports_the_rename_without_inventing_an_annotation() {
     }
 }
 
+/// `pbps rename` from a name the declarations have only just added onto one
+/// already identified renames nothing: the source is new, not vacated. It
+/// used to report success, write the ids for the addition, and leave the
+/// rename undone (#973). Now it is reported, and nothing is written.
+#[test]
+fn a_rename_from_a_newly_declared_name_onto_an_identified_one_writes_nothing() {
+    let d = Demo::new("rename-from-new-name");
+    d.table("table: dbo.b\ncolumns:\n  id: {type: int}\n  kept: {type: int}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let before = std::fs::read(d.ids_path()).unwrap();
+    d.table(
+        "table: dbo.b\ncolumns:\n  id: {type: int}\n  kept: {type: int}\n  fresh: {type: int}\n",
+    );
+    d.table("table: dbo.a\ncolumns:\n  id: {type: int}\n");
+    for (args, expected) in [
+        (
+            vec!["rename", "dbo.b.fresh", "kept"],
+            "rename column dbo.b.fresh -> dbo.b.kept",
+        ),
+        (
+            vec!["rename-table", "dbo.a", "dbo.b"],
+            "rename table dbo.a -> dbo.b",
+        ),
+    ] {
+        let o = d.run(&args);
+        assert_eq!(code(&o), FINDING, "{args:?}: {}", stderr(&o));
+        assert!(stderr(&o).contains(expected), "{}", stderr(&o));
+        assert_eq!(std::fs::read(d.ids_path()).unwrap(), before, "{args:?}");
+    }
+}
+
 #[test]
 fn annotation_and_command_conflicts_name_operations_without_claiming_two_annotations() {
     let d = Demo::new("intent-source-conflict");

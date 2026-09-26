@@ -1284,7 +1284,12 @@ async fn applying_a_planned_migration_converges_on_the_target() {
     assert_eq!(state_b.schema, normalized(&b));
 
     // And having converged, the next plan must be empty — the fixpoint check.
-    let ids_b2 = mint_ids(&b, &ids_b, &intents);
+    // The intents are the declarations' `renamed_from` annotations by now,
+    // already recorded: as annotations they are absorbed. Handed over again as
+    // current decisions they would be reported as renaming nothing (#973).
+    let ids_b2 = pbps_diff::resolve_with_annotations(&b, &ids_b, &intents, intents.len(), &ctx())
+        .expect("resolve")
+        .ids;
     let again = plan(&state_b.schema, &ids_b2, &b, &ids_b2);
     assert!(
         again.is_empty(),

@@ -354,10 +354,31 @@ fn resolve_with_provenance(
         } else {
             RenameSource::of(intent, declared)
         };
-        if !accounted.contains(intent)
-            && !contested.contains(intent)
-            && !intent_is_absorbed(original_intent.as_ref().unwrap_or(intent), ids, source)
-        {
+        // A rename decided this run that this run did not perform changed
+        // nothing, whatever the identity file already holds. Absorption is
+        // an annotation's excuse, for a rename recorded on an earlier run;
+        // reading a source absent from the ids file as "already vacated"
+        // let a current `pbps rename` from a newly declared name onto an
+        // identified one report success and record nothing (#973). A current
+        // drop still asks the ids file, which is the one fact it has.
+        let absorbed = match intent {
+            Intent::RenameTable { .. }
+            | Intent::RenameColumn { .. }
+            | Intent::RenameRole { .. }
+                if current_decision =>
+            {
+                false
+            }
+            Intent::RenameTable { .. }
+            | Intent::RenameColumn { .. }
+            | Intent::RenameRole { .. }
+            | Intent::DropTable { .. }
+            | Intent::DropColumn { .. }
+            | Intent::DropRole { .. } => {
+                intent_is_absorbed(original_intent.as_ref().unwrap_or(intent), ids, source)
+            }
+        };
+        if !accounted.contains(intent) && !contested.contains(intent) && !absorbed {
             blockers.push(Blocker::UnusedIntent {
                 intent: intent.clone(),
             });
@@ -1253,6 +1274,11 @@ mod tests {
         }
     }
 
+    /// An annotation whose rename is recorded lets the declarations reuse its
+    /// source name: the new `code` is an addition. The same rename decided
+    /// this run as a command is not excused: `code` is not in the ids file
+    /// because it is new, not because a rename vacated it, and the rename
+    /// did nothing (#973).
     #[test]
     fn an_absorbed_column_rename_allows_reusing_its_source_name() {
         let before = resolve(&schema(&["code_v1"]), &IdsFile::default(), &[], &ctx())
@@ -1264,7 +1290,20 @@ mod tests {
             from: "code".into(),
             to: "code_v1".into(),
         };
-        let result = resolve(&schema(&["code_v1", "code"]), &before, &[intent], &ctx()).unwrap();
+        let decided = resolve(
+            &schema(&["code_v1", "code"]),
+            &before,
+            std::slice::from_ref(&intent),
+            &ctx(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            decided,
+            vec![Blocker::UnusedIntent {
+                intent: intent.clone()
+            }]
+        );
+        let result = annotated(&schema(&["code_v1", "code"]), &before, &[intent], &ctx()).unwrap();
         assert!(result.renamed_columns.is_empty());
         assert_eq!(result.added_columns.len(), 1);
         assert_eq!(result.added_columns[0].1, table.column("code"));
