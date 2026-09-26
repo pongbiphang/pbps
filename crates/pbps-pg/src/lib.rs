@@ -1200,9 +1200,10 @@ mod tests {
 
     /// #987: two tables whose unnamed keys generate one `_pkey` leave the
     /// engine a fallback, `_pkey1`, for whichever is created second, and a
-    /// declared index there meets it in one order or the other. Negatives: a
-    /// single table has no fallback in play, and two claimants use only the
-    /// first fallback, never `_pkey2`.
+    /// declared index there meets it in one order or the other. Its remedy
+    /// is the key's own with two claimants and not with three (#990).
+    /// Negatives: a single table has no fallback in play, and two claimants
+    /// use only the first fallback, never `_pkey2`.
     #[test]
     fn a_declared_name_at_a_generated_fallback_is_refused() {
         use pbps_model::{Column, Index, IndexColumn, PrimaryKey, Schema, Table};
@@ -1252,6 +1253,21 @@ mod tests {
         );
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].contains("may both be named"), "{found:?}");
+        assert!(found[0].contains("Name the primary key"), "{found:?}");
+
+        // Three claimants: naming one key leaves two that still meet, so
+        // the fallback stays taken and only the declared index can move.
+        let found = pbps_dialect::check_index_names(
+            &schema(vec![
+                (long('x'), keyed(None)),
+                (long('z'), keyed(None)),
+                (long('y'), keyed(Some(&pkey("1")))),
+            ]),
+            &pg,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].ends_with("Rename the other object."), "{found:?}");
+        assert!(!found[0].contains("Name the primary key"), "{found:?}");
 
         assert!(
             pbps_dialect::check_index_names(
