@@ -158,6 +158,10 @@ def await_engine(container, engine):
     for _ in range(90):
         if run("docker", "exec", container, *probe, check=False, **QUIET).returncode == 0:
             return
+        # An engine that has exited will not become ready. Waiting out the
+        # loop for one only delays the report by three minutes (#958).
+        if not running(container):
+            break
         time.sleep(2)
     # Say why. The cleanup below removes the container, so whatever is not
     # printed here is the last anyone reading CI ever sees of it. Through the
@@ -167,6 +171,47 @@ def await_engine(container, engine):
     # does not print logs.
     report(run, container)
     raise RuntimeError(f"owned fixture {container} did not become ready")
+
+
+def running(container):
+    done = run("docker", "inspect", "--format", "{{.State.Running}}", container,
+               check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    # Unreadable is not "exited": keep waiting, and let the loop's own limit
+    # decide.
+    return done.returncode != 0 or done.stdout.strip() == "true"
+
+
+def crashed_starting(container, engine):
+    """Whether SQL Server core-dumped before it ever answered (#958, DEC-958.1).
+
+    The shape measured in CI, five merge groups out of five: the engine dumps
+    about two seconds after `docker start`, before any test has touched it, and
+    `paldumper` names the dump in the container's log. Nothing the code under
+    test does can reach an engine at that point, so this is the one failure
+    worth a second start. Any other failure stays a failure.
+    """
+    if engine != "mssql" or running(container):
+        return False
+    done = run("docker", "logs", container, check=False, stdout=subprocess.PIPE,
+               stderr=subprocess.STDOUT)
+    return done.returncode == 0 and "Dump already generated: /var/opt/mssql/log/core.sqlservr" in done.stdout
+
+
+def ready(container, engine, start):
+    """Wait for `container`'s engine, starting it once more if SQL Server
+    crashed while starting. `start` recreates the container under the same
+    name; a second crash fails the run, since a crash that repeats is no
+    longer the transient one this retries."""
+    try:
+        await_engine(container, engine)
+    except RuntimeError:
+        if not crashed_starting(container, engine):
+            raise
+        print(f"{container}: SQL Server core-dumped while starting; starting it once more "
+              "(#958)", flush=True)
+        run("docker", "rm", "--force", "--volumes", container, **QUIET)
+        start()
+        await_engine(container, engine)
 
 
 def start_dedicated(engine, name, owned, network=None, empty_runtime_files=False):
@@ -321,8 +366,8 @@ def fixture(args, binary, root, owned):
     start_target(engine, target, root, owned)
     supplied = f"pbps-dedicated-server-{unique}"
     start_dedicated(engine, supplied, owned)
-    await_engine(target, engine)
-    await_engine(supplied, engine)
+    ready(target, engine, lambda: start_target(engine, target, root, owned))
+    ready(supplied, engine, lambda: start_dedicated(engine, supplied, owned))
     describe(supplied)
     # A pre-existing database no run may touch, and the counter's baseline.
     statement(supplied, engine, f"CREATE DATABASE {MARKER}")
@@ -361,7 +406,8 @@ def fixture(args, binary, root, owned):
         empty_server = f"pbps-dedicated-empty-{unique}"
         if empty:
             start_dedicated(engine, empty_server, owned, empty_runtime_files=True)
-            await_engine(empty_server, engine)
+            ready(empty_server, engine, lambda: start_dedicated(
+                engine, empty_server, owned, empty_runtime_files=True))
             statement(empty_server, engine, f"CREATE DATABASE {MARKER}")
         # The exposed control is a second supplied server whose runtime does
         # not give it a private network; everything else about it qualifies.
@@ -369,7 +415,8 @@ def fixture(args, binary, root, owned):
         # one extra engine's startup is ever in flight.
         if test == exposing:
             start_dedicated(engine, exposed, owned, network="bridge")
-            await_engine(exposed, engine)
+            ready(exposed, engine, lambda: start_dedicated(engine, exposed, owned,
+                                                           network="bridge"))
         # One test needs a process the engine never started, sharing its
         # namespaces: `docker exec` joins them without becoming a descendant,
         # which is exactly the shape a subtree walk cannot see. Root, so it

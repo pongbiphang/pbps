@@ -21,7 +21,10 @@ from pathlib import Path
 import subprocess
 import uuid
 
-TAIL = "80"
+# Long enough to reach past a crash dump's own report. On every occurrence of
+# #958, the dump collector's `find: Permission denied` lines alone filled 80
+# lines, and none of what the engine printed before it crashed was left.
+TAIL = "300"
 
 
 def report(run, container):
