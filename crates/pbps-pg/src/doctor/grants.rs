@@ -95,8 +95,9 @@ pub(super) async fn missing(
                 // Recorded by its physical name, which a removed grant's
                 // `REVOKE` names too: absent, its authority cannot be
                 // established, exactly as for a declared recorded target
-                // (#568).
-                if matches!(target, GrantTarget::Object(_)) {
+                // (#568). An exact routine overload the same: `REVOKE ... ON
+                // FUNCTION` fails on a missing one just as on a table.
+                if matches!(target, GrantTarget::Object(_) | GrantTarget::Routine(_)) {
                     recorded_targets.insert(target.clone());
                 }
                 demands.entry(target).or_default().extend(permissions);

@@ -27966,6 +27966,11 @@ async fn doctor_reports_an_absent_target_of_a_recorded_only_grant() {
             [pbps_model::Permission::Select].into_iter().collect(),
         );
     }
+    // And an exact routine overload that is gone.
+    grants.insert(
+        "public.gone_f(integer)".parse().unwrap(),
+        [pbps_model::Permission::Execute].into_iter().collect(),
+    );
     recorded.roles.insert(
         reader.clone(),
         pbps_model::Role {
@@ -28007,7 +28012,12 @@ async fn doctor_reports_an_absent_target_of_a_recorded_only_grant() {
         .filter(|g| g.why.contains("recorded grant target is absent"))
         .map(|g| g.securable())
         .collect();
-    assert_eq!(absent, ["TABLE \"public\".\"gone\"".to_owned()], "{gaps:?}");
+    assert_eq!(absent.len(), 2, "{gaps:?}");
+    assert!(
+        absent.contains(&"TABLE \"public\".\"gone\"".to_owned()),
+        "{absent:?}"
+    );
+    assert!(absent.iter().any(|a| a.contains("gone_f")), "{absent:?}");
 }
 
 /// #569: a new identity reusing a departing one's name is not asked about in
