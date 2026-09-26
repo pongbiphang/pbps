@@ -238,7 +238,11 @@ fn derived(
     let Some(schema) = owner(object).name.first() else {
         return sets;
     };
-    for binding in &input.bindings {
+    for binding in input
+        .bindings
+        .iter()
+        .filter(|binding| resolved_by_name(binding))
+    {
         let target = &binding.target;
         let (Some(class), [namespace, name]) =
             (candidate_class(&target.class), target.name.as_slice())
@@ -417,6 +421,39 @@ fn properties_equal(left: &BTreeMap<String, Value>, right: &BTreeMap<String, Val
     strip(left) == strip(right)
 }
 
+/// Node fields whose object follows from another binding of the same node,
+/// never from looking a name up: an operator's implementation from the
+/// operator, a call's or operator's result and transition types from the
+/// routine, a column reference's type from the column, a collation from its
+/// inputs. The binding that decided each is compared in its own right; a
+/// same-named object cannot displace these.
+const DETERMINED: &[&str] = &[
+    "opfuncid",
+    "funcresulttype",
+    "opresulttype",
+    "aggtype",
+    "wintype",
+    "aggtranstype",
+    "aggargtypes",
+    "vartype",
+];
+
+/// Whether a binding's object was selected by name resolution, so that a
+/// same-named object could have been selected instead. The field is the
+/// binding path's last named step; a trailing number is a list position.
+fn resolved_by_name(binding: &super::bindings::Binding) -> bool {
+    let Some(field) = binding
+        .path
+        .iter()
+        .rev()
+        .find(|step| step.parse::<usize>().is_err())
+    else {
+        return true;
+    };
+    let collation = field.ends_with("collid") || field == "collation";
+    !collation && !DETERMINED.contains(&field.as_str())
+}
+
 /// Whether a call with exactly one argument can reach `routine`: its
 /// declared argument count less its defaults is at most one, and it takes at
 /// least one or is variadic. The count at the call site is not in the
@@ -453,18 +490,22 @@ fn compiled_early(
     };
     // Only an object that could have been resolved instead counts: an index
     // named like a routine a view calls could not have taken that call.
-    input.bindings.iter().any(|binding| {
-        binding.target.name.last().is_some_and(|bound| {
-            later.iter().any(|(kind, name)| {
-                *name == bound
-                    && kind.shadows(
-                        &binding.target.class,
-                        binding.target.class == "pg_proc"
-                            && callable_with_one(routines, &binding.target),
-                    )
+    input
+        .bindings
+        .iter()
+        .filter(|binding| resolved_by_name(binding))
+        .any(|binding| {
+            binding.target.name.last().is_some_and(|bound| {
+                later.iter().any(|(kind, name)| {
+                    *name == bound
+                        && kind.shadows(
+                            &binding.target.class,
+                            binding.target.class == "pg_proc"
+                                && callable_with_one(routines, &binding.target),
+                        )
+                })
             })
         })
-    })
 }
 
 #[cfg(test)]
@@ -655,6 +696,23 @@ mod tests {
         assert!(!routine(2, 0), "two required arguments are not a cast");
         assert!(routine(1, 0));
         assert!(routine(2, 1), "a defaulted second argument leaves one");
+        // An operator's implementation follows from the operator, and a
+        // column reference's type from the column: neither was looked up
+        // by name, so neither derives a candidate.
+        let determined = Input {
+            properties: BTreeMap::new(),
+            bindings: ["opfuncid", "vartype", "inputcollid"]
+                .into_iter()
+                .map(|field| Binding {
+                    path: vec!["ev_action".into(), "0".into(), field.into()],
+                    target: id("pg_proc", &["pg_catalog", "int4pl"], Vec::new()),
+                })
+                .collect(),
+        };
+        assert_eq!(
+            derived(&view, &determined, &paths, &BTreeMap::new()),
+            BTreeSet::from([set(CandidateClass::Cast, None, None)])
+        );
         // An extra the deployer cannot use is not on its measured path, so
         // nothing in it is a candidate.
         let measured = Paths::new(

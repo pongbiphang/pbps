@@ -943,7 +943,10 @@ every schema of the deployer's effective path as the analysis scope measured it
 is looked up as a routine too, and a bound routine a one-argument call can
 reach (its declared count less defaults, or variadic) as a type, since `t(x)` is an exact call, else a cast to `t`, else the
 best-matching call, and a cast takes exactly one argument —
-plus every cast, which resolution consults with no name. A
+plus every cast. Only a binding some name lookup selected counts: an
+operator's implementation, a result or transition type, a column reference's
+type and a derived collation follow from another binding, which is compared
+itself, which resolution consults with no name. A
 declaration the plan leaves unchanged has the same text on both sides and
 resolves the same names; only the selected objects can differ, and that is
 what the bindings carry. On the target each member must be an engine object

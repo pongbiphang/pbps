@@ -1226,3 +1226,36 @@ async fn a_type_can_take_a_call_that_defaults_reduce_to_one_argument() {
         );
     }
 }
+
+/// An operator's implementation routine follows from the operator; no name
+/// was looked up to find it. A same-named unmanaged routine is no candidate
+/// for `1 + 1`, and the view's verdict stands.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn an_operators_implementation_is_no_named_candidate() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let declared = || Declared::default().view("app.v", "SELECT 1 + 1 AS x");
+        let assessment = analyze(
+            &server,
+            "implementation",
+            Case {
+                schemas: &["app"],
+                extras: &[],
+                target: "
+                    SET search_path = app;
+                    CREATE VIEW app.v AS SELECT 1 + 1 AS x;
+                    CREATE FUNCTION app.int4pl(integer, integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN 0;",
+                base: declared(),
+                desired: declared(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            only(&assessment, "app", "v"),
+            Verdict::Unaffected,
+            "{variable}"
+        );
+    }
+}
