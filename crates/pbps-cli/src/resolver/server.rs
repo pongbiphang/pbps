@@ -387,6 +387,12 @@ struct Control {
     /// cannot (finding-family #652). Global to the cluster, so the scratch
     /// database being dropped does not remove them.
     roles: Vec<String>,
+    /// An administrative session on the scratch database, from the moment it
+    /// opens until the step that needed it retires it. Held here rather than
+    /// in that step's locals so that a cancelled step leaves it where cleanup
+    /// can confirm its forwarder's removal or name it (#1031); found here on
+    /// the next check, it is the mark of that cancellation.
+    admin: Option<Session>,
 }
 
 impl Control {
@@ -695,6 +701,10 @@ impl Inner {
     /// Every check goes through here: a refusal ends the analysis for good,
     /// and a cancelled one is found on the next call by the flag it left set.
     async fn check(&mut self, extra: Option<&Session>) -> Result<(), Error> {
+        if let Some(admin) = self.control.admin.take() {
+            self.control.retire(admin);
+            self.refuse(Error::Cancelled);
+        }
         if self.control.in_flight {
             if let Some(session) = self.control.session.take() {
                 self.control.retire(session);
@@ -871,6 +881,7 @@ impl DedicatedServer {
                 stale: Vec::new(),
                 unconfirmed: Vec::new(),
                 roles: Vec::new(),
+                admin: None,
             },
             analysis: Some(Analysis {
                 runtime,
@@ -1177,6 +1188,10 @@ impl ScratchRun {
         target: &mut NativeTarget,
         request: &ScopeRequest,
     ) -> Result<Verdict, Error> {
+        // A cancelled step's session, or a refusal already recorded, ends
+        // the run before anything below records new cleanup state.
+        self.refuse_held_admin()?;
+        self.inner.live()?;
         let driver = self.inner.control.driver;
         let read =
             |error: crate::resolver::native::EnvironmentError| Error::Scope(error.to_string());
@@ -1219,7 +1234,13 @@ impl ScratchRun {
         let login = self.names.login().to_owned();
         let token = login[login.len().saturating_sub(16)..].to_owned();
         let map = scope::Principals::generate(&target_auth, &request.planned, &login, &token);
-        self.inner.control.roles = map.server_wide_names();
+        // Added to, never replaced: a role an earlier attempt may have
+        // created must stay among the names cleanup drops.
+        for role in map.server_wide_names() {
+            if !self.inner.control.roles.contains(&role) {
+                self.inner.control.roles.push(role);
+            }
+        }
         // The mapped deployer runs the plan's grants on scratch and is the
         // principal every scratch read below runs as; its name follows from
         // the principal alone, which the planned grants do not change. `None`
@@ -1232,7 +1253,8 @@ impl ScratchRun {
         // maintenance database and its `CREATE SCHEMA`/`GRANT ON SCHEMA` would
         // land there instead (finding on #688). Open an admin session to the
         // scratch database for it; the run login cannot, being unprivileged.
-        let mut reconstruction = self.admin_session().await?;
+        self.admin_session().await?;
+        let reconstruction = self.inner.control.admin.as_mut().ok_or(Error::Cancelled)?;
         let outcome = scope::prepare(
             &mut reconstruction.connection,
             &map,
@@ -1245,7 +1267,7 @@ impl ScratchRun {
         .map_err(db);
         // The admin session is done either way; retire it so cleanup closes
         // its forwarder and reports it if that cannot be confirmed.
-        self.inner.control.retire(reconstruction);
+        self.retire_admin();
         outcome?;
         // The scratch session opened before reconstruction, so it did not load
         // the login defaults reconstruction set — PostgreSQL's `ALTER ROLE ...
@@ -1514,8 +1536,11 @@ impl ScratchRun {
     /// Database-local DDL and privileged catalog reads must run *in* that
     /// database, and the run login cannot make them, being unprivileged. The
     /// session moves the engine's cumulative counter, which stays moved after
-    /// it closes, so the run accounts for it; the caller retires it.
-    async fn admin_session(&mut self) -> Result<Session, Error> {
+    /// it closes, so the run accounts for it. It is held in the run's control
+    /// state; the caller uses it there and retires it with
+    /// [`Self::retire_admin`].
+    async fn admin_session(&mut self) -> Result<(), Error> {
+        self.refuse_held_admin()?;
         let admin_login = self.inner.control.endpoint.login(self.names.database());
         let session = {
             let analysis = self.inner.live()?;
@@ -1543,7 +1568,33 @@ impl ScratchRun {
         if let Some(analysis) = self.inner.analysis.as_mut() {
             analysis.opened += 1;
         }
-        Ok(session)
+        let _admin = self.inner.control.admin.insert(session);
+        #[cfg(test)]
+        live_tests::admission_recovery::after_admin_open(&_admin.forwarder);
+        #[cfg(test)]
+        live_tests::admission_recovery::hold().await;
+        Ok(())
+    }
+
+    /// An administrative session still held means a step was cancelled
+    /// while it used it, and the caller retried without a check in between.
+    /// Retire it where cleanup finds it and end the analysis, before any
+    /// other guard can answer the retry and leave it held.
+    fn refuse_held_admin(&mut self) -> Result<(), Error> {
+        if let Some(admin) = self.inner.control.admin.take() {
+            self.inner.control.retire(admin);
+            self.inner.refuse(Error::Cancelled);
+            return Err(Error::Cancelled);
+        }
+        Ok(())
+    }
+
+    /// Ends the administrative session without confirming its forwarder's
+    /// removal yet; cleanup confirms it or names it.
+    fn retire_admin(&mut self) {
+        if let Some(admin) = self.inner.control.admin.take() {
+            self.inner.control.retire(admin);
+        }
     }
 
     /// Compiles the desired declarations on this run's scratch database as
@@ -1564,6 +1615,10 @@ impl ScratchRun {
         target: &mut NativeTarget,
         request: &BindingRequest<'_>,
     ) -> Result<pbps_db::resolver::capture::Assessment, Error> {
+        // A held session, or a refusal already recorded, ends the run before
+        // the scope and compiled guards below can answer in its place.
+        self.refuse_held_admin()?;
+        self.inner.live()?;
         let extras = match self.scope.as_ref() {
             Some(scope) if scope.report.verdict() == Verdict::Verified => {
                 scope.write_path_extras.clone()
@@ -1623,10 +1678,11 @@ impl ScratchRun {
             let sealed = self.scope.as_ref().ok_or(Error::Cancelled)?;
             engine::paths(extras, &sealed.target.catalog.visibility)
         };
-        let mut admin = self.admin_session().await?;
+        self.admin_session().await?;
+        let admin = self.inner.control.admin.as_mut().ok_or(Error::Cancelled)?;
         let captured =
             engine::capture_desired(&mut admin.connection, &base, &desired, &paths).await;
-        self.inner.control.retire(admin);
+        self.retire_admin();
         let (compiled, scope) = captured.map_err(Error::Binding)?;
         self.check(target).await?;
         let current = target
@@ -1733,6 +1789,9 @@ impl ScratchRun {
 async fn close_control(control: &mut Control) -> Vec<String> {
     if let Some(session) = control.session.take() {
         control.retire(session);
+    }
+    if let Some(admin) = control.admin.take() {
+        control.retire(admin);
     }
     let mut unconfirmed = std::mem::take(&mut control.unconfirmed);
     for forwarder in std::mem::take(&mut control.stale) {
