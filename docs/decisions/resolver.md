@@ -973,8 +973,9 @@ that took an identity column's generated name first, shares scratch's identity
 without being what scratch made (#1041). A routine is managed only as an exact overload:
 the one scratch compiled for a declaration the plan keeps, or, for one the plan
 drops and so never compiles, the identity its declared signature names, each
-argument type identified with `to_regtype` in the compile session, as the
-deployer that runs the plan's `DROP` resolves it. An overload whose types
+argument type identified with `to_regtype` in the compile session under the
+routine schema's write path, as the deployer that runs the plan's `DROP`
+resolves it. An overload whose types
 cannot all be identified, such as one taking a type the plan also drops, holds
 nothing. Counting the dropped overloads instead let an unmanaged overload stand
 in for a declared one the target had lost (#1063). An unmanaged overload

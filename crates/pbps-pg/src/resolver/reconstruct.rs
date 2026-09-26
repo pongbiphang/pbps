@@ -364,10 +364,24 @@ impl Reconstruction {
         // After the commit: a type name the engine cannot parse is an error
         // there, which inside the transaction would abort the compile. Here
         // it only leaves that routine unidentified, which counts for nothing.
+        // Each is looked up under the write path the plan's DROP of it runs
+        // under, which is where an unqualified argument type resolves.
         for (id, identity) in &mut self.dropped {
-            if let ModuleId::Routine(routine) = id {
-                *identity = signature(conn, routine).await;
+            let ModuleId::Routine(routine) = id else {
+                continue;
+            };
+            let Ok(path) = crate::emit::write_path(dialect, id.schema()) else {
+                continue;
+            };
+            if conn
+                .execute(&format!("SET search_path = {path}"))
+                .await
+                .is_err()
+            {
+                continue;
             }
+            *identity = signature(conn, routine).await;
+            let _ = conn.execute("RESET search_path").await;
         }
         Ok(())
     }

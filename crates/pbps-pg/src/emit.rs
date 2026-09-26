@@ -1000,7 +1000,7 @@ pub(crate) const NOT_A_SCHEMA_A_PATH_CAN_NAME: &str = "$user";
 /// (ADR-0013 §3, DECISIONS 276 and 277).
 pub(crate) const NOT_A_SCHEMA_A_PATH_MAY_LIST: &str = "pg_catalog";
 
-fn write_path(pg: &Postgres, schema: &str) -> Result<String, DialectError> {
+pub(crate) fn write_path(pg: &Postgres, schema: &str) -> Result<String, DialectError> {
     let mut parts = Vec::new();
     for part in std::iter::once(schema).chain(pg.write_path_extras().iter().map(String::as_str)) {
         if part == NOT_A_SCHEMA_A_PATH_MAY_LIST {

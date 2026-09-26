@@ -816,6 +816,43 @@ async fn a_dropped_overload_is_held_by_its_declared_identity_not_by_a_count() {
                 assert_eq!(verdict, Verdict::Unaffected, "{variable} {tag}");
             }
         }
+        // An unqualified argument type is identified where the plan's DROP
+        // resolves it: under the routine schema's write path, not the
+        // session's default path.
+        let table = || {
+            let mut table = pbps_model::Table::default();
+            table.columns.insert(
+                "x".into(),
+                pbps_model::Column::new("integer".parse().unwrap()),
+            );
+            table
+        };
+        let desired = || desired().table("app.t", table());
+        let assessment = analyze(
+            &server,
+            "unqualified",
+            Case {
+                schemas: &["app"],
+                extras: &[],
+                target: "CREATE FUNCTION app.f(numeric) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;
+                         CREATE TABLE app.t (x integer);
+                         SET search_path = app;
+                         CREATE VIEW app.v AS SELECT f(1) AS x;
+                         CREATE FUNCTION app.f(t) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN 0;",
+                base: desired().function(
+                    "app.f(t)",
+                    "(t) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN 0",
+                ),
+                desired: desired(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            only(&assessment, "app", "v"),
+            Verdict::Unaffected,
+            "{variable} unqualified: {assessment:#?}"
+        );
     }
 }
 
