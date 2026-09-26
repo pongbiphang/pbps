@@ -583,8 +583,11 @@ creation order: created after the table, the declared index fails with
 `42P07`; created before it, the engine silently suffixes its own name
 (`taken_pkey1`), and the same declaration succeeds or fails by order alone.
 Predicting the suffix would make the result depend on apply order and
-on objects outside the declaration, so the check refuses the meeting and asks
-for a named primary key or another name. Two generated names that meet are
+on objects outside the declaration, so the check refuses the meeting. The
+refusal names the remedy that fits the generated relation (#990). For the index
+behind an unnamed primary key, name the key or rename the other object. For an
+identity sequence, which is named after its table and column and not after the
+key, rename the other object or the column. Two generated names that meet are
 left alone: the engine suffixes one of them, neither is declared, and nothing
 records it by name. The suffix is not left alone (#987). When `c` generated
 names meet, the engine gives the later ones its fallbacks, 1 to `c - 1`. It
