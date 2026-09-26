@@ -667,7 +667,20 @@ fn string_end(expr: &str, at: usize) -> Option<usize> {
         match bytes[i] {
             b'\\' if escapes => i += 2,
             b'\'' if bytes.get(i + 1) == Some(&b'\'') => i += 2,
-            b'\'' => return Some(i + 1),
+            b'\'' => {
+                // A piece continued across a newline is the same constant,
+                // and it takes the first piece's escapes: measured,
+                // `E'a' ⏎ 'b\'c'` is `ab'c` (#539). Its end is the last
+                // piece's, or a scan that stopped here would read the
+                // continuation's escaped quote as its close.
+                let end = i + 1;
+                let (rest, continues) = crate::emit::after_the_gap(&expr[end..]);
+                if continues && rest.starts_with('\'') {
+                    i = expr.len() - rest.len() + 1;
+                    continue;
+                }
+                return Some(end);
+            }
             _ => i += 1,
         }
     }
@@ -1851,6 +1864,12 @@ mod tests {
             "CAST($q$a AS b$q$ AS text)",
             "'é'::text",
             "E'a\\\\'::text",
+            // A continued `E'…'` takes its escapes into every piece, so the
+            // escaped quote is data and the cast is still around one literal.
+            // Measured, each of these is `ab'c` (#539).
+            "CAST(E'a'\n'b\\'c' AS text)",
+            "E'a'\n'b\\'c'::text",
+            "(E'a'\n'b\\'c')::text",
         ] {
             assert!(is_constant(constant), "{constant}");
         }
@@ -1945,6 +1964,9 @@ mod tests {
             "NULL::U&\"unclosed",
             "CAST(NULL AS text -- ) unterminated",
             "E'a\\'::text",
+            // Unterminated to the engine: the second piece's escaped quote
+            // does not close it (#539).
+            "E'a'\n'x\\'\n'y'::text",
             "$$open::text",
             "$q$open$$",
         ] {
