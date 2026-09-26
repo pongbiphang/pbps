@@ -664,31 +664,50 @@ under version 1. Some past changes would move the version under this rule, for
 example the timeline's `denied` variant (DECISIONS 435). They are not
 renumbered.
 
-Two tests in `integration` hold the part a reviewer cannot see.
+Two checks hold the part a reviewer cannot see.
 
-- `only_the_named_envelope_objects_constrain_unnamed_properties` names the
-  constrained objects, and fails when another appears. Today there are four:
+- `integration`'s `only_the_named_envelope_objects_constrain_unnamed_properties`
+  names the constrained objects, and fails when another appears. Today there
+  are four:
   - `ResolverProfile`'s two variants. This is the configuration's own type,
     echoed by a connected plan, and it stays closed so `pbps.yml` refuses a
     misspelt key.
   - `Discovery`'s `observations` and `qualification` maps. They accept new
     keys whose values are `Observation`s, and nothing else.
-- `a_constrained_object_changes_only_with_the_wire_version` checks each
-  constrained object against every archived schema set stamped with the same
-  wire version. The archive must still accept what the object now describes.
-  A property may be dropped or become required. A property may not be added,
-  stop being required or change its own schema, and no other keyword may
-  change. The current object is found by its pointer even when it is no
-  longer constrained, so an object that opens is compared too. Annotation
-  keywords (`description`, `title`, `$comment`, `default`, `examples`,
-  `deprecated`, `readOnly`, `writeOnly`) are ignored, because they change no
-  validation. A property named like one is kept, and so is a `const`,
-  `enum` or `dependentRequired` value that holds one. Archives never change, so a change the old
-  document would refuse fails until `output::SCHEMA_VERSION` moves. A
-  property's own schema is compared by equality, so a narrowing inside it is
-  refused conservatively. Deciding JSON Schema containment in general is not
-  attempted (DECISIONS 465).
+- Every envelope the flow tests emit is validated against each archived
+  schema set, from 16 on, that shares the current wire version (DEC-1038.1).
 
 `pbps-ui`'s contract types use `deny_unknown_fields` on purpose. They ship in
 the same binary as the CLI they read (ADR-0015 decision 6), and each addition
 updates them in the same change.
+
+<a id="dec-1038-1"></a>
+
+**DEC-1038.1. DEC-997.1's wire-version rule is checked by validating the
+envelopes the CLI emits against the archived schemas, not by comparing
+schema definitions.** DEC-997.1 moves the wire version exactly when an
+emitted envelope could fail a schema published before under the same
+version. #1032 approximated that by comparing each constrained object's
+definition with the archive by equality. That comparison missed breaking
+changes elsewhere: a new enum value such as an `Outcome` variant, a changed
+referenced definition, or a required field renamed or removed from an open
+object. It also demanded a bump for compatible narrowings.
+
+Every emitted envelope is now also validated against every archived
+envelope schema, from set 16 on, stamped with the same wire version. The
+check lives in `tests/support/envelope_archives.rs` and is called wherever
+the tests validate an envelope: `flow.rs`'s `envelope_matches_schema`, the
+resolver selection and discovery supports, which carry the closed
+`ResolverProfile` and `Discovery` shapes, and `flow_pg.rs`'s connected
+plan. That is exactly the rule, on real output, and
+it needs no general JSON Schema containment (DECISIONS 465).
+- **Starts at set 16.** Earlier sets under version 1 predate the rule, for
+  example DECISIONS 435's `denied` variant.
+- **Replaces the definition comparison.** A narrowing, such as
+  `FmtData.mode` limited to `check|write`, now passes. Renaming
+  `FmtData.mode` to `run_mode` with the published schema regenerated fails
+  against set 16.
+- **The cost.** A breaking change in a part no flow test emits goes unseen.
+  It is covered only as far as the offline and connected envelope tests
+  reach, the connected ones on the live CI jobs.
+

@@ -59,6 +59,7 @@ fn report(output: Output) -> serde_json::Value {
         jsonschema::validator_for(&schema).unwrap().is_valid(&value),
         "{value}"
     );
+    crate::envelope_archives::assert_accepted_by_archives(&value, "resolver selection");
     value
 }
 

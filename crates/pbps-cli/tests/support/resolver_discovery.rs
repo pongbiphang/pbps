@@ -75,6 +75,7 @@ pub fn check(server: &str, dialect: &str) {
             .is_valid(&report),
         "{report}"
     );
+    crate::envelope_archives::assert_accepted_by_archives(&report, "resolver discovery");
     let human = run(&["doctor", "--db", connection]);
     assert_eq!(code(&human), 0, "{}{}", stdout(&human), stderr(&human));
     let text = stdout(&human);

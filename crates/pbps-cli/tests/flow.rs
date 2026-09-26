@@ -20,6 +20,9 @@ async fn connect_live(connection: &str) -> Result<pbps_db::Conn, pbps_db::DbErro
 
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
+#[path = "support/envelope_archives.rs"]
+mod envelope_archives;
+
 #[path = "support/resolver_selection.rs"]
 mod resolver_selection;
 
@@ -13199,6 +13202,7 @@ fn envelope_matches_schema(validator: &jsonschema::Validator, label: &str, out: 
     if let Err(e) = validator.validate(&value) {
         panic!("{label}: the envelope does not match the published schema: {e}\n{text}");
     }
+    envelope_archives::assert_accepted_by_archives(&value, label);
     if matches!(label, "status" | "verify" | "explain" | "state list") {
         pbps_ui::contract::parse(label, &out.stdout, code(out)).unwrap_or_else(|e| {
             panic!("{label}: the independent UI consumer refused the CLI output: {e}\n{text}")
