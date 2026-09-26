@@ -13659,6 +13659,14 @@ fn a_chain_of_renames_into_vacated_names_applies_together() {
                 "foreign_keys:\n  fk_keeper_y:\n    columns: [y_id]\n    references: {to}(id)\n"
             )
     };
+    // And one on the head of the chain: it follows `z` to `a`, while the
+    // closing read also has a `z`, the renamed `y`.
+    let head_keeper = |to: &str| {
+        keyed("pk_head_keeper", "  z_id: {type: bigint}\n")
+            + &format!(
+                "foreign_keys:\n  fk_head_keeper_z:\n    columns: [z_id]\n    references: {to}(id)\n"
+            )
+    };
     let step = |d: &Demo| {
         assert_eq!(code(&d.run(&["plan"])), 0);
         d.commit();
@@ -13668,6 +13676,7 @@ fn a_chain_of_renames_into_vacated_names_applies_together() {
     declare("z", Some(keyed("pk_z", "  zed: {type: bigint}\n")));
     declare("y", Some(keyed("pk_y", "  why: {type: bigint}\n")));
     declare("keeper", Some(keeper("app.y")));
+    declare("head_keeper", Some(head_keeper("app.z")));
     step(&d);
     let o = d.run(&["bootstrap", "--db", connection]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
@@ -13679,6 +13688,7 @@ fn a_chain_of_renames_into_vacated_names_applies_together() {
 
     declare("z", None);
     declare("a", Some(keyed("pk_z", "  zed: {type: bigint}\n")));
+    declare("head_keeper", Some(head_keeper("app.a")));
     let o = d.run(&["rename-table", "app.z", "app.a"]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
     step(&d);

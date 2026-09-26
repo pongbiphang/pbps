@@ -1957,16 +1957,45 @@ fn refuse_unplanned_movement(
     let holds = |s: &Schema, a: &TableName, b: &TableName| {
         s.tables.contains_key(a) && s.tables.contains_key(b)
     };
-    // Except an occupant this plan drops or renames away: holding both
-    // spellings is then the plan's own order, that statement not having run
-    // yet (DEC-536.1).
-    let mut undo = pbps_model::Renames::default();
+    // Except where this plan explains the second spelling (DEC-536.1): on the
+    // earlier read, an occupant it drops or renames away, whose statement has
+    // not run yet; on the later read, a table it renames into the source
+    // name, the next link of a chain.
+    //
+    // Each read undoes only the renames that had run when it was taken: in a
+    // chain, `z` on the earlier read is still `z`, and on the later one it is
+    // the renamed `y`, so one map for both sides rewrote a reference that had
+    // not moved. A rename has run when its source name is gone, or when the
+    // table there is the next link's, and that link's rename has run.
+    let refills: BTreeMap<&TableName, &TableName> =
+        renamed.iter().map(|(from, to)| (*to, *from)).collect();
+    let has_run = |s: &Schema, from: &TableName| {
+        let mut name = from;
+        for _ in 0..=renamed.len() {
+            if !s.tables.contains_key(name) {
+                return true;
+            }
+            match refills.get(name) {
+                Some(next) => name = next,
+                None => return false,
+            }
+        }
+        false
+    };
+    let mut undo_before = pbps_model::Renames::default();
+    let mut undo_after = pbps_model::Renames::default();
     for (from, to) in &renamed {
         let vacated = dropped_tables.contains(to) || renamed.contains_key(to);
-        if (holds(before, from, to) && !vacated) || holds(after, from, to) {
+        let refilled = refills.contains_key(from);
+        if (holds(before, from, to) && !vacated) || (holds(after, from, to) && !refilled) {
             continue;
         }
-        undo.rename_table((*to).clone(), (*from).clone());
+        if has_run(before, from) {
+            undo_before.rename_table((*to).clone(), (*from).clone());
+        }
+        if has_run(after, from) {
+            undo_after.rename_table((*to).clone(), (*from).clone());
+        }
     }
     // A `RenameColumn` carries its table's *declared* name — the one the
     // rename leaves it under — which is already the key this map wants. And
@@ -1983,7 +2012,9 @@ fn refuse_unplanned_movement(
         if holds_column(before, table, from, to) || holds_column(after, table, from, to) {
             continue;
         }
-        undo.rename_column(pbps_model::ColumnRef::new((*table).clone(), *to), *from);
+        for undo in [&mut undo_before, &mut undo_after] {
+            undo.rename_column(pbps_model::ColumnRef::new((*table).clone(), *to), *from);
+        }
     }
 
     let mut moved = Vec::new();
@@ -1998,7 +2029,7 @@ fn refuse_unplanned_movement(
         &after.tables,
         named,
         |name: &TableName, was: &pbps_model::Table, now: &pbps_model::Table| {
-            undo.apply(was, name) == undo.apply(now, name)
+            undo_before.apply(was, name) == undo_after.apply(now, name)
         },
         &mut moved,
     );
@@ -2248,8 +2279,8 @@ fn refuse_unplanned_movement(
             // already carries the rename. Undoing is idempotent on a name the
             // plan does not rename, so a read from either side of a statement
             // lands in the same spelling.
-            let was = &undo.apply(was, name);
-            let now = &undo.apply(now, now_name);
+            let was = &undo_before.apply(was, name);
+            let now = &undo_after.apply(now, now_name);
             let no_fields = BTreeMap::new();
             let moved_columns = redefined.get(now_name).unwrap_or(&no_fields);
             let no_names = BTreeSet::new();

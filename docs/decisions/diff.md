@@ -803,4 +803,8 @@ two tables trading names through a third — has no order an engine takes
 without a temporary name; its edge is left out, and the engine refuses it as
 before. The apply movement check likewise undoes a rename whose target this
 plan renames away, as it does one whose occupant it drops: an untouched
-child's key follows `y` to `z` and is not movement.
+child's key follows `y` to `z` and is not movement. Each read undoes only the
+renames that had run when it was taken — a rename has run when its source name
+is gone, or holds the next link, whose rename has run. One map for both reads
+rewrote the earlier read's `z`, still the original table, to `y`, and a key
+that followed the chain's head from `z` to `a` read as moved.
