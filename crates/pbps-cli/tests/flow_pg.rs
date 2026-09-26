@@ -1595,6 +1595,47 @@ fn a_default_follows_a_rebuilt_function_past_an_update_that_does_not_take_it() {
     );
 }
 
+/// A function dropped for good, a view edited to stop calling it, and an
+/// unchanged view over that view: the plan is valid, and the second view is
+/// rebuilt around the first (#1069 review). Its path to the function goes
+/// through the edited view, so it is not refused as a dependent of the drop.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_view_over_a_view_edited_off_a_dropped_function_is_rebuilt() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "cut-path-to-dropped-function");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE VIEW app.v1 AS SELECT app.f(1) AS one; \
+         CREATE VIEW app.v2 AS SELECT one FROM app.v1",
+    );
+    let d = Demo::new("cut-path-to-dropped-function");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    std::fs::remove_file(d.dir.join("schema/app.f%28integer%29.function.yml")).unwrap();
+    let v1 = d.dir.join("schema/app.v1.view.yml");
+    let text = std::fs::read_to_string(&v1).unwrap();
+    assert!(text.contains("app.f(1)"), "{text}");
+    std::fs::write(&v1, text.replace("app.f(1)", "1")).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "destructive"],
+    ));
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
 /// Declarations that drop a function for good while keeping a view that
 /// calls it are refused by name at `plan --db`, and no plan is written
 /// (#947). The view used to be rebuilt around the drop, and the plan failed at

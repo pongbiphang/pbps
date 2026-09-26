@@ -89,14 +89,42 @@ pub(crate) fn untouched_module_dependents(
     // on a rebuilt one is still a view on the dropped function, and rebuilding
     // it for the second would hand `weave` a create to take as its
     // restoration from the first.
+    //
+    // Unless the plan cuts its path to the dropped root. `dependents` is
+    // transitive, so a view `v2` over an edited `v1` over `f` is listed under
+    // `f` even when the edit makes `v1` stop calling `f`. That `v2` is on `f`
+    // only through `v1`, it is listed under `v1` too (a module the plan
+    // drops), and it is rebuilt around `v1` as any view over an edited view
+    // is (#1069 review). A module listed under both `f` and such a `v1` that
+    // also calls `f` directly cannot be told apart without parsing; it is
+    // rebuilt, and its `CREATE` fails at apply, which is the loud outcome,
+    // where refusing would turn the valid plan away.
+    let under = |root: &ModuleId, x: &ModuleId| {
+        found.get(root).is_some_and(|deps| {
+            deps.iter()
+                .any(|d| matches!(&d.holds, Holds::Module(y) if y == x))
+        })
+    };
     let on_a_dropped_root: std::collections::BTreeSet<&ModuleId> = found
         .iter()
         .filter(|(root, _)| !recreated(root))
-        .flat_map(|(_, deps)| deps)
-        .filter_map(|d| match &d.holds {
-            Holds::Module(x) => Some(x),
-            Holds::TablePart { .. } | Holds::Unrepresentable(_) => None,
+        .flat_map(|(root, deps)| {
+            deps.iter().filter_map(move |d| match &d.holds {
+                Holds::Module(x) => Some((root, x)),
+                Holds::TablePart { .. } | Holds::Unrepresentable(_) => None,
+            })
         })
+        .filter(|(root, x)| {
+            !found
+                .get(*root)
+                .into_iter()
+                .flatten()
+                .any(|m| match &m.holds {
+                    Holds::Module(m) => m != *x && touched(m) && under(m, x),
+                    Holds::TablePart { .. } | Holds::Unrepresentable(_) => false,
+                })
+        })
+        .map(|(_, x)| x)
         .collect();
     found
         .values()
@@ -1621,6 +1649,33 @@ mod tests {
         assert!(untouched_module_dependents(&cs, &both, &s).is_empty());
         let refused = weave(&mut cs, &both, &s, &[&ids], pg().as_ref()).unwrap_err();
         assert!(refused.contains("view app.v0"), "{refused}");
+    }
+
+    /// A view over an edited view is rebuilt around the edit even when the
+    /// edit stops the first view calling a function the plan drops for good:
+    /// its path to the function goes through the edited view, which the plan
+    /// cuts (#1069 review). Refusing it would turn a valid plan away.
+    #[test]
+    fn a_view_whose_path_to_a_dropped_function_the_plan_cuts_is_rebuilt() {
+        let (s, ids) = declared();
+        // Transitive and deepest first, as `modules::dependents` answers.
+        let found = BTreeMap::from([
+            (id("app.f(integer)"), vec![view("app.v2"), view("app.v1")]),
+            (id("app.v1"), vec![view("app.v2")]),
+        ]);
+        let drop = Change::DropModule {
+            id: id("app.f(integer)"),
+            kind: ModuleKind::Function,
+        };
+        let cs = plan(vec![drop.clone(), alter(&s, "app.v1")]);
+        let back: Vec<String> = untouched_module_dependents(&cs, &found, &s)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(back, ["app.v2"]);
+        // What `rediff` returns with `v2` rebuilt, woven without refusal.
+        let mut cs = plan(vec![drop, alter(&s, "app.v1"), alter(&s, "app.v2")]);
+        weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).expect("a valid plan");
     }
 
     /// A plan that drops a function and replaces the table its check lives on
