@@ -942,7 +942,8 @@ routine, type, operator, collation or operator class/family name, looked up in
 every schema of the deployer's effective path as the analysis scope measured it
 (`pg_catalog`, then the write path's schemas it may use; an extra without
 `USAGE` is not searched) and in the schema it bound into; a bound type name
-is looked up as a routine too, and a bound routine a one-argument call can
+is looked up as a routine too (only overloads a single argument can reach,
+since a cast has one), and a bound routine a one-argument call can
 reach (its declared count less defaults, or variadic) as a type, since `t(x)` is an exact call, else a cast to `t`, else the
 best-matching call, and a cast takes exactly one argument —
 plus every cast, which resolution consults with no name. Only a binding some

@@ -229,12 +229,18 @@ fn derived(
     input: &super::manifest::Input,
     paths: &Paths,
     routines: &BTreeMap<ObjectIdentity, super::manifest::Input>,
-) -> BTreeSet<CandidateSet> {
-    let mut sets = BTreeSet::from([CandidateSet {
-        class: CandidateClass::Cast,
-        namespace: None,
-        name: None,
-    }]);
+) -> BTreeMap<CandidateSet, bool> {
+    // Each set maps to whether only its members a one-argument call can
+    // reach matter: true for routines looked up only because a type binding
+    // may have been written as a call, which a cast's single argument limits.
+    let mut sets = BTreeMap::from([(
+        CandidateSet {
+            class: CandidateClass::Cast,
+            namespace: None,
+            name: None,
+        },
+        false,
+    )]);
     let Some(schema) = owner(object).name.first() else {
         return sets;
     };
@@ -273,12 +279,16 @@ fn derived(
             | CandidateClass::Extension => std::slice::from_ref(&class),
         };
         for space in paths.of(schema).into_iter().chain([namespace.clone()]) {
-            for &class in classes {
-                sets.insert(CandidateSet {
-                    class,
+            for &member_class in classes {
+                let one_argument =
+                    class == CandidateClass::Type && member_class == CandidateClass::Routine;
+                sets.entry(CandidateSet {
+                    class: member_class,
                     namespace: Some(space.clone()),
                     name: Some(name.clone()),
-                });
+                })
+                .and_modify(|only| *only &= one_argument)
+                .or_insert(one_argument);
             }
         }
     }
@@ -290,7 +300,7 @@ fn derived(
 pub fn scope(desired: &CapturedInputs, managed: &[&Managed], paths: &Paths) -> CaptureScope {
     let mut candidates: BTreeSet<CandidateSet> = managed.iter().flat_map(|m| m.scope()).collect();
     for (object, input) in surfaces(desired) {
-        candidates.extend(derived(object, input, paths, &desired.inputs));
+        candidates.extend(derived(object, input, paths, &desired.inputs).into_keys());
     }
     CaptureScope {
         retained: BTreeSet::new(),
@@ -337,13 +347,22 @@ pub fn assess(
     // could win: the engine's own objects identically, the managed ones as
     // declared. Missing from either capture is not faithful: an uncaptured
     // set is not an empty one.
-    let faithful = |set: &CandidateSet| -> bool {
+    let faithful = |(set, one_argument): (&CandidateSet, &bool)| -> bool {
         let (Some(on_target), Some(on_scratch)) =
             (target.candidates.get(set), desired.candidates.get(set))
         else {
             return false;
         };
         on_target.union(on_scratch).all(|member| {
+            // A routine a one-argument call cannot reach cannot take a cast.
+            let holder = if target.inputs.contains_key(member) {
+                &target.inputs
+            } else {
+                &desired.inputs
+            };
+            if *one_argument && !callable_with_one(holder, member) {
+                return true;
+            }
             let system = set.class == CandidateClass::Cast
                 || member.name.first().is_some_and(|schema| is_system(schema));
             if system {
@@ -588,6 +607,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn keys(sets: BTreeMap<CandidateSet, bool>) -> BTreeSet<CandidateSet> {
+        sets.into_keys().collect()
+    }
+
     fn id(class: &str, name: &[&str], signature: Vec<ObjectIdentity>) -> ObjectIdentity {
         ObjectIdentity {
             class: class.into(),
@@ -721,7 +744,7 @@ mod tests {
             vec!["shared".to_owned(), "pg_temp".to_owned()],
             BTreeMap::new(),
         );
-        let sets = derived(&view, &input, &paths, &BTreeMap::new());
+        let sets = keys(derived(&view, &input, &paths, &BTreeMap::new()));
         let set = |class, namespace: Option<&str>, name: Option<&str>| CandidateSet {
             class,
             namespace: namespace.map(str::to_owned),
@@ -762,7 +785,7 @@ mod tests {
                     bindings: Vec::new(),
                 },
             )]);
-            derived(&view, &call, &paths, &catalog)
+            keys(derived(&view, &call, &paths, &catalog))
                 .iter()
                 .any(|set| set.class == CandidateClass::Type)
         };
@@ -821,12 +844,12 @@ mod tests {
             }],
         };
         assert!(
-            derived(&view, &written, &paths, &BTreeMap::new())
+            keys(derived(&view, &written, &paths, &BTreeMap::new()))
                 .iter()
                 .any(|set| set.class == CandidateClass::Type)
         );
         assert_eq!(
-            derived(&view, &determined, &paths, &BTreeMap::new()),
+            keys(derived(&view, &determined, &paths, &BTreeMap::new())),
             BTreeSet::from([set(CandidateClass::Cast, None, None)])
         );
         // An extra the deployer cannot use is not on its measured path, so
@@ -838,13 +861,37 @@ mod tests {
                 vec!["pg_catalog".to_owned(), "app".to_owned()],
             )]),
         );
-        let visible = derived(&view, &input, &measured, &BTreeMap::new());
+        let visible = keys(derived(&view, &input, &measured, &BTreeMap::new()));
         assert!(
             !visible
                 .iter()
                 .any(|set| set.namespace.as_deref() == Some("shared"))
         );
         assert!(visible.contains(&set(CandidateClass::Routine, Some("util"), Some("f"))));
+        // A type binding looks up same-named routines only as calls a
+        // single argument can reach; a routine binding looks up every one.
+        let typed = Input {
+            properties: BTreeMap::new(),
+            bindings: vec![Binding {
+                node: "COERCEVIAIO".into(),
+                path: vec!["ev_action".into(), "resulttype".into()],
+                target: id("pg_type", &["pg_catalog", "f"], Vec::new()),
+            }],
+        };
+        let marked = derived(&view, &typed, &paths, &BTreeMap::new());
+        assert_eq!(
+            marked.get(&set(CandidateClass::Routine, Some("app"), Some("f"))),
+            Some(&true)
+        );
+        assert_eq!(
+            marked.get(&set(CandidateClass::Type, Some("app"), Some("f"))),
+            Some(&false)
+        );
+        let routine_bound = derived(&view, &input, &paths, &BTreeMap::new());
+        assert_eq!(
+            routine_bound.get(&set(CandidateClass::Routine, Some("app"), Some("f"))),
+            Some(&false)
+        );
         assert_eq!(owner(&view).name, ["app", "v"]);
         let default = id(
             "pg_attrdef",

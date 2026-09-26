@@ -1610,3 +1610,36 @@ async fn an_sql_value_functions_type_is_no_named_candidate() {
         );
     }
 }
+
+/// A cast takes one argument, so of the routines named like a cast's type
+/// only one a single argument can reach could take the call: a two-argument
+/// `app.int4` beside `int4('1'::text)` is no candidate.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_routine_no_single_argument_reaches_cannot_take_a_cast() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let declared = || Declared::default().view("app.v", "SELECT int4('1'::text) AS x");
+        let assessment = analyze(
+            &server,
+            "two_arguments",
+            Case {
+                schemas: &["app"],
+                extras: &[],
+                target: "
+                    SET search_path = app;
+                    CREATE VIEW app.v AS SELECT int4('1'::text) AS x;
+                    CREATE FUNCTION app.int4(integer, integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN 0;",
+                base: declared(),
+                desired: declared(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            only(&assessment, "app", "v"),
+            Verdict::Unaffected,
+            "{variable}"
+        );
+    }
+}
