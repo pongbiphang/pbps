@@ -959,10 +959,14 @@ they were not, so they count (#1062). A declaration the plan leaves unchanged ha
 resolves the same names; only the selected objects can differ, and that is
 what the bindings carry. On the target each member must be an engine object
 scratch has with the same properties, role references removed because the
-bootstrap superuser's name is the installation's; a member of a user schema
-scratch has too, which creating a declaration made (an identity column's
-sequence, a key's index, a row type); or one of the project's managed objects
-by name (a type only for a table or view, never for an index). A routine is managed only as the exact overload
+bootstrap superuser's name is the installation's; or a member of a user schema
+that is the project's own: one of its managed objects by name (a type only for
+a table or view, never for an index), or an object the target records, through
+an internal or automatic dependency, as made by one (an identity column's
+sequence, a key's index, a row type). The same identity on scratch is not
+enough: an unmanaged routine the plan creates again, or an unmanaged sequence
+that took an identity column's generated name first, shares scratch's identity
+without being what scratch made (#1041). A routine is managed only as the exact overload
 scratch compiled for a declaration the plan keeps; overloads the plan drops,
 never compiled, are the only ones counted. A count alone let an unmanaged
 overload stand in for a declared one the target had lost. An unmanaged overload

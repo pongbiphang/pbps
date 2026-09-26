@@ -359,6 +359,34 @@ pub fn assess(
     paths: &Paths,
     order: &crate::resolver::reconstruct::Reconstruction,
 ) -> Assessment {
+    // What made each target member, as the target recorded it: the other end
+    // of its internal and automatic dependencies (an identity column's
+    // sequence, a key's index, a relation's row type).
+    let mut makers: BTreeMap<&ObjectIdentity, Vec<&ObjectIdentity>> = BTreeMap::new();
+    for dependency in target.inputs.keys() {
+        if let ("pg_depend", [kind], [made, maker]) = (
+            dependency.class.as_str(),
+            dependency.name.as_slice(),
+            dependency.signature.as_slice(),
+        ) && matches!(kind.as_str(), "i" | "a")
+        {
+            makers.entry(made).or_default().push(maker);
+        }
+    }
+    // A target member is the project's own when the model names it, or when
+    // an object the model names made it. A same identity on scratch is not
+    // enough: scratch made its copy from a declaration, while the target's
+    // may be an unmanaged object that holds the name, such as one a plan
+    // creates or one that took a generated name first (#1041).
+    let own = |class: CandidateClass, member: &ObjectIdentity, members| {
+        managed.holds(class, member, members, order)
+            || makers.get(member).into_iter().flatten().any(|maker| {
+                let maker = owner(maker);
+                candidate_class(&maker.class).is_some_and(|class| {
+                    managed.holds(class, maker, &BTreeSet::from([maker.clone()]), order)
+                })
+            })
+    };
     // A set is faithful when scratch reproduced every target member that
     // could win: the engine's own objects identically, the managed ones as
     // declared. Missing from either capture is not faithful: an uncaptured
@@ -392,13 +420,10 @@ pub fn assess(
                 };
             }
             // Scratch's user schemas hold only the declarations and what
-            // creating them made — an identity column's sequence, a key's
-            // index, a relation's row type — so a member scratch has too was
-            // reproduced, whatever the model calls it. What only the target
-            // has must be one of the project's own objects the plan drops.
-            !on_target.contains(member)
-                || on_scratch.contains(member)
-                || managed.holds(set.class, member, on_target, order)
+            // creating them made, so a member only scratch has was
+            // reproduced. A target member, whether scratch has the same
+            // identity or the plan drops it, must be the project's own.
+            !on_target.contains(member) || own(set.class, member, on_target)
         })
     };
     let mut assessment = Assessment::default();
