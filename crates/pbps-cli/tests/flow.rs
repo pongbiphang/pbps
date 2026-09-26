@@ -15765,3 +15765,327 @@ fn an_undeclared_key_is_named_by_connected_planning_and_again_before_apply() {
         "the benign change ordered before the retype must not have run"
     );
 }
+
+/// Two revisions deployed at once, where the second renames a table into the
+/// name the first dropped (#536). The drop ran in its own class after every
+/// rename, and the engine refused the rename while the doomed table still held
+/// the name (Msg 15335). The doomed table cannot go while `child`'s key still
+/// names it, and its own key to `parent` is dropped first as it always is, so
+/// both keys move ahead with it.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_table_drop_and_a_later_rename_that_reuses_its_name_apply_together() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let slug = "reusedtable536";
+    let own = OwnDatabase::new(&server, slug);
+    let connection = own.connection();
+    let d = Demo::new(slug);
+    let declare = |name: &str, body: Option<String>| {
+        let path = d.dir.join(format!("schema/dbo.{name}.yml"));
+        match body {
+            Some(body) => std::fs::write(path, format!("table: dbo.{name}\n{body}")).unwrap(),
+            None => std::fs::remove_file(path).unwrap(),
+        }
+    };
+    let keyed = |pk: &str, rest: &str| {
+        format!(
+            "columns:\n  id: {{type: bigint, nullable: false}}\n{rest}\
+             primary_key: {{name: {pk}, columns: [id]}}\n"
+        )
+    };
+    let target_key = "foreign_keys:\n  fk_target_parent:\n    columns: [parent_id]\n    \
+                      references: dbo.parent(id)\n";
+    let keeper_key = |to: &str| {
+        format!(
+            "foreign_keys:\n  fk_keeper_old:\n    columns: [old_id]\n    \
+             references: {to}(id)\n"
+        )
+    };
+    let child_key = "foreign_keys:\n  fk_child_target:\n    columns: [target_id]\n    \
+                     references: dbo.target(id)\n";
+
+    // v1, and the only revision this database ever gets deployed.
+    declare("parent", Some(keyed("pk_parent", "")));
+    declare(
+        "target",
+        Some(keyed("pk_target", "  parent_id: {type: bigint}\n") + target_key),
+    );
+    declare(
+        "child",
+        Some(keyed("pk_child", "  target_id: {type: bigint}\n") + child_key),
+    );
+    // `other` goes before `target` does, in a revision of its own.
+    declare(
+        "other",
+        Some(
+            keyed("pk_other", "  target_id: {type: bigint}\n")
+                + &child_key.replace("fk_child_target", "fk_other_target"),
+        ),
+    );
+    // `keeper` is untouched: its key follows `old` through the rename.
+    declare(
+        "keeper",
+        Some(keyed("pk_keeper", "  old_id: {type: bigint}\n") + &keeper_key("dbo.old")),
+    );
+    declare(
+        "old",
+        Some(keyed("pk_old", "  label: {type: nvarchar(50)}\n")),
+    );
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // v1b: `other` goes, and its key to `target` with it. Never deployed.
+    declare("other", None);
+    let o = d.run(&["drop-table", "dbo.other", "--reason", "no longer used"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // v2: `target` goes, and `child`'s key to it. Committed, never deployed.
+    declare("target", None);
+    declare(
+        "child",
+        Some(keyed("pk_child", "  target_id: {type: bigint}\n")),
+    );
+    let o = d.run(&["drop-table", "dbo.target", "--reason", "no longer used"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // v3: `old` takes the name `target` just vacated.
+    declare("old", None);
+    declare(
+        "keeper",
+        Some(keyed("pk_keeper", "  old_id: {type: bigint}\n") + &keeper_key("dbo.target")),
+    );
+    declare(
+        "target",
+        Some(keyed("pk_old", "  label: {type: nvarchar(50)}\n")),
+    );
+    // And `child` points a key of the same name at the new occupant.
+    declare(
+        "child",
+        Some(keyed("pk_child", "  target_id: {type: bigint}\n") + child_key),
+    );
+    let o = d.run(&["rename-table", "dbo.old", "dbo.target"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    // The database is still at v1, so this one plan carries both revisions.
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let checksum = plan_checksum(&plan);
+    let args = [
+        "apply",
+        "--db",
+        connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+        "--allow",
+        "rename,destructive,constraint",
+    ];
+    let o = d.run(&args);
+    assert_eq!(
+        code(&o),
+        0,
+        "the drop and the rename must apply together: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+
+    // The database really is in the declared shape, not merely un-errored.
+    let o = d.run(&["verify", "--db", connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["plan", "--db", connection]);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+}
+
+/// Skipped revisions that drop `a`, rename `z` into `a`, then rename `y` into
+/// `z`: each rename runs after the statement that vacates its name, and the
+/// closing check follows `y` to `z` for `keeper`, whose key the engine carries
+/// through the rename (DEC-536.1).
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_chain_of_renames_into_vacated_names_applies_together() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "chain536");
+    let connection = own.connection();
+    let d = Demo::new("chain536");
+    let declare = |name: &str, body: Option<String>| {
+        let path = d.dir.join(format!("schema/dbo.{name}.yml"));
+        match body {
+            Some(body) => std::fs::write(path, format!("table: dbo.{name}\n{body}")).unwrap(),
+            None => std::fs::remove_file(path).unwrap(),
+        }
+    };
+    let keyed = |pk: &str, rest: &str| {
+        format!(
+            "columns:\n  id: {{type: bigint, nullable: false}}\n{rest}\
+             primary_key: {{name: {pk}, columns: [id]}}\n"
+        )
+    };
+    let keeper = |to: &str| {
+        keyed("pk_keeper", "  y_id: {type: bigint}\n")
+            + &format!(
+                "foreign_keys:\n  fk_keeper_y:\n    columns: [y_id]\n    references: {to}(id)\n"
+            )
+    };
+    // And one on the head of the chain: it follows `z` to `a`, while the
+    // closing read also has a `z`, the renamed `y`.
+    let head_keeper = |to: &str| {
+        keyed("pk_head_keeper", "  z_id: {type: bigint}\n")
+            + &format!(
+                "foreign_keys:\n  fk_head_keeper_z:\n    columns: [z_id]\n    references: {to}(id)\n"
+            )
+    };
+    let step = |d: &Demo| {
+        assert_eq!(code(&d.run(&["plan"])), 0);
+        d.commit();
+    };
+
+    declare("a", Some(keyed("pk_a", "  doomed: {type: bigint}\n")));
+    declare("z", Some(keyed("pk_z", "  zed: {type: bigint}\n")));
+    declare("y", Some(keyed("pk_y", "  why: {type: bigint}\n")));
+    declare("keeper", Some(keeper("dbo.y")));
+    declare("head_keeper", Some(head_keeper("dbo.z")));
+    step(&d);
+    let o = d.run(&["bootstrap", "--db", connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    declare("a", None);
+    let o = d.run(&["drop-table", "dbo.a", "--reason", "no longer used"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    step(&d);
+
+    declare("z", None);
+    declare("a", Some(keyed("pk_z", "  zed: {type: bigint}\n")));
+    declare("head_keeper", Some(head_keeper("dbo.a")));
+    let o = d.run(&["rename-table", "dbo.z", "dbo.a"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    step(&d);
+
+    declare("y", None);
+    declare("z", Some(keyed("pk_y", "  why: {type: bigint}\n")));
+    declare("keeper", Some(keeper("dbo.z")));
+    let o = d.run(&["rename-table", "dbo.y", "dbo.z"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    step(&d);
+
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let checksum = plan_checksum(&plan);
+    let o = d.run(&[
+        "apply",
+        "--db",
+        connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+        "--allow",
+        "rename,destructive",
+    ]);
+    assert_eq!(
+        code(&o),
+        0,
+        "the chain must apply: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+    let o = d.run(&["verify", "--db", connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["plan", "--db", connection]);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+}
+
+/// A chain across schemas: `s1.z` moves to `s2.a` in one skipped revision and
+/// `s1.y` moves to `s2.z` in the next. The first move passes through `s2.z`,
+/// its source name in the destination schema, so the second waits for it
+/// (DEC-536.1).
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_chain_of_moves_through_an_intermediate_name_applies_together() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "xschema536");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "EXEC(N'CREATE SCHEMA s1;'); EXEC(N'CREATE SCHEMA s2;');",
+    );
+    let d = Demo::new("xschema536");
+    let declare = |name: &str, body: Option<String>| {
+        let path = d.dir.join(format!("schema/{name}.yml"));
+        match body {
+            Some(body) => std::fs::write(path, format!("table: {name}\n{body}")).unwrap(),
+            None => std::fs::remove_file(path).unwrap(),
+        }
+    };
+    let keyed = |pk: &str, column: &str| {
+        format!(
+            "columns:\n  id: {{type: bigint, nullable: false}}\n  {column}: {{type: bigint}}\n\
+             primary_key: {{name: {pk}, columns: [id]}}\n"
+        )
+    };
+    let step = |d: &Demo| {
+        assert_eq!(code(&d.run(&["plan"])), 0);
+        d.commit();
+    };
+
+    declare("s1.z", Some(keyed("pk_z", "zed")));
+    declare("s1.y", Some(keyed("pk_y", "why")));
+    step(&d);
+    let o = d.run(&["bootstrap", "--db", connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    declare("s1.z", None);
+    declare("s2.a", Some(keyed("pk_z", "zed")));
+    let o = d.run(&["rename-table", "s1.z", "s2.a"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    step(&d);
+
+    declare("s1.y", None);
+    declare("s2.z", Some(keyed("pk_y", "why")));
+    let o = d.run(&["rename-table", "s1.y", "s2.z"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    step(&d);
+
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let checksum = plan_checksum(&plan);
+    let o = d.run(&[
+        "apply",
+        "--db",
+        connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+        "--allow",
+        "rename",
+    ]);
+    assert_eq!(
+        code(&o),
+        0,
+        "the moves must apply: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+    let o = d.run(&["verify", "--db", connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["plan", "--db", connection]);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+}
