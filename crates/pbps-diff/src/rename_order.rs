@@ -224,11 +224,22 @@ pub(crate) fn order(
         }
     }
     for (i, p) in planned.iter().enumerate() {
-        if own.contains(&i) {
+        let Change::DropForeignKey { table, name } = &p.change else {
             continue;
-        }
-        if let Change::DropForeignKey { table, name } = &p.change
-            && let Some(t) = before(table)
+        };
+        // A dropped table's own key is read under its baseline name, which a
+        // rename into that name would otherwise redirect to the rename's
+        // source; it still has to go before a key it references is dropped.
+        let own_key = own.contains(&i);
+        let t = if own_key {
+            base.schema
+                .tables
+                .get(table)
+                .map(|t| renames.apply(t, table))
+        } else {
+            before(table)
+        };
+        if let Some(t) = t
             && let Some(fk) = t.foreign_keys.get(name)
         {
             // Catalog binding is unavailable to this pure differ. A matching
@@ -242,6 +253,9 @@ pub(crate) fn order(
                 if &fk.references_table == parent && &columns == key_columns {
                     drops.insert(i);
                     edges[i].insert(*key);
+                    if own_key {
+                        fixed.insert(i);
+                    }
                 }
             }
         }

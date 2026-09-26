@@ -6548,6 +6548,57 @@ mod tests {
         assert_eq!(kinds(&cs), ["DropUnique", "RenameTable"], "{cs:?}");
     }
 
+    /// The same, where the key on the freeing constraint belongs to a table
+    /// this plan drops. The dropped table's own key drop still has to precede
+    /// the unique it references, under the dropped table's name.
+    #[test]
+    fn a_dropped_tables_key_to_a_freeing_unique_precedes_it() {
+        let old_t = table(&[("id", Column::new(ty("int")))]);
+        let mut other_base = table(&[("n", Column::new(ty("int")))]);
+        other_base.unique.insert("target".into(), unique(&["n"]));
+        let mut child = table(&[("other_n", Column::new(ty("int")))]);
+        child.foreign_keys.insert(
+            "fk_child_other".into(),
+            fk(&["other_n"], "app.other", &["n"]),
+        );
+        let mut base = two_tables(("app.old", old_t.clone()), ("app.other", other_base));
+        base.tables.insert("app.child".parse().unwrap(), child);
+
+        let declared = two_tables(
+            ("app.target", old_t),
+            ("app.other", table(&[("n", Column::new(ty("int")))])),
+        );
+
+        let cs = run_with(
+            &SharesIndexNamespace,
+            &base,
+            &declared,
+            &[
+                Intent::RenameTable {
+                    from: "app.old".parse().unwrap(),
+                    to: "app.target".parse().unwrap(),
+                },
+                Intent::DropTable {
+                    table: "app.child".parse().unwrap(),
+                    reason: "gone".into(),
+                },
+            ],
+        );
+        let at = |f: &dyn Fn(&Change) -> bool| {
+            cs.changes
+                .iter()
+                .position(|p| f(&p.change))
+                .unwrap_or_else(|| panic!("{:?}", cs.changes))
+        };
+        let key = at(&|c| {
+            matches!(c, Change::DropForeignKey { table, name }
+                if table.to_string() == "app.child" && name == "fk_child_other")
+        });
+        let unique = at(&|c| matches!(c, Change::DropUnique { .. }));
+        let rename = at(&|c| matches!(c, Change::RenameTable { .. }));
+        assert!(key < unique && unique < rename, "{:?}", cs.changes);
+    }
+
     /// Finding 1 from PR #462's round-2 review: the guard used to disable all
     /// reordering the moment *any* `DropForeignKey` was anywhere in the plan
     /// — even one that itself depends on the very constraint a freeing drop
