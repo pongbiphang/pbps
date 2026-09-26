@@ -2037,6 +2037,30 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
         }
     };
 
+    // The project-wide names, for judging a table's or a role's own
+    // `renamed_from`: its source is another file's table or role (#404). One
+    // file alone could not see a new `dbo.old` declared elsewhere after an
+    // applied `dbo.old -> dbo.new`, so it kept the redundant annotation for
+    // ever while `plan`, which has every file, called it absorbed and asked
+    // for a `fmt` that then changed nothing. A file that cannot be read or
+    // parsed contributes nothing here, and the loop below still stops on it
+    // exactly as it did.
+    let mut declared = Schema::default();
+    for path in &files {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        match pbps_load::load_file_str(path, &text) {
+            Ok(pbps_load::LoadedFile::Table(t)) => {
+                declared.tables.insert(t.name, t.table);
+            }
+            Ok(pbps_load::LoadedFile::Role(r)) => {
+                declared.roles.insert(r.name, r.role);
+            }
+            Ok(pbps_load::LoadedFile::Module(_)) | Err(_) => {}
+        }
+    }
+
     let mut changed: Vec<(PathBuf, Vec<Intent>)> = Vec::new();
     for path in &files {
         let original = output::or_unanswerable(
@@ -2072,14 +2096,12 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
                 Vec::new(),
             ),
             pbps_load::LoadedFile::Table(t) => {
-                // Judged against the names this file declares, because a
-                // `renamed_from` whose source column is declared again records
-                // a rename that happened and a new column that has since taken
-                // the vacated name -- not a rename still waiting. One file is
-                // all fmt reads, so a table-level source, which lives in
-                // another file, stays unknown and its annotation is kept.
-                let mut declared = Schema::default();
-                declared.tables.insert(t.name.clone(), t.table.clone());
+                // Judged against the declared names, because a `renamed_from`
+                // whose source is declared again records a rename that
+                // happened and a new object that has since taken the vacated
+                // name -- not a rename still waiting. A column source is in
+                // this file; a table source is in another, which is why the
+                // names are the project's (#404).
                 let (pending, absorbed): (Vec<Intent>, Vec<Intent>) =
                     t.intents.iter().cloned().partition(|i| {
                         !pbps_diff::intent_is_absorbed(i, &ids, RenameSource::of(i, &declared))
@@ -2090,8 +2112,6 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
                 )
             }
             pbps_load::LoadedFile::Role(r) => {
-                let mut declared = Schema::default();
-                declared.roles.insert(r.name.clone(), r.role.clone());
                 let (pending, absorbed): (Vec<Intent>, Vec<Intent>) =
                     r.intents.iter().cloned().partition(|i| {
                         !pbps_diff::intent_is_absorbed(i, &ids, RenameSource::of(i, &declared))
