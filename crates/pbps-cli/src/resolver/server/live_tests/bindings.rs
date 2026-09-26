@@ -90,11 +90,7 @@ async fn a_qualified_run_resolves_desired_bindings_against_the_target() {
         }
     }
     let mut target = native_target().await;
-    let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
-    let mut run = server
-        .open_scratch(&scratch_recipe(&mut target).await)
-        .await
-        .expect("scratch resources");
+    let mut run = open_when_exclusive(&mut target).await;
     // Nothing is compiled before the scope is qualified.
     let unqualified = run
         .resolve(&mut target, &request)

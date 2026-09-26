@@ -34,11 +34,7 @@ async fn foreign_pseudo_roots_refuse_admission_and_discard_live_analysis() {
                 Err(error) => panic!("unexpected admission refusal: {error}"),
             };
         changed.restore();
-        let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
-        let mut run = server
-            .open_scratch(&scratch_recipe(&mut target).await)
-            .await
-            .unwrap();
+        let mut run = open_when_exclusive(&mut target).await;
         let connection = &mut run.scratch.as_mut().unwrap().connection;
         connection
             .execute("CREATE TABLE pbps_pseudo_table (id integer)")

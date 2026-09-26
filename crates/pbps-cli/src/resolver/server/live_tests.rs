@@ -130,6 +130,33 @@ async fn admit_when_exclusive(variable: &str, target: &mut NativeTarget) -> Dedi
     panic!("the supplied server never became exclusive to this run: {refusals:?}");
 }
 
+/// Admission and the scratch open that follows each read the engine's PID
+/// namespace, and a task the previous step ended can still be leaving it
+/// between the two: admission passed, then the open refused (#1044).
+/// Waited out here like exclusivity, not tolerated by the product, and
+/// bounded, so a task that stays is still a failure.
+async fn open_when_exclusive(target: &mut NativeTarget) -> ScratchRun {
+    let mut refusals = 0;
+    loop {
+        let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", target).await;
+        match server.open_scratch(&scratch_recipe(target).await).await {
+            Ok(run) => return run,
+            Err(ServerFailure {
+                cause: Error::Containment(super::Premise::Occupants),
+                recovery_names,
+            }) if recovery_names.is_empty() && refusals < 20 => {
+                refusals += 1;
+                server
+                    .discard()
+                    .await
+                    .expect("a refused open leaves nothing it cannot remove");
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Err(other) => panic!("the admitted server must open a scratch run: {other}"),
+        }
+    }
+}
+
 /// What the engine says this session's own database is.
 fn current_database() -> &'static str {
     match driver() {
@@ -190,11 +217,7 @@ async fn a_supported_dedicated_server_compiles_declarations_and_removes_only_its
     let mut target = native_target().await;
     // No inspection session is open here on purpose: one would be a session
     // this run did not open, and admission is required to refuse it.
-    let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
-    let mut run = server
-        .open_scratch(&scratch_recipe(&mut target).await)
-        .await
-        .expect("scratch resources");
+    let mut run = open_when_exclusive(&mut target).await;
     let database = run.database().to_owned();
     // Reaching into the run's own state: this step exposes no SQL surface,
     // so a declaration path cannot be opened by accident from outside it.
@@ -686,11 +709,7 @@ async fn an_unconfirmed_cleanup_reports_only_the_run_owned_names() {
     fixture();
     let configured = endpoint("PBPS_SERVER_ENDPOINT");
     let mut target = native_target().await;
-    let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
-    let mut run = server
-        .open_scratch(&scratch_recipe(&mut target).await)
-        .await
-        .unwrap();
+    let mut run = open_when_exclusive(&mut target).await;
     let database = run.database().to_owned();
     let mut api = LocalApi::connect_native(&configured.daemon).await.unwrap();
     api.stop_container(&configured.container).await.unwrap();
@@ -807,11 +826,7 @@ async fn a_run_qualifies_its_analysis_scope_against_the_target() {
         setup.query(statement).await.unwrap();
     }
     let mut target = native_target().await;
-    let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
-    let mut run = server
-        .open_scratch(&scratch_recipe(&mut target).await)
-        .await
-        .expect("scratch resources");
+    let mut run = open_when_exclusive(&mut target).await;
 
     let request = crate::resolver::server::ScopeRequest {
         schemas: case.schemas.clone(),
@@ -864,11 +879,7 @@ async fn a_run_qualifies_its_analysis_scope_against_the_target() {
     // target is not what was sealed, and the next check must say so
     // (finding on #688). An admission opens one run, so the server is
     // admitted again for it, once the first run's resources are gone.
-    let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
-    let mut run = server
-        .open_scratch(&scratch_recipe(&mut target).await)
-        .await
-        .expect("scratch resources for the second run");
+    let mut run = open_when_exclusive(&mut target).await;
     let request = crate::resolver::server::ScopeRequest {
         schemas: case.schemas.clone(),
         write_path_extras: case.extras.clone(),
