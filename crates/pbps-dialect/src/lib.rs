@@ -123,6 +123,21 @@ impl TypeChangeRisk {
     }
 }
 
+/// A relation an engine creates with a table under a name it generates itself
+/// (#465), with how to move a declared name out of its way (#990).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImplicitRelation {
+    /// The name the engine generates.
+    pub name: String,
+    /// What it is, as a refusal names it.
+    pub descriptor: String,
+    /// What the author can change so a declared name stops meeting it. Naming
+    /// the primary key moves only its index. An identity sequence is named
+    /// after its table and column when it is created, but keeps that name
+    /// when either is renamed later, so only the other object can move.
+    pub remedy: &'static str,
+}
+
 /// One executable statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Statement {
@@ -1956,7 +1971,7 @@ pub trait Dialect {
     /// Asked by [`check_index_names`] only where
     /// [`Dialect::indexes_share_namespace_with_tables`] says the namespace is
     /// shared; the default, none, is right for an engine where it is not.
-    fn implicit_relation_names(&self, _name: &TableName, _table: &Table) -> Vec<(String, String)> {
+    fn implicit_relation_names(&self, _name: &TableName, _table: &Table) -> Vec<ImplicitRelation> {
         Vec::new()
     }
 
@@ -2450,30 +2465,31 @@ pub fn check_index_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> 
     // itself (#465, DEC-465.1). It resolves it by suffixing the later one,
     // so the names it may fall back to are in play as well (#987).
     let declared_names: BTreeSet<ObjectName> = claimed.keys().cloned().collect();
-    let mut generated: BTreeMap<ObjectName, Vec<(&TableName, usize, String)>> = BTreeMap::new();
+    let mut generated: BTreeMap<ObjectName, Vec<(&TableName, usize, ImplicitRelation)>> =
+        BTreeMap::new();
     for (table_name, table) in &schema.tables {
-        for (i, (name, descriptor)) in dialect
+        for (i, relation) in dialect
             .implicit_relation_names(table_name, table)
             .into_iter()
             .enumerate()
         {
-            let claim_name = ObjectName::new(table_name.schema.clone(), name);
-            generated.entry(claim_name.clone()).or_default().push((
-                table_name,
-                i,
-                descriptor.clone(),
-            ));
+            let claim_name = ObjectName::new(table_name.schema.clone(), relation.name.clone());
             if declared_names.contains(&claim_name) {
                 let existing = &claimed[&claim_name];
                 problems.push(format!(
-                    "{} and {descriptor} are both named `{claim_name}`; {} keeps tables, \
-                     views, indexes and sequences in one namespace per schema, so it can hold \
-                     only one of them, and which one depends on the order they are created in. \
-                     Name the primary key, or rename the other object",
+                    "{} and {} are both named `{claim_name}`; {} keeps tables, views, indexes \
+                     and sequences in one namespace per schema, so it can hold only one of \
+                     them, and which one depends on the order they are created in. {}",
                     existing.descriptor,
-                    dialect.name()
+                    relation.descriptor,
+                    dialect.name(),
+                    relation.remedy
                 ));
             }
+            generated
+                .entry(claim_name)
+                .or_default()
+                .push((table_name, i, relation));
         }
     }
     // `c` generated names meeting at one name: the engine keeps it for the
@@ -2482,7 +2498,8 @@ pub fn check_index_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> 
     for claimants in generated.values().filter(|c| c.len() > 1) {
         let retries = u32::try_from(claimants.len() - 1).unwrap_or(u32::MAX);
         let mut reported = BTreeSet::new();
-        for (table_name, i, descriptor) in claimants {
+        for (table_name, i, relation) in claimants {
+            let descriptor = &relation.descriptor;
             let table = &schema.tables[*table_name];
             for suffix in 1..=retries {
                 let Some(fallback) = dialect
@@ -2495,13 +2512,23 @@ pub fn check_index_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> 
                 let claim_name = ObjectName::new(table_name.schema.clone(), fallback);
                 if declared_names.contains(&claim_name) && reported.insert(claim_name.clone()) {
                     let existing = &claimed[&claim_name];
+                    // A claimant's own remedy takes that one claimant out,
+                    // and `c - 1` claimants retry only up to fallback
+                    // `c - 2`: it frees the last fallback and no other. Any
+                    // earlier one stays in play, so only moving the declared
+                    // object is a remedy there.
+                    let remedy = if suffix < retries {
+                        "Rename the other object."
+                    } else {
+                        relation.remedy
+                    };
                     problems.push(format!(
                         "{} and {descriptor} may both be named `{claim_name}`: {descriptor} \
                          meets another generated name, and {} gives one of them this name \
-                         instead, which one depending on the order they are created in. \
-                         Name the primary key, or rename the other object",
+                         instead, which one depending on the order they are created in. {}",
                         existing.descriptor,
-                        dialect.name()
+                        dialect.name(),
+                        remedy
                     ));
                 }
             }

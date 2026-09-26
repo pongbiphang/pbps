@@ -583,8 +583,13 @@ creation order: created after the table, the declared index fails with
 `42P07`; created before it, the engine silently suffixes its own name
 (`taken_pkey1`), and the same declaration succeeds or fails by order alone.
 Predicting the suffix would make the result depend on apply order and
-on objects outside the declaration, so the check refuses the meeting and asks
-for a named primary key or another name. Two generated names that meet are
+on objects outside the declaration, so the check refuses the meeting. The
+refusal names the remedy that fits the generated relation (#990). For the index
+behind an unnamed primary key, name the key or rename the other object. For an
+identity sequence, which is named after its table and column and not after the
+key, rename the other object: renaming the column moves nothing once the
+sequence exists, because `RENAME COLUMN` keeps the owned sequence's name (measured on 16 and
+18). Two generated names that meet are
 left alone: the engine suffixes one of them, neither is declared, and nothing
 records it by name. The suffix is not left alone (#987). When `c` generated
 names meet, the engine gives the later ones its fallbacks, 1 to `c - 1`. It
@@ -593,7 +598,10 @@ a 60-byte table's key falls back to a 57-byte cut plus `_pkey1` (measured on 16
 and 18). A declared name equal to one of those fallbacks lands by creation
 order: created after both tables it fails with `42P07`, and created between
 them it pushes the second key to the next fallback. It is refused like a
-declared name that meets a first choice. SQL Server names these objects per table and reports no
+declared name that meets a first choice. Its remedy is the claimant's own only
+at the last fallback in play, `c - 1`: taking one claimant out leaves `c - 1`,
+which retry only up to `c - 2`. At an earlier fallback the rest still reach it,
+so the refusal says to rename the other object alone. SQL Server names these objects per table and reports no
 generated relation names. Measured on PostgreSQL 16 and 18: short, 60-byte and
 multibyte table names generate exactly the predicted names, the declared index
 created afterwards fails with `42P07`, and a name taken first yields

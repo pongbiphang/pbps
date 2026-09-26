@@ -23341,7 +23341,7 @@ async fn a_generated_fallback_is_the_one_the_engine_uses_and_order_decides_it() 
     });
     let pg = Postgres::new();
     let first = pg.implicit_relation_names(&TableName::new(&s, long('x')), &keyed)[0]
-        .0
+        .name
         .clone();
     let fallback =
         |n| pg.implicit_relation_fallbacks(&TableName::new(&s, long('y')), &keyed, n)[0].clone();
@@ -23458,7 +23458,7 @@ async fn the_generated_relation_names_are_the_ones_the_engine_uses() {
         let mut predicted: Vec<String> = pg
             .implicit_relation_names(&TableName::new(&s, &table), &declared)
             .into_iter()
-            .map(|(name, _)| name)
+            .map(|relation| relation.name)
             .collect();
         predicted.sort();
         let actual = text(&mut conn, &names(&s)).await;
