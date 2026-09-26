@@ -829,30 +829,38 @@ impl Dialect for Postgres {
     /// DEC-465.1). A unique constraint is always named in a declaration and a
     /// `serial` column is refused (`types::refuse_serial`), so neither of
     /// their generated names can arise.
-    fn implicit_relation_names(&self, name: &TableName, table: &Table) -> Vec<(String, String)> {
+    fn implicit_relation_names(
+        &self,
+        name: &TableName,
+        table: &Table,
+    ) -> Vec<pbps_dialect::ImplicitRelation> {
         let mut out = Vec::new();
         if table
             .primary_key
             .as_ref()
             .is_some_and(|pk| pk.name.is_none())
         {
-            out.push((
-                generated_name(&name.name, None, "pkey"),
-                format!(
+            out.push(pbps_dialect::ImplicitRelation {
+                name: generated_name(&name.name, None, "pkey"),
+                descriptor: format!(
                     "the index {} generates for `{name}`'s unnamed primary key",
                     types::DIALECT
                 ),
-            ));
+                remedy: "Name the primary key, or rename the other object",
+            });
         }
         for (column, spec) in &table.columns {
             if spec.identity.is_some() {
-                out.push((
-                    generated_name(&name.name, Some(column), "seq"),
-                    format!(
+                // Named after the table and the column: naming the key moves
+                // nothing here (#990).
+                out.push(pbps_dialect::ImplicitRelation {
+                    name: generated_name(&name.name, Some(column), "seq"),
+                    descriptor: format!(
                         "the sequence {} generates for identity column `{name}.{column}`",
                         types::DIALECT
                     ),
-                ));
+                    remedy: "Rename the other object, or the identity column",
+                });
             }
         }
         out
@@ -1309,6 +1317,8 @@ mod tests {
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].contains("unnamed primary key"), "{found:?}");
 
+        assert!(found[0].contains("Name the primary key"), "{found:?}");
+
         let found = pbps_dialect::check_index_names(
             &one(table(Some("pk_w"), true, Some("widget_id_seq"))),
             &pg,
@@ -1316,6 +1326,13 @@ mod tests {
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(
             found[0].contains("identity column `app.widget.id`"),
+            "{found:?}"
+        );
+        // #990: the key is already named, and naming it moves nothing here;
+        // the sequence moves with its table or column.
+        assert!(!found[0].contains("Name the primary key"), "{found:?}");
+        assert!(
+            found[0].contains("Rename the other object, or the identity column"),
             "{found:?}"
         );
 
