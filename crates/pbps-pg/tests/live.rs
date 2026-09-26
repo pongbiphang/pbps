@@ -28326,3 +28326,85 @@ async fn an_owner_with_select_on_every_column_has_no_managed_table_gap() {
     let mut admin = connect().await;
     let _ = admin.execute(&format!("DROP ROLE IF EXISTS {role}")).await;
 }
+
+/// #419, DEC-419.1. Narrowing `timestamp`/`timestamptz` precision never makes
+/// the engine refuse: every `ALTER` succeeds. A value within half a unit of
+/// the type's upper bound rounds past it and is stored as
+/// `294277-01-01 00:00:00`, a value the engine then refuses as a literal. One
+/// microsecond below each precision's threshold the value round-trips, and so
+/// does the BC lower bound. This pins the contract DEC-419.1 records: no
+/// count, because nothing is refused. If a release starts refusing, this test
+/// is where it shows.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn timestamp_precision_narrowing_rounds_past_the_upper_bound_without_refusing() {
+    let mut db = TestDb::create("timestamp419").await;
+    db.conn.execute("SET TimeZone = 'UTC'").await.unwrap();
+    // The fractional second at which rounding to `p` digits carries into the
+    // next second, and the microsecond just below it.
+    let thresholds = [
+        (0, "5", "499999"),
+        (1, "95", "949999"),
+        (2, "995", "994999"),
+        (3, "9995", "999499"),
+        (4, "99995", "999949"),
+        (5, "999995", "999994"),
+    ];
+    for base in ["timestamp", "timestamptz"] {
+        let zone = if base == "timestamptz" { "+00" } else { "" };
+        for (p, at, below) in thresholds {
+            for (fraction, carries) in [(at, true), (below, false)] {
+                let value = format!("294276-12-31 23:59:59.{fraction}{zone}");
+                db.conn
+                    .execute(&format!(
+                        "DROP TABLE IF EXISTS t419; CREATE TABLE t419 (c {base}(6)); \
+                         INSERT INTO t419 VALUES ('{value}')"
+                    ))
+                    .await
+                    .unwrap();
+                db.conn
+                    .execute(&format!("ALTER TABLE t419 ALTER COLUMN c TYPE {base}({p})"))
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("{base}({p}) from {value}: the engine refused: {e}")
+                    });
+                let stored = text(&mut db.conn, "SELECT c::text FROM t419").await;
+                let reparsed = db.conn.query(&format!("SELECT '{stored}'::{base}")).await;
+                if carries {
+                    assert!(
+                        stored.starts_with("294277-01-01 00:00:00"),
+                        "{base}({p}) from {value}: {stored}"
+                    );
+                    assert!(
+                        reparsed.is_err(),
+                        "{base}({p}) from {value}: {stored} was expected not to round-trip"
+                    );
+                } else {
+                    assert!(
+                        stored.starts_with("294276-12-31 23:59:59"),
+                        "{base}({p}) from {value}: {stored}"
+                    );
+                    reparsed.unwrap_or_else(|e| panic!("{base}({p}) {stored}: {e}"));
+                }
+            }
+        }
+        // The lower bound has nowhere to round to, and round-trips.
+        let low = format!("4714-11-24 00:00:00{zone} BC");
+        for p in 0..=5 {
+            db.conn
+                .execute(&format!(
+                    "DROP TABLE IF EXISTS t419; CREATE TABLE t419 (c {base}(6)); \
+                     INSERT INTO t419 VALUES ('{low}'); \
+                     ALTER TABLE t419 ALTER COLUMN c TYPE {base}({p})"
+                ))
+                .await
+                .unwrap();
+            let stored = text(&mut db.conn, "SELECT c::text FROM t419").await;
+            db.conn
+                .query(&format!("SELECT '{stored}'::{base}"))
+                .await
+                .unwrap_or_else(|e| panic!("{base}({p}) {stored}: {e}"));
+        }
+    }
+    db.drop().await;
+}
