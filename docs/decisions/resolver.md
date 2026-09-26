@@ -964,7 +964,10 @@ unresolved. This is a known limitation, kept on purpose: the written form is
 not in the catalog, the engine exposes no raw parse tree (measured on 16 and
 18), and recovering it would take a SQL parser (ADR-0016 refuses grammar work)
 or probe types planted on scratch. The conservative answer records nothing
-wrongly and refuses no valid plan (#1062). A declaration the plan leaves unchanged has the same text on both sides and
+wrongly, but it does block a plan whose affected surface only an exact call or
+a cast constant binds, since an unresolved verdict prevents a deployable plan
+(SPEC §9.3.2). The remedy is the operator's: remove or rename the unmanaged
+type the target alone holds (#1062). A declaration the plan leaves unchanged has the same text on both sides and
 resolves the same names; only the selected objects can differ, and that is
 what the bindings carry. On the target each member must be an engine object
 scratch has with the same properties, role references removed because the
