@@ -1031,6 +1031,13 @@ impl Dialect for Postgres {
     }
 }
 
+/// The name this engine gives the index behind an unnamed primary key of
+/// `table`: what a plan that drops that key frees (#951).
+#[must_use]
+pub fn implicit_primary_key_name(table: &str) -> String {
+    generated_name(table, None, "pkey")
+}
+
 /// The name the engine generates for an implicit relation: `makeObjectName`
 /// in PostgreSQL's `src/backend/commands/indexcmds.c`, ported and measured on
 /// 18.6 (#465, DEC-465.1).

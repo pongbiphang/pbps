@@ -288,6 +288,144 @@ fn refuse_occupied_names(
     );
 }
 
+/// The relation names this plan creates: its tables and the views it creates
+/// that it does not also drop. A view dropped and created in one plan is a
+/// rebuild, and its name is already its own.
+// The complement is every change that creates or frees no relation name.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn created_relation_names(cs: &pbps_model::ChangeSet) -> Vec<TableName> {
+    use pbps_model::Change;
+    let dropped: BTreeSet<&ModuleId> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::DropModule { id, .. } => Some(id),
+            _ => None,
+        })
+        .collect();
+    cs.changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::CreateTable { name, .. } => Some(name.clone()),
+            Change::CreateModule {
+                id: id @ ModuleId::Named(name),
+                module,
+            } if module.kind == pbps_model::ModuleKind::View && !dropped.contains(id) => {
+                Some(name.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Refuses a name this plan creates that a sequence, an index or a composite
+/// type already holds (#951), the relation-namespace entries the catalog
+/// inventory behind [`refuse_occupied_names`] does not report. One this plan
+/// frees first is not an occupant: an index it drops, and an index or owned
+/// sequence of a table it drops, which goes with its table.
+// The complement is every change that creates or frees no relation name.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn refuse_uninventoried_occupants(
+    cs: &pbps_model::ChangeSet,
+    occupants: &[pbps_pg::catalog::NameOccupant],
+    label: &str,
+) -> anyhow::Result<()> {
+    use pbps_model::Change;
+    // The catalog read names every occupant and owner as the database does
+    // now, and the plan's changes on a table it also renames carry the new
+    // name (the differ sorts renames first). Each freeing change is read back
+    // to the catalog's name before it is compared, so a key dropped from a
+    // renamed table frees `<old>_pkey`, the name its index still has
+    // (#1082 review).
+    let renamed_from: BTreeMap<&TableName, &TableName> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::RenameTable { from, to, .. } => Some((to, from)),
+            _ => None,
+        })
+        .collect();
+    let now = |t: &TableName| (*renamed_from.get(t).unwrap_or(&t)).clone();
+    // Names this plan frees before it creates anything: an index it drops,
+    // and the index behind a unique constraint or a primary key it drops,
+    // which PostgreSQL names after the constraint (an unnamed key's is
+    // `<table>_pkey`).
+    let freed: BTreeSet<TableName> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::DropIndex { table, name } | Change::DropUnique { table, name, .. } => {
+                Some(TableName::new(now(table).schema, name.clone()))
+            }
+            Change::SetPrimaryKey {
+                table,
+                from: Some(key),
+                ..
+            } => {
+                let table = now(table);
+                let name = key
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| pbps_pg::implicit_primary_key_name(&table.name));
+                Some(TableName::new(table.schema, name))
+            }
+            _ => None,
+        })
+        .collect();
+    // Owners whose indexes and sequences leave the schema first: a table it
+    // drops, and one it moves to another schema, which `SET SCHEMA` takes
+    // them along with.
+    let released: BTreeSet<&TableName> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::DropTable { name, .. } => Some(name),
+            Change::RenameTable { from, to, .. } if from.schema != to.schema => Some(from),
+            _ => None,
+        })
+        .collect();
+    // And a sequence whose owning column it drops, which goes with the column.
+    let dropped_columns: BTreeSet<(TableName, &str)> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::DropColumn { column, .. } => Some((now(&column.table), column.name.as_str())),
+            _ => None,
+        })
+        .collect();
+    let gone = |o: &pbps_pg::catalog::NameOccupant| {
+        freed.contains(&o.name)
+            || o.owner.as_ref().is_some_and(|t| released.contains(t))
+            || matches!((&o.owner, &o.owner_column), (Some(t), Some(c)) if dropped_columns.contains(&(t.clone(), c.as_str())))
+    };
+    let taken: Vec<String> = created_relation_names(cs)
+        .iter()
+        .flat_map(|name| {
+            occupants
+                .iter()
+                .filter(move |o| &o.name == name)
+                .filter(|o| !gone(o))
+                .map(move |o| match &o.owner {
+                    Some(owner) => format!(
+                        "`{name}`: the database already has {} `{name}` on `{owner}`",
+                        o.kind
+                    ),
+                    None => format!("`{name}`: the database already has {} `{name}`", o.kind),
+                })
+        })
+        .collect();
+    if taken.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "`{label}` already uses {} name(s) this plan would create, for objects that share \
+         PostgreSQL's relation namespace with tables and views:\n  {}\nEach `CREATE` would be \
+         refused at apply. Rename the declaration, or drop or rename the object in the database.",
+        taken.len(),
+        taken.join("\n  ")
+    );
+}
+
 /// Refuses to use a catalog projection that omitted facts inside the managed
 /// set. Both recording and connected planning need the same guard: a partial
 /// schema is neither an honest snapshot nor a safe baseline for an artifact.
@@ -3940,6 +4078,17 @@ pub fn cmd_plan_db(
         crate::engine::require_transactional_rebuilds(conn.driver(), &cs, staged)?;
         conn.begin(dialect.transaction_framing()).await?;
         let checks = async {
+            // In the read-only planning transaction, with everything below:
+            // the names this plan creates, asked of the whole relation
+            // namespace, not only of what the inventory reports (#951).
+            if conn.driver() == pbps_db::Driver::Postgres {
+                let occupants = pbps_pg::catalog::relation_name_occupants(
+                    &mut conn,
+                    &created_relation_names(&cs),
+                )
+                .await?;
+                refuse_uninventoried_occupants(&cs, &occupants, &target.label)?;
+            }
             let rename_evidence = crate::engine::external_role_renames(
                 &mut conn,
                 &recorded_snapshot.ids,
@@ -6238,6 +6387,244 @@ fn dropped_referrer_names(changes: &pbps_model::ChangeSet) -> BTreeSet<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// #951: a sequence, index or composite type at a name the plan creates
+    /// refuses it, with the kind and owning table named. One the plan frees
+    /// first does not: an index it drops, or an index or owned sequence of a
+    /// table it drops. A view the plan rebuilds already owns its name.
+    #[test]
+    fn an_uninventoried_occupant_refuses_unless_the_plan_frees_it() {
+        use pbps_model::{Change, ChangeSet, Module, ModuleKind, PlannedChange};
+        use pbps_pg::catalog::NameOccupant;
+        let x = TableName::new("app", "x");
+        let owner = TableName::new("app", "old");
+        let create_table = || {
+            PlannedChange::new(Change::CreateTable {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "app.x", 0),
+                name: x.clone(),
+                table: Box::default(),
+            })
+        };
+        let view = || Module {
+            kind: ModuleKind::View,
+            description: None,
+            definition: "SELECT 1".into(),
+        };
+        let occupant = |kind, owner: Option<&TableName>| NameOccupant {
+            name: x.clone(),
+            kind,
+            owner: owner.cloned(),
+            owner_column: None,
+        };
+        let plan = |changes: Vec<PlannedChange>| ChangeSet { changes };
+
+        let e = refuse_uninventoried_occupants(
+            &plan(vec![create_table()]),
+            &[occupant("sequence", None)],
+            "prod",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("already has sequence `app.x`"), "{e}");
+        let e = refuse_uninventoried_occupants(
+            &plan(vec![create_table()]),
+            &[occupant("index", Some(&owner))],
+            "prod",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("already has index `app.x` on `app.old`"), "{e}");
+        // A new view's name is asked too.
+        let new_view = PlannedChange::new(Change::CreateModule {
+            id: ModuleId::Named(x.clone()),
+            module: Box::new(view()),
+        });
+        assert!(
+            refuse_uninventoried_occupants(
+                &plan(vec![new_view.clone()]),
+                &[occupant("composite type", None)],
+                "prod"
+            )
+            .is_err()
+        );
+
+        // Freed by the plan itself.
+        let drop_index = PlannedChange::new(Change::DropIndex {
+            table: owner.clone(),
+            name: "x".into(),
+        });
+        refuse_uninventoried_occupants(
+            &plan(vec![drop_index, create_table()]),
+            &[occupant("index", Some(&owner))],
+            "prod",
+        )
+        .expect("an index the plan drops first");
+        let drop_table = PlannedChange::new(Change::DropTable {
+            uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "app.old", 0),
+            name: owner.clone(),
+        });
+        for kind in ["index", "sequence"] {
+            refuse_uninventoried_occupants(
+                &plan(vec![drop_table.clone(), create_table()]),
+                &[occupant(kind, Some(&owner))],
+                "prod",
+            )
+            .expect("it goes with the table the plan drops");
+        }
+        // The index behind a unique constraint or a primary key the plan
+        // drops, named after the constraint (#1082 review).
+        let drop_unique = PlannedChange::new(Change::DropUnique {
+            table: owner.clone(),
+            name: "x".into(),
+        });
+        let drop_key = |name: Option<&str>| {
+            PlannedChange::new(Change::SetPrimaryKey {
+                table: TableName::new("app", if name.is_some() { "old" } else { "x" }),
+                from: Some(pbps_model::PrimaryKey {
+                    name: name.map(Into::into),
+                    columns: vec!["id".into()],
+                }),
+                to: None,
+            })
+        };
+        for dropped in [drop_unique, drop_key(Some("x"))] {
+            refuse_uninventoried_occupants(
+                &plan(vec![dropped, create_table()]),
+                &[occupant("index", Some(&owner))],
+                "prod",
+            )
+            .expect("a constraint's index the plan drops first");
+        }
+        // An unnamed key's index is `<table>_pkey`: freeing `app.x_pkey`
+        // frees nothing at `app.x`.
+        assert!(
+            refuse_uninventoried_occupants(
+                &plan(vec![drop_key(None), create_table()]),
+                &[occupant("index", Some(&owner))],
+                "prod"
+            )
+            .is_err()
+        );
+        // An owner moved to another schema takes its index along; one renamed
+        // within the schema does not.
+        let rename = |to: TableName| {
+            PlannedChange::new(Change::RenameTable {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "app.old", 0),
+                from: owner.clone(),
+                to,
+                defaults: Vec::new(),
+            })
+        };
+        refuse_uninventoried_occupants(
+            &plan(vec![
+                rename(TableName::new("archive", "old")),
+                create_table(),
+            ]),
+            &[occupant("index", Some(&owner))],
+            "prod",
+        )
+        .expect("the index moves to `archive` with its table");
+        assert!(
+            refuse_uninventoried_occupants(
+                &plan(vec![rename(TableName::new("app", "older")), create_table()]),
+                &[occupant("index", Some(&owner))],
+                "prod"
+            )
+            .is_err()
+        );
+        // A sequence whose owning column the plan drops goes with it; one
+        // owned by another column stays.
+        let owned_by = |column: &str| NameOccupant {
+            owner_column: Some(column.into()),
+            ..occupant("sequence", Some(&owner))
+        };
+        let drop_column = PlannedChange::new(Change::DropColumn {
+            uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "app.old.id", 0),
+            column: pbps_model::ColumnRef::new(owner.clone(), "id"),
+        });
+        refuse_uninventoried_occupants(
+            &plan(vec![drop_column.clone(), create_table()]),
+            &[owned_by("id")],
+            "prod",
+        )
+        .expect("the sequence goes with its column");
+        assert!(
+            refuse_uninventoried_occupants(
+                &plan(vec![drop_column, create_table()]),
+                &[owned_by("other")],
+                "prod"
+            )
+            .is_err()
+        );
+
+        // A table renamed within its schema by the same plan: the catalog
+        // still names its key's index and its owned sequence after the old
+        // table, and the plan's changes carry the new name (#1082 review).
+        let renamed = TableName::new("app", "renamed");
+        let at = |name: &str, kind, column: Option<&str>| NameOccupant {
+            name: TableName::new("app", name),
+            kind,
+            owner: Some(owner.clone()),
+            owner_column: column.map(Into::into),
+        };
+        let create_at = |name: &str| {
+            PlannedChange::new(Change::CreateTable {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, name, 0),
+                name: TableName::new("app", name),
+                table: Box::default(),
+            })
+        };
+        let unnamed_key_on = |table: &TableName| {
+            PlannedChange::new(Change::SetPrimaryKey {
+                table: table.clone(),
+                from: Some(pbps_model::PrimaryKey {
+                    name: None,
+                    columns: vec!["id".into()],
+                }),
+                to: None,
+            })
+        };
+        refuse_uninventoried_occupants(
+            &plan(vec![
+                rename(renamed.clone()),
+                unnamed_key_on(&renamed),
+                create_at("old_pkey"),
+            ]),
+            &[at("old_pkey", "index", None)],
+            "prod",
+        )
+        .expect("the key's index is still `old_pkey`, and the plan drops it");
+        assert!(
+            refuse_uninventoried_occupants(
+                &plan(vec![unnamed_key_on(&renamed), create_at("old_pkey")]),
+                &[at("old_pkey", "index", None)],
+                "prod"
+            )
+            .is_err(),
+            "without the rename, dropping `renamed`'s key frees `renamed_pkey`"
+        );
+        let drop_renamed_column = PlannedChange::new(Change::DropColumn {
+            uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "app.renamed.n", 0),
+            column: pbps_model::ColumnRef::new(renamed.clone(), "n"),
+        });
+        refuse_uninventoried_occupants(
+            &plan(vec![
+                rename(renamed.clone()),
+                drop_renamed_column,
+                create_at("old_n_seq"),
+            ]),
+            &[at("old_n_seq", "sequence", Some("n"))],
+            "prod",
+        )
+        .expect("the sequence's owning column is dropped under its new table name");
+
+        // A view dropped and created is a rebuild: its name is its own.
+        let drop_view = PlannedChange::new(Change::DropModule {
+            id: ModuleId::Named(x.clone()),
+            kind: ModuleKind::View,
+        });
+        assert!(created_relation_names(&plan(vec![drop_view, new_view])).is_empty());
+    }
 
     /// The name checks behind DEC-316.1, one occupant at a time. A relation
     /// occupies a new table's or view's name; an unreadable routine of the
