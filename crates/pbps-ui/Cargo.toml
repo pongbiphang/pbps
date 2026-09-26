@@ -17,5 +17,8 @@ sha2.workspace = true
 # No-follow capture and bounded subprocess groups; no schema/model dependency.
 rustix = { workspace = true, features = ["fs", "process", "rand"] }
 
+[dev-dependencies]
+toml.workspace = true
+
 [lints]
 workspace = true

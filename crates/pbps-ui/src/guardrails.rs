@@ -545,38 +545,88 @@ fn clippy_forbids_every_environment_read_in_this_crate() {
     assert!(config.contains("disallowed-methods") && config.contains("disallowed-macros"));
 }
 
+/// The lint names a Cargo lint table could use to lower the environment
+/// lints: the two by name, in either spelling Cargo accepts, their `style`
+/// and `all` groups, and `warnings`.
+const LOWERING_KEYS: [&str; 7] = [
+    "disallowed_methods",
+    "disallowed-methods",
+    "disallowed_macros",
+    "disallowed-macros",
+    "style",
+    "all",
+    "warnings",
+];
+
+/// Every key of every lint table in a parsed manifest that lowers the
+/// environment lints: `[lints.*]` and `[workspace.lints.*]`. Parsed, so a
+/// quoted, dotted or inline-table key reads as Cargo reads it (#1065).
+fn lowering_lint_levels(manifest: &str) -> Vec<String> {
+    let manifest: toml::Table = manifest.parse().expect("a manifest parses");
+    let mut found = Vec::new();
+    let tables = [
+        manifest.get("lints"),
+        manifest.get("workspace").and_then(|w| w.get("lints")),
+    ];
+    for lints in tables.into_iter().flatten() {
+        let Some(lints) = lints.as_table() else {
+            continue;
+        };
+        for (tool, levels) in lints {
+            let Some(levels) = levels.as_table() else {
+                continue;
+            };
+            for key in levels.keys() {
+                if LOWERING_KEYS.contains(&key.as_str()) {
+                    found.push(format!("{tool}.{key}"));
+                }
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn a_lint_level_is_seen_however_the_manifest_spells_its_key() {
+    for manifest in [
+        "[workspace.lints.clippy]\ndisallowed_methods = \"allow\"\n",
+        "[workspace.lints.clippy]\n\"disallowed_methods\" = \"allow\"\n",
+        "[workspace.lints.clippy]\n'disallowed-macros' = { level = \"allow\" }\n",
+        "[workspace.lints]\nclippy = { style = \"allow\" }\n",
+        "[workspace]\nlints.clippy.all = \"allow\"\n",
+        "[lints.rust]\nwarnings = \"allow\"\n",
+        "[lints]\nclippy.disallowed_methods = \"allow\"\n",
+    ] {
+        assert!(!lowering_lint_levels(manifest).is_empty(), "{manifest}");
+    }
+    for manifest in [
+        "[workspace.lints.clippy]\nwildcard_enum_match_arm = \"warn\"\n",
+        "[lints]\nworkspace = true\n",
+        "[package]\nname = \"all\"\n",
+    ] {
+        assert!(lowering_lint_levels(manifest).is_empty(), "{manifest}");
+    }
+}
+
 /// A Cargo lint level overrides CI's `-D warnings`, so the manifests are a
 /// second place these lints could be silenced. This crate inherits the
-/// workspace's lints and sets none of its own, and the workspace names none
-/// of these lints, their `style` or `all` group, or `warnings` at any level.
+/// workspace's lints and sets none of its own, and no lint table in either
+/// manifest names these lints, their `style` or `all` group, or `warnings`.
 #[test]
 fn no_manifest_lowers_the_environment_lints() {
-    let crate_manifest = include_str!("../Cargo.toml");
-    let lints = crate_manifest
-        .split("[lints")
-        .skip(1)
-        .collect::<Vec<_>>()
-        .join("[lints");
-    assert_eq!(lints.trim(), "]\nworkspace = true", "{crate_manifest}");
-    let workspace = include_str!("../../../Cargo.toml");
-    for line in workspace
-        .lines()
-        .filter(|line| !line.trim_start().starts_with('#'))
-    {
-        let key = line.split('=').next().unwrap_or("").trim();
-        assert!(
-            !matches!(
-                key,
-                "disallowed_methods"
-                    | "disallowed-methods"
-                    | "disallowed_macros"
-                    | "disallowed-macros"
-                    | "style"
-                    | "all"
-                    | "warnings"
-            ),
-            "the workspace manifest sets {line:?}"
-        );
+    let crate_manifest: toml::Table = include_str!("../Cargo.toml").parse().unwrap();
+    let lints = crate_manifest.get("lints").and_then(toml::Value::as_table);
+    assert!(
+        lints.is_some_and(|lints| {
+            lints.len() == 1 && lints.get("workspace") == Some(&toml::Value::Boolean(true))
+        }),
+        "this crate's lints must be exactly the workspace's: {lints:?}"
+    );
+    for manifest in [
+        include_str!("../Cargo.toml"),
+        include_str!("../../../Cargo.toml"),
+    ] {
+        assert_eq!(lowering_lint_levels(manifest), Vec::<String>::new());
     }
 }
 
@@ -607,6 +657,7 @@ fn the_ui_reads_no_environment_value() {
     let mut reads = Vec::new();
     let mut scrubs = 0;
     let mut suppressions = Vec::new();
+    let mut macros = Vec::new();
     for file in files {
         if file.ends_with("guardrails.rs") {
             continue;
@@ -625,6 +676,9 @@ fn the_ui_reads_no_environment_value() {
             suppressions.push((name.clone(), suppression));
         }
         let text = normalized(&source);
+        if text.contains("macro_rules!") {
+            macros.push(name.clone());
+        }
         let without = if name == "compose/git.rs" {
             scrubs += text.matches(NAMES_ONLY_SCRUB).count();
             text.replace(NAMES_ONLY_SCRUB, "")
@@ -636,6 +690,11 @@ fn the_ui_reads_no_environment_value() {
         }
     }
     assert_eq!(scrubs, 1, "the names-only scrub is where it is expected");
+    // A `macro_rules!` can assemble a path (`std::$m::var`) or a lint
+    // attribute (`allow(clippy::$lint)`) that no scan of unexpanded source
+    // sees, and the lint it would silence cannot flag its own suppression.
+    // The crate defines none, and keeps it that way (#1065).
+    assert_eq!(macros, Vec::<String>::new(), "pbps-ui defines no macros");
     // The lints in `clippy.toml` are silenced in exactly one place: the scrub
     // statement. Any other `allow` or `expect` would let a read the source
     // scan cannot see, such as one a macro assembles, through CI's clippy.

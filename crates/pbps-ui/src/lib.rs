@@ -596,28 +596,34 @@ mod tests {
 
     #[test]
     fn the_ui_crate_has_no_workspace_dependency_and_embeds_no_remote_assets() {
-        let manifest = include_str!("../Cargo.toml");
-        let dependencies = manifest
-            .split("[dependencies]")
-            .nth(1)
-            .unwrap()
-            .split("[lints]")
-            .next()
-            .unwrap();
-        assert!(!dependencies.contains("pbps-"));
-        for line in dependencies
-            .lines()
-            .filter(|line| line.contains('=') && !line.starts_with('[') && !line.starts_with('#'))
-        {
-            assert!(matches!(
-                line.split('=').next().unwrap().trim(),
-                "serde.workspace"
-                    | "serde_json.workspace"
-                    | "tiny_http.workspace"
-                    | "sha2.workspace"
-                    | "rustix"
-            ));
+        // Parsed, so a dependency cannot hide in a spelling or a section
+        // the reader does not expect (#1065). Shipped dependencies are
+        // `[dependencies]` and every `[target.*.dependencies]`; the one
+        // dev-dependency never reaches the binary.
+        let manifest: toml::Table = include_str!("../Cargo.toml").parse().unwrap();
+        let mut shipped: Vec<&str> = Vec::new();
+        fn names(table: Option<&toml::Value>) -> Vec<&str> {
+            table
+                .and_then(toml::Value::as_table)
+                .map(|t| t.keys().map(String::as_str).collect())
+                .unwrap_or_default()
         }
+        shipped.extend(names(manifest.get("dependencies")));
+        for target in manifest
+            .get("target")
+            .and_then(toml::Value::as_table)
+            .into_iter()
+            .flat_map(|targets| targets.values())
+        {
+            shipped.extend(names(target.get("dependencies")));
+        }
+        shipped.sort_unstable();
+        assert_eq!(
+            shipped,
+            ["rustix", "serde", "serde_json", "sha2", "tiny_http"],
+            "no workspace crate, and nothing new, ships in the UI"
+        );
+        assert_eq!(names(manifest.get("dev-dependencies")), ["toml"]);
         assert!(!HTML.contains("<script>"));
         assert!(!JS.contains("innerHTML"));
         assert!(!COMPOSE_JS.contains("innerHTML"));

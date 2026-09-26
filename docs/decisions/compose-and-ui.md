@@ -440,7 +440,12 @@ hand, though, passes for a route added after it was written.
   read is still an error, even one in the same helper. Because a local `allow`
   or `expect` could silence the lints anywhere, the source test also requires
   that single `#[expect]` to be the crate's only suppression of them, whether
-  by name, by the `style` or `all` group, or with `warnings`. A test pins the clippy configuration, so deleting
+  by name, by the `style` or `all` group, or with `warnings`. The crate
+  defines no `macro_rules!`, and the scan keeps it that way: a macro could
+  assemble a path or a lint attribute no scan of unexpanded source sees. The
+  manifests' lint tables are read with a TOML parser (a test-only `toml`
+  dependency), so a quoted, dotted or inline-table key cannot lower these
+  lints unseen (#1065). A test pins the clippy configuration, so deleting
   it fails.
 - The real-CLI test searches every response, served asset and file the
   session leaves (git's compressed objects included) for the password marker
