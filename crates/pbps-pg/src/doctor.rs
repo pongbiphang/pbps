@@ -55,6 +55,7 @@ use crate::state::{LEDGER_SCHEMA, LOCK_TABLE, STATE_TABLE};
 mod data;
 mod grants;
 mod identity;
+mod managed;
 mod referenced;
 
 pub use pbps_db::doctor::Ask;
@@ -301,10 +302,11 @@ pub struct TableRights {
     /// on `id` answers `true` for both, and the key really does create. So the
     /// object answer alone reports a gap the account does not have.
     ///
-    /// Populated only for [`Held::referenced_objects`], and only for the
-    /// columns a declared key actually names there (this module's own
-    /// `referenced` submodule) — never for [`Held::tables`] or
-    /// [`Held::ledger_objects`], which stay empty. A permission this map was
+    /// Populated for [`Held::referenced_objects`], only for the columns a
+    /// declared key actually names there (the `referenced` submodule), and for
+    /// [`Held::tables`] lacking object-level `SELECT`, over every column the
+    /// catalog has (the `managed` submodule, issue #392). Never for
+    /// [`Held::ledger_objects`], which stays empty. A permission this map was
     /// never asked about for a column [`missing`] reads the same as any other
     /// NULL from the server: not held.
     pub columns: BTreeMap<String, BTreeSet<String>>,
@@ -688,6 +690,10 @@ pub async fn permissions(
         }
     }
 
+    // An owner who revoked its own object-level `SELECT` may have granted it
+    // back column by column, which the probes accept (issue #392).
+    managed::fill(conn, &mut held.tables).await?;
+
     held.ledger_migration_needed = held.ledger_objects.contains_key(&ledger_tables()[0])
         && !crate::state::timeline_columns_present(conn).await?;
 
@@ -779,9 +785,9 @@ async fn read_tables(
                 TableRights {
                     owned: optional_flag(row, "owned")?.unwrap_or(false),
                     privileges,
-                    // Filled in afterwards, only for `referenced_objects` and
-                    // only where the object answer above did not already
-                    // cover a permission (`referenced::fill`).
+                    // Filled in afterwards, only where the object answer above
+                    // did not already cover a permission (`referenced::fill`,
+                    // `managed::fill`).
                     columns: BTreeMap::new(),
                 },
             ))
@@ -824,7 +830,7 @@ pub fn missing(held: &Held) -> Vec<Gap> {
             }
             Needed::ManagedTable => {
                 for (object, rights) in &held.tables {
-                    if !rights.privileges.contains(r.name) {
+                    if !managed::covered(rights) {
                         out.push(Gap {
                             permission: r.name,
                             why: r.why.to_owned(),
@@ -1228,6 +1234,42 @@ mod tests {
         assert_eq!(gaps.len(), 1, "{gaps:?}");
         assert_eq!(gaps[0].permission, "REFERENCES");
         assert_eq!(gaps[0].securable(), "TABLE \"shared\".\"parent\"");
+    }
+
+    /// #392: an owner that revoked its own object-level `SELECT` and granted
+    /// every column back is covered, as the probes are.
+    #[test]
+    fn a_managed_table_with_every_column_granted_has_no_select_gap() {
+        let mut held = Held::default();
+        held.tables.insert(
+            object("app", "t"),
+            column_rights(&[("id", &["SELECT"]), ("label", &["SELECT"])]),
+        );
+        assert!(
+            missing(&held)
+                .iter()
+                .all(|g| !(g.permission == "SELECT" && g.securable() == "TABLE \"app\".\"t\"")),
+            "{held:?}"
+        );
+    }
+
+    /// The converse: one column short is still the gap, and so is a table
+    /// whose column read returned nothing at all.
+    #[test]
+    fn a_managed_table_one_column_short_or_unread_keeps_its_select_gap() {
+        for rights in [
+            column_rights(&[("id", &["SELECT"]), ("label", &[])]),
+            column_rights(&[]),
+        ] {
+            let mut held = Held::default();
+            held.tables.insert(object("app", "t"), rights);
+            assert!(
+                missing(&held)
+                    .iter()
+                    .any(|g| g.permission == "SELECT" && g.securable() == "TABLE \"app\".\"t\""),
+                "{held:?}"
+            );
+        }
     }
 
     /// A schema that is not there produces no `GRANT` advice, because there is

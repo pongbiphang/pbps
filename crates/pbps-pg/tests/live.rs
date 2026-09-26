@@ -28248,3 +28248,81 @@ async fn a_denied_legacy_row_leaves_the_callers_transaction_usable() {
     let mut admin = connect().await;
     let _ = admin.execute(&format!("DROP ROLE IF EXISTS {role}")).await;
 }
+
+/// #392. A table's owner that revoked its own object-level `SELECT` and granted
+/// `SELECT` back on every column can run the pre-flight probes, so `doctor`
+/// must not report the object-scope gap. One column short, it must.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn an_owner_with_select_on_every_column_has_no_managed_table_gap() {
+    let mut db = TestDb::create("doctor392").await;
+    let role = least_privilege_role(&mut db, "doctor392").await;
+    db.conn
+        .execute(&format!(
+            "CREATE SCHEMA app; GRANT USAGE, CREATE ON SCHEMA app TO {role}; \
+             CREATE TABLE app.t (id bigint PRIMARY KEY, label text, n integer); \
+             INSERT INTO app.t VALUES (1, 'a', NULL); \
+             ALTER TABLE app.t OWNER TO {role}"
+        ))
+        .await
+        .expect("a table the role owns");
+    let mut theirs = Conn::connect(Driver::Postgres, &conn_str_as(&role, "live-test", &db.name))
+        .await
+        .expect("connect as the owner");
+    theirs
+        .execute(&format!(
+            "REVOKE SELECT ON app.t FROM {role}; GRANT SELECT (id, label, n) ON app.t TO {role}"
+        ))
+        .await
+        .expect("the owner narrows its own SELECT to columns");
+    let t = ObjectName {
+        schema: "app".to_owned(),
+        name: "t".to_owned(),
+    };
+    let select_gap = |held: &doctor::Held| {
+        doctor::missing(held)
+            .iter()
+            .any(|g| g.permission == "SELECT" && g.securable() == "TABLE \"app\".\"t\"")
+    };
+    let ask = doctor::Ask {
+        granted: &pbps_db::doctor::GrantTargets::default(),
+        data: &pbps_db::doctor::DataTables::default(),
+        managed_schemas: &["app".to_owned()],
+        managed_tables: std::slice::from_ref(&t),
+        referenced: &[],
+        referenced_columns: &pbps_db::doctor::ReferencedColumns::default(),
+        declared_keys: &Default::default(),
+    };
+
+    // The premise, measured: the object answer says no, and a probe runs.
+    let held = doctor::permissions(&mut theirs, &ask, &IdsFile::default())
+        .await
+        .expect("read what the owner holds");
+    assert!(!held.tables[&t].privileges.contains("SELECT"), "{held:?}");
+    theirs
+        .query("SELECT count(*) FROM app.t WHERE n IS NULL")
+        .await
+        .expect("the probe shape runs on column grants alone");
+    assert!(!select_gap(&held), "{held:?}");
+
+    // One column short: the probe reading it is refused, and so is readiness.
+    theirs
+        .execute(&format!("REVOKE SELECT (n) ON app.t FROM {role}"))
+        .await
+        .expect("drop one column's grant");
+    assert!(
+        theirs
+            .query("SELECT count(*) FROM app.t WHERE n IS NULL")
+            .await
+            .is_err()
+    );
+    let held = doctor::permissions(&mut theirs, &ask, &IdsFile::default())
+        .await
+        .expect("read again");
+    assert!(select_gap(&held), "{held:?}");
+
+    drop(theirs);
+    db.drop().await;
+    let mut admin = connect().await;
+    let _ = admin.execute(&format!("DROP ROLE IF EXISTS {role}")).await;
+}
