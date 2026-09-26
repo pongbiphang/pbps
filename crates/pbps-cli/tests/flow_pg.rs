@@ -7856,9 +7856,33 @@ fn doctor_exercises_a_real_non_superuser_and_names_the_permission_removed_from_i
         serde_json::json!([]),
         "{ready}"
     );
+    // The role owns `app.t`, and an owner can still lose ordinary `SELECT`:
+    // ownership keeps the grant option, not the privilege (DECISIONS 428,
+    // measured on 18.6, #368). The setup asserts both halves of that, so the
+    // exit 2 below is `doctor` reading a real missing privilege.
+    let privilege = |which: &str| {
+        scalar(
+            connection,
+            &format!(
+                "SELECT pg_catalog.has_table_privilege('{}', 'app.t', '{which}')::int::int8",
+                role.1
+            ),
+        )
+    };
+    assert_eq!(privilege("SELECT"), 1, "the owner starts with SELECT");
     on_server(
         connection,
         &format!("REVOKE SELECT ON app.t FROM {}", role.1),
+    );
+    assert_eq!(
+        privilege("SELECT"),
+        0,
+        "the REVOKE took SELECT from the owner"
+    );
+    assert_eq!(
+        privilege("SELECT WITH GRANT OPTION"),
+        1,
+        "and left the owner's grant option standing"
     );
     let refused = d.run(&["doctor", "--db", &login, "--format", "json"]);
     assert_eq!(
