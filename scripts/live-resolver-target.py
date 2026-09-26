@@ -26,6 +26,7 @@ IMAGES = {
 PASSWORD = "Pbps!NativeFixture12345"
 TARGET_TEST = "resolver::native::target::tests::native_aliases_share_one_instance_and_backend_children_cannot_claim_another"
 FACTORY_TEST = "resolver::docker::session::native_factory_tests::native_factory_qualifies_before_bootstrap_and_rejects_rebound_target_connections"
+DAEMON_TEST = "resolver::docker::tests::direct_native_daemon_is_accepted_but_a_root_owned_proxy_is_not"
 QUIET = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
 DOCKER_SOCKET = "/var/run/docker.sock"
 
@@ -39,6 +40,18 @@ def run(*args, **kwargs):
 
 def interrupted(signum, _frame):
     raise SystemExit(128 + signum)
+
+
+def native_tests(binary, env):
+    # The daemon/proxy case needs the same disposable root host as the factory;
+    # the ordinary library run only compiles it and leaves it ignored.
+    for test in (DAEMON_TEST, TARGET_TEST, FACTORY_TEST):
+        result = run(binary, "--ignored", "--exact", test, "--nocapture",
+                     env=dict(os.environ, **env), stdout=subprocess.PIPE,
+                     stderr=subprocess.STDOUT, check=False)
+        print(result.stdout, end="", flush=True)
+        if result.returncode or "test result: ok. 1 passed" not in result.stdout:
+            raise RuntimeError("native fixture did not run exactly one passing test: " + test)
 
 
 def test_binary():
@@ -154,12 +167,7 @@ def fixture(args, binary, root, owned):
     if args.native_host:
         env.update(PBPS_NATIVE_FACTORY_FIXTURE="1", PBPS_RESOLVER_TEST_SOCKET=args.socket,
                    PBPS_RESOLVER_TEST_IMAGE=IMAGES[engine])
-        for test in (TARGET_TEST, FACTORY_TEST):
-            result = run(binary, "--ignored", "--exact", test, "--nocapture",
-                         env=dict(os.environ, **env), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
-            print(result.stdout, end="", flush=True)
-            if result.returncode or "test result: ok. 1 passed" not in result.stdout:
-                raise RuntimeError("native fixture did not run exactly one passing test")
+        native_tests(binary, env)
         return
     reader = "pbps-native-reader-" + uuid.uuid4().hex
     owned.append(reader)

@@ -83,6 +83,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: python3 scripts/live_test_runners_test.py
       # Before the toolchain: it needs none, and a duplicate decision
       # identifier from two branches merges without a textual conflict, so this
       # is the only place it is caught (DEC-671.1).
@@ -184,6 +185,8 @@ jobs:
       # it crashed this job the first time it was tried (#611). Skipped by
       # name here; unset, its variable makes the test fail rather than pass.
       - run: cargo test -p pbps-mssql --test live -- --ignored --skip a_real_express_target_is_an_edition_limitation
+      # Driver error conversion is a separate test target, ignored by quick.
+      - run: cargo test -p pbps-db --test live_mssql -- --ignored
       - run: python3 scripts/live-transport.py mssql
       # Phase 3.1's onboarding path and the optional dev rehearsal both cross
       # the CLI/database boundary, so the dialect-only suite cannot exercise
@@ -326,6 +329,7 @@ jobs:
       - run: cargo test -p pbps-pg --test live -- --ignored
       # Private capture internals have live snapshot/rendering regressions.
       - run: cargo test -p pbps-pg --lib -- --ignored --test-threads=1
+      - run: cargo test -p pbps-db --test live_pg -- --ignored
       - run: python3 scripts/live-transport.py pg
       # The CLI's own PostgreSQL-dependent test, in the bin target rather than
       # in `tests/` because `deploy::run_probes` is private and what it asserts
