@@ -390,6 +390,56 @@ fn normalizing_drops_comments_and_whitespace_but_keeps_literals() {
     assert_eq!(normalized("fn f<'a>(x: &'a str) {}"), "fnf<'a>(x:&'astr){}");
 }
 
+/// Every lint attribute in `source` that could silence the clippy rules in
+/// `clippy.toml`: by name, through the `style` or `all` group they belong
+/// to, or with `warnings`. Read from normalized source, so `cfg_attr` forms
+/// are seen as well.
+fn lint_suppressions(source: &str) -> Vec<String> {
+    let text = normalized(source);
+    let mut found = Vec::new();
+    for opener in ["allow(", "expect("] {
+        for (at, _) in text.match_indices(opener) {
+            let body = &text[at..];
+            let body = &body[..body.find(')').map_or(body.len(), |end| end + 1)];
+            if [
+                "disallowed_methods",
+                "disallowed_macros",
+                "clippy::style",
+                "clippy::all",
+                "warnings",
+            ]
+            .iter()
+            .any(|lint| body.contains(lint))
+            {
+                found.push(body.to_owned());
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn a_suppression_of_the_environment_lints_is_seen_in_any_form() {
+    for source in [
+        "#[allow(clippy::disallowed_methods)] fn f() {}",
+        "#[expect(clippy::disallowed_macros, reason = \"x\")] fn f() {}",
+        "#![allow(clippy::style)]",
+        "#[allow(clippy::all)] fn f() {}",
+        "#![allow(warnings)]",
+        "#[cfg_attr(unix, allow(clippy::disallowed_methods))] fn f() {}",
+        "#[ allow ( clippy :: disallowed_methods ) ] fn f() {}",
+    ] {
+        assert!(!lint_suppressions(source).is_empty(), "{source}");
+    }
+    for source in [
+        "#[allow(dead_code)] fn f() {}",
+        "#[expect(clippy::too_many_arguments, reason = \"x\")] fn f() {}",
+        "let v = x.expect(\"a value\");",
+    ] {
+        assert!(lint_suppressions(source).is_empty(), "{source}");
+    }
+}
+
 /// Every place in `source` that could read an environment variable's value.
 /// The source is compared with all whitespace removed, since Rust accepts
 /// `env ! ("X")` and `std :: env :: var` split across lines. Conservative on
@@ -521,6 +571,7 @@ fn the_ui_reads_no_environment_value() {
     assert!(files.len() > 10, "the source walk found {files:?}");
     let mut reads = Vec::new();
     let mut scrubs = 0;
+    let mut suppressions = Vec::new();
     for file in files {
         if file.ends_with("guardrails.rs") {
             continue;
@@ -534,7 +585,11 @@ fn the_ui_reads_no_environment_value() {
             .map(|part| part.as_os_str().to_string_lossy())
             .collect::<Vec<_>>()
             .join("/");
-        let text = normalized(&std::fs::read_to_string(&file).unwrap());
+        let source = std::fs::read_to_string(&file).unwrap();
+        for suppression in lint_suppressions(&source) {
+            suppressions.push((name.clone(), suppression));
+        }
+        let text = normalized(&source);
         let without = if name == "compose/git.rs" {
             scrubs += text.matches(NAMES_ONLY_SCRUB).count();
             text.replace(NAMES_ONLY_SCRUB, "")
@@ -546,5 +601,16 @@ fn the_ui_reads_no_environment_value() {
         }
     }
     assert_eq!(scrubs, 1, "the names-only scrub is where it is expected");
+    // The lints in `clippy.toml` are silenced in exactly one place: the scrub
+    // statement. Any other `allow` or `expect` would let a read the source
+    // scan cannot see, such as one a macro assembles, through CI's clippy.
+    assert_eq!(
+        suppressions,
+        [(
+            "compose/git.rs".to_owned(),
+            "expect(clippy::disallowed_methods,reason=\"readsonlythenamesofinheritedvariablesanddiscardseveryvalue\")"
+                .to_owned()
+        )]
+    );
     assert_eq!(reads, Vec::<(String, String)>::new());
 }

@@ -437,7 +437,10 @@ hand, though, passes for a route added after it was written.
   Compose's names-only `GIT_*` scrub is the one allowed site. The
   `#[expect]` sits on the single `let` that calls `vars_os()` and drops each
   value in the same statement, so what it binds holds names only. Any other
-  read is still an error, even one in the same helper. A test pins the clippy configuration, so deleting
+  read is still an error, even one in the same helper. Because a local `allow`
+  or `expect` could silence the lints anywhere, the source test also requires
+  that single `#[expect]` to be the crate's only suppression of them, whether
+  by name, by the `style` or `all` group, or with `warnings`. A test pins the clippy configuration, so deleting
   it fails.
 - The real-CLI test searches every response, served asset and file the
   session leaves (git's compressed objects included) for the password marker
