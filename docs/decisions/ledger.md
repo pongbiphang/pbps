@@ -1004,3 +1004,37 @@ owner an event trigger blocks, and by
 `a_role_without_ownership_is_refused_by_name_on_a_pre_migration_ledger` for
 the DML-only non-owner who is correctly told to obtain ownership (both in
 `crates/pbps-pg/tests/live.rs`).
+
+<a id="dec-898-1"></a>
+
+**DEC-898.1. Concurrent ledger creation is tolerated on PostgreSQL and
+serialized on SQL Server.** Two pipelines reaching an empty database at once
+both run the create, and one of them loses.
+
+On PostgreSQL the loser's error surfaces as one of three codes: `42P07` on the
+table, `23505` on the catalog's unique index, or `42710` on the table's
+composite row type, which PostgreSQL creates under the same name. The first two
+were already tolerated. The third was not, and the race failed in CI twice. All
+three are now handed to the catalog recheck, which alone decides success. So a
+stand-in of the ledger's name, such as a bare row type, is still refused by
+name.
+
+On SQL Server the create is `IF OBJECT_ID(...) IS NULL` then `CREATE TABLE`, a
+check-then-act. Measured on the pinned server, the loser's `CREATE` failed with
+Msg 2714 on 37 of 300 calls over 150 races. Tolerating 2714 after the fact, as
+PostgreSQL does, is not available: `record` runs inside the apply's
+`XACT_ABORT ON` transaction, which the error has already doomed. So every
+statement that creates or reshapes a ledger table runs under an exclusive
+`sp_getapplock` owned by a transaction. The loser waits for the winner's commit
+and then finds the table. The batch's own transaction nests in a caller's
+transaction, and the lock lasts until that caller's commit. A failure rolls
+back only a transaction the batch opened itself.
+
+Pinned by `two_pipelines_initializing_the_ledger_at_once_both_succeed`,
+`a_refused_ledger_create_leaves_no_transaction_open` and
+`the_ledger_created_inside_a_callers_transaction_follows_that_transaction`
+(`crates/pbps-mssql/tests/live.rs`). On the PostgreSQL side it is pinned by
+`a_concurrent_creator_is_recognised_by_each_code_it_can_surface_as`
+(`crates/pbps-pg/src/state.rs`) and
+`a_row_type_of_the_ledgers_name_without_the_table_is_still_refused`
+(`crates/pbps-pg/tests/live.rs`).

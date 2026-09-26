@@ -316,12 +316,55 @@ async fn refuse_misspelt_ledger(conn: &mut Conn) -> Result<(), DbError> {
     )))
 }
 
+/// The application lock every statement that creates or reshapes a ledger
+/// table holds first (DEC-898.1).
+const LEDGER_DDL_LOCK: &str = "pbps: ledger ddl";
+
+/// Wraps `body` so it runs holding [`LEDGER_DDL_LOCK`], owned by a transaction.
+///
+/// `IF OBJECT_ID(...) IS NULL` then `CREATE TABLE` is a check-then-act: two
+/// pipelines initializing the same database both see no table, and the loser's
+/// `CREATE` fails with Msg 2714 — measured, 37 of 300 calls across 150 races on
+/// the pinned server (#898). Tolerating 2714 afterwards does not work here,
+/// because [`record`] runs inside the apply's `XACT_ABORT ON` transaction, where
+/// the error has already doomed it. Holding the lock, the loser waits for the
+/// winner's transaction and then finds the table (DEC-898.1).
+///
+/// The transaction is this batch's own, or nests in the caller's, where the
+/// lock is held until the caller's commit. The `CATCH` rolls back only a
+/// transaction the batch opened itself: a caller's one is doomed by
+/// `XACT_ABORT` and left to the caller, which rolls it back as it would for any
+/// failed statement. `THROW` rethrows the original error number, so the codes
+/// callers read (Msg 1088 in [`migration_error`]) are unchanged.
+fn serialized(body: &str) -> String {
+    format!(
+        "\
+DECLARE @outer INT = @@TRANCOUNT, @granted INT;
+BEGIN TRY
+    BEGIN TRANSACTION;
+    EXEC @granted = sys.sp_getapplock @Resource = N'{LEDGER_DDL_LOCK}',
+        @LockMode = N'Exclusive', @LockOwner = N'Transaction';
+    IF @granted < 0
+        THROW 50000, N'pbps could not take the lock that serializes creating its ledger tables.', 1;
+{body}
+    COMMIT TRANSACTION;
+END TRY
+BEGIN CATCH
+    IF @outer = 0 AND @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+    THROW;
+END CATCH;"
+    )
+}
+
 /// Creates the ledger and lock tables if they are not there yet, and migrates
 /// a `__pbps_state` from before issue #103 to carry the timeline columns.
+///
+/// Both run under [`serialized`], so two pipelines reaching an empty database
+/// at once both succeed (#898).
 pub async fn ensure_tables(conn: &mut Conn) -> Result<(), DbError> {
     refuse_misspelt_ledger(conn).await?;
-    conn.execute(CREATE_STATE).await?;
-    conn.execute(CREATE_LOCK).await?;
+    conn.execute(&serialized(&format!("{CREATE_STATE}\n{CREATE_LOCK}")))
+        .await?;
     migrate_timeline_columns(conn).await
 }
 
@@ -333,7 +376,9 @@ pub async fn ensure_tables(conn: &mut Conn) -> Result<(), DbError> {
 /// permissions" — names neither. `doctor` asks for this right before migration,
 /// but callers that deploy without running it still need an actionable error.
 async fn migrate_timeline_columns(conn: &mut Conn) -> Result<(), DbError> {
-    conn.execute(ADD_TIMELINE_COLUMNS)
+    // The same check-then-act as the creates: two pipelines reaching a
+    // pre-#103 ledger at once would both add the columns.
+    conn.execute(&serialized(ADD_TIMELINE_COLUMNS))
         .await
         .map_err(migration_error)
 }

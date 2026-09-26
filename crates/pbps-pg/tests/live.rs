@@ -6037,6 +6037,58 @@ async fn two_pipelines_creating_the_ledger_at_once_both_find_it_there() {
     db.drop().await;
 }
 
+/// #898: `42710` is now tolerated as a concurrent creator, like `42P07` and
+/// `23505`, and only the catalog recheck decides success. Tolerating the code
+/// must not make a stand-in pass: a composite type of the ledger's name with
+/// no table behind it is still refused, by name, on both servers, and never
+/// reads as initialized.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+async fn a_row_type_of_the_ledgers_name_without_the_table_is_still_refused() {
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("the PostgreSQL 16 fixture");
+    for connection in [conn_str(), old] {
+        let mut admin = Conn::connect(Driver::Postgres, &connection).await.unwrap();
+        let name = format!("pbps_test_type898_{}", std::process::id());
+        let _ = admin
+            .execute(&format!("DROP DATABASE IF EXISTS {name}"))
+            .await;
+        admin
+            .execute(&format!("CREATE DATABASE {name}"))
+            .await
+            .unwrap();
+        let target: String = connection
+            .split_whitespace()
+            .map(|w| {
+                if w.starts_with("dbname=") {
+                    format!("dbname={name}")
+                } else {
+                    w.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut conn = Conn::connect(Driver::Postgres, &target).await.unwrap();
+        conn.execute("CREATE TYPE public.__pbps_state AS (x integer)")
+            .await
+            .unwrap();
+        let refused = state::ensure_tables(&mut conn).await;
+        let present = state::is_initialized(&mut conn).await;
+        drop(conn);
+        admin
+            .execute(&format!("DROP DATABASE {name} WITH (FORCE)"))
+            .await
+            .unwrap();
+        let e = refused.expect_err("a row type is not the ledger");
+        assert!(e.to_string().contains("composite type"), "{e}");
+        // The probe may refuse the stand-in outright (`42809`) or say false;
+        // what it must never do is read the type as a ledger.
+        assert!(
+            !matches!(present, Ok(true)),
+            "a row type reads as the ledger: {present:?}"
+        );
+    }
+}
+
 /// The loser of the creation race, inside a transaction of its own.
 ///
 /// `record` runs inside the apply's transaction (DECISIONS 147), so this is the
