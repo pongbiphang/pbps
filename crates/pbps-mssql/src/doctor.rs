@@ -67,7 +67,8 @@ pub enum Needed {
     /// the over-demand coming back.
     LedgerCreation,
 
-    /// Held on an existing state ledger only while its columns need migration.
+    /// `ALTER` on an existing state ledger, only while its timeline columns
+    /// still need migration (DEC-416.1, applying DECISIONS 435).
     LedgerMigration,
 
     /// Needed only on the ledger and the lock themselves.

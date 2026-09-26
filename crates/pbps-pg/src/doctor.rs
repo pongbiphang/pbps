@@ -99,7 +99,8 @@ pub enum Needed {
     /// `public` for the rest of the project's life.
     LedgerCreation,
 
-    /// Ownership of an existing state ledger only while its columns need migration.
+    /// Ownership of an existing state ledger, only while its timeline columns
+    /// still need migration (DEC-416.1, applying DECISIONS 435).
     LedgerMigration,
 
     /// Held on the ledger's schema for as long as the ledger is used.

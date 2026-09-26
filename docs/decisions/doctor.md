@@ -740,3 +740,33 @@ into "ready": an object-level grant answers every column anyway, a table one
 column short keeps its gap, and a table whose column read returned nothing
 keeps it too.
 
+<a id="dec-416-1"></a>
+
+**DEC-416.1. `doctor` asks for the right to migrate the ledger's timeline
+columns only while an existing ledger still lacks them: `ALTER` on SQL Server,
+ownership on PostgreSQL (#416; applies DECISIONS 435).** DECISIONS 435 added
+five projected columns to `__pbps_state` and made the migration conditional,
+so that it costs nothing once done:
+- On SQL Server, `IF COL_LENGTH(...) IS NULL` evaluates its guard before the
+  `ALTER` it would need.
+- On PostgreSQL, a world-readable catalog probe runs first, because `ALTER
+  TABLE ... ADD COLUMN IF NOT EXISTS` is refused by ownership even when every
+  column exists.
+
+A migrated ledger therefore needs only `SELECT`, `INSERT` and `DELETE` from
+the account that writes it.
+
+SPEC §9.5 asks `doctor` for the right the next command will use, at the
+securable it will use it on, without writing. `Needed::LedgerMigration`
+applies both rules together. It is asked only when the ledger table exists
+and the same read-only shape probe that `migrate_timeline_columns` uses says
+the columns are missing. It is asked on the table itself, as `ALTER` on SQL
+Server and ownership on PostgreSQL. Before the ledger exists, the creation
+requirement covers the new table instead. Once the columns exist, nothing is
+asked, because demanding the right for ever would be an over-demand that
+names a right no command will use again.
+
+The live regressions are `doctor_requires_alter_only_until_the_existing_ledger_is_migrated`
+(SQL Server) and `doctor_requires_ownership_only_until_the_existing_ledger_is_migrated`
+(PostgreSQL). Each shows the gap on an unmigrated ledger and its absence once
+the ledger is migrated.
