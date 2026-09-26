@@ -946,7 +946,8 @@ is looked up as a routine too (only overloads a single argument can reach,
 since a cast has one), and a bound routine a one-argument call can
 reach (its declared count less defaults, or variadic) as a type, since `t(x)` is an exact call, else a cast to `t`, else the
 best-matching call, and a cast takes exactly one argument —
-plus every cast, which resolution consults with no name. Only a binding some
+plus every cast, which routine, operator and coercion resolution consults with
+no name, for a surface that looked any of those up. Only a binding some
 name lookup selected counts. Every type, operator, routine and relation field the node allowlist admits is classified by node and field:
 an operator's implementation, result and transition types, a column's, field's
 or placeholder's type, operands' common types, a query's output types, an SQL
@@ -961,7 +962,7 @@ scratch has with the same properties, role references removed because the
 bootstrap superuser's name is the installation's; a member of a user schema
 scratch has too, which creating a declaration made (an identity column's
 sequence, a key's index, a row type); or one of the project's managed objects
-by name. A routine is managed only as the exact overload
+by name (a type only for a table or view, never for an index). A routine is managed only as the exact overload
 scratch compiled for a declaration the plan keeps; overloads the plan drops,
 never compiled, are the only ones counted. A count alone let an unmanaged
 overload stand in for a declared one the target had lost. An unmanaged overload

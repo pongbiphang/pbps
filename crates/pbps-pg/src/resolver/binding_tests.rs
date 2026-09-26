@@ -1643,3 +1643,106 @@ async fn a_routine_no_single_argument_reaches_cannot_take_a_cast() {
         );
     }
 }
+
+/// Casts are consulted by routine, operator and coercion resolution. A view
+/// that only reads a column resolves nothing a cast could change, so an
+/// unrelated cast on the target leaves its verdict standing.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_cast_cannot_change_a_surface_that_resolves_no_call() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let declared = || {
+            let mut table = pbps_model::Table::default();
+            table.columns.insert(
+                "c".into(),
+                pbps_model::Column::new("integer".parse().unwrap()),
+            );
+            Declared::default()
+                .table("app.t", table)
+                .view("app.v", "SELECT c FROM t")
+        };
+        let assessment = analyze(
+            &server,
+            "column_only",
+            Case {
+                schemas: &["app"],
+                extras: &[],
+                target: "
+                    CREATE TABLE app.t (c integer);
+                    SET search_path = app;
+                    CREATE VIEW app.v AS SELECT c FROM t;
+                    CREATE CAST (date AS money) WITH INOUT;",
+                base: declared(),
+                desired: declared(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            only(&assessment, "app", "v"),
+            Verdict::Unaffected,
+            "{variable}"
+        );
+    }
+}
+
+/// An index is a relation with no type. A managed index named `foo` does not
+/// make an unmanaged type `app.foo` one of the project's own, and that type
+/// can take a call `foo('x')` as a cast.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_managed_index_does_not_account_for_a_same_named_type() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let declared = || {
+            let mut table = pbps_model::Table::default();
+            table.columns.insert(
+                "c".into(),
+                pbps_model::Column::new("integer".parse().unwrap()),
+            );
+            table.indexes.insert(
+                "foo".into(),
+                pbps_model::Index {
+                    columns: vec![pbps_model::IndexColumn {
+                        name: "c".into(),
+                        descending: false,
+                    }],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                },
+            );
+            Declared::default()
+                .table("app.t", table)
+                .function(
+                    "app.foo(text)",
+                    "(text) RETURNS text LANGUAGE sql IMMUTABLE RETURN 'routine'",
+                )
+                .view("app.v", "SELECT foo('x')::text AS x")
+        };
+        let assessment = analyze(
+            &server,
+            "index_type",
+            Case {
+                schemas: &["app"],
+                extras: &[],
+                target: "
+                    CREATE TABLE app.t (c integer);
+                    CREATE INDEX foo ON app.t (c);
+                    SET search_path = app;
+                    CREATE FUNCTION foo(text) RETURNS text LANGUAGE sql IMMUTABLE RETURN 'routine';
+                    CREATE VIEW app.v AS SELECT foo('x')::text AS x;
+                    CREATE TYPE app.foo AS ENUM ('x');",
+                base: declared(),
+                desired: declared(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(only(&assessment, "app", "v"), Verdict::Unresolved { .. }),
+            "{variable}: {assessment:#?}"
+        );
+    }
+}

@@ -30,7 +30,10 @@ use std::collections::{BTreeMap, BTreeSet};
 /// (DEC-613.2).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Managed {
+    /// Tables and views: relations with a row type and an array type.
     relations: BTreeSet<(String, String)>,
+    /// Named indexes and keys: relations with no type.
+    indexes: BTreeSet<(String, String)>,
     routines: BTreeMap<(String, String), BTreeSet<pbps_model::ModuleId>>,
 }
 
@@ -45,9 +48,7 @@ impl Managed {
                 .insert((name.schema.clone(), name.name.clone()));
             let key = table.primary_key.as_ref().and_then(|pk| pk.name.clone());
             for index in table.indexes.keys().chain(table.unique.keys()).chain(&key) {
-                managed
-                    .relations
-                    .insert((name.schema.clone(), index.clone()));
+                managed.indexes.insert((name.schema.clone(), index.clone()));
             }
         }
         for id in schema.modules.keys() {
@@ -75,6 +76,7 @@ impl Managed {
         };
         self.relations
             .iter()
+            .chain(&self.indexes)
             .map(|key| set(CandidateClass::Relation, key))
             .chain(
                 self.routines
@@ -96,9 +98,11 @@ impl Managed {
         };
         let key = |name: &str| (schema.clone(), name.to_owned());
         match class {
-            CandidateClass::Relation => self.relations.contains(&key(name)),
-            // A relation's row type has its name, and its array type is the
-            // name with an underscore in front.
+            CandidateClass::Relation => {
+                self.relations.contains(&key(name)) || self.indexes.contains(&key(name))
+            }
+            // A table's or view's row type has its name, and its array type is
+            // the name with an underscore in front; an index has neither.
             CandidateClass::Type => {
                 self.relations.contains(&key(name))
                     || name
@@ -233,14 +237,26 @@ fn derived(
     // Each set maps to whether only its members a one-argument call can
     // reach matter: true for routines looked up only because a type binding
     // may have been written as a call, which a cast's single argument limits.
-    let mut sets = BTreeMap::from([(
-        CandidateSet {
-            class: CandidateClass::Cast,
-            namespace: None,
-            name: None,
-        },
-        false,
-    )]);
+    // Casts are consulted with no name by routine, operator and coercion
+    // resolution, so a surface that looked up a routine, operator or type
+    // depends on every cast. One that only reads relations and columns
+    // resolves nothing a cast could change.
+    let mut sets = BTreeMap::new();
+    if input.bindings.iter().any(|binding| {
+        matches!(
+            binding.target.class.as_str(),
+            "pg_proc" | "pg_operator" | "pg_type"
+        ) && resolved_by_name(binding)
+    }) {
+        sets.insert(
+            CandidateSet {
+                class: CandidateClass::Cast,
+                namespace: None,
+                name: None,
+            },
+            false,
+        );
+    }
     let Some(schema) = owner(object).name.first() else {
         return sets;
     };
@@ -688,6 +704,32 @@ mod tests {
             &none,
             &order
         ));
+        // An index is a relation with no row or array type.
+        let mut indexed = pbps_model::Table::default();
+        indexed.indexes.insert(
+            "ix".into(),
+            pbps_model::Index {
+                columns: Vec::new(),
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+            },
+        );
+        let mut with_index = pbps_model::Schema::default();
+        with_index.tables.insert("app.u".parse().unwrap(), indexed);
+        let with_index = Managed::from_schema(&with_index);
+        assert!(with_index.holds(
+            CandidateClass::Relation,
+            &id("pg_class", &["app", "ix"], Vec::new()),
+            &none,
+            &order
+        ));
+        assert!(!with_index.holds(
+            CandidateClass::Type,
+            &id("pg_type", &["app", "ix"], Vec::new()),
+            &none,
+            &order
+        ));
         assert!(!managed.holds(
             CandidateClass::Operator,
             &id("pg_operator", &["app", "t"], Vec::new()),
@@ -850,7 +892,8 @@ mod tests {
         );
         assert_eq!(
             keys(derived(&view, &determined, &paths, &BTreeMap::new())),
-            BTreeSet::from([set(CandidateClass::Cast, None, None)])
+            BTreeSet::new(),
+            "nothing looked up, so not even a cast can change the surface"
         );
         // An extra the deployer cannot use is not on its measured path, so
         // nothing in it is a candidate.
