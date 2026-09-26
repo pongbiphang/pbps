@@ -1384,7 +1384,8 @@ async fn a_later_object_outside_the_path_is_no_candidate() {
                     }],
                     include: Vec::new(),
                     unique: false,
-                    filter: None,
+                    // A predicate keeps the index after every module.
+                    filter: Some("id > 0".into()),
                 },
             );
             Declared::default()
@@ -1401,7 +1402,7 @@ async fn a_later_object_outside_the_path_is_no_candidate() {
                 target: "
                     CREATE TABLE app.t (id integer);
                     CREATE TABLE z.o (id integer);
-                    CREATE INDEX t ON z.o (id);
+                    CREATE INDEX t ON z.o (id) WHERE id > 0;
                     SET search_path = app;
                     CREATE VIEW app.v AS SELECT id FROM t;",
                 base: declared(),
