@@ -27,6 +27,7 @@
 use pbps_db::resolver::capture::ObjectIdentity;
 use pbps_dialect::Dialect;
 use pbps_model::{Change, ModuleId, ModuleKind, Strategy};
+use std::collections::BTreeMap;
 
 /// Why the desired namespace could not be built on scratch. A named limit,
 /// never a partially compiled namespace that evidence could be read from.
@@ -109,6 +110,10 @@ struct Step {
 #[derive(Debug, Clone)]
 pub struct Reconstruction {
     steps: Vec<Step>,
+    /// Declared routines the plan drops, which are never compiled, and the
+    /// catalog identity each declared signature names once compiled: `None`
+    /// until then, or when an argument type cannot be identified (#1063).
+    dropped: BTreeMap<ModuleId, Option<ObjectIdentity>>,
 }
 
 impl Reconstruction {
@@ -273,7 +278,10 @@ impl Reconstruction {
         // Stable: within a phase the differ's order stands, which for modules
         // is its dependency order.
         steps.sort_by_key(|step| step.phase);
-        Ok(Self { steps })
+        Ok(Self {
+            steps,
+            dropped: BTreeMap::new(),
+        })
     }
 
     /// The names made resolvable after the module that `owner` belongs to
@@ -318,6 +326,20 @@ impl Reconstruction {
             .and_then(|step| step.created.as_ref())
     }
 
+    /// Declared routines the plan drops. Their signatures are identified
+    /// after compiling, as the deployer the plan's `DROP` runs as would
+    /// resolve them.
+    pub fn drops(&mut self, routines: impl IntoIterator<Item = ModuleId>) {
+        self.dropped
+            .extend(routines.into_iter().map(|routine| (routine, None)));
+    }
+
+    /// The catalog identity a dropped routine's declared signature names, when
+    /// every argument type was identified; `None` for one that was not.
+    pub fn dropped(&self, id: &ModuleId) -> Option<&ObjectIdentity> {
+        self.dropped.get(id).and_then(Option::as_ref)
+    }
+
     /// Runs every step in one transaction under the dialect's session pins,
     /// as whatever role the session currently is — the reproduced deployer,
     /// which the scope has entered. Committed only when all of it compiled;
@@ -338,7 +360,16 @@ impl Reconstruction {
         }
         conn.execute(framing.commit)
             .await
-            .map_err(|_| ReconstructError::Transaction("commit"))
+            .map_err(|_| ReconstructError::Transaction("commit"))?;
+        // After the commit: a type name the engine cannot parse is an error
+        // there, which inside the transaction would abort the compile. Here
+        // it only leaves that routine unidentified, which counts for nothing.
+        for (id, identity) in &mut self.dropped {
+            if let ModuleId::Routine(routine) = id {
+                *identity = signature(conn, routine).await;
+            }
+        }
+        Ok(())
     }
 
     async fn compile_steps(
@@ -389,6 +420,50 @@ impl Reconstruction {
         }
         Ok(())
     }
+}
+
+/// The identity a declared routine signature names, as the capture names
+/// routines, with each argument type identified the way the session's
+/// deployer would identify it; `None` unless every one was.
+async fn signature(
+    conn: &mut pbps_db::transport::StreamConn,
+    routine: &pbps_model::RoutineId,
+) -> Option<ObjectIdentity> {
+    let literal = |value: &str| format!("'{}'", value.replace('\'', "''"));
+    let arguments = routine
+        .args
+        .iter()
+        .map(|arg| literal(arg.as_str()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let rows = conn
+        .query(&format!(
+            "SELECT COALESCE(pg_catalog.json_agg(pg_catalog.json_build_array(tn.nspname, t.typname) ORDER BY a.ord), '[]')::text AS args, \
+             pg_catalog.count(t.oid) = pg_catalog.count(*) AS complete \
+             FROM pg_catalog.unnest(ARRAY[{arguments}]::pg_catalog.text[]) WITH ORDINALITY AS a(arg, ord) \
+             LEFT JOIN pg_catalog.pg_type t ON t.oid = pg_catalog.to_regtype(a.arg) \
+             LEFT JOIN pg_catalog.pg_namespace tn ON tn.oid = t.typnamespace"
+        ))
+        .await
+        .ok()?;
+    let row = rows.first()?;
+    if row.try_get::<bool>("complete").ok().flatten() != Some(true) {
+        return None;
+    }
+    let args = row.try_get::<&str>("args").ok().flatten()?;
+    let args = serde_json::from_str::<Vec<[String; 2]>>(args).ok()?;
+    Some(ObjectIdentity {
+        class: "pg_proc".into(),
+        name: vec![routine.name.schema.clone(), routine.name.name.clone()],
+        signature: args
+            .into_iter()
+            .map(|type_name| ObjectIdentity {
+                class: "pg_type".into(),
+                name: type_name.into(),
+                signature: Vec::new(),
+            })
+            .collect(),
+    })
 }
 
 /// Every routine of one schema-qualified name, named as the capture names
