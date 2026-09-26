@@ -1088,6 +1088,39 @@ fn git_output_terminators_cannot_normalize_an_invalid_destination() {
     }
 }
 
+/// A local push destination's Git directory is held to compose's own checks
+/// before anything is sealed (#1074): a link to a directory under its
+/// `refs/heads` would carry the published ref wherever it points.
+#[test]
+fn a_local_destination_that_git_would_write_through_a_link_does_not_seal() {
+    let repo = Repository::new("destination-link", "");
+    repo.table(RENAMED);
+    let remote = repo.root.join("remote.git");
+    git(
+        &repo.root,
+        &["init", "-q", "--bare", remote.to_str().unwrap()],
+    );
+    git(
+        &repo.root,
+        &["push", "-q", remote.to_str().unwrap(), "master"],
+    );
+    git(
+        &repo.root,
+        &["remote", "set-url", "origin", remote.to_str().unwrap()],
+    );
+    // The clean destination seals.
+    assert!(repo.store().preview(request(), SystemTime::now()).is_ok());
+    let elsewhere = repo.root.join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, remote.join("refs/heads/pbps-compose")).unwrap();
+    let error = match repo.store().preview(request(), SystemTime::now()) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("sealed a destination Git would write through a link"),
+    };
+    assert!(error.contains("destination's Git directory"), "{error}");
+    assert!(error.contains("refs/heads/pbps-compose"), "{error}");
+}
+
 #[test]
 fn changed_configuration_and_secret_bearing_destinations_do_not_seal() {
     let repo = Repository::new("settings", "");

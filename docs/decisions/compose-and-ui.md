@@ -506,3 +506,19 @@ the WSL filesystem.
   a publication, so a refusal here must not tell recovery that nothing was
   published.
 
+<a id="dec-1074-1"></a>
+
+**DEC-1074.1. A local push destination's Git directory is held to
+DEC-1070.1's checks, at resolution and again before the push.** Compose
+writes objects and the output ref into a local (`file`) destination. A bare
+repository under `/mnt/c`, or one whose `refs` hold a link to a directory,
+would take them onto an unqualified filesystem, although compose's own
+repository passes. `destination::resolve` therefore runs the same checks,
+the filesystem type and the mount and link walk of `objects`, `refs`,
+`logs` and `reftable` (a destination may use either ref backend), on the
+destination's Git common directory before the candidate seals. `transport::run_push` runs them again just before pushing, since the
+destination can change in between. A remote reached over HTTP or SSH
+remains out of scope, as ADR-0017 states: its storage is the server's. The
+destination's working tree is not checked, because a push to a new branch
+does not write it.
+

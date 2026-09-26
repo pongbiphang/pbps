@@ -186,6 +186,15 @@ fn run_push(
     dry_run: bool,
 ) -> Result<()> {
     let (mut command, alias) = command(git, description)?;
+    // Checked at resolution, and again here: the destination can change
+    // between preview and push (#1074).
+    if let Some(identity) = description
+        .destination
+        .local_repository()
+        .and(description.destination.repository_identity())
+    {
+        super::durable::qualify_git_directory(&identity.common)?;
+    }
     if local_evidence(git, description, &description.output_ref)
         .is_some_and(|evidence| evidence != RefEvidence::Absent)
     {
