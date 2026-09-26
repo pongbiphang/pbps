@@ -14685,3 +14685,93 @@ async fn doctor_as_deployer(conn: &mut Conn) -> pbps_mssql::doctor::Held {
     conn.execute("REVERT;").await.unwrap();
     held
 }
+
+/// #898: two pipelines initializing the same empty database at once both
+/// succeed. Unserialized, the loser's `CREATE TABLE` failed with Msg 2714 on 37
+/// of 300 calls over 150 races, so twenty races miss the old failure with odds
+/// under one in a hundred.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn two_pipelines_initializing_the_ledger_at_once_both_succeed() {
+    for round in 0..20 {
+        let db = TestDb::create(&format!("ledger_race898_{round}")).await;
+        let target = format!("{};Database={}", conn_str(), db.name);
+        let mut a = connect_live(&target).await.unwrap();
+        let mut b = connect_live(&target).await.unwrap();
+        let (first, second) = tokio::join!(
+            pbps_mssql::state::ensure_tables(&mut a),
+            pbps_mssql::state::ensure_tables(&mut b)
+        );
+        let present = pbps_mssql::state::is_initialized(&mut a).await;
+        drop(a);
+        drop(b);
+        db.drop().await;
+        first.unwrap_or_else(|e| panic!("round {round}, first creator: {e}"));
+        second.unwrap_or_else(|e| panic!("round {round}, second creator: {e}"));
+        assert!(present.unwrap(), "round {round}: no ledger afterwards");
+    }
+}
+
+/// The lock that serializes the creates is taken inside a transaction the
+/// batch opens itself. When a create fails outside any caller's transaction,
+/// that transaction must not outlive the batch: a session left inside it
+/// would hold the lock and every later statement's locks until it closed.
+/// A view in the lock table's name makes the create fail deterministically.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_refused_ledger_create_leaves_no_transaction_open() {
+    let mut db = TestDb::create("ledger_refused898").await;
+    db.conn
+        .execute("CREATE VIEW dbo.__pbps_lock AS SELECT 1 AS id;")
+        .await
+        .unwrap();
+    let e = pbps_mssql::state::ensure_tables(&mut db.conn)
+        .await
+        .expect_err("a view is not the lock table");
+    assert_eq!(e.server_error_code().as_deref(), Some("2714"), "{e}");
+    let rows = db
+        .conn
+        .query("SELECT @@TRANCOUNT AS open_transactions, OBJECT_ID(N'dbo.__pbps_state', N'U') AS state_table;")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows[0].try_get::<i32>("open_transactions").unwrap(),
+        Some(0)
+    );
+    // The ledger created in the same batch went with the refusal: nothing
+    // half-initialized is left for the next command to read as a ledger.
+    assert_eq!(rows[0].try_get::<i32>("state_table").unwrap(), None);
+    db.drop().await;
+}
+
+/// `record` runs inside the apply's transaction, so the serialized create
+/// nests in it. Its `COMMIT` must not end the caller's transaction, and the
+/// caller's rollback must still take the ledger with it.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn the_ledger_created_inside_a_callers_transaction_follows_that_transaction() {
+    let mut db = TestDb::create("ledger_nested898").await;
+    db.conn
+        .execute("SET XACT_ABORT ON; BEGIN TRANSACTION;")
+        .await
+        .unwrap();
+    pbps_mssql::state::ensure_tables(&mut db.conn)
+        .await
+        .unwrap();
+    let rows = db
+        .conn
+        .query("SELECT @@TRANCOUNT AS open_transactions;")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows[0].try_get::<i32>("open_transactions").unwrap(),
+        Some(1)
+    );
+    db.conn.execute("ROLLBACK TRANSACTION;").await.unwrap();
+    assert!(
+        !pbps_mssql::state::is_initialized(&mut db.conn)
+            .await
+            .unwrap()
+    );
+    db.drop().await;
+}
