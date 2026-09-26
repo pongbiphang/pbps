@@ -433,3 +433,33 @@ now appears on the approved run rather than on the push that caused it, after
 review has qualified the head. That run is a single run on a head that is about
 to be queued, which is where a failure is cheapest to act on; the local checks
 remain the per-push gate.
+
+<a id="dec-958-1"></a>
+
+**DEC-958.1. The dedicated-server fixture starts SQL Server once more after a
+startup core dump, and only then.** Retrying a flaky fixture usually hides the
+failure it should expose. The shape here is narrow enough to tell apart. In
+every merge-group failure of the `resolver (mssql)` job read for #958, five of
+five, the target server core-dumped about two seconds after `docker start`.
+No test had connected by then, so no code under test could have caused it.
+The fixture also spent three minutes polling an engine that had already
+exited, and the 80-line log tail its reporter kept was all dump-collector
+noise.
+
+The retry needs every one of these conditions:
+- the engine is SQL Server;
+- the container has exited;
+- its log names a `core.sqlservr` dump.
+
+It happens once, and a second crash fails the run. An engine that is still
+running, an exit with no dump, and every PostgreSQL failure fail as before.
+Each crash is reported before the container is removed, so the retry leaves
+the first occurrence on record. The reporter keeps 300 lines, which is long
+enough to reach past the dump report to what the engine printed first.
+
+The cause is still unproven, as docs/PITFALLS.md records for the `live` job.
+This makes the crash cost one start instead of a queue ejection, and makes its
+next occurrence readable. It is not a fix for the crash itself.
+
+Pinned by `scripts/live_resolver_server_test.py`, which runs in the `quick`
+job.
