@@ -945,15 +945,15 @@ every schema of the deployer's effective path as the analysis scope measured it
 is looked up as a routine too, and a bound routine a one-argument call can
 reach (its declared count less defaults, or variadic) as a type, since `t(x)` is an exact call, else a cast to `t`, else the
 best-matching call, and a cast takes exactly one argument —
-plus every cast. Only a binding some name lookup selected counts: an
-operator's implementation, a result or transition type, a column reference's
-type, the operands' common type of a CASE, COALESCE, GREATEST/LEAST or array, a
-subscript's types, a CTE's or VALUES list's output types, a grouping's,
-DISTINCT's or set operation's inferred operators and a derived collation follow
-from other parts of the tree,
-which are compared themselves; a constant's or coercion's type can be a written
-name stored no differently, so it counts (#1062), which resolution consults with no name. A
-declaration the plan leaves unchanged has the same text on both sides and
+plus every cast, which resolution consults with no name. Only a binding some
+name lookup selected counts. Every type, operator, routine and relation field the node allowlist admits is classified by node and field:
+an operator's implementation, result and transition types, a column's, field's
+or placeholder's type, operands' common types, a query's output types, an SQL
+value function's fixed type, a grouping's inferred operators and a derived
+collation follow from other parts of the tree, which are compared themselves.
+A constant's or coercion's type, a written column definition and a named
+operator or routine can be a name in the source, stored no differently when
+they were not, so they count (#1062). A declaration the plan leaves unchanged has the same text on both sides and
 resolves the same names; only the selected objects can differ, and that is
 what the bindings carry. On the target each member must be an engine object
 scratch has with the same properties, role references removed because the

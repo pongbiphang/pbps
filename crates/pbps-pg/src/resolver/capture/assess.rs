@@ -421,40 +421,74 @@ fn properties_equal(left: &BTreeMap<String, Value>, right: &BTreeMap<String, Val
     strip(left) == strip(right)
 }
 
-/// Node fields whose object follows from other parts of the tree, never
-/// from looking a name up: an operator's implementation from the operator; a
-/// call's, operator's or aggregate's result and transition types from the
-/// routine; a column reference's type from the column; the common type of a
-/// CASE, COALESCE, GREATEST/LEAST or array from its operands; a subscript's
-/// container and element types from its input; a parameter's and a
-/// placeholder's type from the declaration they stand for; a CTE's output
-/// types from its query; a collation from its inputs. What decided each is compared in its own right, and a
-/// same-named object cannot displace these.
+/// Reference fields, by node and field, whose object follows from other
+/// parts of the tree rather than from looking a name up. Every type,
+/// operator, routine and relation reference the node allowlist admits
+/// (`node_fields.rs`) is classified here or left as a name lookup; the
+/// binding that decided each of these is compared in its own right, and a
+/// same-named object cannot displace them.
 ///
-/// Not here: a constant's type and a coercion's or row constructor's result,
-/// which can be a name written in the source (`'x'::t`, `ROW(..)::t`) and
-/// are stored the same way when they were not (#1062); nor a routine's or
-/// table function's column types, which a column definition list names.
-const DETERMINED: &[&str] = &[
-    "opfuncid",
-    "funcresulttype",
-    "opresulttype",
-    "aggtype",
-    "wintype",
-    "aggtranstype",
-    "aggargtypes",
-    "vartype",
-    "casetype",
-    "coalescetype",
-    "minmaxtype",
-    "array_typeid",
-    "element_typeid",
-    "refcontainertype",
-    "refelemtype",
-    "refrestype",
-    "paramtype",
-    "typeId",
-    "ctecoltypes",
+/// Left as lookups, because each can be a name written in the source and is
+/// stored no differently when it was not (#1062): a constant's type
+/// (`'x'::t`), a coercion's, domain coercion's, row conversion's or row
+/// constructor's result (`::t`, `ROW(..)::t`), a RETURNING or XMLSERIALIZE
+/// type, a table function's or routine's column definition list, an
+/// operator, routine, aggregate or window function, an ON CONFLICT
+/// operator class, a TABLESAMPLE method and a relation read by name.
+const DETERMINED: &[(&str, &str)] = &[
+    // An operator's implementation, and its hashed or negated form.
+    ("OPEXPR", "opfuncid"),
+    ("DISTINCTEXPR", "opfuncid"),
+    ("NULLIFEXPR", "opfuncid"),
+    ("SCALARARRAYOPEXPR", "opfuncid"),
+    ("SCALARARRAYOPEXPR", "hashfuncid"),
+    ("SCALARARRAYOPEXPR", "negfuncid"),
+    ("ROWCOMPAREEXPR", "opfamilies"),
+    // Result and transition types of a call, operator or aggregate.
+    ("FUNCEXPR", "funcresulttype"),
+    ("OPEXPR", "opresulttype"),
+    ("DISTINCTEXPR", "opresulttype"),
+    ("NULLIFEXPR", "opresulttype"),
+    ("AGGREF", "aggtype"),
+    ("AGGREF", "aggtranstype"),
+    ("AGGREF", "aggargtypes"),
+    ("WINDOWFUNC", "wintype"),
+    ("MERGESUPPORTFUNC", "msftype"),
+    // A column's, field's or placeholder's type.
+    ("VAR", "vartype"),
+    ("FIELDSELECT", "resulttype"),
+    ("FIELDSTORE", "resulttype"),
+    ("PARAM", "paramtype"),
+    ("CASETESTEXPR", "typeId"),
+    ("COERCETODOMAINVALUE", "typeId"),
+    ("SETTODEFAULT", "typeId"),
+    // Common types of the operands.
+    ("CASEEXPR", "casetype"),
+    ("COALESCEEXPR", "coalescetype"),
+    ("MINMAXEXPR", "minmaxtype"),
+    ("ARRAYEXPR", "array_typeid"),
+    ("ARRAYEXPR", "element_typeid"),
+    ("SUBSCRIPTINGREF", "refcontainertype"),
+    ("SUBSCRIPTINGREF", "refelemtype"),
+    ("SUBSCRIPTINGREF", "refrestype"),
+    // Output types of a query: a CTE, a VALUES list or tuplestore range,
+    // a set operation, a CYCLE mark.
+    ("COMMONTABLEEXPR", "ctecoltypes"),
+    ("RANGETBLENTRY", "coltypes"),
+    ("SETOPERATIONSTMT", "colTypes"),
+    ("CTECYCLECLAUSE", "cycle_mark_type"),
+    ("CTECYCLECLAUSE", "cycle_mark_neop"),
+    // An SQL value function's fixed type, such as CURRENT_DATE's.
+    ("SQLVALUEFUNCTION", "type"),
+    // An identity column's sequence and type, a target's origin column,
+    // a RANGE frame's offset functions.
+    ("NEXTVALUEEXPR", "seqid"),
+    ("NEXTVALUEEXPR", "typeId"),
+    ("TARGETENTRY", "resorigtbl"),
+    ("WINDOWCLAUSE", "startInRangeFunc"),
+    ("WINDOWCLAUSE", "endInRangeFunc"),
+    // A grouping's, DISTINCT's or set operation's equality operator.
+    ("SORTGROUPCLAUSE", "eqop"),
 ];
 
 /// Whether a binding's object was selected by name resolution, so that a
@@ -469,22 +503,17 @@ fn resolved_by_name(binding: &super::bindings::Binding) -> bool {
     let Some(field) = named.next() else {
         return true;
     };
-    // A range-table entry's column types are its VALUES', CTE's or
-    // tuplestore's output, inferred; a table function's written column
-    // types sit under its own `tablefunc` node instead.
-    let range_columns = field == "coltypes"
-        && named
-            .clone()
-            .next()
-            .is_some_and(|parent| parent == "rtable");
-    // A grouping, DISTINCT or set operation's equality and ordering
-    // operators come from the type's default operator class; no syntax names
-    // them. An ORDER BY's, a window's included, can name its ordering
-    // operator (`USING <`), stored no differently from an inferred one.
-    let ordered = named.any(|step| step == "sortClause" || step == "orderClause");
-    let inferred_operator = field == "eqop" || field == "sortop" && !ordered;
+    // An ordering operator comes from the type's default operator class,
+    // except under an ORDER BY, a window's included, where `USING <` can
+    // name it and it is stored no differently.
+    if binding.node == "SORTGROUPCLAUSE" && field == "sortop" {
+        return named.any(|step| step == "sortClause" || step == "orderClause");
+    }
     let collation = field.ends_with("collid") || field == "collation";
-    !range_columns && !inferred_operator && !collation && !DETERMINED.contains(&field.as_str())
+    !collation
+        && !DETERMINED
+            .iter()
+            .any(|(node, determined)| *node == binding.node && determined == field)
 }
 
 /// Whether a call with exactly one argument can reach `routine`: its
@@ -669,6 +698,7 @@ mod tests {
             vec![id("pg_class", &["app", "v"], Vec::new())],
         );
         let bound = |target| Binding {
+            node: "FUNCEXPR".into(),
             path: Vec::new(),
             target,
         };
@@ -747,29 +777,54 @@ mod tests {
             properties: BTreeMap::new(),
             bindings: [
                 (
+                    "OPEXPR",
                     "opfuncid",
                     id("pg_proc", &["pg_catalog", "int4pl"], Vec::new()),
                 ),
                 (
+                    "VAR",
                     "vartype",
                     id("pg_type", &["pg_catalog", "text"], Vec::new()),
                 ),
                 (
+                    "COALESCEEXPR",
                     "coalescetype",
                     id("pg_type", &["pg_catalog", "text"], Vec::new()),
                 ),
                 (
+                    "SQLVALUEFUNCTION",
+                    "type",
+                    id("pg_type", &["pg_catalog", "date"], Vec::new()),
+                ),
+                (
+                    "OPEXPR",
                     "inputcollid",
                     id("pg_collation", &["pg_catalog", "default"], Vec::new()),
                 ),
             ]
             .into_iter()
-            .map(|(field, target)| Binding {
+            .map(|(node, field, target)| Binding {
+                node: node.into(),
                 path: vec!["ev_action".into(), "0".into(), field.into(), "0".into()],
                 target,
             })
             .collect(),
         };
+        // The same field name elsewhere is a written name: XMLSERIALIZE's
+        // `AS t` is stored in a `type` field too.
+        let written = Input {
+            properties: BTreeMap::new(),
+            bindings: vec![Binding {
+                node: "XMLEXPR".into(),
+                path: vec!["ev_action".into(), "type".into()],
+                target: id("pg_type", &["pg_catalog", "date"], Vec::new()),
+            }],
+        };
+        assert!(
+            derived(&view, &written, &paths, &BTreeMap::new())
+                .iter()
+                .any(|set| set.class == CandidateClass::Type)
+        );
         assert_eq!(
             derived(&view, &determined, &paths, &BTreeMap::new()),
             BTreeSet::from([set(CandidateClass::Cast, None, None)])

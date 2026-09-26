@@ -9,6 +9,9 @@ use pbps_db::resolver::capture::ObjectIdentity;
 // These are private capture inputs, not an ordinary diagnostic or wire type.
 #[derive(Clone, PartialEq, Eq, serde::Serialize)]
 pub(super) struct Binding {
+    /// The tag of the node that holds the reference: which field a path's
+    /// last step names depends on the node it belongs to.
+    pub node: String,
     pub path: Vec<String>,
     pub target: ObjectIdentity,
 }
@@ -65,6 +68,7 @@ pub(super) fn extract(
             ReferenceClass::OperatorFamily => "pg_opfamily",
         };
         bindings.push(Binding {
+            node: reference.node,
             path: reference.path,
             target: catalog.object(class, reference.oid)?,
         });
@@ -108,13 +112,21 @@ fn subobjects<'a>(
                     let target = variable(catalog, node, relation, frames)?;
                     let mut path = path.clone();
                     path.push("column".into());
-                    bindings.push(Binding { path, target });
+                    bindings.push(Binding {
+                        node: node.tag.clone(),
+                        path,
+                        target,
+                    });
                 }
                 "FIELDSTORE" => {
                     for (index, target) in assigned_fields(catalog, node)?.into_iter().enumerate() {
                         let mut path = path.clone();
                         path.extend(["assigned_field".into(), index.to_string()]);
-                        bindings.push(Binding { path, target });
+                        bindings.push(Binding {
+                            node: node.tag.clone(),
+                            path,
+                            target,
+                        });
                     }
                 }
                 "FIELDSELECT" => {
@@ -128,7 +140,11 @@ fn subobjects<'a>(
                     let target = catalog.column(relation, signed(node, "fieldnum")?)?;
                     let mut path = path.clone();
                     path.push("field".into());
-                    bindings.push(Binding { path, target });
+                    bindings.push(Binding {
+                        node: node.tag.clone(),
+                        path,
+                        target,
+                    });
                 }
                 "TARGETENTRY" => {
                     let relation = node.number("resorigtbl")?;
@@ -137,6 +153,7 @@ fn subobjects<'a>(
                         let mut path = path.clone();
                         path.push("origin_column".into());
                         bindings.push(Binding {
+                            node: node.tag.clone(),
                             path,
                             target: catalog.column(relation, column)?,
                         });

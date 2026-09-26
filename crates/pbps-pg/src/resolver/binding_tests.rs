@@ -1578,3 +1578,35 @@ async fn a_set_operations_inferred_operators_are_no_named_candidates() {
         );
     }
 }
+
+/// An SQL value function's type is fixed: CURRENT_DATE is a date whatever
+/// else is named `date`, so a same-named unmanaged type is no candidate.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn an_sql_value_functions_type_is_no_named_candidate() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let declared = || Declared::default().view("app.v", "SELECT CURRENT_DATE AS d");
+        let assessment = analyze(
+            &server,
+            "sql_value",
+            Case {
+                schemas: &["app"],
+                extras: &[],
+                target: "
+                    SET search_path = app;
+                    CREATE VIEW app.v AS SELECT CURRENT_DATE AS d;
+                    CREATE TYPE app.date AS ENUM ('x');",
+                base: declared(),
+                desired: declared(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            only(&assessment, "app", "v"),
+            Verdict::Unaffected,
+            "{variable}"
+        );
+    }
+}
