@@ -1703,6 +1703,68 @@ fn a_view_kept_on_a_function_dropped_for_good_refuses_the_plan_by_name() {
     succeeds(d.run(&["verify", "--db", connection]));
 }
 
+/// A sequence or an index already at the name of a table this plan creates
+/// refuses the plan by name, and no plan is written (#951). Both share
+/// PostgreSQL's relation namespace with tables, and neither is in the catalog
+/// inventory the other occupied-name checks read, so the `CREATE TABLE` used
+/// to reach apply and fail there. Control: the same table at a free name.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_sequence_or_index_at_a_new_tables_name_refuses_the_plan() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "relation-namespace-occupant");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; \
+         CREATE SEQUENCE app.s",
+    );
+    // Each case from a fresh project, so one case's ids file names nothing
+    // the next one has to decide about.
+    let adopted = |case: &str| {
+        let d = Demo::new(&format!("relation-namespace-occupant-{case}"));
+        succeeds(d.run(&["pull", "--db", connection]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+        d
+    };
+    let declare = |d: &Demo, name: &str| {
+        std::fs::write(
+            d.dir.join(format!("schema/app.{name}.yml")),
+            format!("table: app.{name}\ncolumns:\n  id: {{type: integer}}\n"),
+        )
+        .unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        d.dir.join("plan.json")
+    };
+    for (name, kind) in [
+        ("s", "sequence `app.s`"),
+        ("i", "index `app.i` on `app.other`"),
+    ] {
+        let d = adopted(name);
+        if name == "i" {
+            // Created after adoption: a table this project does not record,
+            // with an index at the name the declaration takes.
+            on_server(
+                connection,
+                "CREATE TABLE app.other (id integer); CREATE INDEX i ON app.other (id)",
+            );
+        }
+        let plan = declare(&d, name);
+        let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+        assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+        let err = stderr(&o);
+        assert!(err.contains(&format!("already has {kind}")), "{err}");
+        assert!(!plan.exists(), "a refused plan wrote {}", plan.display());
+    }
+
+    let d = adopted("free");
+    let plan = declare(&d, "free");
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(&d, connection, &plan, &[]));
+}
+
 /// A check, a filtered index and a default the same revision adds, each calling
 /// a function that revision rebuilds, are created after the rebuild (#942,
 /// DEC-942.1). `modules::dependents` reads the catalog, where none of them

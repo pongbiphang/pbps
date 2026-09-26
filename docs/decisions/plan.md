@@ -403,6 +403,15 @@ removing the declaration or moving the object. A `CREATE OR REPLACE` would
 have been the shortest path, and it is exactly the silent replacement of an
 object nobody reviewed that ADR-0002 rules out.
 
+A sequence, an index, a partitioned index or a standalone composite type
+shares the same relation namespace and is in none of those inventories (#951).
+So the names the plan creates as tables and views are also asked of
+`pg_class` directly, in the read-only planning transaction, and an occupant is
+refused with its kind and, for an index or an owned sequence, its table. This
+is a query scoped to the plan's own new names, not a wider inventory. Here the
+plan can clear a name first: an index it drops, or an index or owned sequence
+that goes with a table it drops, is not an occupant.
+
 A name taken after the plan was saved is left to the apply. The `CREATE` fails
 inside the transaction and the ledger records nothing, which is the outcome a
 recheck could only have reported earlier. SQL Server is unchanged: its module

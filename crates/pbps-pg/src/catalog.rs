@@ -2299,6 +2299,94 @@ pub async fn schema_spellings(
     Ok(out)
 }
 
+/// A relation-namespace entry the catalog inventory does not report, at a
+/// name a plan creates (#951): a sequence, an index, a partitioned index or a
+/// standalone composite type. Each shares this engine's one namespace per
+/// schema with tables and views, so `CREATE TABLE` or `CREATE VIEW` at its
+/// name is refused. The inventory reads tables, views and the relations it
+/// cannot represent, never these, so they are asked about here, by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameOccupant {
+    pub name: TableName,
+    /// `sequence`, `index`, `partitioned index` or `composite type`.
+    pub kind: &'static str,
+    /// The table an index is on, or the table whose column owns a sequence.
+    pub owner: Option<TableName>,
+}
+
+/// The [`NameOccupant`]s at `names`, read in the caller's transaction.
+pub async fn relation_name_occupants(
+    conn: &mut Conn,
+    names: &[TableName],
+) -> Result<Vec<NameOccupant>, DbError> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let params: Vec<Param<'_>> = names
+        .iter()
+        .flat_map(|n| [Param::Str(n.schema.as_str()), Param::Str(n.name.as_str())])
+        .collect();
+    let values: Vec<String> = (0..names.len())
+        .map(|i| format!("(${}::text, ${}::text)", 2 * i + 1, 2 * i + 2))
+        .collect();
+    let sql = format!(
+        "WITH wanted(schema_name, relation_name) AS (VALUES {})\n\
+         SELECT n.nspname AS schema_name, c.relname AS relation_name,\n       \
+                c.relkind::text AS relkind,\n       \
+                ownns.nspname AS owner_schema, own.relname AS owner_name\n  \
+           FROM wanted w\n  \
+           JOIN pg_catalog.pg_namespace n ON n.nspname = w.schema_name\n  \
+           JOIN pg_catalog.pg_class c\n    \
+             ON c.relnamespace = n.oid AND c.relname = w.relation_name\n  \
+           LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid\n  \
+           LEFT JOIN pg_catalog.pg_depend d\n    \
+             ON c.relkind = 'S'\n   \
+            AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass\n   \
+            AND d.objid = c.oid\n   \
+            AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass\n   \
+            AND d.deptype IN ('a', 'i')\n  \
+           LEFT JOIN pg_catalog.pg_class own\n    \
+             ON own.oid = COALESCE(i.indrelid, d.refobjid)\n  \
+           LEFT JOIN pg_catalog.pg_namespace ownns ON ownns.oid = own.relnamespace\n \
+          WHERE c.relkind IN ('S', 'i', 'I', 'c')",
+        values.join(", ")
+    );
+    let mut out = Vec::new();
+    for row in &conn.query_with(&sql, &params).await? {
+        let text = |column: &str| -> Result<String, DbError> {
+            row.try_get::<&str>(column)?
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    DbError::BadRow(format!("the name-occupant query returned a NULL {column}"))
+                })
+        };
+        let kind = match text("relkind")?.as_str() {
+            "S" => "sequence",
+            "i" => "index",
+            "I" => "partitioned index",
+            "c" => "composite type",
+            other => {
+                return Err(DbError::BadRow(format!(
+                    "the name-occupant query returned relkind `{other}`"
+                )));
+            }
+        };
+        let owner = match (
+            row.try_get::<&str>("owner_schema")?,
+            row.try_get::<&str>("owner_name")?,
+        ) {
+            (Some(schema), Some(name)) => Some(TableName::new(schema, name)),
+            _ => None,
+        };
+        out.push(NameOccupant {
+            name: TableName::new(text("schema_name")?, text("relation_name")?),
+            kind,
+            owner,
+        });
+    }
+    Ok(out)
+}
+
 /// What the catalog calls each declared table's key column collation *now*.
 ///
 /// The one input to the spelling checks that is read from the database rather

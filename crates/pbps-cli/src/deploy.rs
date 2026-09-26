@@ -288,6 +288,96 @@ fn refuse_occupied_names(
     );
 }
 
+/// The relation names this plan creates: its tables and the views it creates
+/// that it does not also drop. A view dropped and created in one plan is a
+/// rebuild, and its name is already its own.
+// The complement is every change that creates or frees no relation name.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn created_relation_names(cs: &pbps_model::ChangeSet) -> Vec<TableName> {
+    use pbps_model::Change;
+    let dropped: BTreeSet<&ModuleId> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::DropModule { id, .. } => Some(id),
+            _ => None,
+        })
+        .collect();
+    cs.changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::CreateTable { name, .. } => Some(name.clone()),
+            Change::CreateModule {
+                id: id @ ModuleId::Named(name),
+                module,
+            } if module.kind == pbps_model::ModuleKind::View && !dropped.contains(id) => {
+                Some(name.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Refuses a name this plan creates that a sequence, an index or a composite
+/// type already holds (#951), the relation-namespace entries the catalog
+/// inventory behind [`refuse_occupied_names`] does not report. One this plan
+/// frees first is not an occupant: an index it drops, and an index or owned
+/// sequence of a table it drops, which goes with its table.
+// The complement is every change that creates or frees no relation name.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn refuse_uninventoried_occupants(
+    cs: &pbps_model::ChangeSet,
+    occupants: &[pbps_pg::catalog::NameOccupant],
+    label: &str,
+) -> anyhow::Result<()> {
+    use pbps_model::Change;
+    let freed: BTreeSet<TableName> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::DropIndex { table, name } => {
+                Some(TableName::new(table.schema.clone(), name.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    let dropped_tables: BTreeSet<&TableName> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::DropTable { name, .. } => Some(name),
+            _ => None,
+        })
+        .collect();
+    let taken: Vec<String> = created_relation_names(cs)
+        .iter()
+        .flat_map(|name| {
+            occupants
+                .iter()
+                .filter(move |o| &o.name == name)
+                .filter(|o| !freed.contains(&o.name))
+                .filter(|o| !o.owner.as_ref().is_some_and(|t| dropped_tables.contains(t)))
+                .map(move |o| match &o.owner {
+                    Some(owner) => format!(
+                        "`{name}`: the database already has {} `{name}` on `{owner}`",
+                        o.kind
+                    ),
+                    None => format!("`{name}`: the database already has {} `{name}`", o.kind),
+                })
+        })
+        .collect();
+    if taken.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "`{label}` already uses {} name(s) this plan would create, for objects that share \
+         PostgreSQL's relation namespace with tables and views:\n  {}\nEach `CREATE` would be \
+         refused at apply. Rename the declaration, or drop or rename the object in the database.",
+        taken.len(),
+        taken.join("\n  ")
+    );
+}
+
 /// Refuses to use a catalog projection that omitted facts inside the managed
 /// set. Both recording and connected planning need the same guard: a partial
 /// schema is neither an honest snapshot nor a safe baseline for an artifact.
@@ -3926,6 +4016,17 @@ pub fn cmd_plan_db(
         crate::engine::require_transactional_rebuilds(conn.driver(), &cs, staged)?;
         conn.begin(dialect.transaction_framing()).await?;
         let checks = async {
+            // In the read-only planning transaction, with everything below:
+            // the names this plan creates, asked of the whole relation
+            // namespace, not only of what the inventory reports (#951).
+            if conn.driver() == pbps_db::Driver::Postgres {
+                let occupants = pbps_pg::catalog::relation_name_occupants(
+                    &mut conn,
+                    &created_relation_names(&cs),
+                )
+                .await?;
+                refuse_uninventoried_occupants(&cs, &occupants, &target.label)?;
+            }
             let rename_evidence = crate::engine::external_role_renames(
                 &mut conn,
                 &recorded_snapshot.ids,
@@ -6224,6 +6325,96 @@ fn dropped_referrer_names(changes: &pbps_model::ChangeSet) -> BTreeSet<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// #951: a sequence, index or composite type at a name the plan creates
+    /// refuses it, with the kind and owning table named. One the plan frees
+    /// first does not: an index it drops, or an index or owned sequence of a
+    /// table it drops. A view the plan rebuilds already owns its name.
+    #[test]
+    fn an_uninventoried_occupant_refuses_unless_the_plan_frees_it() {
+        use pbps_model::{Change, ChangeSet, Module, ModuleKind, PlannedChange};
+        use pbps_pg::catalog::NameOccupant;
+        let x = TableName::new("app", "x");
+        let owner = TableName::new("app", "old");
+        let create_table = || {
+            PlannedChange::new(Change::CreateTable {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "app.x", 0),
+                name: x.clone(),
+                table: Box::default(),
+            })
+        };
+        let view = || Module {
+            kind: ModuleKind::View,
+            description: None,
+            definition: "SELECT 1".into(),
+        };
+        let occupant = |kind, owner: Option<&TableName>| NameOccupant {
+            name: x.clone(),
+            kind,
+            owner: owner.cloned(),
+        };
+        let plan = |changes: Vec<PlannedChange>| ChangeSet { changes };
+
+        let e = refuse_uninventoried_occupants(
+            &plan(vec![create_table()]),
+            &[occupant("sequence", None)],
+            "prod",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("already has sequence `app.x`"), "{e}");
+        let e = refuse_uninventoried_occupants(
+            &plan(vec![create_table()]),
+            &[occupant("index", Some(&owner))],
+            "prod",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("already has index `app.x` on `app.old`"), "{e}");
+        // A new view's name is asked too.
+        let new_view = PlannedChange::new(Change::CreateModule {
+            id: ModuleId::Named(x.clone()),
+            module: Box::new(view()),
+        });
+        assert!(
+            refuse_uninventoried_occupants(
+                &plan(vec![new_view.clone()]),
+                &[occupant("composite type", None)],
+                "prod"
+            )
+            .is_err()
+        );
+
+        // Freed by the plan itself.
+        let drop_index = PlannedChange::new(Change::DropIndex {
+            table: owner.clone(),
+            name: "x".into(),
+        });
+        refuse_uninventoried_occupants(
+            &plan(vec![drop_index, create_table()]),
+            &[occupant("index", Some(&owner))],
+            "prod",
+        )
+        .expect("an index the plan drops first");
+        let drop_table = PlannedChange::new(Change::DropTable {
+            uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "app.old", 0),
+            name: owner.clone(),
+        });
+        for kind in ["index", "sequence"] {
+            refuse_uninventoried_occupants(
+                &plan(vec![drop_table.clone(), create_table()]),
+                &[occupant(kind, Some(&owner))],
+                "prod",
+            )
+            .expect("it goes with the table the plan drops");
+        }
+        // A view dropped and created is a rebuild: its name is its own.
+        let drop_view = PlannedChange::new(Change::DropModule {
+            id: ModuleId::Named(x.clone()),
+            kind: ModuleKind::View,
+        });
+        assert!(created_relation_names(&plan(vec![drop_view, new_view])).is_empty());
+    }
 
     /// The name checks behind DEC-316.1, one occupant at a time. A relation
     /// occupies a new table's or view's name; an unreadable routine of the
