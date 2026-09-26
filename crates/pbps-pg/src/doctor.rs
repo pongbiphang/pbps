@@ -604,12 +604,30 @@ pub async fn permissions(
     let mut held = Held::default();
     // Without project identities there is nothing to resolve. When they are
     // present, an unreadable recorded mapping must not become a new-table ACL.
-    let recorded_ids = if project_ids.tables.is_empty() && project_ids.columns.is_empty() {
-        pbps_model::IdsFile::default()
+    // Tombstones count as identities here: when the project's last table is
+    // dropped, only its tombstone is left, and the recorded table is the next
+    // plan's `DROP TABLE` (review of #1104).
+    // The recorded tables are kept beside the ids: a staged checkpoint keeps
+    // the ids of a table its committed `DROP TABLE` already removed, and only
+    // its schema says the table is gone on purpose.
+    let (recorded_ids, recorded_tables) = if project_ids.tables.is_empty()
+        && project_ids.columns.is_empty()
+        && project_ids.tombstones.is_empty()
+    {
+        (pbps_model::IdsFile::default(), BTreeSet::new())
     } else {
         match crate::state::latest(conn).await {
-            Ok(recorded) => recorded.map(|state| state.snapshot.ids).unwrap_or_default(),
-            Err(pbps_db::ledger::LedgerError::NotInitialized) => pbps_model::IdsFile::default(),
+            Ok(recorded) => recorded.map_or_else(
+                || (pbps_model::IdsFile::default(), BTreeSet::new()),
+                |state| {
+                    let tables: BTreeSet<ObjectName> =
+                        state.snapshot.schema.tables.keys().cloned().collect();
+                    (state.snapshot.ids, tables)
+                },
+            ),
+            Err(pbps_db::ledger::LedgerError::NotInitialized) => {
+                (pbps_model::IdsFile::default(), BTreeSet::new())
+            }
             Err(pbps_db::ledger::LedgerError::Db(error)) => {
                 return Err(error.context("cannot read recorded identities for doctor"));
             }
@@ -671,6 +689,17 @@ pub async fn permissions(
         .iter()
         .filter_map(|name| identities.table(name).name().cloned())
         .collect();
+    // The tables the environment records, under their physical names. One of
+    // these that is not there is not a table a deployment will create: the
+    // next plan renames, alters or grants on it and fails (#570).
+    let recorded: BTreeSet<ObjectName> = ask
+        .managed_tables
+        .iter()
+        .filter_map(|name| match identities.table(name) {
+            identity::Table::Recorded(current) => Some(current),
+            identity::Table::Future | identity::Table::Unrecorded(_) => None,
+        })
+        .collect();
     tables.extend(ledger.iter().cloned());
     for (object, present, rights) in read_tables(conn, &tables, &MANAGED_KINDS).await? {
         let is_ledger = ledger.contains(&object);
@@ -685,9 +714,52 @@ pub async fn permissions(
             // table: `ensure_tables` creates it, and what that needs is
             // `Needed::LedgerCreation` on the schema.
             (false, true) => {}
+            (false, false) if recorded.contains(&object) => {
+                held.declaration_gaps.push(Gap {
+                    permission: OWNERSHIP,
+                    why: "the recorded table is absent; its ownership cannot be established"
+                        .to_owned(),
+                    securable: Securable::Object(object),
+                });
+            }
             (false, false) => {
                 held.absent_tables.insert(object);
             }
+        }
+    }
+
+    // A table the environment records and the declarations no longer name is
+    // the next plan's `DROP TABLE`, which fails on a relation that is already
+    // gone. Only its presence is asked: the table was not part of the managed
+    // rights above, and this does not add it to them (review of #1104).
+    // A table the data demand names is still declared, and the data path
+    // reports its absence itself.
+    let declared_data: BTreeSet<ObjectName> = ask
+        .data
+        .keys()
+        .filter_map(|name| identities.table(name).name().cloned())
+        .collect();
+    let dropping: Vec<ObjectName> = recorded_ids
+        .tables
+        .values()
+        .filter(|name| {
+            !tables.contains(name)
+                && !ledger.contains(name)
+                && !declared_data.contains(name)
+                // Still in the recorded schema, so its drop has not run. A
+                // staged checkpoint after a committed `DROP TABLE` keeps the
+                // ids but not the table (review of #1104).
+                && recorded_tables.contains(*name)
+        })
+        .cloned()
+        .collect();
+    for (object, present, _) in read_tables(conn, &dropping, &MANAGED_KINDS).await? {
+        if !present {
+            held.declaration_gaps.push(Gap {
+                permission: OWNERSHIP,
+                why: "the recorded table is absent; its ownership cannot be established".to_owned(),
+                securable: Securable::Object(object),
+            });
         }
     }
 

@@ -27669,6 +27669,23 @@ async fn doctor_execute_change(
     Ok(())
 }
 
+/// A recorded state whose schema holds `tables`, beside `ids`: what a closed
+/// deployment leaves, where every recorded table is also in the schema.
+async fn doctor_record_state(conn: &mut Conn, ids: &IdsFile, tables: &[&str]) {
+    let mut schema = Schema::default();
+    for table in tables {
+        schema
+            .tables
+            .insert(table.parse().unwrap(), pbps_model::Table::default());
+    }
+    state::record(
+        conn,
+        &StateSnapshot::new(StateKind::Baseline, schema, ids.clone(), "doctor-live"),
+    )
+    .await
+    .unwrap();
+}
+
 async fn doctor_record_ids(conn: &mut Conn, ids: &IdsFile) {
     state::record(
         conn,
@@ -28258,6 +28275,173 @@ async fn server_version_num(conn: &mut Conn) -> i64 {
         .try_get::<i64>("v")
         .unwrap()
         .unwrap()
+}
+
+/// #570: a managed table the environment records is one the next plan acts
+/// on under its recorded name. When it is gone, that plan fails, so doctor
+/// reports that its ownership cannot be established. It does not read it as a
+/// table a deployment will create. A recorded table that is there and owned is
+/// fine, and a genuinely new table that is absent is still exempt.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn doctor_reports_an_absent_recorded_managed_table() {
+    let mut db = TestDb::create("doctor_abs570").await;
+    let (role, mut theirs) = grant_deployer(&mut db, "abs570").await;
+    theirs
+        .execute("CREATE TABLE public.kept(id integer); CREATE TABLE public.lingering(id integer)")
+        .await
+        .unwrap();
+    let (moving, kept, fresh) = (
+        pbps_model::Uid::generate(pbps_model::UidKind::Table),
+        pbps_model::Uid::generate(pbps_model::UidKind::Table),
+        pbps_model::Uid::generate(pbps_model::UidKind::Table),
+    );
+    let mut recorded = IdsFile::default();
+    // `t` is recorded and pending a rename to `moved`, and has been dropped.
+    recorded
+        .tables
+        .insert(moving.clone(), "public.t".parse().unwrap());
+    recorded
+        .tables
+        .insert(kept.clone(), "public.kept".parse().unwrap());
+    // Two recorded tables the declarations dropped: one already gone, one
+    // still there. Only the gone one is a gap.
+    recorded.tables.insert(
+        pbps_model::Uid::generate(pbps_model::UidKind::Table),
+        "public.dropped".parse().unwrap(),
+    );
+    recorded.tables.insert(
+        pbps_model::Uid::generate(pbps_model::UidKind::Table),
+        "public.lingering".parse().unwrap(),
+    );
+    // `staged` is recorded in the ids only: a staged checkpoint after its
+    // committed `DROP TABLE`, whose absence is the plan's own doing.
+    recorded.tables.insert(
+        pbps_model::Uid::generate(pbps_model::UidKind::Table),
+        "public.staged".parse().unwrap(),
+    );
+    doctor_record_state(
+        &mut theirs,
+        &recorded,
+        &[
+            "public.t",
+            "public.kept",
+            "public.dropped",
+            "public.lingering",
+        ],
+    )
+    .await;
+    let mut project = IdsFile::default();
+    project
+        .tables
+        .insert(kept.clone(), "public.kept".parse().unwrap());
+    project
+        .tables
+        .insert(moving, "public.moved".parse().unwrap());
+    project
+        .tables
+        .insert(fresh, "public.fresh".parse().unwrap());
+    let managed: Vec<ObjectName> = ["public.moved", "public.kept", "public.fresh"]
+        .iter()
+        .map(|n| n.parse().unwrap())
+        .collect();
+    let empty = pbps_db::doctor::GrantTargets::default();
+    let ask = doctor::Ask {
+        managed_schemas: &[],
+        managed_tables: &managed,
+        referenced: &[],
+        referenced_columns: &Default::default(),
+        declared_keys: &Default::default(),
+        granted: &empty,
+        data: &Default::default(),
+    };
+    let held = doctor::permissions(&mut theirs, &ask, &project)
+        .await
+        .unwrap();
+    drop(theirs);
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+    let absent: Vec<String> = held
+        .declaration_gaps
+        .iter()
+        .filter(|g| g.why.contains("the recorded table is absent"))
+        .map(|g| g.securable())
+        .collect();
+    assert_eq!(
+        absent,
+        [
+            "TABLE \"public\".\"t\"".to_owned(),
+            "TABLE \"public\".\"dropped\"".to_owned()
+        ],
+        "{:?}",
+        held.declaration_gaps
+    );
+    assert!(
+        held.absent_tables
+            .contains(&"public.fresh".parse().unwrap()),
+        "{:?}",
+        held.absent_tables
+    );
+    assert!(
+        !held.absent_tables.contains(&"public.t".parse().unwrap()),
+        "{:?}",
+        held.absent_tables
+    );
+}
+
+/// Review of #1104: when the project's last table is dropped, its ids file
+/// holds only that table's tombstone. The environment still records the table,
+/// and when it is already gone the next plan's `DROP TABLE` fails, so doctor
+/// has to read the recorded identities and report it.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn doctor_reports_an_absent_recorded_table_when_only_its_tombstone_remains() {
+    let mut db = TestDb::create("doctor_tomb570").await;
+    let (role, mut theirs) = grant_deployer(&mut db, "tomb570").await;
+    let uid = pbps_model::Uid::generate(pbps_model::UidKind::Table);
+    let mut recorded = IdsFile::default();
+    recorded
+        .tables
+        .insert(uid.clone(), "public.last".parse().unwrap());
+    doctor_record_state(&mut theirs, &recorded, &["public.last"]).await;
+    let mut project = IdsFile::default();
+    project.tombstones.insert(
+        uid,
+        pbps_model::ids::Tombstone {
+            was: "public.last".to_owned(),
+            dropped_at: "2026-09-26".to_owned(),
+            reason: "the last table goes".to_owned(),
+            operator: "doctor-live".to_owned(),
+        },
+    );
+    let empty = pbps_db::doctor::GrantTargets::default();
+    let ask = doctor::Ask {
+        managed_schemas: &[],
+        managed_tables: &[],
+        referenced: &[],
+        referenced_columns: &Default::default(),
+        declared_keys: &Default::default(),
+        granted: &empty,
+        data: &Default::default(),
+    };
+    let held = doctor::permissions(&mut theirs, &ask, &project)
+        .await
+        .unwrap();
+    drop(theirs);
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+    let absent: Vec<String> = held
+        .declaration_gaps
+        .iter()
+        .filter(|g| g.why.contains("the recorded table is absent"))
+        .map(|g| g.securable())
+        .collect();
+    assert_eq!(
+        absent,
+        ["TABLE \"public\".\"last\"".to_owned()],
+        "{:?}",
+        held.declaration_gaps
+    );
 }
 
 /// #396, #842: `prune` and `unlock` delete, and a DELETE fires a trigger and
