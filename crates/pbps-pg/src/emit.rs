@@ -286,7 +286,7 @@ fn skip_datum(rest: &str) -> Option<usize> {
     ] {
         if let Some(after) = rest.strip_prefix(opener) {
             return Some(match end_of_literal(after, escapes) {
-                Some(end) => opener.len() + end,
+                Some(end) => continued_end(rest, opener.len() + end, escapes).unwrap_or(rest.len()),
                 None => rest.len(),
             });
         }
@@ -554,6 +554,21 @@ pub(crate) fn end_of_block_comment(after: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// Where a string constant that ends at `end` in `text` really ends: past each
+/// piece continued after it across a line break, scanned with the first
+/// piece's escapes — measured, `E'a' ⏎ 'b\'c'` is the one constant `ab'c`
+/// (#539). `None` where a continuation never closes.
+fn continued_end(text: &str, mut end: usize, escapes: bool) -> Option<usize> {
+    loop {
+        let (after, continues) = after_the_gap(&text[end..]);
+        let Some(next) = after.strip_prefix('\'').filter(|_| continues) else {
+            return Some(end);
+        };
+        let start = text.len() - next.len();
+        end = start + end_of_literal(next, escapes)?;
+    }
 }
 
 /// The byte index just past the closing quote of the literal that starts at
@@ -3792,6 +3807,15 @@ mod tests {
             (
                 "app.f(integer)",
                 "(a int DEFAULT 3) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            // A default continued across a line break, whose `E` carries to
+            // the second piece: measured, the engine takes this and stores
+            // `'xy''z'::text`, so the escaped quote is not the list's end
+            // (#539).
+            (
+                "app.f(text, integer)",
+                "(a text DEFAULT E'x'\n'y\\'z', b integer DEFAULT 1) RETURNS int LANGUAGE sql \
+                 AS $$ SELECT 1 $$",
             ),
             // The modifier is discarded from every routine argument.
             (
