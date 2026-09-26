@@ -912,8 +912,8 @@ reference, and a module compiled before a same-named object it would have
 preferred binds the other one silently. That is detected from the captured
 bindings instead of prevented: a module that bound any name first made
 nameable later in the reconstruction, by an object that could have been
-resolved in its place, is unresolved: a later relation for a relation, a row
-type or a call a single argument can reach (its row type can take `t(x)`), a later routine for a routine
+resolved in its place, is unresolved: a later relation — with its row type and its
+`_name` array type — for a relation, a type or a call a single argument can reach (its row type can take `t(x)`), a later routine for a routine
 or a function-style cast, a later index for a relation only, and only one in
 the schema the binding named or on the declaration's path. The check is by name within those kinds, so it is
 conservative — a qualified reference it cannot tell from a bare one is

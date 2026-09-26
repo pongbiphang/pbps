@@ -134,7 +134,7 @@ impl Reconstruction {
                             name: name.clone(),
                             table: Box::new(bare),
                         },
-                        vec![(Nameable::Relation, name.schema.clone(), name.name.clone())],
+                        relation(&name.schema, &name.name),
                         None,
                     )?);
                     for (key, constraint) in keys {
@@ -203,16 +203,16 @@ impl Reconstruction {
                     let (phase, names, compiled) = if module.kind == ModuleKind::Trigger {
                         (Phase::Expressions, Vec::new(), None)
                     } else {
-                        let kind = if matches!(id, ModuleId::Routine(_)) {
-                            Nameable::Routine
+                        let names = if matches!(id, ModuleId::Routine(_)) {
+                            vec![(
+                                Nameable::Routine,
+                                id.schema().to_owned(),
+                                id.name().to_owned(),
+                            )]
                         } else {
-                            Nameable::Relation
+                            relation(id.schema(), id.name())
                         };
-                        (
-                            Phase::Modules,
-                            vec![(kind, id.schema().to_owned(), id.name().to_owned())],
-                            Some(id.clone()),
-                        )
+                        (Phase::Modules, names, Some(id.clone()))
                     };
                     steps.push(step(
                         dialect,
@@ -417,6 +417,16 @@ async fn routines(
             })
         })
         .collect()
+}
+
+/// What creating a table or view makes nameable: the relation with its row
+/// type, and the array type of that row type, which the engine names with a
+/// leading underscore.
+fn relation(schema: &str, name: &str) -> Vec<(Nameable, String, String)> {
+    vec![
+        (Nameable::Relation, schema.to_owned(), name.to_owned()),
+        (Nameable::Relation, schema.to_owned(), format!("_{name}")),
+    ]
 }
 
 fn step(

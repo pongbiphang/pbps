@@ -155,6 +155,7 @@ fn later_names_are_what_became_nameable_after_the_module() {
         reconstruction.later_names(&routine("int4")).unwrap(),
         [
             (Nameable::Relation, "app", "v"),
+            (Nameable::Relation, "app", "_v"),
             (Nameable::Index, "app", "ix")
         ]
         .into_iter()

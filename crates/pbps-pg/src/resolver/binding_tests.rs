@@ -1403,3 +1403,49 @@ async fn a_ctes_output_types_are_no_named_candidates() {
         );
     }
 }
+
+/// Creating a view also creates its row type's array type, `_x`. A view
+/// compiled before `app.x` that bound `_x` to `shared._x` would bind
+/// `app._x` once `app.x` exists, so its binding is not trusted.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_later_relations_array_type_is_a_later_name() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let declared = || {
+            let mut table = pbps_model::Table::default();
+            table.columns.insert(
+                "id".into(),
+                pbps_model::Column::new("integer".parse().unwrap()),
+            );
+            Declared::default()
+                .table("shared.x", table)
+                .view("app.a", "SELECT NULL::_x AS v")
+                .view("app.x", "SELECT 1 AS id")
+        };
+        let assessment = analyze(
+            &server,
+            "array",
+            Case {
+                schemas: &["app", "shared"],
+                extras: &["shared"],
+                target: "
+                    CREATE TABLE shared.x (id integer);
+                    SET search_path = app, shared;
+                    CREATE VIEW app.a AS SELECT NULL::_x AS v;
+                    CREATE VIEW app.x AS SELECT 1 AS id;",
+                base: declared(),
+                desired: declared(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                only(&assessment, "app", "a"),
+                Verdict::Unresolved { condition } if condition.contains("compiled before")
+            ),
+            "{variable}: {assessment:#?}"
+        );
+    }
+}
