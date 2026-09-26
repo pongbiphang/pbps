@@ -269,6 +269,17 @@ const NAMES_ONLY_SCRUB: &str = "letnames=std::env::vars_os().map(|(name,_)|name)
 /// String, raw-string and char literals are kept, so a `//` inside
 /// `"http://"` is not taken for a comment.
 fn normalized(source: &str) -> String {
+    normalize(source, true)
+}
+
+/// The same, with every literal's contents dropped (its quotes kept), for a
+/// check that must see only code: a message that merely mentions
+/// `macro_rules!` declares nothing.
+fn code_only(source: &str) -> String {
+    normalize(source, false)
+}
+
+fn normalize(source: &str, keep_literals: bool) -> String {
     let chars: Vec<char> = source.chars().collect();
     let mut out = String::new();
     let mut i = 0;
@@ -323,7 +334,7 @@ fn normalized(source: &str) -> String {
                         i += 1 + hashes;
                         break;
                     }
-                    if !c.is_whitespace() {
+                    if keep_literals && !c.is_whitespace() {
                         out.push(c);
                     }
                     i += 1;
@@ -337,17 +348,20 @@ fn normalized(source: &str) -> String {
                     i += 1;
                     if c == '\\' {
                         if let Some(escaped) = at(i) {
-                            out.push(c);
-                            out.push(escaped);
+                            if keep_literals {
+                                out.push(c);
+                                out.push(escaped);
+                            }
                             i += 1;
                         }
                         continue;
                     }
-                    if !c.is_whitespace() {
-                        out.push(c);
-                    }
                     if c == '"' {
+                        out.push(c);
                         break;
+                    }
+                    if keep_literals && !c.is_whitespace() {
+                        out.push(c);
                     }
                 }
             }
@@ -356,7 +370,11 @@ fn normalized(source: &str) -> String {
                 let end = (i + 2..chars.len())
                     .find(|&j| chars[j] == '\'' && chars[j - 1] != '\\')
                     .unwrap_or(chars.len() - 1);
-                out.extend(&chars[i..=end]);
+                if keep_literals {
+                    out.extend(&chars[i..=end]);
+                } else {
+                    out.push_str("''");
+                }
                 i = end + 1;
             }
             c if c.is_whitespace() => i += 1,
@@ -388,6 +406,14 @@ fn normalizing_drops_comments_and_whitespace_but_keeps_literals() {
     assert_eq!(normalized("let q = '\"'; env!(x)"), "letq='\"';env!(x)");
     assert_eq!(normalized("let e = '\\''; /* c */ x"), "lete='\\'';x");
     assert_eq!(normalized("fn f<'a>(x: &'a str) {}"), "fnf<'a>(x:&'astr){}");
+    // Code only: literal contents go, their quotes and all code stay.
+    assert_eq!(
+        code_only("const H: &str = \"macro_rules!\"; macro_rules! m {}"),
+        "constH:&str=\"\";macro_rules!m{}"
+    );
+    assert_eq!(code_only("r#\"a \" macro_rules!\"# x"), "\"\"x");
+    assert_eq!(code_only("let q = '\"'; y"), "letq='';y");
+    assert_eq!(code_only("fn f<'a>() {}"), "fnf<'a>(){}");
 }
 
 /// Every lint attribute in `source` that could silence the clippy rules in
@@ -676,7 +702,7 @@ fn the_ui_reads_no_environment_value() {
             suppressions.push((name.clone(), suppression));
         }
         let text = normalized(&source);
-        if text.contains("macro_rules!") {
+        if code_only(&source).contains("macro_rules!") {
             macros.push(name.clone());
         }
         let without = if name == "compose/git.rs" {

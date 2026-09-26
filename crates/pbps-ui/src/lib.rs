@@ -596,26 +596,51 @@ mod tests {
 
     #[test]
     fn the_ui_crate_has_no_workspace_dependency_and_embeds_no_remote_assets() {
-        // Parsed, so a dependency cannot hide in a spelling or a section
-        // the reader does not expect (#1065). Shipped dependencies are
-        // `[dependencies]` and every `[target.*.dependencies]`; the one
-        // dev-dependency never reaches the binary.
-        let manifest: toml::Table = include_str!("../Cargo.toml").parse().unwrap();
-        let mut shipped: Vec<&str> = Vec::new();
+        // Parsed, and each dependency resolved to the package it names, so a
+        // dependency cannot hide behind a spelling, a section or a rename
+        // (`serde = { package = "pbps-model", .. }`), including through the
+        // workspace table (#1065). Shipped dependencies are `[dependencies]`
+        // and every `[target.*.dependencies]`; the one dev-dependency never
+        // reaches the binary.
         fn names(table: Option<&toml::Value>) -> Vec<&str> {
             table
                 .and_then(toml::Value::as_table)
                 .map(|t| t.keys().map(String::as_str).collect())
                 .unwrap_or_default()
         }
-        shipped.extend(names(manifest.get("dependencies")));
+        let manifest: toml::Table = include_str!("../Cargo.toml").parse().unwrap();
+        let root: toml::Table = include_str!("../../../Cargo.toml").parse().unwrap();
+        let workspace = &root["workspace"]["dependencies"];
+        let mut sections = vec![manifest.get("dependencies")];
         for target in manifest
             .get("target")
             .and_then(toml::Value::as_table)
             .into_iter()
             .flat_map(|targets| targets.values())
         {
-            shipped.extend(names(target.get("dependencies")));
+            sections.push(target.get("dependencies"));
+        }
+        let mut shipped = Vec::new();
+        for section in sections.into_iter().flatten() {
+            for (name, spec) in section.as_table().unwrap() {
+                // `workspace = true` takes its source from the root table.
+                let spec = if spec.get("workspace") == Some(&toml::Value::Boolean(true)) {
+                    &workspace[name.as_str()]
+                } else {
+                    spec
+                };
+                for local in ["path", "git"] {
+                    assert!(
+                        spec.get(local).is_none(),
+                        "{name} comes from a {local} source"
+                    );
+                }
+                let package = spec
+                    .get("package")
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or(name);
+                shipped.push(package.to_owned());
+            }
         }
         shipped.sort_unstable();
         assert_eq!(
