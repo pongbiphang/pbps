@@ -450,3 +450,30 @@ A route list kept beside the router, with a test comparing the two, was the
 alternative. It is refused because the comparison is itself a list someone
 has to remember to update.
 
+<a id="dec-1070-1"></a>
+
+**DEC-1070.1. Compose refuses a checkout or Git directory on a 9p mount,
+decided from the open handle's filesystem type.** Windows users get compose
+by running the Linux build inside WSL (#1070). A checkout under `/mnt/c`,
+though, reaches NTFS through WSL2's drvfs, served over 9p. ADR-0017's
+guarantees rest on directory fsync, `flock`, rename over open files and
+stable inode identity, and none of these has been qualified through that
+layer. So compose refuses there, with the remedy of moving the checkout into
+the WSL filesystem.
+- **Decided by type, not path.** The check runs `fstatfs` on the handle
+  compose has already opened: the capture root in `files::Root::open`, and
+  the common directory in `durable::store`. A path prefix like `/mnt/` would
+  miss other mount points and misfire on a native Linux path with that name.
+  A handle cannot be swapped between the check and its use.
+- **Measured.** On WSL2 6.6, `/mnt/c` is `9p` with `aname=drvfs`, and
+  `statfs` reports `0x01021997`. With the check, opening `/mnt/c/Windows` as
+  a capture root is refused; without it, it opens.
+- **Only 9p is refused.** It is the one type measured to be the WSL route to
+  a Windows drive, and 9p is unqualified wherever it appears. Other
+  filesystems keep their existing checks. An allow list of qualified types
+  was the alternative. It was not taken, because nothing measured says
+  which of ext4, xfs, btrfs, overlayfs or tmpfs would be wrongly refused.
+- **The refusal is not definite.** A repository can move to a 9p mount after
+  a publication, so a refusal here must not tell recovery that nothing was
+  published.
+

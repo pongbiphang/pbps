@@ -3,13 +3,45 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Component, Path};
 
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, ResolveFlags, fstat, openat2, statat};
 use serde::Serialize;
 
 use super::{Error, Result, digest};
+
+/// `statfs` type of a 9p mount: how WSL2 serves a Windows drive (`/mnt/c`,
+/// `aname=drvfs`), measured on WSL2 6.6 (#1070).
+const V9FS_MAGIC: u64 = 0x0102_1997;
+
+/// Why compose's guarantees are not known to hold on a filesystem, or `None`.
+/// ADR-0017 rests on POSIX directory fsync, `flock`, rename over open files
+/// and stable inode identity; on a 9p mount these reach NTFS through a
+/// translation layer that has not been qualified. Everything else is left
+/// to the ordinary checks, as before.
+fn unqualified_filesystem(kind: u64) -> Option<&'static str> {
+    (kind == V9FS_MAGIC).then_some(
+        "is on a 9p mount, such as a Windows drive under WSL (/mnt/c), where compose's \
+         durability and locking guarantees are not qualified; move the checkout into the \
+         WSL filesystem (for example ~/project) and run pbps ui there",
+    )
+}
+
+/// Refuses a compose root or store whose filesystem is not qualified,
+/// decided from the handle already open, never from the path's spelling.
+pub(super) fn qualified_filesystem(handle: impl AsFd, what: &str) -> Result<()> {
+    let stat = rustix::fs::fstatfs(handle)
+        .map_err(|_| Error::new(&format!("Could not inspect the filesystem of {what}")))?;
+    // `f_type` is a signed word on some targets; the magic numbers are
+    // non-negative 32-bit values, so widening through `i64` is exact.
+    #[allow(clippy::unnecessary_cast)]
+    let kind = stat.f_type as i64 as u64;
+    match unqualified_filesystem(kind) {
+        Some(reason) => Err(Error::new(&format!("The {what} {reason}"))),
+        None => Ok(()),
+    }
+}
 
 pub(super) const MAX_BYTES: usize = 64 * 1024 * 1024;
 pub(super) const MAX_FILES: usize = 4096;
@@ -76,6 +108,7 @@ impl Root {
             ResolveFlags::NO_SYMLINKS,
         )
         .map_err(|_| Error::new("Could not open a no-follow compose root"))?;
+        qualified_filesystem(&fd, "project checkout")?;
         Ok(Self(fd))
     }
 
@@ -243,5 +276,32 @@ impl Root {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod filesystem_tests {
+    use super::*;
+
+    #[test]
+    fn a_windows_drive_under_wsl_is_refused_and_ordinary_filesystems_are_not() {
+        // 9p, as WSL2 serves /mnt/c: measured on WSL2 6.6 (#1070).
+        let reason = unqualified_filesystem(0x0102_1997).unwrap();
+        assert!(reason.contains("WSL filesystem"), "{reason}");
+        for (name, kind) in [
+            ("ext4", 0xEF53),
+            ("tmpfs", 0x0102_1994),
+            ("xfs", 0x5846_5342),
+            ("btrfs", 0x9123_683E),
+            ("overlayfs", 0x794C_7630),
+        ] {
+            assert_eq!(unqualified_filesystem(kind), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn an_ordinary_local_directory_is_qualified() {
+        let root = Root::open(&std::env::temp_dir()).unwrap();
+        assert!(qualified_filesystem(&root.0, "test directory").is_ok());
     }
 }

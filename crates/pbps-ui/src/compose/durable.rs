@@ -572,7 +572,9 @@ impl Directory {
 }
 
 pub(super) fn store(common: &Path, observer: ResourceObserver) -> Result<Directory> {
-    Directory::open(common, observer)?.child("pbps-compose-v2", true)
+    let common = Directory::open(common, observer)?;
+    super::files::qualified_filesystem(&common.file, "Git directory holding compose's records")?;
+    common.child("pbps-compose-v2", true)
 }
 
 pub(super) fn refuse_legacy(git: &super::git::Git) -> Result<()> {

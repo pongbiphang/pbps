@@ -52,7 +52,8 @@ records a rename, a drop reason or annotations as a reviewed commit on a new
 output branch, following [ADR-0017](ADR-0017-isolated-compose.md) as qualified
 by #745–#748. Its fixed `POST /api/compose/<action>` requests are the viewer's
 only writes besides step 5's. Compose is Linux-only until #471 qualifies other
-platforms. Phase 6 step 5 (#1025) adds **Plan & apply**, which runs `plan --env
+platforms; Windows users run it inside WSL, with the project in the WSL
+filesystem (#1070). Phase 6 step 5 (#1025) adds **Plan & apply**, which runs `plan --env
 --out` and `apply --plan --checksum` with a checksum a person types. Phase 6
 step 6 (#1050) tests ADR-0006's refusals across every route the router's tables
 hold (DEC-1050.1). See [UI.md](UI.md).
