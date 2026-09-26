@@ -1530,6 +1530,14 @@ impl ScratchRun {
     /// state; the caller uses it there and retires it with
     /// [`Self::retire_admin`].
     async fn admin_session(&mut self) -> Result<(), Error> {
+        // One still held means a step was cancelled while it used it, and
+        // the caller retried without a check in between. Retire it where
+        // cleanup finds it, and end the analysis, rather than replace it.
+        if let Some(admin) = self.inner.control.admin.take() {
+            self.inner.control.retire(admin);
+            self.inner.refuse(Error::Cancelled);
+            return Err(Error::Cancelled);
+        }
         let admin_login = self.inner.control.endpoint.login(self.names.database());
         let session = {
             let analysis = self.inner.live()?;

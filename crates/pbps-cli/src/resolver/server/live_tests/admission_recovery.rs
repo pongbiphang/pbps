@@ -482,6 +482,17 @@ async fn a_cancelled_step_leaves_its_admin_session_to_cleanup() {
             state.restore().unwrap();
             (state.name.clone().unwrap(), state.id.clone().unwrap())
         };
+        // With the daemon reachable again, retrying the same step would
+        // open a new administrative session in place of the held one; qualify
+        // reaches it past every check. The retry must end the run instead.
+        let retried = match stage {
+            "qualify" => run.qualify(&mut target, &request).await.map(|_| ()),
+            _ => run.resolve(&mut target, &binding).await.map(|_| ()),
+        };
+        assert!(
+            matches!(retried, Err(Error::Cancelled)),
+            "{stage}: a retry after cancellation ends the run: {retried:?}"
+        );
         let closed = run.close().await;
         let named = closed
             .as_ref()
