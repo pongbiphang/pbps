@@ -564,6 +564,42 @@ pub async fn matching_table_names(
     Ok(found)
 }
 
+/// Of the groups in `added`, the ones where an added column's name is a name
+/// the same group's `recorded` columns have, compared under the database's
+/// collation (#676). A group is one table, by the caller's index. Asked of the
+/// engine for the reason [`matching_table_names`] is: an accent-, width- or
+/// kana-insensitive database reads `café` and `cafe` as one column, which no
+/// fold in Rust reproduces.
+pub async fn tables_reusing_a_column_name(
+    conn: &mut Conn,
+    added: &[(usize, String)],
+    recorded: &[(usize, String)],
+) -> Result<std::collections::BTreeSet<usize>, DbError> {
+    if added.is_empty() || recorded.is_empty() {
+        return Ok(std::collections::BTreeSet::new());
+    }
+    let values = |names: &[(usize, String)]| {
+        names
+            .iter()
+            .map(|(i, n)| format!("({i}, {})", crate::ident::literal(n)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let sql = format!(
+        "SELECT DISTINCT a.i FROM (VALUES {}) AS a(i, column_name)
+         JOIN (VALUES {}) AS b(i, column_name)
+           ON a.i = b.i AND a.column_name = b.column_name COLLATE DATABASE_DEFAULT
+         ORDER BY a.i;",
+        values(added),
+        values(recorded)
+    );
+    let mut found = std::collections::BTreeSet::new();
+    for row in conn.query(&sql).await? {
+        found.insert(get::<i32>(&row, "i")? as usize);
+    }
+    Ok(found)
+}
+
 /// Among `names`, the pairs the database reads as one name — `Reader` and
 /// `reader` under a case-insensitive collation — each as `(earlier, later)`
 /// in the order given. A plan that creates both passes every check against

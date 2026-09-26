@@ -5779,6 +5779,43 @@ async fn a_case_differing_reused_name_collides_under_the_servers_default_collati
     db.drop().await;
 }
 
+/// #676: whether an added column reuses a recorded column's name is the
+/// database collation's answer. On an accent-insensitive database `cafe` is
+/// `café`, which no fold in Rust would say; on a case-sensitive one `Label` is
+/// not `label`. Only the same table's names are compared.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+async fn a_reused_column_name_is_found_by_the_databases_collation() {
+    for (collation, recorded, added, reused) in [
+        ("SQL_Latin1_General_CP1_CI_AI", "café", "cafe", true),
+        ("SQL_Latin1_General_CP1_CI_AS", "label", "LABEL", true),
+        ("Latin1_General_CS_AS", "label", "Label", false),
+    ] {
+        let mut db = TestDb::create("doctorcolumn676").await;
+        db.conn
+            .execute(&format!(
+                "USE master; ALTER DATABASE [{0}] COLLATE {collation}; USE [{0}];",
+                db.name
+            ))
+            .await
+            .expect("set the database collation");
+        let found = pbps_mssql::catalog::tables_reusing_a_column_name(
+            &mut db.conn,
+            &[(0, added.to_owned()), (1, "other".to_owned())],
+            &[(0, recorded.to_owned()), (1, recorded.to_owned())],
+        )
+        .await
+        .expect("the comparison");
+        let expected: std::collections::BTreeSet<usize> = if reused {
+            [0].into_iter().collect()
+        } else {
+            Default::default()
+        };
+        assert_eq!(found, expected, "{collation}: {recorded} / {added}");
+        db.drop().await;
+    }
+}
+
 /// #384: the claim check asks the engine, not a Rust fold. On an
 /// accent-insensitive database `app.café` and `app.cafe` are one securable,
 /// which `to_lowercase` kept apart. With a rename freeing `app.café` and a new

@@ -1327,8 +1327,8 @@ fn resolve_for_query<'a>(
     (safe, unresolvable)
 }
 
-/// The names `columns` of the declared table `declared` have in this
-/// environment, in order (#676).
+/// Each of `columns` of the declared table `declared`, with the name it has
+/// in this environment and whether the recorded ids gave it that name (#676).
 ///
 /// A column a plan is about to rename is still under its recorded name here,
 /// and `sp_rename` keeps its column grants with it (measured on the pinned
@@ -1336,22 +1336,13 @@ fn resolve_for_query<'a>(
 /// no recorded uid is one this deployment adds: it keeps its declared name,
 /// which the catalog does not hold yet and answers 0 for, so it still demands
 /// a covering grant (`Needed::DataRead`, DECISIONS 510).
-///
-/// A rename can free a name the same plan reuses: `label` renamed to `caption`
-/// beside a new `label`. The new column would then be asked about under the
-/// renamed column's physical name and inherit its answer. The list is
-/// positional in the generated statement, so that collision is settled here:
-/// the table gets no column list, and only an object-level grant counts. That
-/// is the one grant that can cover a column that does not exist yet. The names
-/// are compared without case, so a case-insensitive database's reading of two
-/// spellings as one column errs towards asking.
 fn resolve_columns(
     declared: &ObjectName,
     columns: &[String],
     project_ids: &pbps_model::IdsFile,
     recorded_ids: &pbps_model::IdsFile,
-) -> Vec<String> {
-    let resolved: Vec<(String, bool)> = columns
+) -> Vec<(String, bool)> {
+    columns
         .iter()
         .map(|column| {
             let wanted = pbps_model::ColumnRef {
@@ -1363,19 +1354,67 @@ fn resolve_columns(
                 .and_then(|uid| recorded_ids.columns.get(uid))
                 .map_or_else(|| (column.clone(), false), |r| (r.name.clone(), true))
         })
-        .collect();
-    let recorded: BTreeSet<String> = resolved
-        .iter()
-        .filter(|(_, recorded)| *recorded)
-        .map(|(name, _)| name.to_lowercase())
-        .collect();
-    if resolved
-        .iter()
-        .any(|(name, recorded_here)| !recorded_here && recorded.contains(&name.to_lowercase()))
-    {
-        return Vec::new();
+        .collect()
+}
+
+/// The column lists for the data tables, each column under the name this
+/// environment has for it (#676), keyed like `data_securable`'s values.
+///
+/// A rename can free a name the same plan reuses: `label` renamed to `caption`
+/// beside a new `label`. The new column would then be asked about under the
+/// renamed column's physical name and inherit its answer. The list is
+/// positional in the generated statement, so that collision is settled before
+/// it is built: such a table gets no column list, and only an object-level
+/// grant counts, the one grant that can cover a column that does not exist
+/// yet. Which names are one column is the database collation's answer, asked
+/// of the engine (`catalog::tables_reusing_a_column_name`), as the table path
+/// asks it (#384).
+async fn resolved_column_lists(
+    conn: &mut Conn,
+    data_securable: &BTreeMap<ObjectName, ObjectName>,
+    data: &BTreeMap<ObjectName, pbps_db::doctor::DataDemand>,
+    project_ids: &pbps_model::IdsFile,
+    recorded_ids: &pbps_model::IdsFile,
+) -> Result<
+    (
+        BTreeMap<ObjectName, Vec<String>>,
+        BTreeMap<ObjectName, Vec<String>>,
+    ),
+    DbError,
+> {
+    let mut rows = Vec::new();
+    let mut added = Vec::new();
+    let mut recorded = Vec::new();
+    for (i, (declared, query)) in data_securable.iter().enumerate() {
+        let Some(demand) = data.get(declared) else {
+            continue;
+        };
+        let row = resolve_columns(declared, demand.row_columns(), project_ids, recorded_ids);
+        let read = resolve_columns(declared, demand.data_columns(), project_ids, recorded_ids);
+        for (name, known) in row.iter().chain(&read) {
+            if *known {
+                recorded.push((i, name.clone()));
+            } else {
+                added.push((i, name.clone()));
+            }
+        }
+        rows.push((i, query.clone(), row, read));
     }
-    resolved.into_iter().map(|(name, _)| name).collect()
+    let reused = crate::catalog::tables_reusing_a_column_name(conn, &added, &recorded).await?;
+    let names = |list: Vec<(String, bool)>, i: usize| -> Vec<String> {
+        if reused.contains(&i) {
+            Vec::new()
+        } else {
+            list.into_iter().map(|(name, _)| name).collect()
+        }
+    };
+    let mut row_lists = BTreeMap::new();
+    let mut read_lists = BTreeMap::new();
+    for (i, query, row, read) in rows {
+        row_lists.insert(query.clone(), names(row, i));
+        read_lists.insert(query, names(read, i));
+    }
+    Ok((row_lists, read_lists))
 }
 
 /// Where the project now declares a recorded table, when that is in another
@@ -1715,16 +1754,8 @@ pub async fn permissions(
     // each declared table's columns land under their own key here rather
     // than overwriting another's.
     // And each column under the name this environment has for it (#676).
-    let data_columns: BTreeMap<ObjectName, Vec<String>> = data_securable
-        .iter()
-        .filter_map(|(declared, query)| {
-            data.get(declared).map(|demand| {
-                let columns =
-                    resolve_columns(declared, demand.row_columns(), project_ids, &recorded_ids);
-                (query.clone(), columns)
-            })
-        })
-        .collect();
+    let (data_columns, read_columns) =
+        resolved_column_lists(conn, &data_securable, data, project_ids, &recorded_ids).await?;
     let mut data_objects = object_permissions(
         conn,
         &data_names,
@@ -1746,16 +1777,6 @@ pub async fn permissions(
         .iter()
         .filter(|r| matches!(r.needed, Needed::DataRead))
         .map(|r| r.name)
-        .collect();
-    let read_columns: BTreeMap<ObjectName, Vec<String>> = data_securable
-        .iter()
-        .filter_map(|(declared, query)| {
-            data.get(declared).map(|demand| {
-                let columns =
-                    resolve_columns(declared, demand.data_columns(), project_ids, &recorded_ids);
-                (query.clone(), columns)
-            })
-        })
         .collect();
     for (object, granted) in object_permissions(
         conn,
@@ -3189,10 +3210,10 @@ mod tests {
 
     /// The ordinary case, with nothing renamed and nothing reused: every
     /// declared name resolves to itself and none collide.
-    /// #676: a declared column is asked about under the name this environment
-    /// has for it. A pending rename resolves to the recorded name, a column
-    /// with no recorded uid keeps its declared name, and a new column that
-    /// reuses a renamed column's name leaves the table with no column list.
+    /// #676: a declared column resolves to the name this environment has for
+    /// it. A pending rename resolves to the recorded name, and a column with no
+    /// recorded uid keeps its declared name and is marked as added: it is the
+    /// candidate `resolved_column_lists` asks the engine about.
     #[test]
     fn declared_columns_resolve_to_the_names_the_environment_has() {
         use pbps_model::{ColumnRef, IdsFile, Uid, UidKind};
@@ -3211,34 +3232,22 @@ mod tests {
         let mut project = IdsFile::default();
         project.columns.insert(code, column("code"));
         project.columns.insert(label, column("caption"));
-        let names = |declared: &[&str], project: &IdsFile| {
-            let declared: Vec<String> = declared.iter().map(|c| (*c).to_owned()).collect();
-            resolve_columns(&table, &declared, project, &recorded)
-        };
-
-        // The rename not applied yet: asked under the name it still has.
-        assert_eq!(names(&["code", "caption"], &project), ["code", "label"]);
-        // A column this deployment adds keeps its declared name.
-        let mut added = project.clone();
-        added
+        project
             .columns
             .insert(Uid::generate(UidKind::Column), column("note"));
+        let declared: Vec<String> = ["code", "caption", "note"]
+            .iter()
+            .map(|c| (*c).to_owned())
+            .collect();
         assert_eq!(
-            names(&["code", "caption", "note"], &added),
-            ["code", "label", "note"]
+            resolve_columns(&table, &declared, &project, &recorded),
+            [
+                ("code".to_owned(), true),
+                ("label".to_owned(), true),
+                ("note".to_owned(), false)
+            ]
         );
-        // A new column reusing the renamed one's name, in either case: no list.
-        for reused in ["label", "LABEL"] {
-            let mut reusing = project.clone();
-            reusing
-                .columns
-                .insert(Uid::generate(UidKind::Column), column(reused));
-            assert!(
-                names(&["code", "caption", reused], &reusing).is_empty(),
-                "{reused}"
-            );
-        }
-        // Nothing recorded: every name stays as declared.
+        // Nothing recorded: every name stays as declared, and is new.
         assert_eq!(
             resolve_columns(
                 &table,
@@ -3246,7 +3255,7 @@ mod tests {
                 &IdsFile::default(),
                 &IdsFile::default()
             ),
-            ["code"]
+            [("code".to_owned(), false)]
         );
     }
 
