@@ -171,8 +171,13 @@ mod contained611 {
             "0123456789abcdef0123456789abcdef".to_owned(),
         )
         .unwrap();
+        // The first statement is the scratch's own `CREATE DATABASE`, open to
+        // the same `model` contention as the target's above. Only Msg 1807 is
+        // retried, which no other statement here can raise (#1055).
         for statement in scratch_database_ddl(&names, &recipe).unwrap() {
-            admin.execute(&statement).await.unwrap();
+            crate::create_database(&mut admin, &statement)
+                .await
+                .unwrap();
         }
         let rows = admin
             .query(&format!(
