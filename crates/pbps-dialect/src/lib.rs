@@ -2480,11 +2480,6 @@ pub fn check_index_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> 
     // order the plan decides. Any of them may be where any claimant lands.
     for claimants in generated.values().filter(|c| c.len() > 1) {
         let retries = u32::try_from(claimants.len() - 1).unwrap_or(u32::MAX);
-        // A claimant's own remedy takes that one claimant out. With two, that
-        // leaves the other its first choice and no fallback in play; with
-        // three or more, the rest still meet and the fallback stays taken,
-        // so only moving the declared object is a remedy.
-        let lone_remedy = (claimants.len() > 2).then_some("Rename the other object.");
         let mut reported = BTreeSet::new();
         for (table_name, i, relation) in claimants {
             let descriptor = &relation.descriptor;
@@ -2500,13 +2495,23 @@ pub fn check_index_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> 
                 let claim_name = ObjectName::new(table_name.schema.clone(), fallback);
                 if declared_names.contains(&claim_name) && reported.insert(claim_name.clone()) {
                     let existing = &claimed[&claim_name];
+                    // A claimant's own remedy takes that one claimant out,
+                    // and `c - 1` claimants retry only up to fallback
+                    // `c - 2`: it frees the last fallback and no other. Any
+                    // earlier one stays in play, so only moving the declared
+                    // object is a remedy there.
+                    let remedy = if suffix < retries {
+                        "Rename the other object."
+                    } else {
+                        relation.remedy
+                    };
                     problems.push(format!(
                         "{} and {descriptor} may both be named `{claim_name}`: {descriptor} \
                          meets another generated name, and {} gives one of them this name \
                          instead, which one depending on the order they are created in. {}",
                         existing.descriptor,
                         dialect.name(),
-                        lone_remedy.unwrap_or(relation.remedy)
+                        remedy
                     ));
                 }
             }

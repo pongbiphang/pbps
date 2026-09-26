@@ -596,10 +596,10 @@ a 60-byte table's key falls back to a 57-byte cut plus `_pkey1` (measured on 16
 and 18). A declared name equal to one of those fallbacks lands by creation
 order: created after both tables it fails with `42P07`, and created between
 them it pushes the second key to the next fallback. It is refused like a
-declared name that meets a first choice. Its remedy is the claimant's own when
-two names meet, since taking one out leaves the other its first choice; when
-three or more meet, the rest still take the fallback, so the refusal says to
-rename the other object alone. SQL Server names these objects per table and reports no
+declared name that meets a first choice. Its remedy is the claimant's own only
+at the last fallback in play, `c - 1`: taking one claimant out leaves `c - 1`,
+which retry only up to `c - 2`. At an earlier fallback the rest still reach it,
+so the refusal says to rename the other object alone. SQL Server names these objects per table and reports no
 generated relation names. Measured on PostgreSQL 16 and 18: short, 60-byte and
 multibyte table names generate exactly the predicted names, the declared index
 created afterwards fails with `42P07`, and a name taken first yields
