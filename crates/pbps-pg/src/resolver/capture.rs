@@ -70,6 +70,10 @@ pub use pbps_db::resolver::capture::{CaptureError, Uncovered};
 mod manifest;
 pub use manifest::CapturedInputs;
 
+mod assess;
+pub use assess::{Managed, Paths, assess, managed_scope, scope};
+pub use pbps_db::resolver::capture::{Assessment, Verdict};
+
 /// Read coherent catalog inputs and release the transaction before returning.
 /// This does not qualify executable content or a scratch runtime. The native
 /// lifecycle must enclose it in its separately qualified input boundary and

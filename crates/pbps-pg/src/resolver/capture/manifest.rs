@@ -7,9 +7,9 @@ use pbps_db::resolver::capture::{CaptureDifference, InputChange, ObjectIdentity}
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-struct Input {
-    properties: BTreeMap<String, Value>,
-    bindings: Vec<Binding>,
+pub(super) struct Input {
+    pub(super) properties: BTreeMap<String, Value>,
+    pub(super) bindings: Vec<Binding>,
 }
 
 /// Private in-memory catalog evidence. It intentionally has no Debug,
@@ -58,9 +58,9 @@ pub struct CapturedInputs {
     rule: &'static str,
     major: u32,
     scope: CaptureScope,
-    inputs: BTreeMap<ObjectIdentity, Input>,
-    candidates: BTreeMap<super::CandidateSet, BTreeSet<ObjectIdentity>>,
-    limitations: BTreeSet<ObjectIdentity>,
+    pub(super) inputs: BTreeMap<ObjectIdentity, Input>,
+    pub(super) candidates: BTreeMap<super::CandidateSet, BTreeSet<ObjectIdentity>>,
+    pub(super) limitations: BTreeSet<ObjectIdentity>,
 }
 
 impl CapturedInputs {

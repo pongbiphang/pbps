@@ -47,6 +47,9 @@ TESTS = [
     # PostgreSQL analysis-scope qualification (#610); no-ops on SQL Server (#611).
     "a_run_qualifies_its_analysis_scope_against_the_target",
     "a_server_inside_the_target_instance_is_refused_before_any_scratch_resource",
+    # Desired-binding resolution through a qualified run (#613); SQL Server
+    # is refused by name until its adapter exists (#619, #620).
+    "bindings::a_qualified_run_resolves_desired_bindings_against_the_target",
     # Runs with the exposed control started; see below.
     "an_unimplemented_profile_or_an_exposed_runtime_is_refused_by_name",
     "a_session_this_run_did_not_open_invalidates_it_even_after_it_closed",

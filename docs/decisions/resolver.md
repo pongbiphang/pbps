@@ -894,3 +894,84 @@ read back as the same empty answer, and requalification accepted the scope.
 `spellings` now maps every planned name to `Some(<catalog spelling>)` or to
 `None`, so presence and absence are sealed apart; the principal map still uses
 the planned spelling for `None`.
+
+<a id="dec-613-1"></a>
+
+**DEC-613.1. The desired namespace is the emitter's bootstrap, reordered only
+so that expressions wait for modules, and its order is qualified afterwards
+from what the engine bound (#613).** The plan's class order creates tables with
+their defaults, checks and indexes before any module (`order_key`), so an
+expression calling a managed function either fails or, worse, binds whatever
+else of that name already exists; a scratch compiled that way answers the
+wrong question without an error. Parsing references to order the compile is
+the grammar work ADR-0016 refuses. So scratch runs the differ's bootstrap of
+the declarations through the ordinary emitter, with a table created bare, its
+foreign keys after every table, the modules in the differ's name-scan order,
+and each default, CHECK, index and trigger last. The scan can miss a
+reference, and a module compiled before a same-named object it would have
+preferred binds the other one silently. That is detected from the captured
+bindings instead of prevented: a module that bound any name first made
+nameable later in the reconstruction, by an object that could have been
+resolved in its place, is unresolved: a later relation, with its row type, for a relation,
+a type or a call; its generated array type, read back from the catalog because
+the engine may clip or respell `_name`, for a type or a call only a single argument can reach (its row type can take `t(x)`), a later routine for a routine
+or a function-style cast, a later index for a relation only, and only one in
+the schema the binding named or on the declaration's path. The check is by name within those kinds, so it is
+conservative — a qualified reference it cannot tell from a bare one is
+flagged too — and a `depends_on` edge that moves the other object first
+removes it. Measured on PostgreSQL 16 and 18: f(integer) whose body calls
+`f('x'::text)` binds f(character varying) through an implicit cast when f(text)
+is compiled after it. Scratch order builds the namespace; it fixes no
+deployment order (#614). Grants, roles and rows are not reproduced, since none
+changes a binding; the deployer's path and schema privileges are the analysis
+scope's (DECISIONS 520). A run compiles once, into its own database, as the
+reproduced deployer, and is read back through an administrative session,
+because the capture reads settings a least-privilege deployer need not see and
+the reading role changes no stored binding. A failed or cancelled compile ends
+the analysis; a second question needs a fresh run.
+
+
+<a id="dec-613-2"></a>
+
+**DEC-613.2. A binding verdict holds only where scratch reproduced every
+candidate for the names the surface bound; everything else is unresolved
+rather than guessed (#613).** Equal bindings prove nothing if the target has a
+candidate scratch lacks: the target would pick it on the next creation. The
+candidate sets are derived from what scratch bound — each bound relation,
+routine, type, operator, collation or operator class/family name, looked up in
+every schema of the deployer's effective path as the analysis scope measured it
+(`pg_catalog`, then the write path's schemas it may use; an extra without
+`USAGE` is not searched) and in the schema it bound into; a bound type name
+is looked up as a routine too (only overloads a single argument can reach,
+since a cast has one), and a bound routine a one-argument call can
+reach (its declared count less defaults, or variadic) as a type, since `t(x)` is an exact call, else a cast to `t`, else the
+best-matching call, and a cast takes exactly one argument —
+plus every cast, which routine, operator and coercion resolution consults with
+no name, for a surface that looked any of those up. Only a binding some
+name lookup selected counts. Every type, operator, routine and relation field the node allowlist admits is classified by node and field:
+an operator's implementation, result and transition types, a column's, field's
+or placeholder's type, operands' common types, a query's output types, an SQL
+value function's fixed type, a grouping's inferred operators and a derived
+collation follow from other parts of the tree, which are compared themselves.
+A constant's or coercion's type, a written column definition and a named
+operator or routine can be a name in the source, stored no differently when
+they were not, so they count (#1062). A declaration the plan leaves unchanged has the same text on both sides and
+resolves the same names; only the selected objects can differ, and that is
+what the bindings carry. On the target each member must be an engine object
+scratch has with the same properties, role references removed because the
+bootstrap superuser's name is the installation's; a member of a user schema
+scratch has too, which creating a declaration made (an identity column's
+sequence, a key's index, a row type); or one of the project's managed objects
+by name (a type only for a table or view, never for an index). A routine is managed only as the exact overload
+scratch compiled for a declaration the plan keeps; overloads the plan drops,
+never compiled, are the only ones counted. A count alone let an unmanaged
+overload stand in for a declared one the target had lost. An unmanaged overload
+beside a managed one, a routine planted
+in `pg_catalog` and a built-in cast whose context was changed each leave the
+surface unresolved, measured on both majors; so does an extension's object,
+because nothing but managed declarations is reconstructed until retained
+external input is handled privately (#617). Capturing whole schemas instead
+would refuse on unmanaged objects no surface can reach, and would pull their
+arbitrary closures into a capture that must refuse what it cannot qualify.
+Runtime-bound bodies are compared by header only and are named, never counted
+as proven by silence (ADR-0016 decision 3).

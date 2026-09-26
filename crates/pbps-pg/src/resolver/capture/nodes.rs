@@ -21,6 +21,8 @@ pub(super) enum ReferenceClass {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Reference {
+    /// The tag of the node the reference field belongs to.
+    pub node: String,
     pub path: Vec<String>,
     pub class: ReferenceClass,
     pub oid: u32,
@@ -277,7 +279,7 @@ fn walk(
                                 }
                                 for (index, value) in values.iter().skip(1).enumerate() {
                                     path.push(index.to_string());
-                                    add_reference(value, *class, path, found)?;
+                                    add_reference(value, *class, &node.tag, path, found)?;
                                     path.pop();
                                 }
                             }
@@ -286,7 +288,7 @@ fn walk(
                             }
                         }
                     } else {
-                        add_reference(value, *class, path, found)?;
+                        add_reference(value, *class, &node.tag, path, found)?;
                     }
                 } else {
                     walk(value, major, path, found)?;
@@ -375,12 +377,14 @@ fn range_table_fields(node: &Node, major: u32) -> Result<Vec<&'static str>, Unco
 fn add_reference(
     value: &Value,
     class: ReferenceClass,
+    node: &str,
     path: &[String],
     found: &mut Vec<Reference>,
 ) -> Result<(), Uncovered> {
     let oid = value.number()?;
     if oid != 0 {
         found.push(Reference {
+            node: node.to_owned(),
             path: path.to_vec(),
             class,
             oid,
