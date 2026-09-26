@@ -625,6 +625,9 @@ pub(crate) fn from_text(literal: &str, ty: &ColumnType) -> Option<String> {
 /// Both sides through [`read_expr`], compared under a binary collation, so a
 /// column whose own collation calls two spellings equal cannot hide an edit.
 ///
+/// **And the SRID as well, for `geometry` and `geography`**, whose rendering
+/// drops it and which have no `=` (#530).
+///
 /// **And the engine's own `=` as well, for `sql_variant`.** That rendering is
 /// lossy in a way the others are not: it writes the value and not its base
 /// type, so **measured**, a variant holding `nvarchar` `N'1'` and one holding
@@ -640,6 +643,15 @@ pub(crate) fn same_value(stored: &str, other: &str, base: &str) -> String {
     );
     match base {
         "sql_variant" => format!("({text} AND {stored} = {other})"),
+        // The well-known text does not carry the spatial reference: measured
+        // on 17.0, `POINT (1 2)` in SRID 4326 and in SRID 0 render the same
+        // `ToString()`, and the types have no `=` to fall back on (#530). So
+        // the SRID is its own conjunct, and the recorded text is left alone.
+        // Parenthesised, because both sides may be expressions and `.STSrid`
+        // is a method call (measured on `TRY_CONVERT(geometry, …)` too).
+        "geometry" | "geography" => {
+            format!("({text} AND ({stored}).STSrid = ({other}).STSrid)")
+        }
         _ => text,
     }
 }
@@ -1537,6 +1549,20 @@ mod tests {
     /// So this one type carries the engine's own `=` beside the text
     /// comparison — and only this one, because adding it everywhere would
     /// refuse matches no measurement says are wrong.
+    /// #530: a spatial value's text drops its SRID, so the SRID is compared
+    /// beside it, for both spatial types and no other.
+    #[test]
+    fn a_spatial_cells_srid_is_compared_beside_its_text() {
+        for base in ["geometry", "geography"] {
+            let sql = same_value("[g]", "TRY_CONVERT(x, (d))", base);
+            assert!(
+                sql.contains("AND ([g]).STSrid = (TRY_CONVERT(x, (d))).STSrid"),
+                "{base}: {sql}"
+            );
+        }
+        assert!(!same_value("[n]", "(d)", "varchar").contains("STSrid"));
+    }
+
     #[test]
     fn a_variants_base_type_is_compared_and_no_other_types_is() {
         let t = table(
