@@ -112,49 +112,47 @@ async fn every_session_qualifies_its_forwarders_mqueue_before_returning() {
                         terminal = true;
                     }
                 }
-            } else {
+            } else if stage == "scratch" {
                 let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
                 let recipe = scratch_recipe(&mut target).await;
-                if stage == "scratch" {
-                    let result = CHANGE
-                        .scope(change.clone(), server.open_scratch(&recipe))
-                        .await;
-                    id = restore(&change, &mut api).await;
-                    match result {
-                        Ok(mut run) => {
-                            refused = false;
-                            reason = String::new();
-                            terminal = true;
-                            run.check(&mut target).await.unwrap();
-                            run.close().await.unwrap();
-                        }
-                        Err(error) => {
-                            assert!(
-                                error.recovery_names.is_empty(),
-                                "owned removal was confirmed"
-                            );
-                            refused = true;
-                            reason = error.to_string();
-                            terminal = server.check().await.is_err();
-                            server.discard().await.unwrap();
-                        }
+                let result = CHANGE
+                    .scope(change.clone(), server.open_scratch(&recipe))
+                    .await;
+                id = restore(&change, &mut api).await;
+                match result {
+                    Ok(mut run) => {
+                        refused = false;
+                        reason = String::new();
+                        terminal = true;
+                        run.check(&mut target).await.unwrap();
+                        run.close().await.unwrap();
                     }
-                } else {
-                    let mut run = server.open_scratch(&recipe).await.unwrap();
-                    let request = ScopeRequest::default();
-                    let result = CHANGE
-                        .scope(change.clone(), run.qualify(&mut target, &request))
-                        .await;
-                    refused = result.is_err();
-                    reason = result
-                        .err()
-                        .map(|error| error.to_string())
-                        .unwrap_or_default();
-                    id = restore(&change, &mut api).await;
-                    terminal = !refused
-                        || (run.inner.live().is_err() && run.check(&mut target).await.is_err());
-                    run.close().await.unwrap();
+                    Err(error) => {
+                        assert!(
+                            error.recovery_names.is_empty(),
+                            "owned removal was confirmed"
+                        );
+                        refused = true;
+                        reason = error.to_string();
+                        terminal = server.check().await.is_err();
+                        server.discard().await.unwrap();
+                    }
                 }
+            } else {
+                let mut run = open_when_exclusive(&mut target).await;
+                let request = ScopeRequest::default();
+                let result = CHANGE
+                    .scope(change.clone(), run.qualify(&mut target, &request))
+                    .await;
+                refused = result.is_err();
+                reason = result
+                    .err()
+                    .map(|error| error.to_string())
+                    .unwrap_or_default();
+                id = restore(&change, &mut api).await;
+                terminal = !refused
+                    || (run.inner.live().is_err() && run.check(&mut target).await.is_err());
+                run.close().await.unwrap();
             }
             cleaned(&configured, &mut api, &id).await;
             assert!(!reason.contains(&configured.password));
@@ -185,9 +183,9 @@ async fn a_foreign_forwarder_mqueue_discards_each_live_view_permanently() {
     let mut api = LocalApi::connect_native(&configured.daemon).await.unwrap();
     let mut missed = Vec::new();
     for stage in ["identity", "control", "scratch"] {
-        let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
-        server.identity().unwrap();
         if stage == "identity" {
+            let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
+            server.identity().unwrap();
             let session = server
                 .inner
                 .as_ref()
@@ -214,10 +212,7 @@ async fn a_foreign_forwarder_mqueue_discards_each_live_view_permanently() {
             }
             continue;
         }
-        let mut run = server
-            .open_scratch(&scratch_recipe(&mut target).await)
-            .await
-            .unwrap();
+        let mut run = open_when_exclusive(&mut target).await;
         run.check(&mut target).await.unwrap();
         let selected = if stage == "control" {
             run.inner.control.session.as_ref().unwrap()

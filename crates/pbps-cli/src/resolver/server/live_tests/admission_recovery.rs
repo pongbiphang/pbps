@@ -257,20 +257,13 @@ async fn failed_admission_names_every_unconfirmed_forwarder() {
                 late_admission,
             )));
             fault.borrow_mut().skip_sessions = usize::from(stage == "reopened");
-            let mut server = if scratch || qualify {
+            let mut server = if scratch {
                 Some(admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await)
             } else {
                 None
             };
             let mut run = if qualify {
-                Some(
-                    server
-                        .as_mut()
-                        .unwrap()
-                        .open_scratch(&scratch_recipe(&mut target).await)
-                        .await
-                        .unwrap(),
-                )
+                Some(open_when_exclusive(&mut target).await)
             } else {
                 None
             };
@@ -445,11 +438,7 @@ async fn a_cancelled_step_leaves_its_admin_session_to_cleanup() {
         if stage == "resolve" && driver() != Driver::Postgres {
             continue;
         }
-        let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
-        let mut run = server
-            .open_scratch(&scratch_recipe(&mut target).await)
-            .await
-            .unwrap();
+        let mut run = open_when_exclusive(&mut target).await;
         let request = ScopeRequest::default();
         let empty = pbps_model::Schema::default();
         let binding = BindingRequest {
@@ -556,7 +545,6 @@ async fn a_cancelled_step_leaves_its_admin_session_to_cleanup() {
         fault.borrow_mut().id = None;
         let _ = run.close().await;
         drop(run);
-        drop(server);
         let mut admin = session(&configured, maintenance()).await;
         assert_eq!(
             exists(&mut admin.connection, "pbps_scratch_").await,

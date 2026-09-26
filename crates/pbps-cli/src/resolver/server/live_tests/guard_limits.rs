@@ -161,11 +161,7 @@ async fn every_forwarder_guard_requires_effective_descriptor_evidence() {
     let mut accepted = Vec::new();
     for control in [true, false] {
         for change in [Change::Higher, Change::Missing, Change::Unreadable] {
-            let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
-            let mut run = server
-                .open_scratch(&scratch_recipe(&mut target).await)
-                .await
-                .unwrap();
+            let mut run = open_when_exclusive(&mut target).await;
             let connection = &mut run.scratch.as_mut().unwrap().connection;
             connection
                 .execute("CREATE TABLE pbps_limit_table (id integer)")

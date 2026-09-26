@@ -43,11 +43,7 @@ async fn kernel_name_loss_refuses_admission_and_discards_each_live_view() {
                 failures.push(format!("empty={empty} admission {field}"));
             }
             for subject in ["workload", "control", "scratch"] {
-                let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
-                let mut run = server
-                    .open_scratch(&scratch_recipe(&mut target).await)
-                    .await
-                    .unwrap();
+                let mut run = open_when_exclusive(&mut target).await;
                 let connection = &mut run.scratch.as_mut().unwrap().connection;
                 connection
                     .execute("CREATE TABLE pbps_uts_table (id integer)")

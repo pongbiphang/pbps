@@ -130,6 +130,41 @@ async fn admit_when_exclusive(variable: &str, target: &mut NativeTarget) -> Dedi
     panic!("the supplied server never became exclusive to this run: {refusals:?}");
 }
 
+/// Admission and the scratch open that follows each read the engine's PID
+/// namespace, and a task the previous step ended can still be leaving it
+/// at either reading: admission passed, then the open refused (#1044).
+/// Waited out here like exclusivity, not tolerated by the product. One
+/// bound covers both refusals at both steps, so a task or session that
+/// stays is still a failure.
+async fn open_when_exclusive(target: &mut NativeTarget) -> ScratchRun {
+    let mut refusals = Vec::new();
+    while refusals.len() < 60 {
+        let refused = match DedicatedServer::admit(endpoint("PBPS_SERVER_ENDPOINT"), target).await {
+            Ok(mut server) => match server.open_scratch(&scratch_recipe(target).await).await {
+                Ok(run) => return run,
+                Err(refused) => {
+                    server
+                        .discard()
+                        .await
+                        .expect("a refused open leaves nothing it cannot remove");
+                    refused
+                }
+            },
+            Err(refused) => refused,
+        };
+        match refused {
+            ServerFailure {
+                cause:
+                    cause @ (Error::Exclusivity(_) | Error::Containment(super::Premise::Occupants)),
+                recovery_names,
+            } if recovery_names.is_empty() => refusals.push(cause),
+            other => panic!("the supported profile must open a scratch run: {other}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    panic!("the supplied server never opened a scratch run exclusively: {refusals:?}");
+}
+
 /// What the engine says this session's own database is.
 fn current_database() -> &'static str {
     match driver() {
@@ -190,11 +225,7 @@ async fn a_supported_dedicated_server_compiles_declarations_and_removes_only_its
     let mut target = native_target().await;
     // No inspection session is open here on purpose: one would be a session
     // this run did not open, and admission is required to refuse it.
-    let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
-    let mut run = server
-        .open_scratch(&scratch_recipe(&mut target).await)
-        .await
-        .expect("scratch resources");
+    let mut run = open_when_exclusive(&mut target).await;
     let database = run.database().to_owned();
     // Reaching into the run's own state: this step exposes no SQL surface,
     // so a declaration path cannot be opened by accident from outside it.
@@ -349,12 +380,7 @@ async fn a_session_this_run_did_not_open_invalidates_it_even_after_it_closed() {
     }
     // The same intrusion during a scratch run invalidates it too, and its
     // resources are still removed.
-    let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
-    server.check().await.unwrap();
-    let mut run = server
-        .open_scratch(&scratch_recipe(&mut target).await)
-        .await
-        .unwrap();
+    let mut run = open_when_exclusive(&mut target).await;
     run.check(&mut target).await.unwrap();
     session(&configured, maintenance()).await.close().await;
     assert!(matches!(
@@ -381,12 +407,7 @@ async fn a_session_this_run_did_not_open_invalidates_it_even_after_it_closed() {
     // A cancelled check is terminal for the analysis, but the run must still
     // be closable: dropping its cleanup capability would strand the database
     // and the login on someone else's server.
-    let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
-    server.check().await.unwrap();
-    let mut run = server
-        .open_scratch(&scratch_recipe(&mut target).await)
-        .await
-        .unwrap();
+    let mut run = open_when_exclusive(&mut target).await;
     let database = run.database().to_owned();
     assert!(
         tokio::time::timeout(std::time::Duration::from_nanos(1), run.check(&mut target))
@@ -686,11 +707,7 @@ async fn an_unconfirmed_cleanup_reports_only_the_run_owned_names() {
     fixture();
     let configured = endpoint("PBPS_SERVER_ENDPOINT");
     let mut target = native_target().await;
-    let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
-    let mut run = server
-        .open_scratch(&scratch_recipe(&mut target).await)
-        .await
-        .unwrap();
+    let mut run = open_when_exclusive(&mut target).await;
     let database = run.database().to_owned();
     let mut api = LocalApi::connect_native(&configured.daemon).await.unwrap();
     api.stop_container(&configured.container).await.unwrap();
@@ -807,11 +824,7 @@ async fn a_run_qualifies_its_analysis_scope_against_the_target() {
         setup.query(statement).await.unwrap();
     }
     let mut target = native_target().await;
-    let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
-    let mut run = server
-        .open_scratch(&scratch_recipe(&mut target).await)
-        .await
-        .expect("scratch resources");
+    let mut run = open_when_exclusive(&mut target).await;
 
     let request = crate::resolver::server::ScopeRequest {
         schemas: case.schemas.clone(),
@@ -864,11 +877,7 @@ async fn a_run_qualifies_its_analysis_scope_against_the_target() {
     // target is not what was sealed, and the next check must say so
     // (finding on #688). An admission opens one run, so the server is
     // admitted again for it, once the first run's resources are gone.
-    let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
-    let mut run = server
-        .open_scratch(&scratch_recipe(&mut target).await)
-        .await
-        .expect("scratch resources for the second run");
+    let mut run = open_when_exclusive(&mut target).await;
     let request = crate::resolver::server::ScopeRequest {
         schemas: case.schemas.clone(),
         write_path_extras: case.extras.clone(),
