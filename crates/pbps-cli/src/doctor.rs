@@ -302,7 +302,7 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
         referenced_columns: keys.referenced_columns,
         declared_keys: keys.declared,
         tables: managed_tables(project),
-        granted: grant_targets(project, &ids),
+        granted: grant_targets(project, &ids, dialect.as_ref()),
         data: data_tables(project),
         schemas: managed_schemas,
         ids,
@@ -680,10 +680,26 @@ fn data_tables_of(schema: &pbps_model::Schema) -> pbps_db::doctor::DataTables {
 /// exists in the database, and the next plan revokes what it holds there —
 /// needing `CONTROL` on securables the declarations no longer name and
 /// `ALTER ANY ROLE` for a role they no longer have.
-fn grant_targets(project: &Project, ids: &pbps_model::IdsFile) -> pbps_db::doctor::GrantTargets {
-    let Ok(loaded) = crate::load_quiet(project) else {
+///
+/// Routine identities are spelled the way the dialect spells them, as every
+/// planning command does (#566): a declared `app.f(int)` is the catalog's
+/// `app.f(integer)`, and a scope keyed by the file's spelling matched nothing
+/// the engine reads back, so the adopted ACL on it was set aside as unmanaged.
+/// Two declarations that collapse to one identity are a finding `validate`
+/// already reports; here the first one is kept, as `load` keeps it.
+fn grant_targets(
+    project: &Project,
+    ids: &pbps_model::IdsFile,
+    dialect: &dyn pbps_dialect::Dialect,
+) -> pbps_db::doctor::GrantTargets {
+    let Ok(mut loaded) = crate::load_quiet(project) else {
         return pbps_db::doctor::GrantTargets::default();
     };
+    let _ = crate::routine_ids_as_the_dialect_spells_them(
+        &mut loaded.schema,
+        &mut loaded.hints,
+        dialect,
+    );
     let mut roles: std::collections::BTreeSet<String> =
         loaded.schema.roles.keys().cloned().collect();
     roles.extend(ids.roles.values().cloned());
@@ -1415,7 +1431,7 @@ mod tests {
             pbps_model::Uid::generate(pbps_model::UidKind::Table),
             "app.removed".parse().unwrap(),
         );
-        let grant = grant_targets(&project, &ids);
+        let grant = grant_targets(&project, &ids, &pbps_pg::Postgres::new());
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(
             grant.managed_tables,
@@ -1443,6 +1459,53 @@ mod tests {
             !grant
                 .managed_modules
                 .contains(&"app.f(text)".parse().unwrap())
+        );
+    }
+
+    /// #566: the scope is keyed the way the dialect spells a routine, as the
+    /// planner keys it. `app.f(int)` in the file is `app.f(integer)` in the
+    /// catalog, both as a managed module and as a grant target. The file's
+    /// own spelling is not kept beside it.
+    #[test]
+    fn adopted_grant_scope_spells_routines_as_the_dialect_does() {
+        let dir = std::env::temp_dir().join(format!(
+            "pbps-doctor-scope566-{}",
+            pbps_model::Uid::generate(pbps_model::UidKind::Table)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::create_dir(dir.join("schema")).unwrap();
+        std::fs::write(dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+        for (file, declaration) in [
+            (
+                "f.yml",
+                "function: app.f(int)\ndefinition: (n int) RETURNS integer LANGUAGE sql AS 'SELECT n'\n",
+            ),
+            ("r.yml", "role: reader\ngrants:\n  app.f(int): [execute]\n"),
+        ] {
+            std::fs::write(dir.join("schema").join(file), declaration).unwrap();
+        }
+        let project = Project::load(&dir.join("pbps.yml")).unwrap();
+        let grant = grant_targets(
+            &project,
+            &pbps_model::IdsFile::default(),
+            &pbps_pg::Postgres::new(),
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            grant.managed_modules,
+            ["app.f(integer)".parse().unwrap()].into_iter().collect()
+        );
+        let spelled: pbps_model::GrantTarget = "app.f(integer)".parse().unwrap();
+        assert!(
+            grant.permissions.contains_key(&spelled),
+            "{:?}",
+            grant.permissions
+        );
+        let as_written: pbps_model::GrantTarget = "app.f(int)".parse().unwrap();
+        assert!(
+            !grant.permissions.contains_key(&as_written),
+            "{:?}",
+            grant.permissions
         );
     }
 
