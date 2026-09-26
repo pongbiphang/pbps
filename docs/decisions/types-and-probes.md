@@ -1654,3 +1654,32 @@ session-dependent `timestamp -> timestamptz`. `TypeChangeRisk` is untouched,
 because cost stays apart from correctness (DECISIONS 399). The live suite
 re-measures the whole matrix and holds the estimate to every statement, so
 the rule cannot go stale without a red build.
+
+<a id="dec-419-1"></a>
+
+**DEC-419.1. Narrowing `timestamp` or `timestamptz` precision gets no count
+and no extra refusal, although a value at the very top of the range rounds to
+one the engine will not re-read (#419).** Measured on 18.6 and 16.15, with the
+same results on both, for `timestamp(6)` and `timestamptz(6)` narrowed to
+every precision 0 through 5, under `UTC`, `Pacific/Kiritimati` and
+`America/Adak`:
+- **Every `ALTER` succeeds.** Nothing is refused at the upper bound, at the
+  half-rounding threshold, or at the BC lower bound.
+- **Rounding carries past the upper bound.** A value within half a unit of the
+  bound (`23:59:59.5` at precision 0, `.95` at 1, up to `.999995` at 5, on
+  `294276-12-31`) is stored as `294277-01-01 00:00:00`, rendered in the session
+  zone for `timestamptz`. That text is then refused as a literal with
+  `timestamp out of range`.
+- **Nothing else loses the round trip.** One microsecond below each threshold,
+  the value keeps its day and round-trips, and so does the BC lower bound.
+
+There is no count because SPEC §15 counts what the engine refuses, and the
+engine refuses nothing here. A predicate that labelled these rows "would fail"
+would report a failure the `ALTER` does not have. There is no extra refusal
+either. Every precision reduction is already in the `narrowing` class, so it
+passes the gate only with `--allow narrowing`, which is the place where lost
+fractional seconds are accepted. The carried value is also loud rather than
+silent: a later statement that spells it as a literal fails on the engine. The
+live fixture `timestamp_precision_narrowing_rounds_past_the_upper_bound_without_refusing`
+pins both sides of each threshold and the lower bound. If a release starts
+refusing, it fails there, and a count then belongs in the probes.
