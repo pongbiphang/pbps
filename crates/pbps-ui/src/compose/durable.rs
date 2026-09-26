@@ -576,7 +576,15 @@ impl Directory {
 
 /// Refuses when any directory beneath `directory` is a mount of its own or a
 /// symbolic link, walking every existing directory once.
-fn same_filesystem_tree(directory: &impl std::os::fd::AsFd, prefix: &str) -> Result<()> {
+/// `links_are_evidence` is false only for `logs`, where Git appends a reflog
+/// through any link. In `refs` and the compose store a link to a file is
+/// evidence the census and store operations report, and `objects` files are
+/// never appended to.
+fn same_filesystem_tree(
+    directory: &impl std::os::fd::AsFd,
+    prefix: &str,
+    links_are_evidence: bool,
+) -> Result<()> {
     let mut stream = rustix::fs::Dir::read_from(directory)
         .map_err(|_| Error::new("Could not enumerate the Git directory"))?;
     while let Some(entry) = stream.read() {
@@ -608,7 +616,7 @@ fn same_filesystem_tree(directory: &impl std::os::fd::AsFd, prefix: &str) -> Res
             Mode::empty(),
             ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
         ) {
-            Ok(child) => same_filesystem_tree(&child, &relative)?,
+            Ok(child) => same_filesystem_tree(&child, &relative, links_are_evidence)?,
             Err(rustix::io::Errno::XDEV) => {
                 return Err(Error::new(&format!(
                     "The Git directory's {relative} is another filesystem mounted inside the \
@@ -620,6 +628,12 @@ fn same_filesystem_tree(directory: &impl std::os::fd::AsFd, prefix: &str) -> Res
             // to a file, or to nothing, is a ref the census reports as
             // evidence, and refusing here would hide that behind a generic
             // refusal. Special entries are not directories Git writes into.
+            Err(rustix::io::Errno::LOOP) if !links_are_evidence => {
+                return Err(Error::new(&format!(
+                    "The Git directory's {relative} is a symbolic link; Git would write \
+                     through it, so compose refuses"
+                )));
+            }
             Err(rustix::io::Errno::LOOP) => {
                 if rustix::fs::statat(directory, name, AtFlags::empty()).is_ok_and(|target| {
                     rustix::fs::FileType::from_raw_mode(target.st_mode)
@@ -657,7 +671,9 @@ pub(super) fn store(common: &Path, observer: ResourceObserver) -> Result<Directo
         ) {
             Ok(fd) => {
                 super::files::qualified_filesystem(&fd, &format!("Git directory's {tree}"))?;
-                same_filesystem_tree(&fd, tree)?;
+                // Only reflogs are appended through a link to a file; links
+                // elsewhere are ref or store evidence reported as before.
+                same_filesystem_tree(&fd, tree, tree != "logs")?;
             }
             Err(rustix::io::Errno::XDEV) => {
                 return Err(Error::new(&format!(
@@ -842,7 +858,7 @@ mod write_tree_tests {
             ResolveFlags::NO_SYMLINKS,
         )
         .unwrap();
-        same_filesystem_tree(&fd, "refs")
+        same_filesystem_tree(&fd, "refs", true)
     }
 
     #[test]
@@ -862,6 +878,35 @@ mod write_tree_tests {
             refused.contains("symbolic link to a directory"),
             "{refused}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Under `logs` a link has no evidence role, and Git appends a reflog
+    /// through a link to a file, so any link there is refused.
+    #[test]
+    fn any_link_in_the_reflog_tree_is_refused() {
+        let root = tree("reflog-link");
+        std::fs::create_dir_all(root.join("logs/refs/heads")).unwrap();
+        std::fs::write(root.join("elsewhere/log"), "").unwrap();
+        let logs = |root: &Path| {
+            let fd = openat2(
+                rustix::fs::CWD,
+                root.join("logs"),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::NO_SYMLINKS,
+            )
+            .unwrap();
+            same_filesystem_tree(&fd, "logs", false)
+        };
+        assert!(logs(&root).is_ok());
+        std::os::unix::fs::symlink(
+            root.join("elsewhere/log"),
+            root.join("logs/refs/heads/master"),
+        )
+        .unwrap();
+        let refused = logs(&root).unwrap_err().to_string();
+        assert!(refused.contains("logs/refs/heads/master"), "{refused}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
