@@ -101,6 +101,8 @@ fn files(root: &Path, skip: &[&Path], found: &mut Vec<(PathBuf, Vec<u8>)>) {
             continue;
         }
         if path.is_dir() {
+            // A directory is state too: its name is searched below.
+            found.push((path.clone(), Vec::new()));
             files(&path, skip, found);
         } else {
             // Unreadable is not empty: it could hold what is searched for.
@@ -234,8 +236,10 @@ fn every_route_keeps_sql_out_of_the_cli_and_stores_no_approval() {
     let mut written = Vec::new();
     files(&project, &[], &mut written);
     for (path, bytes) in &written {
+        // A name can hold what a file does not: search both.
         assert!(
-            !String::from_utf8_lossy(bytes).contains(APPROVAL),
+            !path.display().to_string().contains(APPROVAL)
+                && !String::from_utf8_lossy(bytes).contains(APPROVAL),
             "{} holds the approval",
             path.display()
         );

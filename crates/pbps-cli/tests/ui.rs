@@ -529,6 +529,8 @@ fn a_connection_string_never_reaches_a_response_or_a_file() {
         for entry in std::fs::read_dir(path).unwrap() {
             let path = entry.unwrap().path();
             if path.is_dir() {
+                // A directory is state too: its name is searched below.
+                found.push((path.clone(), Vec::new()));
                 walk(&path, found);
             } else {
                 // Unreadable is not empty: it could hold what is searched for.
@@ -552,7 +554,8 @@ fn a_connection_string_never_reaches_a_response_or_a_file() {
     );
     files.push(("git objects".into(), objects.stdout));
     for (path, bytes) in &files {
-        let text = String::from_utf8_lossy(bytes);
+        // A name can hold what a file does not: search both.
+        let text = format!("{}\n{}", path.display(), String::from_utf8_lossy(bytes));
         assert!(
             !text.contains(SECRET),
             "{} holds the password",
