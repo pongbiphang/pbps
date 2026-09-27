@@ -126,14 +126,26 @@ pub enum Target {
     /// what keeps this command's promise to a reviewer holding nothing but a
     /// file.
     Connection(String),
-    Unresolved(anyhow::Error),
+    /// An environment that could not be resolved, and the engine it is
+    /// configured for where that is known anyway: a readable `pbps.yml` names
+    /// the dialect of an environment whose `url_env` is merely unset. Carried
+    /// apart from the error, so an incompatible environment is still reported
+    /// as one rather than offered in the approval command (DEC-562.1). `None` where
+    /// the project, or the environment in it, is unknown.
+    Unresolved {
+        error: anyhow::Error,
+        driver: Option<pbps_db::Driver>,
+    },
 }
 
 impl From<anyhow::Result<db::Target>> for Target {
     fn from(r: anyhow::Result<db::Target>) -> Self {
         match r {
             Ok(t) => Target::Reachable(t),
-            Err(e) => Target::Unresolved(e),
+            Err(error) => Target::Unresolved {
+                error,
+                driver: None,
+            },
         }
     }
 }
@@ -156,17 +168,24 @@ impl Target {
         match self {
             Target::None => Resolved::None,
             Target::Connection(c) => Resolved::Reachable(db::target_from_connection(&c, driver)),
-            Target::Reachable(t) if t.driver() != driver => {
-                Resolved::DialectMismatch(anyhow::anyhow!(
-                    "environment dialect mismatch: the plan requires {driver:?}, but the \
-                     configured target uses {:?}; the environment was not queried",
-                    t.driver()
-                ))
-            }
+            Target::Reachable(t) if t.driver() != driver => mismatch(driver, t.driver()),
             Target::Reachable(t) => Resolved::Reachable(t),
-            Target::Unresolved(e) => Resolved::Unresolved(e),
+            Target::Unresolved {
+                driver: Some(configured),
+                ..
+            } if configured != driver => mismatch(driver, configured),
+            Target::Unresolved { error, .. } => Resolved::Unresolved(error),
         }
     }
+}
+
+/// A known target engine that is not the plan's: reported, and never queried
+/// or offered for approval.
+fn mismatch(plan: pbps_db::Driver, configured: pbps_db::Driver) -> Resolved {
+    Resolved::DialectMismatch(anyhow::anyhow!(
+        "environment dialect mismatch: the plan requires {plan:?}, but the configured target \
+         uses {configured:?}; the environment was not queried"
+    ))
 }
 
 pub fn cmd_explain(

@@ -711,3 +711,16 @@ it needs no general JSON Schema containment (DECISIONS 465).
   It is covered only as far as the offline and connected envelope tests
   reach, the connected ones on the live CI jobs.
 
+<a id="dec-562-1"></a>
+
+**DEC-562.1. An environment's engine is known from the project before its
+secret is read, and a known mismatch is reported even when the secret is
+unset.** DECISIONS 481 compared the plan's driver with a pre-resolved `--env`
+target only, so an environment whose `url_env` was unset lost the engine with
+the connection string. `explain` then reported it as merely `unconfigured`
+and offered `--env <that environment>` in the approval command, which `apply`
+rejects once the secret is supplied. A readable `pbps.yml` that configures the
+named environment now carries its engine beside the resolution error, and a
+mismatch is reported as in 481, without connecting and with the environment
+replaced by the placeholder. An unknown environment, or no readable project,
+still knows no engine and keeps the file-only behavior.
