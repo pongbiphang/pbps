@@ -101,6 +101,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
+      # Terminal integration tests must fail when their fixture is unavailable.
+      - name: Required Linux PTY fixtures (util-linux and coreutils)
+        run: |
+          script --version
+          timeout --version
       - run: cargo test --workspace --all-targets
       # --all-targets excludes doctests. These compile-fail cases pin the
       # downstream opacity of source-bearing native capture inputs (#876).
