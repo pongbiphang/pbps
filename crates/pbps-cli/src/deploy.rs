@@ -462,7 +462,10 @@ fn module_object(id: &ModuleId) -> TableName {
 }
 
 /// What the SQL Server occupant read has to cover beyond the names the plan
-/// creates: the names its renames may move a generated default to (#975),
+/// creates: the constraints and generated defaults it adds, which the walk
+/// checks like a created table (#1201) and which only this read can find
+/// already held in the database (#1214); the names its renames may move a
+/// generated default to (#975),
 /// the generated one and the digested fallback taken when that is held
 /// (DEC-981.1), and the tables whose constraints, defaults and triggers its
 /// changes move or remove, by the catalog's names for them.
@@ -501,13 +504,51 @@ pub(crate) fn object_reads(cs: &pbps_model::ChangeSet) -> (Vec<TableName>, Vec<T
                 names.push(in_schema(table, fallback_name(table, to)));
             }
             Change::DropTable { name, .. } => parents.push(name.clone()),
-            Change::DropColumn { column, .. } | Change::AlterColumnDefault { column, .. } => {
+            Change::DropColumn { column, .. } => parents.push(now(&column.table)),
+            Change::AlterColumnDefault { column, to, .. } => {
                 parents.push(now(&column.table));
+                if to.is_some() {
+                    names.push(in_schema(
+                        &column.table,
+                        generated(&column.table, &column.name),
+                    ));
+                }
             }
             Change::DropUnique { table, .. }
             | Change::DropForeignKey { table, .. }
-            | Change::DropCheck { table, .. }
-            | Change::SetPrimaryKey { table, .. } => parents.push(now(table)),
+            | Change::DropCheck { table, .. } => parents.push(now(table)),
+            Change::SetPrimaryKey { table, to, .. } => {
+                parents.push(now(table));
+                if let Some(name) = to.as_ref().and_then(|k| k.name.as_deref()) {
+                    names.push(in_schema(table, name.to_owned()));
+                }
+            }
+            Change::AddUnique { table, name, .. }
+            | Change::AddForeignKey { table, name, .. }
+            | Change::AddCheck { table, name, .. } => {
+                names.push(in_schema(table, name.clone()));
+            }
+            Change::AddColumn {
+                table,
+                name,
+                column,
+                ..
+            } if column.default.is_some() => names.push(in_schema(table, generated(table, name))),
+            Change::CreateTable { name, table, .. } => {
+                for (column, spec) in &table.columns {
+                    if spec.default.is_some() {
+                        names.push(in_schema(name, generated(name, column)));
+                    }
+                }
+                let named = table
+                    .primary_key
+                    .iter()
+                    .filter_map(|k| k.name.clone())
+                    .chain(table.unique.keys().cloned())
+                    .chain(table.foreign_keys.keys().cloned())
+                    .chain(table.checks.keys().cloned());
+                names.extend(named.map(|n| in_schema(name, n)));
+            }
             _ => {}
         }
     }
@@ -7538,6 +7579,31 @@ mod tests {
             )),
             "{names:?}"
         );
+        // #1214: every name the walk claims for an addition is read too, so
+        // one already held in the database is found.
+        let cs = plan(vec![
+            PlannedChange::new(Change::AddCheck {
+                table: old.clone(),
+                name: "ck_added".into(),
+                constraint: pbps_model::CheckConstraint {
+                    expression: "1 = 1".into(),
+                },
+            }),
+            PlannedChange::new(Change::AddUnique {
+                table: old.clone(),
+                name: "uq_added".into(),
+                constraint: pbps_model::UniqueConstraint {
+                    columns: vec!["id".into()],
+                },
+            }),
+        ]);
+        let (added, _) = object_reads(&cs);
+        for name in ["ck_added", "uq_added"] {
+            assert!(
+                added.contains(&TableName::new("dbo", name)),
+                "{name}: {added:?}"
+            );
+        }
         // And the fallback the move takes when that is held (#981).
         assert!(
             names.contains(&TableName::new(
