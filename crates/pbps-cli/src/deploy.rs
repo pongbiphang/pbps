@@ -546,7 +546,8 @@ struct Held {
 ///   nothing holds that name at that point (#975), and otherwise to the
 ///   digested fallback when nothing holds that (DEC-981.1);
 /// - a dropped column takes its default, and a changed default is replaced;
-/// - added constraints, defaults, tables and modules take their names.
+/// - added constraints, defaults, tables and modules take their names, each
+///   refused if the walk holds that name when it is added (#1201).
 ///
 /// So a name freed before the `CREATE` runs is free, and a name something
 /// moves into first is taken, whatever order the changes that do it come in.
@@ -628,7 +629,12 @@ pub(crate) fn refuse_occupied_objects(
         }
     };
     let mut taken: Vec<String> = Vec::new();
-    let mut create = |held: &mut Vec<Held>, name: &TableName, kind: &str| {
+    // Every name a change adds is checked against what the walk holds at that
+    // point, not only a created table's or module's: a constraint or default
+    // the plan adds under a name it or the database already holds fails
+    // with Msg 2714 just the same (#1201).
+    let mut claim = |held: &mut Vec<Held>, entry: Held| {
+        let name = &entry.name;
         if let Some(i) = at(held, name) {
             let h = &held[i];
             let what = match &h.parent {
@@ -641,13 +647,14 @@ pub(crate) fn refuse_occupied_objects(
                 format!("`{name}`: the database already has {what}")
             });
         }
-        held.push(Held {
-            name: name.clone(),
-            kind: kind.into(),
-            parent: None,
-            column: None,
-            planned: true,
-        });
+        held.push(entry);
+    };
+    let object = |name: &TableName, kind: &str| Held {
+        name: name.clone(),
+        kind: kind.into(),
+        parent: None,
+        column: None,
+        planned: true,
     };
     for p in &cs.changes {
         match &p.change {
@@ -729,7 +736,7 @@ pub(crate) fn refuse_occupied_objects(
                     });
                 }
                 if to.is_some() {
-                    held.push(default_of(&column.table, &column.name));
+                    claim(&mut held, default_of(&column.table, &column.name));
                 }
             }
             Change::AddColumn {
@@ -737,7 +744,7 @@ pub(crate) fn refuse_occupied_objects(
                 name,
                 column,
                 ..
-            } if column.default.is_some() => held.push(default_of(table, name)),
+            } if column.default.is_some() => claim(&mut held, default_of(table, name)),
             Change::DropUnique { table, name }
             | Change::DropForeignKey { table, name }
             | Change::DropCheck { table, name } => {
@@ -745,13 +752,13 @@ pub(crate) fn refuse_occupied_objects(
                 held.retain(|h| h.name != name);
             }
             Change::AddUnique { table, name, .. } => {
-                held.push(constraint(table, name, "unique constraint"));
+                claim(&mut held, constraint(table, name, "unique constraint"));
             }
             Change::AddForeignKey { table, name, .. } => {
-                held.push(constraint(table, name, "foreign key constraint"));
+                claim(&mut held, constraint(table, name, "foreign key constraint"));
             }
             Change::AddCheck { table, name, .. } => {
-                held.push(constraint(table, name, "check constraint"));
+                claim(&mut held, constraint(table, name, "check constraint"));
             }
             Change::SetPrimaryKey { table, from, to } => {
                 match from.as_ref().map(|k| k.name.as_deref()) {
@@ -767,16 +774,16 @@ pub(crate) fn refuse_occupied_objects(
                     None => {}
                 }
                 if let Some(name) = to.as_ref().and_then(|k| k.name.as_deref()) {
-                    held.push(constraint(table, name, "primary key constraint"));
+                    claim(&mut held, constraint(table, name, "primary key constraint"));
                 }
             }
             Change::CreateTable { name, table, .. } => {
-                create(&mut held, name, "user table");
+                claim(&mut held, object(name, "user table"));
                 // Its own constraints and generated defaults take their names
                 // with it, for whatever the plan creates after.
                 for (column, spec) in &table.columns {
                     if spec.default.is_some() {
-                        held.push(default_of(name, column));
+                        claim(&mut held, default_of(name, column));
                     }
                 }
                 let named = table
@@ -803,11 +810,14 @@ pub(crate) fn refuse_occupied_objects(
                             .map(|n| (n.as_str(), "check constraint")),
                     );
                 for (n, kind) in named {
-                    held.push(constraint(name, n, kind));
+                    claim(&mut held, constraint(name, n, kind));
                 }
             }
             Change::CreateModule { id, module } => {
-                create(&mut held, &module_object(id), &module.kind.to_string());
+                claim(
+                    &mut held,
+                    object(&module_object(id), &module.kind.to_string()),
+                );
             }
             _ => {}
         }
@@ -7268,6 +7278,79 @@ mod tests {
         assert!(
             refuse_occupied_objects(&moves, &[on_another_column], "prod").is_err(),
             "another column's default under this column's name is not moved"
+        );
+        // #1201: a constraint the plan adds is checked like a created table.
+        // With the target held, the rename parks the default at its fallback,
+        // so a check added under that name after it is refused, naming the
+        // default; under a free name it passes, and a check dropped and
+        // added again under one name passes too.
+        let check_named = |name: &str| {
+            PlannedChange::new(Change::AddCheck {
+                table: old.clone(),
+                name: name.into(),
+                constraint: pbps_model::CheckConstraint {
+                    expression: "1 = 1".into(),
+                },
+            })
+        };
+        let e = refuse_occupied_objects(
+            &plan(vec![rename_column(), check_named(&fallback.name)]),
+            &[the_default.clone(), synonym_at(&target)],
+            "prod",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains(&format!("this plan puts default constraint `{fallback}`")),
+            "{e}"
+        );
+        refuse_occupied_objects(
+            &plan(vec![rename_column(), check_named("ck_free")]),
+            &[the_default.clone(), synonym_at(&target)],
+            "prod",
+        )
+        .expect("a check under a free name");
+        let existing_check = NameOccupant {
+            wanted: TableName::new("dbo", "ck_same"),
+            name: TableName::new("dbo", "ck_same"),
+            kind: "check constraint".into(),
+            parent: Some(old.clone()),
+            parent_column: None,
+        };
+        refuse_occupied_objects(
+            &plan(vec![
+                PlannedChange::new(Change::DropCheck {
+                    table: old.clone(),
+                    name: "ck_same".into(),
+                }),
+                check_named("ck_same"),
+            ]),
+            &[existing_check],
+            "prod",
+        )
+        .expect("a check dropped and added again under its name");
+        // And a new column's generated default, where the old default is
+        // still held because target and fallback are both taken.
+        let mut defaulted = pbps_model::Column::new("int".parse().unwrap());
+        defaulted.default = Some("0".into());
+        let add_c = PlannedChange::new(Change::AddColumn {
+            uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.old", 0),
+            table: old.clone(),
+            name: "c".into(),
+            column: Box::new(defaulted),
+        });
+        assert!(
+            refuse_occupied_objects(
+                &plan(vec![rename_column(), add_c]),
+                &[
+                    the_default.clone(),
+                    synonym_at(&target),
+                    synonym_at(&fallback)
+                ],
+                "prod"
+            )
+            .is_err(),
+            "the old default still holds the name the new column generates"
         );
         // #981: a taken target sends it to its digested fallback, which
         // frees the old name for the table created after it, as the emitted
