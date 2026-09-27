@@ -876,8 +876,12 @@ no `CLUSTERED`"), which no longer holds.
 `pull` declares a clustered rowstore index or key (narrowing DECISIONS 14 and
 #1186's limitation). It still leaves out a key backed by any other index
 kind, a disabled clustered index, and a nonclustered key whose table's
-clustered index it left out: without that index the key's layout is one no
-declaration can write. PostgreSQL refuses the field, since `CLUSTER` is a
+clustered index it left out (a clustered columnstore included): without that
+index the key's layout is one no declaration can write. It also leaves out
+each of these newly adopted layouts on a table whose rows sit on a partition
+scheme, since the declarations hold no data space and bootstrap would build
+the table unpartitioned; the shapes adopted before this, on partitioned rows,
+are #1227. PostgreSQL refuses the field, since `CLUSTER` is a
 one-time reorder rather than a layout. The operational estimate calls a
 clustered build, and the drop of an object the catalog confirms is clustered,
 a rewrite of every row under Sch-M (measured on 17.0: new partition ids for

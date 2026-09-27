@@ -139,6 +139,10 @@ SELECT c.object_id, c.name, ty.name AS type_name,
          ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id
  ORDER BY c.object_id, c.column_id;";
 
+/// `rows_partitioned` says whether the table's rows (its heap or clustered
+/// index) sit on a partition scheme, which no declaration can say (#1209
+/// review).
+///
 /// `ki.type` travels for the same reason it does in `INDEX_COLUMNS`: the
 /// declarations spell neither `CLUSTERED` nor `NONCLUSTERED` on a key, so a
 /// key whose layout is not the engine's default for its kind would come back
@@ -146,7 +150,12 @@ SELECT c.object_id, c.name, ty.name AS type_name,
 const KEY_COLUMNS: &str = "\
 SELECT kc.parent_object_id AS object_id, kc.name,
        CONVERT(bit, CASE WHEN kc.type = 'PK' THEN 1 ELSE 0 END) AS is_primary,
-       col.name AS column_name, ki.is_disabled, ki.ignore_dup_key, ki.type AS index_type
+       col.name AS column_name, ki.is_disabled, ki.ignore_dup_key, ki.type AS index_type,
+       CONVERT(bit, CASE WHEN EXISTS (
+           SELECT 1 FROM sys.indexes b
+             JOIN sys.data_spaces bd ON bd.data_space_id = b.data_space_id
+            WHERE b.object_id = kc.parent_object_id AND b.index_id IN (0, 1) AND bd.type = 'PS')
+         THEN 1 ELSE 0 END) AS rows_partitioned
   FROM sys.key_constraints kc
   JOIN sys.indexes ki
     ON ki.object_id = kc.parent_object_id AND ki.index_id = kc.unique_index_id
@@ -199,7 +208,12 @@ SELECT cc.parent_object_id AS object_id, cc.object_id AS constraint_object_id,
 const INDEX_COLUMNS: &str = "\
 SELECT i.object_id, i.name, i.is_unique, i.type AS index_type, i.is_disabled, i.ignore_dup_key,
        i.filter_definition,
-       col.name AS column_name, ic.is_included_column, ic.is_descending_key
+       col.name AS column_name, ic.is_included_column, ic.is_descending_key,
+       CONVERT(bit, CASE WHEN EXISTS (
+           SELECT 1 FROM sys.indexes b
+             JOIN sys.data_spaces bd ON bd.data_space_id = b.data_space_id
+            WHERE b.object_id = i.object_id AND b.index_id IN (0, 1) AND bd.type = 'PS')
+         THEN 1 ELSE 0 END) AS rows_partitioned
   FROM sys.indexes i
   JOIN sys.index_columns ic
     ON ic.object_id = i.object_id AND ic.index_id = i.index_id
@@ -372,6 +386,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             is_disabled: get(&row, "is_disabled")?,
             ignore_dup_key: get(&row, "ignore_dup_key")?,
             index_type: get(&row, "index_type")?,
+            rows_partitioned: get(&row, "rows_partitioned")?,
 
             object_id: get(&row, "object_id")?,
             constraint_name: get::<&str>(&row, "name")?.to_owned(),
@@ -424,6 +439,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             column: get::<&str>(&row, "column_name")?.to_owned(),
             is_included: get(&row, "is_included_column")?,
             is_descending: get(&row, "is_descending_key")?,
+            rows_partitioned: get(&row, "rows_partitioned")?,
         });
     }
 

@@ -2021,6 +2021,60 @@ async fn every_rowstore_layout_round_trips_through_an_empty_database() {
     assert_eq!(types("c"), [("pk_c", 1), ("uq_c_code", 2)]);
 }
 
+/// Partitioned rows under a layout this reader adopts since #1178 — a
+/// clustered index, a clustered UNIQUE constraint, a nonclustered key on a
+/// partitioned heap — are left out and named: declared, bootstrap would build
+/// the table unpartitioned (#1209 review). Measured on 17.0: the partition
+/// scheme shows as data space type `PS` on the heap's or the clustered
+/// index's row, and a nonclustered key beside a partitioned clustered index
+/// can sit on a plain filegroup, so the rows' data space is what is read.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_layout_on_partitioned_rows_is_left_out_and_named() {
+    let mut db = TestDb::create("partition1178").await;
+    db.conn
+        .execute(
+            "CREATE PARTITION FUNCTION pf (int) AS RANGE RIGHT FOR VALUES (10, 20);
+             CREATE PARTITION SCHEME ps AS PARTITION pf ALL TO ([PRIMARY]);",
+        )
+        .await
+        .expect("create the partition scheme");
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.x (id int NOT NULL, v int NOT NULL,
+                 CONSTRAINT pk_x PRIMARY KEY NONCLUSTERED (id, v) ON [PRIMARY]);
+             CREATE CLUSTERED INDEX cx_x ON dbo.x (v) ON ps (v);
+             CREATE TABLE dbo.h (id int NOT NULL,
+                 CONSTRAINT pk_h PRIMARY KEY NONCLUSTERED (id) ON [PRIMARY]) ON ps (id);
+             CREATE TABLE dbo.u (id int NOT NULL,
+                 CONSTRAINT uq_u UNIQUE CLUSTERED (id) ON ps (id));
+             CREATE TABLE dbo.plain (id int NOT NULL CONSTRAINT pk_plain PRIMARY KEY NONCLUSTERED);",
+        )
+        .await
+        .expect("create partitioned tables");
+    let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    db.drop().await;
+
+    let t = |name: &str| &pulled.schema.tables[&TableName::new("dbo", name)];
+    assert!(t("x").indexes.is_empty());
+    assert_eq!(t("x").primary_key, None);
+    assert!(t("u").unique.is_empty());
+    assert_eq!(t("h").primary_key, None);
+    let said = pulled.warnings.join("\n");
+    for name in ["cx_x", "uq_u", "pk_h", "pk_x"] {
+        assert!(
+            said.contains(&format!(
+                "`{name}`: the table's rows are on a partition scheme"
+            )),
+            "{name}: {said}"
+        );
+    }
+    // Negative: unpartitioned, the same key is declared as a heap's.
+    assert_eq!(t("plain").clustered, Some(Clustered::Heap));
+}
+
 /// A key the plan adds as the clustered index spells `CLUSTERED`, so a
 /// clustered index nobody declared stops the plan instead of turning the key
 /// nonclustered underneath it. Measured before the keyword was spelled: the

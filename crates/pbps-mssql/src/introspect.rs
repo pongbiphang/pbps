@@ -103,6 +103,9 @@ pub struct RawKeyColumn {
     /// nonclustered rowstore, anything else a kind a key declaration cannot
     /// spell either.
     pub index_type: u8,
+    /// The table's rows sit on a partition scheme (its heap or its clustered
+    /// index does), which no declaration can say.
+    pub rows_partitioned: bool,
     pub object_id: i32,
     pub constraint_name: String,
     pub is_primary: bool,
@@ -179,10 +182,19 @@ impl IndexKind {
 /// unmodelled write behavior is left out by the rule every unique index
 /// follows; a disabled one of any kind is too, because disabling the
 /// clustered index makes the table's rows unreadable, and a declaration has no
-/// way to say so (#1178).
+/// way to say so (#1178). So is a partitioned one: the declarations hold no
+/// partition scheme, and bootstrap would build the table unpartitioned (#1209
+/// review).
 fn clustered_index_left_out(i: &RawIndexColumn) -> bool {
-    i.is_disabled || (i.is_unique && i.ignore_dup_key)
+    i.is_disabled || (i.is_unique && i.ignore_dup_key) || i.rows_partitioned
 }
+
+/// Why a layout this reader adopts since #1178 — a clustered UNIQUE
+/// constraint or index, or a nonclustered primary key — cannot be declared on
+/// a table whose rows are partitioned. The shapes it adopted before keep their
+/// older reading; that gap is its own issue.
+const PARTITIONED: &str = "the table's rows are on a partition scheme, which the declarations \
+     cannot hold, and bootstrap would build the table unpartitioned";
 
 /// How an unmodelled index type is named to the operator.
 ///
@@ -214,6 +226,8 @@ pub struct RawIndexColumn {
     pub column: String,
     pub is_included: bool,
     pub is_descending: bool,
+    /// The table's rows sit on a partition scheme; see [`RawKeyColumn`].
+    pub rows_partitioned: bool,
 }
 
 /// One view, procedure, function or trigger, as `sys.objects` and
@@ -926,7 +940,11 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     let lost_clustered: BTreeMap<i32, String> = raw
         .key_columns
         .iter()
-        .filter(|k| !k.is_primary && k.index_type == 1 && (k.is_disabled || k.ignore_dup_key))
+        .filter(|k| {
+            !k.is_primary
+                && k.index_type == 1
+                && (k.is_disabled || k.ignore_dup_key || k.rows_partitioned)
+        })
         .map(|k| (k.object_id, k.constraint_name.clone()))
         .chain(
             raw.index_columns
@@ -989,6 +1007,28 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                         name_of(k.object_id, &names),
                         k.constraint_name,
                         index_type_name(k.index_type),
+                    ),
+                );
+            }
+            continue;
+        }
+        // The two key layouts this reader adopts since #1178, on a table
+        // whose rows are partitioned.
+        if k.rows_partitioned && k.index_type == if k.is_primary { 2 } else { 1 } {
+            if unsupported_keys.insert((k.object_id, k.constraint_name.clone())) {
+                let kind = if k.is_primary {
+                    "nonclustered primary key"
+                } else {
+                    "clustered unique constraint"
+                };
+                push_limitation(
+                    &mut warnings,
+                    &mut limitations,
+                    names.get(&k.object_id),
+                    format!(
+                        "{}: {kind} `{}`: {PARTITIONED}, so it was left out of the declarations",
+                        name_of(k.object_id, &names),
+                        k.constraint_name,
                     ),
                 );
             }
@@ -1076,11 +1116,19 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     &mut warnings,
                     &mut limitations,
                     names.get(&i.object_id),
-                    format!(
-                        "{}: clustered index `{}` is disabled, which leaves the table's rows unreadable until it is rebuilt; a declaration cannot say so, and bootstrap would create it enabled, so it was left out of the declarations",
-                        name_of(i.object_id, &names),
-                        i.index_name,
-                    ),
+                    if i.rows_partitioned {
+                        format!(
+                            "{}: clustered index `{}`: {PARTITIONED}, so it was left out of the declarations",
+                            name_of(i.object_id, &names),
+                            i.index_name,
+                        )
+                    } else {
+                        format!(
+                            "{}: clustered index `{}` is disabled, which leaves the table's rows unreadable until it is rebuilt; a declaration cannot say so, and bootstrap would create it enabled, so it was left out of the declarations",
+                            name_of(i.object_id, &names),
+                            i.index_name,
+                        )
+                    },
                 );
             }
             continue;
@@ -2020,6 +2068,7 @@ mod tests {
                 constraint_name: "pk_customer".into(),
                 is_primary: true,
                 column: "id".into(),
+                rows_partitioned: false,
             }],
             ..Default::default()
         }
@@ -2423,6 +2472,7 @@ mod tests {
                 constraint_name: "pk_customer".into(),
                 is_primary: true,
                 column: "email".into(),
+                rows_partitioned: false,
             },
             RawKeyColumn {
                 is_disabled: false,
@@ -2432,6 +2482,7 @@ mod tests {
                 constraint_name: "pk_customer".into(),
                 is_primary: true,
                 column: "id".into(),
+                rows_partitioned: false,
             },
         ];
         let p = assemble(&raw);
@@ -2578,6 +2629,7 @@ mod tests {
             constraint_name: name.into(),
             is_primary,
             column: column.into(),
+            rows_partitioned: false,
         }
     }
 
@@ -2604,6 +2656,7 @@ mod tests {
             column: "code".into(),
             is_included: false,
             is_descending: false,
+            rows_partitioned: false,
         };
         raw.index_columns = vec![
             index(1, "ux_p_code", IndexKind::Unmodelled(7), false),
@@ -2703,6 +2756,7 @@ mod tests {
             column: "code".into(),
             is_included: false,
             is_descending: false,
+            rows_partitioned: false,
         });
         for (name, ref_object_id, ref_table, ref_key, ref_column) in [
             ("fk_child_h", 1, "h", "pk_h", "id"),
@@ -2798,6 +2852,7 @@ mod tests {
             column: "email".into(),
             is_included: false,
             is_descending: true,
+            rows_partitioned: false,
         };
         raw.index_columns.push(base.clone());
         raw.index_columns.push(RawIndexColumn {
@@ -2834,6 +2889,7 @@ mod tests {
             column: "id".into(),
             is_included: false,
             is_descending: false,
+            rows_partitioned: false,
         };
         raw.index_columns.push(customer_index.clone());
         raw.index_columns.push(RawIndexColumn {
@@ -2870,6 +2926,7 @@ mod tests {
             column: "id".into(),
             is_included: false,
             is_descending: false,
+            rows_partitioned: false,
         };
         let mut raw = one_table_catalog();
         raw.key_columns[0].index_type = 2;
@@ -2904,6 +2961,66 @@ mod tests {
         assert_eq!(t.clustered, Some(Clustered::Heap));
     }
 
+    /// The layouts this reader adopts since #1178 are left out on a table
+    /// whose rows are partitioned: declared, bootstrap would build the table
+    /// unpartitioned (#1209 review). A nonclustered key beside a partitioned
+    /// clustered index is on partitioned rows too, whatever filegroup it is
+    /// on, and goes for that reason.
+    #[test]
+    fn a_layout_on_partitioned_rows_is_left_out() {
+        let mut raw = RawCatalog::default();
+        for (id, name) in [(1, "x"), (2, "u"), (3, "h"), (4, "plain")] {
+            raw.tables.push(raw_table(id, "dbo", name));
+            raw.columns.push(raw_column(id, "id", "int"));
+        }
+        let mut pk_x = key(1, "pk_x", true, 2, "id");
+        pk_x.rows_partitioned = true;
+        let mut uq_u = key(2, "uq_u", false, 1, "id");
+        uq_u.rows_partitioned = true;
+        let mut pk_h = key(3, "pk_h", true, 2, "id");
+        pk_h.rows_partitioned = true;
+        raw.key_columns = vec![pk_x, uq_u, pk_h, key(4, "pk_plain", true, 2, "id")];
+        raw.index_columns.push(RawIndexColumn {
+            is_disabled: false,
+            ignore_dup_key: false,
+            object_id: 1,
+            index_name: "cx_x".into(),
+            is_unique: false,
+            kind: IndexKind::Clustered,
+            filter: None,
+            column: "id".into(),
+            is_included: false,
+            is_descending: false,
+            rows_partitioned: true,
+        });
+        let p = assemble(&raw);
+        let t = |name: &str| &p.schema.tables[&TableName::new("dbo", name)];
+        assert!(t("x").indexes.is_empty());
+        assert_eq!(t("x").primary_key, None);
+        assert!(t("u").unique.is_empty());
+        assert_eq!(t("h").primary_key, None);
+        for table in ["x", "u", "h"] {
+            assert_eq!(t(table).clustered, None, "{table}");
+        }
+        let said = p
+            .limitations
+            .iter()
+            .map(|l| l.detail.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for name in ["cx_x", "uq_u", "pk_h", "pk_x"] {
+            assert!(
+                said.contains(&format!(
+                    "`{name}`: the table's rows are on a partition scheme"
+                )),
+                "{name}: {said}"
+            );
+        }
+        // Negative: the same nonclustered key on unpartitioned rows is kept.
+        assert_eq!(t("plain").clustered, Some(Clustered::Heap));
+        assert_eq!(p.limitations.len(), 4, "{said}");
+    }
+
     /// Negative: a disabled clustered index leaves the table's rows
     /// unreadable, which no declaration says, so it is reported rather than
     /// declared as an ordinary clustered index bootstrap would build enabled.
@@ -2922,6 +3039,7 @@ mod tests {
             column: "id".into(),
             is_included: false,
             is_descending: false,
+            rows_partitioned: false,
         });
         let p = assemble(&raw);
         let t = &p.schema.tables[&TableName::new("dbo", "customer")];
@@ -2962,6 +3080,7 @@ mod tests {
             column: "email".into(),
             is_included: false,
             is_descending: false,
+            rows_partitioned: false,
         };
         let mut raw = one_table_catalog();
         raw.index_columns.push(column("cci", 5));
