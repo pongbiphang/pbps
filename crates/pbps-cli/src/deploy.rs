@@ -3030,23 +3030,31 @@ fn refuse_unplanned_movement(
             // And which of them holds the rows (#1178). Every part can read
             // back unchanged while another session moves the clustered index
             // between them, so the layout is compared on its own. The plan
-            // moves it only through the key or the object a selector names,
-            // on either side, so those are what excuse a difference.
-            // A free function: the name it returns borrows from the layout,
+            // moves it only by changing the object that holds the rows on one
+            // side or the other — the clustered key, or the constraint or
+            // index a selector names — so only those excuse a difference. A
+            // change to a nonclustered key moves nothing (#1209 review).
+            // A free function: the name it returns borrows from the table,
             // which a closure cannot say.
-            fn named_by(layout: &Option<pbps_model::Clustered>) -> Option<(Part, &str)> {
-                match layout {
+            fn holds_the_rows(t: &pbps_model::Table) -> Option<(Part, &str)> {
+                match &t.clustered {
+                    None if t.primary_key.is_some() => Some((Part::PrimaryKey, "")),
                     Some(pbps_model::Clustered::Unique(n)) => Some((Part::Unique, n.as_str())),
                     Some(pbps_model::Clustered::Index(n)) => Some((Part::Index, n.as_str())),
-                    Some(pbps_model::Clustered::Heap) | None => None,
+                    None | Some(pbps_model::Clustered::Heap) => None,
                 }
             }
-            let plan_moves_layout = keys.contains(now_name)
-                || [&was.clustered, &now.clustered]
-                    .into_iter()
-                    .filter_map(named_by)
-                    .any(|part| moved_parts.contains(&part));
-            if was.clustered != now.clustered && !plan_moves_layout {
+            let plan_moves_layout = [holds_the_rows(was), holds_the_rows(now)]
+                .into_iter()
+                .flatten()
+                .any(|part| match part {
+                    (Part::PrimaryKey, _) => keys.contains(now_name),
+                    part => moved_parts.contains(&part),
+                });
+            // Compared by what holds the rows, not by the selector's
+            // spelling: a nonclustered key added to a keyless heap turns an
+            // absent selector into `heap`, and the rows are where they were.
+            if holds_the_rows(was) != holds_the_rows(now) && !plan_moves_layout {
                 moved.push(format!(
                     "{now_name} is clustered differently from the table the plan was approved \
                      over, and no change of this plan moves its clustered index"
@@ -10543,6 +10551,9 @@ mod tests {
         let e = check(&unrelated, &schema(Some(Clustered::Index("ix".into()))))
             .expect_err("another session made ix the clustered index");
         assert!(format!("{e:#}").contains("clustered differently"), "{e:#}");
+        let e = check(&unrelated, &schema(Some(Clustered::Heap)))
+            .expect_err("another session rebuilt the key nonclustered");
+        assert!(format!("{e:#}").contains("clustered differently"), "{e:#}");
         // The plan's own move is not movement.
         let moving = pbps_model::ChangeSet {
             changes: vec![
@@ -10572,6 +10583,49 @@ mod tests {
         };
         check(&moving, &schema(Some(Clustered::Index("ix".into()))))
             .expect("the plan moved it itself");
+
+        // A change to a key that holds the rows on neither side moves
+        // nothing: with the key nonclustered beside a clustered `ix`, a
+        // second session moving the rows to `ix2` is still movement.
+        let mut t2 = t.clone();
+        t2.indexes.insert("ix2".into(), t.indexes["ix"].clone());
+        let beside = |layout: &str| {
+            let mut t = t2.clone();
+            t.clustered = Some(Clustered::Index(layout.into()));
+            Schema {
+                tables: [(name.clone(), t)].into(),
+                ..Default::default()
+            }
+        };
+        let rekeying = pbps_model::ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::SetPrimaryKey {
+                    table: name.clone(),
+                    from: t.primary_key.clone(),
+                    to: None,
+                    nonclustered: false,
+                }),
+                PlannedChange::new(Change::SetPrimaryKey {
+                    table: name.clone(),
+                    from: None,
+                    to: t.primary_key.clone(),
+                    nonclustered: true,
+                }),
+            ],
+        };
+        let recheck = |after: &Schema| {
+            refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                &rekeying,
+                &beside("ix"),
+                after,
+                "test",
+                Settled::SoFar,
+            )
+        };
+        recheck(&beside("ix")).expect("the nonclustered key replaced, as planned");
+        let e = recheck(&beside("ix2")).expect_err("someone else moved the rows to ix2");
+        assert!(format!("{e:#}").contains("clustered differently"), "{e:#}");
     }
 
     /// A created table's layout is held with its parts (#1178): read back
