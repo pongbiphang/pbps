@@ -326,3 +326,225 @@ fn removing_a_predicate_can_retain_the_plain_index_catalog_record() {
     evidence.transitions.clear();
     assert!(evidence.validate(&changes).is_err());
 }
+
+// A default and its owner are distinct catalog records. Keeping only the
+// child's transition must not leave a dropped owner, or omit a created one,
+// even when the binding-surface inventory contains only the expression.
+fn owner_coverage(change: Change, owner: Surface, child: Surface, creating: bool) {
+    use crate::resolver::{BoundSurface, Prerequisite};
+    let table: TableName = "app.v".parse().unwrap();
+    let (_, mut evidence) = drop_fixture(
+        Change::DropTable {
+            uid: "t_000000".parse().unwrap(),
+            name: table.clone(),
+        },
+        Surface::Table(table.clone()),
+    );
+    let table_object = evidence.surfaces[0]
+        .current
+        .as_ref()
+        .unwrap()
+        .object
+        .clone();
+    let column_object = ObjectIdentity {
+        class: "column".into(),
+        name: vec!["n".into()],
+        signature: vec![table_object.clone()],
+    };
+    let owner_object = if matches!(owner, Surface::Table(_)) {
+        table_object.clone()
+    } else {
+        column_object.clone()
+    };
+    let child_object = if matches!(child, Surface::Column(_)) {
+        column_object
+    } else {
+        ObjectIdentity {
+            class: "default".into(),
+            name: vec!["n".into()],
+            signature: vec![table_object],
+        }
+    };
+    let mut records = evidence.before.prerequisites().to_vec();
+    for object in [&owner_object, &child_object] {
+        if !records.iter().any(|p| &p.object == object) {
+            records.push(Prerequisite {
+                object: object.clone(),
+                canonicalization: "fixture-v1".into(),
+                properties: "dd".repeat(32),
+                bindings: vec![],
+            });
+        }
+    }
+    records.sort_by(|a, b| a.object.cmp(&b.object));
+    let manifest = |owner_present: bool, child_present: bool| {
+        let records: Vec<_> = records
+            .iter()
+            .filter(|p| {
+                (p.object != owner_object || owner_present)
+                    && (p.object != child_object || child_present)
+            })
+            .collect();
+        let mut membership = evidence.before.membership().to_vec();
+        for m in &mut membership {
+            m.members
+                .retain(|id| records.iter().any(|p| &p.object == id));
+        }
+        let mut json = serde_json::to_value(&evidence.before).unwrap();
+        json["prerequisites"] = serde_json::to_value(records).unwrap();
+        json["membership"] = serde_json::to_value(membership).unwrap();
+        serde_json::from_value::<InputManifest>(json).unwrap()
+    };
+    let before = manifest(!creating, !creating);
+    let compiled = manifest(creating, creating);
+    let wrong_after = manifest(!creating, creating);
+    let changes = ChangeSet {
+        changes: vec![PlannedChange::new(change)],
+    };
+    let observation = BoundSurface {
+        object: child_object.clone(),
+        bindings: vec![],
+        managed_inputs: BTreeSet::new(),
+    };
+    evidence.before = before;
+    evidence.surfaces = vec![SurfaceResolution {
+        surface: child.clone(),
+        current: (!creating).then(|| observation.clone()),
+        desired: creating.then_some(observation),
+    }];
+    let owned = BTreeSet::from([owner_object.clone(), child_object.clone()]);
+    evidence.transitions = vec![ObjectTransition {
+        surface: owner,
+        before: if creating {
+            BTreeSet::new()
+        } else {
+            owned.clone()
+        },
+        after: if creating { owned } else { BTreeSet::new() },
+    }];
+    evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
+    evidence.after = evidence
+        .before
+        .project(&changes, &compiled, &evidence.transitions)
+        .unwrap();
+    evidence.validate(&changes).unwrap();
+    assert_eq!(evidence.after, compiled);
+    // Aggregate table ownership remains valid for ADD COLUMN plus its default.
+    if matches!(evidence.transitions[0].surface, Surface::Column(_)) {
+        let mut aggregate = evidence.clone();
+        aggregate.transitions[0].surface = Surface::Table(table);
+        aggregate.validate(&changes).unwrap();
+    }
+    let child_only = BTreeSet::from([child_object]);
+    evidence.transitions = vec![ObjectTransition {
+        surface: child,
+        before: if creating {
+            BTreeSet::new()
+        } else {
+            child_only.clone()
+        },
+        after: if creating {
+            child_only
+        } else {
+            BTreeSet::new()
+        },
+    }];
+    assert!(
+        evidence
+            .before
+            .project(&changes, &compiled, &evidence.transitions)
+            .is_err(),
+        "child-only transition must not substitute for the changed owner"
+    );
+    assert!(
+        ResolverEvidence::new(
+            &changes,
+            evidence.qualification.clone(),
+            evidence.authorization.clone(),
+            evidence.before.clone(),
+            &compiled,
+            evidence.surfaces.clone(),
+            evidence.transitions.clone(),
+            evidence.ordering.clone(),
+        )
+        .is_err(),
+        "constructor accepted a missing owner transition"
+    );
+    evidence.after = wrong_after;
+    assert_eq!(
+        evidence
+            .after
+            .prerequisites()
+            .iter()
+            .any(|p| p.object == owner_object),
+        !creating
+    );
+    let decoded: ResolverEvidence =
+        serde_json::from_value(serde_json::to_value(evidence).unwrap()).unwrap();
+    assert!(
+        decoded.validate(&changes).is_err(),
+        "reader accepted a stale owner record"
+    );
+}
+
+#[test]
+fn table_drops_require_the_owner_even_with_a_child_transition() {
+    let table: TableName = "app.v".parse().unwrap();
+    for child in [
+        Surface::Default(table.column("n")),
+        Surface::Column(table.column("n")),
+    ] {
+        owner_coverage(
+            Change::DropTable {
+                uid: "t_000000".parse().unwrap(),
+                name: table.clone(),
+            },
+            Surface::Table(table.clone()),
+            child,
+            false,
+        );
+    }
+}
+
+#[test]
+fn table_creation_requires_the_owner_even_with_a_child_transition() {
+    let table: TableName = "app.v".parse().unwrap();
+    let definition: crate::Table = serde_json::from_value(serde_json::json!({
+        "columns": {"n": {"type": "integer", "nullable": true, "default": "7"}}
+    }))
+    .unwrap();
+    for child in [
+        Surface::Default(table.column("n")),
+        Surface::Column(table.column("n")),
+    ] {
+        owner_coverage(
+            Change::CreateTable {
+                uid: "t_000000".parse().unwrap(),
+                name: table.clone(),
+                table: Box::new(definition.clone()),
+            },
+            Surface::Table(table.clone()),
+            child,
+            true,
+        );
+    }
+}
+
+#[test]
+fn adding_a_column_requires_more_than_its_default_transition() {
+    let table: TableName = "app.v".parse().unwrap();
+    let column =
+        serde_json::from_value(serde_json::json!({"type":"integer","nullable":true,"default":"7"}))
+            .unwrap();
+    owner_coverage(
+        Change::AddColumn {
+            uid: "c_000000".parse().unwrap(),
+            table: table.clone(),
+            name: "n".into(),
+            column: Box::new(column),
+        },
+        Surface::Column(table.column("n")),
+        Surface::Default(table.column("n")),
+        true,
+    );
+}

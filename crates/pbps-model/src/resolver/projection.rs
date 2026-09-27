@@ -36,7 +36,9 @@ impl InputManifest {
         // DROP, leaving the closing manifest at the pre-DDL state (SPEC 9.3.2).
         if changes.changes.iter().any(|p| {
             changes_catalog(&p.change)
-                && !transitions.iter().any(|t| touches(&p.change, &t.surface))
+                && !transitions
+                    .iter()
+                    .any(|t| covers_change(&p.change, &t.surface))
         }) {
             return Err(ManifestError::Incomplete);
         }
@@ -138,6 +140,25 @@ impl InputManifest {
             lookups,
         )
     }
+}
+
+// A child record can be touched by its owner's DDL without accounting for
+// the owner itself: a default-only transition leaves a dropped table behind
+// (SPEC 9.3.2). Aggregate owner inventories remain allowed, but a child must
+// never substitute for the table/column that the approved change creates or removes.
+fn covers_change(c: &Change, surface: &Surface) -> bool {
+    touches(c, surface)
+        && match surface {
+            Surface::Column(_) => {
+                !matches!(c, Change::CreateTable { .. } | Change::DropTable { .. })
+            }
+            Surface::Default(_) => matches!(c, Change::AlterColumnDefault { .. }),
+            Surface::Namespace(_)
+            | Surface::Table(_)
+            | Surface::Check { .. }
+            | Surface::Index { .. }
+            | Surface::Module(_) => true,
+        }
 }
 
 // Only typed changes authorize transitions. The adapter identifies catalog
