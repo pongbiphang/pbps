@@ -44,6 +44,7 @@ TESTS = [
     "uts::kernel_name_loss_refuses_admission_and_discards_each_live_view",
     "pseudo::foreign_pseudo_roots_refuse_admission_and_discard_live_analysis",
     "a_supported_dedicated_server_compiles_declarations_and_removes_only_its_own_resources",
+    "guard_limits::guard_restoration_distinguishes_process_exit_from_live_cleanup_failure",
     "guard_limits::every_forwarder_guard_requires_effective_descriptor_evidence",
     # PostgreSQL analysis-scope qualification (#610); no-ops on SQL Server (#611).
     "a_run_qualifies_its_analysis_scope_against_the_target",
@@ -437,10 +438,11 @@ def fixture(args, binary, root, owned):
         if empty:
             selected["PBPS_SERVER_ENDPOINT"] = endpoint(empty_server)
         selected["PBPS_SERVER_EMPTY_RUNTIME_FILES"] = "1" if empty else "0"
-        if test == "guard_limits::every_forwarder_guard_requires_effective_descriptor_evidence":
+        if test.startswith("guard_limits::"):
             # Only this test's observer view hides an owned guard's limits.
             command = ["/usr/bin/unshare", "--mount", "--propagation", "private", "--", *command]
             selected["PBPS_LIMITS_PRIVATE_PROC_FIXTURE"] = "1"
+            selected["PBPS_LIMITS_PARENT_MOUNT_NAMESPACE"] = os.readlink("/proc/self/ns/mnt")
         if test.startswith("admission_recovery::"):
             # Socket unavailability is confined to this observer's mount view.
             command = ["/usr/bin/unshare", "--mount", "--propagation", "private", "--", *command]
