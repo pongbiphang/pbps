@@ -4304,6 +4304,78 @@ fn an_owners_grant_a_least_privilege_deployer_cannot_revoke_is_refused_before_it
 
     // A superuser can take it back, so the same plan is an ordinary one there.
     succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+
+    // #1057: revocability is beside the checksum, so that artifact passes the
+    // baseline under the deployer too. Applied through the deployer, it is
+    // refused by the same check before a statement runs, transactional and
+    // staged alike: no apply entry or checkpoint is written, the refusal is
+    // audited, and the grant still stands.
+    let entries = |kind: &str| {
+        scalar(
+            connection,
+            &format!("SELECT count(*) FROM public.__pbps_state WHERE kind {kind}"),
+        )
+    };
+    let inserts = || {
+        scalar(
+            connection,
+            &format!(
+                "SELECT count(*) FROM information_schema.role_table_grants \
+                 WHERE grantee = '{reader}' AND privilege_type = 'INSERT'"
+            ),
+        )
+    };
+    let staged = d.dir.join("staged-plan.json");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        staged.to_str().unwrap(),
+        "--staged",
+    ]));
+    // `--allow revoke`, so the risk gate passes and the refusal is this one.
+    let allow = ["--allow", "revoke"];
+    let allow_staged = ["--allow", "revoke", "--staged"];
+    for (artifact, extra) in [(&plan, &allow[..]), (&staged, &allow_staged[..])] {
+        let (recorded, failed) = (entries("<> 'failed'"), entries("= 'failed'"));
+        let refused = approved_apply(&d, &deployment, artifact, extra);
+        assert_eq!(
+            code(&refused),
+            1,
+            "{extra:?}: {}{}",
+            stdout(&refused),
+            stderr(&refused)
+        );
+        assert!(
+            stderr(&refused).contains("unrevocable_grants")
+                && stderr(&refused).contains(&format!("granted by `{owner}`")),
+            "{extra:?}: {}",
+            stderr(&refused)
+        );
+        assert_eq!(
+            entries("<> 'failed'"),
+            recorded,
+            "{extra:?}: no apply entry or checkpoint was written"
+        );
+        assert_eq!(
+            entries("= 'failed'"),
+            failed + 1,
+            "{extra:?}: the refusal is audited"
+        );
+        assert_eq!(inserts(), 1, "{extra:?}: the grant still stands");
+    }
+    // The same artifact applied by the connection that can revoke it lands.
+    // The deployer's `baseline` created the ledger, and a ledger another login
+    // role can put a trigger on is one a superuser will not write to
+    // (DEC-863.1), so it is handed over first, as that refusal advises.
+    on_server(
+        connection,
+        "ALTER TABLE public.__pbps_state OWNER TO CURRENT_USER; \
+         ALTER TABLE public.__pbps_lock OWNER TO CURRENT_USER",
+    );
+    succeeds(approved_apply(&d, connection, &plan, &allow));
+    assert_eq!(inserts(), 0, "the superuser's apply revoked it");
 }
 
 /// Issue #251, the rename the check has to see through. A plan that renames a
