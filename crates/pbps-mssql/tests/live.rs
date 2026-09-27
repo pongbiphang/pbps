@@ -1860,6 +1860,12 @@ async fn a_key_laid_out_against_its_kinds_default_is_reported_and_left_out() {
              CREATE TABLE dbo.c (
                  id int NOT NULL CONSTRAINT pk_c PRIMARY KEY,
                  code int NOT NULL CONSTRAINT uq_c_code UNIQUE
+             );
+             CREATE TABLE dbo.child (
+                 id int NOT NULL,
+                 u_id int NULL CONSTRAINT fk_child_u REFERENCES dbo.u (id),
+                 u_code int NULL CONSTRAINT fk_child_u_code REFERENCES dbo.u (code),
+                 c_id int NULL CONSTRAINT fk_child_c REFERENCES dbo.c (id)
              );",
         )
         .await
@@ -1912,7 +1918,23 @@ async fn a_key_laid_out_against_its_kinds_default_is_reported_and_left_out() {
         "{:?}",
         pulled.limitations
     );
-    assert_eq!(pulled.limitations.len(), 3, "{:?}", pulled.limitations);
+    // A foreign key into an omitted key goes with it: bootstrap would find
+    // no candidate key to bind it to. The one into the control table stays.
+    let child = &table("child").foreign_keys;
+    assert_eq!(child.keys().collect::<Vec<_>>(), ["fk_child_c"]);
+    for (fk, key) in [("fk_child_u", "pk_u"), ("fk_child_u_code", "uq_u_code")] {
+        assert!(
+            pulled.limitations.iter().any(|l| {
+                l.target.object_name() == TableName::new("dbo", "child")
+                    && l.detail.contains(&format!(
+                        "foreign key `{fk}` references key `{key}` of dbo.u"
+                    ))
+            }),
+            "{fk}: {:?}",
+            pulled.limitations
+        );
+    }
+    assert_eq!(pulled.limitations.len(), 5, "{:?}", pulled.limitations);
 }
 
 #[tokio::test]

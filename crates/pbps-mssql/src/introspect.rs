@@ -115,6 +115,10 @@ pub struct RawForeignKeyColumn {
     pub constraint_name: String,
     pub ref_schema: String,
     pub ref_table: String,
+    pub ref_object_id: i32,
+    /// The name of the referenced key or unique index, as `key_index_id`
+    /// resolves it.
+    pub ref_key: Option<String>,
     pub column: String,
     pub ref_column: String,
     /// `sys.foreign_keys.delete_referential_action`: 0..=3.
@@ -1006,6 +1010,25 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             continue;
         }
         let referenced = TableName::new(f.ref_schema.clone(), f.ref_table.clone());
+        if let Some(key) = f
+            .ref_key
+            .as_ref()
+            .filter(|key| unsupported_keys.contains(&(f.ref_object_id, (*key).clone())))
+        {
+            if unsupported_omitted_foreign_keys.insert((f.object_id, f.constraint_name.clone())) {
+                let table_name = name_of(f.object_id, &names);
+                push_limitation(
+                    &mut warnings,
+                    &mut limitations,
+                    names.get(&f.object_id),
+                    format!(
+                        "{table_name}: foreign key `{}` references key `{key}` of {referenced}, which was left out of the declarations; the foreign key was left out too",
+                        f.constraint_name
+                    ),
+                );
+            }
+            continue;
+        }
         if let Some(kind) = omitted_tables.get(&referenced) {
             if unsupported_omitted_foreign_keys.insert((f.object_id, f.constraint_name.clone())) {
                 let table_name = name_of(f.object_id, &names);
@@ -2319,6 +2342,8 @@ mod tests {
                 constraint_name: "fk_x".into(),
                 ref_schema: "dbo".into(),
                 ref_table: "other".into(),
+                ref_object_id: 0,
+                ref_key: None,
                 column: a.into(),
                 ref_column: b.into(),
                 on_delete: 1,
@@ -2352,6 +2377,8 @@ mod tests {
                     constraint_name: "fk_state".into(),
                     ref_schema: "dbo".into(),
                     ref_table: "other".into(),
+                    ref_object_id: 0,
+                    ref_key: None,
                     column: column.into(),
                     ref_column: referenced.into(),
                     on_delete: 0,
@@ -2405,6 +2432,8 @@ mod tests {
             constraint_name: "fk_customer_versioned".into(),
             ref_schema: "dbo".into(),
             ref_table: "versioned".into(),
+            ref_object_id: 0,
+            ref_key: None,
             column: "id".into(),
             ref_column: "id".into(),
             on_delete: 0,
@@ -2452,7 +2481,7 @@ mod tests {
     #[test]
     fn a_key_whose_layout_is_not_its_kinds_default_is_reported_instead_of_declared() {
         let mut raw = RawCatalog::default();
-        for (id, name) in [(1, "h"), (2, "u"), (3, "c"), (4, "m")] {
+        for (id, name) in [(1, "h"), (2, "u"), (3, "c"), (4, "m"), (5, "child")] {
             raw.tables.push(raw_table(id, "dbo", name));
             raw.columns.push(raw_column(id, "id", "int"));
             raw.columns.push(raw_column(id, "code", "int"));
@@ -2470,6 +2499,29 @@ mod tests {
             key(4, "pk_m", true, 7, "id"),
             key(4, "pk_m", true, 7, "code"),
         ];
+        // A child referencing each omitted key, and one referencing the
+        // control's key, which stays.
+        for (name, ref_object_id, ref_table, ref_key, ref_column) in [
+            ("fk_child_h", 1, "h", "pk_h", "id"),
+            ("fk_child_u_code", 2, "u", "uq_u_code", "code"),
+            ("fk_child_c", 3, "c", "pk_c", "id"),
+        ] {
+            raw.foreign_key_columns.push(RawForeignKeyColumn {
+                object_id: 5,
+                constraint_name: name.into(),
+                ref_schema: "dbo".into(),
+                ref_table: ref_table.into(),
+                ref_object_id,
+                ref_key: Some(ref_key.into()),
+                column: "id".into(),
+                ref_column: ref_column.into(),
+                on_delete: 0,
+                on_update: 0,
+                is_disabled: false,
+                is_not_trusted: false,
+                is_not_for_replication: false,
+            });
+        }
 
         let pulled = assemble(&raw);
 
@@ -2517,9 +2569,22 @@ mod tests {
                 pulled.limitations
             );
         }
-        // One limitation per key, however many columns it has; none for the
-        // control table.
-        assert_eq!(pulled.limitations.len(), 4, "{:?}", pulled.limitations);
+        let child = &table("child").foreign_keys;
+        assert_eq!(child.keys().collect::<Vec<_>>(), ["fk_child_c"]);
+        for (fk, key) in [("fk_child_h", "pk_h"), ("fk_child_u_code", "uq_u_code")] {
+            assert!(
+                pulled.limitations.iter().any(|l| {
+                    l.target.object_name() == TableName::new("dbo", "child")
+                        && l.detail
+                            .contains(&format!("foreign key `{fk}` references key `{key}`"))
+                }),
+                "{fk}: {:?}",
+                pulled.limitations
+            );
+        }
+        // One limitation per key and per foreign key, however many columns
+        // each has; none for the control table.
+        assert_eq!(pulled.limitations.len(), 6, "{:?}", pulled.limitations);
     }
 
     #[test]
@@ -2769,6 +2834,8 @@ mod module_tests {
             constraint_name: "fk_plain_acct".into(),
             ref_schema: "dbo".into(),
             ref_table: "acct".into(),
+            ref_object_id: 0,
+            ref_key: None,
             column: "id".into(),
             ref_column: "id".into(),
             on_delete: 0,

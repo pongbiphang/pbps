@@ -85,6 +85,8 @@ fn full_catalog() -> RawCatalog {
             constraint_name: "fk_customer_region".into(),
             ref_schema: "app".into(),
             ref_table: "region".into(),
+            ref_object_id: 0,
+            ref_key: None,
             column: "status".into(),
             ref_column: "region_id".into(),
             on_delete: 0,
