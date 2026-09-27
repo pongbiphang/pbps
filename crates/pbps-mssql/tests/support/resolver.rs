@@ -468,8 +468,8 @@ mod editions611 {
 mod recon611 {
     use super::*;
     use pbps_mssql::resolver::authorization::{
-        PlannedGrant, PrincipalMap, apply_planned, enter, read, reconstruct, resolve_spellings,
-        verify,
+        PlannedGrant, PrincipalKind, PrincipalMap, apply_planned, enter, read, reconstruct,
+        resolve_spellings, verify,
     };
 
     /// On a case-insensitive database `DBO` and `App` are valid spellings of
@@ -1242,5 +1242,138 @@ mod recon611 {
             .execute(&format!("DROP LOGIN [{run_login}];"))
             .await
             .unwrap();
+    }
+
+    /// #1011: a grant on a database principal (class 4) decides what the
+    /// deployer sees. `VIEW DEFINITION ON ROLE::Readers` makes the role's
+    /// schema grant rows visible to a deployer that is not in the role, so the
+    /// target context holds them. The reproduction replays that grant, so the
+    /// reproduced deployer sees the same rows and verifies with no
+    /// differences. A `DENY` on another principal is replayed as a `DENY`,
+    /// and the grants of a principal the deployer holds nothing on stay out.
+    #[tokio::test]
+    #[ignore = "needs live SQL Server"]
+    async fn a_grant_on_a_principal_is_replayed_so_the_deployer_sees_what_it_sees() {
+        let mut target = TestDb::create("recon1011_t").await;
+        let mut scratch = TestDb::create("recon1011_s").await;
+        let pid = std::process::id();
+        let dep = format!("pbps_dep1011_{pid}");
+        let run_login = format!("pbps_run1011_{pid}");
+        for statement in [
+            format!(
+                "CREATE LOGIN [{dep}] WITH PASSWORD = 'Pbps!Recon1011', CHECK_POLICY = OFF; \
+                 CREATE USER [{dep}] FOR LOGIN [{dep}]; CREATE USER app_owner WITHOUT LOGIN; \
+                 CREATE ROLE Readers; CREATE ROLE Writers; CREATE USER auditor WITHOUT LOGIN; \
+                 CREATE ROLE Leads; ALTER ROLE Leads ADD MEMBER [{dep}]; \
+                 CREATE ROLE Owned AUTHORIZATION Leads; \
+                 CREATE ROLE Kept AUTHORIZATION [{dep}]; CREATE ROLE Led AUTHORIZATION Leads;"
+            ),
+            "CREATE SCHEMA app AUTHORIZATION app_owner;".to_owned(),
+            format!(
+                "GRANT SELECT ON SCHEMA::app TO Readers; GRANT INSERT ON SCHEMA::app TO Writers; \
+                 GRANT SELECT ON SCHEMA::app TO [{dep}]; \
+                 GRANT VIEW DEFINITION ON ROLE::Readers TO [{dep}]; \
+                 GRANT DELETE ON SCHEMA::app TO Owned; \
+                 GRANT UPDATE ON SCHEMA::app TO Kept; GRANT REFERENCES ON SCHEMA::app TO Led; \
+                 GRANT VIEW DEFINITION ON ROLE::Owned TO [{dep}]; \
+                 DENY VIEW DEFINITION ON USER::auditor TO [{dep}];"
+            ),
+        ] {
+            target.conn.execute(&statement).await.unwrap();
+        }
+        let schemas = ["app".to_owned()];
+        let mut planning = connect_live(&login_url(&dep, "Pbps!Recon1011", &target.name))
+            .await
+            .unwrap();
+        let context = read(&mut planning, &schemas).await.unwrap();
+        let app = &context.schemas["app"].grants;
+        // The premise: the class-4 grant is what shows the role's row, and
+        // the role the deployer holds nothing on stays hidden.
+        assert!(
+            app.iter().any(|g| g.grantee == "Readers"),
+            "the role's row is visible through VIEW DEFINITION: {app:?}"
+        );
+        assert!(
+            !app.iter().any(|g| g.grantee == "Writers"),
+            "a role the deployer holds nothing on is hidden: {app:?}"
+        );
+        // Owning a role shows its rows with no grant on it at all, whether
+        // the deployer owns it or a role the deployer is in does.
+        for owned in ["Kept", "Led"] {
+            assert!(
+                app.iter().any(|g| g.grantee == owned),
+                "{owned}'s row is visible through ownership: {app:?}"
+            );
+        }
+        let on: Vec<_> = context
+            .principal_grants
+            .iter()
+            .map(|g| {
+                (
+                    g.on.as_str(),
+                    context.principals.get(&g.on).copied(),
+                    g.grant.grantor.as_str(),
+                    g.grant.permission.as_str(),
+                    g.grant.state.as_str(),
+                )
+            })
+            .collect();
+        let role = Some(PrincipalKind::Role);
+        assert_eq!(
+            on,
+            [
+                // Granted by `sa`, recorded under the role's owner (measured):
+                // the row a `dbo`-owned role on scratch could not replay
+                // without a grant-option row the deployer would see.
+                ("Owned", role, "Leads", "VIEW DEFINITION", "GRANT"),
+                ("Readers", role, "dbo", "VIEW DEFINITION", "GRANT"),
+                // A DENY does not make the principal's row visible
+                // (measured), so its kind is unknown to the deployer. A user
+                // owns itself, and is recorded as the grantor.
+                ("auditor", None, "auditor", "VIEW DEFINITION", "DENY"),
+            ]
+        );
+        assert_eq!(context.principal_owners["Owned"], "Leads");
+        assert_eq!(context.principal_owners["Kept"], dep);
+        assert_eq!(context.principal_owners["Led"], "Leads");
+        // `dbo` owns every role scratch creates, so it is not recorded.
+        assert!(!context.principal_owners.contains_key("Readers"));
+
+        scratch
+            .conn
+            .execute(&format!(
+                "CREATE LOGIN [{run_login}] WITH PASSWORD = 'Pbps!Run1011', CHECK_POLICY = OFF; \
+                 ALTER AUTHORIZATION ON DATABASE::[{}] TO [{run_login}];",
+                scratch.name
+            ))
+            .await
+            .unwrap();
+        let map = PrincipalMap::generate(&context, &[], &format!("g{pid}"));
+        reconstruct(&mut scratch.conn, &map, &context, &run_login)
+            .await
+            .unwrap();
+        let mut run = connect_live(&login_url(&run_login, "Pbps!Run1011", &scratch.name))
+            .await
+            .unwrap();
+        enter(&mut run, map.deployer(&context).as_deref())
+            .await
+            .unwrap();
+        let differences = verify(&mut run, &map, &context, &schemas).await.unwrap();
+        assert!(
+            differences.is_empty(),
+            "reproduction differed: {differences:?}"
+        );
+
+        drop(run);
+        drop(planning);
+        let mut master = connect_live(&conn_str()).await.unwrap();
+        target.drop().await;
+        scratch.drop().await;
+        for login in [&dep, &run_login] {
+            master
+                .execute(&format!("DROP LOGIN [{login}];"))
+                .await
+                .unwrap();
+        }
     }
 }

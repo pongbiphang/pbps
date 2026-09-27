@@ -1006,3 +1006,46 @@ arbitrary closures into a capture that must refuse what it cannot qualify.
 Runtime-bound bodies are compared by header only and are named, never counted
 as proven by silence (ADR-0016 decision 3); one the plan creates is named too,
 though the target has nothing to compare it with (#1064).
+
+<a id="dec-1011-1"></a>
+
+**DEC-1011.1. The SQL Server authorization context reads and replays grants on
+database principals, apart from granted `IMPERSONATE`.** A grant on a principal
+(class 4) decides what the deployer sees. For example, `VIEW DEFINITION ON
+ROLE::Readers` makes that role's schema grant rows visible to a deployer that
+is not in the role. Unreplayed, the reproduction saw fewer rows than the target
+and reported `schema:<name>:grants` for an ordinary deployer.
+
+- The rows are read for the same holders as the database grants: the
+  deployer, its roles, and `public`.
+- They are replayed after the principals exist. Each row is replayed under its
+  own grantor, with each principal replayed as its own securable. Each
+  principal is replayed under its owner, because the engine records that
+  owner as the grantor of what `dbo` grants on it (measured on 17.0). A user
+  owns itself. With the owner left as `dbo`, a row granted under a role the
+  deployer is in needed a synthetic grant-option row for that role, which the
+  deployer then saw.
+- Ownership is also visibility with no grant at all: a role the deployer owns,
+  or a role it is in owns, shows the deployer that role's grant rows. So the
+  owner is kept for every role the context names, not only the roles these
+  rows are on. It is read, restored on scratch with `ALTER AUTHORIZATION`, and
+  compared as `principal:owners`. Only an owner other than `dbo` is kept.
+  `dbo` owns every role scratch creates, so a database whose roles `dbo` owns
+  keeps the context it had.
+- They are compared under the key `principal:grants`.
+- Granted `IMPERSONATE` stays out, because the impersonation list already
+  replays it. A `DENY` of it is read like any other row.
+
+Measured on 17.0: a `GRANT` on a principal makes that principal's row visible
+to the grantee, and a `DENY` does not. So a principal named only by a `DENY`
+has no kind the deployer can read. It is reproduced as a user, as every unseen
+owner and grantor already is. A `DENY` shows the deployer nothing either way.
+
+The field is left out of the canonical form when it is empty, so a context
+that has no such rows keeps the fingerprint it was sealed with.
+
+Pinned by `a_grant_on_a_principal_is_replayed_so_the_deployer_sees_what_it_sees`
+(`crates/pbps-mssql/tests/support/resolver.rs`, live), and by the
+`principal:grants` cases and
+`a_context_without_principal_grants_keeps_its_canonical_form` in
+`crates/pbps-mssql/src/resolver/authorization.rs`.
