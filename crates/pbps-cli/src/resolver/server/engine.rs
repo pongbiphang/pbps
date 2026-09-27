@@ -81,6 +81,29 @@ pub(super) use pbps_pg::resolver::reconstruct::Reconstruction;
 const NO_BINDING_ADAPTER: &str =
     "SQL Server has no binding adapter yet; its design and implementation are #619 and #620";
 
+/// Each routine the plan drops, with its declared signature spelled as the
+/// plan's `DROP` spells it, for the target capture to identify (#1148).
+pub(super) fn dropped_signatures(
+    extras: &[String],
+    routines: Vec<(pbps_model::ModuleId, pbps_model::ModuleKind)>,
+) -> Result<
+    Vec<(
+        pbps_model::ModuleId,
+        Option<pbps_pg::resolver::capture::DroppedSignature>,
+    )>,
+    String,
+> {
+    let dialect = pbps_pg::Postgres::with_write_path_extras(extras.to_vec());
+    routines
+        .into_iter()
+        .map(|(id, kind)| {
+            pbps_pg::resolver::reconstruct::dropped_signature(&dialect, &id, kind)
+                .map(|signature| (id, signature))
+                .map_err(|error| error.to_string())
+        })
+        .collect()
+}
+
 /// The desired namespace's scratch statements, for this engine.
 pub(super) fn reconstruction(
     driver: Driver,

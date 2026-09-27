@@ -991,7 +991,9 @@ without being what scratch made (#1041). A routine is managed only as an exact o
 the one scratch compiled for a declaration the plan keeps, or, for one the plan
 drops and so never compiles, the routine its declared signature names on the
 target, found with the engine's own signature lookup (`to_regprocedure`) under
-the routine schema's write path, as the plan's `DROP` resolves it, and only
+the routine schema's write path, as the plan's `DROP` resolves it, inside the
+target capture's own snapshot so that it is read coherently with the
+candidates it is assessed against (#1148), and only
 if it is of the declared kind: an aggregate holding a declared function's
 signature is not that function, and the plan's `DROP FUNCTION` refuses it
 (#1126). On the

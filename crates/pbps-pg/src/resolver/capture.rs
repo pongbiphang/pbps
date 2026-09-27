@@ -65,6 +65,18 @@ pub struct CaptureScope {
     pub candidates: BTreeSet<CandidateSet>,
 }
 
+/// A dropped routine's declared signature as the plan's `DROP` spells it,
+/// with the write path that `DROP` runs under and the kind it must be (`f`
+/// or `p`). The capture identifies it in its own snapshot, so the routine a
+/// plan drops is read coherently with the candidates it is assessed against
+/// (#1124, #1126, #1148).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub struct DroppedSignature {
+    pub spelled: String,
+    pub path: String,
+    pub kind: &'static str,
+}
+
 pub use pbps_db::resolver::capture::{CaptureError, Uncovered};
 
 mod manifest;
@@ -82,8 +94,17 @@ pub async fn capture(
     connection: &mut impl pbps_db::transport::QueryConnection,
     scope: &CaptureScope,
 ) -> Result<CapturedInputs, CaptureError> {
+    capture_identifying(connection, scope, &BTreeSet::new()).await
+}
+
+/// [`capture`], also identifying each dropped signature in the same snapshot.
+pub async fn capture_identifying(
+    connection: &mut impl pbps_db::transport::QueryConnection,
+    scope: &CaptureScope,
+    dropped: &BTreeSet<DroppedSignature>,
+) -> Result<CapturedInputs, CaptureError> {
     let mut prepared = None;
-    let read = read::owned(connection, |catalog, major| {
+    let read = read::owned(connection, dropped, |catalog, major| {
         let mut result = scope::prepare(catalog, major, scope)?;
         let selection = std::mem::take(&mut result.render);
         prepared = Some(result);
@@ -111,14 +132,15 @@ pub async fn capture(
 /// use pbps_pg::resolver::capture::{capture_with_runtime_inputs, CapturedInputs};
 /// async fn acquire(captured: &mut CapturedInputs) {
 ///     let scope = captured.scope().clone();
-///     let _ = capture_with_runtime_inputs(captured, &scope).await;
+///     let _ = capture_with_runtime_inputs(captured, &scope, &Default::default()).await;
 /// }
 /// ```
 pub async fn capture_with_runtime_inputs(
     connection: &mut impl pbps_db::transport::QueryConnection,
     scope: &CaptureScope,
+    dropped: &BTreeSet<DroppedSignature>,
 ) -> Result<(CapturedInputs, RuntimeInputs), CaptureError> {
-    let captured = capture(connection, scope).await?;
+    let captured = capture_identifying(connection, scope, dropped).await?;
     let runtime = captured.runtime_inputs().map_err(CaptureError::Coverage)?;
     Ok((captured, runtime))
 }
@@ -135,7 +157,8 @@ pub async fn recapture(
     ),
     CaptureError,
 > {
-    let current = capture(connection, previous.scope()).await?;
+    let signatures = previous.dropped().keys().cloned().collect();
+    let current = capture_identifying(connection, previous.scope(), &signatures).await?;
     let differences = previous.compare(&current);
     Ok((current, differences))
 }

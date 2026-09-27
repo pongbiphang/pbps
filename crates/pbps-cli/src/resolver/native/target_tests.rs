@@ -310,7 +310,7 @@ async fn postgres_capture_is_fresh_and_cancellation_expires_its_connection(
         });
     }
     let mut target = NativeTarget::establish(connection, main_pid).await.unwrap();
-    let captured = target.capture_postgres(&scope).await;
+    let captured = target.capture_postgres(&scope, &Default::default()).await;
     if std::env::var("PBPS_NATIVE_FACTORY_FIXTURE").as_deref() == Ok("1") {
         let captured =
             captured.expect("native capture must qualify actual loaded executable content");
@@ -363,7 +363,7 @@ async fn postgres_capture_is_fresh_and_cancellation_expires_its_connection(
         // Alter only this owned fixture's row, then restore it before asserting.
         for missing_or_unreadable in ["/pbps_private_missing876", "/tmp"] {
             writer.query(&format!("UPDATE pg_catalog.pg_proc SET probin='{missing_or_unreadable}' WHERE oid='capture_fixture.standalone_handler()'::regprocedure")).await.unwrap();
-            let unavailable = target.capture_postgres(&scope).await;
+            let unavailable = target.capture_postgres(&scope, &Default::default()).await;
             writer.query("UPDATE pg_catalog.pg_proc SET probin='$libdir/../lib/plpgsql' WHERE oid='capture_fixture.standalone_handler()'::regprocedure").await.unwrap();
             let error = match unavailable {
                 Err(error) => error,
@@ -446,10 +446,11 @@ async fn postgres_capture_is_fresh_and_cancellation_expires_its_connection(
             writer.query("COMMIT").await.unwrap();
             reloaded
         };
+        let none = std::collections::BTreeSet::new();
         let (capture, reloaded) = tokio::join!(
             tokio::time::timeout(
                 std::time::Duration::from_secs(45),
-                target.capture_postgres(&scope)
+                target.capture_postgres(&scope, &none)
             ),
             trigger_reload,
         );
@@ -495,7 +496,7 @@ async fn postgres_capture_is_fresh_and_cancellation_expires_its_connection(
     );
     let timed = tokio::time::timeout(
         std::time::Duration::from_millis(100),
-        target.capture_postgres(&scope),
+        target.capture_postgres(&scope, &Default::default()),
     )
     .await;
     let resumed = std::process::Command::new("/bin/kill")
@@ -518,36 +519,6 @@ async fn postgres_capture_is_fresh_and_cancellation_expires_its_connection(
     let mut administrator = PeerVerifiedConn::connect(Driver::Postgres, primary)
         .await
         .unwrap();
-    // Identifying a dropped signature reads inside a transaction of its own.
-    // Held there by a lock on the routine catalog and cancelled, it must
-    // expire the binding as a cancelled capture does, never leave the
-    // connection mid-transaction for a later read (#1124).
-    let connection = PeerVerifiedConn::connect(Driver::Postgres, primary)
-        .await
-        .unwrap();
-    let mut target = NativeTarget::establish(connection, main_pid).await.unwrap();
-    administrator.query("BEGIN").await.unwrap();
-    administrator
-        .query("LOCK TABLE pg_catalog.pg_proc IN ACCESS EXCLUSIVE MODE")
-        .await
-        .unwrap();
-    let timed = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        target.identify_dropped(
-            &[],
-            vec![(
-                "capture_fixture.gone(integer)".parse().unwrap(),
-                pbps_model::ModuleKind::Function,
-            )],
-        ),
-    )
-    .await;
-    administrator.query("ROLLBACK").await.unwrap();
-    assert!(timed.is_err(), "the lookup was held inside its transaction");
-    assert!(
-        target.identity().is_err(),
-        "cancelled identification must expire the complete connection"
-    );
     administrator
         .query("DROP SCHEMA capture_fixture CASCADE")
         .await
@@ -567,13 +538,13 @@ async fn sql_server_capture_refuses_by_name_and_expires_binding(primary: &str, m
     // Keep a caller transaction live to also pin the absence of transaction I/O.
     connection.query("BEGIN TRANSACTION").await.unwrap();
     assert!(matches!(
-        engine::capture_with_runtime_inputs(&mut connection, &scope).await,
+        engine::capture_with_runtime_inputs(&mut connection, &scope, &Default::default()).await,
         Err(CaptureError::Unsupported {
             engine: "SQL Server"
         })
     ));
     assert!(matches!(
-        engine::capture(&mut connection, &scope).await,
+        engine::capture(&mut connection, &scope, &Default::default()).await,
         Err(CaptureError::Unsupported {
             engine: "SQL Server"
         })
@@ -586,7 +557,7 @@ async fn sql_server_capture_refuses_by_name_and_expires_binding(primary: &str, m
     connection.query("ROLLBACK TRANSACTION").await.unwrap();
     let mut target = NativeTarget::establish(connection, main_pid).await.unwrap();
     let witness = target.witness().unwrap();
-    let error = match target.capture_postgres(&scope).await {
+    let error = match target.capture_postgres(&scope, &Default::default()).await {
         Err(error) => error,
         Ok(_) => panic!("an unsupported engine cannot produce captured input"),
     };
@@ -606,7 +577,10 @@ async fn sql_server_capture_refuses_by_name_and_expires_binding(primary: &str, m
         "refusal expires existing scratch witnesses"
     );
     assert!(
-        target.capture_postgres(&scope).await.is_err(),
+        target
+            .capture_postgres(&scope, &Default::default())
+            .await
+            .is_err(),
         "refusal cannot revive a consumed binding"
     );
 }

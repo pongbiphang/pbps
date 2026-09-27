@@ -94,9 +94,12 @@ fn qualified<'a>(
 }
 
 impl NativeTarget {
+    /// `dropped` are the dropped routines' signatures to identify in the
+    /// capture's own snapshot, which both reads below carry (#1148).
     pub async fn capture_postgres(
         &mut self,
         scope: &CaptureScope,
+        dropped: &std::collections::BTreeSet<engine::DroppedSignature>,
     ) -> Result<CapturedTargetInputs, CaptureFailure> {
         // Ownership moves before the first await. Cancellation, even during
         // an owned SQL transaction, drops the connection and every weak lease.
@@ -105,7 +108,7 @@ impl NativeTarget {
         // Native-input authority comes only from our own fresh connected read.
         // The returned catalog alone cannot recreate it (DEC-974.1).
         let (hints, required) =
-            engine::capture_with_runtime_inputs(&mut bound.connection, scope).await?;
+            engine::capture_with_runtime_inputs(&mut bound.connection, scope, dropped).await?;
         let before = executables::captured_executables(bound.lease.owner(), &required)
             .await
             .map_err(|_| CaptureFailure::Executables)?;
@@ -113,7 +116,7 @@ impl NativeTarget {
             return Err(CaptureFailure::Executables);
         }
         check(&mut bound).await?;
-        let catalog = engine::capture(&mut bound.connection, scope).await?;
+        let catalog = engine::capture(&mut bound.connection, scope, dropped).await?;
         if !hints.compare(&catalog).is_empty() {
             return Err(CaptureFailure::Changed);
         }
@@ -136,36 +139,14 @@ impl NativeTarget {
         Ok(captured)
     }
 
-    /// The routine each dropped declaration's signature names on the target,
-    /// read the way the plan's `DROP` of it resolves it (#1124). Ownership
-    /// moves before the first await, as in a capture: cancelled inside its
-    /// transaction, the connection is dropped rather than left for a later
-    /// read to reuse mid-transaction.
-    pub async fn identify_dropped(
-        &mut self,
-        write_path_extras: &[String],
-        routines: Vec<(pbps_model::ModuleId, pbps_model::ModuleKind)>,
-    ) -> Result<
-        std::collections::BTreeMap<
-            pbps_model::ModuleId,
-            Option<pbps_db::resolver::capture::ObjectIdentity>,
-        >,
-        CaptureFailure,
-    > {
-        let mut bound = self.current.take().ok_or(CaptureFailure::Binding)?;
-        check(&mut bound).await?;
-        let identified =
-            engine::identify_dropped(&mut bound.connection, write_path_extras, routines).await?;
-        check(&mut bound).await?;
-        self.current = Some(bound);
-        Ok(identified)
-    }
-
     pub async fn recapture_postgres(
         &mut self,
         previous: &CapturedTargetInputs,
     ) -> Result<(CapturedTargetInputs, Vec<CaptureDifference>), CaptureFailure> {
-        let current = self.capture_postgres(previous.catalog.scope()).await?;
+        let signatures = previous.catalog.dropped().keys().cloned().collect();
+        let current = self
+            .capture_postgres(previous.catalog.scope(), &signatures)
+            .await?;
         let differences = previous.compare(&current);
         Ok((current, differences))
     }

@@ -61,9 +61,17 @@ pub struct CapturedInputs {
     pub(super) inputs: BTreeMap<ObjectIdentity, Input>,
     pub(super) candidates: BTreeMap<super::CandidateSet, BTreeSet<ObjectIdentity>>,
     pub(super) limitations: BTreeSet<ObjectIdentity>,
+    /// What each requested dropped signature named in this snapshot.
+    dropped: BTreeMap<super::DroppedSignature, Option<ObjectIdentity>>,
 }
 
 impl CapturedInputs {
+    /// What each requested dropped signature named in this capture's
+    /// snapshot: the routine the plan's `DROP` of it would address.
+    pub fn dropped(&self) -> &BTreeMap<super::DroppedSignature, Option<ObjectIdentity>> {
+        &self.dropped
+    }
+
     pub fn scope(&self) -> &CaptureScope {
         &self.scope
     }
@@ -218,7 +226,10 @@ impl CapturedInputs {
                 });
             }
         }
-        if self.candidates != current.candidates || self.limitations != current.limitations {
+        if self.candidates != current.candidates
+            || self.limitations != current.limitations
+            || self.dropped != current.dropped
+        {
             differences.push(CaptureDifference {
                 object: None,
                 change: InputChange::Membership,
@@ -300,6 +311,7 @@ pub(super) fn finish(
         inputs,
         candidates: prepared.candidates,
         limitations: prepared.limitations,
+        dropped: read.dropped,
     })
 }
 

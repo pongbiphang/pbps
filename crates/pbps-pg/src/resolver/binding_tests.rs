@@ -15,6 +15,7 @@ use pbps_db::resolver::capture::ObjectIdentity;
 use pbps_db::transport::{StreamConn, StreamLogin};
 use pbps_db::{Conn, Driver};
 use pbps_model::{Hints, IdsFile, Module, ModuleId, ModuleKind, Schema};
+use std::collections::{BTreeMap, BTreeSet};
 
 fn ctx() -> pbps_diff::Context {
     pbps_diff::Context {
@@ -194,15 +195,7 @@ async fn analyze_on(
                 .map_err(|e| e.to_string())?;
         let desired_managed = Managed::from_schema(&case.desired.schema);
         let base_managed = Managed::from_schema(&case.base.schema);
-        reconstruction.identified(
-            reconstruct::identify_dropped(
-                &mut target,
-                &pg,
-                base_managed.dropped_by(&desired_managed),
-            )
-            .await
-            .map_err(|e| e.to_string())?,
-        );
+        let dropped = signatures(&pg, base_managed.dropped_by(&desired_managed));
         let mut scratch = databases.stream(&scratch_name).await;
         reconstruction
             .compile(&pg, &mut scratch)
@@ -227,9 +220,10 @@ async fn analyze_on(
         let desired = capture::capture(&mut scratch, &scope)
             .await
             .map_err(|e| e.to_string())?;
-        let current = capture::capture(&mut target, &scope)
+        let current = capture::capture_identifying(&mut target, &scope, &requested(&dropped))
             .await
             .map_err(|e| e.to_string())?;
+        reconstruction.identified(answered(dropped, &current));
         Ok(capture::assess(
             &current,
             &desired,
@@ -242,6 +236,53 @@ async fn analyze_on(
     drop(target);
     databases.drop().await;
     result
+}
+
+type Dropped = Vec<(ModuleId, Option<capture::DroppedSignature>)>;
+
+/// Each routine the plan drops, with the signature the target capture is to
+/// identify for it.
+fn signatures(pg: &Postgres, routines: Vec<(ModuleId, pbps_model::ModuleKind)>) -> Dropped {
+    routines
+        .into_iter()
+        .map(|(id, kind)| {
+            let signature = reconstruct::dropped_signature(pg, &id, kind).unwrap();
+            (id, signature)
+        })
+        .collect()
+}
+
+fn requested(dropped: &Dropped) -> BTreeSet<capture::DroppedSignature> {
+    dropped.iter().filter_map(|(_, s)| s.clone()).collect()
+}
+
+fn answered(
+    dropped: Dropped,
+    captured: &capture::CapturedInputs,
+) -> BTreeMap<ModuleId, Option<ObjectIdentity>> {
+    dropped
+        .into_iter()
+        .map(|(id, signature)| {
+            let identity = signature.and_then(|s| captured.dropped().get(&s).cloned().flatten());
+            (id, identity)
+        })
+        .collect()
+}
+
+/// What each dropped routine's signature names on `conn`, read by a target
+/// capture of nothing else, as the resolver reads it inside its own.
+async fn identify_dropped(
+    conn: &mut Conn,
+    pg: &Postgres,
+    routines: Vec<(ModuleId, pbps_model::ModuleKind)>,
+) -> Result<BTreeMap<ModuleId, Option<ObjectIdentity>>, pbps_db::resolver::capture::CaptureError> {
+    let dropped = signatures(pg, routines);
+    let scope = capture::CaptureScope {
+        retained: BTreeSet::new(),
+        candidates: BTreeSet::new(),
+    };
+    let captured = capture::capture_identifying(conn, &scope, &requested(&dropped)).await?;
+    Ok(answered(dropped, &captured))
 }
 
 /// The relation or routine a surface belongs to, as the assessment reads it.
@@ -967,7 +1008,7 @@ async fn an_unreadable_dropped_signature_is_refused_not_absent() {
         let server = std::env::var(variable).unwrap();
         let mut conn = Conn::connect(Driver::Postgres, &server).await.unwrap();
         let pg = dialect(&[]);
-        let absent = reconstruct::identify_dropped(
+        let absent = identify_dropped(
             &mut conn,
             &pg,
             vec![(
@@ -982,7 +1023,7 @@ async fn an_unreadable_dropped_signature_is_refused_not_absent() {
             [None],
             "{variable}"
         );
-        let unreadable = reconstruct::identify_dropped(
+        let unreadable = identify_dropped(
             &mut conn,
             &pg,
             vec![(
@@ -1007,7 +1048,7 @@ async fn an_unreadable_dropped_signature_is_refused_not_absent() {
         conn.query("SET standard_conforming_strings = off")
             .await
             .unwrap();
-        let backslash = reconstruct::identify_dropped(
+        let backslash = identify_dropped(
             &mut conn,
             &pg,
             vec![(
@@ -1036,6 +1077,53 @@ async fn an_unreadable_dropped_signature_is_refused_not_absent() {
             open[0].try_get::<&str>("read_only").unwrap(),
             Some("off"),
             "{variable}: the lookup left its transaction open"
+        );
+    }
+}
+
+/// A dropped signature is identified inside the capture's own snapshot, and a
+/// recheck of that capture reads it again: the routine it named going away
+/// is a change of membership, not a stale identity (#1148).
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_dropped_signature_is_rechecked_with_its_capture() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let mut conn = Conn::connect(Driver::Postgres, &server).await.unwrap();
+        let pg = dialect(&[]);
+        conn.query(
+            "CREATE FUNCTION public.pbps_1148(integer) RETURNS integer LANGUAGE sql RETURN 1",
+        )
+        .await
+        .unwrap();
+        let dropped = signatures(
+            &pg,
+            vec![(
+                "public.pbps_1148(integer)".parse().unwrap(),
+                pbps_model::ModuleKind::Function,
+            )],
+        );
+        let scope = capture::CaptureScope {
+            retained: BTreeSet::new(),
+            candidates: BTreeSet::new(),
+        };
+        let before = capture::capture_identifying(&mut conn, &scope, &requested(&dropped))
+            .await
+            .unwrap();
+        let unchanged = capture::recapture(&mut conn, &before).await.unwrap().1;
+        conn.query("DROP FUNCTION public.pbps_1148(integer)")
+            .await
+            .unwrap();
+        let changed = capture::recapture(&mut conn, &before).await.unwrap().1;
+        assert!(
+            answered(dropped, &before).values().all(Option::is_some),
+            "{variable}: the signature was identified in the capture"
+        );
+        assert!(unchanged.is_empty(), "{variable}: {unchanged:?}");
+        assert!(
+            changed.iter().any(|difference| difference.change
+                == pbps_db::resolver::capture::InputChange::Membership),
+            "{variable}: {changed:?}"
         );
     }
 }

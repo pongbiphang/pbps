@@ -4,6 +4,7 @@
 
 use super::logical::{Catalog, Row};
 use super::{properties, queries, render::Selection};
+use pbps_db::resolver::capture::ObjectIdentity;
 use pbps_db::transport::QueryConnection;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -16,6 +17,8 @@ pub(super) struct Read {
     pub major: u32,
     pub baseline: super::baseline::Baseline,
     pub session: super::session::Facts,
+    /// What each requested dropped signature names in this snapshot.
+    pub dropped: BTreeMap<super::DroppedSignature, Option<ObjectIdentity>>,
 }
 
 pub(super) use pbps_db::resolver::capture::CaptureError as Failure;
@@ -27,6 +30,7 @@ pub(super) use pbps_db::resolver::capture::CaptureError as Failure;
 /// custom datum output must not run before its type has qualified.
 pub(super) async fn owned(
     conn: &mut impl QueryConnection,
+    dropped: &BTreeSet<super::DroppedSignature>,
     qualify: impl FnOnce(&Catalog, u32) -> Result<Selection, Failure>,
 ) -> Result<Read, Failure> {
     let token = crate::catalog::probe_token();
@@ -50,7 +54,7 @@ pub(super) async fn owned(
     conn.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .await
         .map_err(|_| Failure::Read)?;
-    let outcome = within(conn, qualify).await;
+    let outcome = within(conn, dropped, qualify).await;
     let (read, witnesses, environment) = match outcome {
         Ok(value) => {
             if conn.query("COMMIT").await.is_err() {
@@ -79,8 +83,79 @@ pub(super) async fn owned(
 
 type Witnesses = BTreeMap<String, BTreeSet<String>>;
 
+/// Each dropped signature, looked up with the engine's own signature lookup
+/// under the write path its `DROP` runs under, inside this snapshot; the
+/// canonical path is restored afterwards. `None` where it names no routine of
+/// the declared kind. A lookup the engine refuses, such as a spelling it
+/// cannot parse, fails the capture: unreadable is never absent, and the
+/// plan's `DROP` would fail on it too (#1124, #1148).
+async fn identify(
+    conn: &mut impl QueryConnection,
+    dropped: &BTreeSet<super::DroppedSignature>,
+) -> Result<BTreeMap<super::DroppedSignature, Option<ObjectIdentity>>, Failure> {
+    let mut identified = BTreeMap::new();
+    for signature in dropped {
+        conn.query(&format!(
+            "SELECT pg_catalog.set_config('search_path', {}, true)",
+            crate::emit::value_literal(&signature.path)
+        ))
+        .await
+        .map_err(|_| Failure::Read)?;
+        let rows = conn
+            .query(&format!(
+                "SELECT n.nspname AS schema, p.proname AS name, p.prokind::pg_catalog.text AS kind, COALESCE((SELECT pg_catalog.json_agg(pg_catalog.json_build_array(tn.nspname, t.typname) ORDER BY a.ord) \
+                 FROM pg_catalog.unnest(p.proargtypes::pg_catalog.oid[]) WITH ORDINALITY AS a(typ, ord) \
+                 JOIN pg_catalog.pg_type t ON t.oid = a.typ JOIN pg_catalog.pg_namespace tn ON tn.oid = t.typnamespace), '[]')::text AS args \
+                 FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+                 WHERE p.oid = pg_catalog.to_regprocedure({})",
+                crate::emit::value_literal(&signature.spelled)
+            ))
+            .await
+            .map_err(|_| Failure::Read)?;
+        let identity = match rows.as_slice() {
+            [] => None,
+            [row] => {
+                let text = |field: &str| {
+                    row.try_get::<&str>(field)
+                        .ok()
+                        .flatten()
+                        .map(str::to_owned)
+                        .ok_or(Failure::Incomplete)
+                };
+                if text("kind")? == signature.kind {
+                    let args = serde_json::from_str::<Vec<[String; 2]>>(&text("args")?)
+                        .map_err(|_| Failure::Incomplete)?;
+                    Some(ObjectIdentity {
+                        class: "pg_proc".into(),
+                        name: vec![text("schema")?, text("name")?],
+                        signature: args
+                            .into_iter()
+                            .map(|type_name| ObjectIdentity {
+                                class: "pg_type".into(),
+                                name: type_name.into(),
+                                signature: Vec::new(),
+                            })
+                            .collect(),
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => return Err(Failure::Incomplete),
+        };
+        identified.insert(signature.clone(), identity);
+    }
+    if !dropped.is_empty() {
+        conn.query(crate::catalog::CANONICAL_PATH)
+            .await
+            .map_err(|_| Failure::Read)?;
+    }
+    Ok(identified)
+}
+
 async fn within(
     conn: &mut impl QueryConnection,
+    dropped: &BTreeSet<super::DroppedSignature>,
     qualify: impl FnOnce(&Catalog, u32) -> Result<Selection, Failure>,
 ) -> Result<(Read, Witnesses, super::session::Observation), Failure> {
     conn.query(crate::catalog::CANONICAL_PATH)
@@ -122,12 +197,14 @@ async fn within(
     if held != witnesses {
         return Err(Failure::Changed);
     }
+    let dropped = identify(conn, dropped).await?;
     Ok((
         Read {
             catalog: rendered,
             major,
             baseline,
             session,
+            dropped,
         },
         witnesses,
         environment,
@@ -335,7 +412,7 @@ mod tests {
     async fn exercise_owned_capture(connection: String, fixture_role: String) {
         let mut conn = Conn::connect(Driver::Postgres, &connection).await.unwrap();
         conn.execute("CREATE SCHEMA app; CREATE TABLE app.a(id integer); CREATE VIEW app.v AS SELECT id FROM app.a; SET search_path=app; SET timezone='Pacific/Honolulu'; SET default_transaction_isolation='read committed'").await.unwrap();
-        let read = owned(&mut conn, |catalog, major| {
+        let read = owned(&mut conn, &BTreeSet::new(), |catalog, major| {
             // A new catalog property must be noticed even though the
             // SQL projection still names only previously known fields.
             let relation = catalog.rows["pg_class"]
@@ -385,7 +462,7 @@ mod tests {
         }));
         restored(&mut conn).await;
 
-        let changed = owned(&mut conn, |catalog, major| {
+        let changed = owned(&mut conn, &BTreeSet::new(), |catalog, major| {
             writer(connection.clone(), "ALTER TABLE app.a RENAME TO changed")?;
             fixture_selection(catalog, major)
         })
@@ -398,14 +475,14 @@ mod tests {
         conn.execute("ALTER TABLE app.changed RENAME TO a")
             .await
             .unwrap();
-        let aba = owned(&mut conn,|catalog,major| { writer(connection.clone(),"ALTER TABLE app.a RENAME TO temporary_name; ALTER TABLE app.temporary_name RENAME TO a")?; fixture_selection(catalog,major) }).await;
+        let aba = owned(&mut conn, &BTreeSet::new(), |catalog,major| { writer(connection.clone(),"ALTER TABLE app.a RENAME TO temporary_name; ALTER TABLE app.temporary_name RENAME TO a")?; fixture_selection(catalog,major) }).await;
         assert!(
             matches!(aba, Err(Failure::Changed)),
             "change-and-restore escaped the rendering witness"
         );
         restored(&mut conn).await;
 
-        let candidate = owned(&mut conn, |catalog, major| {
+        let candidate = owned(&mut conn, &BTreeSet::new(), |catalog, major| {
             writer(
                 connection.clone(),
                 "CREATE FUNCTION app.arriving(integer) RETURNS integer LANGUAGE SQL RETURN $1+1",
@@ -422,7 +499,7 @@ mod tests {
             .await
             .unwrap();
 
-        let refusal = owned(&mut conn, |_, _| Err(Failure::Incomplete)).await;
+        let refusal = owned(&mut conn, &BTreeSet::new(), |_, _| Err(Failure::Incomplete)).await;
         assert!(matches!(refusal, Err(Failure::Incomplete)));
         restored(&mut conn).await;
         let scope = super::super::CaptureScope {
@@ -468,7 +545,7 @@ mod tests {
         ))
         .await
         .unwrap();
-        let unreadable = owned(&mut conn, |_, _| {
+        let unreadable = owned(&mut conn, &BTreeSet::new(), |_, _| {
             panic!("unreadable catalog must fail before qualification")
         })
         .await;
@@ -481,7 +558,10 @@ mod tests {
             .await
             .unwrap();
         conn.execute("BEGIN; CREATE TEMP TABLE caller_owned(value integer); INSERT INTO caller_owned VALUES (1)").await.unwrap();
-        let caller = owned(&mut conn, |_, _| panic!("must refuse before reading")).await;
+        let caller = owned(&mut conn, &BTreeSet::new(), |_, _| {
+            panic!("must refuse before reading")
+        })
+        .await;
         assert!(matches!(caller, Err(Failure::CallerTransaction)));
         let rows = conn
             .query("SELECT count(*)::text AS count FROM caller_owned")
@@ -495,13 +575,13 @@ mod tests {
         // needs no native fixture library or invalid memory layout.
         // A raw catalog is readable even when its type cannot render.
         conn.execute("CREATE TYPE app.unqualified; CREATE FUNCTION app.type_in(cstring) RETURNS app.unqualified LANGUAGE internal IMMUTABLE AS 'textin'; CREATE FUNCTION app.type_out(app.unqualified) RETURNS cstring LANGUAGE internal AS 'shell_out'; CREATE TYPE app.unqualified (INPUT=app.type_in,OUTPUT=app.type_out,INTERNALLENGTH=variable,STORAGE=extended); CREATE TABLE app.unselected(value app.unqualified DEFAULT 'private-fixture'); CREATE TABLE app.fast_default(id integer); INSERT INTO app.fast_default VALUES (1); ALTER TABLE app.fast_default ADD value app.unqualified DEFAULT 'private-fixture'; CREATE FUNCTION app.unselected_function(value app.unqualified DEFAULT 'private-fixture') RETURNS integer LANGUAGE sql AS 'SELECT 1' ").await.unwrap();
-        let unselected = owned(&mut conn, |_, _| Ok(Selection::default())).await;
+        let unselected = owned(&mut conn, &BTreeSet::new(), |_, _| Ok(Selection::default())).await;
         assert!(
             unselected.is_ok(),
             "an unselected output handler was invoked"
         );
         restored(&mut conn).await;
-        let selected = owned(&mut conn, fixture_selection).await;
+        let selected = owned(&mut conn, &BTreeSet::new(), fixture_selection).await;
         assert!(
             matches!(selected, Err(Failure::Read)),
             "required unreadable output was accepted"
