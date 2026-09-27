@@ -1874,6 +1874,8 @@ fn a_sequence_or_synonym_at_a_new_tables_name_refuses_the_plan() {
         connection,
         "CREATE TABLE dbo.keep (id int, c int CONSTRAINT x DEFAULT 0); \
          CREATE TABLE dbo.keeptwo (id int, c int CONSTRAINT DF_pbps_keeptwo_c DEFAULT 0); \
+         CREATE TABLE dbo.chain (id int, a int CONSTRAINT DF_pbps_chain_a DEFAULT 0, \
+             b int CONSTRAINT DF_pbps_chain_b DEFAULT 1); \
          CREATE SEQUENCE dbo.s; \
          CREATE SYNONYM dbo.y FOR dbo.keep;",
     );
@@ -1894,7 +1896,8 @@ fn a_sequence_or_synonym_at_a_new_tables_name_refuses_the_plan() {
             format!("table: dbo.{name}\ncolumns:\n  id: {{type: int}}\n"),
         )
         .unwrap();
-        assert_eq!(code(&d.run(&["plan"])), 0);
+        let o = d.run(&["plan"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
         d.commit();
         d.dir.join("plan.json")
     };
@@ -1955,6 +1958,30 @@ fn a_sequence_or_synonym_at_a_new_tables_name_refuses_the_plan() {
     assert_ne!(renamed, pulled, "{pulled}");
     std::fs::write(&path, renamed).unwrap();
     let plan = declare(&d, "DF_pbps_keeptwo_c");
+    let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    apply(&d, &plan, &["--allow", "rename"]);
+
+    // A rename chain across two revisions the environment skipped, `b -> c`
+    // then `a -> b`: the plan moves `b`'s default to `c` before `a`'s
+    // arrives at `b`, so `a`'s old default name is free for the table too
+    // (#1147 review).
+    let d = adopted("default-chain");
+    let path = d.dir.join("schema/dbo.chain.yml");
+    let pulled = std::fs::read_to_string(&path).unwrap();
+    let first = pulled.replacen("\n  b:\n", "\n  c:\n    renamed_from: b\n", 1);
+    assert_ne!(first, pulled, "{pulled}");
+    std::fs::write(&path, &first).unwrap();
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    d.commit();
+    let second = first.replace("    renamed_from: b\n", "").replacen(
+        "\n  a:\n",
+        "\n  b:\n    renamed_from: a\n",
+        1,
+    );
+    std::fs::write(&path, second).unwrap();
+    let plan = declare(&d, "DF_pbps_chain_a");
     let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     apply(&d, &plan, &["--allow", "rename"]);

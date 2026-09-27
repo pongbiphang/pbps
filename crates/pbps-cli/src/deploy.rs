@@ -670,19 +670,45 @@ pub(crate) fn refuse_occupied_objects(
             _ => None,
         })
         .collect();
-    let held = |m: &DefaultMove| {
-        occupants.iter().any(|o| {
-            o.wanted == m.new
-                && !dropped_modules.contains(&o.name)
-                && !(m.after_constraint_drops && before_column_renames.contains(&o.name))
-        })
-    };
-    let moved_away = |o: &pbps_mssql::catalog::NameOccupant| {
-        o.kind == "default constraint"
-            && default_moves(cs)
+    // Walked in plan order, because one move can free another's target: a
+    // column rename chain `b -> c`, then `a -> b`, moves `b`'s default out of
+    // the way before `a`'s arrives. A default moves when it is still at the
+    // old name on that table and nothing holds the target at that point.
+    let vacated: BTreeSet<TableName> = {
+        let mut at: BTreeMap<TableName, TableName> = occupants
+            .iter()
+            .filter(|o| o.kind == "default constraint")
+            .filter_map(|o| Some((o.name.clone(), o.parent.clone()?)))
+            .collect();
+        let mut current: BTreeMap<TableName, TableName> =
+            at.keys().map(|n| (n.clone(), n.clone())).collect();
+        let others: BTreeSet<TableName> = occupants
+            .iter()
+            .filter(|o| o.kind != "default constraint")
+            .map(|o| o.name.clone())
+            .collect();
+        for m in default_moves(cs).into_iter().filter(|m| m.old != m.new) {
+            let dropped = |n: &TableName| {
+                dropped_modules.contains(n)
+                    || (m.after_constraint_drops && before_column_renames.contains(n))
+            };
+            let held = others.iter().any(|n| n == &m.new && !dropped(n))
+                || current.values().any(|n| n == &m.new);
+            let Some(original) = current
                 .iter()
-                .any(|m| m.old == o.name && o.parent.as_ref() == Some(&m.parent) && !held(m))
+                .find(|(original, now)| **now == m.old && at.get(*original) == Some(&m.parent))
+                .map(|(original, _)| original.clone())
+            else {
+                continue;
+            };
+            if !held {
+                current.insert(original, m.new.clone());
+            }
+        }
+        at.retain(|original, _| current.get(original) != Some(original));
+        at.into_keys().collect()
     };
+    let moved_away = |o: &pbps_mssql::catalog::NameOccupant| vacated.contains(&o.name);
     let gone = |o: &pbps_mssql::catalog::NameOccupant| {
         let early = moved_away(o)
             || freed.contains(&o.name)
@@ -7163,6 +7189,56 @@ mod tests {
             )
             .is_err()
         );
+        // A chain: `b -> c` moves `b`'s default away before `a -> b` needs
+        // its name, so `a`'s old default name is free for a new table. In
+        // the other order `a`'s target is still held and it stays.
+        let named = |column: &str| {
+            TableName::new(
+                "dbo",
+                pbps_mssql::emit::default_constraint_name(&old, column),
+            )
+        };
+        let default_at = |column: &str| NameOccupant {
+            wanted: named(column),
+            name: named(column),
+            kind: "default constraint".into(),
+            parent: Some(old.clone()),
+            parent_column: Some(column.into()),
+        };
+        let rename = |from: &str, to: &str| {
+            PlannedChange::new(Change::RenameColumn {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "dbo.old.x", 0),
+                table: old.clone(),
+                from: from.into(),
+                to: to.into(),
+                table_was: None,
+            })
+        };
+        let chain = [default_at("a"), default_at("b")];
+        refuse_occupied_objects(
+            &plan(vec![
+                rename("b", "c"),
+                rename("a", "b"),
+                create_at(&named("a")),
+            ]),
+            &chain,
+            "prod",
+        )
+        .expect("the chain frees `a`'s default name");
+        assert!(
+            refuse_occupied_objects(
+                &plan(vec![
+                    rename("a", "b"),
+                    rename("b", "c"),
+                    create_at(&named("a"))
+                ]),
+                &chain,
+                "prod",
+            )
+            .is_err(),
+            "`a`'s target is still held when its rename runs"
+        );
+
         // A table rename in its schema moves each default it lists.
         let renamed = TableName::new("dbo", "fresh");
         let table_moves = plan(vec![
