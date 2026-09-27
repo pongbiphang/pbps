@@ -155,7 +155,7 @@ fn ends_like_a_digest(name: &str) -> bool {
 /// prefix. It is seeded with NUL between the parts: NUL is the one character
 /// [`quote`] refuses outright, so no name can contain one and no two different
 /// triples can spell the same seed.
-fn digested_default_constraint_name(table: &TableName, column: &str) -> String {
+pub fn digested_default_constraint_name(table: &TableName, column: &str) -> String {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
@@ -1632,8 +1632,9 @@ fn rename_generated_default(
 /// The names `pbps` may have left a column's default under: the one it
 /// generates, and the digested one a rename falls back to when that is taken
 /// (DEC-981.1). A later rename looks under both, so a default parked at its
-/// fallback still follows its table and column.
-fn generated_default_names(table: &TableName, column: &str) -> Vec<String> {
+/// fallback still follows its table and column. Public so the connected
+/// plan's namespace walk (`pbps-cli`) moves defaults exactly as this emits.
+pub fn generated_default_names(table: &TableName, column: &str) -> Vec<String> {
     let generated = default_constraint_name(table, column);
     let digested = digested_default_constraint_name(table, column);
     if generated == digested {

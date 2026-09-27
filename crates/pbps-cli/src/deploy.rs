@@ -463,13 +463,15 @@ fn module_object(id: &ModuleId) -> TableName {
 
 /// What the SQL Server occupant read has to cover beyond the names the plan
 /// creates: the names its renames may move a generated default to (#975),
-/// and the tables whose constraints, defaults and triggers its changes move
-/// or remove, by the catalog's names for them.
+/// the generated one and the digested fallback taken when that is held
+/// (DEC-981.1), and the tables whose constraints, defaults and triggers its
+/// changes move or remove, by the catalog's names for them.
 // The complement is every change that moves or removes no object.
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(crate) fn object_reads(cs: &pbps_model::ChangeSet) -> (Vec<TableName>, Vec<TableName>) {
     use pbps_model::Change;
     use pbps_mssql::emit::default_constraint_name as generated;
+    use pbps_mssql::emit::digested_default_constraint_name as digested;
     let renamed_from: BTreeMap<&TableName, &TableName> = cs
         .changes
         .iter()
@@ -488,11 +490,15 @@ pub(crate) fn object_reads(cs: &pbps_model::ChangeSet) -> (Vec<TableName>, Vec<T
                 from, to, defaults, ..
             } => {
                 parents.push(from.clone());
-                names.extend(defaults.iter().map(|c| in_schema(to, generated(to, c))));
+                for c in defaults {
+                    names.push(in_schema(to, generated(to, c)));
+                    names.push(in_schema(to, digested(to, c)));
+                }
             }
             Change::RenameColumn { table, to, .. } => {
                 parents.push(now(table));
                 names.push(in_schema(table, generated(table, to)));
+                names.push(in_schema(table, digested(table, to)));
             }
             Change::DropTable { name, .. } => parents.push(name.clone()),
             Change::DropColumn { column, .. } | Change::AlterColumnDefault { column, .. } => {
@@ -535,8 +541,10 @@ struct Held {
 /// namespace as the emitter's statements do:
 /// - drops remove an object, and a dropped table takes its children along;
 /// - a rename moves a table; a transfer moves its children to the new schema;
-/// - a table or column rename moves a generated default to its new
-///   generated name when nothing holds that name at that point (#975);
+/// - a table or column rename moves a generated default, found under either
+///   name `pbps` may have left it under, to its new generated name when
+///   nothing holds that name at that point (#975), and otherwise to the
+///   digested fallback when nothing holds that (DEC-981.1);
 /// - a dropped column takes its default, and a changed default is replaced;
 /// - added constraints, defaults, tables and modules take their names.
 ///
@@ -551,6 +559,8 @@ pub(crate) fn refuse_occupied_objects(
 ) -> anyhow::Result<()> {
     use pbps_model::Change;
     use pbps_mssql::emit::default_constraint_name as generated;
+    use pbps_mssql::emit::digested_default_constraint_name as digested;
+    use pbps_mssql::emit::generated_default_names as left_under;
     let in_schema = |t: &TableName, name: &str| TableName::new(t.schema.clone(), name);
     // The plan spells a created name its own way; the database's collation
     // may read it as an object the catalog spells differently.
@@ -588,11 +598,23 @@ pub(crate) fn refuse_occupied_objects(
         planned: true,
     };
     // `sp_rename` of a generated default, taken only when it is at `old` on
-    // `table` and nothing holds `new` (the emitter's own guard).
-    let move_default = |held: &mut Vec<Held>, table: &TableName, old: TableName, new: TableName| {
-        if old == new || at(held, &new).is_some() {
+    // `table`: to `new` when nothing holds it, else to `fallback` when nothing
+    // holds that (the emitter's own guards, DEC-981.1).
+    let move_default = |held: &mut Vec<Held>,
+                        table: &TableName,
+                        old: TableName,
+                        new: TableName,
+                        fallback: TableName| {
+        if old == new {
             return;
         }
+        let new = if at(held, &new).is_none() {
+            new
+        } else if fallback != new && fallback != old && at(held, &fallback).is_none() {
+            fallback
+        } else {
+            return;
+        };
         if let Some(h) = held.iter_mut().find(|h| {
             h.name == old && h.kind == "default constraint" && h.parent.as_ref() == Some(table)
         }) {
@@ -647,12 +669,15 @@ pub(crate) fn refuse_occupied_objects(
                     }
                 }
                 for column in defaults {
-                    move_default(
-                        &mut held,
-                        to,
-                        in_schema(to, &generated(from, column)),
-                        in_schema(to, &generated(to, column)),
-                    );
+                    for old in left_under(from, column) {
+                        move_default(
+                            &mut held,
+                            to,
+                            in_schema(to, &old),
+                            in_schema(to, &generated(to, column)),
+                            in_schema(to, &digested(to, column)),
+                        );
+                    }
                 }
             }
             Change::RenameColumn {
@@ -663,13 +688,17 @@ pub(crate) fn refuse_occupied_objects(
                 ..
             } => {
                 let new = in_schema(table, &generated(table, to));
+                let fallback = in_schema(table, &digested(table, to));
                 for was in std::iter::once(table).chain(table_was) {
-                    move_default(
-                        &mut held,
-                        table,
-                        in_schema(table, &generated(was, from)),
-                        new.clone(),
-                    );
+                    for old in left_under(was, from) {
+                        move_default(
+                            &mut held,
+                            table,
+                            in_schema(table, &old),
+                            new.clone(),
+                            fallback.clone(),
+                        );
+                    }
                 }
                 for h in held.iter_mut() {
                     if h.parent.as_ref() == Some(table) && h.column.as_deref() == Some(from) {
@@ -7183,6 +7212,17 @@ mod tests {
         // nothing holds the name it moves to (#1147 review).
         let generated = TableName::new("dbo", pbps_mssql::emit::default_constraint_name(&old, "c"));
         let target = TableName::new("dbo", pbps_mssql::emit::default_constraint_name(&old, "d"));
+        let fallback = TableName::new(
+            "dbo",
+            pbps_mssql::emit::digested_default_constraint_name(&old, "d"),
+        );
+        let synonym_at = |name: &TableName| NameOccupant {
+            wanted: name.clone(),
+            name: name.clone(),
+            kind: "synonym".into(),
+            parent: None,
+            parent_column: None,
+        };
         let create_at = |name: &TableName| {
             PlannedChange::new(Change::CreateTable {
                 uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.n", 0),
@@ -7209,17 +7249,17 @@ mod tests {
         let moves = plan(vec![rename_column(), create_at(&generated)]);
         refuse_occupied_objects(&moves, std::slice::from_ref(&the_default), "prod")
             .expect("the rename moves the default out of the way");
+        // #981: a taken target sends it to its digested fallback, which
+        // frees the old name for the table created after it, as the emitted
+        // SQL does. Only a taken fallback too keeps it where it is.
+        refuse_occupied_objects(&moves, &[the_default.clone(), synonym_at(&target)], "prod")
+            .expect("a taken target moves the default to its fallback");
         let e = refuse_occupied_objects(
             &moves,
             &[
                 the_default.clone(),
-                NameOccupant {
-                    wanted: target.clone(),
-                    name: target.clone(),
-                    kind: "synonym".into(),
-                    parent: None,
-                    parent_column: None,
-                },
+                synonym_at(&target),
+                synonym_at(&fallback),
             ],
             "prod",
         )
@@ -7227,7 +7267,7 @@ mod tests {
         .to_string();
         assert!(
             e.contains("default constraint"),
-            "a taken target keeps it: {e}"
+            "a taken target and fallback keep it: {e}"
         );
         // A check at the target that the plan drops first is gone by the
         // time the column rename runs (#1147 review).
@@ -7248,9 +7288,14 @@ mod tests {
             "prod",
         )
         .expect("the check is dropped before the rename looks");
+        // The fallback is held here, so the order alone decides.
         assert!(
-            refuse_occupied_objects(&moves, &[the_default.clone(), check_at_target], "prod")
-                .is_err(),
+            refuse_occupied_objects(
+                &moves,
+                &[the_default.clone(), check_at_target, synonym_at(&fallback)],
+                "prod"
+            )
+            .is_err(),
             "a check that stays still holds the target"
         );
         assert!(
@@ -7292,13 +7337,20 @@ mod tests {
         )
         .expect("the transfer takes the check out of the schema first");
         assert!(
-            refuse_occupied_objects(&moves, &[the_default.clone(), on_other], "prod").is_err(),
+            refuse_occupied_objects(
+                &moves,
+                &[the_default.clone(), on_other, synonym_at(&fallback)],
+                "prod"
+            )
+            .is_err(),
             "untransferred, the check still holds the target"
         );
 
         // A chain: `b -> c` moves `b`'s default away before `a -> b` needs
         // its name, so `a`'s old default name is free for a new table. In
-        // the other order `a`'s target is still held and it stays.
+        // the other order `a`'s target is still held, so it goes to its
+        // digested fallback and the old name is free all the same (#981);
+        // only a held fallback keeps it there.
         let named = |column: &str| {
             TableName::new(
                 "dbo",
@@ -7332,18 +7384,27 @@ mod tests {
             "prod",
         )
         .expect("the chain frees `a`'s default name");
+        let reversed = || {
+            plan(vec![
+                rename("a", "b"),
+                rename("b", "c"),
+                create_at(&named("a")),
+            ])
+        };
+        refuse_occupied_objects(&reversed(), &chain, "prod")
+            .expect("`a`'s default goes to its fallback while `b`'s name is held");
+        let b_fallback = TableName::new(
+            "dbo",
+            pbps_mssql::emit::digested_default_constraint_name(&old, "b"),
+        );
         assert!(
             refuse_occupied_objects(
-                &plan(vec![
-                    rename("a", "b"),
-                    rename("b", "c"),
-                    create_at(&named("a"))
-                ]),
-                &chain,
+                &reversed(),
+                &[default_at("a"), default_at("b"), synonym_at(&b_fallback)],
                 "prod",
             )
             .is_err(),
-            "`a`'s target is still held when its rename runs"
+            "`a`'s target and fallback are both held when its rename runs"
         );
 
         // A table rename in its schema moves each default it lists.
@@ -7363,6 +7424,14 @@ mod tests {
             names.contains(&TableName::new(
                 "dbo",
                 pbps_mssql::emit::default_constraint_name(&renamed, "c")
+            )),
+            "{names:?}"
+        );
+        // And the fallback the move takes when that is held (#981).
+        assert!(
+            names.contains(&TableName::new(
+                "dbo",
+                pbps_mssql::emit::digested_default_constraint_name(&renamed, "c")
             )),
             "{names:?}"
         );
@@ -7408,18 +7477,38 @@ mod tests {
             "prod",
         )
         .expect("`b`'s default leaves before `a`'s arrives");
+        // The other way round, `a`'s target is still held, so its default
+        // takes its digested fallback and the old name is free all the same
+        // (#981); only a held fallback keeps it.
+        let a_first = || {
+            plan(vec![
+                rename_table(&a, &b),
+                rename_table(&b, &gone_b),
+                create_at(&a_default.name),
+            ])
+        };
+        refuse_occupied_objects(
+            &a_first(),
+            &[a_default.clone(), default_on(&b, "c")],
+            "prod",
+        )
+        .expect("`a`'s default takes its fallback while `b`'s is held");
+        let a_fallback = TableName::new(
+            "dbo",
+            pbps_mssql::emit::digested_default_constraint_name(&b, "c"),
+        );
         assert!(
             refuse_occupied_objects(
-                &plan(vec![
-                    rename_table(&a, &b),
-                    rename_table(&b, &gone_b),
-                    create_at(&a_default.name),
-                ]),
-                &[a_default.clone(), default_on(&b, "c")],
+                &a_first(),
+                &[
+                    a_default.clone(),
+                    default_on(&b, "c"),
+                    synonym_at(&a_fallback)
+                ],
                 "prod",
             )
             .is_err(),
-            "the other way round, `a`'s target is still held"
+            "the other way round, `a`'s target and fallback are both held"
         );
 
         // Names the plan moves into are taken (#1153): a default a rename

@@ -703,6 +703,12 @@ left it under, the generated one and the digested one, so a default parked at
 its fallback still follows its table and column. An adopted default under a
 name `pbps` never chose is still left alone.
 
+The connected plan's namespace walk (`refuse_occupied_objects` in
+`pbps-cli`) moves a default by the same rules, using the same name functions,
+and its read covers the fallback names too. Otherwise the walk would keep the
+default under its old name and refuse a plan whose emitted SQL frees that
+name (review of #1200).
+
 Pinned by `a_default_whose_new_name_is_taken_frees_its_old_one` (SQL Server
 live suite). `a_renamed_tables_and_columns_generated_defaults_follow_them` now
 expects the fallback name where DEC-975.1 kept the old one.
