@@ -349,6 +349,17 @@ impl Reconstruction {
         self.dropped.get(id).and_then(Option::as_ref)
     }
 
+    /// The identity a declared routine holds on the target: the one its
+    /// signature names there if the plan drops it, even where the plan
+    /// creates it again under another kind, else the one scratch compiled.
+    pub fn known(&self, id: &ModuleId) -> Option<&ObjectIdentity> {
+        if self.dropped.contains_key(id) {
+            self.dropped(id)
+        } else {
+            self.created(id)
+        }
+    }
+
     /// Runs every step in one transaction under the dialect's session pins,
     /// as whatever role the session currently is — the reproduced deployer,
     /// which the scope has entered. Committed only when all of it compiled;
