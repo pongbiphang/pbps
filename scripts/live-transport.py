@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import tempfile
@@ -25,6 +26,29 @@ PASSWORD = "Pbps!Test12345"
 
 def run(*args, **kwargs):
     return subprocess.run(args, check=True, text=True, **kwargs)
+
+
+def run_case(command, test, env):
+    result = subprocess.run(
+        [*command, "--ignored", "--exact", test, "--test-threads=1",
+         "--format=pretty", "--color=never"],
+        env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    print(result.stdout, end="", flush=True)
+    # libtest succeeds when a renamed or filtered case runs zero tests. Both
+    # its named result and its sole summary must attest to this exact case.
+    lines = result.stdout.splitlines()
+    cases = [line for line in lines if re.match(r"test .+ \.\.\. ", line)]
+    summaries = [line for line in lines if line.startswith("test result:")]
+    if (result.returncode or cases != [f"test {test} ... ok"]
+            or len(summaries) != 1
+            or not re.fullmatch(
+                r"test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; "
+                r"[0-9]+ filtered out; finished in .+", summaries[0])):
+        raise RuntimeError(
+            f"TLS case {test!r} did not run and pass exactly once "
+            f"(exit {result.returncode})"
+        )
 
 
 def interrupted(signum, _frame):
@@ -107,12 +131,12 @@ def main():
                        PBPS_TEST_TLS_PORT=ports[internal_port + "/tcp"][0]["HostPort"],
                        PBPS_TEST_TLS_CA=str(root / "ca.pem"),
                        SSL_CERT_FILE=str(root / "ca.pem"), SSL_CERT_DIR=str(root / "empty"))
-            cargo = ["cargo", "test", "-p", "pbps-db", "--test", "live_transport", "--",
-                     "--ignored", "--test-threads=1"]
-            run(*cargo, "verified_round_trips_reject_wrong_peers_and_corrupted_replies", env=env)
+            cargo = ["cargo", "test", "-p", "pbps-db", "--test", "live_transport", "--"]
+            run_case(cargo, "verified_round_trips_reject_wrong_peers_and_corrupted_replies", env)
             for trust in ("untrusted.pem", "invalid.pem", "missing.pem"):
+                print(f"TLS trust variant: {trust}", flush=True)
                 env["SSL_CERT_FILE"] = str(root / trust)
-                run(*cargo, "invalid_trust_cannot_yield_a_verified_connection", env=env)
+                run_case(cargo, "invalid_trust_cannot_yield_a_verified_connection", env)
         finally:
             # Do not silently ignore failed cleanup: no shared container is
             # named, and a failed removal leaves this fixture's resources live.
