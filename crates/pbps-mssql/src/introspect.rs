@@ -188,6 +188,14 @@ fn index_type_name(code: u8) -> String {
     }
 }
 
+/// Whether the assembler leaves this index out of the declarations: a unique
+/// index whose write behaviour the model cannot hold, or any kind but a
+/// nonclustered rowstore one.
+fn index_is_left_out(i: &RawIndexColumn) -> bool {
+    (i.is_unique && (i.is_disabled || i.ignore_dup_key))
+        || matches!(i.kind, IndexKind::Unmodelled(_))
+}
+
 /// One column of an index that is not backing a PK or UNIQUE constraint.
 #[derive(Debug, Clone)]
 pub struct RawIndexColumn {
@@ -978,6 +986,16 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
 
     let mut unsupported_omitted_foreign_keys = BTreeSet::new();
     let mut unsupported_fk_enforcement = BTreeSet::new();
+    // A foreign key may be bound to a standalone unique index as well as to a
+    // key (`key_index_id`), and the index loop below leaves some of those out.
+    // Known before the foreign keys are read, so one bound to such an index
+    // goes with it rather than being declared against no candidate key (#1199).
+    let left_out_indexes: BTreeSet<(i32, String)> = raw
+        .index_columns
+        .iter()
+        .filter(|i| index_is_left_out(i))
+        .map(|i| (i.object_id, i.index_name.clone()))
+        .collect();
     for f in &raw.foreign_key_columns {
         if !tables.contains_key(&f.object_id) {
             continue;
@@ -1010,11 +1028,16 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             continue;
         }
         let referenced = TableName::new(f.ref_schema.clone(), f.ref_table.clone());
-        if let Some(key) = f
-            .ref_key
-            .as_ref()
-            .filter(|key| unsupported_keys.contains(&(f.ref_object_id, (*key).clone())))
-        {
+        if let Some((key, kind)) = f.ref_key.as_ref().and_then(|key| {
+            let bound = (f.ref_object_id, key.clone());
+            if unsupported_keys.contains(&bound) {
+                Some((key, "key"))
+            } else {
+                left_out_indexes
+                    .contains(&bound)
+                    .then_some((key, "unique index"))
+            }
+        }) {
             if unsupported_omitted_foreign_keys.insert((f.object_id, f.constraint_name.clone())) {
                 let table_name = name_of(f.object_id, &names);
                 push_limitation(
@@ -1022,7 +1045,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     &mut limitations,
                     names.get(&f.object_id),
                     format!(
-                        "{table_name}: foreign key `{}` references key `{key}` of {referenced}, which was left out of the declarations; the foreign key was left out too",
+                        "{table_name}: foreign key `{}` references {kind} `{key}` of {referenced}, which was left out of the declarations; the foreign key was left out too",
                         f.constraint_name
                     ),
                 );
@@ -1111,6 +1134,8 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         // Ordinary disabled indexes affect access paths only. Unique indexes
         // change which writes survive, so rebuilding them must not silently
         // enable enforcement or replace IGNORE_DUP_KEY with rejection.
+        // The two branches below are exactly `index_is_left_out`, which the
+        // foreign keys read first; keep them in step.
         if i.is_unique && (i.is_disabled || i.ignore_dup_key) {
             if unmodelled_indexes.insert((i.object_id, i.index_name.clone())) {
                 push_limitation(
@@ -2473,6 +2498,76 @@ mod tests {
             is_primary,
             column: column.into(),
         }
+    }
+
+    /// #1199: a foreign key bound to a standalone unique index the assembler
+    /// leaves out — clustered, or with `IGNORE_DUP_KEY` — went on being
+    /// declared, and bootstrap then had no candidate key to bind it to.
+    #[test]
+    fn a_foreign_key_into_a_left_out_unique_index_is_left_out_too() {
+        let mut raw = RawCatalog::default();
+        for (id, name) in [(1, "p"), (2, "q"), (3, "r"), (4, "ch")] {
+            raw.tables.push(raw_table(id, "dbo", name));
+            raw.columns.push(raw_column(id, "code", "int"));
+        }
+        let index = |object_id, name: &str, kind, ignore_dup_key| RawIndexColumn {
+            is_disabled: false,
+            ignore_dup_key,
+            object_id,
+            index_name: name.into(),
+            is_unique: true,
+            kind,
+            filter: None,
+            column: "code".into(),
+            is_included: false,
+            is_descending: false,
+        };
+        raw.index_columns = vec![
+            index(1, "ux_p_code", IndexKind::Unmodelled(1), false),
+            index(2, "ux_q_code", IndexKind::Nonclustered, true),
+            // The control: a unique index the declarations hold.
+            index(3, "ux_r_code", IndexKind::Nonclustered, false),
+        ];
+        for (name, ref_object_id, ref_table, ref_key) in [
+            ("fk_ch_p", 1, "p", "ux_p_code"),
+            ("fk_ch_q", 2, "q", "ux_q_code"),
+            ("fk_ch_r", 3, "r", "ux_r_code"),
+        ] {
+            raw.foreign_key_columns.push(RawForeignKeyColumn {
+                object_id: 4,
+                constraint_name: name.into(),
+                ref_schema: "dbo".into(),
+                ref_table: ref_table.into(),
+                ref_object_id,
+                ref_key: Some(ref_key.into()),
+                column: "code".into(),
+                ref_column: "code".into(),
+                on_delete: 0,
+                on_update: 0,
+                is_disabled: false,
+                is_not_trusted: false,
+                is_not_for_replication: false,
+            });
+        }
+
+        let pulled = assemble(&raw);
+
+        let ch = &pulled.schema.tables[&TableName::new("dbo", "ch")].foreign_keys;
+        assert_eq!(ch.keys().collect::<Vec<_>>(), ["fk_ch_r"]);
+        for (fk, index, table) in [("fk_ch_p", "ux_p_code", "p"), ("fk_ch_q", "ux_q_code", "q")] {
+            assert!(
+                pulled.limitations.iter().any(|l| {
+                    l.target.object_name() == TableName::new("dbo", "ch")
+                        && l.detail.contains(&format!(
+                            "foreign key `{fk}` references unique index `{index}` of dbo.{table}"
+                        ))
+                }),
+                "{fk}: {:?}",
+                pulled.limitations
+            );
+        }
+        // One per left-out index and one per foreign key that went with it.
+        assert_eq!(pulled.limitations.len(), 4, "{:?}", pulled.limitations);
     }
 
     /// #1186: the declarations spell no key layout, so bootstrap takes the

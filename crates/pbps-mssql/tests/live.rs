@@ -1841,6 +1841,56 @@ async fn ledger_tables_their_history_and_their_views_are_not_pulled() {
     );
 }
 
+/// #1199: a foreign key the engine bound to a standalone unique index that
+/// pull leaves out was still declared, so bootstrap created it against no
+/// candidate key and the engine refused it.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_foreign_key_into_a_left_out_unique_index_is_left_out_too() {
+    let mut db = TestDb::create("fkindex1199").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.p (id int NOT NULL, code int NOT NULL);
+             CREATE UNIQUE CLUSTERED INDEX ux_p_code ON dbo.p (code);
+             CREATE TABLE dbo.q (code int NOT NULL);
+             CREATE UNIQUE INDEX ux_q_code ON dbo.q (code) WITH (IGNORE_DUP_KEY = ON);
+             CREATE TABLE dbo.r (code int NOT NULL);
+             CREATE UNIQUE INDEX ux_r_code ON dbo.r (code);
+             CREATE TABLE dbo.ch (
+                 p_code int NULL CONSTRAINT fk_ch_p REFERENCES dbo.p (code),
+                 q_code int NULL CONSTRAINT fk_ch_q REFERENCES dbo.q (code),
+                 r_code int NULL CONSTRAINT fk_ch_r REFERENCES dbo.r (code)
+             );",
+        )
+        .await
+        .expect("create tables with foreign keys into unique indexes");
+    let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    db.drop().await;
+
+    let ch = &pulled.schema.tables[&TableName::new("dbo", "ch")].foreign_keys;
+    assert_eq!(ch.keys().collect::<Vec<_>>(), ["fk_ch_r"]);
+    for (fk, index, table) in [("fk_ch_p", "ux_p_code", "p"), ("fk_ch_q", "ux_q_code", "q")] {
+        assert!(
+            pulled.limitations.iter().any(|l| {
+                l.target.object_name() == TableName::new("dbo", "ch")
+                    && l.detail.contains(&format!(
+                        "foreign key `{fk}` references unique index `{index}` of dbo.{table}"
+                    ))
+            }),
+            "{fk}: {:?}",
+            pulled.limitations
+        );
+    }
+    assert!(
+        pulled.schema.tables[&TableName::new("dbo", "r")]
+            .indexes
+            .contains_key("ux_r_code")
+    );
+    assert_eq!(pulled.limitations.len(), 4, "{:?}", pulled.limitations);
+}
+
 /// #1186: a key's backing index layout was never read, and the declarations
 /// spell no `CLUSTERED` or `NONCLUSTERED`, so bootstrap turned a heap's
 /// nonclustered primary key clustered and swapped a nonclustered primary key
