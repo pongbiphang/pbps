@@ -34,7 +34,9 @@ pub struct Managed {
     relations: BTreeSet<(String, String)>,
     /// Named indexes and keys: relations with no type.
     indexes: BTreeSet<(String, String)>,
-    routines: BTreeMap<(String, String), BTreeSet<pbps_model::ModuleId>>,
+    /// Declared routines by name, each with its kind, which a dropped one's
+    /// lookup must match (#1126).
+    routines: BTreeMap<(String, String), BTreeMap<pbps_model::ModuleId, pbps_model::ModuleKind>>,
 }
 
 impl Managed {
@@ -51,14 +53,18 @@ impl Managed {
                 managed.indexes.insert((name.schema.clone(), index.clone()));
             }
         }
-        for id in schema.modules.keys() {
+        for (id, module) in &schema.modules {
             let key = (id.schema().to_owned(), id.name().to_owned());
             match id {
                 pbps_model::ModuleId::Named(_) => {
                     managed.relations.insert(key);
                 }
                 pbps_model::ModuleId::Routine(_) => {
-                    managed.routines.entry(key).or_default().insert(id.clone());
+                    managed
+                        .routines
+                        .entry(key)
+                        .or_default()
+                        .insert(id.clone(), module.kind);
                 }
                 pbps_model::ModuleId::Trigger { .. } => {}
             }
@@ -68,12 +74,15 @@ impl Managed {
 
     /// Declared routines these managed objects hold and `desired` does not:
     /// the overloads a plan from this side to `desired` drops.
-    pub fn dropped_by(&self, desired: &Managed) -> Vec<pbps_model::ModuleId> {
+    pub fn dropped_by(
+        &self,
+        desired: &Managed,
+    ) -> Vec<(pbps_model::ModuleId, pbps_model::ModuleKind)> {
         self.routines
             .values()
             .flatten()
-            .filter(|id| !desired.routines.values().any(|kept| kept.contains(*id)))
-            .cloned()
+            .filter(|(id, _)| !desired.routines.values().any(|kept| kept.contains_key(*id)))
+            .map(|(id, kind)| (id.clone(), *kind))
             .collect()
     }
 
@@ -124,7 +133,7 @@ impl Managed {
             // declared one the target lacks (#1063).
             CandidateClass::Routine => self.routines.get(&key(name)).is_some_and(|declared| {
                 declared
-                    .iter()
+                    .keys()
                     .filter_map(|id| order.created(id).or_else(|| order.dropped(id)))
                     .any(|known| known == member)
             }),

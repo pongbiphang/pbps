@@ -533,7 +533,13 @@ async fn postgres_capture_is_fresh_and_cancellation_expires_its_connection(
         .unwrap();
     let timed = tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        target.identify_dropped(&[], vec!["capture_fixture.gone(integer)".parse().unwrap()]),
+        target.identify_dropped(
+            &[],
+            vec![(
+                "capture_fixture.gone(integer)".parse().unwrap(),
+                pbps_model::ModuleKind::Function,
+            )],
+        ),
     )
     .await;
     administrator.query("ROLLBACK").await.unwrap();

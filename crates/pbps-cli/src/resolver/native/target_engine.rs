@@ -64,7 +64,7 @@ pub(super) async fn capture(
 pub(super) async fn identify_dropped(
     connection: &mut PeerVerifiedConn,
     write_path_extras: &[String],
-    routines: Vec<pbps_model::ModuleId>,
+    routines: Vec<(pbps_model::ModuleId, pbps_model::ModuleKind)>,
 ) -> Result<
     std::collections::BTreeMap<
         pbps_model::ModuleId,

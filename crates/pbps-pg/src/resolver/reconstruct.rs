@@ -432,16 +432,18 @@ impl Reconstruction {
 /// path that `DROP` runs under, in a read-only transaction of its own whose
 /// `SET LOCAL` the rollback undoes. A lookup that fails is an unreadable
 /// target, never an absent routine: a spelling the engine cannot parse would
-/// fail the plan's `DROP` as well.
+/// fail the plan's `DROP` as well. A routine of another kind than the one
+/// declared, such as an aggregate where a function was, is not it: the plan's
+/// `DROP FUNCTION` refuses an aggregate (#1126).
 pub async fn identify_dropped(
     conn: &mut impl pbps_db::transport::QueryConnection,
     dialect: &crate::Postgres,
-    routines: Vec<ModuleId>,
+    routines: Vec<(ModuleId, ModuleKind)>,
 ) -> Result<BTreeMap<ModuleId, Option<ObjectIdentity>>, CaptureError> {
     let mut identified = BTreeMap::new();
-    for id in routines {
+    for (id, kind) in routines {
         let identity = match &id {
-            ModuleId::Routine(routine) => signature(conn, dialect, routine).await?,
+            ModuleId::Routine(routine) => signature(conn, dialect, routine, kind).await?,
             ModuleId::Named(_) | ModuleId::Trigger { .. } => None,
         };
         identified.insert(id, identity);
@@ -453,7 +455,13 @@ async fn signature(
     conn: &mut impl pbps_db::transport::QueryConnection,
     dialect: &crate::Postgres,
     routine: &pbps_model::RoutineId,
+    kind: ModuleKind,
 ) -> Result<Option<ObjectIdentity>, CaptureError> {
+    let prokind = match kind {
+        ModuleKind::Function => "f",
+        ModuleKind::Procedure => "p",
+        ModuleKind::View | ModuleKind::Trigger => return Ok(None),
+    };
     // A path or name the emitter cannot write is a DROP the plan cannot
     // contain, so it is refused like an unreadable lookup.
     let path =
@@ -487,7 +495,7 @@ async fn signature(
         conn.query(&format!("SET LOCAL search_path = {path}"))
             .await?;
         conn.query(&format!(
-            "SELECT n.nspname AS schema, p.proname AS name, COALESCE((SELECT pg_catalog.json_agg(pg_catalog.json_build_array(tn.nspname, t.typname) ORDER BY a.ord) \
+            "SELECT n.nspname AS schema, p.proname AS name, p.prokind::pg_catalog.text AS kind, COALESCE((SELECT pg_catalog.json_agg(pg_catalog.json_build_array(tn.nspname, t.typname) ORDER BY a.ord) \
              FROM pg_catalog.unnest(p.proargtypes::pg_catalog.oid[]) WITH ORDINALITY AS a(typ, ord) \
              JOIN pg_catalog.pg_type t ON t.oid = a.typ JOIN pg_catalog.pg_namespace tn ON tn.oid = t.typnamespace), '[]')::text AS args \
              FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
@@ -511,6 +519,9 @@ async fn signature(
             .map(str::to_owned)
             .ok_or(CaptureError::Incomplete)
     };
+    if text("kind")? != prokind {
+        return Ok(None);
+    }
     let args = serde_json::from_str::<Vec<[String; 2]>>(&text("args")?)
         .map_err(|_| CaptureError::Incomplete)?;
     Ok(Some(ObjectIdentity {
