@@ -716,9 +716,17 @@ pub(crate) fn refuse_occupied_objects(
                 held.push(constraint(table, name, "check constraint"));
             }
             Change::SetPrimaryKey { table, from, to } => {
-                if let Some(name) = from.as_ref().and_then(|k| k.name.as_deref()) {
-                    let name = in_schema(table, name);
-                    held.retain(|h| h.name != name);
+                match from.as_ref().map(|k| k.name.as_deref()) {
+                    Some(Some(name)) => {
+                        let name = in_schema(table, name);
+                        held.retain(|h| h.name != name);
+                    }
+                    // An unnamed key has the name the server gave it, which
+                    // the emitter looks up by table; so does the walk.
+                    Some(None) => held.retain(|h| {
+                        !(h.kind == "primary key constraint" && h.parent.as_ref() == Some(table))
+                    }),
+                    None => {}
                 }
                 if let Some(name) = to.as_ref().and_then(|k| k.name.as_deref()) {
                     held.push(constraint(table, name, "primary key constraint"));
@@ -7107,6 +7115,24 @@ mod tests {
         assert!(refused(vec![create_table(), redefault()], default_of("c")).is_some());
         assert_eq!(
             refused(vec![redefault(), create_view()], default_of("c")),
+            None
+        );
+        // An unnamed key's server-given name goes with it too.
+        assert_eq!(
+            refused(
+                vec![
+                    PlannedChange::new(Change::SetPrimaryKey {
+                        table: old.clone(),
+                        from: Some(pbps_model::PrimaryKey {
+                            name: None,
+                            columns: vec!["id".into()],
+                        }),
+                        to: None,
+                    }),
+                    create_table()
+                ],
+                occupant("primary key constraint", Some(&old))
+            ),
             None
         );
         // A named key dropped outright goes before the tables; one replaced
