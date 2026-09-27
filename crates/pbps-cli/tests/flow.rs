@@ -386,6 +386,13 @@ fn an_occupied_rename_command_cannot_borrow_a_loaded_annotations_match() {
     let o = d.run(&["rename", "dbo.t.old", "occupied"]);
     assert_eq!(code(&o), FINDING, "{}{}", stdout(&o), stderr(&o));
     assert!(stderr(&o).contains("dbo.t.occupied"), "{}", stderr(&o));
+    // The annotation already accounts for the source, so the guidance about
+    // it is conditional rather than a second decision to make (#554).
+    assert!(
+        stderr(&o).contains("unless another rename already accounts for the source"),
+        "{}",
+        stderr(&o)
+    );
     assert_eq!(
         std::fs::read_to_string(d.ids_path()).unwrap(),
         before,
@@ -418,7 +425,7 @@ fn keeping_an_occupied_rename_target_still_asks_what_becomes_of_the_source() {
     let o = d.run(&["plan"]);
     assert_eq!(code(&o), FINDING, "{}{}", stdout(&o), stderr(&o));
     let text = stderr(&o);
-    assert!(text.contains("decide what becomes of the source"), "{text}");
+    assert!(text.contains("decide what becomes of it"), "{text}");
     assert!(text.contains("--reason"), "{text}");
     let o = d.run(&["plan", "--format", "json"]);
     assert_eq!(code(&o), FINDING);
@@ -444,7 +451,7 @@ fn keeping_an_occupied_rename_target_still_asks_what_becomes_of_the_source() {
         occupied["remedy"]
             .as_str()
             .unwrap()
-            .contains("decide what becomes of the source"),
+            .contains("decide what becomes of it"),
         "{occupied}"
     );
     assert_eq!(std::fs::read_to_string(d.ids_path()).unwrap(), ids);
