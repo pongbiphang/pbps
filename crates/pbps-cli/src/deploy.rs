@@ -461,29 +461,13 @@ fn module_object(id: &ModuleId) -> TableName {
     }
 }
 
-/// A generated default a rename moves, as SQL Server's emitter does it
-/// (#975): `sp_rename` of `old` to `new` on the table the catalog calls
-/// `parent`, taken only when nothing holds `new` yet.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DefaultMove {
-    pub(crate) parent: TableName,
-    pub(crate) old: TableName,
-    pub(crate) new: TableName,
-    /// A column rename's move, which runs after the table renames and the
-    /// constraint drops; a table rename's runs before them.
-    pub(crate) after_constraint_drops: bool,
-}
-
-/// Every generated-default move this plan's renames ask for, in plan order.
-/// A table rename moves each default it lists from the old table's generated
-/// name to the new one's, in the new schema only after a transfer, which has
-/// already taken the constraint along. A column rename moves the default
-/// named for the old column, under the table's current or earlier name, to
-/// the one named for the new column. Each `parent` is the catalog's name for
-/// the table before the plan runs.
-// The complement is every change that renames nothing.
+/// What the SQL Server occupant read has to cover beyond the names the plan
+/// creates: the names its renames may move a generated default to (#975),
+/// and the tables whose constraints, defaults and triggers its changes move
+/// or remove, by the catalog's names for them.
+// The complement is every change that moves or removes no object.
 #[allow(clippy::wildcard_enum_match_arm)]
-pub(crate) fn default_moves(cs: &pbps_model::ChangeSet) -> Vec<DefaultMove> {
+pub(crate) fn object_reads(cs: &pbps_model::ChangeSet) -> (Vec<TableName>, Vec<TableName>) {
     use pbps_model::Change;
     use pbps_mssql::emit::default_constraint_name as generated;
     let renamed_from: BTreeMap<&TableName, &TableName> = cs
@@ -496,19 +480,179 @@ pub(crate) fn default_moves(cs: &pbps_model::ChangeSet) -> Vec<DefaultMove> {
         .collect();
     let now = |t: &TableName| (*renamed_from.get(t).unwrap_or(&t)).clone();
     let in_schema = |t: &TableName, name: String| TableName::new(t.schema.clone(), name);
-    let mut out = Vec::new();
+    let mut names = created_object_names(cs);
+    let mut parents = Vec::new();
     for p in &cs.changes {
         match &p.change {
             Change::RenameTable {
                 from, to, defaults, ..
-            } if from.schema == to.schema => {
+            } => {
+                parents.push(from.clone());
+                names.extend(defaults.iter().map(|c| in_schema(to, generated(to, c))));
+            }
+            Change::RenameColumn { table, to, .. } => {
+                parents.push(now(table));
+                names.push(in_schema(table, generated(table, to)));
+            }
+            Change::DropTable { name, .. } => parents.push(name.clone()),
+            Change::DropColumn { column, .. } | Change::AlterColumnDefault { column, .. } => {
+                parents.push(now(&column.table));
+            }
+            Change::DropUnique { table, .. }
+            | Change::DropForeignKey { table, .. }
+            | Change::DropCheck { table, .. }
+            | Change::SetPrimaryKey { table, .. } => parents.push(now(table)),
+            _ => {}
+        }
+    }
+    for list in [&mut names, &mut parents] {
+        list.sort();
+        list.dedup();
+    }
+    (names, parents)
+}
+
+/// One entry of a schema's `sys.objects` namespace while a plan is walked:
+/// read from the catalog, or put there by an earlier change of the plan.
+#[derive(Debug, Clone)]
+struct Held {
+    name: TableName,
+    kind: String,
+    parent: Option<TableName>,
+    column: Option<String>,
+    /// Put where it is by the plan, rather than found there in the database.
+    planned: bool,
+}
+
+/// Refuses a name this plan creates on SQL Server that another object in
+/// the schema's `sys.objects` namespace holds when the `CREATE` runs (#1077):
+/// a sequence, a synonym, a constraint, a default, or a table or module this
+/// project does not record. `CREATE TABLE` there fails with Msg 2714, and
+/// `CREATE OR ALTER` fails or replaces what is there.
+///
+/// The plan is walked in its own order, which is the order it runs in
+/// (`order_key`), over what the catalog read found. Each change moves the
+/// namespace as the emitter's statements do:
+/// - drops remove an object, and a dropped table takes its children along;
+/// - a rename moves a table; a transfer moves its children to the new schema;
+/// - a table or column rename moves a generated default to its new
+///   generated name when nothing holds that name at that point (#975);
+/// - a dropped column takes its default, and a changed default is replaced;
+/// - added constraints, defaults, tables and modules take their names.
+///
+/// So a name freed before the `CREATE` runs is free, and a name something
+/// moves into first is taken, whatever order the changes that do it come in.
+// The complement is every change that touches no object name.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub(crate) fn refuse_occupied_objects(
+    cs: &pbps_model::ChangeSet,
+    occupants: &[pbps_mssql::catalog::NameOccupant],
+    label: &str,
+) -> anyhow::Result<()> {
+    use pbps_model::Change;
+    use pbps_mssql::emit::default_constraint_name as generated;
+    let in_schema = |t: &TableName, name: &str| TableName::new(t.schema.clone(), name);
+    // The plan spells a created name its own way; the database's collation
+    // may read it as an object the catalog spells differently.
+    let catalog_spelling: BTreeMap<&TableName, &TableName> =
+        occupants.iter().map(|o| (&o.wanted, &o.name)).collect();
+    let mut held: Vec<Held> = Vec::new();
+    for o in occupants {
+        if !held.iter().any(|h| h.name == o.name) {
+            held.push(Held {
+                name: o.name.clone(),
+                kind: o.kind.clone(),
+                parent: o.parent.clone(),
+                column: o.parent_column.clone(),
+                planned: false,
+            });
+        }
+    }
+    let at = |held: &[Held], name: &TableName| {
+        let spelled = catalog_spelling.get(name).copied();
+        held.iter()
+            .position(|h| &h.name == name || Some(&h.name) == spelled)
+    };
+    let default_of = |table: &TableName, column: &str| Held {
+        name: in_schema(table, &generated(table, column)),
+        kind: "default constraint".into(),
+        parent: Some(table.clone()),
+        column: Some(column.into()),
+        planned: true,
+    };
+    let constraint = |table: &TableName, name: &str, kind: &str| Held {
+        name: in_schema(table, name),
+        kind: kind.into(),
+        parent: Some(table.clone()),
+        column: None,
+        planned: true,
+    };
+    // `sp_rename` of a generated default, taken only when it is at `old` on
+    // `table` and nothing holds `new` (the emitter's own guard).
+    let move_default = |held: &mut Vec<Held>, table: &TableName, old: TableName, new: TableName| {
+        if old == new || at(held, &new).is_some() {
+            return;
+        }
+        if let Some(h) = held.iter_mut().find(|h| {
+            h.name == old && h.kind == "default constraint" && h.parent.as_ref() == Some(table)
+        }) {
+            h.name = new;
+            h.planned = true;
+        }
+    };
+    let mut taken: Vec<String> = Vec::new();
+    let mut create = |held: &mut Vec<Held>, name: &TableName, kind: &str| {
+        if let Some(i) = at(held, name) {
+            let h = &held[i];
+            let what = match &h.parent {
+                Some(parent) => format!("{} `{}` on `{parent}`", h.kind, h.name),
+                None => format!("{} `{}`", h.kind, h.name),
+            };
+            taken.push(if h.planned {
+                format!("`{name}`: this plan puts {what} there first")
+            } else {
+                format!("`{name}`: the database already has {what}")
+            });
+        }
+        held.push(Held {
+            name: name.clone(),
+            kind: kind.into(),
+            parent: None,
+            column: None,
+            planned: true,
+        });
+    };
+    for p in &cs.changes {
+        match &p.change {
+            Change::DropModule { id, .. } => {
+                let name = module_object(id);
+                held.retain(|h| h.name != name);
+            }
+            Change::DropTable { name, .. } => {
+                held.retain(|h| &h.name != name && h.parent.as_ref() != Some(name));
+            }
+            Change::RenameTable {
+                from, to, defaults, ..
+            } => {
+                for h in held.iter_mut() {
+                    if &h.name == from {
+                        h.name = to.clone();
+                    }
+                    if h.parent.as_ref() == Some(from) {
+                        h.parent = Some(to.clone());
+                        if h.name.schema != to.schema {
+                            h.name.schema = to.schema.clone();
+                            h.planned = true;
+                        }
+                    }
+                }
                 for column in defaults {
-                    out.push(DefaultMove {
-                        parent: from.clone(),
-                        old: in_schema(to, generated(from, column)),
-                        new: in_schema(to, generated(to, column)),
-                        after_constraint_drops: false,
-                    });
+                    move_default(
+                        &mut held,
+                        to,
+                        in_schema(to, &generated(from, column)),
+                        in_schema(to, &generated(to, column)),
+                    );
                 }
             }
             Change::RenameColumn {
@@ -518,237 +662,110 @@ pub(crate) fn default_moves(cs: &pbps_model::ChangeSet) -> Vec<DefaultMove> {
                 table_was,
                 ..
             } => {
+                let new = in_schema(table, &generated(table, to));
                 for was in std::iter::once(table).chain(table_was) {
-                    out.push(DefaultMove {
-                        parent: now(table),
-                        old: in_schema(table, generated(was, from)),
-                        new: in_schema(table, generated(table, to)),
-                        after_constraint_drops: true,
+                    move_default(
+                        &mut held,
+                        table,
+                        in_schema(table, &generated(was, from)),
+                        new.clone(),
+                    );
+                }
+                for h in held.iter_mut() {
+                    if h.parent.as_ref() == Some(table) && h.column.as_deref() == Some(from) {
+                        h.column = Some(to.clone());
+                    }
+                }
+            }
+            Change::DropColumn { column, .. } => held.retain(|h| {
+                !(h.parent.as_ref() == Some(&column.table)
+                    && h.column.as_deref() == Some(column.name.as_str()))
+            }),
+            Change::AlterColumnDefault {
+                column, from, to, ..
+            } => {
+                if from.is_some() {
+                    held.retain(|h| {
+                        !(h.parent.as_ref() == Some(&column.table)
+                            && h.column.as_deref() == Some(column.name.as_str()))
                     });
                 }
+                if to.is_some() {
+                    held.push(default_of(&column.table, &column.name));
+                }
+            }
+            Change::AddColumn {
+                table,
+                name,
+                column,
+                ..
+            } if column.default.is_some() => held.push(default_of(table, name)),
+            Change::DropUnique { table, name }
+            | Change::DropForeignKey { table, name }
+            | Change::DropCheck { table, name } => {
+                let name = in_schema(table, name);
+                held.retain(|h| h.name != name);
+            }
+            Change::AddUnique { table, name, .. } => {
+                held.push(constraint(table, name, "unique constraint"));
+            }
+            Change::AddForeignKey { table, name, .. } => {
+                held.push(constraint(table, name, "foreign key constraint"));
+            }
+            Change::AddCheck { table, name, .. } => {
+                held.push(constraint(table, name, "check constraint"));
+            }
+            Change::SetPrimaryKey { table, from, to } => {
+                if let Some(name) = from.as_ref().and_then(|k| k.name.as_deref()) {
+                    let name = in_schema(table, name);
+                    held.retain(|h| h.name != name);
+                }
+                if let Some(name) = to.as_ref().and_then(|k| k.name.as_deref()) {
+                    held.push(constraint(table, name, "primary key constraint"));
+                }
+            }
+            Change::CreateTable { name, table, .. } => {
+                create(&mut held, name, "user table");
+                // Its own constraints and generated defaults take their names
+                // with it, for whatever the plan creates after.
+                for (column, spec) in &table.columns {
+                    if spec.default.is_some() {
+                        held.push(default_of(name, column));
+                    }
+                }
+                let named = table
+                    .primary_key
+                    .iter()
+                    .filter_map(|k| k.name.as_deref())
+                    .map(|n| (n, "primary key constraint"))
+                    .chain(
+                        table
+                            .unique
+                            .keys()
+                            .map(|n| (n.as_str(), "unique constraint")),
+                    )
+                    .chain(
+                        table
+                            .foreign_keys
+                            .keys()
+                            .map(|n| (n.as_str(), "foreign key constraint")),
+                    )
+                    .chain(
+                        table
+                            .checks
+                            .keys()
+                            .map(|n| (n.as_str(), "check constraint")),
+                    );
+                for (n, kind) in named {
+                    held.push(constraint(name, n, kind));
+                }
+            }
+            Change::CreateModule { id, module } => {
+                create(&mut held, &module_object(id), &module.kind.to_string());
             }
             _ => {}
         }
     }
-    out
-}
-
-/// Refuses a name this plan creates on SQL Server that another object in
-/// the schema's `sys.objects` namespace already holds (#1077): a sequence, a
-/// synonym, a constraint, or a table or module this project does not record.
-/// `CREATE TABLE` there fails with Msg 2714, and `CREATE OR ALTER` fails or
-/// replaces what is there. One this plan frees first is not an occupant, and
-/// "first" is the differ's order (`order_key`): what runs before the tables
-/// are created frees a name for a table, and what runs before the modules
-/// are created, near the end, frees it for a module.
-// The complement is every change that frees no object name.
-#[allow(clippy::wildcard_enum_match_arm)]
-pub(crate) fn refuse_occupied_objects(
-    cs: &pbps_model::ChangeSet,
-    occupants: &[pbps_mssql::catalog::NameOccupant],
-    label: &str,
-) -> anyhow::Result<()> {
-    use pbps_model::Change;
-    // The catalog spells every name as the database does now, and a change
-    // on a table the plan also renames carries the new name (the differ
-    // sorts renames first): each is read back to the catalog's name.
-    let renamed_from: BTreeMap<&TableName, &TableName> = cs
-        .changes
-        .iter()
-        .filter_map(|p| match &p.change {
-            Change::RenameTable { from, to, .. } => Some((to, from)),
-            _ => None,
-        })
-        .collect();
-    let now = |t: &TableName| (*renamed_from.get(t).unwrap_or(&t)).clone();
-    let constraint = |table: &TableName, name: &str| TableName::new(now(table).schema, name);
-    // Freed ahead of `CreateTable`: every drop and rename class sorts first.
-    let freed: BTreeSet<TableName> = cs
-        .changes
-        .iter()
-        .filter_map(|p| match &p.change {
-            Change::DropTable { name, .. } => Some(name.clone()),
-            Change::RenameTable { from, .. } => Some(from.clone()),
-            Change::DropModule { id, .. } => Some(module_object(id)),
-            Change::DropUnique { table, name }
-            | Change::DropForeignKey { table, name }
-            | Change::DropCheck { table, name } => Some(constraint(table, name)),
-            Change::SetPrimaryKey {
-                table,
-                from: Some(key),
-                to: None,
-            } => key.name.as_deref().map(|name| constraint(table, name)),
-            _ => None,
-        })
-        .collect();
-    // Freed only ahead of `CreateModule`: a key replaced in place, whose drop
-    // travels with its add after the tables are created.
-    let freed_for_modules: BTreeSet<TableName> = cs
-        .changes
-        .iter()
-        .filter_map(|p| match &p.change {
-            Change::SetPrimaryKey {
-                table,
-                from: Some(key),
-                to: Some(_),
-            } => key.name.as_deref().map(|name| constraint(table, name)),
-            _ => None,
-        })
-        .collect();
-    // Parents whose constraints and triggers leave the schema with them.
-    let released: BTreeSet<&TableName> = cs
-        .changes
-        .iter()
-        .filter_map(|p| match &p.change {
-            Change::DropTable { name, .. } => Some(name),
-            Change::RenameTable { from, to, .. } if from.schema != to.schema => Some(from),
-            _ => None,
-        })
-        .collect();
-    // A column's default goes with the column, which is dropped ahead of the
-    // tables; and with a changed default, whose drop runs after the tables
-    // but ahead of the modules.
-    let dropped_columns: BTreeSet<(TableName, &str)> = cs
-        .changes
-        .iter()
-        .filter_map(|p| match &p.change {
-            Change::DropColumn { column, .. } => Some((now(&column.table), column.name.as_str())),
-            _ => None,
-        })
-        .collect();
-    let redefaulted: BTreeSet<(TableName, &str)> = cs
-        .changes
-        .iter()
-        .filter_map(|p| match &p.change {
-            Change::AlterColumnDefault {
-                column,
-                from: Some(_),
-                ..
-            } => Some((now(&column.table), column.name.as_str())),
-            _ => None,
-        })
-        .collect();
-    let of_column = |o: &pbps_mssql::catalog::NameOccupant,
-                     columns: &BTreeSet<(TableName, &str)>| {
-        matches!((&o.parent, &o.parent_column), (Some(t), Some(c)) if columns.contains(&(t.clone(), c.as_str())))
-    };
-    let tables: BTreeSet<&TableName> = cs
-        .changes
-        .iter()
-        .filter_map(|p| match &p.change {
-            Change::CreateTable { name, .. } => Some(name),
-            _ => None,
-        })
-        .collect();
-    // A generated default a rename moves away, which runs before the tables
-    // are created. The emitter moves it only when nothing holds the target,
-    // so a target the catalog read found taken keeps the default where it is
-    // — unless what holds it is gone by then. Only module drops run before a
-    // table rename; a column rename also follows the table renames and the
-    // constraint drops (`order_key`).
-    let dropped_modules: BTreeSet<TableName> = cs
-        .changes
-        .iter()
-        .filter_map(|p| match &p.change {
-            Change::DropModule { id, .. } => Some(module_object(id)),
-            _ => None,
-        })
-        .collect();
-    let before_column_renames: BTreeSet<TableName> = cs
-        .changes
-        .iter()
-        .filter_map(|p| match &p.change {
-            Change::RenameTable { from, .. } => Some(from.clone()),
-            Change::DropUnique { table, name }
-            | Change::DropForeignKey { table, name }
-            | Change::DropCheck { table, name } => Some(constraint(table, name)),
-            Change::SetPrimaryKey {
-                table,
-                from: Some(key),
-                to: None,
-            } => key.name.as_deref().map(|name| constraint(table, name)),
-            _ => None,
-        })
-        .collect();
-    // Walked in plan order, because one move can free another's target: a
-    // column rename chain `b -> c`, then `a -> b`, moves `b`'s default out of
-    // the way before `a`'s arrives. A default moves when it is still at the
-    // old name on that table and nothing holds the target at that point.
-    let vacated: BTreeSet<TableName> = {
-        let mut at: BTreeMap<TableName, TableName> = occupants
-            .iter()
-            .filter(|o| o.kind == "default constraint")
-            .filter_map(|o| Some((o.name.clone(), o.parent.clone()?)))
-            .collect();
-        let mut current: BTreeMap<TableName, TableName> =
-            at.keys().map(|n| (n.clone(), n.clone())).collect();
-        let others: Vec<&pbps_mssql::catalog::NameOccupant> = occupants
-            .iter()
-            .filter(|o| o.kind != "default constraint")
-            .collect();
-        // A table transferred to another schema takes its constraints and
-        // defaults along before any column rename runs; a table rename's own
-        // moves are not judged against it, which only errs toward refusing.
-        let transferred: BTreeSet<&TableName> = cs
-            .changes
-            .iter()
-            .filter_map(|p| match &p.change {
-                Change::RenameTable { from, to, .. } if from.schema != to.schema => Some(from),
-                _ => None,
-            })
-            .collect();
-        for m in default_moves(cs).into_iter().filter(|m| m.old != m.new) {
-            let dropped = |n: &TableName, parent: Option<&TableName>| {
-                dropped_modules.contains(n)
-                    || (m.after_constraint_drops
-                        && (before_column_renames.contains(n)
-                            || parent.is_some_and(|p| transferred.contains(p))))
-            };
-            let held = others
-                .iter()
-                .any(|o| o.name == m.new && !dropped(&o.name, o.parent.as_ref()))
-                || current
-                    .iter()
-                    .any(|(original, n)| n == &m.new && !dropped(n, at.get(original)));
-            let Some(original) = current
-                .iter()
-                .find(|(original, now)| **now == m.old && at.get(*original) == Some(&m.parent))
-                .map(|(original, _)| original.clone())
-            else {
-                continue;
-            };
-            if !held {
-                current.insert(original, m.new.clone());
-            }
-        }
-        at.retain(|original, _| current.get(original) != Some(original));
-        at.into_keys().collect()
-    };
-    let moved_away = |o: &pbps_mssql::catalog::NameOccupant| vacated.contains(&o.name);
-    let gone = |o: &pbps_mssql::catalog::NameOccupant| {
-        let early = moved_away(o)
-            || freed.contains(&o.name)
-            || o.parent.as_ref().is_some_and(|p| released.contains(p))
-            || of_column(o, &dropped_columns);
-        let late = freed_for_modules.contains(&o.name) || of_column(o, &redefaulted);
-        early || (late && !tables.contains(&o.wanted))
-    };
-    let created: BTreeSet<TableName> = created_object_names(cs).into_iter().collect();
-    let taken: Vec<String> = occupants
-        .iter()
-        .filter(|o| created.contains(&o.wanted))
-        .filter(|o| !gone(o))
-        .map(|o| {
-            let name = &o.wanted;
-            match &o.parent {
-                Some(parent) => format!(
-                    "`{name}`: the database already has {} `{}` on `{parent}`",
-                    o.kind, o.name
-                ),
-                None => format!("`{name}`: the database already has {} `{}`", o.kind, o.name),
-            }
-        })
-        .collect();
     if taken.is_empty() {
         return Ok(());
     }
@@ -7293,20 +7310,126 @@ mod tests {
             }),
             create_at(&generated),
         ]);
-        assert_eq!(
-            default_moves(&table_moves),
-            [DefaultMove {
-                parent: old.clone(),
-                old: generated.clone(),
-                new: TableName::new(
-                    "dbo",
-                    pbps_mssql::emit::default_constraint_name(&renamed, "c")
-                ),
-                after_constraint_drops: false,
-            }]
+        // The read covers the move's target and the renamed table's children.
+        let (names, parents) = object_reads(&table_moves);
+        assert!(
+            names.contains(&TableName::new(
+                "dbo",
+                pbps_mssql::emit::default_constraint_name(&renamed, "c")
+            )),
+            "{names:?}"
         );
+        assert_eq!(parents, std::slice::from_ref(&old));
         refuse_occupied_objects(&table_moves, std::slice::from_ref(&the_default), "prod")
             .expect("the table rename moves the default out of the way");
+
+        // An earlier table rename vacates a later one's target: `dbo.a`'s
+        // default moves only once `dbo.b` has become `dbo.gone_b`, and the
+        // walk sees that (#1147 review).
+        let a = TableName::new("dbo", "a");
+        let b = TableName::new("dbo", "b");
+        let gone_b = TableName::new("dbo", "goneb");
+        let default_on = |table: &TableName, column: &str| NameOccupant {
+            wanted: TableName::new(
+                "dbo",
+                pbps_mssql::emit::default_constraint_name(table, column),
+            ),
+            name: TableName::new(
+                "dbo",
+                pbps_mssql::emit::default_constraint_name(table, column),
+            ),
+            kind: "default constraint".into(),
+            parent: Some(table.clone()),
+            parent_column: Some(column.into()),
+        };
+        let rename_table = |from: &TableName, to: &TableName| {
+            PlannedChange::new(Change::RenameTable {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.t", 0),
+                from: from.clone(),
+                to: to.clone(),
+                defaults: vec!["c".into()],
+            })
+        };
+        let a_default = default_on(&a, "c");
+        refuse_occupied_objects(
+            &plan(vec![
+                rename_table(&b, &gone_b),
+                rename_table(&a, &b),
+                create_at(&a_default.name),
+            ]),
+            &[a_default.clone(), default_on(&b, "c")],
+            "prod",
+        )
+        .expect("`b`'s default leaves before `a`'s arrives");
+        assert!(
+            refuse_occupied_objects(
+                &plan(vec![
+                    rename_table(&a, &b),
+                    rename_table(&b, &gone_b),
+                    create_at(&a_default.name),
+                ]),
+                &[a_default.clone(), default_on(&b, "c")],
+                "prod",
+            )
+            .is_err(),
+            "the other way round, `a`'s target is still held"
+        );
+
+        // Names the plan moves into are taken (#1153): a default a rename
+        // moves onto a created name, and a check a transfer carries into
+        // the schema of one.
+        let e = refuse_occupied_objects(
+            &plan(vec![rename_column(), create_at(&target)]),
+            std::slice::from_ref(&the_default),
+            "prod",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("this plan puts default constraint"), "{e}");
+        let carried = NameOccupant {
+            wanted: TableName::new("dbo", "carried"),
+            name: TableName::new("dbo", "carried"),
+            kind: "check constraint".into(),
+            parent: Some(other.clone()),
+            parent_column: None,
+        };
+        let e = refuse_occupied_objects(
+            &plan(vec![
+                PlannedChange::new(Change::RenameTable {
+                    uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.other", 0),
+                    from: other.clone(),
+                    to: TableName::new("archive", "other"),
+                    defaults: Vec::new(),
+                }),
+                create_at(&TableName::new("archive", "carried")),
+            ]),
+            &[carried],
+            "prod",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("check constraint `archive.carried` on `archive.other`"),
+            "{e}"
+        );
+        // And a check the plan adds before a view at its name is created.
+        let e = refuse_occupied_objects(
+            &plan(vec![
+                PlannedChange::new(Change::AddCheck {
+                    table: old.clone(),
+                    name: "x".into(),
+                    constraint: pbps_model::CheckConstraint {
+                        expression: "1 = 1".into(),
+                    },
+                }),
+                create_view(),
+            ]),
+            &[],
+            "prod",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("this plan puts check constraint `dbo.x`"), "{e}");
 
         let rebuild = plan(vec![
             PlannedChange::new(Change::DropModule {

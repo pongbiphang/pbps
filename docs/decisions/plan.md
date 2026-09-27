@@ -435,38 +435,46 @@ catalog inventory reads tables and modules, not sequences, synonyms or
 constraints, and nothing asked about the rest, so the plan was saved and the
 statement failed at apply.
 
-`plan --db` now asks `sys.objects` for every name the plan creates, in the
-read-only planning transaction:
+`plan --db` now reads `sys.objects`, in the read-only planning transaction,
+matched under the database's collation, for:
 
-- each `CreateTable`;
-- each `CreateModule` not preceded by its own `DropModule` (a rebuild);
-- a trigger in its table's schema.
+- every name the plan creates: each `CreateTable`, each `CreateModule`, and a
+  trigger in its table's schema;
+- every name a rename may move a generated default to (#975);
+- the constraints, defaults and triggers of every table the plan renames,
+  transfers, drops, or changes the columns or constraints of.
 
-Names are matched under the database's collation. An occupant is refused with
-its `type_desc` and, for a constraint or trigger, its table. As in DEC-316.1,
-the plan can clear a name first, and an occupant it clears is not one:
+It then walks the plan in its own order, which is the order it runs in
+(`order_key`), moving that namespace as the emitter's statements do:
 
-- an object it drops, or a table it renames away;
-- a unique, foreign-key or check constraint it drops, or a named primary key
-  it drops outright;
-- the default of a column it drops;
-- a default pbps generated that a table or column rename moves to its new
-  generated name (#975). The emitter moves it only when nothing holds the
-  target, so the target names are asked too, and a taken target keeps the
-  default where it is. A target held by something the plan drops before the
-  rename runs counts as free: a module drop before either rename, and a
-  constraint drop, a table rename or a transfer of the holder's table to
-  another schema before a column rename. The moves are
-  walked in plan order, so an earlier move that vacates a target frees it for
-  a later one: a column rename chain `b -> c`, then `a -> b`, from revisions
-  an environment skipped;
-- a constraint or trigger of a table it drops or transfers to another schema.
-  A rename within the schema leaves the constraint's name where it was.
+- a drop removes an object, and a dropped table takes its children along;
+- a rename moves a table, and a transfer moves its children into the new
+  schema;
+- a table or column rename moves a generated default to its new generated
+  name, but only when the default is still at the old name and nothing holds
+  the new one at that point, which is the emitter's own guard;
+- a dropped column takes its default, and a changed default is replaced;
+- added constraints, defaults, tables and modules take their names.
 
-"First" is the differ's order. All of those run before any table is created.
-A named primary key replaced in place, and the default of a column whose
-default changes, are dropped after the tables are created and before the
-modules are. So they free a name for a module and not for a table.
+Each `CREATE` is judged when the walk reaches it. An occupant is refused with
+its `type_desc` and, for a constraint or trigger, its table, and with whether
+the database holds it or the plan puts it there first.
+
+So whether a name is free follows from the order the changes run in, not from
+a list of exemptions. Six review rounds on #1147 each found one more ordering
+the list missed:
+
+- a column's default leaving with the column;
+- a replaced key leaving only after the tables are created;
+- a drop freeing a default's target;
+- a rename chain across skipped revisions;
+- a transfer vacating a target;
+- one table rename vacating another's.
+
+The walk also refuses the names the plan moves into (#1153), which the
+snapshot could not see. The read is what bounds it. An object the plan moves
+that the read did not return is unknown to it, and a name only a rebuild uses
+is not asked at all.
 
 Both engines' reads are one question routed by `engine`
 (`refuse_created_name_occupants`), not a driver branch in `deploy`.

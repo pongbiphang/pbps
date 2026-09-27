@@ -489,9 +489,9 @@ fn roles_are_the_clusters(question: &str) -> anyhow::Error {
 
 /// Refuses a name this plan creates that an object outside the catalog
 /// inventory already holds: on PostgreSQL a relation-namespace entry (#951),
-/// on SQL Server any `sys.objects` entry (#1077). SQL Server also asks about
-/// the names its renames would move generated defaults to, which decide
-/// whether a default's old name is freed.
+/// on SQL Server any `sys.objects` entry (#1077). SQL Server also reads the
+/// names its renames may move generated defaults to, and the children of the
+/// tables it changes, so the plan's own moves can be walked.
 pub async fn refuse_created_name_occupants(
     conn: &mut Conn,
     cs: &ChangeSet,
@@ -507,11 +507,9 @@ pub async fn refuse_created_name_occupants(
             crate::deploy::refuse_uninventoried_occupants(cs, &occupants, label)
         }
         Driver::Mssql => {
-            let mut names = crate::deploy::created_object_names(cs);
-            names.extend(crate::deploy::default_moves(cs).into_iter().map(|m| m.new));
-            names.sort();
-            names.dedup();
-            let occupants = pbps_mssql::catalog::object_name_occupants(conn, &names).await?;
+            let (names, parents) = crate::deploy::object_reads(cs);
+            let occupants =
+                pbps_mssql::catalog::object_name_occupants(conn, &names, &parents).await?;
             crate::deploy::refuse_occupied_objects(cs, &occupants, label)
         }
     }

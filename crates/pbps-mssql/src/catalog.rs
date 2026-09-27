@@ -587,49 +587,71 @@ pub struct NameOccupant {
     pub parent_column: Option<String>,
 }
 
-/// The [`NameOccupant`]s at `names`, compared under the database's
-/// collation, read in the caller's transaction.
+/// The [`NameOccupant`]s at `names`, and every object whose parent is one of
+/// `parents` (its constraints, defaults and triggers), compared under the
+/// database's collation, read in the caller's transaction. An object found
+/// only as a child has its own name as `wanted`.
 pub async fn object_name_occupants(
     conn: &mut Conn,
     names: &[TableName],
+    parents: &[TableName],
 ) -> Result<Vec<NameOccupant>, DbError> {
-    if names.is_empty() {
+    if names.is_empty() && parents.is_empty() {
         return Ok(Vec::new());
     }
-    let values = names
-        .iter()
-        .enumerate()
-        .map(|(i, n)| {
-            format!(
-                "({i}, {}, {})",
-                crate::ident::literal(&n.schema),
-                crate::ident::literal(&n.name)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
+    // `VALUES` cannot be empty, so an empty list is a row that matches
+    // nothing: `i` of -1 and names no identifier can be.
+    let values = |list: &[TableName]| {
+        if list.is_empty() {
+            return "(-1, CAST(NULL AS sysname), CAST(NULL AS sysname))".to_owned();
+        }
+        list.iter()
+            .enumerate()
+            .map(|(i, n)| {
+                format!(
+                    "({i}, {}, {})",
+                    crate::ident::literal(&n.schema),
+                    crate::ident::literal(&n.name)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     let sql = format!(
         "SELECT w.i, s.name AS schema_name, o.name AS object_name,
                 CONVERT(nvarchar(60), o.type_desc) AS type_desc,
                 ps.name AS parent_schema, p.name AS parent_name,
                 c.name AS parent_column
-           FROM (VALUES {values}) AS w(i, schema_name, object_name)
-           JOIN sys.schemas s ON s.name = w.schema_name COLLATE DATABASE_DEFAULT
-           JOIN sys.objects o
-             ON o.schema_id = s.schema_id AND o.name = w.object_name COLLATE DATABASE_DEFAULT
+           FROM sys.objects o
+           JOIN sys.schemas s ON s.schema_id = o.schema_id
+           LEFT JOIN (VALUES {}) AS w(i, schema_name, object_name)
+             ON s.name = w.schema_name COLLATE DATABASE_DEFAULT
+            AND o.name = w.object_name COLLATE DATABASE_DEFAULT
            LEFT JOIN sys.objects p ON p.object_id = o.parent_object_id
            LEFT JOIN sys.schemas ps ON ps.schema_id = p.schema_id
            LEFT JOIN sys.default_constraints dc ON dc.object_id = o.object_id
            LEFT JOIN sys.columns c
              ON c.object_id = dc.parent_object_id AND c.column_id = dc.parent_column_id
-          ORDER BY w.i;"
+          WHERE w.i IS NOT NULL
+             OR EXISTS (SELECT 1 FROM (VALUES {}) AS q(i, schema_name, table_name)
+                         WHERE q.schema_name = ps.name COLLATE DATABASE_DEFAULT
+                           AND q.table_name = p.name COLLATE DATABASE_DEFAULT)
+          ORDER BY s.name, o.name;",
+        values(names),
+        values(parents)
     );
     let mut out = Vec::new();
     for row in conn.query(&sql).await? {
-        let i = get::<i32>(&row, "i")? as usize;
-        let wanted = names.get(i).cloned().ok_or_else(|| {
-            DbError::BadRow(format!("the name-occupant query returned index {i}"))
-        })?;
+        let name = TableName::new(
+            get::<&str>(&row, "schema_name")?,
+            get::<&str>(&row, "object_name")?,
+        );
+        let wanted = match row.try_get::<i32>("i")? {
+            Some(i) => names.get(i as usize).cloned().ok_or_else(|| {
+                DbError::BadRow(format!("the name-occupant query returned index {i}"))
+            })?,
+            None => name.clone(),
+        };
         let parent = match (
             row.try_get::<&str>("parent_schema")?,
             row.try_get::<&str>("parent_name")?,
@@ -639,10 +661,7 @@ pub async fn object_name_occupants(
         };
         out.push(NameOccupant {
             wanted,
-            name: TableName::new(
-                get::<&str>(&row, "schema_name")?,
-                get::<&str>(&row, "object_name")?,
-            ),
+            name,
             kind: get::<&str>(&row, "type_desc")?
                 .to_lowercase()
                 .replace('_', " "),

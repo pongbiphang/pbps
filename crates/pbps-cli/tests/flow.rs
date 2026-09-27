@@ -1876,6 +1876,7 @@ fn a_sequence_or_synonym_at_a_new_tables_name_refuses_the_plan() {
          CREATE TABLE dbo.keeptwo (id int, c int CONSTRAINT DF_pbps_keeptwo_c DEFAULT 0); \
          CREATE TABLE dbo.chain (id int, a int CONSTRAINT DF_pbps_chain_a DEFAULT 0, \
              b int CONSTRAINT DF_pbps_chain_b DEFAULT 1); \
+         CREATE TABLE dbo.mv (id int, c int CONSTRAINT DF_pbps_mv_c DEFAULT 0); \
          CREATE SEQUENCE dbo.s; \
          CREATE SYNONYM dbo.y FOR dbo.keep;",
     );
@@ -1966,6 +1967,31 @@ fn a_sequence_or_synonym_at_a_new_tables_name_refuses_the_plan() {
     // then `a -> b`: the plan moves `b`'s default to `c` before `a`'s
     // arrives at `b`, so `a`'s old default name is free for the table too
     // (#1147 review).
+    // Names the plan moves into are taken too (#1153): a generated default a
+    // column rename moves onto a declared table's name is refused by name,
+    // and no plan is written. (A declared check a transfer carries into a
+    // declared table's schema never gets here: validation refuses the two
+    // names offline.)
+    let refused_with = |d: &Demo, name: &str, expected: &str| {
+        let plan = declare(d, name);
+        let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+        assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+        assert!(stderr(&o).contains(expected), "{}", stderr(&o));
+        assert!(!plan.exists(), "a refused plan wrote {}", plan.display());
+    };
+    let d = adopted("moved-into");
+    let path = d.dir.join("schema/dbo.mv.yml");
+    let pulled = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        pulled.replacen("\n  c:\n", "\n  d:\n    renamed_from: c\n", 1),
+    )
+    .unwrap();
+    refused_with(
+        &d,
+        "DF_pbps_mv_d",
+        "this plan puts default constraint `dbo.DF_pbps_mv_d` on `dbo.mv` there first",
+    );
     let d = adopted("default-chain");
     let path = d.dir.join("schema/dbo.chain.yml");
     let pulled = std::fs::read_to_string(&path).unwrap();
