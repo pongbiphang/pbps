@@ -55,7 +55,7 @@ def native_tests(binary, env):
 
 
 def test_binary():
-    built = run("cargo", "test", "-p", "pbps-cli", "--lib", "--no-run",
+    built = run("cargo", "test", "--profile", "live-test", "-p", "pbps-cli", "--lib", "--no-run",
                 "--message-format=json", stdout=subprocess.PIPE)
     artifacts = [json.loads(line) for line in built.stdout.splitlines()]
     return next(item["executable"] for item in artifacts

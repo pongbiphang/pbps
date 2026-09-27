@@ -463,3 +463,21 @@ next occurrence readable. It is not a fix for the crash itself.
 
 Pinned by `scripts/live_resolver_server_test.py`, which runs in the `quick`
 job.
+
+<a id="dec-1208-1"></a>
+
+**DEC-1208.1. CPU-heavy engine fixtures use an optimized test profile with all
+test assertions retained.** The ordinary quick suite keeps Cargo's unoptimized
+`test` profile. PostgreSQL's private capture regressions and the resolver
+fixtures use `live-test`, inheriting `test` with `opt-level = 1`,
+`debug-assertions = true` and `overflow-checks = true`. A release build would
+remove checks that these fixtures must still exercise; removing catalog
+observations or executable-content hashes would remove the facts they prove.
+Local and CI runners select the same profile, and native fixtures discover
+the resulting binary from Cargo artifacts rather than guessing its directory.
+
+The measured tradeoff is additional compilation for less repeated CPU work,
+not fewer test cases or weaker qualification. The representative timings and
+reproduction commands are in [CI performance](../CI-PERFORMANCE.md). Engine
+versions, test filters, serialization, fixture ownership and both merge gates
+remain as before.

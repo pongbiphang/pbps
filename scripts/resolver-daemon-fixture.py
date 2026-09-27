@@ -14,7 +14,7 @@ TEST = "resolver::native::daemon::tests::socket_activation_requires_the_candidat
 
 
 def main():
-    built = subprocess.run(["cargo", "test", "-p", "pbps-cli", "--lib", "--no-run",
+    built = subprocess.run(["cargo", "test", "--profile", "live-test", "-p", "pbps-cli", "--lib", "--no-run",
                             "--message-format=json"], check=True, text=True,
                            stdout=subprocess.PIPE)
     binaries = []
