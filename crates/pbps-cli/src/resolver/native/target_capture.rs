@@ -136,6 +136,31 @@ impl NativeTarget {
         Ok(captured)
     }
 
+    /// The routine each dropped declaration's signature names on the target,
+    /// read the way the plan's `DROP` of it resolves it (#1124). Ownership
+    /// moves before the first await, as in a capture: cancelled inside its
+    /// transaction, the connection is dropped rather than left for a later
+    /// read to reuse mid-transaction.
+    pub async fn identify_dropped(
+        &mut self,
+        write_path_extras: &[String],
+        routines: Vec<pbps_model::ModuleId>,
+    ) -> Result<
+        std::collections::BTreeMap<
+            pbps_model::ModuleId,
+            Option<pbps_db::resolver::capture::ObjectIdentity>,
+        >,
+        CaptureFailure,
+    > {
+        let mut bound = self.current.take().ok_or(CaptureFailure::Binding)?;
+        check(&mut bound).await?;
+        let identified =
+            engine::identify_dropped(&mut bound.connection, write_path_extras, routines).await?;
+        check(&mut bound).await?;
+        self.current = Some(bound);
+        Ok(identified)
+    }
+
     pub async fn recapture_postgres(
         &mut self,
         previous: &CapturedTargetInputs,

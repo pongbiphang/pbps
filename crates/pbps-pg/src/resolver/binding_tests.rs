@@ -200,7 +200,8 @@ async fn analyze_on(
                 &pg,
                 base_managed.dropped_by(&desired_managed),
             )
-            .await,
+            .await
+            .map_err(|e| e.to_string())?,
         );
         let mut scratch = databases.stream(&scratch_name).await;
         reconstruction
@@ -923,6 +924,53 @@ async fn a_dropped_overload_is_held_by_its_declared_identity_not_by_a_count() {
                 "{variable} {tag}: {assessment:#?}"
             );
         }
+    }
+}
+
+/// A dropped signature that names no routine on the target is absent; one
+/// the engine cannot even read is refused, never taken for absent. Either
+/// way the lookup's own transaction is closed behind it.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn an_unreadable_dropped_signature_is_refused_not_absent() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let mut conn = Conn::connect(Driver::Postgres, &server).await.unwrap();
+        let pg = dialect(&[]);
+        let absent = reconstruct::identify_dropped(
+            &mut conn,
+            &pg,
+            vec!["public.pbps_absent_1124(integer)".parse().unwrap()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            absent.into_values().collect::<Vec<_>>(),
+            [None],
+            "{variable}"
+        );
+        let unreadable = reconstruct::identify_dropped(
+            &mut conn,
+            &pg,
+            vec!["public.f(int int)".parse().unwrap()],
+        )
+        .await;
+        assert_eq!(
+            unreadable,
+            Err(pbps_db::resolver::capture::CaptureError::Read),
+            "{variable}"
+        );
+        // The lookup's transaction is read-only; left open, the next
+        // statement would still run inside it.
+        let open = conn
+            .query("SELECT pg_catalog.current_setting('transaction_read_only') AS read_only")
+            .await
+            .unwrap();
+        assert_eq!(
+            open[0].try_get::<&str>("read_only").unwrap(),
+            Some("off"),
+            "{variable}: the lookup left its transaction open"
+        );
     }
 }
 

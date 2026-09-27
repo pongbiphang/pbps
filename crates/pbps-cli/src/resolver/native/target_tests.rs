@@ -518,6 +518,30 @@ async fn postgres_capture_is_fresh_and_cancellation_expires_its_connection(
     let mut administrator = PeerVerifiedConn::connect(Driver::Postgres, primary)
         .await
         .unwrap();
+    // Identifying a dropped signature reads inside a transaction of its own.
+    // Held there by a lock on the routine catalog and cancelled, it must
+    // expire the binding as a cancelled capture does, never leave the
+    // connection mid-transaction for a later read (#1124).
+    let connection = PeerVerifiedConn::connect(Driver::Postgres, primary)
+        .await
+        .unwrap();
+    let mut target = NativeTarget::establish(connection, main_pid).await.unwrap();
+    administrator.query("BEGIN").await.unwrap();
+    administrator
+        .query("LOCK TABLE pg_catalog.pg_proc IN ACCESS EXCLUSIVE MODE")
+        .await
+        .unwrap();
+    let timed = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        target.identify_dropped(&[], vec!["capture_fixture.gone(integer)".parse().unwrap()]),
+    )
+    .await;
+    administrator.query("ROLLBACK").await.unwrap();
+    assert!(timed.is_err(), "the lookup was held inside its transaction");
+    assert!(
+        target.identity().is_err(),
+        "cancelled identification must expire the complete connection"
+    );
     administrator
         .query("DROP SCHEMA capture_fixture CASCADE")
         .await
