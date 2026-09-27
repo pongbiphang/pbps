@@ -420,6 +420,66 @@ plan can clear a name first, and an occupant it clears is not one:
 
 A name taken after the plan was saved is left to the apply. The `CREATE` fails
 inside the transaction and the ledger records nothing, which is the outcome a
-recheck could only have reported earlier. SQL Server is unchanged: its module
-path is `CREATE OR ALTER`, whose adoption of an existing module is a separate
-question.
+recheck could only have reported earlier. SQL Server is answered by
+DEC-1077.1.
+
+<a id="dec-1077-1"></a>
+
+**DEC-1077.1. A SQL Server plan that creates a name another object in its
+schema holds is refused at plan time (#1077; follows DEC-316.1).** SQL Server
+keeps tables, views, routines, triggers, sequences, synonyms and constraints
+in one `sys.objects` namespace per schema. A `CREATE TABLE` at any of their
+names fails with Msg 2714. A module's `CREATE OR ALTER` fails when the name
+holds another kind of object, and silently replaces one of its own kind. The
+catalog inventory reads tables and modules, not sequences, synonyms or
+constraints, and nothing asked about the rest, so the plan was saved and the
+statement failed at apply.
+
+`plan --db` now reads `sys.objects`, in the read-only planning transaction,
+matched under the database's collation, for:
+
+- every name the plan creates: each `CreateTable`, each `CreateModule`, and a
+  trigger in its table's schema;
+- every name a rename may move a generated default to (#975);
+- the constraints, defaults and triggers of every table the plan renames,
+  transfers, drops, or changes the columns or constraints of.
+
+It then walks the plan in its own order, which is the order it runs in
+(`order_key`), moving that namespace as the emitter's statements do:
+
+- a drop removes an object, and a dropped table takes its children along;
+- a rename moves a table, and a transfer moves its children into the new
+  schema;
+- a table or column rename moves a generated default to its new generated
+  name, but only when the default is still at the old name and nothing holds
+  the new one at that point, which is the emitter's own guard;
+- a dropped column takes its default, and a changed default is replaced;
+- added constraints, defaults, tables and modules take their names.
+
+Each `CREATE` is judged when the walk reaches it. An occupant is refused with
+its `type_desc` and, for a constraint or trigger, its table, and with whether
+the database holds it or the plan puts it there first.
+
+So whether a name is free follows from the order the changes run in, not from
+a list of exemptions. Six review rounds on #1147 each found one more ordering
+the list missed:
+
+- a column's default leaving with the column;
+- a replaced key leaving only after the tables are created;
+- a drop freeing a default's target;
+- a rename chain across skipped revisions;
+- a transfer vacating a target;
+- one table rename vacating another's.
+
+The walk also refuses the names the plan moves into (#1153), which the
+snapshot could not see. The read is what bounds it. An object the plan moves
+that the read did not return is unknown to it, and a name only a rebuild uses
+is not asked at all.
+
+Both engines' reads are one question routed by `engine`
+(`refuse_created_name_occupants`), not a driver branch in `deploy`.
+
+Refusing the same-kind module rather than letting `CREATE OR ALTER` replace it
+is DEC-316.1's reasoning. Replacing an object this project never recorded is
+the silent replacement ADR-0002 rules out, and `baseline` is the explicit act
+that adopts it.

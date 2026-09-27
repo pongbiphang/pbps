@@ -1954,6 +1954,161 @@ fn pull_round_trips_ordinary_engine_names_without_a_name_warning() {
     assert_eq!(code(&validate), 0, "{}", stderr(&validate));
 }
 
+/// A sequence or a synonym already at the name of a table this plan creates
+/// refuses the plan by name, and no plan is written (#1077). SQL Server keeps
+/// tables, views, routines, sequences, synonyms and constraints in one
+/// `sys.objects` namespace per schema, so the `CREATE TABLE` used to reach
+/// apply and fail there with Msg 2714. Control: the same table at a free
+/// name plans and applies.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_sequence_or_synonym_at_a_new_tables_name_refuses_the_plan() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "object_namespace_occupant");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE TABLE dbo.keep (id int, c int CONSTRAINT x DEFAULT 0); \
+         CREATE TABLE dbo.keeptwo (id int, c int CONSTRAINT DF_pbps_keeptwo_c DEFAULT 0); \
+         CREATE TABLE dbo.chain (id int, a int CONSTRAINT DF_pbps_chain_a DEFAULT 0, \
+             b int CONSTRAINT DF_pbps_chain_b DEFAULT 1); \
+         CREATE TABLE dbo.mv (id int, c int CONSTRAINT DF_pbps_mv_c DEFAULT 0); \
+         CREATE SEQUENCE dbo.s; \
+         CREATE SYNONYM dbo.y FOR dbo.keep;",
+    );
+    // Each case from a fresh project, so one case's ids file names nothing
+    // the next one has to decide about.
+    let adopted = |case: &str| {
+        let d = Demo::new(&format!("object-namespace-occupant-{case}"));
+        let o = d.run(&["pull", "--db", connection]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        d.commit();
+        let o = d.run(&["baseline", "--db", connection, "--reason", "adopt"]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        d
+    };
+    let declare = |d: &Demo, name: &str| {
+        std::fs::write(
+            d.dir.join(format!("schema/dbo.{name}.yml")),
+            format!("table: dbo.{name}\ncolumns:\n  id: {{type: int}}\n"),
+        )
+        .unwrap();
+        let o = d.run(&["plan"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        d.commit();
+        d.dir.join("plan.json")
+    };
+    for (name, kind) in [("s", "sequence object `dbo.s`"), ("y", "synonym `dbo.y`")] {
+        let d = adopted(name);
+        let plan = declare(&d, name);
+        let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+        assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+        let err = stderr(&o);
+        assert!(err.contains(&format!("already has {kind}")), "{err}");
+        assert!(!plan.exists(), "a refused plan wrote {}", plan.display());
+    }
+
+    let apply = |d: &Demo, plan: &std::path::Path, allow: &[&str]| {
+        let checksum = plan_checksum(plan);
+        let mut args = vec![
+            "apply",
+            "--db",
+            connection,
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+        ];
+        args.extend_from_slice(allow);
+        let o = d.run(&args);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    };
+    let d = adopted("free");
+    let plan = declare(&d, "free");
+    let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    apply(&d, &plan, &[]);
+
+    // A default goes with the column the same revision drops, which runs
+    // before the table is created: its name is free for the table, a valid
+    // plan, and applied (#1147 review).
+    let d = adopted("dropped-default");
+    std::fs::write(
+        d.dir.join("schema/dbo.keep.yml"),
+        "table: dbo.keep\ncolumns:\n  id: {type: int}\n",
+    )
+    .unwrap();
+    let o = d.run(&["drop", "dbo.keep.c", "--reason", "free the default's name"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let plan = declare(&d, "x");
+    let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    apply(&d, &plan, &["--allow", "destructive"]);
+
+    // A generated default the same revision's column rename moves to the new
+    // column's name, which runs before the table is created: its old name is
+    // free for the table (#1147 review).
+    let d = adopted("moved-default");
+    let path = d.dir.join("schema/dbo.keeptwo.yml");
+    let pulled = std::fs::read_to_string(&path).unwrap();
+    let renamed = pulled.replacen("\n  c:\n", "\n  d:\n    renamed_from: c\n", 1);
+    assert_ne!(renamed, pulled, "{pulled}");
+    std::fs::write(&path, renamed).unwrap();
+    let plan = declare(&d, "DF_pbps_keeptwo_c");
+    let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    apply(&d, &plan, &["--allow", "rename"]);
+
+    // A rename chain across two revisions the environment skipped, `b -> c`
+    // then `a -> b`: the plan moves `b`'s default to `c` before `a`'s
+    // arrives at `b`, so `a`'s old default name is free for the table too
+    // (#1147 review).
+    // Names the plan moves into are taken too (#1153): a generated default a
+    // column rename moves onto a declared table's name is refused by name,
+    // and no plan is written. (A declared check a transfer carries into a
+    // declared table's schema never gets here: validation refuses the two
+    // names offline.)
+    let refused_with = |d: &Demo, name: &str, expected: &str| {
+        let plan = declare(d, name);
+        let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+        assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+        assert!(stderr(&o).contains(expected), "{}", stderr(&o));
+        assert!(!plan.exists(), "a refused plan wrote {}", plan.display());
+    };
+    let d = adopted("moved-into");
+    let path = d.dir.join("schema/dbo.mv.yml");
+    let pulled = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        pulled.replacen("\n  c:\n", "\n  d:\n    renamed_from: c\n", 1),
+    )
+    .unwrap();
+    refused_with(
+        &d,
+        "DF_pbps_mv_d",
+        "this plan puts default constraint `dbo.DF_pbps_mv_d` on `dbo.mv` there first",
+    );
+    let d = adopted("default-chain");
+    let path = d.dir.join("schema/dbo.chain.yml");
+    let pulled = std::fs::read_to_string(&path).unwrap();
+    let first = pulled.replacen("\n  b:\n", "\n  c:\n    renamed_from: b\n", 1);
+    assert_ne!(first, pulled, "{pulled}");
+    std::fs::write(&path, &first).unwrap();
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    d.commit();
+    let second = first.replace("    renamed_from: b\n", "").replacen(
+        "\n  a:\n",
+        "\n  b:\n    renamed_from: a\n",
+        1,
+    );
+    std::fs::write(&path, second).unwrap();
+    let plan = declare(&d, "DF_pbps_chain_a");
+    let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    apply(&d, &plan, &["--allow", "rename"]);
+}
+
 // ---- pull (the paths that need no database) ----
 
 /// pull must never clobber an existing project by accident: the connection is

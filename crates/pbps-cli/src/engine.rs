@@ -487,6 +487,34 @@ fn roles_are_the_clusters(question: &str) -> anyhow::Error {
     )
 }
 
+/// Refuses a name this plan creates that an object outside the catalog
+/// inventory already holds: on PostgreSQL a relation-namespace entry (#951),
+/// on SQL Server any `sys.objects` entry (#1077). SQL Server also reads the
+/// names its renames may move generated defaults to, and the children of the
+/// tables it changes, so the plan's own moves can be walked.
+pub async fn refuse_created_name_occupants(
+    conn: &mut Conn,
+    cs: &ChangeSet,
+    label: &str,
+) -> anyhow::Result<()> {
+    match conn.driver() {
+        Driver::Postgres => {
+            let occupants = pbps_pg::catalog::relation_name_occupants(
+                conn,
+                &crate::deploy::created_relation_names(cs),
+            )
+            .await?;
+            crate::deploy::refuse_uninventoried_occupants(cs, &occupants, label)
+        }
+        Driver::Mssql => {
+            let (names, parents) = crate::deploy::object_reads(cs);
+            let occupants =
+                pbps_mssql::catalog::object_name_occupants(conn, &names, &parents).await?;
+            crate::deploy::refuse_occupied_objects(cs, &occupants, label)
+        }
+    }
+}
+
 /// Which requested names occur in an already captured table inventory.
 pub async fn matching_table_names(
     conn: &mut Conn,
