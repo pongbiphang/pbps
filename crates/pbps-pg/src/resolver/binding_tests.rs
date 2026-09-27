@@ -960,6 +960,33 @@ async fn an_unreadable_dropped_signature_is_refused_not_absent() {
             Err(pbps_db::resolver::capture::CaptureError::Read),
             "{variable}"
         );
+        // A name with a backslash is spelled as the plan's DROP spells it,
+        // under the string-literal mode its framing pins, whatever mode the
+        // target session was left in.
+        conn.query(
+            "CREATE FUNCTION public.\"pbps\\1124\"(integer) RETURNS integer LANGUAGE sql RETURN 1",
+        )
+        .await
+        .unwrap();
+        conn.query("SET standard_conforming_strings = off")
+            .await
+            .unwrap();
+        let backslash = reconstruct::identify_dropped(
+            &mut conn,
+            &pg,
+            vec![r"public.pbps\1124(integer)".parse().unwrap()],
+        )
+        .await;
+        conn.query("RESET standard_conforming_strings")
+            .await
+            .unwrap();
+        conn.query("DROP FUNCTION public.\"pbps\\1124\"(integer)")
+            .await
+            .unwrap();
+        assert!(
+            matches!(&backslash, Ok(found) if found.values().all(Option::is_some)),
+            "{variable}: {backslash:?}"
+        );
         // The lookup's transaction is read-only; left open, the next
         // statement would still run inside it.
         let open = conn

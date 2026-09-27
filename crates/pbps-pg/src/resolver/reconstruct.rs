@@ -478,6 +478,12 @@ async fn signature(
         .await
         .map_err(|_| CaptureError::Read)?;
     let rows = async {
+        // The literal below is read in the plan's string-literal mode, which
+        // its framing pins, not in whatever mode the target session keeps: a
+        // backslash in a name would otherwise be an escape. Set in its own
+        // round trip, since a statement is parsed before it runs.
+        conn.query("SET LOCAL standard_conforming_strings = on")
+            .await?;
         conn.query(&format!("SET LOCAL search_path = {path}"))
             .await?;
         conn.query(&format!(
