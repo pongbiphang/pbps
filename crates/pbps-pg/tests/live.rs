@@ -28515,6 +28515,11 @@ async fn doctor_reports_an_absent_recorded_managed_table() {
         .execute("CREATE TABLE public.kept(id integer); CREATE TABLE public.lingering(id integer)")
         .await
         .unwrap();
+    // #1109: a pending drop another role owns.
+    db.conn
+        .execute("CREATE TABLE public.foreign_owned(id integer)")
+        .await
+        .unwrap();
     let (moving, kept, fresh) = (
         pbps_model::Uid::generate(pbps_model::UidKind::Table),
         pbps_model::Uid::generate(pbps_model::UidKind::Table),
@@ -28538,6 +28543,10 @@ async fn doctor_reports_an_absent_recorded_managed_table() {
         pbps_model::Uid::generate(pbps_model::UidKind::Table),
         "public.lingering".parse().unwrap(),
     );
+    recorded.tables.insert(
+        pbps_model::Uid::generate(pbps_model::UidKind::Table),
+        "public.foreign_owned".parse().unwrap(),
+    );
     // `staged` is recorded in the ids only: a staged checkpoint after its
     // committed `DROP TABLE`, whose absence is the plan's own doing.
     recorded.tables.insert(
@@ -28552,6 +28561,7 @@ async fn doctor_reports_an_absent_recorded_managed_table() {
             "public.kept",
             "public.dropped",
             "public.lingering",
+            "public.foreign_owned",
         ],
     )
     .await;
@@ -28597,6 +28607,21 @@ async fn doctor_reports_an_absent_recorded_managed_table() {
             "TABLE \"public\".\"t\"".to_owned(),
             "TABLE \"public\".\"dropped\"".to_owned()
         ],
+        "{:?}",
+        held.declaration_gaps
+    );
+    // #1109: a pending drop that is there needs ownership for its
+    // `DROP TABLE`. The one another role owns is a gap; `lingering`, which
+    // the deployer owns, is not.
+    let dropping: Vec<String> = held
+        .declaration_gaps
+        .iter()
+        .filter(|g| g.why.contains("the next plan drops it"))
+        .map(|g| g.securable())
+        .collect();
+    assert_eq!(
+        dropping,
+        ["TABLE \"public\".\"foreign_owned\"".to_owned()],
         "{:?}",
         held.declaration_gaps
     );

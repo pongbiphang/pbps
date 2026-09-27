@@ -753,11 +753,23 @@ pub async fn permissions(
         })
         .cloned()
         .collect();
-    for (object, present, _) in read_tables(conn, &dropping, &MANAGED_KINDS).await? {
+    for (object, present, rights) in read_tables(conn, &dropping, &MANAGED_KINDS).await? {
         if !present {
             held.declaration_gaps.push(Gap {
                 permission: OWNERSHIP,
                 why: "the recorded table is absent; its ownership cannot be established".to_owned(),
+                securable: Securable::Object(object),
+            });
+        } else if !rights.owned {
+            // A `DROP TABLE` needs ownership (DECISIONS 289), and nothing
+            // else asks this table for it: it is out of the managed rights
+            // above, so a table another role owns read as ready here and
+            // failed at the drop (#1109).
+            held.declaration_gaps.push(Gap {
+                permission: OWNERSHIP,
+                why: "the declarations no longer name this recorded table, so the next plan \
+                      drops it, which needs ownership"
+                    .to_owned(),
                 securable: Securable::Object(object),
             });
         }
