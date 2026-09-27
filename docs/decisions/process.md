@@ -481,3 +481,17 @@ not fewer test cases or weaker qualification. The representative timings and
 reproduction commands are in [CI performance](../CI-PERFORMANCE.md). Engine
 versions, test filters, serialization, fixture ownership and both merge gates
 remain as before.
+
+<a id="dec-1130-1"></a>
+
+**DEC-1130.1. Ignored tests have checked execution owners discovered from compiled
+artifacts.** A source attribute is not evidence that a CI runner selects the
+case, and a library-wide `--ignored` would execute private PID-1/root helpers
+without their parents. The execution inventory uses Cargo artifacts and libtest
+listings for names, targets and platform conditions, then checks the maintained
+CI selectors and scoped fixture invocation witnesses. Nested helpers name their
+compiled parent and its fixture path. Linux and Windows check the cases they
+compile; conditionally ignored cases can be owned by ordinary tests on another
+platform when that relationship is explicit. The inventory establishes a
+scheduling contract, not dynamic branch coverage or permission to weaken the
+fixture's execution assertions. See [test execution](../TEST-EXECUTION.md).

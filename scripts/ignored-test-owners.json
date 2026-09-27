@@ -1,0 +1,1851 @@
+{
+  "version": 1,
+  "owners": {
+    "quick": {
+      "platform": "linux",
+      "fixture": "Ordinary non-ignored tests on Linux; owned subprocess fixtures inherit their parent prerequisites.",
+      "job": "quick",
+      "ordinary": true
+    },
+    "pg": {
+      "platform": "linux",
+      "fixture": "Pinned PostgreSQL 16 and 18; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB.",
+      "job": "live-pg"
+    },
+    "mssql": {
+      "platform": "linux",
+      "fixture": "Pinned SQL Server; PBPS_TEST_DB.",
+      "job": "live"
+    },
+    "editions": {
+      "platform": "linux",
+      "fixture": "Pinned SQL Server Developer and case-sensitive Express instances.",
+      "job": "live-editions"
+    },
+    "rehearsal": {
+      "platform": "linux",
+      "fixture": "Disposable Docker SQL Server; PBPS_TEST_DEV_IMAGE must be set.",
+      "job": "dev-rehearsal"
+    },
+    "rename-churn": {
+      "platform": "linux",
+      "fixture": "Linux procfs/sysfs and an owned temporary directory; no root or database.",
+      "job": "quick"
+    },
+    "docker": {
+      "platform": "linux",
+      "fixture": "Linux native Docker; both pinned engines; owned containers.",
+      "job": "resolver",
+      "script": "scripts/live-resolver.py",
+      "selection": {
+        "kind": "data",
+        "file": "scripts/live-resolver.py",
+        "expression": "TESTS",
+        "prefix": "resolver::"
+      },
+      "witnesses": [
+        {
+          "file": "scripts/live-resolver.py",
+          "language": "python",
+          "scope": "<module>",
+          "requires": [
+            "main()"
+          ]
+        },
+        {
+          "file": "scripts/live-resolver.py",
+          "language": "python",
+          "scope": "main",
+          "requires": [
+            "for test in TESTS:",
+            "\"--\", \"--ignored\", \"--exact\", \"resolver::\" + test",
+            "subprocess.run(command,"
+          ]
+        }
+      ]
+    },
+    "launch": {
+      "platform": "linux",
+      "fixture": "Root observer on disposable native Linux; both engines.",
+      "job": "resolver",
+      "script": "scripts/live-resolver-launch.py",
+      "selection": {
+        "kind": "data",
+        "file": "scripts/live-resolver-launch.py",
+        "expression": "TESTS",
+        "prefix": ""
+      },
+      "witnesses": [
+        {
+          "file": "scripts/live-resolver-launch.py",
+          "language": "python",
+          "scope": "<module>",
+          "requires": [
+            "main()"
+          ]
+        },
+        {
+          "file": "scripts/live-resolver-launch.py",
+          "language": "python",
+          "scope": "main",
+          "requires": [
+            "for name in TESTS:",
+            "command = [str(binary), \"--ignored\", \"--exact\", name",
+            "subprocess.run(command,"
+          ]
+        }
+      ]
+    },
+    "server": {
+      "platform": "linux",
+      "fixture": "Root observer and separate owned target/dedicated engines; both engine matrix entries.",
+      "job": "resolver",
+      "script": "scripts/live-resolver-server.py",
+      "selection": {
+        "kind": "data",
+        "file": "scripts/live-resolver-server.py",
+        "expression": "TESTS",
+        "prefix": "resolver::server::live_tests::"
+      },
+      "witnesses": [
+        {
+          "file": "scripts/live-resolver-server.py",
+          "language": "python",
+          "scope": "<module>",
+          "requires": [
+            "main()"
+          ]
+        },
+        {
+          "file": "scripts/live-resolver-server.py",
+          "language": "python",
+          "scope": "main",
+          "requires": [
+            "fixture(args, binary, root, owned)"
+          ]
+        },
+        {
+          "file": "scripts/live-resolver-server.py",
+          "language": "python",
+          "scope": "fixture",
+          "requires": [
+            "for test in TESTS",
+            "for test, empty in cases:",
+            "command = [binary, \"--ignored\", \"--exact\", f\"resolver::server::live_tests::{test}\"",
+            "run(*command,"
+          ]
+        },
+        {
+          "file": "scripts/live-resolver-server.py",
+          "language": "python",
+          "scope": "run",
+          "requires": [
+            "subprocess.run(args,"
+          ]
+        }
+      ]
+    },
+    "target": {
+      "platform": "linux",
+      "fixture": "Root native Docker observer; explicitly prebuilt library test executable.",
+      "job": "resolver",
+      "script": "scripts/live-resolver-target.py",
+      "arguments": [
+        "--native-host",
+        "--test-binary"
+      ],
+      "selection": {
+        "kind": "data",
+        "file": "scripts/live-resolver-target.py",
+        "expression": "[DAEMON_TEST, TARGET_TEST, FACTORY_TEST]",
+        "prefix": ""
+      },
+      "witnesses": [
+        {
+          "file": "scripts/live-resolver-target.py",
+          "language": "python",
+          "scope": "<module>",
+          "requires": [
+            "main()"
+          ]
+        },
+        {
+          "file": "scripts/live-resolver-target.py",
+          "language": "python",
+          "scope": "main",
+          "requires": [
+            "fixture(args, binary, Path(directory), owned)"
+          ]
+        },
+        {
+          "file": "scripts/live-resolver-target.py",
+          "language": "python",
+          "scope": "fixture",
+          "requires": [
+            "if args.native_host:",
+            "native_tests(binary, env)"
+          ]
+        },
+        {
+          "file": "scripts/live-resolver-target.py",
+          "language": "python",
+          "scope": "native_tests",
+          "requires": [
+            "for test in (DAEMON_TEST, TARGET_TEST, FACTORY_TEST):",
+            "run(binary, \"--ignored\", \"--exact\", test,"
+          ]
+        },
+        {
+          "file": "scripts/live-resolver-target.py",
+          "language": "python",
+          "scope": "run",
+          "requires": [
+            "subprocess.run(args,"
+          ]
+        }
+      ]
+    },
+    "namespaces": {
+      "platform": "linux",
+      "fixture": "Root Linux observer; private mount/PID namespaces and owned mapping/group helpers.",
+      "job": "resolver",
+      "script": "scripts/live-resolver-namespace.py",
+      "selection": {
+        "kind": "calls",
+        "file": "scripts/live-resolver-namespace.py",
+        "scope": "main",
+        "callee": "test",
+        "argument": 1,
+        "ignored_keyword": true
+      },
+      "witnesses": [
+        {
+          "file": "scripts/live-resolver-namespace.py",
+          "language": "python",
+          "scope": "<module>",
+          "requires": [
+            "main()"
+          ]
+        },
+        {
+          "file": "scripts/live-resolver-namespace.py",
+          "language": "python",
+          "scope": "test",
+          "requires": [
+            "run(*prefix, str(binary), \"--exact\", name,",
+            "[\"--ignored\"] if ignored else []"
+          ]
+        },
+        {
+          "file": "scripts/live-resolver-namespace.py",
+          "language": "python",
+          "scope": "run",
+          "requires": [
+            "subprocess.run(args,"
+          ]
+        }
+      ]
+    },
+    "sockets": {
+      "platform": "linux",
+      "fixture": "Root Linux observer and disposable proc/PID socket-holder fixture.",
+      "job": "resolver",
+      "script": "scripts/live-resolver-sockets.py",
+      "prefix": "resolver::native::namespace::sockets::tests::",
+      "witnesses": [
+        {
+          "file": "scripts/live-resolver-sockets.py",
+          "language": "python",
+          "scope": "<module>",
+          "requires": [
+            "subprocess.run([",
+            "str(args.test_binary.resolve(strict=True)), \"--ignored\", \"--test-threads=1\", 'resolver::native::namespace::sockets::tests::'"
+          ]
+        }
+      ]
+    },
+    "daemon": {
+      "platform": "linux",
+      "fixture": "Nested owned Docker PID-1 socket-activation fixture; never execute on the host.",
+      "parent": "docker",
+      "selection": {
+        "kind": "data",
+        "file": "scripts/resolver-daemon-fixture.py",
+        "expression": "TEST",
+        "prefix": ""
+      },
+      "witnesses": [
+        {
+          "file": "scripts/live-resolver.py",
+          "language": "python",
+          "scope": "main",
+          "requires": [
+            "subprocess.run([sys.executable, \"scripts/resolver-daemon-fixture.py\"],"
+          ]
+        },
+        {
+          "file": "scripts/resolver-daemon-fixture.py",
+          "language": "python",
+          "scope": "<module>",
+          "requires": [
+            "main()"
+          ]
+        },
+        {
+          "file": "scripts/resolver-daemon-fixture.py",
+          "language": "python",
+          "scope": "main",
+          "requires": [
+            "IMAGE, \"--ignored\", \"--exact\", TEST,",
+            "subprocess.run([\"docker\", \"start\", \"--attach\", name]"
+          ]
+        }
+      ]
+    },
+    "pseudo": {
+      "platform": "linux",
+      "fixture": "Nested owned user/mount/IPC namespace; launched from the root launch fixture.",
+      "parent": "launch",
+      "selection": {
+        "kind": "data",
+        "file": "scripts/live-resolver-pseudo.py",
+        "expression": "TEST",
+        "prefix": ""
+      },
+      "witnesses": [
+        {
+          "file": "scripts/live-resolver-launch.py",
+          "language": "python",
+          "scope": "main",
+          "requires": [
+            "subprocess.run([sys.executable, str(Path(__file__).with_name(\"live-resolver-pseudo.py\"))"
+          ]
+        },
+        {
+          "file": "scripts/live-resolver-pseudo.py",
+          "language": "python",
+          "scope": "<module>",
+          "requires": [
+            "main()"
+          ]
+        },
+        {
+          "file": "scripts/live-resolver-pseudo.py",
+          "language": "python",
+          "scope": "main",
+          "requires": [
+            "subprocess.run([str(binary), \"--ignored\", \"--exact\", TEST,"
+          ]
+        }
+      ]
+    },
+    "tls": {
+      "platform": "linux",
+      "fixture": "Owned TLS engine and PKI; verified round trip plus untrusted/invalid/missing trust variants.",
+      "job": "live-pg",
+      "script": "scripts/live-transport.py",
+      "selection": {
+        "kind": "calls",
+        "file": "scripts/live-transport.py",
+        "scope": "main",
+        "callee": "run_case",
+        "argument": 1
+      },
+      "witnesses": [
+        {
+          "file": "scripts/live-transport.py",
+          "language": "python",
+          "scope": "<module>",
+          "requires": [
+            "main()"
+          ]
+        },
+        {
+          "file": "scripts/live-transport.py",
+          "language": "python",
+          "scope": "main",
+          "requires": [
+            "cargo = [\"cargo\", \"test\", \"-p\", \"pbps-db\", \"--test\", \"live_transport\", \"--\"]"
+          ]
+        },
+        {
+          "file": "scripts/live-transport.py",
+          "language": "python",
+          "scope": "run_case",
+          "requires": [
+            "subprocess.run([*command, \"--ignored\", \"--exact\", test,"
+          ]
+        }
+      ]
+    },
+    "daemon-child": {
+      "platform": "linux",
+      "fixture": "Nested subprocess; only the named parent supplies its synchronization and private fixture.",
+      "parent": "daemon",
+      "case": "resolver::native::daemon::tests::fixture_acceptor_holds_only_its_accepted_sockets",
+      "parent_tests": [
+        {
+          "target": [
+            "pbps-cli",
+            "lib",
+            "pbps_cli"
+          ],
+          "case": "resolver::native::daemon::tests::socket_activation_requires_the_candidate_daemon_to_own_the_actual_peer"
+        }
+      ],
+      "witnesses": [
+        {
+          "file": "crates/pbps-cli/src/resolver/native/daemon/tests.rs",
+          "language": "rust",
+          "scope": "socket_activation_requires_the_candidate_daemon_to_own_the_actual_peer",
+          "requires": [
+            ".args([\"--ignored\", \"--exact\", \"resolver::native::daemon::tests::fixture_acceptor_holds_only_its_accepted_sockets\"",
+            "spawned_and_execed(&mut command, \"dockerd\")"
+          ]
+        }
+      ]
+    },
+    "execution-child": {
+      "platform": "linux",
+      "fixture": "Nested subprocess; only the named parent supplies its synchronization and private fixture.",
+      "parent": "docker",
+      "case": "resolver::native::execution::tests::actual_owned_root_limits_and_visible_mounts_match_the_profile",
+      "parent_tests": [
+        {
+          "target": [
+            "pbps-cli",
+            "lib",
+            "pbps_cli"
+          ],
+          "case": "resolver::native::execution::tests::owned_root_guard_controls_are_measured_on_the_native_kernel"
+        }
+      ],
+      "witnesses": [
+        {
+          "file": "crates/pbps-cli/src/resolver/native/execution/tests.rs",
+          "language": "rust",
+          "scope": "owned_root_guard_controls_are_measured_on_the_native_kernel",
+          "requires": [
+            "\"--ignored\", \"--exact\", \"resolver::native::execution::tests::actual_owned_root_limits_and_visible_mounts_match_the_profile\"",
+            ".output()"
+          ]
+        }
+      ]
+    },
+    "channel-child": {
+      "platform": "linux",
+      "fixture": "Nested subprocess; only the named parent supplies its synchronization and private fixture.",
+      "parent": "docker",
+      "case": "resolver::docker::session::kernel_tests::the_actual_private_backend_and_controls_remain_bound_during_compilation",
+      "parent_tests": [
+        {
+          "target": [
+            "pbps-cli",
+            "lib",
+            "pbps_cli"
+          ],
+          "case": "resolver::docker::session::kernel_tests::private_channel_kernel_pairing_uses_only_owned_process_mounts"
+        }
+      ],
+      "witnesses": [
+        {
+          "file": "crates/pbps-cli/src/resolver/docker/session/kernel_tests.rs",
+          "language": "rust",
+          "scope": "private_channel_kernel_pairing_uses_only_owned_process_mounts",
+          "requires": [
+            "inspect_pair("
+          ]
+        },
+        {
+          "file": "crates/pbps-cli/src/resolver/docker/session/kernel_tests.rs",
+          "language": "rust",
+          "scope": "inspect_pair",
+          "requires": [
+            "create.args([",
+            "create.output()"
+          ],
+          "literal_contains": [
+            "/pbps-kernel-tests --ignored --exact {INNER} --nocapture"
+          ]
+        },
+        {
+          "file": "crates/pbps-cli/src/resolver/docker/session/kernel_tests.rs",
+          "language": "rust",
+          "scope": "<module>",
+          "requires": [
+            "const INNER: &str = \"resolver::docker::session::kernel_tests::the_actual_private_backend_and_controls_remain_bound_during_compilation\""
+          ]
+        }
+      ]
+    },
+    "signing-child": {
+      "platform": "linux",
+      "fixture": "Nested subprocess; only the named parent supplies its synchronization and private fixture.",
+      "parent": "quick",
+      "case": "publication::push_signing::push_signing_count_child",
+      "parent_tests": [
+        {
+          "target": [
+            "pbps-cli",
+            "test",
+            "compose_candidate"
+          ],
+          "case": "publication::push_signing::one_publication_reads_the_push_signing_mode_once"
+        }
+      ],
+      "witnesses": [
+        {
+          "file": "crates/pbps-cli/tests/compose_publication/push_signing.rs",
+          "language": "rust",
+          "scope": "one_publication_reads_the_push_signing_mode_once",
+          "requires": [
+            "Command::new(std::env::current_exe().unwrap())",
+            ".args([\"--ignored\", \"--exact\", \"publication::push_signing::push_signing_count_child\"",
+            ".output()"
+          ]
+        }
+      ]
+    },
+    "resource-child": {
+      "platform": "linux",
+      "fixture": "Nested subprocess; only the named parent supplies its synchronization and private fixture.",
+      "parent": "quick",
+      "case": "publication::resources::resource_stop_child",
+      "parent_tests": [
+        {
+          "target": [
+            "pbps-cli",
+            "test",
+            "compose_candidate"
+          ],
+          "case": "publication::resources::actual_process_death_preserves_acquisition_ref_handoff_and_retirement_evidence"
+        }
+      ],
+      "witnesses": [
+        {
+          "file": "crates/pbps-cli/tests/compose_publication/resources.rs",
+          "language": "rust",
+          "scope": "actual_process_death_preserves_acquisition_ref_handoff_and_retirement_evidence",
+          "requires": [
+            ".args([\"--ignored\", \"--exact\", \"publication::resources::resource_stop_child\"",
+            ".spawn()"
+          ]
+        }
+      ]
+    },
+    "publication-child": {
+      "platform": "linux",
+      "fixture": "Nested subprocess; only the named parent supplies its synchronization and private fixture.",
+      "parent": "quick",
+      "case": "publication::process_death::publication_stop_child",
+      "parent_tests": [
+        {
+          "target": [
+            "pbps-cli",
+            "test",
+            "compose_candidate"
+          ],
+          "case": "publication::process_death::death_after_commit_creation_never_yields_a_second_commit"
+        }
+      ],
+      "witnesses": [
+        {
+          "file": "crates/pbps-cli/tests/compose_publication/process_death.rs",
+          "language": "rust",
+          "scope": "death_after_commit_creation_never_yields_a_second_commit",
+          "requires": [
+            "killed_at("
+          ]
+        },
+        {
+          "file": "crates/pbps-cli/tests/compose_publication/process_death.rs",
+          "language": "rust",
+          "scope": "killed_at",
+          "requires": [
+            ".args([\"--ignored\", \"--exact\", CHILD, \"--nocapture\"])",
+            ".spawn()"
+          ]
+        },
+        {
+          "file": "crates/pbps-cli/tests/compose_publication/process_death.rs",
+          "language": "rust",
+          "scope": "<module>",
+          "requires": [
+            "const CHILD: &str = \"publication::process_death::publication_stop_child\""
+          ]
+        }
+      ]
+    }
+  },
+  "groups": [
+    {
+      "target": [
+        "pbps-cli",
+        "bin",
+        "pbps"
+      ],
+      "owner": "pg",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "deploy::tests::a_probe_cannot_advance_a_sequence_named_in_a_declared_check",
+        "deploy::tests::a_probe_is_answered_under_the_settings_the_statement_will_run_under",
+        "deploy::tests::a_read_only_probe_still_refuses_a_violating_row",
+        "deploy::tests::transactional_read_back_refuses_concurrent_managed_ddl_but_ignores_unmanaged_ddl",
+        "engine::tests::a_failed_cost_query_is_unavailable_not_a_static_guess",
+        "engine::tests::a_module_handed_to_the_postgres_rename_impact_is_refused_not_empty",
+        "engine::tests::the_postgres_arms_answer_engine_only_questions_by_name",
+        "engine::tests::the_role_questions_refuse_on_postgres_rather_than_answer_none"
+      ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "lib",
+        "pbps_cli"
+      ],
+      "owner": "channel-child",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "resolver::docker::session::kernel_tests::the_actual_private_backend_and_controls_remain_bound_during_compilation"
+      ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "lib",
+        "pbps_cli"
+      ],
+      "owner": "daemon",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "resolver::native::daemon::tests::socket_activation_requires_the_candidate_daemon_to_own_the_actual_peer"
+      ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "lib",
+        "pbps_cli"
+      ],
+      "owner": "daemon-child",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "resolver::native::daemon::tests::fixture_acceptor_holds_only_its_accepted_sockets"
+      ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "lib",
+        "pbps_cli"
+      ],
+      "owner": "docker",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "resolver::docker::lifecycle::tests::external_sentinels_are_unreachable_until_the_corresponding_boundary_is_removed",
+        "resolver::docker::lifecycle::tests::fixed_launch_survives_bootstrap_and_explicit_close_removes_the_live_candidate",
+        "resolver::docker::lifecycle::tests::the_root_deadline_removes_even_a_detached_descendant",
+        "resolver::docker::reserved::tests::a_reserved_runtime_has_no_database_until_its_fixed_bootstrap_gate_opens",
+        "resolver::docker::session::kernel_tests::private_channel_kernel_pairing_uses_only_owned_process_mounts",
+        "resolver::docker::session::tests::the_private_channel_compiles_declarations_and_control_loss_discards_the_run",
+        "resolver::docker::tests::local_image_acquisition_observes_immutable_content_without_pulling",
+        "resolver::native::execution::tests::owned_root_guard_controls_are_measured_on_the_native_kernel"
+      ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "lib",
+        "pbps_cli"
+      ],
+      "owner": "execution-child",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "resolver::native::execution::tests::actual_owned_root_limits_and_visible_mounts_match_the_profile"
+      ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "lib",
+        "pbps_cli"
+      ],
+      "owner": "launch",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "resolver::docker::profile::launch_tests::a_guard_without_termination_authority_is_refused_before_initialization",
+        "resolver::docker::profile::launch_tests::a_wrong_workload_identity_is_refused_before_initialization",
+        "resolver::docker::profile::launch_tests::effective_descriptor_limits_are_required_before_initialization",
+        "resolver::docker::profile::launch_tests::host_information_is_refused_before_engine_initialization",
+        "resolver::docker::profile::launch_tests::masks::every_existing_proc_interface_requires_its_effective_mask",
+        "resolver::docker::profile::launch_tests::pseudo::mqueue_origin_is_required_before_engine_initialization",
+        "resolver::docker::profile::launch_tests::seccomp::reported_policy_and_filter_mode_cannot_replace_effective_bootstrap_probes",
+        "resolver::docker::profile::launch_tests::seccomp::the_owned_forwarder_requires_its_effective_process_and_fastopen_restrictions",
+        "resolver::docker::profile::launch_tests::the_launch_cannot_omit_inherited_no_new_privileges",
+        "resolver::docker::profile::launch_tests::unreadable_effective_limits_are_not_a_bounded_answer",
+        "resolver::docker::profile::launch_tests::uts::kernel_names_are_required_before_engine_initialization",
+        "resolver::docker::session::tests::host_files::host_information_cannot_enter_either_private_runtime_view",
+        "resolver::docker::session::tests::uts::kernel_names_cannot_enter_either_private_runtime_view",
+        "resolver::native::uts::tests::a_uts_only_replacement_invalidates_the_lease_without_moving_the_observer"
+      ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "lib",
+        "pbps_cli"
+      ],
+      "owner": "namespaces",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "resolver::native::accounting_tests::known_pid_members_need_no_second_executable_qualification",
+        "resolver::native::executables::tests::a_departed_mapping_cannot_use_the_same_inode_on_another_device",
+        "resolver::native::executables::tests::a_surviving_mapping_keeps_loaded_content_after_the_first_range_exits",
+        "resolver::native::executables::tests::an_inode_collision_cannot_lend_mapped_content_to_a_required_candidate",
+        "resolver::native::namespace::tests::a_process_with_the_kernel_maximum_groups_can_be_captured"
+      ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "lib",
+        "pbps_cli"
+      ],
+      "owner": "pseudo",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "resolver::native::pseudo::tests::a_foreign_mqueue_mount_invalidates_admission_and_the_retained_lease"
+      ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "lib",
+        "pbps_cli"
+      ],
+      "owner": "rename-churn",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "resolver::native::confined_open_tests::unrelated_rename_churn_preserves_confined_objects"
+      ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "lib",
+        "pbps_cli"
+      ],
+      "owner": "server",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "resolver::server::live_tests::a_container_joined_to_the_engines_network_refuses_the_run",
+        "resolver::server::live_tests::a_process_the_engine_did_not_start_refuses_its_namespaces",
+        "resolver::server::live_tests::a_removed_statistics_row_cannot_pay_for_an_intruding_session",
+        "resolver::server::live_tests::a_run_qualifies_its_analysis_scope_against_the_target",
+        "resolver::server::live_tests::a_server_inside_the_target_instance_is_refused_before_any_scratch_resource",
+        "resolver::server::live_tests::a_session_present_at_admission_is_refused_rather_than_counted",
+        "resolver::server::live_tests::a_session_this_run_did_not_open_invalidates_it_even_after_it_closed",
+        "resolver::server::live_tests::a_supported_dedicated_server_compiles_declarations_and_removes_only_its_own_resources",
+        "resolver::server::live_tests::admission_recovery::a_cancelled_step_leaves_its_admin_session_to_cleanup",
+        "resolver::server::live_tests::admission_recovery::failed_admission_names_every_unconfirmed_forwarder",
+        "resolver::server::live_tests::an_unconfirmed_cleanup_reports_only_the_run_owned_names",
+        "resolver::server::live_tests::an_unimplemented_profile_or_an_exposed_runtime_is_refused_by_name",
+        "resolver::server::live_tests::bindings::a_qualified_run_resolves_desired_bindings_against_the_target",
+        "resolver::server::live_tests::forwarder_mqueue::a_foreign_forwarder_mqueue_discards_each_live_view_permanently",
+        "resolver::server::live_tests::forwarder_mqueue::every_session_qualifies_its_forwarders_mqueue_before_returning",
+        "resolver::server::live_tests::guard_limits::every_forwarder_guard_requires_effective_descriptor_evidence",
+        "resolver::server::live_tests::guard_limits::guard_restoration_distinguishes_process_exit_from_live_cleanup_failure",
+        "resolver::server::live_tests::host_files::host_file_loss_refuses_admission_and_discards_live_analysis",
+        "resolver::server::live_tests::pseudo::foreign_pseudo_roots_refuse_admission_and_discard_live_analysis",
+        "resolver::server::live_tests::replacing_or_dropping_the_target_binding_discards_the_run",
+        "resolver::server::live_tests::uts::kernel_name_loss_refuses_admission_and_discards_each_live_view"
+      ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "lib",
+        "pbps_cli"
+      ],
+      "owner": "sockets",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "resolver::native::namespace::sockets::tests::a_singleton_observation_does_not_claim_exhaustive_socket_ownership",
+        "resolver::native::namespace::sockets::tests::an_empty_observation_gets_one_fresh_backend_observation",
+        "resolver::native::namespace::sockets::tests::an_intermediate_exit_cannot_preserve_a_stale_service_relation",
+        "resolver::native::namespace::sockets::tests::socket_observation_preserves_groups_reparented_holders_and_service_identity"
+      ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "lib",
+        "pbps_cli"
+      ],
+      "owner": "target",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "resolver::docker::session::native_factory_tests::native_factory_qualifies_before_bootstrap_and_rejects_rebound_target_connections",
+        "resolver::docker::tests::direct_native_daemon_is_accepted_but_a_root_owned_proxy_is_not",
+        "resolver::native::target::tests::native_aliases_share_one_instance_and_backend_children_cannot_claim_another"
+      ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "test",
+        "compose_candidate"
+      ],
+      "owner": "publication-child",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "publication::process_death::publication_stop_child"
+      ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "test",
+        "compose_candidate"
+      ],
+      "owner": "resource-child",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "publication::resources::resource_stop_child"
+      ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "test",
+        "compose_candidate"
+      ],
+      "owner": "signing-child",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "publication::push_signing::push_signing_count_child"
+      ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "test",
+        "flow"
+      ],
+      "owner": "mssql",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "a_cell_returned_to_its_default_applies",
+        "a_chain_of_moves_through_an_intermediate_name_applies_together",
+        "a_chain_of_renames_into_vacated_names_applies_together",
+        "a_change_that_lands_during_an_apply_is_not_recorded_as_the_plan_s_own",
+        "a_column_a_check_names_is_renamed_after_the_check_is_dropped",
+        "a_column_a_filtered_index_names_is_renamed_after_the_index_is_dropped",
+        "a_computed_column_inside_the_managed_set_is_reported_as_drift",
+        "a_connected_sql_server_plan_names_inapplicable_postgres_checks_in_json",
+        "a_created_table_with_a_foreign_key_applies",
+        "a_declared_child_row_survives_a_parent_delete_with_and_without_a_retype",
+        "a_declared_expression_the_engine_respells_is_not_restated",
+        "a_declared_module_the_catalog_cannot_read_is_never_recorded",
+        "a_declared_spelling_the_engine_reads_back_differently_is_refused_before_it_is_written",
+        "a_declared_unreadable_trigger_is_never_recorded_or_planned_over",
+        "a_delete_beside_a_type_change_in_the_same_revision_applies",
+        "a_drop_and_a_later_rename_that_reuses_its_name_apply_together",
+        "a_failed_apply_is_audited_and_emitted_to_the_hook",
+        "a_failed_resume_does_not_relabel_the_interrupted_plan",
+        "a_foreign_key_is_added_after_the_key_it_references_live",
+        "a_foreign_key_is_dropped_before_the_key_it_references_live",
+        "a_ledger_failure_rolls_back_the_ddl_it_would_have_recorded",
+        "a_lock_names_its_holders_process_and_says_how_to_find_its_session",
+        "a_member_added_after_planning_refuses_the_role_drop_before_anything_runs",
+        "a_panicking_test_leaves_no_database_behind",
+        "a_plan_that_reshapes_an_existing_table_applies",
+        "a_printing_drift_hook_leaves_the_json_envelope_whole",
+        "a_referenced_key_replacement_applies_and_the_next_plan_is_empty",
+        "a_rehearsal_against_a_real_engine_reports_convergence",
+        "a_rename_and_a_column_drop_in_one_revision_apply_together",
+        "a_rename_leaves_the_constraints_that_name_the_column_alone",
+        "a_rename_of_a_granted_table_is_applied_rather_than_read_as_movement",
+        "a_renamed_data_table_is_planned_against_the_rows_it_still_holds",
+        "a_retyped_column_that_also_replaces_its_default_applies",
+        "a_role_named_like_a_user_is_refused_before_anything_runs",
+        "a_row_the_declarations_spell_differently_from_the_recorded_ledger_still_plans",
+        "a_schema_name_the_database_spells_differently_is_refused",
+        "a_sequence_or_synonym_at_a_new_tables_name_refuses_the_plan",
+        "a_staged_apply_stops_at_a_change_that_is_not_its_own",
+        "a_staged_rename_checks_recreated_names_under_the_database_collation",
+        "a_state_list_envelope_with_a_zero_limit_is_refused_by_the_published_schema",
+        "a_table_and_one_of_its_columns_renamed_in_one_revision_apply_together",
+        "a_table_drop_and_a_later_rename_that_reuses_its_name_apply_together",
+        "a_triggers_own_throw_is_redacted_without_being_called_a_sqlstate",
+        "an_undeclared_key_is_named_by_connected_planning_and_again_before_apply",
+        "an_unlock_failure_does_not_relabel_a_successful_apply",
+        "an_unreleased_lock_after_a_failed_command_is_reported",
+        "bootstrap_refuses_a_declared_table_the_projection_left_out",
+        "column_names_that_change_hands_across_revisions_apply_together",
+        "commented_constraint_probes_count_violations_and_accept_nonviolating_rows",
+        "commented_default_arrivals_are_counted_before_constraints_are_applied",
+        "connected_plan_json_keeps_edition_warnings_without_duplicate_prose",
+        "connected_planning_keeps_dependencies_for_deleted_modules",
+        "deliberately_unbuilt_constraint_is_reported_as_unchecked",
+        "doctor_accepts_complete_managed_column_select_and_names_the_missing_scope",
+        "doctor_against_a_real_server_reads_its_edition_and_permissions",
+        "doctor_and_explain_see_a_lock_that_outlived_its_state_table",
+        "doctor_asks_about_a_column_under_the_name_a_pending_rename_has_not_changed_yet",
+        "doctor_asks_for_the_dml_a_declared_data_block_needs",
+        "doctor_does_not_report_ready_while_the_lock_is_held",
+        "doctor_reports_server_capabilities_or_says_it_could_not_read_them",
+        "doctor_resolver_discovery_is_advisory_and_never_acquires_an_engine",
+        "doctor_unions_only_the_columns_external_foreign_keys_reference",
+        "durable_record_commands_report_success_before_an_unlock_failure",
+        "explain_calls_a_never_initialized_database_uninitialized",
+        "explain_reports_a_locked_target_rather_than_a_ready_one",
+        "external_referenced_key_dependencies_are_refused_before_planning_and_writing",
+        "init_from_a_real_database_produces_a_valid_project",
+        "ledger_migration_guidance_keeps_the_explicit_or_configured_target",
+        "nonstandard_foreign_key_state_refuses_key_replacement_before_writing",
+        "pull_leaves_out_a_trigger_whose_table_it_does_not_write",
+        "pull_refuses_dotted_engine_names_before_writing_declarations_or_ids",
+        "pull_reports_system_versioning_without_declaring_either_temporal_table",
+        "pull_round_trips_ordinary_engine_names_without_a_name_warning",
+        "reference_data_round_trips_through_a_real_target",
+        "resolver_selection_is_lazy_and_obeys_cli_environment_project_precedence",
+        "retyped_defaults_and_referenced_keys_apply_through_the_saved_plan_gate",
+        "roles_holding_each_other_are_dropped_parent_first_through_a_connected_plan",
+        "snapshot_and_baseline_refuse_a_held_deployment_lock",
+        "source_default_collation_notice_is_only_printed_once_during_onboarding",
+        "sql_server_cost_reports_row_work_without_changing_the_saved_plan_or_gate",
+        "state_list_carries_an_unreadable_entry_rather_than_losing_the_timeline",
+        "state_list_returns_the_history_newest_first_in_the_published_shape",
+        "state_list_routes_an_unreadable_ledger_to_the_operator_not_to_findings",
+        "state_list_separates_no_ledger_from_an_empty_one_and_from_an_unreachable_server",
+        "status_reports_a_lock_held_over_an_empty_ledger",
+        "status_reports_a_lock_that_outlived_its_state_table",
+        "status_reports_the_unmanaged_error_policy",
+        "status_says_nothing_about_a_lock_on_a_database_with_no_ledger",
+        "the_connected_envelopes_match_the_published_schema",
+        "the_rehearsal_still_runs_when_the_output_is_json",
+        "unmodelled_check_and_unique_enforcement_refuses_connected_retypes_before_writes",
+        "verify_and_status_reject_an_unreadable_unmanaged_module",
+        "verify_calls_an_unexpressible_live_difference_drift_not_unreachable",
+        "verify_keeps_the_expressible_drift_beside_an_unexpressible_one"
+      ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "test",
+        "flow"
+      ],
+      "owner": "quick",
+      "validate_on": "linux",
+      "ignored_on": [
+        "darwin"
+      ],
+      "cases": [
+        "a_plan_path_that_is_not_utf8_becomes_the_placeholder",
+        "an_unreadable_plan_at_a_non_utf8_path_still_produces_an_envelope"
+      ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "test",
+        "flow"
+      ],
+      "owner": "rehearsal",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "a_dev_container_outlives_the_call_that_started_it"
+      ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "test",
+        "flow_pg"
+      ],
+      "owner": "pg",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "a_carried_only_rename_impact_lists_what_the_rename_carries",
+        "a_cascade_lock_denial_keeps_its_remedy_on_the_failed_ledger",
+        "a_cascade_reached_table_is_held_until_the_write_finishes",
+        "a_chain_of_moves_through_an_intermediate_name_applies_together",
+        "a_chain_of_renames_into_vacated_names_applies_together",
+        "a_check_calling_a_new_function_follows_it_beside_a_function_turned_procedure",
+        "a_check_calling_a_procedure_turned_function_follows_its_create",
+        "a_child_committed_while_a_guarded_delete_waits_fires_cascade_row_triggers",
+        "a_concurrent_replacement_is_seen_under_a_repeatable_read_default",
+        "a_continued_escape_strings_spacing_is_a_change_to_the_view",
+        "a_created_routine_refuses_a_low_privilege_caller_unless_the_declaration_opens_it",
+        "a_cross_schema_cli_rename_requires_approval_and_records_only_its_declared_destination",
+        "a_declaration_may_reopen_a_closed_routine_on_its_next_rebuild",
+        "a_declaration_opens_a_routine_even_where_default_privileges_close_it",
+        "a_declared_grant_to_the_targets_own_owner_is_refused_before_a_statement_runs",
+        "a_default_follows_a_rebuilt_function_past_an_update_that_does_not_take_it",
+        "a_definer_routine_a_plan_writes_must_pin_search_path_with_pg_temp_last",
+        "a_deployers_own_onward_grant_is_one_it_can_still_narrow",
+        "a_grant_a_third_role_made_is_kept_and_only_its_removal_is_refused",
+        "a_grant_from_a_role_the_deployer_inherits_is_one_it_can_still_narrow",
+        "a_grant_no_revoke_could_remove_is_found_under_the_name_the_read_saw",
+        "a_grant_on_a_table_this_plan_creates_is_checked_against_its_coming_owner",
+        "a_grant_the_deployer_made_is_narrowable_beside_one_the_owner_made",
+        "a_key_a_before_trigger_can_rewrite_is_in_the_closure",
+        "a_lock_names_its_holders_process_and_says_how_to_find_its_session",
+        "a_membership_granted_after_planning_is_refused_before_the_row_write",
+        "a_new_tables_expressions_calling_a_rebuilt_function_follow_it",
+        "a_newly_declared_name_the_database_already_uses_is_refused_before_the_plan",
+        "a_plan_pinned_under_one_key_is_refused_under_another",
+        "a_plan_that_must_pin_a_routine_is_refused_without_a_key_and_names_the_remedy",
+        "a_reached_table_the_deployment_role_cannot_lock_is_named_in_the_refusal",
+        "a_referenced_key_replacement_applies_and_the_next_plan_is_empty",
+        "a_reused_tables_key_and_the_renamed_tables_key_of_one_name_both_go",
+        "a_revoke_that_does_not_land_is_refused_at_the_closing_read",
+        "a_rewrite_rule_on_a_reached_table_is_refused",
+        "a_routine_reopened_or_closed_behind_the_plan_refuses_to_close_the_run",
+        "a_routine_replaced_after_approval_refuses_the_apply_before_its_first_statement",
+        "a_routine_replaced_during_a_staged_step_is_caught_after_its_checkpoint",
+        "a_routine_replaced_while_the_statements_run_rolls_the_apply_back",
+        "a_routine_with_a_continued_escape_string_default_plans_and_applies",
+        "a_second_statement_failure_rolls_back_the_first_and_records_only_a_failed_attempt",
+        "a_sequence_or_index_at_a_new_tables_name_refuses_the_plan",
+        "a_staged_cli_checkpoint_survives_state_json_and_resume_checks_its_intermediate_name",
+        "a_staged_create_never_closes_over_a_replaced_pending_part",
+        "a_staged_or_bootstrapped_definer_routine_without_a_pinned_path_is_refused_before_it_commits",
+        "a_staged_rename_refuses_a_recreated_intermediate_name_at_closing_and_resume",
+        "a_staged_rename_refuses_a_recreated_source_even_when_resuming_only_the_closing_read",
+        "a_staged_revision_may_still_create_one_routine",
+        "a_staged_schema_transfer_does_not_hide_an_unplanned_column_at_the_intermediate_name",
+        "a_table_drop_and_a_later_rename_that_reuses_its_name_apply_together",
+        "a_target_handed_to_its_grantee_after_planning_is_refused_at_apply",
+        "a_transactional_rename_rolls_back_when_a_trigger_recreates_its_source",
+        "a_trigger_function_replaced_between_the_check_and_the_row_write_is_rolled_back",
+        "a_trigger_guard_holds_off_replacement_until_the_write_finishes",
+        "a_triggers_own_exception_keeps_the_row_value_off_the_ledger_but_not_off_the_operator",
+        "a_view_kept_on_a_function_dropped_for_good_refuses_the_plan_by_name",
+        "a_view_over_a_view_edited_off_a_dropped_function_is_rebuilt",
+        "a_view_rebuild_restates_a_declared_roles_grant_and_the_role_still_reads_it",
+        "additions_calling_a_rebuilt_function_are_created_after_it",
+        "an_action_that_cannot_write_is_not_in_the_closure",
+        "an_inherited_trigger_function_owner_cannot_use_the_deployers_privileges",
+        "an_owners_grant_a_least_privilege_deployer_cannot_revoke_is_refused_before_it_runs",
+        "an_unapproved_triggers_own_refusal_keeps_naming_it_on_the_ledger",
+        "an_unchanged_pinned_routine_lets_both_apply_modes_through",
+        "another_sessions_temporary_routine_is_not_pinned",
+        "arriving_overloads_rebind_unchanged_callers_in_the_approved_plan",
+        "bootstrap_checks_triggers_that_arrive_with_a_created_table",
+        "bootstrap_grants_to_an_existing_cluster_role_without_adopting_existing_grants",
+        "bootstrap_refuses_a_grant_to_the_role_that_will_own_what_it_builds",
+        "bootstrap_refuses_to_record_a_routine_a_trigger_reopened_to_public",
+        "bootstrap_requires_cluster_roles_before_building_and_before_recording",
+        "closing_a_routine_a_third_role_opened_to_public_is_refused_before_it_runs",
+        "column_names_that_change_hands_across_revisions_apply_together",
+        "completed_cluster_role_renames_are_pinned_and_recorded_without_role_sql",
+        "connected_cost_distinguishes_rewrites_scans_unknowns_and_risk",
+        "connected_cost_keeps_catalog_identity_through_column_and_table_renames",
+        "connected_plan_json_keeps_policy_warnings_without_duplicate_prose",
+        "connected_plan_json_retains_error_policy_findings_without_artifacts",
+        "connected_plan_json_retains_identity_remedies_and_operational_errors",
+        "constraint_trigger_checks_wait_for_every_planned_row",
+        "constraint_trigger_effects_cannot_arrive_after_the_recorded_row_check",
+        "constraint_trigger_guards_accept_only_the_recorded_managed_definition",
+        "constraint_triggers_pull_bootstrap_and_plan_without_duplicate_constraints",
+        "doctor_asks_about_an_undeclared_foreign_key_parent_in_a_managed_schema",
+        "doctor_examines_a_postgres_environment",
+        "doctor_exercises_a_real_non_superuser_and_names_the_permission_removed_from_it",
+        "doctor_json_follows_recorded_table_and_column_ids_before_pending_renames",
+        "doctor_json_reports_external_schema_absence_before_grant_authority",
+        "doctor_reports_an_adopted_routine_grant_whatever_the_argument_spelling",
+        "doctor_reports_data_and_role_grant_gaps_from_the_declarations",
+        "doctor_resolver_discovery_is_advisory_and_never_acquires_an_engine",
+        "doctor_tells_a_role_that_cannot_read_the_lock_what_to_grant_in_postgres_terms",
+        "drift_and_pull_are_read_from_the_postgres_catalog",
+        "drop_blockers_are_named_in_planning_and_rechecked_before_apply_writes",
+        "drop_blockers_do_not_refuse_a_closing_resume_after_the_drop_completed",
+        "effective_function_ownership_decides_trigger_trust_before_postgres_17",
+        "effective_function_ownership_not_the_direct_owner_decides_trigger_trust",
+        "every_sql_output_pins_the_parser_before_the_generated_definitions",
+        "external_referenced_key_dependencies_are_refused_before_planning_and_writing",
+        "failed_concurrent_index_builds_are_cleaned_recorded_and_retried_without_resume",
+        "grantless_cluster_role_additions_and_removals_update_the_recorded_scope",
+        "identity_increments_at_the_sequence_span_produce_two_values",
+        "indirect_constraint_trigger_effects_are_settled_before_recording",
+        "init_from_a_database_says_which_permissions_it_could_not_take_with_it",
+        "ledger_migration_guidance_keeps_the_explicit_or_configured_target",
+        "managed_omission_relations_stay_out_of_unmanaged_policy_with_absent_tables",
+        "managed_omission_reports_each_catalog_fact_once_and_keeps_recording_refusals",
+        "module_dependents_are_dropped_and_restored_around_the_rebuild_or_refused_by_name",
+        "module_rebuilds_refuse_carried_state_before_planning_and_before_recording",
+        "modules_apply_then_pull_round_trip_and_changed_bodies_are_drift",
+        "narrowing_projection_refuses_constraint_failures_before_the_first_statement",
+        "nonordinary_trigger_modes_are_reported_instead_of_recorded",
+        "omitted_modules_obey_unmanaged_policy_even_beside_a_managed_overload",
+        "permission_versions_are_checked_before_planning_bootstrap_apply_and_resume",
+        "postgres_rename_impact_reaches_the_cli_as_advisory_and_requires_explicit_approval",
+        "pull_data_on_a_table_validate_refuses_leaves_it_out_and_reads_the_rest",
+        "pull_draws_the_line_the_projects_own_rules_draw",
+        "pull_leaves_out_and_names_what_validate_would_refuse",
+        "recorded_triggers_run_but_their_names_cannot_authorize_replacements",
+        "reference_data_applies_pulls_defaults_and_refuses_rows_arriving_after_the_plan",
+        "referential_action_locks_exclude_plain_children_and_hold_partitions",
+        "referential_actions_cannot_reach_an_unapproved_trigger",
+        "rename_order_pg::saved_rename_dependencies_apply_and_record_only_surviving_objects",
+        "resolver_selection_is_lazy_and_obeys_cli_environment_project_precedence",
+        "routine_rebuilds_do_not_restore_revoked_public_execute",
+        "staged_and_resumed_writes_pin_the_session_before_the_next_statement",
+        "the_cli_ledger_preserves_history_and_distinguishes_absent_empty_and_unreadable",
+        "the_cli_probe_counts_real_null_rows_before_any_statement_and_then_accepts_clean_data",
+        "the_cli_refuses_the_second_lock_holder_and_unlock_releases_only_the_gate",
+        "the_deployment_loop_reads_constraints_before_postgres_18",
+        "the_deployment_loop_runs_end_to_end_on_postgres",
+        "the_resume_status_prints_carries_the_approval_the_gate_asks_for_again",
+        "the_write_closure_follows_writing_actions_and_stops_at_the_others",
+        "two_grantors_on_two_privileges_are_revoked_one_statement_each",
+        "unapproved_data_triggers_cannot_use_the_deployers_privileges",
+        "unrelated_routine_limitations_do_not_refuse_a_managed_table_or_overload",
+        "update_of_generated_columns_follows_their_source_columns",
+        "update_of_triggers_only_guard_columns_the_statement_can_fire"
+      ]
+    },
+    {
+      "target": [
+        "pbps-db",
+        "test",
+        "live_mssql"
+      ],
+      "owner": "mssql",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "a_server_refusal_already_carries_the_servers_own_sentence",
+        "a_session_is_named_for_this_process_unless_the_string_names_it"
+      ]
+    },
+    {
+      "target": [
+        "pbps-db",
+        "test",
+        "live_pg"
+      ],
+      "owner": "pg",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "a_connection_failure_with_no_server_error_still_renders_its_own_text",
+        "a_misspelled_columns_hint_never_reaches_the_message",
+        "a_not_null_violations_detail_never_reaches_the_message",
+        "a_server_refusal_carries_the_servers_own_sentence",
+        "a_session_is_named_for_this_process_unless_the_string_names_it",
+        "a_statement_literal_inside_a_function_never_reaches_the_message",
+        "an_exceptions_call_stack_never_reaches_the_message"
+      ]
+    },
+    {
+      "target": [
+        "pbps-db",
+        "test",
+        "live_transport"
+      ],
+      "owner": "tls",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "invalid_trust_cannot_yield_a_verified_connection",
+        "verified_round_trips_reject_wrong_peers_and_corrupted_replies"
+      ]
+    },
+    {
+      "target": [
+        "pbps-mssql",
+        "test",
+        "live"
+      ],
+      "owner": "editions",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "resolver_tests::editions611::a_real_express_target_is_an_edition_limitation_and_its_server_collation_a_mismatch"
+      ]
+    },
+    {
+      "target": [
+        "pbps-mssql",
+        "test",
+        "live"
+      ],
+      "owner": "mssql",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "a_bare_name_in_another_schema_is_not_an_edge",
+        "a_case_differing_reused_name_collides_under_the_servers_default_collation",
+        "a_cell_the_columns_collation_calls_equal_to_its_default_is_still_drift",
+        "a_child_row_that_arrives_after_the_probe_is_not_cascaded_away",
+        "a_child_this_plan_sets_to_null_is_not_counted_against_its_parents_delete",
+        "a_column_level_grant_is_seen_where_the_object_level_answer_is_zero",
+        "a_column_rename_on_a_renamed_table_still_finds_its_blocker",
+        "a_cross_schema_rename_stops_where_the_emitter_says_it_does",
+        "a_declaration_that_removes_rows_is_told_which_policy_catalog_read_its_count_needs",
+        "a_declared_key_keeps_its_spelling_when_the_engine_spells_it_differently",
+        "a_default_this_engine_fills_every_row_from_is_not_counted_as_missing",
+        "a_default_whose_new_name_is_taken_frees_its_old_one",
+        "a_deny_beats_control_and_the_readiness_check_sees_it",
+        "a_differently_cased_table_on_a_case_sensitive_database_is_not_the_ledger",
+        "a_disabled_foreign_key_neither_cascades_nor_blocks_a_delete",
+        "a_dropped_columns_name_is_free_before_the_rename_that_reuses_it",
+        "a_failed_retype_restores_the_default_it_temporarily_removed",
+        "a_failed_statement_rolls_the_whole_plan_back",
+        "a_filtered_predicate_reads_a_retyped_column_through_the_type_it_has_now",
+        "a_foreign_key_into_a_left_out_unique_index_is_left_out_too",
+        "a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target",
+        "a_fully_migrated_ledger_answers_the_timeline_without_reading_state_json",
+        "a_grant_on_a_renamed_objects_current_name_is_seen_under_the_declared_one",
+        "a_grant_on_a_schema_the_database_does_not_have_is_counted_before_it_runs",
+        "a_grant_on_a_system_object_is_reported_with_its_name_not_as_unnameable",
+        "a_granted_target_whose_name_is_reused_is_an_unconditional_gap",
+        "a_half_populated_staged_pair_is_malformed_not_silently_unstaged",
+        "a_hand_written_default_on_another_column_is_not_renamed_with_this_one",
+        "a_key_laid_out_against_its_kinds_default_is_reported_and_left_out",
+        "a_key_probe_counts_the_rows_the_plan_will_leave",
+        "a_ledger_that_cannot_be_read_is_not_an_uninitialized_one",
+        "a_lock_table_that_cannot_be_read_is_not_an_absent_one",
+        "a_login_without_alter_is_refused_by_name_on_a_pre_migration_ledger",
+        "a_login_without_alter_succeeds_on_an_already_migrated_ledger",
+        "a_malformed_timeline_row_is_refused_alone_and_the_rest_are_read",
+        "a_managed_table_under_another_spelling_is_not_asked_about_twice",
+        "a_module_applied_then_read_back_equals_what_was_declared",
+        "a_moved_table_does_not_keep_its_source_schema_managed_but_a_dropped_one_does",
+        "a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave",
+        "a_pinned_union_keeps_recorded_key_spelling_and_default_cells",
+        "a_pre_issue_103_ledger_is_migrated_in_place_and_legacy_rows_still_list_their_counts",
+        "a_project_table_the_collation_folds_onto_an_ordinary_ledger_name_is_refused",
+        "a_projected_row_from_a_newer_pbps_is_unsupported_not_ordinary_data",
+        "a_query_may_bind_two_fewer_parameters_than_the_server_names",
+        "a_recorded_module_keeps_its_schema_in_the_readiness_check_until_its_drop",
+        "a_refused_ledger_create_leaves_no_transaction_open",
+        "a_renamed_and_a_reused_name_keep_their_own_distinct_demands",
+        "a_renamed_tables_and_columns_generated_defaults_follow_them",
+        "a_retyped_column_gives_up_its_old_default_before_the_type_moves",
+        "a_reused_column_name_is_found_by_the_databases_collation",
+        "a_reused_name_collides_by_the_databases_collation_not_by_a_case_fold",
+        "a_role_granted_on_more_tables_than_one_statement_holds_is_read_whole",
+        "a_row_rewritten_after_the_plan_was_made_is_not_deleted_as_the_reviewed_one",
+        "a_row_write_across_a_retyped_column_still_holds_the_recorded_row",
+        "a_schema_scoped_grant_satisfies_the_readiness_check",
+        "a_spatial_cell_whose_srid_alone_differs_from_its_default_is_still_drift",
+        "a_staged_checkpoint_survives_the_ledger",
+        "a_table_name_needing_quoting_still_reports_what_blocks_its_rename",
+        "a_timestamp_column_cannot_be_altered_into_or_out_of",
+        "a_trigger_that_undoes_a_row_write_rolls_the_statement_back",
+        "a_type_with_no_native_equality_is_read_back_against_its_default",
+        "a_unique_index_is_probed_and_a_filtered_one_only_over_the_rows_it_keeps",
+        "a_variant_that_renders_like_its_default_is_still_drift",
+        "a_view_named_by_a_reserved_word_is_created_after_the_view_it_selects_from",
+        "an_absent_ledger_is_not_misspelt_when_null_concatenation_is_off",
+        "an_authorized_migration_connection_failure_does_not_claim_missing_rights",
+        "an_explicit_default_stays_explicit_and_a_volatile_default_is_never_run",
+        "an_expression_ending_in_a_line_comment_still_applies",
+        "an_index_whose_physical_kind_the_model_cannot_hold_is_never_adopted_as_a_plain_one",
+        "an_object_name_holding_a_dot_or_a_bracket_is_asked_about_as_named",
+        "an_unassignable_signed_default_is_unknown_not_null",
+        "an_undeclared_key_on_a_retyped_column_is_named_before_the_widening",
+        "an_unparseable_count_beside_an_unsupported_version_is_still_refused_by_version",
+        "applying_a_planned_migration_converges_on_the_target",
+        "binary_unicode_capacity_preserves_zero_padding_and_rejects_nonzero_suffixes",
+        "bootstrap_then_introspect_returns_the_declared_schema",
+        "constraint_name_validation_preserves_legal_index_sharing",
+        "constraints_share_a_schemas_namespace_with_tables_and_routines",
+        "declared_rows_need_dml_that_alter_on_the_schema_does_not_confer",
+        "declared_rows_read_back_as_declared_and_hand_edits_are_seen",
+        "doctor_reads_the_permissions_of_more_schemas_than_one_statement_can_bind",
+        "doctor_requires_alter_only_until_the_existing_ledger_is_migrated",
+        "doctor_select::a_column_deny_is_a_gap_under_an_object_grant_and_under_a_schema_grant",
+        "doctor_select::a_column_the_plan_adds_is_demanded_before_the_plan_runs",
+        "doctor_select::a_cross_schema_move_demands_the_destinations_read",
+        "doctor_select::an_undeclared_foreign_key_parent_in_a_managed_schema_is_asked_about",
+        "doctor_select::the_delete_count_demands_a_read_of_every_child_the_catalog_names",
+        "dotted_names_survive_introspection_in_keys_indexes_and_foreign_keys",
+        "estimate_tests::connected_estimates_keep_storage_and_identity_uncertainty_visible",
+        "estimate_tests::nullability_and_storage_boundaries_keep_the_measured_row_paths",
+        "estimate_tests::the_estimate_agrees_with_the_catalogues_row_update_and_scan_paths",
+        "every_explicitly_referenced_column_needs_its_grant",
+        "finite_floats_render_round_trip_and_keep_row_guards_effective",
+        "fixed_binary_growth_changes_the_payload_and_requires_approval",
+        "key_collisions_are_judged_by_the_key_column_s_own_collation",
+        "key_spelling::a_trigger_that_appends_spaces_to_the_inserted_key_rolls_back",
+        "key_spelling::a_trigger_that_appends_spaces_to_the_updated_key_rolls_back",
+        "key_spelling::a_trigger_that_respells_the_inserted_key_rolls_the_statement_back",
+        "key_spelling::a_trigger_that_respells_the_updated_key_rolls_the_statement_back",
+        "key_spelling::an_insert_refuses_keys_that_lose_declared_text",
+        "key_spelling::an_update_preserves_existing_text_key_aliases",
+        "key_spelling::an_update_refuses_a_trigger_that_rewrites_an_existing_key_alias",
+        "key_spelling::canonical_non_text_keys_and_padded_text_keys_still_accept_writes",
+        "key_spelling::exported_updates_keep_key_capture_variables_in_separate_batches",
+        "ledger_tables_their_history_and_their_views_are_not_pulled",
+        "money_reads_back_with_the_four_decimals_it_holds",
+        "narrowing_a_varbinary_source_to_sysname_is_not_falsely_blocked",
+        "narrowing_to_sysname_probes_the_alias_real_capacity",
+        "non_schema_bound_functions_defer_missing_table_resolution",
+        "numeric_capacity_requires_approval_for_overflow_and_changed_values",
+        "numeric_capacity_safe_alters_preserve_both_endpoints",
+        "object_id_resolves_a_quoted_name_and_not_the_bare_one",
+        "omitted_character_columns_do_not_request_a_bootstrap_collation",
+        "preflight_probes_count_what_the_engine_would_refuse",
+        "probes_over_a_column_this_plan_adds_run_and_count_what_the_engine_refuses",
+        "pull_reads_every_kind_of_module_back",
+        "pull_reports_the_source_default_once_when_character_columns_exist",
+        "pull_warns_about_what_it_cannot_express",
+        "recorded_last_table_keeps_its_schema_in_the_readiness_check",
+        "reference_data_reaches_the_engine_in_an_order_it_accepts",
+        "referenced_column_subsets_match_the_foreign_key_and_its_probe",
+        "referenced_key_guards_use_actual_bindings_and_prior_removals",
+        "rename_impact_finds_the_dependencies_that_block",
+        "resolver_tests::contained611::a_partially_contained_target_needs_a_server_that_allows_contained_databases",
+        "resolver_tests::recon611::a_dbo_deployer_is_reproduced_by_the_scratch_owner_itself",
+        "resolver_tests::recon611::a_grant_from_a_holder_whose_own_grant_the_deployer_cannot_see_is_reproduced",
+        "resolver_tests::recon611::a_grant_on_a_principal_is_replayed_so_the_deployer_sees_what_it_sees",
+        "resolver_tests::recon611::a_planned_principal_in_another_casing_is_granted_to_the_catalogs_principal",
+        "resolver_tests::recon611::a_schema_requested_in_another_casing_is_the_catalogs_schema",
+        "resolver_tests::recon611::scratch_reproduces_the_deployers_authorization_not_the_scratch_owners",
+        "resolver_tests::recon611::what_the_deployer_holds_through_public_is_reproduced",
+        "resolver_tests::resolver_discovery_reads_product_database_and_restricted_session_without_writes",
+        "resolver_tests::scope611::scope_facts_are_the_deployment_sessions_own_and_the_rule_names_each_difference",
+        "retyped_keys_checks_indexes_and_foreign_keys_converge_and_still_enforce",
+        "retyping_an_included_column_recreates_fks_bound_to_its_unique_index",
+        "retyping_preserves_adopted_defaults_and_leaves_absence_absent",
+        "roles_and_grants_round_trip_and_a_rename_keeps_the_members",
+        "row_security::an_invisible_referencing_key_does_not_hide_its_row_filter_from_the_guard",
+        "row_security::denying_the_security_definition_permission_hides_no_policy_and_refuses_no_safe_delete",
+        "row_security::filtered_children_refuse_preflight_and_delete_for_both_referential_actions",
+        "row_security::hidden_security_policy_metadata_is_not_treated_as_no_policy",
+        "self_reference::a_row_that_references_only_itself_can_be_deleted",
+        "self_reference::a_self_reference_to_another_unique_key_excludes_only_the_deleted_row",
+        "signed_default_arrivals_compare_the_assigned_foreign_key",
+        "signed_defaults_are_comparable_before_and_after_catalog_folding",
+        "signed_defaults_are_compared_as_the_column_stores_them",
+        "sysname_risk_matches_the_engines_length_boundary",
+        "temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables",
+        "the_ledger_created_inside_a_callers_transaction_follows_that_transaction",
+        "the_ledger_returns_exactly_what_was_recorded",
+        "the_legacy_fallback_batches_past_sql_servers_parameter_ceiling",
+        "the_lock_admits_one_holder_at_a_time",
+        "the_pull_hides_this_tools_two_tables_and_not_a_projects_own",
+        "the_pull_keeps_a_project_table_named_like_the_ledger_with_a_trailing_space",
+        "the_readiness_check_asks_for_role_permissions_only_where_a_role_is_granted",
+        "the_widest_rendered_holder_fits_the_lock_column",
+        "throwing_signed_defaults_do_not_break_explicit_row_reads",
+        "timeline_answers_a_never_migrated_ledger_without_ever_calling_ensure_tables",
+        "trailing_default_comments_preserve_insert_guards",
+        "trailing_default_comments_preserve_row_default_answers",
+        "two_columns_whose_names_join_to_one_string_both_get_their_defaults",
+        "two_pipelines_initializing_the_ledger_at_once_both_succeed",
+        "unicode_capacity_matches_alter_under_supplementary_character_collations",
+        "unicode_to_varchar_probes_character_loss",
+        "unmodelled_check_and_unique_write_behavior_is_inventoried_before_rebuild",
+        "widening_a_referenced_string_keeps_its_key_but_rebuilds_the_fk_and_filter"
+      ]
+    },
+    {
+      "target": [
+        "pbps-pg",
+        "lib",
+        "pbps_pg"
+      ],
+      "owner": "pg",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "catalog::tests::a_failed_canonical_permission_query_restores_both_transaction_scopes",
+        "resolver::binding_tests::a_body_compiled_before_a_same_named_candidate_is_unresolved",
+        "resolver::binding_tests::a_candidate_scratch_did_not_reproduce_leaves_the_surface_unresolved",
+        "resolver::binding_tests::a_cast_cannot_change_a_surface_that_resolves_no_call",
+        "resolver::binding_tests::a_clipped_array_type_name_is_read_back",
+        "resolver::binding_tests::a_common_type_the_operands_decide_is_no_named_candidate",
+        "resolver::binding_tests::a_ctes_output_types_are_no_named_candidates",
+        "resolver::binding_tests::a_dropped_overload_is_held_by_its_declared_identity_not_by_a_count",
+        "resolver::binding_tests::a_dropped_signature_is_rechecked_with_its_capture",
+        "resolver::binding_tests::a_later_array_type_does_not_shadow_a_relation",
+        "resolver::binding_tests::a_later_object_of_another_kind_is_no_candidate",
+        "resolver::binding_tests::a_later_object_outside_the_path_is_no_candidate",
+        "resolver::binding_tests::a_later_overload_is_measured_from_its_own_step",
+        "resolver::binding_tests::a_later_relations_array_type_is_a_later_name",
+        "resolver::binding_tests::a_managed_index_does_not_account_for_a_same_named_type",
+        "resolver::binding_tests::a_missing_prerequisite_or_a_cycle_refuses_the_reconstruction_by_declaration",
+        "resolver::binding_tests::a_module_naming_an_index_is_refused_for_its_oid_alias_constant",
+        "resolver::binding_tests::a_new_runtime_bound_routine_is_named_as_one",
+        "resolver::binding_tests::a_routine_no_single_argument_reaches_cannot_take_a_cast",
+        "resolver::binding_tests::a_routine_that_would_take_a_function_style_cast_is_a_candidate",
+        "resolver::binding_tests::a_schema_the_deployer_cannot_use_holds_no_candidate",
+        "resolver::binding_tests::a_set_operations_inferred_operators_are_no_named_candidates",
+        "resolver::binding_tests::a_shared_identity_the_target_did_not_get_from_a_managed_object_is_unresolved",
+        "resolver::binding_tests::a_type_can_take_a_call_that_defaults_reduce_to_one_argument",
+        "resolver::binding_tests::a_type_cannot_take_a_call_that_is_not_a_cast",
+        "resolver::binding_tests::a_type_that_would_take_a_routine_call_is_a_candidate",
+        "resolver::binding_tests::an_object_a_declaration_creates_is_reproduced_with_it",
+        "resolver::binding_tests::an_operators_implementation_is_no_named_candidate",
+        "resolver::binding_tests::an_sql_value_functions_type_is_no_named_candidate",
+        "resolver::binding_tests::an_unreadable_dropped_signature_is_refused_not_absent",
+        "resolver::binding_tests::an_unrelated_arriving_routine_leaves_a_view_and_a_capturing_one_rebuilds_it",
+        "resolver::binding_tests::bindings_compare_logical_names_never_object_numbers",
+        "resolver::binding_tests::candidates_earlier_on_the_path_capture_and_other_overloads_and_qualified_names_do_not",
+        "resolver::binding_tests::every_covered_expression_surface_gets_the_engines_answer",
+        "resolver::binding_tests::the_observed_historical_binding_is_compared_not_a_fresh_bootstrap_of_the_old_source",
+        "resolver::capture::baseline::tests::a_captured_baseline_requires_the_complete_ordinary_ledger_recipe",
+        "resolver::capture::read::coverage_tests::a_large_constant_does_not_refuse_a_supported_stored_expression",
+        "resolver::capture::read::coverage_tests::inherited_row_coercions_keep_parent_type_and_field_bindings",
+        "resolver::capture::read::expression_tests::composite_expression_results_keep_the_selected_field_owner",
+        "resolver::capture::read::expression_tests::xml_constructors_keep_named_and_positional_routine_bindings",
+        "resolver::capture::read::large_tests::a_small_scope_is_not_refused_by_an_unrelated_large_catalog",
+        "resolver::capture::read::merge_scalar_tests::builtin_scalar_constants_use_qualified_output_handlers",
+        "resolver::capture::read::merge_scalar_tests::merge_actions_keep_qualification_and_assignment_bindings",
+        "resolver::capture::read::range_tests::cte_search_cycle_and_xmltable_retain_their_complete_bindings",
+        "resolver::capture::read::range_tests::derived_whole_rows_keep_output_shape_and_underlying_bindings",
+        "resolver::capture::read::role_tests::public_role_changes_after_the_snapshot_refuse_without_authentication_catalog_access",
+        "resolver::capture::read::stored_tests::composite_assignments_retain_written_fields_and_child_bindings",
+        "resolver::capture::read::stored_tests::ranges_and_multiranges_qualify_complete_nested_output_paths",
+        "resolver::capture::read::stored_tests::sql_json_surfaces_retain_return_types_and_all_child_bindings",
+        "resolver::capture::read::subscripting_tests::subscripting_captures_elements_slices_assignments_and_composite_fields",
+        "resolver::capture::read::tests::owned_capture_rejects_mixed_rendering_and_restores_its_session",
+        "resolver::capture::tests::coherent_inputs_pin_properties_membership_and_actual_bindings"
+      ]
+    },
+    {
+      "target": [
+        "pbps-pg",
+        "test",
+        "live"
+      ],
+      "owner": "pg",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "a_backfilled_literal_is_compared_through_its_columns_type",
+        "a_backslash_and_a_bytea_mean_one_thing_under_either_string_setting",
+        "a_bare_name_in_another_schema_is_not_an_edge",
+        "a_bare_name_in_both_namespaces_grants_in_the_one_its_permissions_name",
+        "a_bare_name_means_the_first_schema_of_the_path_that_has_it",
+        "a_bodys_dollar_tags_are_not_the_name_of_a_module",
+        "a_bodys_trailing_non_ascii_byte_reaches_the_engine",
+        "a_caller_only_a_name_scan_can_see_is_reported_and_the_engine_never_saw_it",
+        "a_cell_a_collation_calls_equal_to_its_default_is_still_drift",
+        "a_cell_left_to_a_default_is_compared_as_the_column_stores_it",
+        "a_change_that_rebuilds_nothing_may_still_read_every_row",
+        "a_change_the_dialect_calls_safe_neither_fails_nor_alters_a_value",
+        "a_check_probe_over_values_a_conversion_replaces_would_refuse_a_valid_plan",
+        "a_check_the_engine_may_prove_the_column_from_takes_the_scan_back_to_unknown",
+        "a_child_collated_differently_from_its_parent_is_still_counted",
+        "a_child_left_to_a_null_default_is_not_counted_against_its_parents_delete",
+        "a_child_row_that_arrives_after_the_probe_is_not_cascaded_away",
+        "a_child_this_plan_creates_arrives_on_the_parent_before_its_key_exists",
+        "a_child_this_plan_sets_to_null_is_not_counted_against_its_parents_delete",
+        "a_column_grant_covering_exactly_the_keys_columns_reports_no_gap",
+        "a_column_grant_that_covers_the_count_is_enough_to_count",
+        "a_column_the_catalog_does_not_have_is_not_a_rename_that_breaks_nothing",
+        "a_constraint_dropped_between_the_scan_and_the_deparse_says_the_catalog_moved",
+        "a_contended_lock_inside_a_transaction_names_its_holder_and_leaves_it_alive",
+        "a_conversion_to_text_renders_under_the_framings_settings_and_not_the_operators",
+        "a_created_table_with_a_foreign_key_reads_back_as_declared",
+        "a_data_table_with_columns_named_like_the_row_blocks_variables_is_written",
+        "a_date_the_engine_carries_across_is_not_counted_out_of_range",
+        "a_declared_argument_and_the_identity_the_engine_writes_are_one_key",
+        "a_declared_expression_that_ends_in_a_comment_still_runs",
+        "a_declared_role_the_cluster_lacks_is_named_with_the_create_role_to_run",
+        "a_declared_schema_is_spelled_as_declared_or_is_not_there",
+        "a_default_cast_from_null_is_the_null_the_row_is_left_to",
+        "a_default_spelled_as_a_number_in_any_base_is_the_constant_it_is",
+        "a_default_spelled_as_an_escape_string_is_the_literal_it_is",
+        "a_default_this_engine_fills_every_row_from_is_not_counted_as_missing",
+        "a_default_whose_value_the_session_decides_is_refused_and_the_resolved_one_is_not",
+        "a_default_written_for_the_new_type_is_set_after_the_type_is",
+        "a_denied_legacy_row_leaves_the_callers_transaction_usable",
+        "a_drop_role_blocked_from_another_database_is_reported_with_that_database_named",
+        "a_dropped_column_keeps_its_slot_and_its_type_is_not_readable",
+        "a_dropped_columns_name_is_free_before_the_rename_that_reuses_it",
+        "a_dropped_connection_times_out_rather_than_reading_as_a_typo",
+        "a_float_on_the_boundary_is_judged_as_the_engine_judges_it",
+        "a_foreign_key_into_a_partitioned_table_asks_for_the_grants_that_key_needs",
+        "a_foreign_key_onto_an_ordinary_ledger_table_refuses_prune_and_unlock",
+        "a_foreign_key_this_plan_adds_is_counted_before_the_delete_that_would_break_it",
+        "a_foreign_key_this_plan_adds_on_a_column_it_narrows_is_not_counted_through_a_raising_cast",
+        "a_foreign_key_this_plan_adds_on_a_narrowing_pair_still_counts_a_row_whose_value_fits",
+        "a_foreign_keys_width_is_the_servers_answer_and_it_answers_before_looking_for_a_key",
+        "a_fully_migrated_ledger_answers_the_timeline_without_reading_state_json",
+        "a_generated_fallback_is_the_one_the_engine_uses_and_order_decides_it",
+        "a_grant_in_the_public_schema_reaches_the_table_with_no_schema_grant",
+        "a_grant_on_something_the_declarations_cannot_name_is_reported_not_lost",
+        "a_grant_on_what_the_pull_cannot_carry_is_reported_rather_than_recorded",
+        "a_grant_without_usage_on_the_schema_reaches_nothing",
+        "a_half_populated_staged_pair_is_malformed_not_silently_unstaged",
+        "a_hand_edited_row_is_seen_and_the_update_holds_what_the_plan_recorded",
+        "a_json_cell_at_its_default_is_told_from_a_hand_edited_one",
+        "a_key_between_two_created_tables_is_compared_as_the_engine_compares_it",
+        "a_key_given_up_leaves_before_its_column_is_relaxed",
+        "a_key_into_a_column_this_plan_adds_to_the_parent_counts_against_its_backfill",
+        "a_key_into_a_created_empty_parent_counts_every_reference_the_child_holds",
+        "a_key_is_replaced_around_the_columns_both_of_its_shapes_name",
+        "a_key_this_plan_adds_on_a_column_it_adds_counts_the_backfilled_rows",
+        "a_key_this_plan_adds_on_a_column_it_retypes_compares_the_converted_values",
+        "a_key_whose_delete_action_is_switched_off_is_not_counted",
+        "a_least_privilege_role_can_read_the_roles_the_acls_and_the_drop_blockers",
+        "a_ledger_lacking_one_timeline_column_is_migrated_before_the_record",
+        "a_ledger_never_initialized_an_empty_one_and_an_unreachable_database_stay_three_answers",
+        "a_ledger_pbps_did_not_create_is_refused_before_any_write",
+        "a_ledger_this_role_may_not_read_is_not_an_uninitialized_one",
+        "a_ledger_whose_schema_is_closed_is_a_gap_however_the_tables_are_granted",
+        "a_length_probe_agrees_with_the_engine_for_every_rendering_the_pins_decide",
+        "a_length_probe_is_measured_in_the_session_the_statement_will_run_in",
+        "a_literals_prefix_and_a_non_ascii_byte_are_not_names_the_order_is_decided_by",
+        "a_live_server_answers_through_the_shared_connection_type",
+        "a_malformed_connection_string_is_not_reported_as_a_network_failure",
+        "a_malformed_timeline_row_is_refused_alone_and_the_rest_are_read",
+        "a_managed_schema_that_is_absent_is_reported_as_absent_and_not_as_a_gap",
+        "a_migration_that_renames_widens_retypes_and_drops_converges",
+        "a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it",
+        "a_module_dropped_between_the_scan_and_the_deparse_says_the_catalog_moved",
+        "a_module_of_every_kind_survives_the_round_trip_as_the_same_object",
+        "a_module_shaped_object_the_model_does_not_hold_is_named_and_the_pull_still_runs",
+        "a_name_collision_that_is_not_the_ledger_is_not_reported_as_a_ledger",
+        "a_name_inside_an_escape_string_does_not_order_the_view_that_holds_it",
+        "a_narrowed_parent_column_is_probed_without_raising_on_either_alias",
+        "a_null_acl_is_the_engines_default_and_is_reported_rather_than_compared",
+        "a_null_an_update_leaves_alone_decides_for_a_key_this_plan_adds_too",
+        "a_null_an_update_leaves_alone_is_a_null_of_the_tuple_it_writes",
+        "a_null_default_is_one_this_engine_does_not_keep",
+        "a_nullable_primary_key_column_is_refused_because_this_engine_would_not",
+        "a_parent_whose_referenced_columns_the_session_cannot_read_refuses_the_delete",
+        "a_plan_that_supplies_the_parent_row_first_is_not_refused_for_its_absence",
+        "a_planned_key_across_collations_is_counted_under_the_referenced_collation",
+        "a_planned_key_on_unchanged_columns_sees_the_survivor_too",
+        "a_policy_on_a_partition_does_not_refuse_a_delete_counted_through_its_parent",
+        "a_pre_issue_103_ledger_is_migrated_in_place_and_legacy_rows_still_list_their_counts",
+        "a_projected_row_from_a_newer_pbps_is_unsupported_not_ordinary_data",
+        "a_pull_inside_the_callers_own_transaction_is_refused",
+        "a_query_may_bind_the_most_parameters_the_extended_protocol_represents",
+        "a_quote_inside_a_name_is_read_as_part_of_it",
+        "a_read_back_inside_the_callers_transaction_sees_its_uncommitted_build",
+        "a_read_back_outside_a_transaction_is_refused_not_answered",
+        "a_reason_at_the_columns_width_is_stored_whole_and_one_more_is_refused",
+        "a_rebuilds_schema_cannot_be_renamed_out_from_under_the_name_its_drop_uses",
+        "a_recorded_time_reads_the_same_under_a_session_that_renders_dates_differently",
+        "a_referencing_relation_is_counted_only_where_its_key_reaches",
+        "a_referencing_row_the_session_cannot_see_refuses_the_delete",
+        "a_referencing_table_in_a_schema_the_session_cannot_use_refuses_the_delete",
+        "a_referencing_table_the_session_cannot_read_refuses_the_delete",
+        "a_refused_socket_names_the_address_it_could_not_reach",
+        "a_rename_across_schemas_is_two_statements_that_each_say_where_the_table_went",
+        "a_rename_is_carried_into_what_the_catalog_holds_and_not_into_a_text_body",
+        "a_rename_is_evidence_only_when_the_old_name_is_gone_from_the_cluster",
+        "a_retyped_survivor_that_holds_the_converted_value_is_a_survivor",
+        "a_role_that_may_write_the_ledger_and_not_create_it_deploys",
+        "a_role_without_ownership_is_refused_by_name_on_a_pre_migration_ledger",
+        "a_role_without_ownership_succeeds_on_an_already_migrated_ledger",
+        "a_routine_body_naming_an_unquoted_column_in_another_case_is_found",
+        "a_routine_grant_is_read_back_by_signature_whatever_spelling_granted_it",
+        "a_routine_replaced_before_its_row_lock_is_refused_rather_than_serialized",
+        "a_routine_that_takes_or_returns_the_views_row_type_is_a_dependent_of_the_view",
+        "a_row_arriving_against_an_unprobeable_parent_backfill_is_refused",
+        "a_row_key_holding_a_nul_is_refused_by_this_engine_and_is_not_exempt_offline",
+        "a_row_spelling_a_value_over_a_null_backfill_is_refused_on_its_own_tuple",
+        "a_row_that_references_only_itself_can_be_deleted",
+        "a_row_type_of_the_ledgers_name_without_the_table_is_still_refused",
+        "a_row_updated_to_a_null_beside_an_unprobeable_default_leaves_the_count",
+        "a_rule_on_the_view_is_named_and_refused_because_the_rebuild_would_lose_it",
+        "a_schema_a_broken_pattern_would_swallow_is_in_the_pull",
+        "a_serial_column_reads_back_as_an_integer_with_a_sequence_it_owns",
+        "a_session_setting_left_behind_cannot_answer_the_transaction_probe",
+        "a_session_the_connection_string_excludes_is_refused",
+        "a_shadow_this_plan_introduces_rebuilds_the_module_in_the_same_plan",
+        "a_shape_the_measurements_never_covered_is_not_answered_from_them",
+        "a_smaller_connect_timeout_gives_up_sooner_than_the_ceiling",
+        "a_staged_checkpoint_survives_the_ledger",
+        "a_stored_row_holding_null_in_the_key_is_not_refused_for_a_backfill_it_never_meets",
+        "a_surviving_parent_row_is_the_row_this_plan_leaves_there",
+        "a_table_already_there_gains_a_column_a_key_a_unique_an_index_and_a_foreign_key",
+        "a_table_built_by_hand_reads_back_field_by_field",
+        "a_table_the_catalog_does_not_have_is_not_a_rename_that_breaks_nothing",
+        "a_table_this_plan_creates_is_not_reported_as_missing",
+        "a_temporal_precision_change_is_estimated_as_the_engine_rebuilds_it",
+        "a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_named",
+        "a_trigger_that_respells_the_written_key_rolls_the_statement_back",
+        "a_trigger_that_undoes_a_row_write_rolls_the_statement_back",
+        "a_triggers_on_clause_is_what_decides_where_it_lands",
+        "a_triggers_parent_replaced_while_its_lock_queued_is_refused_rather_than_serialized",
+        "a_type_change_that_the_session_would_decide_is_refused_by_name",
+        "a_type_change_that_would_need_a_using_clause_is_refused_by_name",
+        "a_type_name_ending_in_a_prefix_letter_is_not_a_literals_prefix",
+        "a_typed_null_backfill_is_a_null_beside_an_unprobeable_one",
+        "a_uescape_clause_does_not_order_the_view_that_holds_it",
+        "a_value_a_cast_would_truncate_is_one_the_alter_refuses",
+        "a_value_the_engine_spells_differently_is_refused_before_it_is_written",
+        "a_view_named_by_a_reserved_word_is_created_after_the_view_it_selects_from",
+        "a_view_named_by_a_unicode_escape_is_created_after_the_view_it_names",
+        "a_view_occupying_the_ledgers_name_is_named_and_never_written_to",
+        "a_view_over_an_array_of_a_routine_is_created_after_the_routine",
+        "a_view_replaced_while_its_lock_queued_is_refused_rather_than_serialized",
+        "a_write_to_a_default_no_probe_can_evaluate_is_refused_where_a_key_spans_it",
+        "an_account_that_cannot_lock_a_routine_says_so_and_the_reads_after_it_still_run",
+        "an_account_that_cannot_pin_a_schema_says_which_half_is_held",
+        "an_authorized_migration_connection_failure_does_not_claim_missing_rights",
+        "an_entry_from_a_newer_build_is_refused_by_its_version_and_still_appears_in_the_timeline",
+        "an_escape_strings_prefix_carries_to_its_continued_pieces",
+        "an_estimate_for_a_renamed_table_is_measured_against_the_one_that_exists",
+        "an_exact_decimal_that_a_float_cannot_hold_is_not_a_safe_change",
+        "an_expected_failure_leaves_the_callers_transaction_where_it_found_it",
+        "an_identity_column_this_plan_adds_is_a_backfill_no_probe_can_evaluate",
+        "an_identity_keyed_data_block_is_refused_and_the_hazard_is_measured",
+        "an_inheriting_table_is_neither_read_nor_pruned_as_the_ledger",
+        "an_insert_leaving_a_key_column_to_an_identity_is_refused",
+        "an_inserted_survivor_and_an_arriving_child_meet_through_the_columns_type",
+        "an_inserted_survivor_meets_an_arriving_child_under_the_referenced_collation",
+        "an_interval_precision_the_engine_would_quietly_reduce_is_refused",
+        "an_isolated_read_back_cannot_inherit_a_neighbours_stale_catalog_rows",
+        "an_omitted_cell_with_no_default_is_a_null_the_probe_knows",
+        "an_online_index_is_built_concurrently_and_says_it_leaves_the_transaction",
+        "an_orphan_is_counted_under_the_referenced_columns_own_collation",
+        "an_owner_trigger_permission_failure_does_not_claim_missing_ownership",
+        "an_owner_with_select_on_every_column_has_no_managed_table_gap",
+        "an_unnamed_primary_key_is_dropped_by_the_name_the_catalog_holds",
+        "an_unparseable_count_beside_an_unsupported_version_is_still_refused_by_version",
+        "an_unprobeable_default_beside_a_null_in_the_same_key_refuses_nothing",
+        "an_unqualified_name_in_a_declared_expression_binds_through_the_write_path",
+        "concurrent_build_recovery_preserves_existing_objects_and_quotes_its_own_artifact",
+        "constraint_name_validation_preserves_legal_index_sharing",
+        "continued_routine_bodies_create_the_callee_first_and_ignore_string_data",
+        "declared_rows_reach_the_engine_and_read_back_as_declared",
+        "default_privileges_cover_only_the_objects_the_named_role_creates",
+        "doctor_adopted_acl_scope_matches_the_differ_and_keeps_recorded_targets",
+        "doctor_adopted_revoke_requires_the_original_grantor",
+        "doctor_asks_a_pending_drops_schema_for_usage",
+        "doctor_data_column_acl_follows_recorded_identity_not_a_reused_name",
+        "doctor_data_future_tables_use_current_role_global_and_schema_defaults",
+        "doctor_data_grant_targets_resolve_the_same_pending_table_identity",
+        "doctor_data_insert_demands_only_the_union_of_explicit_cells",
+        "doctor_data_table_acl_follows_recorded_identity_and_retains_missing_objects",
+        "doctor_grant_authority_preserves_overloads_and_inherited_rights",
+        "doctor_reads_a_real_version_and_a_permission_set_ownership_decides",
+        "doctor_reports_absent_external_schema_grant_targets_before_authority",
+        "doctor_reports_an_absent_recorded_managed_table",
+        "doctor_reports_an_absent_recorded_table_when_only_its_tombstone_remains",
+        "doctor_reports_an_absent_target_of_a_recorded_only_grant",
+        "doctor_reports_maintain_on_an_old_server_for_a_reused_table_name",
+        "doctor_requires_ownership_only_until_the_existing_ledger_is_migrated",
+        "doctor_routine_grants_use_canonical_types_and_restore_the_search_path",
+        "drop_blockers_follow_prior_renames_and_refuse_missing_existing_targets",
+        "drop_blockers_keep_row_type_domain_rule_and_unenumerated_catalog_paths",
+        "drop_blockers_predict_restrict_and_allow_earlier_removal_and_automatic_parts",
+        "each_kind_says_what_serialized_its_read_or_that_nothing_did",
+        "empty_routine_acls_still_report_revoked_public_execute",
+        "estimate_provenance_does_not_measure_a_vacated_names_old_identity",
+        "estimate_provenance_follows_renamed_columns_for_indexes_and_checks",
+        "every_catalog_keyed_by_an_object_is_read",
+        "every_catalog_that_holds_a_grant_is_read",
+        "every_grant_the_emitter_writes_is_one_this_engine_runs",
+        "every_kind_of_dependent_blocks_the_rebuild_and_the_refusal_names_it",
+        "every_spelling_the_catalogue_admits_reads_back_as_the_dialect_says",
+        "groups_sharing_a_fallback_push_the_later_group_past_it",
+        "handled_ledger_failures_release_their_savepoint",
+        "impact_lexer_distinguishes_a_reserved_word_from_its_qualified_name",
+        "impact_lexer_ignores_literal_and_comment_contents",
+        "impact_lexer_keeps_longer_quoted_identifiers_whole",
+        "impact_lexer_keeps_the_engine_spelling_of_embedded_quotes",
+        "index_expressions_and_predicates_keep_unmeasured_costs_unknown",
+        "installed_default_operator_classes_can_make_json_keys_valid",
+        "integer_narrowing_conversion_probes_match_both_engine_boundaries",
+        "integer_narrowing_key_probes_exclude_overflow_but_keep_fitting_orphans",
+        "isolated_pulls_and_read_backs_survive_continuous_foreign_ddl",
+        "maintain_is_taken_at_seventeen_and_up_and_refused_below_it",
+        "narrowing_projection_counts_rounding_collisions_without_losing_nulls",
+        "narrowing_projection_keeps_added_foreign_key_checks_for_fitting_rows",
+        "narrowing_projection_keeps_inserted_and_updated_rows_in_composite_keys",
+        "native_routine_symbols_do_not_report_callers_or_trigger_rebuilds",
+        "non_ascii_identifier_edits_plan_and_apply_a_module_change",
+        "nondefault_public_grants_are_reported_without_reporting_materialized_defaults",
+        "nullability_estimates_use_only_checks_surviving_to_the_statement",
+        "nullability_folded_into_widening_keeps_unparsed_check_uncertainty",
+        "nulls_are_distinct_under_this_engines_unique_and_the_count_says_so",
+        "planned_key_collation_guards_match_the_engine_for_every_collation_pair",
+        "planned_key_collation_guards_use_renamed_added_created_and_retyped_columns",
+        "preflight_probes_count_the_rows_this_engine_would_refuse",
+        "prune_and_unlock_refuse_an_untrusted_ledger_before_their_delete",
+        "quiet_ledger_rewinds_restore_the_callers_same_named_savepoint",
+        "quoted_routine_bodies_report_calls_but_not_their_string_data",
+        "referenced_key_guards_use_actual_bindings_and_prior_removals",
+        "relation_name_occupants_name_each_kind_and_its_owner",
+        "rename_order_tests::rename_dependencies_execute_with_their_statement_time_names",
+        "resolver_tests::auth610::an_in_scope_schema_the_deployer_cannot_see_refuses_rather_than_reading_empty",
+        "resolver_tests::auth610::the_deployers_authorization_is_the_engines_own_answers_not_the_admins",
+        "resolver_tests::auth688::role_defaults_are_the_logins_not_the_effective_roles_after_set_role",
+        "resolver_tests::recon610::scratch_reproduces_the_deployers_authorization_not_the_admins",
+        "resolver_tests::recon610_public::scratch_reproduces_the_template_public_and_refuses_an_impossible_grant",
+        "resolver_tests::recon610_super::a_superuser_deployer_on_the_default_database_reproduces_public_owner",
+        "resolver_tests::resolver_discovery_observes_both_catalog_versions_without_writes_or_qualification",
+        "resolver_tests::scope610::a_schema_name_is_one_visibility_element_whatever_it_contains",
+        "resolver_tests::scope610::scope_facts_end_their_snapshot_whether_the_read_completes_or_is_refused",
+        "resolver_tests::scope610::scope_facts_read_the_deployers_own_visibility_and_leave_the_session_untouched",
+        "resolver_tests::scope610::the_rule_refuses_version_and_collation_differences_between_real_servers_and_verifies_a_matching_side",
+        "routine_lock_timeouts_are_errors_and_leave_the_callers_transaction_usable",
+        "structural_declarations_and_the_engine_agree_on_refusals_and_legal_repetitions",
+        "temporal_modifiers_keep_the_engine_bounds_and_do_not_shorten_the_calendar",
+        "temporary_relations_and_types_follow_the_declared_write_path",
+        "the_database_owner_is_no_exception_to_the_ledger_editor_rule",
+        "the_engine_and_the_dialect_agree_on_what_a_name_becomes",
+        "the_engine_and_the_dialect_agree_on_what_can_carry_an_identity",
+        "the_engine_and_the_dialect_agree_on_which_type_changes_are_impossible",
+        "the_engine_and_the_scanner_agree_on_what_is_data_in_a_definition",
+        "the_estimate_says_what_the_engine_does_about_rebuilding_the_table",
+        "the_framing_pins_the_settings_that_decide_what_a_definition_means",
+        "the_framing_pins_what_an_ambiguous_temporal_literal_means",
+        "the_generated_relation_names_are_the_ones_the_engine_uses",
+        "the_identity_a_routine_body_creates_is_the_key_the_gate_accepts_it_under",
+        "the_ledger_is_created_on_heap_whatever_the_default_access_method",
+        "the_ledger_names_are_hidden_only_for_tables_in_its_schema",
+        "the_ledger_returns_exactly_what_was_recorded",
+        "the_legacy_fallback_batches_past_postgresqls_parameter_ceiling",
+        "the_lock_admits_one_holder_and_names_it_to_the_second",
+        "the_lock_each_statement_takes_is_the_one_the_estimate_names",
+        "the_loser_of_the_creation_race_keeps_the_transaction_it_was_called_in",
+        "the_owners_own_entry_in_a_touched_acl_is_not_read_as_an_unnameable_grant",
+        "the_plan_straight_after_a_bootstrap_is_empty",
+        "the_pre_delete_probe_counts_a_foreign_key_this_engine_never_stopped_enforcing",
+        "the_pull_does_not_move_when_the_sessions_search_path_does",
+        "the_pull_keeps_project_ledger_names_beside_the_real_ledger",
+        "the_read_back_savepoint_is_read_only_and_gives_the_transaction_back_writable",
+        "the_schemas_the_reader_skips_are_the_ones_a_declaration_may_not_name",
+        "the_settings_a_staged_run_depends_on_reach_a_connection_that_opens_no_transaction",
+        "timeline_answers_a_never_migrated_ledger_without_ever_calling_ensure_tables",
+        "timestamp_precision_narrowing_rounds_past_the_upper_bound_without_refusing",
+        "two_entries_recorded_in_one_transaction_carry_the_times_they_were_written",
+        "two_keys_a_collation_calls_one_row_are_found_by_the_engine_and_not_offline",
+        "two_overloads_of_one_name_are_two_objects_and_each_drop_names_one",
+        "two_pipelines_creating_the_ledger_at_once_both_find_it_there",
+        "two_real_ledger_tables_still_pass_the_relkind_confirmation",
+        "views_with_nondefault_options_are_named_and_default_options_stay_plain",
+        "what_the_model_cannot_hold_is_named_and_never_silently_dropped"
+      ]
+    }
+  ]
+}

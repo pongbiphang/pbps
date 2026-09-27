@@ -188,6 +188,8 @@ binary serves embedded assets and does not invoke it.
 
 Linux is the primary development and release target; Windows coverage comes from
 the CI matrix.
+Ignored tests have a [checked execution inventory](docs/TEST-EXECUTION.md); every
+case names the CI runner or nested fixture responsible for executing it.
 
 ```bash
 cargo test --workspace
