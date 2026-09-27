@@ -434,3 +434,124 @@ fn a_delayed_child_rename_does_not_lose_its_foreign_key_drop_dependency() {
         .unwrap();
     assert!(rename < drop, "the drop uses the child's approved new name");
 }
+
+#[test]
+fn deprecation_does_not_rebuild_unchanged_column_dependents() {
+    use pbps_model::resolver::Binding;
+    use pbps_model::{IdsFile, Module, ModuleKind};
+    let mut base = tables();
+    let input: pbps_model::ColumnRef = "app.a.id".parse().unwrap();
+    for (name, kind) in [
+        ("app.v", ModuleKind::View),
+        ("app.f()", ModuleKind::Function),
+    ] {
+        base.modules.insert(
+            name.parse().unwrap(),
+            Module {
+                kind,
+                description: None,
+                definition: "fixture supplied by engine".into(),
+            },
+        );
+    }
+    let identities = ids(&base, &IdsFile::default());
+    let observations: Vec<_> = base
+        .modules
+        .keys()
+        .map(|id| {
+            let mut o = observation(
+                Surface::Module(id.clone()),
+                BTreeSet::from([Surface::Column(input.clone())]),
+            );
+            o.desired.as_mut().unwrap().bindings.push(Binding {
+                node: "column".into(),
+                path: vec!["input".into()],
+                target: identity("original"),
+            });
+            o.current = o.desired.clone();
+            o
+        })
+        .collect();
+    for (from, to) in [
+        (None, Some("old API")),
+        (Some("old API"), Some("use new API")),
+        (Some("old API"), None),
+    ] {
+        base.tables
+            .get_mut(&input.table)
+            .unwrap()
+            .columns
+            .get_mut(&input.name)
+            .unwrap()
+            .deprecated = from.map(str::to_owned);
+        let mut desired = base.clone();
+        desired
+            .tables
+            .get_mut(&input.table)
+            .unwrap()
+            .columns
+            .get_mut(&input.name)
+            .unwrap()
+            .deprecated = to.map(str::to_owned);
+        let old = crate::Side {
+            schema: &base,
+            ids: &identities,
+        };
+        let wanted = crate::Side {
+            schema: &desired,
+            ids: &identities,
+        };
+        let hints = Default::default();
+        let ordinary = crate::diff(old, wanted, &pbps_dialect::MinimalDialect, &hints).unwrap();
+        assert!(
+            matches!(&ordinary.changes[..], [p] if matches!(p.change, Change::SetColumnDeprecated { .. }))
+        );
+        let resolved = plan(
+            old,
+            wanted,
+            &hints,
+            &observations,
+            &pbps_dialect::MinimalDialect,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.changes, ordinary,
+            "metadata must not invent a dependent rebuild"
+        );
+        resolved.proof.validate(&resolved.changes).unwrap();
+        // The metadata exemption must not hide an independently observed binding change.
+        let mut rebound = observations.clone();
+        rebound[0].desired.as_mut().unwrap().bindings[0].target = identity("replacement");
+        let resolved = plan(old, wanted, &hints, &rebound, &pbps_dialect::MinimalDialect).unwrap();
+        assert!(resolved.changes.changes.iter().any(|p| {
+            matches!(&rebound[0].surface, Surface::Module(id) if p.change.module_id() == Some(id))
+        }));
+        // A real column type change still invalidates dependents even if the logical binding stays.
+        desired
+            .tables
+            .get_mut(&input.table)
+            .unwrap()
+            .columns
+            .get_mut(&input.name)
+            .unwrap()
+            .ty = "bigint".parse().unwrap();
+        let resolved = plan(
+            old,
+            crate::Side {
+                schema: &desired,
+                ids: &identities,
+            },
+            &hints,
+            &observations,
+            &pbps_dialect::MinimalDialect,
+        )
+        .unwrap();
+        assert!(
+            resolved
+                .changes
+                .changes
+                .iter()
+                .any(|p| p.change.module_id().is_some())
+        );
+    }
+}

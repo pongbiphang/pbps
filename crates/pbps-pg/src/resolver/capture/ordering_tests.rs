@@ -132,8 +132,11 @@ fn observed(captured: &CapturedInputs) -> BTreeMap<Surface, BoundSurface> {
                             &b.target.name[0],
                             &b.target.name[1],
                         )))
-                    } else if b.target.class == "pg_attribute"
+                    } else if b.target.class == "column"
                         && (b.target.name == ["id"] || b.target.name == ["n"])
+                        && b.target.signature.first().is_some_and(|owner| {
+                            owner.name == ["app", "t"] || owner.name == ["app", "u"]
+                        })
                     {
                         Some(Surface::Column(table.column(&b.target.name[0])))
                     } else if b.target.class == "pg_proc" && b.target.name == ["app", "f"] {

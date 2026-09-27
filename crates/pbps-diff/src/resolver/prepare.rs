@@ -131,7 +131,13 @@ pub(super) fn invalidates(change: &Change, surface: &Surface) -> bool {
             matches!(change, Change::DropTable { name, .. } if name == table)
                 || matches!(change, Change::RenameTable { from, .. } if from == table)
         }
-        Surface::Column(column) => change.columns_redefined().iter().any(|(r, _)| r == column),
+        // Definition comparisons also name declaration-only metadata. It emits
+        // no DDL, so dropping a bound view/routine would invent a dependency
+        // failure on a plan that needs no catalog change (SPEC §7.6).
+        Surface::Column(column) => change
+            .columns_redefined()
+            .iter()
+            .any(|(r, field)| r == column && *field != pbps_model::ColumnField::Deprecated),
         Surface::Default(column) => {
             matches!(change, Change::AlterColumnDefault { column: r, from: Some(_), .. } if r == column)
         }

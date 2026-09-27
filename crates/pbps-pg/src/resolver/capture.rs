@@ -226,3 +226,6 @@ pub use native_inputs::{
 
 #[cfg(test)]
 mod ordering_tests;
+
+#[cfg(test)]
+mod metadata_tests;
