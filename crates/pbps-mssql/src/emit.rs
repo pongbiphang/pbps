@@ -156,6 +156,25 @@ fn ends_like_a_digest(name: &str) -> bool {
 /// [`quote`] refuses outright, so no name can contain one and no two different
 /// triples can spell the same seed.
 pub fn digested_default_constraint_name(table: &TableName, column: &str) -> String {
+    salted_default_constraint_name(table, column, None)
+}
+
+/// The name a rename moves a generated default to when the name
+/// [`default_constraint_name`] gives it is taken (DEC-981.1): the digested
+/// one, unless that *is* the generated name — a table name with `_`, or one
+/// too long to keep — in which case a digest seeded with one more part, so
+/// it is a different name all the same.
+pub fn fallback_default_constraint_name(table: &TableName, column: &str) -> String {
+    let digested = digested_default_constraint_name(table, column);
+    if digested != default_constraint_name(table, column) {
+        return digested;
+    }
+    salted_default_constraint_name(table, column, Some(b"fallback"))
+}
+
+/// [`digested_default_constraint_name`], with `salt` as a fourth part of the
+/// seed when given. `None` is the generated digest, unchanged.
+fn salted_default_constraint_name(table: &TableName, column: &str, salt: Option<&[u8]>) -> String {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
@@ -164,6 +183,10 @@ pub fn digested_default_constraint_name(table: &TableName, column: &str) -> Stri
     hasher.update(table.name.as_bytes());
     hasher.update([0]);
     hasher.update(column.as_bytes());
+    if let Some(salt) = salt {
+        hasher.update([0]);
+        hasher.update(salt);
+    }
     let digest = hasher.finalize();
     let digest: String = digest
         .iter()
@@ -478,7 +501,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
                 literal(to)
             );
             let new = default_constraint_name(table, to);
-            let fallback = digested_default_constraint_name(table, to);
+            let fallback = fallback_default_constraint_name(table, to);
             let olds = std::iter::once(table)
                 .chain(table_was)
                 .flat_map(|t| generated_default_names(t, from));
@@ -1630,18 +1653,15 @@ fn rename_generated_default(
 }
 
 /// The names `pbps` may have left a column's default under: the one it
-/// generates, and the digested one a rename falls back to when that is taken
-/// (DEC-981.1). A later rename looks under both, so a default parked at its
+/// generates, and the fallback a rename moves it to when that is taken
+/// (DEC-981.1). Always two different names. A later rename looks under both, so a default parked at its
 /// fallback still follows its table and column. Public so the connected
 /// plan's namespace walk (`pbps-cli`) moves defaults exactly as this emits.
 pub fn generated_default_names(table: &TableName, column: &str) -> Vec<String> {
-    let generated = default_constraint_name(table, column);
-    let digested = digested_default_constraint_name(table, column);
-    if generated == digested {
-        vec![generated]
-    } else {
-        vec![generated, digested]
-    }
+    vec![
+        default_constraint_name(table, column),
+        fallback_default_constraint_name(table, column),
+    ]
 }
 
 /// Renames a table, then each default `pbps` generated for it to the name the
@@ -1698,7 +1718,7 @@ fn rename_table(from: &TableName, to: &TableName, defaults: &[String]) -> Sql {
                 column,
                 &old,
                 &default_constraint_name(to, column),
-                &digested_default_constraint_name(to, column),
+                &fallback_default_constraint_name(to, column),
             )
         })
         .collect::<Result<Vec<_>, _>>()?
@@ -1960,6 +1980,32 @@ mod tests {
                 to_nullable: false,
             }),
             ["ALTER TABLE [dbo].[t] ALTER COLUMN [version] varbinary(8) NOT NULL;"]
+        );
+    }
+
+    /// #981: the fallback is always a name other than the generated one. For
+    /// a table whose generated name is already digested (an `_` in it), it
+    /// is a digest seeded differently, never the taken name again; for any
+    /// other it is the digested name, as before.
+    #[test]
+    fn a_defaults_fallback_name_differs_from_its_generated_one() {
+        for (table, digested_already) in [("dbo.t", false), ("dbo.order_items", true)] {
+            let table = tname(table);
+            let generated = default_constraint_name(&table, "d");
+            let fallback = fallback_default_constraint_name(&table, "d");
+            assert_ne!(generated, fallback, "{table}");
+            assert_eq!(
+                fallback == digested_default_constraint_name(&table, "d"),
+                !digested_already,
+                "{table}: {fallback}"
+            );
+            assert!(fallback.starts_with("DF_pbps_"), "{fallback}");
+            assert_eq!(generated_default_names(&table, "d"), [generated, fallback]);
+        }
+        // And stable: the same column gets the same fallback on every run.
+        assert_eq!(
+            fallback_default_constraint_name(&tname("dbo.order_items"), "d"),
+            fallback_default_constraint_name(&tname("dbo.order_items"), "d")
         );
     }
 

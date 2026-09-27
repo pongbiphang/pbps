@@ -471,7 +471,7 @@ fn module_object(id: &ModuleId) -> TableName {
 pub(crate) fn object_reads(cs: &pbps_model::ChangeSet) -> (Vec<TableName>, Vec<TableName>) {
     use pbps_model::Change;
     use pbps_mssql::emit::default_constraint_name as generated;
-    use pbps_mssql::emit::digested_default_constraint_name as digested;
+    use pbps_mssql::emit::fallback_default_constraint_name as fallback_name;
     let renamed_from: BTreeMap<&TableName, &TableName> = cs
         .changes
         .iter()
@@ -492,13 +492,13 @@ pub(crate) fn object_reads(cs: &pbps_model::ChangeSet) -> (Vec<TableName>, Vec<T
                 parents.push(from.clone());
                 for c in defaults {
                     names.push(in_schema(to, generated(to, c)));
-                    names.push(in_schema(to, digested(to, c)));
+                    names.push(in_schema(to, fallback_name(to, c)));
                 }
             }
             Change::RenameColumn { table, to, .. } => {
                 parents.push(now(table));
                 names.push(in_schema(table, generated(table, to)));
-                names.push(in_schema(table, digested(table, to)));
+                names.push(in_schema(table, fallback_name(table, to)));
             }
             Change::DropTable { name, .. } => parents.push(name.clone()),
             Change::DropColumn { column, .. } | Change::AlterColumnDefault { column, .. } => {
@@ -559,7 +559,7 @@ pub(crate) fn refuse_occupied_objects(
 ) -> anyhow::Result<()> {
     use pbps_model::Change;
     use pbps_mssql::emit::default_constraint_name as generated;
-    use pbps_mssql::emit::digested_default_constraint_name as digested;
+    use pbps_mssql::emit::fallback_default_constraint_name as fallback_name;
     use pbps_mssql::emit::generated_default_names as left_under;
     let in_schema = |t: &TableName, name: &str| TableName::new(t.schema.clone(), name);
     // The plan spells a created name its own way; the database's collation
@@ -681,7 +681,7 @@ pub(crate) fn refuse_occupied_objects(
                             column,
                             in_schema(to, &old),
                             in_schema(to, &generated(to, column)),
-                            in_schema(to, &digested(to, column)),
+                            in_schema(to, &fallback_name(to, column)),
                         );
                     }
                 }
@@ -694,7 +694,7 @@ pub(crate) fn refuse_occupied_objects(
                 ..
             } => {
                 let new = in_schema(table, &generated(table, to));
-                let fallback = in_schema(table, &digested(table, to));
+                let fallback = in_schema(table, &fallback_name(table, to));
                 for was in std::iter::once(table).chain(table_was) {
                     // Still under `from`: the walk renames the column's
                     // entries below, after the default has moved.
@@ -7223,7 +7223,7 @@ mod tests {
         let target = TableName::new("dbo", pbps_mssql::emit::default_constraint_name(&old, "d"));
         let fallback = TableName::new(
             "dbo",
-            pbps_mssql::emit::digested_default_constraint_name(&old, "d"),
+            pbps_mssql::emit::fallback_default_constraint_name(&old, "d"),
         );
         let synonym_at = |name: &TableName| NameOccupant {
             wanted: name.clone(),
@@ -7415,7 +7415,7 @@ mod tests {
             .expect("`a`'s default goes to its fallback while `b`'s name is held");
         let b_fallback = TableName::new(
             "dbo",
-            pbps_mssql::emit::digested_default_constraint_name(&old, "b"),
+            pbps_mssql::emit::fallback_default_constraint_name(&old, "b"),
         );
         assert!(
             refuse_occupied_objects(
@@ -7451,7 +7451,7 @@ mod tests {
         assert!(
             names.contains(&TableName::new(
                 "dbo",
-                pbps_mssql::emit::digested_default_constraint_name(&renamed, "c")
+                pbps_mssql::emit::fallback_default_constraint_name(&renamed, "c")
             )),
             "{names:?}"
         );
@@ -7515,7 +7515,7 @@ mod tests {
         .expect("`a`'s default takes its fallback while `b`'s is held");
         let a_fallback = TableName::new(
             "dbo",
-            pbps_mssql::emit::digested_default_constraint_name(&b, "c"),
+            pbps_mssql::emit::fallback_default_constraint_name(&b, "c"),
         );
         assert!(
             refuse_occupied_objects(

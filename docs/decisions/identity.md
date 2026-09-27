@@ -694,9 +694,12 @@ by `ALTER TABLE ... ADD [c] ... CONSTRAINT [DF_pbps_t_c]`.
 
 The fallback is the digested name for the same column,
 `DF_pbps_<table>_<column>_<digest>`. The digest is over the qualified column
-(DEC-496.1), so no other column generates that name. It is used only when the
-target is taken, and when the fallback is taken too, the default stays where
-it is.
+(DEC-496.1), so no other column generates that name. When the generated name
+is itself the digested one, which happens for every table name with `_` and
+for names too long to keep, the fallback is a digest seeded with one more part.
+Otherwise the fallback would be the taken name again, and the default would
+stay where it is (review of #1200). The fallback is used only when the target
+is taken, and when the fallback is taken too, the default stays where it is.
 
 A later rename looks for a default under both of the names `pbps` may have
 left it under, the generated one and the digested one, so a default parked at

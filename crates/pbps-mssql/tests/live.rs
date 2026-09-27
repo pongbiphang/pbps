@@ -2976,71 +2976,86 @@ async fn a_renamed_tables_and_columns_generated_defaults_follow_them() {
 async fn a_default_whose_new_name_is_taken_frees_its_old_one() {
     use pbps_model::{Change, ChangeSet, PlannedChange};
     let mut db = TestDb::create("defaultfallback981").await;
-    let mut t = Table::default();
-    let mut c = Column::new(ty("int")).not_null();
-    c.default = Some("0".into());
-    t.columns.insert("c".to_owned(), c.clone());
-    apply(
-        &mut db.conn,
-        &ChangeSet {
-            changes: vec![PlannedChange::new(Change::CreateTable {
-                uid: "t_aaa981".parse().unwrap(),
-                name: "dbo.t".parse().unwrap(),
-                table: Box::new(t),
-            })],
-        },
-    )
-    .await;
-    // The name the renamed column's default would take is held.
-    db.conn
-        .execute("CREATE TABLE dbo.DF_pbps_t_d (id int);")
-        .await
-        .unwrap();
-    apply(
-        &mut db.conn,
-        &ChangeSet {
-            changes: vec![
-                PlannedChange::new(Change::RenameColumn {
-                    uid: "t_aaa981".parse().unwrap(),
-                    table: "dbo.t".parse().unwrap(),
-                    from: "c".into(),
-                    to: "d".into(),
-                    table_was: None,
-                }),
-                PlannedChange::new(Change::AddColumn {
-                    uid: "t_aaa981".parse().unwrap(),
-                    table: "dbo.t".parse().unwrap(),
-                    name: "c".into(),
-                    column: Box::new(c),
-                }),
-            ],
-        },
-    )
-    .await;
-    let rows = db
-        .conn
-        .query(
-            "SELECT COL_NAME(parent_object_id, parent_column_id) AS c, name \
-             FROM sys.default_constraints \
-             WHERE parent_object_id = OBJECT_ID(N'dbo.t') ORDER BY c;",
+    // `t`, whose generated names are short, and `order_items`, whose
+    // generated names are already digested: its fallback is a digest seeded
+    // differently, not the taken name again (review of #1200).
+    for (table, uid) in [("dbo.t", "t_aaa981"), ("dbo.order_items", "t_aab981")] {
+        let name: pbps_model::TableName = table.parse().unwrap();
+        let mut t = Table::default();
+        let mut c = Column::new(ty("int")).not_null();
+        c.default = Some("0".into());
+        t.columns.insert("c".to_owned(), c.clone());
+        apply(
+            &mut db.conn,
+            &ChangeSet {
+                changes: vec![PlannedChange::new(Change::CreateTable {
+                    uid: uid.parse().unwrap(),
+                    name: name.clone(),
+                    table: Box::new(t),
+                })],
+            },
         )
-        .await
-        .unwrap();
-    let names: Vec<(String, String)> = rows
-        .iter()
-        .map(|r| {
-            (
-                r.try_get::<&str>("c").unwrap().unwrap().to_owned(),
-                r.try_get::<&str>("name").unwrap().unwrap().to_owned(),
-            )
-        })
-        .collect();
-    assert_eq!(names[0], ("c".to_owned(), "DF_pbps_t_c".to_owned()));
-    assert_eq!(names[1].0, "d");
-    assert!(
-        names[1].1.starts_with("DF_pbps_t_d_") && names[1].1.len() > "DF_pbps_t_d_".len(),
-        "{names:?}"
-    );
+        .await;
+        // The name the renamed column's default would take is held.
+        let target = pbps_mssql::emit::default_constraint_name(&name, "d");
+        db.conn
+            .execute(&format!("CREATE TABLE dbo.[{target}] (id int);"))
+            .await
+            .unwrap();
+        apply(
+            &mut db.conn,
+            &ChangeSet {
+                changes: vec![
+                    PlannedChange::new(Change::RenameColumn {
+                        uid: uid.parse().unwrap(),
+                        table: name.clone(),
+                        from: "c".into(),
+                        to: "d".into(),
+                        table_was: None,
+                    }),
+                    PlannedChange::new(Change::AddColumn {
+                        uid: uid.parse().unwrap(),
+                        table: name.clone(),
+                        name: "c".into(),
+                        column: Box::new(c),
+                    }),
+                ],
+            },
+        )
+        .await;
+        let rows = db
+            .conn
+            .query(&format!(
+                "SELECT COL_NAME(parent_object_id, parent_column_id) AS c, name \
+                 FROM sys.default_constraints \
+                 WHERE parent_object_id = OBJECT_ID(N'{table}') ORDER BY c;"
+            ))
+            .await
+            .unwrap();
+        let names: Vec<(String, String)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.try_get::<&str>("c").unwrap().unwrap().to_owned(),
+                    r.try_get::<&str>("name").unwrap().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                (
+                    "c".to_owned(),
+                    pbps_mssql::emit::default_constraint_name(&name, "c")
+                ),
+                (
+                    "d".to_owned(),
+                    pbps_mssql::emit::fallback_default_constraint_name(&name, "d")
+                ),
+            ],
+            "{table}"
+        );
+    }
     db.drop().await;
 }
 
