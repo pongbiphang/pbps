@@ -644,11 +644,23 @@ fn run() -> anyhow::Result<()> {
                 );
             }
             (Some(db), None) => explain::Target::Connection(db.clone()),
-            (None, Some(_)) => explain::Target::from(
-                Project::discover(&start)
-                    .map_err(anyhow::Error::from)
-                    .and_then(|project| target.resolve(&project)),
-            ),
+            // A configured environment's engine is the project's, known before
+            // its secret is read: an unset `url_env` must not hide that the
+            // environment is the wrong engine for this plan (DEC-562.1). An unknown
+            // environment or an unreadable project knows no engine at all.
+            (None, Some(name)) => match Project::discover(&start) {
+                Ok(project) => match target.resolve(&project) {
+                    Ok(resolved) => explain::Target::Reachable(resolved),
+                    Err(error) => explain::Target::Unresolved {
+                        error,
+                        driver: project
+                            .environment(name)
+                            .ok()
+                            .map(|_| db::driver_for(project.config.dialect)),
+                    },
+                },
+                Err(e) => explain::Target::from(Err(anyhow::Error::from(e))),
+            },
             (None, None) => explain::Target::None,
         };
         return explain::cmd_explain(

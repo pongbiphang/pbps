@@ -2139,6 +2139,95 @@ fn explain_dialects_refuse_mismatched_environments_without_connecting() {
     }
 }
 
+/// #562: the same mismatch with the environment's secret unset. The project
+/// still names the environment's engine, so the explanation reports the
+/// mismatch and keeps the environment out of the approval command, rather
+/// than calling it merely unconfigured and offering `--env wrong_engine`.
+/// Controls: a matching engine with the secret unset, an unknown environment
+/// and no project at all keep their file-only behavior.
+#[test]
+fn explain_dialects_refuse_a_mismatched_environment_whose_secret_is_unset() {
+    let explain = |d: &Demo, plan: &std::path::Path, env: &str, format: &str| {
+        Command::new(BIN)
+            .arg("--project")
+            .arg(&d.dir)
+            .env_remove("PBPS_EXPLAIN_UNSET_TARGET")
+            .args([
+                "explain",
+                "--plan",
+                plan.to_str().unwrap(),
+                "--env",
+                env,
+                "--format",
+                format,
+            ])
+            .output()
+            .unwrap()
+    };
+    let approval = |out: &Output, format: &str| -> String {
+        let text = stdout(out);
+        if format == "json" {
+            let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+            report["data"]["approve_with"].as_str().unwrap().to_owned()
+        } else {
+            text.lines()
+                .find(|l| l.trim_start().starts_with("pbps apply"))
+                .unwrap()
+                .to_owned()
+        }
+    };
+    for (plan_dialect, other) in [("mssql", "postgres"), ("postgres", "mssql")] {
+        let d = Demo::new(&format!("explain-unset-{plan_dialect}"));
+        let plan = explain_dialect_plan(&d, plan_dialect);
+        for (project_dialect, mismatched) in [(other, true), (plan_dialect, false)] {
+            std::fs::write(
+                d.dir.join("pbps.yml"),
+                format!(
+                    "dialect: {project_dialect}\nenvironments:\n  target:\n    url_env: PBPS_EXPLAIN_UNSET_TARGET\n"
+                ),
+            )
+            .unwrap();
+            for format in ["text", "json"] {
+                let out = explain(&d, &plan, "target", format);
+                let text = stdout(&out);
+                assert_eq!(code(&out), 0, "{text}{}", stderr(&out));
+                let approve = approval(&out, format);
+                if mismatched {
+                    assert!(text.contains("dialect mismatch"), "{text}");
+                    assert!(text.contains("was not queried"), "{text}");
+                    assert!(approve.contains("--env \"<environment>\""), "{approve}");
+                    assert!(!approve.contains("--env target "), "{approve}");
+                } else {
+                    // The matching engine keeps its current shape: unconfigured,
+                    // and still the environment to approve against.
+                    assert!(!text.contains("dialect mismatch"), "{text}");
+                    assert!(text.contains("PBPS_EXPLAIN_UNSET_TARGET"), "{text}");
+                    assert!(approve.contains("--env target "), "{approve}");
+                }
+            }
+        }
+        // An environment the project does not configure knows no engine.
+        for format in ["text", "json"] {
+            let out = explain(&d, &plan, "nosuch", format);
+            assert!(
+                !stdout(&out).contains("dialect mismatch"),
+                "{}",
+                stdout(&out)
+            );
+        }
+        // And neither does a directory with no project.
+        std::fs::remove_file(d.dir.join("pbps.yml")).unwrap();
+        for format in ["text", "json"] {
+            let out = explain(&d, &plan, "target", format);
+            assert!(
+                !stdout(&out).contains("dialect mismatch"),
+                "{}",
+                stdout(&out)
+            );
+        }
+    }
+}
+
 #[test]
 fn explain_dialects_keep_matching_and_bare_targets_connectable() {
     for dialect in ["mssql", "postgres"] {
