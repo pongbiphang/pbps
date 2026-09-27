@@ -8455,28 +8455,57 @@ async fn rollback(conn: &mut Conn) {
     conn.execute("ROLLBACK").await.expect("rollback");
 }
 
+// Short deadlines exercise the reader's error recovery, not fixture setup
+// or the caller's later work. Restore the caller's setting even on an error.
+async fn read_a_rebuild_with_scoped_timeout(
+    conn: &mut Conn,
+    id: &pbps_model::ModuleId,
+    kind: pbps_model::ModuleKind,
+    changes: &pbps_model::ChangeSet,
+    timeout: Option<&str>,
+) -> Result<pbps_pg::modules::Rebuild, DbError> {
+    let previous = if let Some(setting) = timeout {
+        assert!(matches!(setting, "statement_timeout" | "lock_timeout"));
+        let previous = text(conn, &format!("SHOW {setting}")).await;
+        conn.execute(&format!("SET LOCAL {setting} = '200ms'"))
+            .await
+            .expect("set the reader's deadline");
+        Some((setting, previous))
+    } else {
+        None
+    };
+    let result = pbps_pg::modules::before_a_rebuild(conn, id, kind, changes).await;
+    if let Some((setting, previous)) = previous {
+        // These two settings have engine-formatted numeric/time values.
+        conn.execute(&format!("SET LOCAL {setting} = '{previous}'"))
+            .await
+            .expect("the recovered transaction restores the caller's deadline");
+    }
+    result
+}
+
 /// #534: a rebuild read that recovers from its routine lock must leave no
 /// `pbps_routine_lock` marker behind, whether it falls back or fails. A caller
 /// holding a savepoint of that name then rolls back to its own checkpoint, and
-/// its remaining work commits. `setup` runs first in each transaction.
+/// its remaining work commits. A short timeout belongs only to the reader.
 ///
 /// Returns what the read answered with the caller's savepoint in place.
 async fn a_callers_routine_lock_savepoint_is_the_one_rolled_back_to(
     conn: &mut Conn,
     table: &str,
-    setup: &str,
+    timeout: Option<&str>,
     id: &pbps_model::ModuleId,
     kind: pbps_model::ModuleKind,
     changes: &pbps_model::ChangeSet,
 ) -> Result<pbps_pg::modules::Rebuild, pbps_db::DbError> {
     in_a_transaction(conn).await;
     conn.execute(&format!(
-        "{setup}; DELETE FROM {table}; INSERT INTO {table} VALUES (1); \
+        "DELETE FROM {table}; INSERT INTO {table} VALUES (1); \
          SAVEPOINT pbps_routine_lock; INSERT INTO {table} VALUES (2)"
     ))
     .await
     .expect("the caller's work and checkpoint");
-    let answered = pbps_pg::modules::before_a_rebuild(conn, id, kind, changes).await;
+    let answered = read_a_rebuild_with_scoped_timeout(conn, id, kind, changes, timeout).await;
     conn.execute("ROLLBACK TO SAVEPOINT pbps_routine_lock; RELEASE SAVEPOINT pbps_routine_lock")
         .await
         .expect("the caller's checkpoint is still there");
@@ -8493,8 +8522,7 @@ async fn a_callers_routine_lock_savepoint_is_the_one_rolled_back_to(
 
     // Without a caller savepoint, there is nothing of that name left to end.
     in_a_transaction(conn).await;
-    conn.execute(setup).await.expect("setup");
-    let _ = pbps_pg::modules::before_a_rebuild(conn, id, kind, changes).await;
+    let _ = read_a_rebuild_with_scoped_timeout(conn, id, kind, changes, timeout).await;
     let left = conn
         .execute("RELEASE SAVEPOINT pbps_routine_lock")
         .await
@@ -9574,7 +9602,7 @@ async fn an_account_that_cannot_lock_a_routine_says_so_and_the_reads_after_it_st
     let fallback = a_callers_routine_lock_savepoint_is_the_one_rolled_back_to(
         &mut conn,
         &format!("{s}.caller_rows"),
-        "SELECT 1",
+        None,
         &id,
         pbps_model::ModuleKind::Function,
         &pbps_model::ChangeSet::default(),
@@ -9601,11 +9629,17 @@ async fn an_account_that_cannot_lock_a_routine_says_so_and_the_reads_after_it_st
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn routine_lock_timeouts_are_errors_and_leave_the_callers_transaction_usable() {
     let mut db = TestDb::create("routine_lock_timeout226").await;
+    // Every caller insert takes longer than the injected 200ms deadline.
+    // Enabling it before this preparation deterministically fails the fixture.
     db.conn
         .execute(
             "CREATE FUNCTION public.f(n int) RETURNS int LANGUAGE sql AS $$ SELECT n $$;
              CREATE PROCEDURE public.p(n int) LANGUAGE sql AS $$ SELECT n $$;
-             CREATE TABLE public.caller_rows (n int);",
+             CREATE TABLE public.caller_rows (n int);
+             CREATE FUNCTION public.slow_caller_write() RETURNS trigger LANGUAGE plpgsql
+                 AS $$ BEGIN PERFORM pg_catalog.pg_sleep(0.3); RETURN NEW; END $$;
+             CREATE TRIGGER slow_caller_write BEFORE INSERT ON public.caller_rows
+                 FOR EACH ROW EXECUTE FUNCTION public.slow_caller_write();",
         )
         .await
         .unwrap();
@@ -9634,11 +9668,13 @@ async fn routine_lock_timeouts_are_errors_and_leave_the_callers_transaction_usab
             .unwrap();
         for (setting, code) in [("statement_timeout", "57014"), ("lock_timeout", "55P03")] {
             in_a_transaction(&mut probe).await;
+            let result =
+                read_a_rebuild_with_scoped_timeout(&mut probe, &id, kind, &changes, Some(setting))
+                    .await;
             probe
-                .execute(&format!("SET LOCAL {setting} = '200ms'"))
+                .execute("SELECT pg_catalog.pg_sleep(0.3)")
                 .await
-                .unwrap();
-            let result = pbps_pg::modules::before_a_rebuild(&mut probe, &id, kind, &changes).await;
+                .expect("later caller work is outside the injected deadline");
             // The error must reach the caller after recovery, rather than leave
             // the transaction aborted or become a missing-privilege note.
             assert_eq!(number(&mut probe, "SELECT 1::int").await, 1);
@@ -9649,7 +9685,7 @@ async fn routine_lock_timeouts_are_errors_and_leave_the_callers_transaction_usab
             let again = a_callers_routine_lock_savepoint_is_the_one_rolled_back_to(
                 &mut probe,
                 "public.caller_rows",
-                &format!("SET LOCAL {setting} = '200ms'"),
+                Some(setting),
                 &id,
                 kind,
                 &changes,
