@@ -63,7 +63,7 @@ def main():
     # would be discovered by the failure it exists to explain (#724).
     self_check(run, IMAGES[args.engine])
     for test in TESTS:
-        command = ["cargo", "test", "-p", "pbps-cli", "--lib", "--", "--ignored",
+        command = ["cargo", "test", "--profile", "live-test", "-p", "pbps-cli", "--lib", "--", "--ignored",
                    "--exact", "resolver::" + test, "--nocapture"]
         completed = subprocess.run(command, env=env, text=True,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)

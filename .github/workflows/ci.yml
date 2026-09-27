@@ -336,7 +336,7 @@ jobs:
       # own, and what proves the wait is bounded is waiting it out.
       - run: cargo test -p pbps-pg --test live -- --ignored
       # Private capture internals have live snapshot/rendering regressions.
-      - run: cargo test -p pbps-pg --lib -- --ignored --test-threads=1
+      - run: cargo test --profile live-test -p pbps-pg --lib -- --ignored --test-threads=1
       - run: cargo test -p pbps-db --test live_pg -- --ignored
       - run: python3 scripts/live-transport.py pg
       # The CLI's own PostgreSQL-dependent test, in the bin target rather than
@@ -416,7 +416,7 @@ jobs:
           FIXTURE_ENGINE: ${{ matrix.engine }}
       - name: Complete factory on the disposable native host
         run: |
-          cargo test -p pbps-cli --lib --no-run --message-format=json > /tmp/pbps-resolver-artifacts.jsonl
+          cargo test --profile live-test -p pbps-cli --lib --no-run --message-format=json > /tmp/pbps-resolver-artifacts.jsonl
           PBPS_FIXTURE_BINARY=$(python3 -c 'import json; rows = [json.loads(line) for line in open("/tmp/pbps-resolver-artifacts.jsonl")]; print(next(row["executable"] for row in rows if row.get("executable") and row.get("target", {}).get("name") == "pbps_cli"))')
           echo "PBPS_FIXTURE_BINARY=$PBPS_FIXTURE_BINARY" >> "$GITHUB_ENV"
           sudo python3 scripts/live-resolver-target.py "$FIXTURE_ENGINE" --native-host --test-binary "$PBPS_FIXTURE_BINARY"

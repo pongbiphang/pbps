@@ -195,6 +195,12 @@ cargo clippy --workspace --all-targets
 cargo fmt --all
 ```
 
+The PostgreSQL capture suite and resolver fixtures use the `live-test` Cargo
+profile: basic optimization with debug assertions and overflow checks retained.
+The local live runners select it just as CI does; ordinary `cargo test` remains
+unoptimized. See [CI performance](docs/CI-PERFORMANCE.md) for the measurements,
+reproduction commands and native test-binary selection.
+
 ### On Windows, develop inside WSL2
 
 Do not use `x86_64-pc-windows-gnu`. Rustup's self-contained mingw ships no GNU

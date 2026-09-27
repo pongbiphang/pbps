@@ -160,3 +160,11 @@ unsafe_code = "forbid"
 # The correctness of diff and emit depends on exhaustive matching; a catch-all
 # `_ =>` must not paper over a missing case.
 wildcard_enum_match_arm = "warn"
+
+# CPU-heavy engine fixtures retain test assertions without paying the full
+# unoptimized catalog/crypto cost on each observation (DEC-1208.1).
+[profile.live-test]
+inherits = "test"
+opt-level = 1
+debug-assertions = true
+overflow-checks = true
