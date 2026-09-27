@@ -783,6 +783,36 @@ pub async fn permissions(
         .cloned()
         .collect();
     let pending = read_tables(conn, &dropping, &MANAGED_KINDS).await?;
+    // The drop names the table by its schema, which needs `USAGE` there
+    // (measured on 18: its owner without it gets `permission denied for
+    // schema`). A schema no declared table is left in has fallen out of the
+    // managed set, so nothing above asked it (#1195). The managed, referenced
+    // and ledger schemas were asked already, and report their own gaps.
+    let asked: BTreeSet<&str> = ask
+        .managed_schemas
+        .iter()
+        .chain(ask.referenced.iter().map(|o| &o.schema))
+        .map(String::as_str)
+        .chain([LEDGER_SCHEMA])
+        .collect();
+    let unasked: Vec<String> = pending
+        .iter()
+        .filter(|(object, present, _)| *present && !asked.contains(object.schema.as_str()))
+        .map(|(object, _, _)| object.schema.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    for (schema, present, rights) in read_schemas(conn, &unasked).await? {
+        if present && !rights.usage {
+            held.declaration_gaps.push(Gap {
+                permission: "USAGE",
+                why: "the declarations no longer name a recorded table in this schema, so the \
+                      next plan drops it, which names it through the schema"
+                    .to_owned(),
+                securable: Securable::Schema(schema),
+            });
+        }
+    }
     // One question for every schema a plain drop might rely on, however many
     // schemas and tables the plan drops.
     let schemas: BTreeSet<&str> = pending
