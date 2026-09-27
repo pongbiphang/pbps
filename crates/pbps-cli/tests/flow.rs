@@ -14767,6 +14767,48 @@ fn text_on_server(connection: &str, sql: &str) -> String {
         })
 }
 
+/// #1205 on SQL Server: `NVARCHAR(128)` counts UTF-16 code units, so the
+/// operator is cut in that measure — 64 emoji, not 128 — and never inside a
+/// surrogate pair, which the engine refuses as invalid UTF-16.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB"]
+fn an_operator_wider_than_the_ledger_column_is_recorded_cut_to_it() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB");
+    let own = OwnDatabase::new(&server, "operator_width");
+    let connection = own.connection();
+    let d = Demo::new("operator-width");
+    d.table(ONE_COLUMN);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let built = d.run(&["bootstrap", "--db", connection]);
+    assert_eq!(code(&built), 0, "{}{}", stdout(&built), stderr(&built));
+    for (name, recorded) in [
+        ("a".repeat(300), "a".repeat(128)),
+        ("\u{1F600}".repeat(100), "\u{1F600}".repeat(64)),
+        (
+            format!("a{}", "\u{1F600}".repeat(100)),
+            format!("a{}", "\u{1F600}".repeat(63)),
+        ),
+    ] {
+        d.git(&["config", "user.name", &name]);
+        let baseline = d.run(&["baseline", "--db", connection, "--reason", "wide operator"]);
+        assert_eq!(
+            code(&baseline),
+            0,
+            "{}{}",
+            stdout(&baseline),
+            stderr(&baseline)
+        );
+        let listed = d.run(&["state", "list", "--db", connection, "--format", "json"]);
+        let v: serde_json::Value = serde_json::from_str(&stdout(&listed)).unwrap();
+        assert_eq!(
+            v["data"]["entries"][0]["operator"],
+            recorded.as_str(),
+            "{v}"
+        );
+    }
+}
+
 /// #1188 on SQL Server: the lock row names the holder's process and the
 /// application name its sessions carry, `sys.dm_exec_sessions` finds them by
 /// it, and the refusal and `unlock` both print that query.

@@ -207,6 +207,31 @@ impl LockInfo {
 /// The widest `locked_by` either engine's lock table holds, in characters.
 pub const LOCKED_BY_CHARS: usize = 256;
 
+/// The widest `operator` either engine's ledger holds: `varchar(128)` on
+/// PostgreSQL, `NVARCHAR(128)` on SQL Server (#1205).
+pub const OPERATOR_CHARS: usize = 128;
+
+/// `text` cut to at most `width` UTF-16 code units, on a character boundary.
+///
+/// UTF-16 code units because that is how SQL Server's `NVARCHAR(n)` measures
+/// a value, and a character outside the Basic Multilingual Plane takes two;
+/// PostgreSQL's `varchar(n)` counts characters, never more than code units,
+/// so one bound fits both. Never inside a surrogate pair: SQL Server refuses
+/// a split one as "Invalid UTF-16 data" rather than storing half a character.
+#[must_use]
+pub fn clip_utf16(text: &str, width: usize) -> String {
+    let mut room = width;
+    text.chars()
+        .take_while(|c| {
+            let fits = c.len_utf16() <= room;
+            if fits {
+                room -= c.len_utf16();
+            }
+            fits
+        })
+        .collect()
+}
+
 /// Which process took the lock, as `locked_by` records it (#1188).
 ///
 /// The lock deliberately outlives the process that took it and `pbps unlock`
@@ -275,18 +300,10 @@ impl LockHolder<'_> {
         .map(|(host, job, name)| suffix(host, job, name))
         .find(|s| width(s) <= LOCKED_BY_CHARS)
         .unwrap_or_else(|| suffix(false, false, false));
-        let mut room = LOCKED_BY_CHARS.saturating_sub(width(&suffix));
-        let operator: String = self
-            .operator
-            .chars()
-            .take_while(|c| {
-                let fits = c.len_utf16() <= room;
-                if fits {
-                    room -= c.len_utf16();
-                }
-                fits
-            })
-            .collect();
+        let operator = clip_utf16(
+            self.operator,
+            LOCKED_BY_CHARS.saturating_sub(width(&suffix)),
+        );
         format!("{operator}{suffix}")
     }
 }
@@ -465,6 +482,25 @@ mod tests {
                 "{rendered}"
             );
         }
+    }
+
+    /// #1205: the bound is UTF-16 code units, the measure SQL Server's
+    /// `NVARCHAR` uses, cut on a character boundary so no surrogate pair is
+    /// split.
+    #[test]
+    fn a_clip_counts_utf16_code_units_and_never_splits_a_character() {
+        let emoji = "\u{1F600}";
+        assert_eq!(
+            clip_utf16(&"a".repeat(300), OPERATOR_CHARS),
+            "a".repeat(128)
+        );
+        assert_eq!(
+            clip_utf16(&emoji.repeat(100), OPERATOR_CHARS),
+            emoji.repeat(64)
+        );
+        assert_eq!(clip_utf16(&format!("a{emoji}"), 2), "a");
+        assert_eq!(clip_utf16("short", OPERATOR_CHARS), "short");
+        assert_eq!(clip_utf16("anything", 0), "");
     }
 
     /// A holder written by hand or by an older pbps has no application name,
