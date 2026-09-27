@@ -465,9 +465,10 @@ fn module_object(id: &ModuleId) -> TableName {
 /// the schema's `sys.objects` namespace already holds (#1077): a sequence, a
 /// synonym, a constraint, or a table or module this project does not record.
 /// `CREATE TABLE` there fails with Msg 2714, and `CREATE OR ALTER` fails or
-/// replaces what is there. One this plan frees first is not an occupant: an
-/// object it drops or renames away, a constraint it drops, and the
-/// constraints and triggers of a table it drops or moves to another schema.
+/// replaces what is there. One this plan frees first is not an occupant, and
+/// "first" is the differ's order (`order_key`): what runs before the tables
+/// are created frees a name for a table, and what runs before the modules
+/// are created, near the end, frees it for a module.
 // The complement is every change that frees no object name.
 #[allow(clippy::wildcard_enum_match_arm)]
 fn refuse_occupied_objects(
@@ -488,6 +489,8 @@ fn refuse_occupied_objects(
         })
         .collect();
     let now = |t: &TableName| (*renamed_from.get(t).unwrap_or(&t)).clone();
+    let constraint = |table: &TableName, name: &str| TableName::new(now(table).schema, name);
+    // Freed ahead of `CreateTable`: every drop and rename class sorts first.
     let freed: BTreeSet<TableName> = cs
         .changes
         .iter()
@@ -497,17 +500,26 @@ fn refuse_occupied_objects(
             Change::DropModule { id, .. } => Some(module_object(id)),
             Change::DropUnique { table, name }
             | Change::DropForeignKey { table, name }
-            | Change::DropCheck { table, name } => {
-                Some(TableName::new(now(table).schema, name.clone()))
-            }
+            | Change::DropCheck { table, name } => Some(constraint(table, name)),
             Change::SetPrimaryKey {
                 table,
                 from: Some(key),
-                ..
-            } => key
-                .name
-                .as_ref()
-                .map(|name| TableName::new(now(table).schema, name.clone())),
+                to: None,
+            } => key.name.as_deref().map(|name| constraint(table, name)),
+            _ => None,
+        })
+        .collect();
+    // Freed only ahead of `CreateModule`: a key replaced in place, whose drop
+    // travels with its add after the tables are created.
+    let freed_for_modules: BTreeSet<TableName> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::SetPrimaryKey {
+                table,
+                from: Some(key),
+                to: Some(_),
+            } => key.name.as_deref().map(|name| constraint(table, name)),
             _ => None,
         })
         .collect();
@@ -521,10 +533,51 @@ fn refuse_occupied_objects(
             _ => None,
         })
         .collect();
+    // A column's default goes with the column, which is dropped ahead of the
+    // tables; and with a changed default, whose drop runs after the tables
+    // but ahead of the modules.
+    let dropped_columns: BTreeSet<(TableName, &str)> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::DropColumn { column, .. } => Some((now(&column.table), column.name.as_str())),
+            _ => None,
+        })
+        .collect();
+    let redefaulted: BTreeSet<(TableName, &str)> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::AlterColumnDefault {
+                column,
+                from: Some(_),
+                ..
+            } => Some((now(&column.table), column.name.as_str())),
+            _ => None,
+        })
+        .collect();
+    let of_column = |o: &pbps_mssql::catalog::NameOccupant,
+                     columns: &BTreeSet<(TableName, &str)>| {
+        matches!((&o.parent, &o.parent_column), (Some(t), Some(c)) if columns.contains(&(t.clone(), c.as_str())))
+    };
+    let tables: BTreeSet<&TableName> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::CreateTable { name, .. } => Some(name),
+            _ => None,
+        })
+        .collect();
+    let gone = |o: &pbps_mssql::catalog::NameOccupant| {
+        let early = freed.contains(&o.name)
+            || o.parent.as_ref().is_some_and(|p| released.contains(p))
+            || of_column(o, &dropped_columns);
+        let late = freed_for_modules.contains(&o.name) || of_column(o, &redefaulted);
+        early || (late && !tables.contains(&o.wanted))
+    };
     let taken: Vec<String> = occupants
         .iter()
-        .filter(|o| !freed.contains(&o.name))
-        .filter(|o| !o.parent.as_ref().is_some_and(|p| released.contains(p)))
+        .filter(|o| !gone(o))
         .map(|o| {
             let name = &o.wanted;
             match &o.parent {
@@ -6736,6 +6789,7 @@ mod tests {
             name: x.clone(),
             kind: kind.into(),
             parent: parent.cloned(),
+            parent_column: None,
         };
         let plan = |changes: Vec<PlannedChange>| ChangeSet { changes };
         let refused = |changes: Vec<PlannedChange>, o: NameOccupant| {
@@ -6851,6 +6905,73 @@ mod tests {
             description: None,
             definition: "SELECT 1".into(),
         };
+        let create_view = || {
+            PlannedChange::new(Change::CreateModule {
+                id: ModuleId::Named(x.clone()),
+                module: Box::new(view()),
+            })
+        };
+        // A default goes with its column, whose drop runs before the tables
+        // are created; a changed default is dropped only after them, in time
+        // for a view but not for a table.
+        let default_of = |column: &str| NameOccupant {
+            parent_column: Some(column.into()),
+            ..occupant("default constraint", Some(&old))
+        };
+        let column = pbps_model::ColumnRef {
+            table: old.clone(),
+            name: "c".into(),
+        };
+        let drop_column = || {
+            PlannedChange::new(Change::DropColumn {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "dbo.old.c", 0),
+                column: column.clone(),
+            })
+        };
+        let redefault = || {
+            PlannedChange::new(Change::AlterColumnDefault {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "dbo.old.c", 0),
+                column: column.clone(),
+                from: Some("0".into()),
+                to: Some("1".into()),
+            })
+        };
+        assert_eq!(
+            refused(vec![drop_column(), create_table()], default_of("c")),
+            None
+        );
+        assert!(
+            refused(vec![drop_column(), create_table()], default_of("other")).is_some(),
+            "another column's default stays"
+        );
+        assert!(refused(vec![create_table(), redefault()], default_of("c")).is_some());
+        assert_eq!(
+            refused(vec![redefault(), create_view()], default_of("c")),
+            None
+        );
+        // A named key dropped outright goes before the tables; one replaced
+        // in place goes with its add, after them.
+        let key = |to: Option<pbps_model::PrimaryKey>| {
+            PlannedChange::new(Change::SetPrimaryKey {
+                table: old.clone(),
+                from: Some(pbps_model::PrimaryKey {
+                    name: Some("x".into()),
+                    columns: vec!["id".into()],
+                }),
+                to,
+            })
+        };
+        let replacement = || {
+            Some(pbps_model::PrimaryKey {
+                name: Some("pk_new".into()),
+                columns: vec!["id".into()],
+            })
+        };
+        let pk = || occupant("primary key constraint", Some(&old));
+        assert_eq!(refused(vec![key(None), create_table()], pk()), None);
+        assert!(refused(vec![create_table(), key(replacement())], pk()).is_some());
+        assert_eq!(refused(vec![key(replacement()), create_view()], pk()), None);
+
         let rebuild = plan(vec![
             PlannedChange::new(Change::DropModule {
                 id: ModuleId::Named(x.clone()),

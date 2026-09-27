@@ -448,9 +448,15 @@ the plan can clear a name first, and an occupant it clears is not one:
 
 - an object it drops, or a table it renames away;
 - a unique, foreign-key or check constraint it drops, or a named primary key
-  it replaces;
+  it drops outright;
+- the default of a column it drops;
 - a constraint or trigger of a table it drops or transfers to another schema.
   A rename within the schema leaves the constraint's name where it was.
+
+"First" is the differ's order. All of those run before any table is created.
+A named primary key replaced in place, and the default of a column whose
+default changes, are dropped after the tables are created and before the
+modules are. So they free a name for a module and not for a table.
 
 Refusing the same-kind module rather than letting `CREATE OR ALTER` replace it
 is DEC-316.1's reasoning. Replacing an object this project never recorded is

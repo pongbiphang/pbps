@@ -582,6 +582,9 @@ pub struct NameOccupant {
     pub kind: String,
     /// The table or view a constraint or trigger belongs to.
     pub parent: Option<TableName>,
+    /// The column a default constraint belongs to, which goes with the
+    /// column and with the default it is.
+    pub parent_column: Option<String>,
 }
 
 /// The [`NameOccupant`]s at `names`, compared under the database's
@@ -608,13 +611,17 @@ pub async fn object_name_occupants(
     let sql = format!(
         "SELECT w.i, s.name AS schema_name, o.name AS object_name,
                 CONVERT(nvarchar(60), o.type_desc) AS type_desc,
-                ps.name AS parent_schema, p.name AS parent_name
+                ps.name AS parent_schema, p.name AS parent_name,
+                c.name AS parent_column
            FROM (VALUES {values}) AS w(i, schema_name, object_name)
            JOIN sys.schemas s ON s.name = w.schema_name COLLATE DATABASE_DEFAULT
            JOIN sys.objects o
              ON o.schema_id = s.schema_id AND o.name = w.object_name COLLATE DATABASE_DEFAULT
            LEFT JOIN sys.objects p ON p.object_id = o.parent_object_id
            LEFT JOIN sys.schemas ps ON ps.schema_id = p.schema_id
+           LEFT JOIN sys.default_constraints dc ON dc.object_id = o.object_id
+           LEFT JOIN sys.columns c
+             ON c.object_id = dc.parent_object_id AND c.column_id = dc.parent_column_id
           ORDER BY w.i;"
     );
     let mut out = Vec::new();
@@ -640,6 +647,7 @@ pub async fn object_name_occupants(
                 .to_lowercase()
                 .replace('_', " "),
             parent,
+            parent_column: row.try_get::<&str>("parent_column")?.map(str::to_owned),
         });
     }
     Ok(out)

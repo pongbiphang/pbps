@@ -1872,7 +1872,7 @@ fn a_sequence_or_synonym_at_a_new_tables_name_refuses_the_plan() {
     let connection = own.connection();
     on_server(
         connection,
-        "CREATE TABLE dbo.keep (id int); \
+        "CREATE TABLE dbo.keep (id int, c int CONSTRAINT x DEFAULT 0); \
          CREATE SEQUENCE dbo.s; \
          CREATE SYNONYM dbo.y FOR dbo.keep;",
     );
@@ -1907,20 +1907,42 @@ fn a_sequence_or_synonym_at_a_new_tables_name_refuses_the_plan() {
         assert!(!plan.exists(), "a refused plan wrote {}", plan.display());
     }
 
+    let apply = |d: &Demo, plan: &std::path::Path, allow: &[&str]| {
+        let checksum = plan_checksum(plan);
+        let mut args = vec![
+            "apply",
+            "--db",
+            connection,
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+        ];
+        args.extend_from_slice(allow);
+        let o = d.run(&args);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    };
     let d = adopted("free");
     let plan = declare(&d, "free");
     let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
-    let o = d.run(&[
-        "apply",
-        "--db",
-        connection,
-        "--plan",
-        plan.to_str().unwrap(),
-        "--checksum",
-        &plan_checksum(&plan),
-    ]);
-    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    apply(&d, &plan, &[]);
+
+    // A default goes with the column the same revision drops, which runs
+    // before the table is created: its name is free for the table, a valid
+    // plan, and applied (#1147 review).
+    let d = adopted("dropped-default");
+    std::fs::write(
+        d.dir.join("schema/dbo.keep.yml"),
+        "table: dbo.keep\ncolumns:\n  id: {type: int}\n",
+    )
+    .unwrap();
+    let o = d.run(&["drop", "dbo.keep.c", "--reason", "free the default's name"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let plan = declare(&d, "x");
+    let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    apply(&d, &plan, &["--allow", "destructive"]);
 }
 
 // ---- pull (the paths that need no database) ----
