@@ -28522,7 +28522,8 @@ async fn doctor_reports_an_absent_recorded_managed_table() {
             "CREATE TABLE public.foreign_owned(id integer); \
              CREATE SCHEMA mine AUTHORIZATION {role}; \
              CREATE TABLE mine.foreign_in_mine(id integer); \
-             CREATE TABLE mine.keyed_in_mine(id integer)"
+             CREATE TABLE mine.keyed_in_mine(id integer); \
+             CREATE TABLE mine.triggered_in_mine(id integer)"
         ))
         .await
         .unwrap();
@@ -28561,6 +28562,10 @@ async fn doctor_reports_an_absent_recorded_managed_table() {
         pbps_model::Uid::generate(pbps_model::UidKind::Table),
         "mine.keyed_in_mine".parse().unwrap(),
     );
+    recorded.tables.insert(
+        pbps_model::Uid::generate(pbps_model::UidKind::Table),
+        "mine.triggered_in_mine".parse().unwrap(),
+    );
     // `staged` is recorded in the ids only: a staged checkpoint after its
     // committed `DROP TABLE`, whose absence is the plan's own doing.
     recorded.tables.insert(
@@ -28578,6 +28583,7 @@ async fn doctor_reports_an_absent_recorded_managed_table() {
         "public.foreign_owned",
         "mine.foreign_in_mine",
         "mine.keyed_in_mine",
+        "mine.triggered_in_mine",
     ] {
         schema
             .tables
@@ -28598,6 +28604,19 @@ async fn doctor_reports_an_absent_recorded_managed_table() {
                 on_update: Default::default(),
             },
         );
+    // And a trigger on `triggered_in_mine`, dropped before the table by a
+    // `DROP TRIGGER ... ON` only the table's owner may run.
+    schema.modules.insert(
+        pbps_model::ModuleId::Trigger {
+            on: "mine.triggered_in_mine".parse().unwrap(),
+            name: "trg".to_owned(),
+        },
+        module(
+            pbps_model::ModuleKind::Trigger,
+            "CREATE TRIGGER trg BEFORE INSERT ON mine.triggered_in_mine \
+             FOR EACH ROW EXECUTE FUNCTION mine.f()",
+        ),
+    );
     state::record(
         &mut theirs,
         &StateSnapshot::new(StateKind::Baseline, schema, recorded.clone(), "doctor-live"),
@@ -28665,6 +28684,7 @@ async fn doctor_reports_an_absent_recorded_managed_table() {
         dropping,
         std::collections::BTreeSet::from([
             "TABLE \"mine\".\"keyed_in_mine\"".to_owned(),
+            "TABLE \"mine\".\"triggered_in_mine\"".to_owned(),
             "TABLE \"public\".\"foreign_owned\"".to_owned(),
         ]),
         "{:?}",
@@ -28680,7 +28700,15 @@ async fn doctor_reports_an_absent_recorded_managed_table() {
             .unwrap()
     };
     assert!(reason("TABLE \"public\".\"foreign_owned\"").contains("of the table or of its schema"));
-    assert!(reason("TABLE \"mine\".\"keyed_in_mine\"").contains("ownership of the table itself"));
+    for table in [
+        "TABLE \"mine\".\"keyed_in_mine\"",
+        "TABLE \"mine\".\"triggered_in_mine\"",
+    ] {
+        assert!(
+            reason(table).contains("ownership of the table itself"),
+            "{table}"
+        );
+    }
     assert!(
         held.absent_tables
             .contains(&"public.fresh".parse().unwrap()),

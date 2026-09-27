@@ -610,8 +610,10 @@ pub async fn permissions(
     // The recorded tables are kept beside the ids: a staged checkpoint keeps
     // the ids of a table its committed `DROP TABLE` already removed, and only
     // its schema says the table is gone on purpose.
-    // The recorded tables with foreign keys are kept too: a dropped table's
-    // keys are dropped first, by an `ALTER TABLE` only its owner may run.
+    // The recorded tables with foreign keys or triggers are kept too: a
+    // dropped table's keys and triggers are dropped first, by an `ALTER
+    // TABLE ... DROP CONSTRAINT` and a `DROP TRIGGER ... ON` only its owner
+    // may run.
     let (recorded_ids, recorded_tables, recorded_with_keys) = if project_ids.tables.is_empty()
         && project_ids.columns.is_empty()
         && project_ids.tombstones.is_empty()
@@ -634,13 +636,18 @@ pub async fn permissions(
                 |state| {
                     let tables: BTreeSet<ObjectName> =
                         state.snapshot.schema.tables.keys().cloned().collect();
-                    let with_keys: BTreeSet<ObjectName> = state
-                        .snapshot
-                        .schema
+                    let schema = &state.snapshot.schema;
+                    let with_keys: BTreeSet<ObjectName> = schema
                         .tables
                         .iter()
                         .filter(|(_, table)| !table.foreign_keys.is_empty())
                         .map(|(name, _)| name.clone())
+                        .chain(schema.modules.keys().filter_map(|id| match id {
+                            pbps_model::ModuleId::Trigger { on, .. } => Some(on.clone()),
+                            pbps_model::ModuleId::Named(_) | pbps_model::ModuleId::Routine(_) => {
+                                None
+                            }
+                        }))
                         .collect();
                     (state.snapshot.ids, tables, with_keys)
                 },
@@ -796,11 +803,13 @@ pub async fn permissions(
         // TABLE` succeeds for the owner of the schema of a table another role
         // owns), so that ownership is enough when the drop is all the plan
         // does to it. A table with foreign keys has them dropped first, by
-        // `ALTER TABLE ... DROP CONSTRAINT`, which only the table's owner may
-        // run, and its reason says so.
+        // `ALTER TABLE ... DROP CONSTRAINT`, and one with triggers has them
+        // dropped by `DROP TRIGGER ... ON`; only the table's owner may run
+        // either, and its reason says so.
         let why = if recorded_with_keys.contains(&object) {
             "the declarations no longer name this recorded table, so the next plan drops it; \
-             its foreign keys are dropped first, which needs ownership of the table itself"
+             its foreign keys or triggers are dropped first, which needs ownership of the \
+             table itself"
         } else {
             let owned = match schema_owned.get(&object.schema) {
                 Some(owned) => *owned,
