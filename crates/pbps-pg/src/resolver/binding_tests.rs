@@ -924,6 +924,36 @@ async fn a_dropped_overload_is_held_by_its_declared_identity_not_by_a_count() {
                 "{variable} {tag}: {assessment:#?}"
             );
         }
+        // An aggregate that took the signature of a declared function the
+        // target lost is not that function: the plan's DROP FUNCTION refuses
+        // it, so it is no managed candidate (#1126).
+        let view = || numeric_f().view("app.v", "SELECT f(1.0) AS x");
+        let assessment = analyze(
+            &server,
+            "aggregate",
+            Case {
+                schemas: &["app"],
+                extras: &[],
+                target: "CREATE FUNCTION app.f(numeric) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;
+                         SET search_path = app;
+                         CREATE VIEW app.v AS SELECT f(1.0) AS x;
+                         CREATE AGGREGATE app.f(integer) (SFUNC = int4pl, STYPE = integer);",
+                base: view().function(
+                    "app.f(integer)",
+                    "(integer) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1",
+                ),
+                desired: view(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                only(&assessment, "app", "v"),
+                Verdict::Unresolved { condition } if condition.contains("not reconstructed")
+            ),
+            "{variable} aggregate: {assessment:#?}"
+        );
     }
 }
 
@@ -940,7 +970,10 @@ async fn an_unreadable_dropped_signature_is_refused_not_absent() {
         let absent = reconstruct::identify_dropped(
             &mut conn,
             &pg,
-            vec!["public.pbps_absent_1124(integer)".parse().unwrap()],
+            vec![(
+                "public.pbps_absent_1124(integer)".parse().unwrap(),
+                pbps_model::ModuleKind::Function,
+            )],
         )
         .await
         .unwrap();
@@ -952,7 +985,10 @@ async fn an_unreadable_dropped_signature_is_refused_not_absent() {
         let unreadable = reconstruct::identify_dropped(
             &mut conn,
             &pg,
-            vec!["public.f(int int)".parse().unwrap()],
+            vec![(
+                "public.f(int int)".parse().unwrap(),
+                pbps_model::ModuleKind::Function,
+            )],
         )
         .await;
         assert_eq!(
@@ -974,7 +1010,10 @@ async fn an_unreadable_dropped_signature_is_refused_not_absent() {
         let backslash = reconstruct::identify_dropped(
             &mut conn,
             &pg,
-            vec![r"public.pbps\1124(integer)".parse().unwrap()],
+            vec![(
+                r"public.pbps\1124(integer)".parse().unwrap(),
+                pbps_model::ModuleKind::Function,
+            )],
         )
         .await;
         conn.query("RESET standard_conforming_strings")

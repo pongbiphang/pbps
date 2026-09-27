@@ -144,7 +144,7 @@ impl NativeTarget {
     pub async fn identify_dropped(
         &mut self,
         write_path_extras: &[String],
-        routines: Vec<pbps_model::ModuleId>,
+        routines: Vec<(pbps_model::ModuleId, pbps_model::ModuleKind)>,
     ) -> Result<
         std::collections::BTreeMap<
             pbps_model::ModuleId,
