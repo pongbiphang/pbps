@@ -7000,6 +7000,117 @@ fn the_cli_ledger_preserves_history_and_distinguishes_absent_empty_and_unreadabl
     assert_eq!(empty["data"]["entries"], serde_json::json!([]));
 }
 
+/// #1188: the lock row named a person, not a process, and pbps set no
+/// application name, so "is the holder gone?" had nothing to check before
+/// `pbps unlock`. The row now names the host, pid, CI job and the application
+/// name the holder's sessions carry, and the refusal and `unlock` both print
+/// the query that finds those sessions.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_lock_names_its_holders_process_and_says_how_to_find_its_session() {
+    let own = OwnDatabase::new(&server(), "lock_holder");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "lock-holder", ONE_COLUMN);
+
+    // What the CLI records while it holds the lock, read from inside its own
+    // apply: a DDL event trigger runs in that session, beside the lock row.
+    on_server(
+        connection,
+        r#"
+        CREATE SCHEMA witness;
+        CREATE TABLE witness.held (locked_by text, session_name text);
+        CREATE FUNCTION witness.copy_lock() RETURNS event_trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          INSERT INTO witness.held
+            SELECT locked_by, current_setting('application_name') FROM public.__pbps_lock;
+        END $$;
+        CREATE EVENT TRIGGER copy_lock ON ddl_command_end WHEN TAG IN ('ALTER TABLE')
+          EXECUTE FUNCTION witness.copy_lock();
+    "#,
+    );
+    d.table(TWO_COLUMNS);
+    let plan = connected_artifact(&d, connection, false);
+    let checksum = plan_checksum(&plan);
+    succeeds(d.run_with_env(
+        &[
+            "apply",
+            "--db",
+            connection,
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+        ],
+        &[("GITHUB_RUN_ID", "4242"), ("GITHUB_RUN_ATTEMPT", "2")],
+    ));
+    on_server(connection, "DROP EVENT TRIGGER copy_lock");
+    let recorded = text_of(connection, "SELECT locked_by FROM witness.held LIMIT 1");
+    let session = text_of(connection, "SELECT session_name FROM witness.held LIMIT 1");
+    assert!(session.starts_with("pbps/"), "{session}");
+    assert!(
+        recorded.ends_with(&format!(
+            ", CI job GitHub Actions run 4242 attempt 2, application_name \"{session}\"]"
+        )),
+        "{recorded}"
+    );
+    assert!(recorded.contains(", pid "), "{recorded}");
+    assert_eq!(
+        pbps_db::holder_application_name(&recorded).as_deref(),
+        Some(session.as_str())
+    );
+
+    // A holder that is still connected: this test's own session, taking the
+    // lock the way the CLI does.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (mut held, name, holder) = rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection)
+            .await
+            .unwrap();
+        let name = pbps_pg::state::session_application_name(&mut conn)
+            .await
+            .unwrap();
+        let holder = pbps_db::LockHolder {
+            operator: "holder-1188",
+            host: Some("host-1188"),
+            pid: std::process::id(),
+            ci_job: None,
+            application_name: &name,
+        }
+        .render();
+        pbps_pg::state::lock(&mut conn, &holder).await.unwrap();
+        (conn, name, holder)
+    });
+    // Found from another session by the name the row recorded. That session
+    // is this process's too, so it carries the same name and is left out.
+    let lookup = format!("FROM pg_stat_activity WHERE application_name = '{name}'");
+    assert_eq!(
+        scalar(
+            connection,
+            &format!("SELECT count(*) {lookup} AND pid <> pg_backend_pid()")
+        ),
+        1,
+        "{holder}"
+    );
+
+    let denied = d.run(&["baseline", "--db", connection, "--reason", "second holder"]);
+    assert_eq!(code(&denied), 1, "{}{}", stdout(&denied), stderr(&denied));
+    for expected in [holder.as_str(), lookup.as_str()] {
+        assert!(stderr(&denied).contains(expected), "{}", stderr(&denied));
+    }
+    let released = succeeds(d.run(&["unlock", "--db", connection]));
+    for expected in [holder.as_str(), lookup.as_str()] {
+        assert!(
+            stdout(&released).contains(expected),
+            "{}",
+            stdout(&released)
+        );
+    }
+    rt.block_on(async { held.execute("SELECT 1").await.unwrap() });
+}
+
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn the_cli_refuses_the_second_lock_holder_and_unlock_releases_only_the_gate() {

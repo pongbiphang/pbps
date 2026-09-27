@@ -35,6 +35,24 @@ fn verified_options(connection_string: &str) -> Result<(), DbError> {
     Ok(())
 }
 
+/// Gives the session this process's application name, unless the connection
+/// string names one under either key the driver reads (#1188).
+///
+/// The driver's parsed `Config` does not say whether the name came from the
+/// string, so the string is read with the same ADO.NET parser the peer check
+/// above uses. One that does not parse is left to `from_ado_string`, which has
+/// already accepted it by the time this runs.
+fn name_session(config: &mut Config, connection_string: &str) {
+    let named = connection_string
+        .parse::<connection_string::AdoNetString>()
+        .is_ok_and(|options| {
+            options.get("application name").is_some() || options.get("applicationname").is_some()
+        });
+    if !named {
+        config.application_name(crate::session_application_name());
+    }
+}
+
 /// One row as this driver hands it back.
 pub struct Row(tiberius::Row);
 
@@ -73,8 +91,9 @@ impl Conn {
     /// (`Server=host,1433;Database=x;User Id=u;Password=p;` — the form every
     /// SQL Server tool already asks for, so users can paste what they have).
     pub(crate) async fn connect(connection_string: &str) -> Result<Self, DbError> {
-        let config = Config::from_ado_string(connection_string)
+        let mut config = Config::from_ado_string(connection_string)
             .map_err(|e| DbError::BadConnectionString(e.to_string()))?;
+        name_session(&mut config, connection_string);
         Self::connect_config(config).await
     }
 
@@ -82,6 +101,7 @@ impl Conn {
         verified_options(connection_string)?;
         let mut config = Config::from_ado_string(connection_string)
             .map_err(|e| DbError::BadConnectionString(e.to_string()))?;
+        name_session(&mut config, connection_string);
         // Keep this explicit even if the driver's default changes. Trust is
         // still its normal chain/name verifier; verified_options rejects bypasses.
         config.encryption(tiberius::EncryptionLevel::Required);
@@ -135,6 +155,7 @@ impl Conn {
         config.database(&login.database);
         config.authentication(tiberius::AuthMethod::sql_server(login.user, login.password));
         config.encryption(tiberius::EncryptionLevel::NotSupported);
+        config.application_name(crate::session_application_name());
         let client = Client::connect(config, stream.compat_write()).await?;
         Ok(Self {
             client,

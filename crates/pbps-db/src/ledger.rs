@@ -188,6 +188,99 @@ pub struct TimelineStaged {
 pub struct LockInfo {
     pub locked_by: String,
     pub locked_at: String,
+    /// How to find the holder's sessions on this engine, and what that search
+    /// cannot prove: the dialect's text, built from the application name
+    /// [`LockHolder`] recorded. `None` for a holder recorded without one, by
+    /// an older pbps or by hand (#1188).
+    pub session_lookup: Option<String>,
+}
+
+impl LockInfo {
+    fn session_lookup_suffix(&self) -> String {
+        self.session_lookup
+            .as_deref()
+            .map(|lookup| format!("\n{lookup}"))
+            .unwrap_or_default()
+    }
+}
+
+/// The widest `locked_by` either engine's lock table holds, in characters.
+pub const LOCKED_BY_CHARS: usize = 256;
+
+/// Which process took the lock, as `locked_by` records it (#1188).
+///
+/// The lock deliberately outlives the process that took it and `pbps unlock`
+/// is the human override (DECISIONS 285), so the row has to give the operator
+/// something to check before overriding: the host, the process, the CI job,
+/// and the application name the holder's sessions carry, which the engine's
+/// session list can be searched by. It goes into `locked_by` rather than new
+/// columns because every reader of the lock already shows that text, and a
+/// new column is ledger DDL for no gain in what a human can check
+/// (DEC-1188.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockHolder<'a> {
+    pub operator: &'a str,
+    pub host: Option<&'a str>,
+    pub pid: u32,
+    pub ci_job: Option<&'a str>,
+    /// What the holder's session reports as its application name, read back
+    /// from the engine rather than assumed: a connection string may name its
+    /// own, and the engine may shorten it.
+    pub application_name: &'a str,
+}
+
+const APPLICATION_NAME_MARKER: &str = "application_name ";
+const CONTEXT_CHARS: usize = 64;
+
+impl LockHolder<'_> {
+    /// `operator [host h, pid p, CI job j, application_name "a"]`, within
+    /// [`LOCKED_BY_CHARS`]. The application name is kept whole and JSON-quoted
+    /// so it can be read back exactly ([`holder_application_name`]); what
+    /// gives way to the width is the job, then the host, then the operator's
+    /// name.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let clip = |text: &str| text.chars().take(CONTEXT_CHARS).collect::<String>();
+        let application_name = format!(
+            "{APPLICATION_NAME_MARKER}{}",
+            serde_json::Value::from(self.application_name)
+        );
+        let suffix = |host: bool, job: bool| {
+            let mut parts = Vec::new();
+            if let Some(h) = self.host.filter(|_| host) {
+                parts.push(format!("host {}", clip(h)));
+            }
+            parts.push(format!("pid {}", self.pid));
+            if let Some(j) = self.ci_job.filter(|_| job) {
+                parts.push(format!("CI job {}", clip(j)));
+            }
+            parts.push(application_name.clone());
+            format!(" [{}]", parts.join(", "))
+        };
+        let suffix = [(true, true), (true, false), (false, false)]
+            .into_iter()
+            .map(|(host, job)| suffix(host, job))
+            .find(|s| s.chars().count() < LOCKED_BY_CHARS)
+            .unwrap_or_else(|| suffix(false, false));
+        let room = LOCKED_BY_CHARS.saturating_sub(suffix.chars().count());
+        let operator: String = self.operator.chars().take(room).collect();
+        format!("{operator}{suffix}")
+    }
+}
+
+/// The application name a [`LockHolder`] recorded, or `None` when `locked_by`
+/// was not written by one.
+///
+/// The marker is searched from the end: the name is JSON-quoted, so an
+/// unescaped `application_name "` cannot occur inside it, while an operator's
+/// name before it may say anything at all.
+#[must_use]
+pub fn holder_application_name(locked_by: &str) -> Option<String> {
+    let quoted = &locked_by[locked_by.rfind(&format!("{APPLICATION_NAME_MARKER}\""))?..];
+    let quoted = quoted
+        .strip_prefix(APPLICATION_NAME_MARKER)?
+        .strip_suffix(']')?;
+    serde_json::from_str::<String>(quoted).ok()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -209,9 +302,10 @@ pub enum LedgerError {
     /// describes.
     #[error(
         "another operation holds the lock: `{}` since {}.\n\
-         Wait for it to finish. If it died without releasing, `pbps unlock --db ...` clears it.",
+         Wait for it to finish. If it died without releasing, `pbps unlock --db ...` clears it.{}",
         .0.locked_by,
-        .0.locked_at
+        .0.locked_at,
+        .0.session_lookup_suffix()
     )]
     Locked(LockInfo),
 
@@ -243,6 +337,109 @@ pub fn ids_to_prune(all_ids_newest_first: &[i64], keep: u32) -> Vec<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn holder(operator: &str, application_name: &str) -> LockHolder<'static> {
+        LockHolder {
+            operator: Box::leak(operator.to_owned().into_boxed_str()),
+            host: Some("build-7"),
+            pid: 4242,
+            ci_job: Some("GitHub Actions run 99 attempt 2"),
+            application_name: Box::leak(application_name.to_owned().into_boxed_str()),
+        }
+    }
+
+    /// #1188: the row names the process, not only the person, and the
+    /// application name reads back exactly.
+    #[test]
+    fn a_rendered_holder_names_the_process_and_its_application_name_reads_back() {
+        let rendered = holder("leon", "pbps/4242/0a1b2c3d").render();
+        assert_eq!(
+            rendered,
+            "leon [host build-7, pid 4242, CI job GitHub Actions run 99 attempt 2, \
+             application_name \"pbps/4242/0a1b2c3d\"]"
+        );
+        assert_eq!(
+            holder_application_name(&rendered).as_deref(),
+            Some("pbps/4242/0a1b2c3d")
+        );
+    }
+
+    /// An operator's name may say anything, and an application name may hold
+    /// quotes and the marker itself; neither may be misread as the other.
+    #[test]
+    fn the_application_name_survives_a_hostile_operator_and_its_own_quotes() {
+        for (operator, name) in [
+            ("x application_name \"evil\"]", "pbps/1/2"),
+            ("leon", "a \"quoted\" application_name \"name\"] too"),
+            ("", "plain"),
+            ("leon", ""),
+        ] {
+            let rendered = holder(operator, name).render();
+            assert_eq!(
+                holder_application_name(&rendered).as_deref(),
+                Some(name),
+                "{rendered}"
+            );
+        }
+    }
+
+    /// The row fits the lock table's `locked_by` whatever it is given, and
+    /// what gives way is the operator's name, then the job and the host, but
+    /// never the application name the session lookup needs.
+    #[test]
+    fn a_long_holder_fits_the_column_and_keeps_its_application_name() {
+        let name = "n".repeat(128);
+        let long = LockHolder {
+            operator: &"o".repeat(300),
+            host: Some(&"h".repeat(300)),
+            pid: u32::MAX,
+            ci_job: Some(&"j".repeat(300)),
+            application_name: &name,
+        }
+        .render();
+        assert!(long.chars().count() <= LOCKED_BY_CHARS, "{}", long.len());
+        assert_eq!(
+            holder_application_name(&long).as_deref(),
+            Some(name.as_str())
+        );
+        let short = holder(&"o".repeat(300), "pbps/1/2").render();
+        assert!(short.chars().count() <= LOCKED_BY_CHARS);
+        assert!(
+            short.contains("host build-7") && short.contains("CI job"),
+            "{short}"
+        );
+    }
+
+    /// A holder written by hand or by an older pbps has no application name,
+    /// and that reads as none rather than as a guess.
+    #[test]
+    fn a_holder_without_an_application_name_has_none() {
+        for locked_by in [
+            "pipeline-one",
+            "leon [host h, pid 1]",
+            "leon [application_name \"unterminated]",
+            "leon [application_name \"x\"] trailing",
+        ] {
+            assert_eq!(holder_application_name(locked_by), None, "{locked_by}");
+        }
+    }
+
+    #[test]
+    fn a_locked_refusal_carries_the_session_lookup_only_when_there_is_one() {
+        let mut info = LockInfo {
+            locked_by: "leon".into(),
+            locked_at: "2026-09-28T01:02:03.000".into(),
+            session_lookup: None,
+        };
+        let bare = LedgerError::Locked(info.clone()).to_string();
+        assert!(bare.ends_with("clears it."), "{bare}");
+        info.session_lookup = Some("SELECT 1 -- find it".into());
+        let found = LedgerError::Locked(info).to_string();
+        assert!(
+            found.ends_with("clears it.\nSELECT 1 -- find it"),
+            "{found}"
+        );
+    }
 
     #[test]
     fn pruning_keeps_the_newest() {

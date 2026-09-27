@@ -5709,8 +5709,12 @@ async fn the_lock_admits_one_holder_and_names_it_to_the_second() {
         Err(LedgerError::Locked(LockInfo {
             locked_by,
             locked_at,
+            session_lookup,
         })) => {
             assert_eq!(locked_by, "pipeline-one");
+            // A holder written without an application name — by hand, or by
+            // an older pbps — has no session to search for (#1188).
+            assert_eq!(session_lookup, None);
             assert_eq!(locked_at.len(), 23, "{locked_at}");
             assert!(locked_at.contains('T'), "{locked_at}");
         }

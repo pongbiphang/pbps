@@ -328,3 +328,32 @@ async fn a_connection_failure_with_no_server_error_still_renders_its_own_text() 
         "this failure never reached the server, so it carries no SQLSTATE"
     );
 }
+
+async fn application_name(connection_string: &str) -> String {
+    let mut conn = Conn::connect(Driver::Postgres, connection_string)
+        .await
+        .expect("connect to the live server");
+    conn.query("SELECT current_setting('application_name')")
+        .await
+        .unwrap()[0]
+        .try_get_at::<&str>(0)
+        .unwrap()
+        .unwrap()
+        .to_owned()
+}
+
+/// #1188: a session this process opens carries its application name, so a
+/// lock holder's sessions can be found; a name the connection string asks
+/// for is kept rather than overwritten.
+#[tokio::test]
+#[ignore = "needs live PostgreSQL"]
+async fn a_session_is_named_for_this_process_unless_the_string_names_it() {
+    let named = application_name(&conn_str()).await;
+    assert_eq!(named, pbps_db::session_application_name());
+    assert!(
+        named.starts_with(&format!("pbps/{}/", std::process::id())),
+        "{named}"
+    );
+    let own = application_name(&format!("{} application_name=ops-dashboard", conn_str())).await;
+    assert_eq!(own, "ops-dashboard");
+}

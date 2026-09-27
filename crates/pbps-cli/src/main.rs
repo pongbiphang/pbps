@@ -3178,6 +3178,44 @@ fn operator(root: &std::path::Path) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
+/// This machine's name, for the lock row (#1188); `None` when none can be read.
+///
+/// Read without a dependency: the environment where a shell or Windows sets
+/// it, else the kernel's own answer on Linux. A missing name is left out of
+/// the row rather than guessed.
+fn host_name() -> Option<String> {
+    ["HOSTNAME", "COMPUTERNAME"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .chain(
+            ["/proc/sys/kernel/hostname", "/etc/hostname"]
+                .into_iter()
+                .filter_map(|path| std::fs::read_to_string(path).ok()),
+        )
+        .map(|name| name.trim().to_owned())
+        .find(|name| !name.is_empty())
+}
+
+/// The CI job this process runs in, for the lock row (#1188): the identifier
+/// each system's own UI searches by. `None` outside the systems named here.
+fn ci_job() -> Option<String> {
+    ci_job_from(|key| std::env::var(key).ok())
+}
+
+fn ci_job_from(read: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let var = |key| read(key).filter(|v: &String| !v.is_empty());
+    if let Some(run) = var("GITHUB_RUN_ID") {
+        return Some(match var("GITHUB_RUN_ATTEMPT") {
+            Some(attempt) => format!("GitHub Actions run {run} attempt {attempt}"),
+            None => format!("GitHub Actions run {run}"),
+        });
+    }
+    if let Some(job) = var("CI_JOB_ID") {
+        return Some(format!("GitLab job {job}"));
+    }
+    var("BUILD_TAG").map(|tag| format!("Jenkins {tag}"))
+}
+
 /// Today's date in UTC, as `YYYY-MM-DD`.
 ///
 /// No date library is pulled in: this is the only thing needed from one, and this
@@ -3229,6 +3267,39 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1188: the lock row names the CI job by the identifier each system
+    /// searches by, and nothing outside the systems named.
+    #[test]
+    fn the_ci_job_is_named_by_the_systems_own_identifier() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| (*v).to_owned())
+            }
+        };
+        for (pairs, expected) in [
+            (
+                &[("GITHUB_RUN_ID", "99"), ("GITHUB_RUN_ATTEMPT", "2")][..],
+                Some("GitHub Actions run 99 attempt 2"),
+            ),
+            (
+                &[("GITHUB_RUN_ID", "99")][..],
+                Some("GitHub Actions run 99"),
+            ),
+            (&[("CI_JOB_ID", "7")][..], Some("GitLab job 7")),
+            (
+                &[("BUILD_TAG", "jenkins-app-12")][..],
+                Some("Jenkins jenkins-app-12"),
+            ),
+            (&[("GITHUB_RUN_ID", ""), ("CI", "true")][..], None),
+            (&[][..], None),
+        ] {
+            assert_eq!(ci_job_from(env(pairs)).as_deref(), expected, "{pairs:?}");
+        }
+    }
 
     /// The one input to a risk that the artifact itself supplies, and so the
     /// one the re-derivation cannot check: `change_risks` reads `origin`,

@@ -1538,8 +1538,44 @@ pub async fn lock(conn: &mut Conn, holder: &str) -> Result<(), LedgerError> {
             locked_by: "another operation, which released the lock while this one was reading it"
                 .to_owned(),
             locked_at: "just now".to_owned(),
+            session_lookup: None,
         })),
     }
+}
+
+/// The application name this session carries, as the server holds it: the
+/// server cuts a longer one to 63 bytes, and the lock must record the name a
+/// search of `pg_stat_activity` will match (#1188).
+pub async fn session_application_name(conn: &mut Conn) -> Result<String, DbError> {
+    let rows = conn
+        .query("SELECT current_setting('application_name') AS name")
+        .await?;
+    let row = rows
+        .first()
+        .ok_or_else(|| DbError::BadRow("current_setting returned no row".into()))?;
+    text(row, "name")
+}
+
+/// How an operator finds a lock holder's sessions here, from what
+/// `locked_by` recorded; `None` when it recorded no application name.
+///
+/// Measured on 18.6: `pg_stat_activity` lists another role's session and its
+/// `application_name` to any role, and hides `client_addr` and
+/// `backend_start` without `pg_read_all_stats`. Whether the holder has gone
+/// is still the operator's call — a session can end while the process lives
+/// (DECISIONS 285).
+#[must_use]
+pub fn session_lookup(locked_by: &str) -> Option<String> {
+    let name = pbps_db::holder_application_name(locked_by)?;
+    Some(format!(
+        "While the holder is connected, its sessions are listed by:\n  \
+         SELECT pid, usename, client_addr, backend_start FROM pg_stat_activity \
+         WHERE application_name = '{}';\n\
+         `client_addr` and `backend_start` read as NULL without `pg_read_all_stats`. \
+         No row means no session carries that name now; it does not show the process has \
+         exited, so confirm that on its host.",
+        name.replace('\'', "''")
+    ))
 }
 
 /// `undefined_table`: the relation this statement names is not there. **Not**
@@ -1644,10 +1680,14 @@ pub async fn lock_holder(conn: &mut Conn) -> Result<Option<LockInfo>, DbError> {
         }
     };
     match rows.first() {
-        Some(row) => Ok(Some(LockInfo {
-            locked_by: text(row, "locked_by")?,
-            locked_at: text(row, "locked_at")?,
-        })),
+        Some(row) => {
+            let locked_by = text(row, "locked_by")?;
+            Ok(Some(LockInfo {
+                session_lookup: session_lookup(&locked_by),
+                locked_by,
+                locked_at: text(row, "locked_at")?,
+            }))
+        }
         None => Ok(None),
     }
 }

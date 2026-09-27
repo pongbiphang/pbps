@@ -111,6 +111,16 @@ impl Demo {
             .unwrap()
     }
 
+    fn run_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+        Command::new(BIN)
+            .arg("--project")
+            .arg(&self.dir)
+            .args(args)
+            .envs(env.iter().copied())
+            .output()
+            .unwrap()
+    }
+
     fn ids_path(&self) -> PathBuf {
         self.dir.join("schema.ids.json")
     }
@@ -14739,6 +14749,135 @@ fn a_connected_sql_server_plan_names_inapplicable_postgres_checks_in_json() {
         "--checksum",
         &plan_checksum(&artifact),
     ]));
+}
+
+/// One text cell from the server under test.
+fn text_on_server(connection: &str, sql: &str) -> String {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut conn = connect_live(connection).await.unwrap();
+            conn.query(sql).await.unwrap()[0]
+                .try_get_at::<&str>(0)
+                .unwrap()
+                .unwrap()
+                .to_owned()
+        })
+}
+
+/// #1188 on SQL Server: the lock row names the holder's process and the
+/// application name its sessions carry, `sys.dm_exec_sessions` finds them by
+/// it, and the refusal and `unlock` both print that query.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB"]
+fn a_lock_names_its_holders_process_and_says_how_to_find_its_session() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB");
+    let own = OwnDatabase::new(&server, "lock_holder");
+    let connection = own.connection();
+    let assert_ok = |o: Output| {
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        o
+    };
+    let d = Demo::new("lock-holder");
+    d.table(ONE_COLUMN);
+    assert_ok(d.run(&["plan"]));
+    d.commit();
+    assert_ok(d.run(&["bootstrap", "--db", connection]));
+
+    // What the CLI records while it holds the lock, read from inside its own
+    // apply: a DDL trigger runs in that session, beside the lock row.
+    on_server(
+        connection,
+        "CREATE TABLE dbo.held (locked_by nvarchar(256), session_name nvarchar(128));",
+    );
+    on_server(
+        connection,
+        "CREATE TRIGGER copy_lock ON DATABASE FOR ALTER_TABLE AS
+         BEGIN
+           SET NOCOUNT ON;
+           INSERT INTO dbo.held SELECT locked_by, APP_NAME() FROM dbo.__pbps_lock;
+         END",
+    );
+    d.table(&format!("{ONE_COLUMN}  label: {{type: nvarchar(50)}}\n"));
+    assert_ok(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("held.json");
+    assert_ok(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    let checksum = plan_checksum(&plan);
+    assert_ok(d.run_with_env(
+        &[
+            "apply",
+            "--db",
+            connection,
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+        ],
+        &[("GITHUB_RUN_ID", "4242"), ("GITHUB_RUN_ATTEMPT", "2")],
+    ));
+    on_server(connection, "DROP TRIGGER copy_lock ON DATABASE;");
+    let recorded = text_on_server(connection, "SELECT TOP (1) locked_by FROM dbo.held;");
+    let session = text_on_server(connection, "SELECT TOP (1) session_name FROM dbo.held;");
+    assert!(session.starts_with("pbps/"), "{session}");
+    assert!(
+        recorded.ends_with(&format!(
+            ", CI job GitHub Actions run 4242 attempt 2, application_name \"{session}\"]"
+        )),
+        "{recorded}"
+    );
+    assert!(recorded.contains(", pid "), "{recorded}");
+
+    // A holder that is still connected: this test's own session, taking the
+    // lock the way the CLI does.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (mut held, name, holder) = rt.block_on(async {
+        let mut conn = connect_live(connection).await.unwrap();
+        let name = pbps_mssql::state::session_application_name(&mut conn)
+            .await
+            .unwrap();
+        let holder = pbps_db::LockHolder {
+            operator: "holder-1188",
+            host: Some("host-1188"),
+            pid: std::process::id(),
+            ci_job: None,
+            application_name: &name,
+        }
+        .render();
+        pbps_mssql::state::lock(&mut conn, &holder).await.unwrap();
+        (conn, name, holder)
+    });
+    // Found from another session by the name the row recorded. That session
+    // is this process's too, so it carries the same name and is left out.
+    let lookup = format!("FROM sys.dm_exec_sessions WHERE program_name = N'{name}'");
+    assert_eq!(
+        text_on_server(
+            connection,
+            &format!("SELECT CONVERT(nvarchar(10), count(*)) {lookup} AND session_id <> @@SPID;")
+        ),
+        "1",
+        "{holder}"
+    );
+
+    let denied = d.run(&["baseline", "--db", connection, "--reason", "second holder"]);
+    assert_eq!(code(&denied), 1, "{}{}", stdout(&denied), stderr(&denied));
+    for expected in [holder.as_str(), lookup.as_str()] {
+        assert!(stderr(&denied).contains(expected), "{}", stderr(&denied));
+    }
+    let released = assert_ok(d.run(&["unlock", "--db", connection]));
+    for expected in [holder.as_str(), lookup.as_str()] {
+        assert!(
+            stdout(&released).contains(expected),
+            "{}",
+            stdout(&released)
+        );
+    }
+    rt.block_on(async { held.execute("SELECT 1;").await.unwrap() });
 }
 
 #[test]

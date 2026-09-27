@@ -772,6 +772,39 @@ pub async fn unlock(conn: &mut Conn) -> Result<bool, DbError> {
 /// differently, and "I could not look" must never be flattened into "nothing
 /// there". See [`is_missing_table`] for why that distinction cannot be made by
 /// asking the catalog first.
+/// The application name this session carries, as the server holds it, so the
+/// lock records the name `sys.dm_exec_sessions.program_name` will show
+/// (#1188).
+pub async fn session_application_name(conn: &mut Conn) -> Result<String, DbError> {
+    let rows = conn.query("SELECT APP_NAME() AS name;").await?;
+    let row = rows
+        .first()
+        .ok_or_else(|| DbError::BadRow("APP_NAME() returned no row".into()))?;
+    Ok(get::<&str>(row, "name")?.to_owned())
+}
+
+/// How an operator finds a lock holder's sessions here, from what
+/// `locked_by` recorded; `None` when it recorded no application name.
+///
+/// Measured on 17.0.4075.5: without `VIEW SERVER STATE` a login sees only its
+/// own row of `sys.dm_exec_sessions`, so an empty result from such a login
+/// says nothing about the holder. Whether the holder has gone stays the
+/// operator's call (DECISIONS 285).
+#[must_use]
+pub fn session_lookup(locked_by: &str) -> Option<String> {
+    let name = pbps_db::holder_application_name(locked_by)?;
+    Some(format!(
+        "While the holder is connected, its sessions are listed by:\n  \
+         SELECT session_id, login_name, host_name, host_process_id, login_time \
+         FROM sys.dm_exec_sessions WHERE program_name = N'{}';\n\
+         A login without VIEW SERVER STATE (VIEW SERVER PERFORMANCE STATE on SQL Server 2022 \
+         and later) sees only its own session, so no row from it proves nothing. No row from \
+         one that has it means no session carries that name now; it does not show the \
+         process has exited, so confirm that on its host.",
+        name.replace('\'', "''")
+    ))
+}
+
 pub async fn lock_holder(conn: &mut Conn) -> Result<Option<LockInfo>, DbError> {
     let rows = match conn.query(SELECT_LOCK).await {
         Ok(rows) => rows,
@@ -779,10 +812,14 @@ pub async fn lock_holder(conn: &mut Conn) -> Result<Option<LockInfo>, DbError> {
         Err(e) => return Err(e),
     };
     match rows.first() {
-        Some(row) => Ok(Some(LockInfo {
-            locked_by: get::<&str>(row, "locked_by")?.to_owned(),
-            locked_at: get::<&str>(row, "locked_at")?.to_owned(),
-        })),
+        Some(row) => {
+            let locked_by = get::<&str>(row, "locked_by")?.to_owned();
+            Ok(Some(LockInfo {
+                session_lookup: session_lookup(&locked_by),
+                locked_by,
+                locked_at: get::<&str>(row, "locked_at")?.to_owned(),
+            }))
+        }
         None => Ok(None),
     }
 }
