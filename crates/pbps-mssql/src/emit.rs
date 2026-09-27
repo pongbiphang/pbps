@@ -155,7 +155,26 @@ fn ends_like_a_digest(name: &str) -> bool {
 /// prefix. It is seeded with NUL between the parts: NUL is the one character
 /// [`quote`] refuses outright, so no name can contain one and no two different
 /// triples can spell the same seed.
-fn digested_default_constraint_name(table: &TableName, column: &str) -> String {
+pub fn digested_default_constraint_name(table: &TableName, column: &str) -> String {
+    salted_default_constraint_name(table, column, None)
+}
+
+/// The name a rename moves a generated default to when the name
+/// [`default_constraint_name`] gives it is taken (DEC-981.1): the digested
+/// one, unless that *is* the generated name — a table name with `_`, or one
+/// too long to keep — in which case a digest seeded with one more part, so
+/// it is a different name all the same.
+pub fn fallback_default_constraint_name(table: &TableName, column: &str) -> String {
+    let digested = digested_default_constraint_name(table, column);
+    if digested != default_constraint_name(table, column) {
+        return digested;
+    }
+    salted_default_constraint_name(table, column, Some(b"fallback"))
+}
+
+/// [`digested_default_constraint_name`], with `salt` as a fourth part of the
+/// seed when given. `None` is the generated digest, unchanged.
+fn salted_default_constraint_name(table: &TableName, column: &str, salt: Option<&[u8]>) -> String {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
@@ -164,6 +183,10 @@ fn digested_default_constraint_name(table: &TableName, column: &str) -> String {
     hasher.update(table.name.as_bytes());
     hasher.update([0]);
     hasher.update(column.as_bytes());
+    if let Some(salt) = salt {
+        hasher.update([0]);
+        hasher.update(salt);
+    }
     let digest = hasher.finalize();
     let digest: String = digest
         .iter()
@@ -478,12 +501,13 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
                 literal(to)
             );
             let new = default_constraint_name(table, to);
+            let fallback = fallback_default_constraint_name(table, to);
             let olds = std::iter::once(table)
                 .chain(table_was)
-                .map(|t| default_constraint_name(t, from));
+                .flat_map(|t| generated_default_names(t, from));
             for old in olds {
                 // After `sp_rename`, so the column is found by its new name.
-                if let Some(rename) = rename_generated_default(table, to, &old, &new)? {
+                if let Some(rename) = rename_generated_default(table, to, &old, &new, &fallback)? {
                     sql.push('\n');
                     sql.push_str(&rename);
                 }
@@ -1580,32 +1604,64 @@ fn create_table(name: &TableName, table: &Table) -> Sql {
 /// column of the same table, under exactly the name `pbps` would generate
 /// for this one, is not this column's (#991). `None` when the two names are
 /// the same. The `|` keeps padding out of the comparison
-/// (DEC-954.1). A target name something else in the schema already holds is
-/// left alone too, and the default keeps its old name: renaming onto it would
-/// fail the whole table or column rename it follows (review of #988).
+/// (DEC-954.1).
+///
+/// A target name something else in the schema already holds is not renamed
+/// onto: that would fail the whole table or column rename it follows (review
+/// of #988). The default moves to `fallback` instead, the digested name for
+/// the same column, which no other column generates. Kept under `old`, it
+/// held a name a later change in the same plan may generate again, for a new
+/// column or table under the old name (DEC-981.1). Only when the fallback is
+/// taken too does it stay where it is.
 fn rename_generated_default(
     table: &TableName,
     column: &str,
     old: &str,
     new: &str,
+    fallback: &str,
 ) -> Result<Option<String>, DialectError> {
     if old == new {
         return Ok(None);
+    }
+    let schema = quote(&table.schema)?;
+    let at = |name: &str| -> Result<String, DialectError> {
+        Ok(literal(&format!("{schema}.{}", quote(name)?)))
+    };
+    let rename_to = |name: &str| -> Result<String, DialectError> {
+        Ok(format!(
+            "IF OBJECT_ID({}) IS NULL EXEC sp_rename {}, {}, 'OBJECT'",
+            at(name)?,
+            at(old)?,
+            literal(name)
+        ))
+    };
+    let mut body = rename_to(new)?;
+    if fallback != new && fallback != old {
+        body = format!("{body}\n    ELSE {};", rename_to(fallback)?);
+    } else {
+        body.push(';');
     }
     Ok(Some(format!(
         "IF EXISTS (SELECT 1 FROM sys.default_constraints \
          WHERE parent_object_id = OBJECT_ID({table}, N'U') \
          AND parent_column_id = COLUMNPROPERTY(OBJECT_ID({table}, N'U'), {}, 'ColumnId') \
-         AND (name + N'|') COLLATE Latin1_General_BIN2 = {}) \
-         AND OBJECT_ID({}) IS NULL\n    \
-         EXEC sp_rename {}, {}, 'OBJECT';",
+         AND (name + N'|') COLLATE Latin1_General_BIN2 = {})\nBEGIN\n    {body}\nEND;",
         literal(column),
         literal(&format!("{old}|")),
-        literal(&format!("{}.{}", quote(&table.schema)?, quote(new)?)),
-        literal(&format!("{}.{}", quote(&table.schema)?, quote(old)?)),
-        literal(new),
         table = literal(&qualified(table)?),
     )))
+}
+
+/// The names `pbps` may have left a column's default under: the one it
+/// generates, and the fallback a rename moves it to when that is taken
+/// (DEC-981.1). Always two different names. A later rename looks under both, so a default parked at its
+/// fallback still follows its table and column. Public so the connected
+/// plan's namespace walk (`pbps-cli`) moves defaults exactly as this emits.
+pub fn generated_default_names(table: &TableName, column: &str) -> Vec<String> {
+    vec![
+        default_constraint_name(table, column),
+        fallback_default_constraint_name(table, column),
+    ]
 }
 
 /// Renames a table, then each default `pbps` generated for it to the name the
@@ -1651,12 +1707,18 @@ fn rename_table(from: &TableName, to: &TableName, defaults: &[String]) -> Sql {
     // whose old and new names agree needs nothing.
     let renames: Vec<String> = defaults
         .iter()
-        .map(|column| {
+        .flat_map(|column| {
+            generated_default_names(from, column)
+                .into_iter()
+                .map(move |old| (column, old))
+        })
+        .map(|(column, old)| {
             rename_generated_default(
                 to,
                 column,
-                &default_constraint_name(from, column),
+                &old,
                 &default_constraint_name(to, column),
+                &fallback_default_constraint_name(to, column),
             )
         })
         .collect::<Result<Vec<_>, _>>()?
@@ -1921,6 +1983,32 @@ mod tests {
         );
     }
 
+    /// #981: the fallback is always a name other than the generated one. For
+    /// a table whose generated name is already digested (an `_` in it), it
+    /// is a digest seeded differently, never the taken name again; for any
+    /// other it is the digested name, as before.
+    #[test]
+    fn a_defaults_fallback_name_differs_from_its_generated_one() {
+        for (table, digested_already) in [("dbo.t", false), ("dbo.order_items", true)] {
+            let table = tname(table);
+            let generated = default_constraint_name(&table, "d");
+            let fallback = fallback_default_constraint_name(&table, "d");
+            assert_ne!(generated, fallback, "{table}");
+            assert_eq!(
+                fallback == digested_default_constraint_name(&table, "d"),
+                !digested_already,
+                "{table}: {fallback}"
+            );
+            assert!(fallback.starts_with("DF_pbps_"), "{fallback}");
+            assert_eq!(generated_default_names(&table, "d"), [generated, fallback]);
+        }
+        // And stable: the same column gets the same fallback on every run.
+        assert_eq!(
+            fallback_default_constraint_name(&tname("dbo.order_items"), "d"),
+            fallback_default_constraint_name(&tname("dbo.order_items"), "d")
+        );
+    }
+
     #[test]
     fn renames_go_through_sp_rename() {
         let sql = sql_of(&Change::RenameColumn {
@@ -1942,8 +2030,16 @@ mod tests {
             sql[0].contains("= N'DF_pbps_customer_customer_name|')")
                 && sql[0].contains(
                     "EXEC sp_rename N'[dbo].[DF_pbps_customer_customer_name]', \
-                     N'DF_pbps_customer_full_name', 'OBJECT';"
+                     N'DF_pbps_customer_full_name', 'OBJECT'"
                 ),
+            "{sql:?}"
+        );
+        // #981: when that name is taken, to the digested one, never staying
+        // under the old name a later change may generate again; and a default
+        // already parked at its digested name is sought too.
+        assert!(
+            sql[0].contains("ELSE IF OBJECT_ID(N'[dbo].[DF_pbps_customer_full_name_")
+                && sql[0].contains("= N'DF_pbps_customer_customer_name_"),
             "{sql:?}"
         );
     }
@@ -1962,7 +2058,7 @@ mod tests {
         assert_eq!(sql.len(), 3, "transfer, rename, defaults: {sql:?}");
         assert!(sql[2].contains("OBJECT_ID(N'[app].[u]', N'U')"), "{sql:?}");
         assert!(
-            sql[2].contains("EXEC sp_rename N'[app].[DF_pbps_t_c]', N'DF_pbps_u_c', 'OBJECT';"),
+            sql[2].contains("EXEC sp_rename N'[app].[DF_pbps_t_c]', N'DF_pbps_u_c', 'OBJECT'"),
             "{sql:?}"
         );
         let bare = sql_of(&Change::RenameTable {
@@ -1990,7 +2086,7 @@ mod tests {
         for old in ["DF_pbps_u_a", "DF_pbps_t_a"] {
             assert!(
                 sql[0].contains(&format!(
-                    "EXEC sp_rename N'[dbo].[{old}]', N'DF_pbps_u_b', 'OBJECT';"
+                    "EXEC sp_rename N'[dbo].[{old}]', N'DF_pbps_u_b', 'OBJECT'"
                 )),
                 "{old}: {sql:?}"
             );
@@ -2003,7 +2099,9 @@ mod tests {
             table_was: None,
         });
         assert!(!alone[0].contains("DF_pbps_t_a"), "{alone:?}");
-        assert_eq!(alone[0].matches("sp_rename").count(), 2, "{alone:?}");
+        // Sought under this table's two names for it, the generated one and
+        // the digested one a taken target leaves it at (#981).
+        assert_eq!(alone[0].matches("IF EXISTS").count(), 2, "{alone:?}");
     }
 
     /// The new name must be bare: qualifying it makes SQL Server store the

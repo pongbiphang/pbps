@@ -642,8 +642,8 @@ so it follows:
 Each rename happens only if the constraint still has the name `pbps` generated
 (compared past padding, DEC-954.1), so an adopted default under a name `pbps`
 never chose keeps it. A target name another object in the schema already
-holds is left alone as well, and the default keeps its old name, so the table
-or column rename it follows still runs (review of #988). Deriving the name from
+holds is left alone as well, so the table or column rename it follows still
+runs (review of #988); where the default goes instead is DEC-981.1's. Deriving the name from
 a uid instead would have left
 names that no longer say which table and column they belong to, which is the
 reason `pbps` names defaults at all. Both fields are `#[serde(default)]`; per
@@ -680,3 +680,38 @@ names) ties the two together. `the_pull_keeps_project_ledger_names_beside_the_re
 (PostgreSQL live suite) checks that only the two `public` ledger tables are
 hidden, and that a project's same-named tables in another schema stay visible
 and valid.
+
+<a id="dec-981-1"></a>
+
+**DEC-981.1. A generated default whose new name is taken moves to its digested
+name, not its old one (#981, amending DEC-975.1).** DEC-975.1 left such a
+default under its old name, so that the table or column rename it follows
+would still run. But the old name is exactly the one a later change in the
+same plan generates again: a new column under the old column name, or a new
+table under the old table name. Measured on 17.0: renaming `dbo.t.c` to `d`
+beside an object `dbo.DF_pbps_t_d`, then adding a defaulted `c`, was refused
+by `ALTER TABLE ... ADD [c] ... CONSTRAINT [DF_pbps_t_c]`.
+
+The fallback is the digested name for the same column,
+`DF_pbps_<table>_<column>_<digest>`. The digest is over the qualified column
+(DEC-496.1), so no other column generates that name. When the generated name
+is itself the digested one, which happens for every table name with `_` and
+for names too long to keep, the fallback is a digest seeded with one more part.
+Otherwise the fallback would be the taken name again, and the default would
+stay where it is (review of #1200). The fallback is used only when the target
+is taken, and when the fallback is taken too, the default stays where it is.
+
+A later rename looks for a default under both of the names `pbps` may have
+left it under, the generated one and the digested one, so a default parked at
+its fallback still follows its table and column. An adopted default under a
+name `pbps` never chose is still left alone.
+
+The connected plan's namespace walk (`refuse_occupied_objects` in
+`pbps-cli`) moves a default by the same rules, using the same name functions,
+and its read covers the fallback names too. Otherwise the walk would keep the
+default under its old name and refuse a plan whose emitted SQL frees that
+name (review of #1200).
+
+Pinned by `a_default_whose_new_name_is_taken_frees_its_old_one` (SQL Server
+live suite). `a_renamed_tables_and_columns_generated_defaults_follow_them` now
+expects the fallback name where DEC-975.1 kept the old one.
