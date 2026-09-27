@@ -682,18 +682,34 @@ pub(crate) fn refuse_occupied_objects(
             .collect();
         let mut current: BTreeMap<TableName, TableName> =
             at.keys().map(|n| (n.clone(), n.clone())).collect();
-        let others: BTreeSet<TableName> = occupants
+        let others: Vec<&pbps_mssql::catalog::NameOccupant> = occupants
             .iter()
             .filter(|o| o.kind != "default constraint")
-            .map(|o| o.name.clone())
+            .collect();
+        // A table transferred to another schema takes its constraints and
+        // defaults along before any column rename runs; a table rename's own
+        // moves are not judged against it, which only errs toward refusing.
+        let transferred: BTreeSet<&TableName> = cs
+            .changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::RenameTable { from, to, .. } if from.schema != to.schema => Some(from),
+                _ => None,
+            })
             .collect();
         for m in default_moves(cs).into_iter().filter(|m| m.old != m.new) {
-            let dropped = |n: &TableName| {
+            let dropped = |n: &TableName, parent: Option<&TableName>| {
                 dropped_modules.contains(n)
-                    || (m.after_constraint_drops && before_column_renames.contains(n))
+                    || (m.after_constraint_drops
+                        && (before_column_renames.contains(n)
+                            || parent.is_some_and(|p| transferred.contains(p))))
             };
-            let held = others.iter().any(|n| n == &m.new && !dropped(n))
-                || current.values().any(|n| n == &m.new);
+            let held = others
+                .iter()
+                .any(|o| o.name == m.new && !dropped(&o.name, o.parent.as_ref()))
+                || current
+                    .iter()
+                    .any(|(original, n)| n == &m.new && !dropped(n, at.get(original)));
             let Some(original) = current
                 .iter()
                 .find(|(original, now)| **now == m.old && at.get(*original) == Some(&m.parent))
@@ -7189,6 +7205,33 @@ mod tests {
             )
             .is_err()
         );
+        // A check at the target on a table the plan transfers to another
+        // schema leaves with its table before the column rename looks.
+        let other = TableName::new("dbo", "other");
+        let on_other = NameOccupant {
+            wanted: target.clone(),
+            name: target.clone(),
+            kind: "check constraint".into(),
+            parent: Some(other.clone()),
+            parent_column: None,
+        };
+        let transfer = PlannedChange::new(Change::RenameTable {
+            uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.other", 0),
+            from: other.clone(),
+            to: TableName::new("archive", "other"),
+            defaults: Vec::new(),
+        });
+        refuse_occupied_objects(
+            &plan(vec![transfer, rename_column(), create_at(&generated)]),
+            &[the_default.clone(), on_other.clone()],
+            "prod",
+        )
+        .expect("the transfer takes the check out of the schema first");
+        assert!(
+            refuse_occupied_objects(&moves, &[the_default.clone(), on_other], "prod").is_err(),
+            "untransferred, the check still holds the target"
+        );
+
         // A chain: `b -> c` moves `b`'s default away before `a -> b` needs
         // its name, so `a`'s old default name is free for a new table. In
         // the other order `a`'s target is still held and it stays.

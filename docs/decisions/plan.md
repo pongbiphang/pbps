@@ -455,7 +455,8 @@ the plan can clear a name first, and an occupant it clears is not one:
   target, so the target names are asked too, and a taken target keeps the
   default where it is. A target held by something the plan drops before the
   rename runs counts as free: a module drop before either rename, and a
-  constraint drop or a table rename before a column rename. The moves are
+  constraint drop, a table rename or a transfer of the holder's table to
+  another schema before a column rename. The moves are
   walked in plan order, so an earlier move that vacates a target frees it for
   a later one: a column rename chain `b -> c`, then `a -> b`, from revisions
   an environment skipped;
