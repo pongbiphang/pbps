@@ -856,6 +856,41 @@ async fn a_dropped_overload_is_held_by_its_declared_identity_not_by_a_count() {
     }
 }
 
+/// A routine the plan creates whose body is bound at run time is named with
+/// the others: its body is outside the proof whether or not the target has
+/// it yet. A routine whose body is bound at creation is not named.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_new_runtime_bound_routine_is_named_as_one() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let assessment = analyze(
+            &server,
+            "new_runtime",
+            Case {
+                schemas: &["app"],
+                extras: &[],
+                target: "",
+                base: Declared::default(),
+                desired: Declared::default()
+                    .function(
+                        "app.late()",
+                        "() RETURNS integer LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$",
+                    )
+                    .function("app.early()", "() RETURNS integer LANGUAGE sql RETURN 1"),
+            },
+        )
+        .await
+        .unwrap();
+        let named: Vec<_> = assessment
+            .runtime_bound
+            .iter()
+            .map(|routine| routine.name.clone())
+            .collect();
+        assert_eq!(named, [["app", "late"]], "{variable}: {assessment:#?}");
+    }
+}
+
 /// A declaration that needs an object nobody reconstructed, and two that
 /// need each other, cannot be compiled; the refusal names the declaration,
 /// and no verdict is read from the half-built namespace.

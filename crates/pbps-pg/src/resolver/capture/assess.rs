@@ -456,14 +456,13 @@ pub fn assess(
         assessment.surfaces.insert(object.clone(), verdict);
     }
     // A runtime-bound routine may have no creation-time bindings at all, so
-    // it is named whether or not it has a surface to compare.
+    // it is named whether or not it has a surface to compare, and whether or
+    // not the target has it yet: one the plan creates has a body outside the
+    // proof just the same (#1064).
     assessment.runtime_bound = desired
         .limitations
         .iter()
-        .filter(|object| {
-            target.inputs.contains_key(*object)
-                && object.name.first().is_some_and(|schema| !is_system(schema))
-        })
+        .filter(|object| object.name.first().is_some_and(|schema| !is_system(schema)))
         .cloned()
         .collect();
     assessment
