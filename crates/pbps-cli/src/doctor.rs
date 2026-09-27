@@ -1024,10 +1024,11 @@ fn env_findings(
                 ),
             )
             .remedy(format!(
-                "pbps apply {} --plan {} --checksum {} --staged --resume",
+                "pbps apply {} --plan {} --checksum {} --allow {} --staged --resume",
                 target_arg(d),
                 crate::report::placeholder("plan.json"),
                 crate::report::placeholder("approved-checksum"),
+                crate::report::placeholder(crate::status::RESUME_ALLOW),
             )),
         ),
         // Unanswerable, like `permission.unknown`: `doctor` could not establish
@@ -1888,7 +1889,10 @@ mod tests {
         }
         let staged = remedies(&diagnosed(None, "mid-deployment"));
         assert!(
-            staged[0].contains("--plan \"<plan.json>\" --checksum \"<approved-checksum>\""),
+            staged[0].contains(
+                "--plan \"<plan.json>\" --checksum \"<approved-checksum>\" \
+                 --allow \"<approved-risk-classes>\""
+            ),
             "{staged:?}"
         );
     }

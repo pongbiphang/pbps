@@ -7913,6 +7913,128 @@ fn modules_apply_then_pull_round_trip_and_changed_bodies_are_drift() {
     assert_eq!(code(&overwrite), 1);
 }
 
+/// #1187: `--resume` passes the risk gate again, and the resume `status`
+/// printed carried no `--allow`, so for the canonical staged plan — a
+/// cross-schema rename, class `rename`, stopped between its schema transfer
+/// and its rename — the one command offered as the way forward was refused.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn the_resume_status_prints_carries_the_approval_the_gate_asks_for_again() {
+    let own = OwnDatabase::new(&server(), "resume_allow");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "resume-allow", ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: postgres\nenvironments:\n  dev:\n    url_env: PBPS_RESUME_DB\n",
+    )
+    .unwrap();
+    d.commit();
+    let env = [("PBPS_RESUME_DB", connection)];
+    on_server(connection, "CREATE SCHEMA moved; CREATE SCHEMA witness");
+    d.table(&ONE_COLUMN.replace("table: app.t", "table: moved.u\nrenamed_from: app.t"));
+    let plan = connected_artifact(&d, connection, true);
+    on_server(
+        connection,
+        r#"
+        CREATE FUNCTION witness.stop_rename() RETURNS event_trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF to_regclass('moved.u') IS NOT NULL THEN RAISE EXCEPTION 'stop after schema transfer'; END IF;
+        END $$;
+        CREATE EVENT TRIGGER stop_rename ON ddl_command_end WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION witness.stop_rename();
+    "#,
+    );
+    let failed = approved_apply(&d, connection, &plan, &["--allow", "rename", "--staged"]);
+    assert_eq!(code(&failed), 1, "{}{}", stdout(&failed), stderr(&failed));
+    on_server(connection, "DROP EVENT TRIGGER stop_rename");
+    assert_eq!(
+        latest_snapshot(connection)
+            .staged
+            .map(|p| (p.completed, p.total)),
+        Some((1, 2))
+    );
+
+    let status = d.run_with_env(&["status", "--format", "json"], &env);
+    let report: serde_json::Value = serde_json::from_str(&stdout(&status))
+        .unwrap_or_else(|e| panic!("{e}: {}{}", stdout(&status), stderr(&status)));
+    let staged = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "state.mid-deployment")
+        .unwrap_or_else(|| panic!("{report}"));
+    assert!(
+        staged["message"]
+            .as_str()
+            .unwrap()
+            .contains("--allow \"<approved-risk-classes>\""),
+        "{report}"
+    );
+    let remedy = staged["remedy"].as_str().unwrap();
+    assert!(
+        remedy.contains("--allow \"<approved-risk-classes>\""),
+        "{remedy}"
+    );
+
+    // The printed command with its placeholders filled. Every placeholder is
+    // a single quoted word, and the environment name needs no quoting.
+    let checksum = plan_checksum(&plan);
+    let filled = remedy
+        .replace("\"<plan.json>\"", plan.to_str().unwrap())
+        .replace("\"<approved-checksum>\"", &checksum);
+    let command = |allow: Option<&str>| -> Vec<String> {
+        let mut words: Vec<String> = filled
+            .split_whitespace()
+            .skip(1)
+            .map(str::to_owned)
+            .collect();
+        let at = words
+            .iter()
+            .position(|w| w == "--allow")
+            .unwrap_or_else(|| panic!("{remedy}"));
+        match allow {
+            Some(classes) => words[at + 1] = classes.to_owned(),
+            None => {
+                words.drain(at..at + 2);
+            }
+        }
+        assert!(!words.iter().any(|w| w.contains('<')), "{words:?}");
+        words
+    };
+
+    // Without the approval the gate refuses, as the issue measured, and the
+    // checkpoint is untouched.
+    let bare = command(None);
+    let refused = d.run_with_env(&bare.iter().map(String::as_str).collect::<Vec<_>>(), &env);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("risks that were not approved: rename"),
+        "{}",
+        stderr(&refused)
+    );
+    assert_eq!(
+        latest_snapshot(connection).staged.map(|p| p.completed),
+        Some(1)
+    );
+
+    // Filled with the class the plan was approved with, it resumes.
+    let filled = command(Some("rename"));
+    succeeds(d.run_with_env(&filled.iter().map(String::as_str).collect::<Vec<_>>(), &env));
+    let closed = latest_snapshot(connection);
+    assert!(closed.staged.is_none(), "{closed:?}");
+    assert!(
+        closed
+            .schema
+            .tables
+            .contains_key(&"moved.u".parse().unwrap())
+    );
+}
+
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_staged_cli_checkpoint_survives_state_json_and_resume_checks_its_intermediate_name() {
