@@ -548,3 +548,163 @@ fn adding_a_column_requires_more_than_its_default_transition() {
         true,
     );
 }
+
+fn rename_endpoints(column: bool) {
+    let table: TableName = "app.v".parse().unwrap();
+    let (drop, surface) = dropped_surfaces().pop().unwrap();
+    let (_, mut evidence) = drop_fixture(drop, surface);
+    let table_object = evidence.before.prerequisites()[0].object.clone();
+    let (change, from, to, old_object, new_object) = if column {
+        let old_object = ObjectIdentity {
+            class: "column".into(),
+            name: vec!["n".into()],
+            signature: vec![table_object],
+        };
+        let mut new_object = old_object.clone();
+        new_object.name[0] = "m".into();
+        let mut before = serde_json::to_value(&evidence.before).unwrap();
+        before["prerequisites"][0]["object"] = serde_json::to_value(&old_object).unwrap();
+        // Columns are prerequisites, not relation-name candidates.
+        before["membership"][0]["members"] = serde_json::json!([]);
+        evidence.before = serde_json::from_value(before).unwrap();
+        (
+            Change::RenameColumn {
+                uid: "c_000000".parse().unwrap(),
+                table: table.clone(),
+                from: "n".into(),
+                to: "m".into(),
+                table_was: None,
+            },
+            Surface::Column(table.column("n")),
+            Surface::Column(table.column("m")),
+            old_object,
+            new_object,
+        )
+    } else {
+        let mut new_object = table_object.clone();
+        new_object.name[1] = "w".into();
+        (
+            Change::RenameTable {
+                uid: "t_000000".parse().unwrap(),
+                from: table.clone(),
+                to: "app.w".parse().unwrap(),
+                defaults: vec![],
+            },
+            Surface::Table(table.clone()),
+            Surface::Table("app.w".parse().unwrap()),
+            table_object,
+            new_object,
+        )
+    };
+    let changes = ChangeSet {
+        changes: vec![PlannedChange::new(change)],
+    };
+    let mut compiled = serde_json::to_value(&evidence.before).unwrap();
+    compiled["prerequisites"][0]["object"] = serde_json::to_value(&new_object).unwrap();
+    if !column {
+        compiled["membership"][0]["members"][0] = serde_json::to_value(&new_object).unwrap();
+    }
+    let compiled: InputManifest = serde_json::from_value(compiled).unwrap();
+    // Plain tables and columns need not occur in a binding-surface inventory.
+    evidence.surfaces.clear();
+    evidence.transitions = vec![ObjectTransition {
+        surface: from.clone(),
+        before: BTreeSet::from([old_object.clone()]),
+        after: BTreeSet::from([new_object.clone()]),
+    }];
+    evidence.after = evidence
+        .before
+        .project(&changes, &compiled, &evidence.transitions)
+        .unwrap();
+    evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
+    evidence.validate(&changes).unwrap();
+    assert_eq!(evidence.after, compiled);
+    // A producer may split the inventory by the old/new surface, or aggregate
+    // a column rename under its owning table. Both endpoints still matter.
+    let mut split = evidence.clone();
+    split.transitions[0].after.clear();
+    split.transitions.push(ObjectTransition {
+        surface: to,
+        before: BTreeSet::new(),
+        after: BTreeSet::from([new_object.clone()]),
+    });
+    split.transitions.sort_by(|a, b| a.surface.cmp(&b.surface));
+    split.validate(&changes).unwrap();
+    if column {
+        let mut aggregate = evidence.clone();
+        aggregate.transitions[0].surface = Surface::Table(table);
+        aggregate.validate(&changes).unwrap();
+    }
+    for omit_before in [false, true] {
+        let mut omitted = evidence.clone();
+        let mut after = serde_json::to_value(&evidence.before).unwrap();
+        if omit_before {
+            omitted.transitions[0].before.clear();
+            let mut records = evidence.before.prerequisites().to_vec();
+            records.extend(
+                compiled
+                    .prerequisites()
+                    .iter()
+                    .filter(|p| p.object == new_object)
+                    .cloned(),
+            );
+            records.sort_by(|a, b| a.object.cmp(&b.object));
+            after["prerequisites"] = serde_json::to_value(records).unwrap();
+            if !column {
+                after["membership"][0]["members"] =
+                    serde_json::to_value(BTreeSet::from([old_object.clone(), new_object.clone()]))
+                        .unwrap();
+            }
+        } else {
+            omitted.transitions[0].after.clear();
+            after["prerequisites"] = serde_json::to_value(
+                evidence
+                    .before
+                    .prerequisites()
+                    .iter()
+                    .filter(|p| p.object != old_object)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            after["membership"][0]["members"] = serde_json::json!([]);
+        }
+        omitted.after = serde_json::from_value(after).unwrap();
+        let decoded: ResolverEvidence =
+            serde_json::from_value(serde_json::to_value(&omitted).unwrap()).unwrap();
+        assert!(
+            decoded.validate(&changes).is_err(),
+            "rename reader accepted missing endpoint (before={omit_before})"
+        );
+        assert!(
+            evidence
+                .before
+                .project(&changes, &compiled, &omitted.transitions)
+                .is_err(),
+            "projection accepted missing rename endpoint"
+        );
+        assert!(
+            ResolverEvidence::new(
+                &changes,
+                evidence.qualification.clone(),
+                evidence.authorization.clone(),
+                evidence.before.clone(),
+                &compiled,
+                vec![],
+                omitted.transitions,
+                evidence.ordering.clone(),
+            )
+            .is_err(),
+            "constructor accepted missing rename endpoint"
+        );
+    }
+}
+
+#[test]
+fn plain_table_renames_require_opening_and_closing_inventories() {
+    rename_endpoints(false);
+}
+
+#[test]
+fn plain_column_renames_require_opening_and_closing_inventories() {
+    rename_endpoints(true);
+}

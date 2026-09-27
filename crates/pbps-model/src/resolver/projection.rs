@@ -34,13 +34,29 @@ impl InputManifest {
         }
         // Checking supplied entries alone accepts an empty inventory for a
         // DROP, leaving the closing manifest at the pre-DDL state (SPEC 9.3.2).
-        if changes.changes.iter().any(|p| {
-            changes_catalog(&p.change)
-                && !transitions
-                    .iter()
-                    .any(|t| covers_change(&p.change, &t.surface))
-        }) {
-            return Err(ManifestError::Incomplete);
+        for step in changes
+            .changes
+            .iter()
+            .filter(|p| changes_catalog(&p.change))
+        {
+            let mut matching = transitions
+                .iter()
+                .filter(|t| covers_change(&step.change, &t.surface));
+            if matching.clone().next().is_none() {
+                return Err(ManifestError::Incomplete);
+            }
+            // Plain tables/columns need no binding observation. Their rename
+            // must still remove an opening inventory and install a closing
+            // one; otherwise a one-sided rename masquerades as DROP or ADD.
+            // Allow either one aggregate transition or separate old/new ones.
+            if matches!(
+                step.change,
+                Change::RenameTable { .. } | Change::RenameColumn { .. }
+            ) && (!matching.clone().any(|t| !t.before.is_empty())
+                || !matching.any(|t| !t.after.is_empty()))
+            {
+                return Err(ManifestError::Incomplete);
+            }
         }
         let mut removed = BTreeSet::new();
         let mut installed = BTreeSet::new();
