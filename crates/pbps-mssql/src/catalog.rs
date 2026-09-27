@@ -66,9 +66,10 @@ SELECT t.object_id, s.name AS schema_name, t.name AS table_name, t.temporal_type
                 IN (N'__pbps_state|', N'__pbps_lock|'))
  ORDER BY s.name, t.name;";
 
-// SQL Server added the ledger columns of `sys.tables` in 2022. A 2016-2019
-// server reads temporal metadata but must not be asked for them: naming a
-// column the view lacks fails the whole pull. No ledger table can exist there.
+// SQL Server added the ledger columns of `sys.tables` in 2022. A server
+// without them reads temporal metadata but must not be asked for them: naming
+// a column the view lacks fails the whole pull. No ledger table can exist
+// there.
 const PRE_LEDGER_TABLES: &str = "\
 SELECT t.object_id, s.name AS schema_name, t.name AS table_name, t.temporal_type,
        CONVERT(bit, CASE WHEN p.object_id IS NULL THEN 0 ELSE 1 END) AS has_period,
@@ -99,21 +100,22 @@ SELECT t.object_id, s.name AS schema_name, t.name AS table_name,
                 IN (N'__pbps_state|', N'__pbps_lock|'))
  ORDER BY s.name, t.name;";
 
-fn tables_query(product_version: &str, edition: &str) -> String {
+/// `has_ledger` is the server's own answer to whether `sys.tables` carries
+/// the ledger columns, not a guess from the banner: Azure SQL Edge says
+/// "Azure" on a 15.x engine without them, and Azure SQL Database says 12.x on
+/// one with them.
+fn tables_query(product_version: &str, edition: &str, has_ledger: bool) -> String {
+    if has_ledger {
+        return TABLES.to_owned();
+    }
     let major = product_version
         .split('.')
         .next()
         .and_then(|v| v.parse::<u32>().ok());
-    // Azure carries both features whatever its banner says. An unreadable
-    // version gets the full query: failing on a column an old server lacks is
-    // loud, while reading a ledger table as ordinary would not be.
-    if edition.to_ascii_lowercase().contains("azure") {
-        return TABLES.to_owned();
-    }
-    match major {
-        Some(v) if v < 13 => LEGACY_TABLES.to_owned(),
-        Some(v) if v < 16 => PRE_LEDGER_TABLES.to_owned(),
-        _ => TABLES.to_owned(),
+    if !edition.to_ascii_lowercase().contains("azure") && major.is_some_and(|v| v < 13) {
+        LEGACY_TABLES.to_owned()
+    } else {
+        PRE_LEDGER_TABLES.to_owned()
     }
 }
 
@@ -306,13 +308,19 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
         .query(
             "SELECT CONVERT(nvarchar(128), SERVERPROPERTY('ProductVersion')) AS version,
                 CONVERT(nvarchar(128), SERVERPROPERTY('Edition')) AS edition,
-                CONVERT(nvarchar(128), DATABASEPROPERTYEX(DB_NAME(), 'Collation')) AS db_collation;",
+                CONVERT(nvarchar(128), DATABASEPROPERTYEX(DB_NAME(), 'Collation')) AS db_collation,
+                CONVERT(bit, CASE WHEN COL_LENGTH('sys.tables', 'ledger_type') IS NULL
+                                  THEN 0 ELSE 1 END) AS has_ledger;",
         )
         .await?;
     let version = versions
         .first()
         .ok_or_else(|| DbError::BadRow("the server version query returned no row".into()))?;
-    let tables = tables_query(get(version, "version")?, get(version, "edition")?);
+    let tables = tables_query(
+        get(version, "version")?,
+        get(version, "edition")?,
+        get(version, "has_ledger")?,
+    );
     raw.database_collation = get::<&str>(version, "db_collation")?.to_owned();
     for row in conn.query(&tables).await? {
         raw.tables.push(RawTable {
@@ -1034,7 +1042,7 @@ mod tests {
     #[test]
     fn old_servers_are_not_asked_for_a_temporal_catalog_column() {
         for version in ["10.50.6000.34", "11.0.7001.0", "12.0.6024.0"] {
-            let query = tables_query(version, "Developer Edition");
+            let query = tables_query(version, "Developer Edition", false);
             assert!(!query.contains("t.temporal_type"), "{query}");
             assert!(!query.contains("sys.periods"), "{query}");
             assert!(query.contains("CONVERT(tinyint, 0) AS temporal_type"));
@@ -1046,22 +1054,33 @@ mod tests {
             ("12.0.2000.8", "SQL Azure"),
             ("unknown", "Developer Edition"),
         ] {
-            let query = tables_query(version, edition);
-            assert!(query.contains("t.temporal_type"));
-            assert!(query.contains("sys.periods"));
+            for has_ledger in [false, true] {
+                let query = tables_query(version, edition, has_ledger);
+                assert!(query.contains("t.temporal_type"));
+                assert!(query.contains("sys.periods"));
+            }
         }
     }
 
     #[test]
-    fn servers_before_2022_are_not_asked_for_a_ledger_catalog_column() {
-        for version in ["11.0.7001.0", "13.0.1601.5", "14.0.3456.2", "15.0.4355.3"] {
-            let query = tables_query(version, "Developer Edition");
+    fn only_a_server_whose_catalog_has_the_ledger_columns_is_asked_for_them() {
+        // Azure SQL Edge's banner says Azure on a 15.x engine whose
+        // `sys.tables` has no ledger columns; the probe, not the banner, decides.
+        for (version, edition) in [
+            ("11.0.7001.0", "Developer Edition"),
+            ("13.0.1601.5", "Developer Edition"),
+            ("15.0.4355.3", "Developer Edition"),
+            ("15.0.2000.1574", "Azure SQL Edge Developer"),
+            ("12.0.2000.8", "SQL Azure"),
+            ("unknown", "Developer Edition"),
+        ] {
+            let query = tables_query(version, edition, false);
             for column in [
                 "t.ledger_type",
                 "t.is_dropped_ledger_table",
                 "t.ledger_view_id",
             ] {
-                assert!(!query.contains(column), "{version}: {query}");
+                assert!(!query.contains(column), "{version} {edition}: {query}");
             }
             assert!(query.contains("CONVERT(tinyint, 0) AS ledger_type"));
         }
@@ -1069,9 +1088,8 @@ mod tests {
             ("16.0.1000.6", "Developer Edition"),
             ("17.0.4075.5", "Enterprise Developer Edition (64-bit)"),
             ("12.0.2000.8", "SQL Azure"),
-            ("unknown", "Developer Edition"),
         ] {
-            let query = tables_query(version, edition);
+            let query = tables_query(version, edition, true);
             assert!(query.contains("t.ledger_type"), "{version}");
             assert!(query.contains("t.is_dropped_ledger_table"), "{version}");
             assert!(query.contains("t.ledger_view_id"), "{version}");
