@@ -1873,6 +1873,7 @@ fn a_sequence_or_synonym_at_a_new_tables_name_refuses_the_plan() {
     on_server(
         connection,
         "CREATE TABLE dbo.keep (id int, c int CONSTRAINT x DEFAULT 0); \
+         CREATE TABLE dbo.keeptwo (id int, c int CONSTRAINT DF_pbps_keeptwo_c DEFAULT 0); \
          CREATE SEQUENCE dbo.s; \
          CREATE SYNONYM dbo.y FOR dbo.keep;",
     );
@@ -1943,6 +1944,20 @@ fn a_sequence_or_synonym_at_a_new_tables_name_refuses_the_plan() {
     let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     apply(&d, &plan, &["--allow", "destructive"]);
+
+    // A generated default the same revision's column rename moves to the new
+    // column's name, which runs before the table is created: its old name is
+    // free for the table (#1147 review).
+    let d = adopted("moved-default");
+    let path = d.dir.join("schema/dbo.keeptwo.yml");
+    let pulled = std::fs::read_to_string(&path).unwrap();
+    let renamed = pulled.replacen("\n  c:\n", "\n  d:\n    renamed_from: c\n", 1);
+    assert_ne!(renamed, pulled, "{pulled}");
+    std::fs::write(&path, renamed).unwrap();
+    let plan = declare(&d, "DF_pbps_keeptwo_c");
+    let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    apply(&d, &plan, &["--allow", "rename"]);
 }
 
 // ---- pull (the paths that need no database) ----

@@ -71,7 +71,7 @@ pub(crate) fn qualified(t: &TableName) -> Result<String, DialectError> {
 /// The table side, not the column side, because the columns that carry
 /// defaults are the ones most often spelled with an underscore (`created_at`,
 /// `is_active`). No environment was deployed under the old shape.
-pub(crate) fn default_constraint_name(table: &TableName, column: &str) -> String {
+pub fn default_constraint_name(table: &TableName, column: &str) -> String {
     let full = format!("{DEFAULT_NAME_PREFIX}{}_{}", table.name, column);
     if !table.name.contains('_')
         && !ends_like_a_digest(&full)
