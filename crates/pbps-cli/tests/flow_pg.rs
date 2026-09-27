@@ -13802,3 +13802,104 @@ fn a_chain_of_moves_through_an_intermediate_name_applies_together() {
     let o = d.run(&["plan", "--db", connection]);
     assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
 }
+
+/// #541, the chain and the reclaimed source name, applied. Each revision is
+/// fine on its own; the plan that carries them all is what nothing ordered
+/// (`a -> b` first, `column "b" of relation "t" already exists`), and what the closing check compared by name:
+/// the baseline's `b` against the renamed `a`, or the renamed `a` against the
+/// new one. The columns have different types so that neither passes for the
+/// wrong reason.
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn column_names_that_change_hands_across_revisions_apply_together() {
+    // The chain's order came from uids minted at each `plan`, so a single
+    // run without the ordering passed half the time; four fresh ones catch
+    // it all but once in sixteen. `a_column_rename_into_a_name_another_rename_vacates_runs_after_it`
+    // pins the order itself.
+    for (slug, reclaimed) in [
+        ("chain541a", false),
+        ("chain541b", false),
+        ("chain541c", false),
+        ("chain541d", false),
+        ("reclaim541", true),
+    ] {
+        column_names_change_hands(slug, reclaimed);
+    }
+}
+
+fn column_names_change_hands(slug: &str, reclaimed: bool) {
+    let own = OwnDatabase::new(&server(), slug);
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new(slug);
+    let declare = |columns: &str| {
+        std::fs::write(
+            d.dir.join("schema/app.t.yml"),
+            format!(
+                "table: app.t\ncolumns:\n  id: {{type: bigint, nullable: false}}\n{columns}\
+                 primary_key: {{name: pk_t, columns: [id]}}\n"
+            ),
+        )
+        .unwrap();
+    };
+    let step = |d: &Demo| {
+        assert_eq!(code(&d.run(&["plan"])), 0);
+        d.commit();
+    };
+
+    declare("  a: {type: int}\n  b: {type: text}\n");
+    step(&d);
+    let o = d.run(&["bootstrap", "--db", connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    if reclaimed {
+        // `a -> b` after `b` goes, then a new `a`.
+        declare("  a: {type: int}\n");
+        let o = d.run(&["drop", "app.t.b", "--reason", "no longer used"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        step(&d);
+        declare("  b: {type: int}\n");
+        let o = d.run(&["rename", "app.t.a", "b"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        step(&d);
+        declare("  b: {type: int}\n  a: {type: smallint}\n");
+        step(&d);
+    } else {
+        // `b -> c`, then `a -> b`.
+        declare("  a: {type: int}\n  c: {type: text}\n");
+        let o = d.run(&["rename", "app.t.b", "c"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        step(&d);
+        declare("  b: {type: int}\n  c: {type: text}\n");
+        let o = d.run(&["rename", "app.t.a", "b"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        step(&d);
+    }
+
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let checksum = plan_checksum(&plan);
+    let o = d.run(&[
+        "apply",
+        "--db",
+        connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+        "--allow",
+        "rename,destructive",
+    ]);
+    assert_eq!(
+        code(&o),
+        0,
+        "{slug}: the revisions must apply together: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+    let o = d.run(&["verify", "--db", connection]);
+    assert_eq!(code(&o), 0, "{slug}: {}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["plan", "--db", connection]);
+    assert!(stdout(&o).contains("No changes"), "{slug}: {}", stdout(&o));
+}

@@ -808,3 +808,30 @@ renames that had run when it was taken — a rename has run when its source name
 is gone, or holds the next link, whose rename has run. One map for both reads
 rewrote the earlier read's `z`, still the original table, to `y`, and a key
 that followed the chain's head from `z` to `a` read as moved.
+
+<a id="dec-541-1"></a>
+
+**DEC-541.1. A column rename into a name another rename vacates runs after
+it, a cycle is refused, and the closing check follows each column by the
+plan's own changes.** Skipped revisions that rename `b` to `c` and then `a`
+to `b` leave a chain. Both renames sat in one class, and their minted uids
+decided the order, so `a -> b` ran while `b` still stood, which is `Msg 15335`
+on SQL Server and `column "b" of relation "t" already exists` on PostgreSQL.
+A rename now ranks by how many links of its table's chain it waits on, so the
+far end, whose target is free, runs first. `resolve` accepts every step of a
+swap through a third name (`a -> c`, `b -> a`, `c -> b`), which nets to a
+cycle; no order of it runs, so the differ reports it instead of emitting one.
+The deployer chooses a temporary name or separate deployments.
+
+The closing movement check compared the two reads by column name. When a name
+changes hands within the plan, because one rename gives it up and another
+rename or a new column takes it, both reads hold that name for two different
+columns, and no condition on names can tell them apart: excusing the pair
+would accept concurrent drift under that name. Such a plan makes at least two
+changes, and `--staged` applies one (ADR-0003), so it is transactional. The
+earlier read is therefore from before its first statement and the later one
+from after its last, and the plan's column changes, in its order, say which
+baseline column each final name holds. The earlier read's columns are re-keyed
+to those names, and the later read's constraint columns are undone to the
+baseline names, before the usual comparison. Tables where no name changes
+hands keep the one-hop rule of DECISIONS 189 and 474 unchanged.
