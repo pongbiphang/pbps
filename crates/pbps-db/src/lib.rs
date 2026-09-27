@@ -42,8 +42,24 @@ pub mod resolver;
 pub mod transport;
 
 pub use ledger::{
-    LedgerEntry, LedgerError, LockInfo, TimelineEntry, TimelineStaged, TimelineState,
+    LedgerEntry, LedgerError, LockHolder, LockInfo, TimelineEntry, TimelineStaged, TimelineState,
+    holder_application_name,
 };
+
+/// The application name every connection this process opens carries, unless
+/// its connection string names one: `pbps/<pid>/<nonce>` (#1188).
+///
+/// It is what lets a DBA find a lock holder's sessions in `pg_stat_activity`
+/// or `sys.dm_exec_sessions`. The nonce keeps a later process that reuses the
+/// pid from answering for this one; the whole stays under PostgreSQL's
+/// 63-byte limit, which the server would otherwise cut it to. A name the
+/// connection string gives is kept: it was asked for, and the lock records
+/// whichever name the session really has.
+#[must_use]
+pub fn session_application_name() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| format!("pbps/{}/{:08x}", std::process::id(), rand::random::<u32>()))
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {

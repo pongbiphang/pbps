@@ -210,7 +210,10 @@ impl Conn {
         Self::connect_config(config, cfg!(target_os = "linux")).await
     }
 
-    async fn connect_config(config: Config, is_linux: bool) -> Result<Self, DbError> {
+    async fn connect_config(mut config: Config, is_linux: bool) -> Result<Self, DbError> {
+        if config.get_application_name().is_none() {
+            config.application_name(crate::session_application_name());
+        }
         let (host, port) = endpoint(&config)?;
         let addr = format!("{host}:{port}");
         let budget = connect_budget(&config)?;
@@ -306,6 +309,7 @@ impl Conn {
             .user(&login.user)
             .password(&login.password)
             .dbname(&login.database)
+            .application_name(crate::session_application_name())
             .ssl_mode(tokio_postgres::config::SslMode::Disable);
         let (client, connection) = config.connect_raw(stream, tokio_postgres::NoTls).await?;
         Ok(Self {

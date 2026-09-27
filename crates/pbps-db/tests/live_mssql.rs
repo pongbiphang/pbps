@@ -46,3 +46,34 @@ fn conn_str() -> String {
         "PBPS_TEST_DB is not set; these tests need a live SQL Server (see scripts/live-tests.sh)",
     )
 }
+
+async fn application_name(connection_string: &str) -> String {
+    let mut conn = Conn::connect(Driver::Mssql, connection_string)
+        .await
+        .expect("connect to the live server");
+    conn.query("SELECT APP_NAME()").await.unwrap()[0]
+        .try_get_at::<&str>(0)
+        .unwrap()
+        .unwrap()
+        .to_owned()
+}
+
+/// #1188: a session this process opens carries its application name, so a
+/// lock holder's sessions can be found; a name the connection string asks
+/// for, under either key the driver reads, is kept rather than overwritten.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_session_is_named_for_this_process_unless_the_string_names_it() {
+    let base = conn_str();
+    let base = base.trim_end_matches(';');
+    let named = application_name(base).await;
+    assert_eq!(named, pbps_db::session_application_name());
+    assert!(
+        named.starts_with(&format!("pbps/{}/", std::process::id())),
+        "{named}"
+    );
+    for key in ["Application Name", "ApplicationName"] {
+        let own = application_name(&format!("{base};{key}=ops-dashboard")).await;
+        assert_eq!(own, "ops-dashboard", "{key}");
+    }
+}

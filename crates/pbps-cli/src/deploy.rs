@@ -4356,9 +4356,17 @@ pub fn cmd_unlock(target: &Target) -> anyhow::Result<()> {
         match crate::engine::unlock(&mut conn).await? {
             true => {
                 let who = holder
+                    .as_ref()
                     .map(|h| format!("`{}` since {}", h.locked_by, h.locked_at))
                     .unwrap_or_else(|| "an unnamed holder".to_owned());
                 println!("Released the lock on `{}`, held by {who}.", target.label);
+                // Printed after the release as well as in every "locked by"
+                // refusal before it: if the holder is in fact alive, this is
+                // how to find it and stop it before it records over whatever
+                // runs next (#1188).
+                if let Some(lookup) = holder.and_then(|h| h.session_lookup) {
+                    println!("{lookup}");
+                }
                 // Nothing about a released lock proves the operation it guarded
                 // finished, and a half-finished apply is exactly what drift
                 // detection is for.

@@ -1038,3 +1038,42 @@ Pinned by `two_pipelines_initializing_the_ledger_at_once_both_succeed`,
 (`crates/pbps-pg/src/state.rs`) and
 `a_row_type_of_the_ledgers_name_without_the_table_is_still_refused`
 (`crates/pbps-pg/tests/live.rs`).
+
+<a id="dec-1188-1"></a>
+
+**DEC-1188.1. The lock names the process holding it, inside `locked_by`, and
+leaves the liveness call to the operator.** DECISIONS 285 makes `pbps unlock`
+the human override for a lock that never expires. That override is only as
+safe as the answer to "is the holder gone?". A git `user.name` answered it
+badly: a CI runner usually has one account for every job.
+
+So `engine::lock` renders `pbps_db::LockHolder`. It records the operator, the
+host, the pid, the CI job, and the application name the holder's session
+carries. The application name is read back from the engine, not assumed: a
+connection string may name its own, and PostgreSQL cuts a name to 63 bytes. It
+is JSON-quoted as the row's last field, so `holder_application_name` reads it
+back exactly whatever the operator's name contains. Every reader of the lock
+already shows `locked_by`. A new column would have been ledger DDL, with a
+recipe change on both engines, and a human could check nothing more.
+
+Each connection this process opens is named `pbps/<pid>/<nonce>` unless its
+connection string names one. The nonce stops a later process that reuses the
+pid from answering for this one. A name the string gives is kept, because
+someone asked for it; the lock records it all the same.
+
+Each dialect turns the recorded name into its session query, and the "locked
+by" refusal and `pbps unlock` both print it. The query is also where the
+engines differ, as measured:
+- PostgreSQL 18.6 lists another role's session and its `application_name` to
+  any role.
+- SQL Server 17.0.4075.5 shows a login without `VIEW SERVER STATE` only its own
+  session.
+
+So the text says that an empty result from such a login proves nothing. A
+session ending is also not the process exiting. The check stays the
+operator's, and pbps makes no automatic liveness decision.
+
+Pinned by `a_lock_names_its_holders_process_and_says_how_to_find_its_session`
+(`crates/pbps-cli/tests/flow.rs` and `flow_pg.rs`) and
+`a_session_is_named_for_this_process_unless_the_string_names_it`
+(`crates/pbps-db/tests/live_mssql.rs` and `live_pg.rs`).

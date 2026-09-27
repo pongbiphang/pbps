@@ -198,10 +198,30 @@ pub async fn prune(conn: &mut Conn, keep: u32) -> Result<u64, LedgerError> {
     }
 }
 
-pub async fn lock(conn: &mut Conn, holder: &str) -> Result<(), LedgerError> {
+/// Takes the lock for `operator`, recording which process holds it (#1188).
+///
+/// The row names the person and also this process: its host, pid, CI job and
+/// the application name its session carries. That is what `pbps unlock` and a
+/// "locked by" refusal give an operator to check before overriding a lock
+/// that, by design, never expires (DECISIONS 285, DEC-1188.1).
+pub async fn lock(conn: &mut Conn, operator: &str) -> Result<(), LedgerError> {
+    let application_name = match conn.driver() {
+        Driver::Mssql => pbps_mssql::state::session_application_name(conn).await?,
+        Driver::Postgres => pbps_pg::state::session_application_name(conn).await?,
+    };
+    let host = crate::host_name();
+    let ci_job = crate::ci_job();
+    let holder = pbps_db::LockHolder {
+        operator,
+        host: host.as_deref(),
+        pid: std::process::id(),
+        ci_job: ci_job.as_deref(),
+        application_name: &application_name,
+    }
+    .render();
     match conn.driver() {
-        Driver::Mssql => pbps_mssql::state::lock(conn, holder).await,
-        Driver::Postgres => pbps_pg::state::lock(conn, holder).await,
+        Driver::Mssql => pbps_mssql::state::lock(conn, &holder).await,
+        Driver::Postgres => pbps_pg::state::lock(conn, &holder).await,
     }
 }
 
