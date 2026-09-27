@@ -24,7 +24,7 @@
 //! name binds to. What does — the deployer's schema privileges and path — is
 //! reproduced by the analysis scope before this runs (#610).
 
-use pbps_db::resolver::capture::ObjectIdentity;
+use pbps_db::resolver::capture::{CaptureError, ObjectIdentity};
 use pbps_dialect::Dialect;
 use pbps_model::{Change, ModuleId, ModuleKind, Strategy};
 use std::collections::BTreeMap;
@@ -111,8 +111,8 @@ struct Step {
 pub struct Reconstruction {
     steps: Vec<Step>,
     /// Declared routines the plan drops, which are never compiled, and the
-    /// catalog identity each declared signature names once compiled: `None`
-    /// until then, or when an argument type cannot be identified (#1063).
+    /// catalog identity each declared signature names on the target, from
+    /// [`identify_dropped`]: `None` where it names none (#1063, #1124).
     dropped: BTreeMap<ModuleId, Option<ObjectIdentity>>,
 }
 
@@ -337,12 +337,10 @@ impl Reconstruction {
             .and_then(|step| step.created.as_ref())
     }
 
-    /// Declared routines the plan drops. Their signatures are identified
-    /// after compiling, as the deployer the plan's `DROP` runs as would
-    /// resolve them.
-    pub fn drops(&mut self, routines: impl IntoIterator<Item = ModuleId>) {
-        self.dropped
-            .extend(routines.into_iter().map(|routine| (routine, None)));
+    /// Declared routines the plan drops, with the identity each names on
+    /// the target, as [`identify_dropped`] read them there.
+    pub fn identified(&mut self, dropped: BTreeMap<ModuleId, Option<ObjectIdentity>>) {
+        self.dropped = dropped;
     }
 
     /// The catalog identity a dropped routine's declared signature names, when
@@ -371,30 +369,7 @@ impl Reconstruction {
         }
         conn.execute(framing.commit)
             .await
-            .map_err(|_| ReconstructError::Transaction("commit"))?;
-        // After the commit: a type name the engine cannot parse is an error
-        // there, which inside the transaction would abort the compile. Here
-        // it only leaves that routine unidentified, which counts for nothing.
-        // Each is looked up under the write path the plan's DROP of it runs
-        // under, which is where an unqualified argument type resolves.
-        for (id, identity) in &mut self.dropped {
-            let ModuleId::Routine(routine) = id else {
-                continue;
-            };
-            let Ok(path) = crate::emit::write_path(dialect, id.schema()) else {
-                continue;
-            };
-            if conn
-                .execute(&format!("SET search_path = {path}"))
-                .await
-                .is_err()
-            {
-                continue;
-            }
-            *identity = signature(conn, routine).await;
-            let _ = conn.execute("RESET search_path").await;
-        }
-        Ok(())
+            .map_err(|_| ReconstructError::Transaction("commit"))
     }
 
     async fn compile_steps(
@@ -447,39 +422,100 @@ impl Reconstruction {
     }
 }
 
-/// The identity a declared routine signature names, as the capture names
-/// routines, with each argument type identified the way the session's
-/// deployer would identify it; `None` unless every one was.
+/// The routine each declared signature names on the target, as the capture
+/// names routines; `None` where it names none.
+///
+/// On the target, not on scratch: the plan's `DROP` resolves the signature in
+/// the target's namespace as it stands then, where an unmanaged type may hold
+/// a table's array name or a type the plan adds is not there yet (#1124).
+/// Each is looked up with the engine's own signature lookup under the write
+/// path that `DROP` runs under, in a read-only transaction of its own whose
+/// `SET LOCAL` the rollback undoes. A lookup that fails is an unreadable
+/// target, never an absent routine: a spelling the engine cannot parse would
+/// fail the plan's `DROP` as well.
+pub async fn identify_dropped(
+    conn: &mut impl pbps_db::transport::QueryConnection,
+    dialect: &crate::Postgres,
+    routines: Vec<ModuleId>,
+) -> Result<BTreeMap<ModuleId, Option<ObjectIdentity>>, CaptureError> {
+    let mut identified = BTreeMap::new();
+    for id in routines {
+        let identity = match &id {
+            ModuleId::Routine(routine) => signature(conn, dialect, routine).await?,
+            ModuleId::Named(_) | ModuleId::Trigger { .. } => None,
+        };
+        identified.insert(id, identity);
+    }
+    Ok(identified)
+}
+
 async fn signature(
-    conn: &mut pbps_db::transport::StreamConn,
+    conn: &mut impl pbps_db::transport::QueryConnection,
+    dialect: &crate::Postgres,
     routine: &pbps_model::RoutineId,
-) -> Option<ObjectIdentity> {
-    let literal = |value: &str| format!("'{}'", value.replace('\'', "''"));
-    let arguments = routine
-        .args
-        .iter()
-        .map(|arg| literal(arg.as_str()))
-        .collect::<Vec<_>>()
-        .join(",");
-    let rows = conn
-        .query(&format!(
-            "SELECT COALESCE(pg_catalog.json_agg(pg_catalog.json_build_array(tn.nspname, t.typname) ORDER BY a.ord), '[]')::text AS args, \
-             pg_catalog.count(t.oid) = pg_catalog.count(*) AS complete \
-             FROM pg_catalog.unnest(ARRAY[{arguments}]::pg_catalog.text[]) WITH ORDINALITY AS a(arg, ord) \
-             LEFT JOIN pg_catalog.pg_type t ON t.oid = pg_catalog.to_regtype(a.arg) \
-             LEFT JOIN pg_catalog.pg_namespace tn ON tn.oid = t.typnamespace"
+) -> Result<Option<ObjectIdentity>, CaptureError> {
+    // A path or name the emitter cannot write is a DROP the plan cannot
+    // contain, so it is refused like an unreadable lookup.
+    let path =
+        crate::emit::write_path(dialect, &routine.name.schema).map_err(|_| CaptureError::Read)?;
+    let spelled = format!(
+        "{}.{}({})",
+        dialect
+            .quote_ident(&routine.name.schema)
+            .map_err(|_| CaptureError::Read)?,
+        dialect
+            .quote_ident(&routine.name.name)
+            .map_err(|_| CaptureError::Read)?,
+        routine
+            .args
+            .iter()
+            .map(pbps_model::RoutineArg::as_str)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let literal = format!("'{}'", spelled.replace('\'', "''"));
+    conn.query("BEGIN READ ONLY")
+        .await
+        .map_err(|_| CaptureError::Read)?;
+    let rows = async {
+        // The literal below is read in the plan's string-literal mode, which
+        // its framing pins, not in whatever mode the target session keeps: a
+        // backslash in a name would otherwise be an escape. Set in its own
+        // round trip, since a statement is parsed before it runs.
+        conn.query("SET LOCAL standard_conforming_strings = on")
+            .await?;
+        conn.query(&format!("SET LOCAL search_path = {path}"))
+            .await?;
+        conn.query(&format!(
+            "SELECT n.nspname AS schema, p.proname AS name, COALESCE((SELECT pg_catalog.json_agg(pg_catalog.json_build_array(tn.nspname, t.typname) ORDER BY a.ord) \
+             FROM pg_catalog.unnest(p.proargtypes::pg_catalog.oid[]) WITH ORDINALITY AS a(typ, ord) \
+             JOIN pg_catalog.pg_type t ON t.oid = a.typ JOIN pg_catalog.pg_namespace tn ON tn.oid = t.typnamespace), '[]')::text AS args \
+             FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+             WHERE p.oid = pg_catalog.to_regprocedure({literal})"
         ))
         .await
-        .ok()?;
-    let row = rows.first()?;
-    if row.try_get::<bool>("complete").ok().flatten() != Some(true) {
-        return None;
     }
-    let args = row.try_get::<&str>("args").ok().flatten()?;
-    let args = serde_json::from_str::<Vec<[String; 2]>>(args).ok()?;
-    Some(ObjectIdentity {
+    .await;
+    let closed = conn.query("ROLLBACK").await;
+    let rows = rows.map_err(|_| CaptureError::Read)?;
+    closed.map_err(|_| CaptureError::Close)?;
+    let row = match rows.as_slice() {
+        [] => return Ok(None),
+        [row] => row,
+        _ => return Err(CaptureError::Incomplete),
+    };
+    let text = |field: &str| {
+        row.try_get::<&str>(field)
+            .ok()
+            .flatten()
+            .map(str::to_owned)
+            .ok_or(CaptureError::Incomplete)
+    };
+    let args = serde_json::from_str::<Vec<[String; 2]>>(&text("args")?)
+        .map_err(|_| CaptureError::Incomplete)?;
+    Ok(Some(ObjectIdentity {
         class: "pg_proc".into(),
-        name: vec![routine.name.schema.clone(), routine.name.name.clone()],
+        name: vec![text("schema")?, text("name")?],
         signature: args
             .into_iter()
             .map(|type_name| ObjectIdentity {
@@ -488,7 +524,7 @@ async fn signature(
                 signature: Vec::new(),
             })
             .collect(),
-    })
+    }))
 }
 
 /// Every routine of one schema-qualified name, named as the capture names

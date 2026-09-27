@@ -989,12 +989,13 @@ enough: an unmanaged routine the plan creates again, or an unmanaged sequence
 that took an identity column's generated name first, shares scratch's identity
 without being what scratch made (#1041). A routine is managed only as an exact overload:
 the one scratch compiled for a declaration the plan keeps, or, for one the plan
-drops and so never compiles, the identity its declared signature names, each
-argument type identified with `to_regtype` in the compile session under the
-routine schema's write path, as the deployer that runs the plan's `DROP`
-resolves it. An overload whose types
-cannot all be identified, such as one taking a type the plan also drops, holds
-nothing. Counting the dropped overloads instead let an unmanaged overload stand
+drops and so never compiles, the routine its declared signature names on the
+target, found with the engine's own signature lookup (`to_regprocedure`) under
+the routine schema's write path, as the plan's `DROP` resolves it. On the
+target and not on scratch, because scratch holds the desired namespace, where
+a type the plan adds can shadow the one the `DROP` finds and a table's array
+type keeps the name an unmanaged type holds on the target (#1124). A signature
+that names no routine there holds nothing. Counting the dropped overloads instead let an unmanaged overload stand
 in for a declared one the target had lost (#1063). An unmanaged overload
 beside a managed one, a routine planted
 in `pg_catalog` and a built-in cast whose context was changed each leave the

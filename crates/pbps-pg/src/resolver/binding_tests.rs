@@ -10,7 +10,7 @@
 
 use crate::Postgres;
 use crate::resolver::capture::{self, Assessment, Managed, Verdict};
-use crate::resolver::reconstruct::Reconstruction;
+use crate::resolver::reconstruct::{self, Reconstruction};
 use pbps_db::resolver::capture::ObjectIdentity;
 use pbps_db::transport::{StreamConn, StreamLogin};
 use pbps_db::{Conn, Driver};
@@ -194,7 +194,15 @@ async fn analyze_on(
                 .map_err(|e| e.to_string())?;
         let desired_managed = Managed::from_schema(&case.desired.schema);
         let base_managed = Managed::from_schema(&case.base.schema);
-        reconstruction.drops(base_managed.dropped_by(&desired_managed));
+        reconstruction.identified(
+            reconstruct::identify_dropped(
+                &mut target,
+                &pg,
+                base_managed.dropped_by(&desired_managed),
+            )
+            .await
+            .map_err(|e| e.to_string())?,
+        );
         let mut scratch = databases.stream(&scratch_name).await;
         reconstruction
             .compile(&pg, &mut scratch)
@@ -852,6 +860,143 @@ async fn a_dropped_overload_is_held_by_its_declared_identity_not_by_a_count() {
             only(&assessment, "app", "v"),
             Verdict::Unaffected,
             "{variable} unqualified: {assessment:#?}"
+        );
+        // The DROP resolves the signature in the target's namespace as it
+        // stands, not in the desired one scratch holds (#1124): where an
+        // unmanaged type took the table's array name, so the target's array
+        // is named otherwise, and where the plan adds a type that would
+        // shadow the one the target resolves.
+        let in_extra = || Declared::default().table("extra.t", table());
+        for (tag, target, base, desired) in [
+            (
+                "taken_array",
+                "CREATE TYPE app._t AS (y integer);
+                 CREATE TABLE app.t (x integer);
+                 CREATE FUNCTION app.f(numeric) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;
+                 CREATE FUNCTION app.f(app.t[]) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN 0;
+                 SET search_path = app;
+                 CREATE VIEW app.v AS SELECT f(1) AS x;",
+                desired().function(
+                    "app.f(app.t[])",
+                    "(app.t[]) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN 0",
+                ),
+                desired(),
+            ),
+            (
+                "shadowed",
+                "CREATE TABLE extra.t (x integer);
+                 CREATE FUNCTION app.f(numeric) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;
+                 SET search_path = app, extra;
+                 CREATE FUNCTION app.f(t) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN 0;
+                 CREATE VIEW app.v AS SELECT f(1) AS x;",
+                numeric_f()
+                    .view("app.v", "SELECT f(1) AS x")
+                    .table("extra.t", table())
+                    .function(
+                        "app.f(t)",
+                        "(t) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN 0",
+                    ),
+                in_extra()
+                    .function(
+                        "app.f(numeric)",
+                        "(numeric) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1",
+                    )
+                    .view("app.v", "SELECT f(1) AS x")
+                    .table("app.t", table()),
+            ),
+        ] {
+            let assessment = analyze(
+                &server,
+                tag,
+                Case {
+                    schemas: &["app", "extra"],
+                    extras: &["extra"],
+                    target,
+                    base,
+                    desired,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                only(&assessment, "app", "v"),
+                Verdict::Unaffected,
+                "{variable} {tag}: {assessment:#?}"
+            );
+        }
+    }
+}
+
+/// A dropped signature that names no routine on the target is absent; one
+/// the engine cannot even read is refused, never taken for absent. Either
+/// way the lookup's own transaction is closed behind it.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn an_unreadable_dropped_signature_is_refused_not_absent() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let mut conn = Conn::connect(Driver::Postgres, &server).await.unwrap();
+        let pg = dialect(&[]);
+        let absent = reconstruct::identify_dropped(
+            &mut conn,
+            &pg,
+            vec!["public.pbps_absent_1124(integer)".parse().unwrap()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            absent.into_values().collect::<Vec<_>>(),
+            [None],
+            "{variable}"
+        );
+        let unreadable = reconstruct::identify_dropped(
+            &mut conn,
+            &pg,
+            vec!["public.f(int int)".parse().unwrap()],
+        )
+        .await;
+        assert_eq!(
+            unreadable,
+            Err(pbps_db::resolver::capture::CaptureError::Read),
+            "{variable}"
+        );
+        // A name with a backslash is spelled as the plan's DROP spells it,
+        // under the string-literal mode its framing pins, whatever mode the
+        // target session was left in.
+        conn.query(
+            "CREATE FUNCTION public.\"pbps\\1124\"(integer) RETURNS integer LANGUAGE sql RETURN 1",
+        )
+        .await
+        .unwrap();
+        conn.query("SET standard_conforming_strings = off")
+            .await
+            .unwrap();
+        let backslash = reconstruct::identify_dropped(
+            &mut conn,
+            &pg,
+            vec![r"public.pbps\1124(integer)".parse().unwrap()],
+        )
+        .await;
+        conn.query("RESET standard_conforming_strings")
+            .await
+            .unwrap();
+        conn.query("DROP FUNCTION public.\"pbps\\1124\"(integer)")
+            .await
+            .unwrap();
+        assert!(
+            matches!(&backslash, Ok(found) if found.values().all(Option::is_some)),
+            "{variable}: {backslash:?}"
+        );
+        // The lookup's transaction is read-only; left open, the next
+        // statement would still run inside it.
+        let open = conn
+            .query("SELECT pg_catalog.current_setting('transaction_read_only') AS read_only")
+            .await
+            .unwrap();
+        assert_eq!(
+            open[0].try_get::<&str>("read_only").unwrap(),
+            Some("off"),
+            "{variable}: the lookup left its transaction open"
         );
     }
 }
