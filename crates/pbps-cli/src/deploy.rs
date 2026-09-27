@@ -3044,21 +3044,108 @@ fn refuse_unplanned_movement(
                     None | Some(pbps_model::Clustered::Heap) => None,
                 }
             }
-            let plan_moves_layout = [holds_the_rows(was), holds_the_rows(now)]
-                .into_iter()
-                .flatten()
-                .any(|part| match part {
-                    (Part::PrimaryKey, _) => keys.contains(now_name),
-                    part => moved_parts.contains(&part),
-                });
             // Compared by what holds the rows, not by the selector's
             // spelling: a nonclustered key added to a keyless heap turns an
             // absent selector into `heap`, and the rows are where they were.
-            if holds_the_rows(was) != holds_the_rows(now) && !plan_moves_layout {
-                moved.push(format!(
-                    "{now_name} is clustered differently from the table the plan was approved \
-                     over, and no change of this plan moves its clustered index"
-                ));
+            let (was_holder, now_holder) = (holds_the_rows(was), holds_the_rows(now));
+            if was_holder != now_holder {
+                let plan_moves_layout =
+                    [was_holder, now_holder]
+                        .into_iter()
+                        .flatten()
+                        .any(|part| match part {
+                            (Part::PrimaryKey, _) => keys.contains(now_name),
+                            part => moved_parts.contains(&part),
+                        });
+                // Touching the old holder does not license any new one: the
+                // plan moves the rows to one object, or to none, and a staged
+                // run's read can find them there or nowhere yet — never on an
+                // object another session made clustered while the plan was
+                // between its drop and its add (#1209 review). So follow this
+                // table's key and index changes, in plan order, from the
+                // approved holder to the one the plan leaves.
+                let mut planned = was_holder;
+                for p in &changes.changes {
+                    match &p.change {
+                        pbps_model::Change::SetPrimaryKey {
+                            table,
+                            from,
+                            to,
+                            nonclustered,
+                        } if table == now_name => {
+                            if from.is_some() && planned == Some((Part::PrimaryKey, "")) {
+                                planned = None;
+                            }
+                            if to.is_some() && !nonclustered {
+                                planned = Some((Part::PrimaryKey, ""));
+                            }
+                        }
+                        pbps_model::Change::DropUnique { table, name }
+                            if table == now_name
+                                && planned == Some((Part::Unique, name.as_str())) =>
+                        {
+                            planned = None;
+                        }
+                        pbps_model::Change::DropIndex { table, name }
+                            if table == now_name
+                                && planned == Some((Part::Index, name.as_str())) =>
+                        {
+                            planned = None;
+                        }
+                        pbps_model::Change::AddUnique {
+                            table,
+                            name,
+                            clustered: true,
+                            ..
+                        } if table == now_name => planned = Some((Part::Unique, name.as_str())),
+                        pbps_model::Change::AddIndex {
+                            table,
+                            name,
+                            clustered: true,
+                            ..
+                        } if table == now_name => planned = Some((Part::Index, name.as_str())),
+                        pbps_model::Change::CreateTable { .. }
+                        | pbps_model::Change::DropTable { .. }
+                        | pbps_model::Change::RenameTable { .. }
+                        | pbps_model::Change::AddColumn { .. }
+                        | pbps_model::Change::DropColumn { .. }
+                        | pbps_model::Change::RenameColumn { .. }
+                        | pbps_model::Change::AlterColumnType { .. }
+                        | pbps_model::Change::AlterColumnNullability { .. }
+                        | pbps_model::Change::AlterColumnDefault { .. }
+                        | pbps_model::Change::SetColumnDeprecated { .. }
+                        | pbps_model::Change::SetPrimaryKey { .. }
+                        | pbps_model::Change::AddUnique { .. }
+                        | pbps_model::Change::DropUnique { .. }
+                        | pbps_model::Change::AddForeignKey { .. }
+                        | pbps_model::Change::DropForeignKey { .. }
+                        | pbps_model::Change::AddCheck { .. }
+                        | pbps_model::Change::DropCheck { .. }
+                        | pbps_model::Change::AddIndex { .. }
+                        | pbps_model::Change::DropIndex { .. }
+                        | pbps_model::Change::InsertRow { .. }
+                        | pbps_model::Change::UpdateRow { .. }
+                        | pbps_model::Change::DeleteRow { .. }
+                        | pbps_model::Change::SetDataMode { .. }
+                        | pbps_model::Change::CreateModule { .. }
+                        | pbps_model::Change::AlterModule { .. }
+                        | pbps_model::Change::DropModule { .. }
+                        | pbps_model::Change::CreateRole { .. }
+                        | pbps_model::Change::DropRole { .. }
+                        | pbps_model::Change::RenameRole { .. }
+                        | pbps_model::Change::Grant { .. }
+                        | pbps_model::Change::Revoke { .. }
+                        | pbps_model::Change::PublicExecution { .. } => {}
+                    }
+                }
+                let passes_through = now_holder.is_none() || now_holder == planned;
+                if !plan_moves_layout || !passes_through {
+                    moved.push(format!(
+                        "{now_name} is clustered differently from the table the plan was \
+                         approved over, and no change of this plan moves its clustered index \
+                         there"
+                    ));
+                }
             }
         }
         // Dropped, or outside the row scope on one side: there is no pair of
@@ -10625,6 +10712,28 @@ mod tests {
         };
         recheck(&beside("ix")).expect("the nonclustered key replaced, as planned");
         let e = recheck(&beside("ix2")).expect_err("someone else moved the rows to ix2");
+        assert!(format!("{e:#}").contains("clustered differently"), "{e:#}");
+
+        // A plan that leaves the rows on no index, caught between its key's
+        // drop and its add by a session that makes `ix` the clustered one:
+        // touching the old holder does not make `ix` the plan's. The heap it
+        // does leave, and the moment between, are the plan's own.
+        let to_heap = |after: &Schema| {
+            refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                &rekeying,
+                &schema(None),
+                after,
+                "test",
+                Settled::SoFar,
+            )
+        };
+        to_heap(&schema(Some(Clustered::Heap))).expect("the heap this plan leaves");
+        let mut keyless = schema(None);
+        keyless.tables.get_mut(&name).unwrap().primary_key = None;
+        to_heap(&keyless).expect("between the key's drop and its add");
+        let e = to_heap(&schema(Some(Clustered::Index("ix".into()))))
+            .expect_err("another session made ix clustered mid-plan");
         assert!(format!("{e:#}").contains("clustered differently"), "{e:#}");
     }
 
