@@ -9668,9 +9668,21 @@ async fn routine_lock_timeouts_are_errors_and_leave_the_callers_transaction_usab
             .unwrap();
         for (setting, code) in [("statement_timeout", "57014"), ("lock_timeout", "55P03")] {
             in_a_transaction(&mut probe).await;
+            // Sleeping cannot detect a leaked lock_timeout. Compare each
+            // setting with the caller's nonzero value, not just a cleared one.
+            probe
+                .execute(&format!("SET LOCAL {setting} = '1min'"))
+                .await
+                .expect("the caller has its own deadline");
+            let previous = text(&mut probe, &format!("SHOW {setting}")).await;
             let result =
                 read_a_rebuild_with_scoped_timeout(&mut probe, &id, kind, &changes, Some(setting))
                     .await;
+            assert_eq!(
+                text(&mut probe, &format!("SHOW {setting}")).await,
+                previous,
+                "{setting}: the reader restores the caller's deadline"
+            );
             probe
                 .execute("SELECT pg_catalog.pg_sleep(0.3)")
                 .await
