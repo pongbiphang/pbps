@@ -482,7 +482,8 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
                 .chain(table_was)
                 .map(|t| default_constraint_name(t, from));
             for old in olds {
-                if let Some(rename) = rename_generated_default(table, &old, &new)? {
+                // After `sp_rename`, so the column is found by its new name.
+                if let Some(rename) = rename_generated_default(table, to, &old, &new)? {
                     sql.push('\n');
                     sql.push_str(&rename);
                 }
@@ -1572,15 +1573,19 @@ fn create_table(name: &TableName, table: &Table) -> Sql {
     Ok(out)
 }
 
-/// Renames the default constraint `pbps` generated as `old` on `table` (by the
-/// name `table` has now) to `new`, if it still has that name: an adopted
-/// default under a name `pbps` never chose keeps it (#975). `None` when the
-/// two names are the same. The `|` keeps padding out of the comparison
+/// Renames the default constraint `pbps` generated as `old` on `column` of
+/// `table` (both by the names they have now) to `new`, if it still has that
+/// name: an adopted default under a name `pbps` never chose keeps it (#975).
+/// The column is part of the match. A default written by hand on another
+/// column of the same table, under exactly the name `pbps` would generate
+/// for this one, is not this column's (#991). `None` when the two names are
+/// the same. The `|` keeps padding out of the comparison
 /// (DEC-954.1). A target name something else in the schema already holds is
 /// left alone too, and the default keeps its old name: renaming onto it would
 /// fail the whole table or column rename it follows (review of #988).
 fn rename_generated_default(
     table: &TableName,
+    column: &str,
     old: &str,
     new: &str,
 ) -> Result<Option<String>, DialectError> {
@@ -1589,15 +1594,17 @@ fn rename_generated_default(
     }
     Ok(Some(format!(
         "IF EXISTS (SELECT 1 FROM sys.default_constraints \
-         WHERE parent_object_id = OBJECT_ID({}, N'U') \
+         WHERE parent_object_id = OBJECT_ID({table}, N'U') \
+         AND parent_column_id = COLUMNPROPERTY(OBJECT_ID({table}, N'U'), {}, 'ColumnId') \
          AND (name + N'|') COLLATE Latin1_General_BIN2 = {}) \
          AND OBJECT_ID({}) IS NULL\n    \
          EXEC sp_rename {}, {}, 'OBJECT';",
-        literal(&qualified(table)?),
+        literal(column),
         literal(&format!("{old}|")),
         literal(&format!("{}.{}", quote(&table.schema)?, quote(new)?)),
         literal(&format!("{}.{}", quote(&table.schema)?, quote(old)?)),
-        literal(new)
+        literal(new),
+        table = literal(&qualified(table)?),
     )))
 }
 
@@ -1647,6 +1654,7 @@ fn rename_table(from: &TableName, to: &TableName, defaults: &[String]) -> Sql {
         .map(|column| {
             rename_generated_default(
                 to,
+                column,
                 &default_constraint_name(from, column),
                 &default_constraint_name(to, column),
             )
