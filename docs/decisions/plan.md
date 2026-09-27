@@ -453,7 +453,9 @@ the plan can clear a name first, and an occupant it clears is not one:
 - a default pbps generated that a table or column rename moves to its new
   generated name (#975). The emitter moves it only when nothing holds the
   target, so the target names are asked too, and a taken target keeps the
-  default where it is;
+  default where it is. A target held by something the plan drops before the
+  rename runs counts as free: a module drop before either rename, and a
+  constraint drop or a table rename before a column rename;
 - a constraint or trigger of a table it drops or transfers to another schema.
   A rename within the schema leaves the constraint's name where it was.
 

@@ -469,6 +469,9 @@ pub(crate) struct DefaultMove {
     pub(crate) parent: TableName,
     pub(crate) old: TableName,
     pub(crate) new: TableName,
+    /// A column rename's move, which runs after the table renames and the
+    /// constraint drops; a table rename's runs before them.
+    pub(crate) after_constraint_drops: bool,
 }
 
 /// Every generated-default move this plan's renames ask for, in plan order.
@@ -504,6 +507,7 @@ pub(crate) fn default_moves(cs: &pbps_model::ChangeSet) -> Vec<DefaultMove> {
                         parent: from.clone(),
                         old: in_schema(to, generated(from, column)),
                         new: in_schema(to, generated(to, column)),
+                        after_constraint_drops: false,
                     });
                 }
             }
@@ -519,6 +523,7 @@ pub(crate) fn default_moves(cs: &pbps_model::ChangeSet) -> Vec<DefaultMove> {
                         parent: now(table),
                         old: in_schema(table, generated(was, from)),
                         new: in_schema(table, generated(table, to)),
+                        after_constraint_drops: true,
                     });
                 }
             }
@@ -637,13 +642,46 @@ pub(crate) fn refuse_occupied_objects(
         .collect();
     // A generated default a rename moves away, which runs before the tables
     // are created. The emitter moves it only when nothing holds the target,
-    // so a target the catalog read found taken keeps the default where it is.
-    let held = |name: &TableName| occupants.iter().any(|o| &o.wanted == name);
+    // so a target the catalog read found taken keeps the default where it is
+    // — unless what holds it is gone by then. Only module drops run before a
+    // table rename; a column rename also follows the table renames and the
+    // constraint drops (`order_key`).
+    let dropped_modules: BTreeSet<TableName> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::DropModule { id, .. } => Some(module_object(id)),
+            _ => None,
+        })
+        .collect();
+    let before_column_renames: BTreeSet<TableName> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::RenameTable { from, .. } => Some(from.clone()),
+            Change::DropUnique { table, name }
+            | Change::DropForeignKey { table, name }
+            | Change::DropCheck { table, name } => Some(constraint(table, name)),
+            Change::SetPrimaryKey {
+                table,
+                from: Some(key),
+                to: None,
+            } => key.name.as_deref().map(|name| constraint(table, name)),
+            _ => None,
+        })
+        .collect();
+    let held = |m: &DefaultMove| {
+        occupants.iter().any(|o| {
+            o.wanted == m.new
+                && !dropped_modules.contains(&o.name)
+                && !(m.after_constraint_drops && before_column_renames.contains(&o.name))
+        })
+    };
     let moved_away = |o: &pbps_mssql::catalog::NameOccupant| {
         o.kind == "default constraint"
             && default_moves(cs)
                 .iter()
-                .any(|m| m.old == o.name && o.parent.as_ref() == Some(&m.parent) && !held(&m.new))
+                .any(|m| m.old == o.name && o.parent.as_ref() == Some(&m.parent) && !held(m))
     };
     let gone = |o: &pbps_mssql::catalog::NameOccupant| {
         let early = moved_away(o)
@@ -7085,6 +7123,30 @@ mod tests {
             e.contains("default constraint"),
             "a taken target keeps it: {e}"
         );
+        // A check at the target that the plan drops first is gone by the
+        // time the column rename runs (#1147 review).
+        let check_at_target = NameOccupant {
+            wanted: target.clone(),
+            name: target.clone(),
+            kind: "check constraint".into(),
+            parent: Some(old.clone()),
+            parent_column: None,
+        };
+        let drop_check = PlannedChange::new(Change::DropCheck {
+            table: old.clone(),
+            name: target.name.clone(),
+        });
+        refuse_occupied_objects(
+            &plan(vec![drop_check, rename_column(), create_at(&generated)]),
+            &[the_default.clone(), check_at_target.clone()],
+            "prod",
+        )
+        .expect("the check is dropped before the rename looks");
+        assert!(
+            refuse_occupied_objects(&moves, &[the_default.clone(), check_at_target], "prod")
+                .is_err(),
+            "a check that stays still holds the target"
+        );
         assert!(
             !e.contains("synonym"),
             "a name asked only to judge a move is not reported: {e}"
@@ -7121,6 +7183,7 @@ mod tests {
                     "dbo",
                     pbps_mssql::emit::default_constraint_name(&renamed, "c")
                 ),
+                after_constraint_drops: false,
             }]
         );
         refuse_occupied_objects(&table_moves, std::slice::from_ref(&the_default), "prod")
