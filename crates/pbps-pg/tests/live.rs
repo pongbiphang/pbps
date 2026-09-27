@@ -28670,6 +28670,17 @@ async fn doctor_reports_an_absent_recorded_managed_table() {
         "{:?}",
         held.declaration_gaps
     );
+    // Each reason names the ownership that would do: the table's or the
+    // schema's for a plain drop, the table's alone where a key goes first.
+    let reason = |table: &str| {
+        held.declaration_gaps
+            .iter()
+            .find(|g| g.securable() == table)
+            .map(|g| g.why.clone())
+            .unwrap()
+    };
+    assert!(reason("TABLE \"public\".\"foreign_owned\"").contains("of the table or of its schema"));
+    assert!(reason("TABLE \"mine\".\"keyed_in_mine\"").contains("ownership of the table itself"));
     assert!(
         held.absent_tables
             .contains(&"public.fresh".parse().unwrap()),

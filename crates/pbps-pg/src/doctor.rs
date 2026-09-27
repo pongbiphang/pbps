@@ -775,6 +775,8 @@ pub async fn permissions(
         })
         .cloned()
         .collect();
+    // One question per schema, however many of its tables the plan drops.
+    let mut schema_owned: BTreeMap<String, bool> = BTreeMap::new();
     for (object, present, rights) in read_tables(conn, &dropping, &MANAGED_KINDS).await? {
         if !present {
             held.declaration_gaps.push(Gap {
@@ -782,26 +784,43 @@ pub async fn permissions(
                 why: "the recorded table is absent; its ownership cannot be established".to_owned(),
                 securable: Securable::Object(object),
             });
-        } else if !rights.owned
-            && (recorded_with_keys.contains(&object) || !owns_schema(conn, &object.schema).await?)
-        {
-            // A `DROP TABLE` needs ownership (DECISIONS 289), and nothing
-            // else asks this table for it: it is out of the managed rights
-            // above, so a table another role owns read as ready here and
-            // failed at the drop (#1109). The schema's owner may drop it too
-            // (measured on 18: `DROP TABLE` succeeds for the owner of the
-            // schema of a table another role owns), so that ownership is
-            // enough when the drop is all the plan does to it. A table with
-            // foreign keys has them dropped first, by `ALTER TABLE ... DROP
-            // CONSTRAINT`, which only the table's owner may run.
-            held.declaration_gaps.push(Gap {
-                permission: OWNERSHIP,
-                why: "the declarations no longer name this recorded table, so the next plan \
-                      drops it, which needs ownership of the table or of its schema"
-                    .to_owned(),
-                securable: Securable::Object(object),
-            });
+            continue;
         }
+        if rights.owned {
+            continue;
+        }
+        // A `DROP TABLE` needs ownership (DECISIONS 289), and nothing else
+        // asks this table for it: it is out of the managed rights above, so a
+        // table another role owns read as ready here and failed at the drop
+        // (#1109). The schema's owner may drop it too (measured on 18: `DROP
+        // TABLE` succeeds for the owner of the schema of a table another role
+        // owns), so that ownership is enough when the drop is all the plan
+        // does to it. A table with foreign keys has them dropped first, by
+        // `ALTER TABLE ... DROP CONSTRAINT`, which only the table's owner may
+        // run, and its reason says so.
+        let why = if recorded_with_keys.contains(&object) {
+            "the declarations no longer name this recorded table, so the next plan drops it; \
+             its foreign keys are dropped first, which needs ownership of the table itself"
+        } else {
+            let owned = match schema_owned.get(&object.schema) {
+                Some(owned) => *owned,
+                None => {
+                    let owned = owns_schema(conn, &object.schema).await?;
+                    schema_owned.insert(object.schema.clone(), owned);
+                    owned
+                }
+            };
+            if owned {
+                continue;
+            }
+            "the declarations no longer name this recorded table, so the next plan drops it, \
+             which needs ownership of the table or of its schema"
+        };
+        held.declaration_gaps.push(Gap {
+            permission: OWNERSHIP,
+            why: why.to_owned(),
+            securable: Securable::Object(object),
+        });
     }
 
     // An owner who revoked its own object-level `SELECT` may have granted it
