@@ -1731,6 +1731,116 @@ async fn non_schema_bound_functions_defer_missing_table_resolution() {
     }
 }
 
+/// #1185: a ledger table (SQL Server 2022 and later) was read as an ordinary
+/// one, with its hidden GENERATED ALWAYS columns as writable `bigint`s, and
+/// its history table, its ledger view and every dropped ledger table the
+/// engine retains were declared beside it. Bootstrap then created plain
+/// tables, and an append-only table accepted updates.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn ledger_tables_their_history_and_their_views_are_not_pulled() {
+    let mut db = TestDb::create("ledger1185").await;
+    for statement in [
+        "CREATE TABLE dbo.acct (id int NOT NULL CONSTRAINT pk_acct PRIMARY KEY, bal int NULL)
+             WITH (SYSTEM_VERSIONING = ON, LEDGER = ON);",
+        "CREATE TABLE dbo.audit_log (id int NOT NULL, msg nvarchar(100) NULL)
+             WITH (LEDGER = ON (APPEND_ONLY = ON));",
+        "CREATE TABLE dbo.gone (id int NOT NULL) WITH (LEDGER = ON (APPEND_ONLY = ON));",
+        "DROP TABLE dbo.gone;",
+        "CREATE TABLE dbo.plain (
+             id int NOT NULL CONSTRAINT pk_plain PRIMARY KEY,
+             v int NULL,
+             acct_id int NULL CONSTRAINT fk_plain_acct REFERENCES dbo.acct (id)
+         );",
+        "CREATE VIEW dbo.v_acct AS SELECT id, bal FROM dbo.acct;",
+    ] {
+        db.conn.execute(statement).await.expect(statement);
+    }
+    // The engine names the history table, the dropped table and the dropped
+    // ledger view by object id and GUID; read those names rather than guess.
+    let names: Vec<String> = db
+        .conn
+        .query(
+            "SELECT name FROM sys.tables WHERE ledger_type = 1 OR is_dropped_ledger_table = 1
+             UNION ALL SELECT name FROM sys.views WHERE is_dropped_ledger_view = 1
+             ORDER BY name;",
+        )
+        .await
+        .expect("read the engine-named ledger objects")
+        .iter()
+        .map(|row| row.try_get::<&str>("name").unwrap().unwrap().to_owned())
+        .collect();
+    let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect ledger catalog");
+    db.drop().await;
+
+    let [dropped_table, dropped_view, history] = names.as_slice() else {
+        panic!("expected one dropped table, one dropped view and one history table: {names:?}");
+    };
+    assert!(dropped_table.starts_with("MSSQL_DroppedLedgerTable_gone_"));
+    assert!(dropped_view.starts_with("MSSQL_DroppedLedgerView_gone_"));
+    assert!(history.starts_with("MSSQL_LedgerHistoryFor_"));
+
+    // The ordinary control table is still pulled, without its key into the
+    // ledger table.
+    assert_eq!(
+        pulled.schema.tables.keys().collect::<Vec<_>>(),
+        [&TableName::new("dbo", "plain")]
+    );
+    let plain = &pulled.schema.tables[&TableName::new("dbo", "plain")];
+    assert_eq!(plain.columns.len(), 3);
+    assert!(plain.foreign_keys.is_empty());
+    for (name, kind) in [
+        ("acct", "an updatable ledger table"),
+        ("audit_log", "an append-only ledger table"),
+        (history.as_str(), "a ledger history table"),
+        (dropped_table.as_str(), "a dropped ledger table"),
+    ] {
+        assert!(
+            pulled.limitations.iter().any(|l| {
+                l.target.object_name() == TableName::new("dbo", name) && l.detail.contains(kind)
+            }),
+            "{name}: {:?}",
+            pulled.limitations
+        );
+    }
+    assert!(pulled.limitations.iter().any(|l| {
+        l.target.object_name() == TableName::new("dbo", "plain")
+            && l.detail.contains("fk_plain_acct")
+            && l.detail.contains("ledger table dbo.acct")
+    }));
+    assert_eq!(pulled.limitations.len(), 5, "{:?}", pulled.limitations);
+
+    // No ledger view and no view over a ledger table is declared; each is
+    // inventoried for what it is.
+    assert!(
+        pulled.schema.modules.is_empty(),
+        "{:?}",
+        pulled.schema.modules
+    );
+    for view in ["acct_Ledger", "audit_log_Ledger", dropped_view.as_str()] {
+        assert!(
+            pulled.unmanaged_modules.iter().any(|module| {
+                module.target.object_name() == TableName::new("dbo", view)
+                    && module.why.contains("ledger view")
+            }),
+            "{view}: {:?}",
+            pulled.unmanaged_modules
+        );
+    }
+    assert!(pulled.unmanaged_modules.iter().any(|module| {
+        module.target.object_name() == TableName::new("dbo", "v_acct")
+            && module.why.contains("create-time-bound dependency")
+    }));
+    assert_eq!(
+        pulled.unmanaged_modules.len(),
+        4,
+        "{:?}",
+        pulled.unmanaged_modules
+    );
+}
+
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
@@ -1879,14 +1989,14 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
             && limitation.detail.contains("ck_plain_temporal_fn")
             && limitation
                 .detail
-                .contains("omitted temporal object or module")
+                .contains("omitted temporal or ledger object or module")
     }));
     assert!(pulled.limitations.iter().any(|limitation| {
         limitation.target.object_name() == TableName::new("dbo", "plain")
             && limitation.detail.contains("df_plain_temporal_fn")
             && limitation
                 .detail
-                .contains("omitted temporal object or module")
+                .contains("omitted temporal or ledger object or module")
     }));
     assert!(
         pulled.schema.tables[&TableName::new("dbo", "plain")]

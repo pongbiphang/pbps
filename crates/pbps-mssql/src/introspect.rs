@@ -45,6 +45,23 @@ pub struct RawTable {
     pub temporal_type: u8,
     /// Whether `sys.periods` still defines `PERIOD FOR SYSTEM_TIME` on the table.
     pub has_period: bool,
+    /// `sys.tables.ledger_type` (SQL Server 2022 and later): zero is ordinary,
+    /// one a ledger history table, two updatable, three append-only.
+    pub ledger_type: u8,
+    /// A ledger table the engine kept, renamed, after `DROP TABLE`.
+    pub is_dropped_ledger_table: bool,
+    /// The ledger view the engine maintains for a ledger table.
+    pub ledger_view_id: Option<i32>,
+}
+
+/// How a ledger table is named to the operator, by `sys.tables.ledger_type`.
+fn ledger_type_name(code: u8) -> String {
+    match code {
+        1 => "a ledger history table".to_owned(),
+        2 => "an updatable ledger table".to_owned(),
+        3 => "an append-only ledger table".to_owned(),
+        other => format!("a ledger table of `sys.tables.ledger_type` {other}"),
+    }
 }
 
 /// One row of `sys.columns`, joined with its type, identity and default.
@@ -688,16 +705,50 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     let mut limitations = Vec::new();
     let mut names: BTreeMap<i32, TableName> = BTreeMap::new();
     let mut tables: BTreeMap<i32, Table> = BTreeMap::new();
-    let mut unsupported_temporal_tables = BTreeSet::new();
+    // Tables left out for what they are rather than for their columns, with
+    // the words a dependent's limitation uses for them.
+    let mut omitted_tables: BTreeMap<TableName, &str> = BTreeMap::new();
     let mut unavailable_object_ids = BTreeSet::new();
+    // The ledger views of omitted ledger tables, so each is inventoried as
+    // what it is rather than as a view that happens to depend on one.
+    let mut ledger_views = BTreeSet::new();
 
     for t in &raw.tables {
+        // The engine maintains a ledger table's hidden GENERATED ALWAYS
+        // columns, its history table and its ledger view, and refuses the
+        // writes an append-only one forbids. Declared as ordinary, bootstrap
+        // creates a plain table and those guarantees vanish without a word.
+        // A dropped ledger table is kept by the engine for verification and is
+        // no table a project declares.
+        if t.ledger_type != 0 || t.is_dropped_ledger_table {
+            let name = TableName::new(t.schema.clone(), t.name.clone());
+            omitted_tables.insert(name.clone(), "ledger table");
+            unavailable_object_ids.insert(t.object_id);
+            ledger_views.extend(t.ledger_view_id);
+            let what = if t.is_dropped_ledger_table {
+                format!(
+                    "a dropped ledger table SQL Server retains ({})",
+                    ledger_type_name(t.ledger_type)
+                )
+            } else {
+                ledger_type_name(t.ledger_type)
+            };
+            push_limitation(
+                &mut warnings,
+                &mut limitations,
+                Some(&name),
+                format!(
+                    "{name}: {what}, which pbps cannot express; the table, its history table and its ledger view were left out of the declarations"
+                ),
+            );
+            continue;
+        }
         // Both halves of active versioning, and a current table whose period
         // remains after versioning is disabled, must stay unmanaged. Declaring
         // any of them as ordinary loses temporal semantics on bootstrap.
         if t.temporal_type != 0 || t.has_period {
             let name = TableName::new(t.schema.clone(), t.name.clone());
-            unsupported_temporal_tables.insert(name.clone());
+            omitted_tables.insert(name.clone(), "temporal table");
             unavailable_object_ids.insert(t.object_id);
             push_limitation(
                 &mut warnings,
@@ -725,6 +776,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
 
     // Grow the unavailable set before assembling either constraints or
     // modules. Both can bind an object that was omitted from the declarations.
+    unavailable_object_ids.extend(ledger_views.iter().copied());
     extend_unavailable_modules(
         &raw.modules,
         &raw.object_dependencies,
@@ -831,7 +883,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 &mut limitations,
                 names.get(&c.object_id),
                 format!(
-                    "{table_name}.{}: default constraint `{constraint_name}` depends on an omitted temporal object or module; the default was left out too",
+                    "{table_name}.{}: default constraint `{constraint_name}` depends on an omitted temporal or ledger object or module; the default was left out too",
                     c.name
                 ),
             );
@@ -884,7 +936,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         }
     }
 
-    let mut unsupported_temporal_foreign_keys = BTreeSet::new();
+    let mut unsupported_omitted_foreign_keys = BTreeSet::new();
     let mut unsupported_fk_enforcement = BTreeSet::new();
     for f in &raw.foreign_key_columns {
         if !tables.contains_key(&f.object_id) {
@@ -918,15 +970,15 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             continue;
         }
         let referenced = TableName::new(f.ref_schema.clone(), f.ref_table.clone());
-        if unsupported_temporal_tables.contains(&referenced) {
-            if unsupported_temporal_foreign_keys.insert((f.object_id, f.constraint_name.clone())) {
+        if let Some(kind) = omitted_tables.get(&referenced) {
+            if unsupported_omitted_foreign_keys.insert((f.object_id, f.constraint_name.clone())) {
                 let table_name = name_of(f.object_id, &names);
                 push_limitation(
                     &mut warnings,
                     &mut limitations,
                     names.get(&f.object_id),
                     format!(
-                        "{table_name}: foreign key `{}` references temporal table {referenced}, which is outside the declarations; the foreign key was left out too",
+                        "{table_name}: foreign key `{}` references {kind} {referenced}, which is outside the declarations; the foreign key was left out too",
                         f.constraint_name
                     ),
                 );
@@ -978,7 +1030,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 &mut limitations,
                 names.get(&c.object_id),
                 format!(
-                    "{table_name}: check constraint `{}` depends on an omitted temporal object or module; the check constraint was left out too",
+                    "{table_name}: check constraint `{}` depends on an omitted temporal or ledger object or module; the check constraint was left out too",
                     c.name
                 ),
             );
@@ -1117,9 +1169,15 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             });
         };
 
+        if ledger_views.contains(&m.object_id) {
+            unmanageable(
+                "it is the ledger view SQL Server maintains for a ledger table, which pbps cannot express",
+            );
+            continue;
+        }
         if unavailable_object_ids.contains(&m.object_id) {
             unmanageable(
-                "it has a create-time-bound dependency on a temporal table or another omitted module",
+                "it has a create-time-bound dependency on a temporal or ledger table or another omitted module",
             );
             continue;
         }
@@ -1161,10 +1219,10 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 .is_some_and(|parent| unavailable_object_ids.contains(&parent))
                 || on
                     .as_ref()
-                    .is_some_and(|parent| unsupported_temporal_tables.contains(parent)))
+                    .is_some_and(|parent| omitted_tables.contains_key(parent)))
         {
             unmanageable(
-                "its parent uses system versioning, PERIOD FOR SYSTEM_TIME, or another omitted module, which pbps cannot express",
+                "its parent uses system versioning, PERIOD FOR SYSTEM_TIME, the ledger, or another omitted module, which pbps cannot express",
             );
             continue;
         }
@@ -1471,6 +1529,9 @@ mod tests {
             name: name.into(),
             temporal_type: 0,
             has_period: false,
+            ledger_type: 0,
+            is_dropped_ledger_table: false,
+            ledger_view_id: None,
         }
     }
 
@@ -2510,6 +2571,9 @@ mod module_tests {
                 name: "t".into(),
                 temporal_type: 0,
                 has_period: false,
+                ledger_type: 0,
+                is_dropped_ledger_table: false,
+                ledger_view_id: None,
             }],
             columns: vec![RawColumn {
                 object_id: 1,
@@ -2542,6 +2606,141 @@ mod module_tests {
             requires_bound_references: kind == ModuleKind::View,
             default_set_options: true,
         }
+    }
+
+    #[test]
+    fn ledger_tables_their_history_and_their_views_are_reported_instead_of_managed() {
+        let base = raw_one_table();
+        let mut raw = RawCatalog::default();
+        // (id, name, ledger_type, dropped, ledger view id)
+        for (id, name, ledger_type, dropped, view) in [
+            (1, "acct", 2, false, Some(101)),
+            (2, "MSSQL_LedgerHistoryFor_1", 1, false, None),
+            (3, "audit_log", 3, false, Some(103)),
+            (4, "MSSQL_DroppedLedgerTable_gone_0A", 3, true, Some(104)),
+            (5, "plain", 0, false, None),
+        ] {
+            let mut table = base.tables[0].clone();
+            table.object_id = id;
+            table.name = name.into();
+            table.ledger_type = ledger_type;
+            table.is_dropped_ledger_table = dropped;
+            table.ledger_view_id = view;
+            raw.tables.push(table);
+            let mut column = base.columns[0].clone();
+            column.object_id = id;
+            raw.columns.push(column);
+        }
+        raw.foreign_key_columns.push(RawForeignKeyColumn {
+            object_id: 5,
+            constraint_name: "fk_plain_acct".into(),
+            ref_schema: "dbo".into(),
+            ref_table: "acct".into(),
+            column: "id".into(),
+            ref_column: "id".into(),
+            on_delete: 0,
+            on_update: 0,
+            is_disabled: false,
+            is_not_trusted: false,
+            is_not_for_replication: false,
+        });
+        let mut modules = Vec::new();
+        for (id, name, source) in [
+            (101, "acct_Ledger", "acct"),
+            (103, "audit_log_Ledger", "audit_log"),
+            (
+                104,
+                "MSSQL_DroppedLedgerView_gone_0B",
+                "MSSQL_DroppedLedgerTable_gone_0A",
+            ),
+            (110, "v_acct", "acct"),
+        ] {
+            let mut view = module(
+                "dbo",
+                name,
+                ModuleKind::View,
+                Some(&format!(
+                    "CREATE VIEW dbo.{name} AS SELECT id FROM dbo.{source}"
+                )),
+            );
+            view.object_id = id;
+            modules.push(view);
+        }
+        raw.modules = modules;
+        raw.object_dependencies = [(101, 1), (101, 2), (103, 3), (104, 4), (110, 1)]
+            .into_iter()
+            .map(|(referencing, referenced)| RawObjectDependency {
+                referencing_object_id: referencing,
+                referenced_object_id: referenced,
+            })
+            .collect();
+
+        let pulled = assemble(&raw);
+
+        assert_eq!(
+            pulled.schema.tables.keys().collect::<Vec<_>>(),
+            [&TableName::new("dbo", "plain")]
+        );
+        assert!(
+            pulled.schema.tables[&TableName::new("dbo", "plain")]
+                .foreign_keys
+                .is_empty()
+        );
+        assert!(pulled.schema.modules.is_empty());
+        for (name, kind) in [
+            ("acct", "an updatable ledger table"),
+            ("MSSQL_LedgerHistoryFor_1", "a ledger history table"),
+            ("audit_log", "an append-only ledger table"),
+            ("MSSQL_DroppedLedgerTable_gone_0A", "a dropped ledger table"),
+        ] {
+            assert!(
+                pulled.limitations.iter().any(|l| {
+                    l.target.object_name() == TableName::new("dbo", name) && l.detail.contains(kind)
+                }),
+                "{name}: {:?}",
+                pulled.limitations
+            );
+        }
+        assert!(pulled.limitations.iter().any(|l| {
+            l.target.object_name() == TableName::new("dbo", "plain")
+                && l.detail.contains("fk_plain_acct")
+                && l.detail.contains("ledger table dbo.acct")
+        }));
+        assert_eq!(pulled.limitations.len(), 5, "{:?}", pulled.limitations);
+        for name in [
+            "acct_Ledger",
+            "audit_log_Ledger",
+            "MSSQL_DroppedLedgerView_gone_0B",
+        ] {
+            assert!(
+                pulled.unmanaged_modules.iter().any(|module| {
+                    module.target.object_name() == TableName::new("dbo", name)
+                        && module.why.contains("ledger view")
+                }),
+                "{name}: {:?}",
+                pulled.unmanaged_modules
+            );
+        }
+        assert!(pulled.unmanaged_modules.iter().any(|module| {
+            module.target.object_name() == TableName::new("dbo", "v_acct")
+                && module.why.contains("create-time-bound dependency")
+        }));
+    }
+
+    #[test]
+    fn a_ledger_view_id_alone_does_not_omit_an_ordinary_table() {
+        // `ledger_view_id` is read for the ledger tables only; an ordinary
+        // table carrying one (it cannot, but the read must not care) stays.
+        let mut raw = raw_one_table();
+        raw.tables[0].ledger_view_id = Some(99);
+        let pulled = assemble(&raw);
+        assert!(
+            pulled
+                .schema
+                .tables
+                .contains_key(&TableName::new("dbo", "t"))
+        );
+        assert!(pulled.limitations.is_empty(), "{:?}", pulled.limitations);
     }
 
     /// ADR-0002: a module pbps can read becomes part of the desired state, and
@@ -2824,7 +3023,7 @@ mod module_tests {
                 && limitation.detail.contains("ck_plain_temporal_fn")
                 && limitation
                     .detail
-                    .contains("omitted temporal object or module")
+                    .contains("omitted temporal or ledger object or module")
         }));
     }
 
@@ -2876,7 +3075,7 @@ mod module_tests {
                 && limitation.detail.contains("df_plain_temporal_fn")
                 && limitation
                     .detail
-                    .contains("omitted temporal object or module")
+                    .contains("omitted temporal or ledger object or module")
         }));
     }
 

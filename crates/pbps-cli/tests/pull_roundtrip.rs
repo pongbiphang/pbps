@@ -171,6 +171,9 @@ fn raw_table(object_id: i32, schema: &str, name: &str) -> RawTable {
         name: name.into(),
         temporal_type: 0,
         has_period: false,
+        ledger_type: 0,
+        is_dropped_ledger_table: false,
+        ledger_view_id: None,
     }
 }
 
