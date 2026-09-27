@@ -1663,9 +1663,13 @@ impl ScratchRun {
         // session is mid-transaction, and the next check must end the run.
         let base = engine::Managed::from_schema(request.base);
         let desired = engine::Managed::from_schema(request.desired);
-        // An overload the plan drops is identified by the deployer the
-        // compile runs as, since that is who resolves the plan's DROP.
-        reconstruction.drops(base.dropped_by(&desired));
+        // An overload the plan drops is identified on the target, where the
+        // plan's DROP resolves its signature (#1124).
+        let dropped = target
+            .identify_dropped(extras, base.dropped_by(&desired))
+            .await
+            .map_err(|error| Error::Binding(error.to_string()))?;
+        reconstruction.identified(dropped);
         let scratch = self.scratch.as_mut().ok_or(Error::Cancelled)?;
         self.in_flight = true;
         let compiled = engine::compile(reconstruction, extras, &mut scratch.connection).await;

@@ -58,3 +58,28 @@ pub(super) async fn capture(
         }),
     }
 }
+
+/// The routine each dropped declaration's signature names on the target, as
+/// the plan's `DROP` resolves it. `None` on an engine with no binding adapter.
+pub(super) async fn identify_dropped(
+    connection: &mut PeerVerifiedConn,
+    write_path_extras: &[String],
+    routines: Vec<pbps_model::ModuleId>,
+) -> Option<
+    std::collections::BTreeMap<
+        pbps_model::ModuleId,
+        Option<pbps_db::resolver::capture::ObjectIdentity>,
+    >,
+> {
+    match connection.driver() {
+        Driver::Postgres => Some(
+            pbps_pg::resolver::reconstruct::identify_dropped(
+                connection,
+                &pbps_pg::Postgres::with_write_path_extras(write_path_extras.to_vec()),
+                routines,
+            )
+            .await,
+        ),
+        Driver::Mssql => None,
+    }
+}

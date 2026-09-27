@@ -259,6 +259,31 @@ impl NativeTarget {
         ))
     }
 
+    /// The routine each dropped declaration's signature names on the target,
+    /// read the way the plan's `DROP` of it resolves it (#1124). PostgreSQL
+    /// only, as binding resolution is; bracketed by the ordinary binding
+    /// check like every other read of this connection.
+    pub async fn identify_dropped(
+        &mut self,
+        write_path_extras: &[String],
+        routines: Vec<pbps_model::ModuleId>,
+    ) -> Result<
+        std::collections::BTreeMap<
+            pbps_model::ModuleId,
+            Option<pbps_db::resolver::capture::ObjectIdentity>,
+        >,
+        EnvironmentError,
+    > {
+        self.check().await.map_err(|_| EnvironmentError::Binding)?;
+        let bound = self.current.as_mut().ok_or(EnvironmentError::Binding)?;
+        let identified =
+            engine::identify_dropped(&mut bound.connection, write_path_extras, routines)
+                .await
+                .ok_or(EnvironmentError::Binding)?;
+        self.check().await.map_err(|_| EnvironmentError::Binding)?;
+        Ok(identified)
+    }
+
     pub async fn check(&mut self) -> Result<(), UnqualifiedProcess> {
         // Taking the complete binding before the first await makes failure or
         // cancellation terminal. A later change-and-restore cannot revive it.
