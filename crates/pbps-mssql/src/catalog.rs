@@ -139,10 +139,14 @@ SELECT c.object_id, c.name, ty.name AS type_name,
          ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id
  ORDER BY c.object_id, c.column_id;";
 
+/// `ki.type` travels for the same reason it does in `INDEX_COLUMNS`: the
+/// declarations spell neither `CLUSTERED` nor `NONCLUSTERED` on a key, so a
+/// key whose layout is not the engine's default for its kind would come back
+/// from bootstrap with a different one (#1186).
 const KEY_COLUMNS: &str = "\
 SELECT kc.parent_object_id AS object_id, kc.name,
        CONVERT(bit, CASE WHEN kc.type = 'PK' THEN 1 ELSE 0 END) AS is_primary,
-       col.name AS column_name, ki.is_disabled, ki.ignore_dup_key
+       col.name AS column_name, ki.is_disabled, ki.ignore_dup_key, ki.type AS index_type
   FROM sys.key_constraints kc
   JOIN sys.indexes ki
     ON ki.object_id = kc.parent_object_id AND ki.index_id = kc.unique_index_id
@@ -153,9 +157,14 @@ SELECT kc.parent_object_id AS object_id, kc.name,
  WHERE ic.is_included_column = 0
  ORDER BY kc.parent_object_id, kc.name, ic.key_ordinal;";
 
+/// `ref_key_name` is the referenced table's key or unique index the engine
+/// bound the foreign key to (`key_index_id`): a key the assembler leaves out
+/// takes its foreign keys with it, or bootstrap would create a reference to a
+/// candidate key that is not there.
 const FOREIGN_KEY_COLUMNS: &str = "\
 SELECT fk.parent_object_id AS object_id, fk.name,
        rs.name AS ref_schema, rt.name AS ref_table,
+       fk.referenced_object_id AS ref_object_id, ri.name AS ref_key_name,
        pc.name AS column_name, rc.name AS ref_column_name,
        fk.delete_referential_action, fk.update_referential_action,
        fk.is_disabled, fk.is_not_trusted, fk.is_not_for_replication
@@ -167,6 +176,8 @@ SELECT fk.parent_object_id AS object_id, fk.name,
     ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id
   JOIN sys.tables rt ON rt.object_id = fk.referenced_object_id
   JOIN sys.schemas rs ON rs.schema_id = rt.schema_id
+  LEFT JOIN sys.indexes ri
+    ON ri.object_id = fk.referenced_object_id AND ri.index_id = fk.key_index_id
  ORDER BY fk.parent_object_id, fk.name, fkc.constraint_column_id;";
 
 const CHECKS: &str = "\
@@ -360,6 +371,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
         raw.key_columns.push(RawKeyColumn {
             is_disabled: get(&row, "is_disabled")?,
             ignore_dup_key: get(&row, "ignore_dup_key")?,
+            index_type: get(&row, "index_type")?,
 
             object_id: get(&row, "object_id")?,
             constraint_name: get::<&str>(&row, "name")?.to_owned(),
@@ -374,6 +386,8 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             constraint_name: get::<&str>(&row, "name")?.to_owned(),
             ref_schema: get::<&str>(&row, "ref_schema")?.to_owned(),
             ref_table: get::<&str>(&row, "ref_table")?.to_owned(),
+            ref_object_id: get(&row, "ref_object_id")?,
+            ref_key: opt::<&str>(&row, "ref_key_name")?.map(str::to_owned),
             column: get::<&str>(&row, "column_name")?.to_owned(),
             ref_column: get::<&str>(&row, "ref_column_name")?.to_owned(),
             on_delete: get(&row, "delete_referential_action")?,

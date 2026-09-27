@@ -98,6 +98,10 @@ pub struct RawColumn {
 pub struct RawKeyColumn {
     pub is_disabled: bool,
     pub ignore_dup_key: bool,
+    /// `sys.indexes.type` of the backing index: one clustered, two
+    /// nonclustered rowstore, anything else a kind a key declaration cannot
+    /// spell either.
+    pub index_type: u8,
     pub object_id: i32,
     pub constraint_name: String,
     pub is_primary: bool,
@@ -111,6 +115,10 @@ pub struct RawForeignKeyColumn {
     pub constraint_name: String,
     pub ref_schema: String,
     pub ref_table: String,
+    pub ref_object_id: i32,
+    /// The name of the referenced key or unique index, as `key_index_id`
+    /// resolves it.
+    pub ref_key: Option<String>,
     pub column: String,
     pub ref_column: String,
     /// `sys.foreign_keys.delete_referential_action`: 0..=3.
@@ -918,6 +926,38 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             }
             continue;
         }
+        // A declaration spells neither CLUSTERED nor NONCLUSTERED, so
+        // bootstrap gets the engine's default: a clustered primary key (when
+        // the table has no clustered index yet) and a nonclustered unique
+        // constraint. A key laid out otherwise would come back swapped or
+        // turn a heap into a clustered table, and nothing would compare
+        // unequal afterwards. Report it, the rule a standalone clustered
+        // index already follows, until clusteredness is modelled (#1178).
+        let default_type = if k.is_primary { 1 } else { 2 };
+        if k.index_type != default_type {
+            if unsupported_keys.insert((k.object_id, k.constraint_name.clone())) {
+                let (kind, default) = if k.is_primary {
+                    ("primary key", "clustered")
+                } else {
+                    ("unique constraint", "nonclustered")
+                };
+                let layout = match k.index_type {
+                    2 => "nonclustered".to_owned(),
+                    other => index_type_name(other),
+                };
+                push_limitation(
+                    &mut warnings,
+                    &mut limitations,
+                    names.get(&k.object_id),
+                    format!(
+                        "{}: {kind} `{}` is backed by an index that is {layout}; a declaration cannot spell that layout, and bootstrap would recreate the key {default}, so it was left out of the declarations",
+                        name_of(k.object_id, &names),
+                        k.constraint_name,
+                    ),
+                );
+            }
+            continue;
+        }
         if k.is_primary {
             let pk = table.primary_key.get_or_insert_with(|| PrimaryKey {
                 name: Some(k.constraint_name.clone()),
@@ -970,6 +1010,25 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             continue;
         }
         let referenced = TableName::new(f.ref_schema.clone(), f.ref_table.clone());
+        if let Some(key) = f
+            .ref_key
+            .as_ref()
+            .filter(|key| unsupported_keys.contains(&(f.ref_object_id, (*key).clone())))
+        {
+            if unsupported_omitted_foreign_keys.insert((f.object_id, f.constraint_name.clone())) {
+                let table_name = name_of(f.object_id, &names);
+                push_limitation(
+                    &mut warnings,
+                    &mut limitations,
+                    names.get(&f.object_id),
+                    format!(
+                        "{table_name}: foreign key `{}` references key `{key}` of {referenced}, which was left out of the declarations; the foreign key was left out too",
+                        f.constraint_name
+                    ),
+                );
+            }
+            continue;
+        }
         if let Some(kind) = omitted_tables.get(&referenced) {
             if unsupported_omitted_foreign_keys.insert((f.object_id, f.constraint_name.clone())) {
                 let table_name = name_of(f.object_id, &names);
@@ -1850,6 +1909,7 @@ mod tests {
             key_columns: vec![RawKeyColumn {
                 is_disabled: false,
                 ignore_dup_key: false,
+                index_type: 1,
                 object_id: 10,
                 constraint_name: "pk_customer".into(),
                 is_primary: true,
@@ -2252,6 +2312,7 @@ mod tests {
             RawKeyColumn {
                 is_disabled: false,
                 ignore_dup_key: false,
+                index_type: 1,
                 object_id: 10,
                 constraint_name: "pk_customer".into(),
                 is_primary: true,
@@ -2260,6 +2321,7 @@ mod tests {
             RawKeyColumn {
                 is_disabled: false,
                 ignore_dup_key: false,
+                index_type: 1,
                 object_id: 10,
                 constraint_name: "pk_customer".into(),
                 is_primary: true,
@@ -2280,6 +2342,8 @@ mod tests {
                 constraint_name: "fk_x".into(),
                 ref_schema: "dbo".into(),
                 ref_table: "other".into(),
+                ref_object_id: 0,
+                ref_key: None,
                 column: a.into(),
                 ref_column: b.into(),
                 on_delete: 1,
@@ -2313,6 +2377,8 @@ mod tests {
                     constraint_name: "fk_state".into(),
                     ref_schema: "dbo".into(),
                     ref_table: "other".into(),
+                    ref_object_id: 0,
+                    ref_key: None,
                     column: column.into(),
                     ref_column: referenced.into(),
                     on_delete: 0,
@@ -2366,6 +2432,8 @@ mod tests {
             constraint_name: "fk_customer_versioned".into(),
             ref_schema: "dbo".into(),
             ref_table: "versioned".into(),
+            ref_object_id: 0,
+            ref_key: None,
             column: "id".into(),
             ref_column: "id".into(),
             on_delete: 0,
@@ -2387,6 +2455,136 @@ mod tests {
                 && limitation.detail.contains("fk_customer_versioned")
                 && limitation.detail.contains("dbo.versioned")
         }));
+    }
+
+    fn key(
+        object_id: i32,
+        name: &str,
+        is_primary: bool,
+        index_type: u8,
+        column: &str,
+    ) -> RawKeyColumn {
+        RawKeyColumn {
+            is_disabled: false,
+            ignore_dup_key: false,
+            index_type,
+            object_id,
+            constraint_name: name.into(),
+            is_primary,
+            column: column.into(),
+        }
+    }
+
+    /// #1186: the declarations spell no key layout, so bootstrap takes the
+    /// engine's default for each kind. A key laid out otherwise is reported
+    /// and left out rather than declared and silently swapped.
+    #[test]
+    fn a_key_whose_layout_is_not_its_kinds_default_is_reported_instead_of_declared() {
+        let mut raw = RawCatalog::default();
+        for (id, name) in [(1, "h"), (2, "u"), (3, "c"), (4, "m"), (5, "child")] {
+            raw.tables.push(raw_table(id, "dbo", name));
+            raw.columns.push(raw_column(id, "id", "int"));
+            raw.columns.push(raw_column(id, "code", "int"));
+        }
+        raw.key_columns = vec![
+            // A nonclustered primary key on a heap.
+            key(1, "pk_h", true, 2, "id"),
+            // A nonclustered primary key beside a clustered unique constraint.
+            key(2, "pk_u", true, 2, "id"),
+            key(2, "uq_u_code", false, 1, "code"),
+            // The control: the defaults for both kinds.
+            key(3, "pk_c", true, 1, "id"),
+            key(3, "uq_c_code", false, 2, "code"),
+            // A kind neither keyword spells (a memory-optimized hash key).
+            key(4, "pk_m", true, 7, "id"),
+            key(4, "pk_m", true, 7, "code"),
+        ];
+        // A child referencing each omitted key, and one referencing the
+        // control's key, which stays.
+        for (name, ref_object_id, ref_table, ref_key, ref_column) in [
+            ("fk_child_h", 1, "h", "pk_h", "id"),
+            ("fk_child_u_code", 2, "u", "uq_u_code", "code"),
+            ("fk_child_c", 3, "c", "pk_c", "id"),
+        ] {
+            raw.foreign_key_columns.push(RawForeignKeyColumn {
+                object_id: 5,
+                constraint_name: name.into(),
+                ref_schema: "dbo".into(),
+                ref_table: ref_table.into(),
+                ref_object_id,
+                ref_key: Some(ref_key.into()),
+                column: "id".into(),
+                ref_column: ref_column.into(),
+                on_delete: 0,
+                on_update: 0,
+                is_disabled: false,
+                is_not_trusted: false,
+                is_not_for_replication: false,
+            });
+        }
+
+        let pulled = assemble(&raw);
+
+        let table = |name: &str| &pulled.schema.tables[&TableName::new("dbo", name)];
+        for name in ["h", "u", "m"] {
+            assert_eq!(table(name).primary_key, None, "{name}");
+        }
+        assert!(table("u").unique.is_empty());
+        assert_eq!(
+            table("c").primary_key,
+            Some(PrimaryKey {
+                name: Some("pk_c".into()),
+                columns: vec!["id".into()],
+            })
+        );
+        assert!(table("c").unique.contains_key("uq_c_code"));
+        for (name, key, detail) in [
+            (
+                "h",
+                "pk_h",
+                "primary key `pk_h` is backed by an index that is nonclustered",
+            ),
+            (
+                "u",
+                "pk_u",
+                "primary key `pk_u` is backed by an index that is nonclustered",
+            ),
+            (
+                "u",
+                "uq_u_code",
+                "unique constraint `uq_u_code` is backed by an index that is clustered",
+            ),
+            (
+                "m",
+                "pk_m",
+                "primary key `pk_m` is backed by an index that is a hash index",
+            ),
+        ] {
+            assert!(
+                pulled.limitations.iter().any(|l| {
+                    l.target.object_name() == TableName::new("dbo", name)
+                        && l.detail.contains(detail)
+                }),
+                "{key}: {:?}",
+                pulled.limitations
+            );
+        }
+        let child = &table("child").foreign_keys;
+        assert_eq!(child.keys().collect::<Vec<_>>(), ["fk_child_c"]);
+        for (fk, key) in [("fk_child_h", "pk_h"), ("fk_child_u_code", "uq_u_code")] {
+            assert!(
+                pulled.limitations.iter().any(|l| {
+                    l.target.object_name() == TableName::new("dbo", "child")
+                        && l.detail
+                            .contains(&format!("foreign key `{fk}` references key `{key}`"))
+                }),
+                "{fk}: {:?}",
+                pulled.limitations
+            );
+        }
+        // One limitation per key and per foreign key, however many columns
+        // each has; none for the control table.
+        assert_eq!(pulled.limitations.len(), 6, "{:?}", pulled.limitations);
     }
 
     #[test]
@@ -2636,6 +2834,8 @@ mod module_tests {
             constraint_name: "fk_plain_acct".into(),
             ref_schema: "dbo".into(),
             ref_table: "acct".into(),
+            ref_object_id: 0,
+            ref_key: None,
             column: "id".into(),
             ref_column: "id".into(),
             on_delete: 0,
