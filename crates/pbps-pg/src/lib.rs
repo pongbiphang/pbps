@@ -2593,6 +2593,23 @@ mod tests {
         }
     }
 
+    /// `clustered` is SQL Server's table layout; this engine has no clustered
+    /// index to create, so the line is refused whatever it names — even a
+    /// well-formed selector (#1178).
+    #[test]
+    fn a_clustered_layout_is_refused_on_this_engine() {
+        let mut table = structural_table();
+        table.primary_key = Some(pbps_model::PrimaryKey {
+            name: None,
+            columns: vec!["a".into()],
+        });
+        assert!(structural_errors(&table).is_empty());
+        table.clustered = Some(pbps_model::Clustered::Heap);
+        let errors = structural_errors(&table);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("SQL Server table layout"), "{errors:?}");
+    }
+
     #[test]
     fn empty_checks_and_filters_are_reported_together_with_other_structural_errors() {
         let mut table = structural_table();

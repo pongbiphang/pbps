@@ -1158,15 +1158,23 @@ fn recreate_retyped_dependents(
                 table: name.clone(),
                 from: Some(key.clone()),
                 to: None,
+                nonclustered: false,
             });
             changes.push(Change::SetPrimaryKey {
                 table: name.clone(),
                 from: None,
                 to: Some(wanted.clone()),
+                nonclustered: !after.primary_key_is_clustered(),
             });
         }
+        // Only a constraint or index whose layout stays as it was: one whose
+        // layout moves is already dropped and re-added by `diff_constraints`,
+        // and a second pair here would drop it twice.
         for (n, key) in &before.unique {
-            if after.unique.get(n) == Some(key) && key.columns.iter().any(|c| key_column(c)) {
+            if after.unique.get(n) == Some(key)
+                && before.unique_is_clustered(n) == after.unique_is_clustered(n)
+                && key.columns.iter().any(|c| key_column(c))
+            {
                 changes.push(Change::DropUnique {
                     table: name.clone(),
                     name: n.clone(),
@@ -1175,6 +1183,7 @@ fn recreate_retyped_dependents(
                     table: name.clone(),
                     name: n.clone(),
                     constraint: key.clone(),
+                    clustered: after.unique_is_clustered(n),
                 });
             }
         }
@@ -1193,6 +1202,7 @@ fn recreate_retyped_dependents(
         }
         for (n, index) in &before.indexes {
             if after.indexes.get(n) == Some(index)
+                && before.index_is_clustered(n) == after.index_is_clustered(n)
                 && (index.columns.iter().any(|c| key_column(&c.name))
                     || index.include.iter().any(|c| key_column(c))
                     || (filters && index.filter.is_some()))
@@ -1205,6 +1215,7 @@ fn recreate_retyped_dependents(
                     table: name.clone(),
                     name: n.clone(),
                     index: Box::new(index.clone()),
+                    clustered: after.index_is_clustered(n),
                 });
             }
         }
@@ -1244,10 +1255,20 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
     // invented name into the file. So an unnamed declaration matches any
     // stored name and only the columns are compared; a *named* declaration is
     // compared in full, because renaming a constraint is a real change.
+    //
+    // A key that stays but changes layout — clustered to nonclustered or
+    // back, because the table's `clustered` selector moved — is a different
+    // index under the same constraint, and the engine has no statement that
+    // moves a key between the two in place: `DROP_EXISTING` refuses to turn a
+    // clustered index nonclustered (1925, measured), and the other direction
+    // is refused while a foreign key references the key (1930). So it is
+    // replaced like any other changed key (#1178).
     let pk_differs = match (&base.primary_key, &declared.primary_key) {
         (Some(b), Some(d)) if d.name.is_none() => b.columns != d.columns,
         (b, d) => b != d,
-    };
+    } || (base.primary_key.is_some()
+        && declared.primary_key.is_some()
+        && base.primary_key_is_clustered() != declared.primary_key_is_clustered());
     if pk_differs {
         // A key that is *replaced* is emitted as two changes: the old one's
         // drop, and the new one's add. One change carrying both directions can
@@ -1277,12 +1298,19 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
             } else {
                 declared.primary_key.clone()
             },
+            // Only a key this change adds has a layout: a key that is only
+            // dropped claims nothing, and PostgreSQL's emitter refuses a
+            // change that says nonclustered.
+            nonclustered: !split
+                && declared.primary_key.is_some()
+                && !declared.primary_key_is_clustered(),
         });
         if split {
             changes.push(Change::SetPrimaryKey {
                 table: name.clone(),
                 from: None,
                 to: declared.primary_key.clone(),
+                nonclustered: !declared.primary_key_is_clustered(),
             });
         }
     }
@@ -1317,12 +1345,43 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
         };
     }
 
-    by_name!(unique, AddUnique, DropUnique, std::convert::identity);
     by_name!(foreign_keys, AddForeignKey, DropForeignKey, Box::new);
     by_name!(checks, AddCheck, DropCheck, std::convert::identity);
 
+    // Out of the macro because these two carry a layout: a constraint or an
+    // index whose definition is unchanged but which becomes, or stops being,
+    // the clustered one is rebuilt, for the reason a key is above.
+    for (n, c) in &declared.unique {
+        let clustered = declared.unique_is_clustered(n);
+        if base.unique.get(n) != Some(c) || base.unique_is_clustered(n) != clustered {
+            if base.unique.contains_key(n) {
+                changes.push(Change::DropUnique {
+                    table: name.clone(),
+                    name: n.clone(),
+                });
+            }
+            changes.push(Change::AddUnique {
+                table: name.clone(),
+                name: n.clone(),
+                constraint: c.clone(),
+                clustered,
+            });
+        }
+    }
+    for n in base
+        .unique
+        .keys()
+        .filter(|n| !declared.unique.contains_key(*n))
+    {
+        changes.push(Change::DropUnique {
+            table: name.clone(),
+            name: n.clone(),
+        });
+    }
+
     for (n, ix) in &declared.indexes {
-        if base.indexes.get(n) != Some(ix) {
+        let clustered = declared.index_is_clustered(n);
+        if base.indexes.get(n) != Some(ix) || base.index_is_clustered(n) != clustered {
             if base.indexes.contains_key(n) {
                 changes.push(Change::DropIndex {
                     table: name.clone(),
@@ -1333,6 +1392,7 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
                 table: name.clone(),
                 name: n.clone(),
                 index: Box::new(ix.clone()),
+                clustered,
             });
         }
     }
@@ -1421,7 +1481,7 @@ fn diff_data(
                 // it on a column the baseline already has (DECISIONS 538).
                 let restored = changes.iter().any(|change| {
                     matches!(change,
-                    Change::SetPrimaryKey { table, from: None, to: Some(pk) }
+                    Change::SetPrimaryKey { table, from: None, to: Some(pk), .. }
                     if table == name && pk.columns == [key_column.clone()])
                 });
                 if !restored {
@@ -1798,14 +1858,32 @@ fn dependency_rank(
         | Change::RenameColumn { .. }
         | Change::AlterColumnNullability { .. }
         | Change::SetColumnDeprecated { .. }
-        | Change::SetPrimaryKey { .. }
-        | Change::AddUnique { .. }
         | Change::DropUnique { .. }
         | Change::AddCheck { .. }
         | Change::DropCheck { .. }
-        | Change::AddIndex { .. }
         | Change::DropIndex { .. }
         | Change::SetDataMode { .. } => 0,
+        // The clustered index goes in ahead of the rest of the addition
+        // class. Building it rebuilds every nonclustered index already on the
+        // table, whose row locators become its key, so an index added before
+        // it is built twice (#1178). Correctness needs nothing here: the old
+        // clustered index is gone by now, since every drop is in class 2.
+        //
+        // A key with no layout to speak of — every PostgreSQL key, whose
+        // `nonclustered` is always false — moves ahead of its siblings too,
+        // which orders nothing that depends on it.
+        Change::SetPrimaryKey {
+            to: Some(_),
+            nonclustered: false,
+            ..
+        }
+        | Change::AddUnique {
+            clustered: true, ..
+        }
+        | Change::AddIndex {
+            clustered: true, ..
+        } => -1,
+        Change::SetPrimaryKey { .. } | Change::AddUnique { .. } | Change::AddIndex { .. } => 0,
         // A foreign key needs the key it references to exist, so it goes last
         // in the addition class and first in the drop class. Measured on the
         // pinned image, both halves are real: added before its key, the engine
@@ -2556,6 +2634,263 @@ mod tests {
         .unwrap()
     }
 
+    /// A table with a key, a UNIQUE constraint and an index, clustered on
+    /// whichever `layout` names (#1178).
+    fn clustered_on(layout: Option<pbps_model::Clustered>) -> Table {
+        let mut t = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("code", Column::new(ty("int")).not_null()),
+            ("v", Column::new(ty("int"))),
+        ]);
+        t.primary_key = Some(PrimaryKey {
+            name: Some("pk_t".into()),
+            columns: vec!["id".into()],
+        });
+        t.unique.insert(
+            "uq_code".into(),
+            UniqueConstraint {
+                columns: vec!["code".into()],
+            },
+        );
+        t.indexes.insert(
+            "ix_v".into(),
+            Index {
+                columns: vec![IndexColumn {
+                    name: "v".into(),
+                    descending: false,
+                }],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+            },
+        );
+        t.clustered = layout;
+        t
+    }
+
+    /// Moving the clustered index rebuilds the object that gives it up and
+    /// the one that takes it, each with its new layout, and nothing else;
+    /// the new clustered index is built before any other addition, so the
+    /// key re-added nonclustered is not built twice.
+    #[test]
+    fn a_layout_change_rebuilds_exactly_the_two_objects_it_moves_between() {
+        use pbps_model::Clustered;
+        let cs = run(
+            &schema_of("dbo.t", clustered_on(None)),
+            &schema_of("dbo.t", clustered_on(Some(Clustered::Index("ix_v".into())))),
+            &[],
+        );
+        let shown: Vec<String> = cs
+            .changes
+            .iter()
+            .map(|p| match &p.change {
+                Change::SetPrimaryKey {
+                    from,
+                    to,
+                    nonclustered,
+                    ..
+                } => format!(
+                    "pk {}->{} nonclustered={nonclustered}",
+                    from.is_some(),
+                    to.is_some()
+                ),
+                Change::AddIndex {
+                    name, clustered, ..
+                } => format!("add {name} clustered={clustered}"),
+                Change::DropIndex { name, .. } => format!("drop {name}"),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "drop ix_v",
+                "pk true->false nonclustered=false",
+                "add ix_v clustered=true",
+                "pk false->true nonclustered=true",
+            ]
+        );
+
+        // And back: the key takes it again, and the index is rebuilt plain —
+        // after the key, although `AddIndex` sorts ahead of `SetPrimaryKey`
+        // everywhere else in the addition class.
+        let cs = run(
+            &schema_of("dbo.t", clustered_on(Some(Clustered::Index("ix_v".into())))),
+            &schema_of("dbo.t", clustered_on(None)),
+            &[],
+        );
+        let key = cs.changes.iter().position(|p| {
+            matches!(
+                &p.change,
+                Change::SetPrimaryKey {
+                    to: Some(_),
+                    nonclustered: false,
+                    ..
+                }
+            )
+        });
+        let index = cs.changes.iter().position(|p| {
+            matches!(
+                &p.change,
+                Change::AddIndex {
+                    clustered: false,
+                    ..
+                }
+            )
+        });
+        assert!(
+            matches!((key, index), (Some(k), Some(i)) if k < i),
+            "{cs:?}"
+        );
+        assert!(!kinds(&cs).iter().any(|k| k.contains("Unique")), "{cs:?}");
+
+        // Negative: an unchanged layout is no change at all.
+        for layout in [
+            None,
+            Some(Clustered::Heap),
+            Some(Clustered::Unique("uq_code".into())),
+        ] {
+            let t = schema_of("dbo.t", clustered_on(layout.clone()));
+            assert!(run(&t, &t, &[]).changes.is_empty(), "{layout:?}");
+        }
+    }
+
+    /// A key that is only dropped claims no layout, whatever the declaration
+    /// says about the table: `nonclustered` describes the key a change adds.
+    /// PostgreSQL's emitter refuses a change that claims one, so a drop that
+    /// did would stop every plan giving up a key there.
+    #[test]
+    fn a_key_that_is_only_dropped_claims_no_layout() {
+        let base = clustered_on(None);
+        let mut declared = base.clone();
+        declared.primary_key = None;
+        let cs = run(
+            &schema_of("dbo.t", base),
+            &schema_of("dbo.t", declared),
+            &[],
+        );
+        assert!(
+            cs.changes.iter().any(|p| matches!(
+                &p.change,
+                Change::SetPrimaryKey {
+                    to: None,
+                    nonclustered: false,
+                    ..
+                }
+            )),
+            "{cs:?}"
+        );
+        assert!(
+            !cs.changes.iter().any(|p| matches!(
+                &p.change,
+                Change::SetPrimaryKey {
+                    nonclustered: true,
+                    ..
+                }
+            )),
+            "{cs:?}"
+        );
+    }
+
+    /// A key that stays but becomes nonclustered is still a different
+    /// index, so the foreign keys bound to it are dropped and re-added
+    /// around it, as they are for any replaced key.
+    #[test]
+    fn a_key_moved_to_the_heap_takes_its_foreign_keys_through_the_rebuild() {
+        let mut base = schema_of("dbo.t", clustered_on(None));
+        let mut child = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("t_id", Column::new(ty("int"))),
+        ]);
+        child.foreign_keys.insert(
+            "fk_child_t".into(),
+            ForeignKey {
+                columns: vec!["t_id".into()],
+                references_table: "dbo.t".parse().unwrap(),
+                references_columns: vec!["id".into()],
+                on_delete: ReferentialAction::NoAction,
+                on_update: ReferentialAction::NoAction,
+            },
+        );
+        base.tables.insert("dbo.child".parse().unwrap(), child);
+        let mut declared = base.clone();
+        declared
+            .tables
+            .get_mut(&"dbo.t".parse::<TableName>().unwrap())
+            .unwrap()
+            .clustered = Some(pbps_model::Clustered::Heap);
+        let k = kinds(&run(&base, &declared, &[]));
+        assert_eq!(
+            k,
+            [
+                "DropForeignKey",
+                "SetPrimaryKey",
+                "SetPrimaryKey",
+                "AddForeignKey"
+            ]
+        );
+    }
+
+    /// A renamed clustered index is a drop and an add under the new name,
+    /// and the selector written with the new name makes the new one the
+    /// clustered one; the key, nonclustered on both sides, is not touched.
+    #[test]
+    fn a_renamed_clustered_index_is_rebuilt_clustered_under_its_new_name() {
+        use pbps_model::Clustered;
+        let base = clustered_on(Some(Clustered::Index("ix_v".into())));
+        let mut declared = base.clone();
+        let index = declared.indexes.remove("ix_v").unwrap();
+        declared.indexes.insert("cx_v".into(), index);
+        declared.clustered = Some(Clustered::Index("cx_v".into()));
+        let cs = run(
+            &schema_of("dbo.t", base),
+            &schema_of("dbo.t", declared),
+            &[],
+        );
+        let shown: Vec<String> = cs
+            .changes
+            .iter()
+            .map(|p| match &p.change {
+                Change::AddIndex {
+                    name, clustered, ..
+                } => format!("add {name} clustered={clustered}"),
+                Change::DropIndex { name, .. } => format!("drop {name}"),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(shown, ["drop ix_v", "add cx_v clustered=true"]);
+    }
+
+    /// A key that references itself goes through its own rebuild: the
+    /// foreign key is dropped before the key and re-added after it.
+    #[test]
+    fn a_self_referencing_key_rebuilt_for_its_layout_keeps_its_foreign_key() {
+        let mut t = clustered_on(None);
+        t.columns.insert("parent".into(), Column::new(ty("int")));
+        t.foreign_keys.insert(
+            "fk_t_parent".into(),
+            ForeignKey {
+                columns: vec!["parent".into()],
+                references_table: "dbo.t".parse().unwrap(),
+                references_columns: vec!["id".into()],
+                on_delete: ReferentialAction::NoAction,
+                on_update: ReferentialAction::NoAction,
+            },
+        );
+        let mut heap = t.clone();
+        heap.clustered = Some(pbps_model::Clustered::Heap);
+        let k = kinds(&run(&schema_of("dbo.t", t), &schema_of("dbo.t", heap), &[]));
+        assert_eq!(
+            k,
+            [
+                "DropForeignKey",
+                "SetPrimaryKey",
+                "SetPrimaryKey",
+                "AddForeignKey"
+            ]
+        );
+    }
+
     /// Why a comparison against a live database has to identify the live side
     /// by what is there (`crate::observed_ids`), not by the mapping the
     /// declarations carry.
@@ -3264,6 +3599,7 @@ mod tests {
             table: name.clone(),
             from: None,
             to: declared.primary_key.clone(),
+            nonclustered: false,
         }];
         let mut errors = Vec::new();
         let mapping = [
@@ -5178,6 +5514,7 @@ mod tests {
                     table: "dbo.t".parse().unwrap(),
                     from: None,
                     to: None,
+                    nonclustered: false,
                 }),
                 std::mem::discriminant(&Change::AlterColumnNullability {
                     uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),

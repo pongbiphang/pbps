@@ -5,9 +5,11 @@
 //! when every row is processed. The live catalogue matrix measures the update
 //! and scan paths alongside log volume. Compression changes those paths.
 //!
-//! Only column type/nullability changes have measurements here. ONLINE and
-//! unmeasured catalog shapes remain unknown. A whole plan supplies catalog
-//! identities before renames and distinguishes newly created objects (D478).
+//! Column type/nullability changes have measurements here, and so do the two
+//! halves of moving a table's clustered index (#1178): building one, and
+//! dropping one the catalog confirms is clustered. ONLINE and unmeasured
+//! catalog shapes remain unknown. A whole plan supplies catalog identities
+//! before renames and distinguishes newly created objects (D478).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -96,12 +98,35 @@ pub struct Estimate {
     pub rows: Option<i64>,
     pub rows_unknown: Option<String>,
     // A created identity or an earlier retype has no measured stored context.
-    source: Option<(TableName, String)>,
-    from: ColumnType,
-    to: ColumnType,
-    from_nullable: bool,
-    to_nullable: bool,
+    // The table as the catalog names it before this plan, with the column's
+    // name for a column change.
+    source: Option<(TableName, Option<String>)>,
+    work: Work,
     online: bool,
+}
+
+/// What the estimated statement does to the table's storage.
+#[derive(Debug, Clone)]
+enum Work {
+    Column {
+        from: ColumnType,
+        to: ColumnType,
+        from_nullable: bool,
+        to_nullable: bool,
+    },
+    /// Building the table's clustered index. Measured on 17.0 with 20,000
+    /// rows: the base table and every nonclustered index got new partition
+    /// ids — the rows were rewritten in the key's order and each
+    /// nonclustered index rebuilt, since their row locators became the key —
+    /// under Sch-M on the table (#1178).
+    ClusteredBuild,
+    /// Dropping an index-backed object — a primary key (`None`), a UNIQUE
+    /// constraint or an index — which rewrites the table as a heap only if
+    /// it is the clustered index. The change does not say; the baseline's
+    /// catalog does, so this is settled in [`against`]. Measured on 17.0 as
+    /// the mirror of the build: new partition ids for the heap and each
+    /// nonclustered index, under Sch-M.
+    MaybeClusteredDrop(Option<String>),
 }
 
 impl Estimate {
@@ -138,8 +163,121 @@ pub fn planned_estimates(changes: &ChangeSet) -> Vec<(usize, Estimate)> {
             tables.insert(name, identities[uid].clone());
         }
     }
+    // A table the plan creates has no stored rows to rewrite; a renamed one is
+    // found in the catalog under its old name.
+    let stored = |table: &TableName| {
+        tables
+            .get(table)
+            .cloned()
+            .unwrap_or_else(|| Some(table.clone()))
+    };
+    let layout = changes
+        .changes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, p)| {
+            let (table, work, about) = match &p.change {
+                Change::SetPrimaryKey {
+                    table,
+                    to: Some(_),
+                    nonclustered: false,
+                    ..
+                } => (
+                    table,
+                    Work::ClusteredBuild,
+                    "building the primary key as the clustered index".to_owned(),
+                ),
+                Change::AddUnique {
+                    table,
+                    name,
+                    clustered: true,
+                    ..
+                }
+                | Change::AddIndex {
+                    table,
+                    name,
+                    clustered: true,
+                    ..
+                } => (
+                    table,
+                    Work::ClusteredBuild,
+                    format!("building `{name}` as the clustered index"),
+                ),
+                Change::SetPrimaryKey {
+                    table,
+                    from: Some(_),
+                    to: None,
+                    ..
+                } => (
+                    table,
+                    Work::MaybeClusteredDrop(None),
+                    "dropping the primary key".to_owned(),
+                ),
+                Change::DropUnique { table, name } | Change::DropIndex { table, name } => (
+                    table,
+                    Work::MaybeClusteredDrop(Some(name.clone())),
+                    format!("dropping `{name}`"),
+                ),
+                Change::CreateTable { .. }
+                | Change::DropTable { .. }
+                | Change::RenameTable { .. }
+                | Change::AddColumn { .. }
+                | Change::DropColumn { .. }
+                | Change::RenameColumn { .. }
+                | Change::AlterColumnType { .. }
+                | Change::AlterColumnNullability { .. }
+                | Change::AlterColumnDefault { .. }
+                | Change::SetColumnDeprecated { .. }
+                | Change::SetPrimaryKey { .. }
+                | Change::AddUnique { .. }
+                | Change::AddForeignKey { .. }
+                | Change::DropForeignKey { .. }
+                | Change::AddCheck { .. }
+                | Change::DropCheck { .. }
+                | Change::AddIndex { .. }
+                | Change::InsertRow { .. }
+                | Change::UpdateRow { .. }
+                | Change::DeleteRow { .. }
+                | Change::SetDataMode { .. }
+                | Change::CreateModule { .. }
+                | Change::AlterModule { .. }
+                | Change::DropModule { .. }
+                | Change::CreateRole { .. }
+                | Change::DropRole { .. }
+                | Change::RenameRole { .. }
+                | Change::Grant { .. }
+                | Change::Revoke { .. }
+                | Change::PublicExecution { .. } => return None,
+            };
+            let (rewrite, reads) = unknown("the table's clustered layout has not been read yet");
+            Some((
+                index,
+                Estimate {
+                    about,
+                    table: table.clone(),
+                    rewrite,
+                    reads,
+                    lock: if p.strategy.online {
+                        "unknown (ONLINE index operations are unmeasured)"
+                    } else {
+                        "Sch-M"
+                    },
+                    blocks: if p.strategy.online {
+                        "unknown"
+                    } else {
+                        "reads and writes"
+                    },
+                    rows: None,
+                    rows_unknown: None,
+                    source: stored(table).map(|t| (t, None)),
+                    work,
+                    online: p.strategy.online,
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
     let mut retyped = BTreeSet::new();
-    changes
+    let mut out: Vec<(usize, Estimate)> = changes
         .changes
         .iter()
         .enumerate()
@@ -190,17 +328,15 @@ pub fn planned_estimates(changes: &ChangeSet) -> Vec<(usize, Estimate)> {
                 | Change::Revoke { .. }
                 | Change::PublicExecution { .. } => return None,
             };
-            let source = tables
-                .get(&column.table)
-                .cloned()
-                .unwrap_or_else(|| Some(column.table.clone()))
+            let source = stored(&column.table)
                 .zip(
                     columns
                         .get(uid)
                         .cloned()
                         .unwrap_or_else(|| Some(column.name.clone())),
                 )
-                .filter(|_| retyped.insert(uid));
+                .filter(|_| retyped.insert(uid))
+                .map(|(table, column)| (table, Some(column)));
             let (rewrite, reads) =
                 unknown("the table's stored row encoding has not been measured yet");
             Some((
@@ -226,15 +362,20 @@ pub fn planned_estimates(changes: &ChangeSet) -> Vec<(usize, Estimate)> {
                     rows: None,
                     rows_unknown: None,
                     source,
-                    from: from.clone(),
-                    to: to.clone(),
-                    from_nullable,
-                    to_nullable,
+                    work: Work::Column {
+                        from: from.clone(),
+                        to: to.clone(),
+                        from_nullable,
+                        to_nullable,
+                    },
                     online: p.strategy.online,
                 },
             ))
         })
-        .collect()
+        .collect();
+    out.extend(layout);
+    out.sort_by_key(|(index, _)| *index);
+    out
 }
 
 // Catalog views suffice for the product. Diagnostic update/log counters belong
@@ -255,10 +396,26 @@ SELECT CONVERT(int, SERVERPROPERTY('ProductMajorVersion')) AS major,
   FROM sys.tables t LEFT JOIN sys.columns c ON c.object_id=t.object_id AND c.name=@P2
  WHERE t.object_id=OBJECT_ID(@P1);";
 
+/// The table's rows and whether the named index-backed object is its
+/// clustered index. `@P2` NULL asks about the primary key.
+const LAYOUT: &str = "\
+SELECT CONVERT(int, SERVERPROPERTY('ProductMajorVersion')) AS major,
+       t.is_memory_optimized, t.temporal_type,
+       (SELECT SUM(p.rows) FROM sys.partitions p WHERE p.object_id=t.object_id AND p.index_id IN (0,1)) AS row_count,
+       (SELECT COUNT_BIG(*) FROM sys.partitions p WHERE p.object_id=t.object_id AND p.index_id IN (0,1)) AS partitions,
+       (SELECT TOP (1) i.type FROM sys.indexes i
+         WHERE i.object_id=t.object_id
+           AND ((@P2 IS NULL AND i.is_primary_key=1) OR i.name=@P2)) AS dropped_type
+  FROM sys.tables t
+ WHERE t.object_id=OBJECT_ID(@P1);";
+
 /// Fill advisory catalog context. Failure is reported by the caller as an
 /// unavailable estimate; it must never refuse a valid plan (SPEC 14.1).
 pub async fn against(conn: &mut Conn, estimate: &mut Estimate) -> Result<(), DbError> {
-    let Some((table, column)) = &estimate.source else {
+    if !matches!(estimate.work, Work::Column { .. }) {
+        return against_layout(conn, estimate).await;
+    }
+    let Some((table, Some(column))) = &estimate.source else {
         let why =
             "this plan creates or already retypes this identity; its future storage is unmeasured";
         estimate.rows_unknown = Some(why.to_owned());
@@ -316,15 +473,93 @@ pub async fn against(conn: &mut Conn, estimate: &mut Estimate) -> Result<(), DbE
         } else {
             RowStorage::Compressed
         };
-        (estimate.rewrite, estimate.reads) = column_work(
-            &estimate.from,
-            &estimate.to,
-            estimate.from_nullable,
-            estimate.to_nullable,
-            storage,
-        );
+        let Work::Column {
+            from,
+            to,
+            from_nullable,
+            to_nullable,
+        } = &estimate.work
+        else {
+            unreachable!("a layout estimate returned above");
+        };
+        (estimate.rewrite, estimate.reads) =
+            column_work(from, to, *from_nullable, *to_nullable, storage);
         if estimate.rewrite == Rewrite::Yes {
             estimate.about.push_str(" (in-place row updates)");
+        }
+    }
+    Ok(())
+}
+
+/// [`against`] for a change to the table's clustered index (#1178).
+async fn against_layout(conn: &mut Conn, estimate: &mut Estimate) -> Result<(), DbError> {
+    let Some((table, _)) = &estimate.source else {
+        let why = "this plan creates this table; it holds no rows to rewrite yet";
+        estimate.rows_unknown = Some(why.to_owned());
+        estimate.unknown(why);
+        return Ok(());
+    };
+    let relation = match crate::emit::qualified(table) {
+        Ok(name) => name,
+        Err(_) => {
+            estimate.unknown("this table's name cannot be written as an identifier");
+            return Ok(());
+        }
+    };
+    let dropped = match &estimate.work {
+        Work::MaybeClusteredDrop(name) => name.clone(),
+        Work::Column { .. } | Work::ClusteredBuild => None,
+    };
+    let rows = conn
+        .query_with(
+            LAYOUT,
+            &[relation.as_str().into(), dropped.as_deref().into()],
+        )
+        .await?;
+    let Some(row) = rows.first() else {
+        let why = "this database has no visible table by that name to measure";
+        estimate.rows_unknown = Some(why.to_owned());
+        estimate.unknown(why);
+        return Ok(());
+    };
+    estimate.rows = row.try_get::<i64>("row_count")?;
+    if estimate.rows.is_none() {
+        estimate.rows_unknown = Some("no catalog row estimate is available".to_owned());
+    }
+    let why = if estimate.online {
+        Some("ONLINE index operations have not been measured")
+    } else if row.try_get::<i32>("major")? != Some(17) {
+        Some(
+            "this SQL Server version has not been measured; the catalogue matrix covers version 17",
+        )
+    } else if row.try_get::<bool>("is_memory_optimized")? != Some(false)
+        || row.try_get::<u8>("temporal_type")? != Some(0)
+        || row.try_get::<i64>("partitions")? != Some(1)
+    {
+        Some(
+            "this table's storage or partitioning is outside the measured ordinary rowstore shapes",
+        )
+    } else if matches!(estimate.work, Work::MaybeClusteredDrop(_))
+        && row.try_get::<u8>("dropped_type")? != Some(1)
+    {
+        Some("only dropping the clustered index is measured, and this is not it")
+    } else {
+        None
+    };
+    match why {
+        Some(why) => estimate.unknown(why),
+        None => {
+            (estimate.rewrite, estimate.reads) = (Rewrite::Yes, Reads::EveryRow);
+            estimate.about.push_str(match estimate.work {
+                Work::MaybeClusteredDrop(_) => {
+                    " (the clustered index: the rows are rewritten as a heap and every \
+                     nonclustered index is rebuilt)"
+                }
+                Work::ClusteredBuild | Work::Column { .. } => {
+                    " (the rows are rewritten in its order and every nonclustered index is \
+                     rebuilt)"
+                }
+            });
         }
     }
     Ok(())

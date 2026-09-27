@@ -3150,7 +3150,7 @@ fn build(
         Change::AddUnique {
             table,
             name,
-            constraint,
+            constraint, ..
         } => {
             let Some(rows) = rows_after(names, table, &constraint.columns, "c", &Applies::AllRows)?
             else {
@@ -3165,7 +3165,7 @@ fn build(
 
         // A unique index asks the same question, over the rows its predicate
         // keeps. A plain index constrains nothing and falls to the arm below.
-        Change::AddIndex { table, name, index } if index.unique => {
+        Change::AddIndex { table, name, index, .. } if index.unique => {
             // The key columns only. `INCLUDE` is payload the engine carries in
             // the leaf and never compares, so counting it would group rows the
             // index will still collide.
@@ -3590,6 +3590,7 @@ mod tests {
                 constraint: pbps_model::UniqueConstraint {
                     columns: columns.clone(),
                 },
+                clustered: false,
             },
             Change::AddIndex {
                 table: table.clone(),
@@ -3603,6 +3604,7 @@ mod tests {
                     unique: true,
                     filter: None,
                 }),
+                clustered: false,
             },
             Change::SetPrimaryKey {
                 table: table.clone(),
@@ -3611,6 +3613,7 @@ mod tests {
                     name: None,
                     columns: columns.clone(),
                 }),
+                nonclustered: false,
             },
             Change::AddForeignKey {
                 table,
@@ -3721,6 +3724,7 @@ mod tests {
                     constraint: pbps_model::UniqueConstraint {
                         columns: vec!["v".into()],
                     },
+                    clustered: false,
                 },
             ),
             (
@@ -3737,6 +3741,7 @@ mod tests {
                         unique: true,
                         filter: None,
                     }),
+                    clustered: false,
                 },
             ),
             (
@@ -3748,6 +3753,7 @@ mod tests {
                         name: None,
                         columns: vec!["v".into()],
                     }),
+                    nonclustered: false,
                 },
             ),
             (

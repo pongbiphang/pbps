@@ -2028,6 +2028,153 @@ fn a_synonym_at_an_added_checks_name_refuses_the_plan() {
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
 }
 
+/// A table's clustered layout goes the whole way through the CLI (#1178):
+/// `pull` declares it, `bootstrap` rebuilds it in an empty database, and a
+/// second `pull` from there writes the same files. Moving it on an adopted,
+/// populated table is a reviewed plan: gated as the key rebuild it is,
+/// estimated as a rewrite, applied, and followed by an empty plan. A state
+/// recorded without the layout — what a pre-#1178 reader wrote for a table
+/// whose key it misread — is drift, not a plan against the wrong layout.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_clustered_layout_round_trips_and_moves_through_the_cli() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let source = OwnDatabase::new(&server, "layout1178_src");
+    let target = OwnDatabase::new(&server, "layout1178_dst");
+    on_server(
+        source.connection(),
+        "CREATE TABLE dbo.h (id int NOT NULL CONSTRAINT pk_h PRIMARY KEY NONCLUSTERED, v int NULL);
+         CREATE TABLE dbo.x (id int NOT NULL CONSTRAINT pk_x PRIMARY KEY NONCLUSTERED,
+                             at datetime2 NOT NULL);
+         CREATE CLUSTERED INDEX cx_x ON dbo.x (at);
+         CREATE TABLE dbo.p (id int NOT NULL CONSTRAINT pk_p PRIMARY KEY, v int NULL);
+         CREATE INDEX ix_p_v ON dbo.p (v);
+         CREATE TABLE dbo.q (id int NOT NULL CONSTRAINT pk_q PRIMARY KEY,
+                             p_id int NOT NULL CONSTRAINT fk_q_p REFERENCES dbo.p (id));
+         INSERT dbo.p VALUES (1, 10), (2, 20), (3, 30);
+         INSERT dbo.q VALUES (1, 1), (2, 3);",
+    );
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+
+    let d = Demo::new("layout1178");
+    let o = d.run(&["pull", "--db", source.connection()]);
+    ok(&o);
+    assert!(!stderr(&o).contains("layout"), "{}", stderr(&o));
+    let file = |d: &Demo, t: &str| {
+        std::fs::read_to_string(d.dir.join(format!("schema/dbo.{t}.yml"))).unwrap()
+    };
+    assert!(
+        file(&d, "h").contains("\nclustered: heap\n"),
+        "{}",
+        file(&d, "h")
+    );
+    assert!(
+        file(&d, "x").contains("\nclustered: {index: cx_x}\n"),
+        "{}",
+        file(&d, "x")
+    );
+    assert!(!file(&d, "p").contains("clustered"), "{}", file(&d, "p"));
+    d.commit();
+
+    // Rebuilt from the files alone, and read back as the same files.
+    ok(&d.run(&["bootstrap", "--db", target.connection()]));
+    let again = Demo::new("layout1178-again");
+    ok(&again.run(&["pull", "--db", target.connection()]));
+    for t in ["h", "x", "p", "q"] {
+        assert_eq!(file(&again, t), file(&d, t), "dbo.{t}");
+    }
+
+    // Adopt the source, then move p's clustered index from its key to ix_p_v.
+    ok(&d.run(&["baseline", "--db", source.connection(), "--reason", "adopt"]));
+    let path = d.dir.join("schema/dbo.p.yml");
+    std::fs::write(
+        &path,
+        format!("{}\nclustered: {{index: ix_p_v}}\n", file(&d, "p")),
+    )
+    .unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&[
+        "plan",
+        "--db",
+        source.connection(),
+        "--out",
+        plan.to_str().unwrap(),
+    ]);
+    ok(&o);
+    let shown = stdout(&o);
+    assert!(
+        shown.contains("building `ix_p_v` as the clustered index"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("dropping the primary key (the clustered index"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("Lock: Sch-M; blocks reads and writes"),
+        "{shown}"
+    );
+    let checksum = plan_checksum(&plan);
+    let apply = |allow: &[&str]| {
+        let mut args = vec![
+            "apply",
+            "--db",
+            source.connection(),
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+        ];
+        args.extend_from_slice(allow);
+        d.run(&args)
+    };
+    // The key is dropped and re-added, so the gate asks, and nothing ran.
+    let refused = apply(&[]);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        stderr(&refused).contains("destructive"),
+        "{}",
+        stderr(&refused)
+    );
+    ok(&apply(&["--allow", "destructive", "--allow", "constraint"]));
+    let o = d.run(&["plan", "--db", source.connection()]);
+    ok(&o);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+
+    // Every row, and the foreign key into the rebuilt key, survived.
+    on_server(
+        source.connection(),
+        "IF (SELECT COUNT(*) FROM dbo.p) <> 3 OR (SELECT COUNT(*) FROM dbo.q) <> 2
+             THROW 50000, 'rows lost', 1;
+         IF (SELECT type FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.p') AND name = 'ix_p_v') <> 1
+             THROW 50000, 'ix_p_v is not clustered', 1;
+         IF OBJECT_ID('dbo.fk_q_p', 'F') IS NULL THROW 50000, 'fk_q_p is gone', 1;",
+    );
+
+    // A recording without the layout, as a reader from before #1178 wrote
+    // it for dbo.h, stops the next plan as drift, and `verify` names it.
+    on_server(
+        source.connection(),
+        "UPDATE dbo.__pbps_state
+            SET state_json = REPLACE(state_json, N',\"clustered\":\"heap\"', N'')
+          WHERE id = (SELECT MAX(id) FROM dbo.__pbps_state);",
+    );
+    let o = d.run(&["plan", "--db", source.connection()]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("has drifted"),
+        "{}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+    let o = d.run(&["verify", "--db", source.connection()]);
+    let said = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(said.contains("dbo.h"), "{said}");
+    assert!(!said.contains("dbo.p"), "{said}");
+}
+
 /// A sequence or a synonym already at the name of a table this plan creates
 /// refuses the plan by name, and no plan is written (#1077). SQL Server keeps
 /// tables, views, routines, sequences, synonyms and constraints in one
@@ -14787,7 +14934,7 @@ fn a_connected_sql_server_plan_names_inapplicable_postgres_checks_in_json() {
         &o,
     );
     let human = stdout(&assert_ok(d.run(&["plan", "--db", own.connection()])));
-    assert!(human.contains("this plan contains neither"));
+    assert!(human.contains("this plan contains none"));
     let saved: pbps_model::SavedPlan =
         serde_json::from_str(&std::fs::read_to_string(&artifact).unwrap()).unwrap();
     assert_eq!(saved.changes.changes.len(), 1);

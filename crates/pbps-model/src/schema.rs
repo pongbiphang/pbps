@@ -104,6 +104,46 @@ impl Table {
         problems
     }
 
+    /// Whether the primary key's index is the clustered one: the default
+    /// layout, where the table has a key at all.
+    pub fn primary_key_is_clustered(&self) -> bool {
+        self.primary_key.is_some() && self.clustered.is_none()
+    }
+
+    /// Whether the UNIQUE constraint `name`'s index is the clustered one.
+    pub fn unique_is_clustered(&self, name: &str) -> bool {
+        matches!(&self.clustered, Some(Clustered::Unique(n)) if n == name)
+    }
+
+    /// Whether the index `name` is the clustered one.
+    pub fn index_is_clustered(&self, name: &str) -> bool {
+        matches!(&self.clustered, Some(Clustered::Index(n)) if n == name)
+    }
+
+    /// Why this table's [`Table::clustered`] cannot be what it says.
+    ///
+    /// Structural, so every dialect asks it, as it asks
+    /// [`Table::constraint_name_conflicts`]. A dialect with no clustered
+    /// index at all refuses the field outright on top of this.
+    pub fn clustered_problems(&self) -> Vec<String> {
+        match &self.clustered {
+            None => Vec::new(),
+            Some(Clustered::Heap) if self.primary_key.is_none() => vec![
+                "`clustered: heap` on a table with no primary key says nothing: without a \
+                 key the table is a heap already; remove the line"
+                    .to_owned(),
+            ],
+            Some(Clustered::Heap) => Vec::new(),
+            Some(Clustered::Unique(n)) if !self.unique.contains_key(n) => vec![format!(
+                "`clustered` names unique constraint `{n}`, which this table does not declare"
+            )],
+            Some(Clustered::Index(n)) if !self.indexes.contains_key(n) => vec![format!(
+                "`clustered` names index `{n}`, which this table does not declare"
+            )],
+            Some(Clustered::Unique(_) | Clustered::Index(_)) => Vec::new(),
+        }
+    }
+
     /// The single column a declared row is keyed by, where this table has one.
     ///
     /// `None` is not "no key": it is a primary key that is absent or composite,
@@ -169,6 +209,22 @@ pub struct Table {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub indexes: BTreeMap<String, Index>,
 
+    /// Which index holds the table's rows, where that is not the default
+    /// (SQL Server's clustered index, #1178).
+    ///
+    /// `None` is the default layout, and it is a reading rather than a gap:
+    /// the primary key is clustered, and a table without one is a heap. That
+    /// is what the engine does with a key that spells neither keyword on a
+    /// table with no clustered index, so it is what every table pbps created
+    /// before this field existed has — which is why a snapshot or plan
+    /// without the field reads as `None` and is not refused.
+    ///
+    /// One selector for the whole table, not a flag on each key and index:
+    /// a table has at most one clustered index, and a selector cannot name
+    /// two, where two flags could both say yes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clustered: Option<Clustered>,
+
     /// Declared reference data (ADR-0004).
     ///
     /// `None` — the overwhelmingly common case — is the opt-in switch being
@@ -180,6 +236,27 @@ pub struct Table {
     /// existed describes a table that declares no rows, not a broken file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<TableData>,
+}
+
+/// A table layout other than the default (see [`Table::clustered`]).
+///
+/// Names the object by its declared name within the same table. A rename of
+/// that object is a drop and an add under the new name (constraints and
+/// indexes are never renamed in place), so the selector follows it by being
+/// written with the new name; nothing else holds the name a second time.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Clustered {
+    /// No clustered index, although the table has a primary key: the key is
+    /// nonclustered and the rows are a heap. Without a key a heap is already
+    /// the default, and this is refused as saying nothing.
+    Heap,
+    /// This UNIQUE constraint's index is the clustered one; the primary key,
+    /// if any, is nonclustered.
+    Unique(String),
+    /// This index is the clustered one; the primary key, if any, is
+    /// nonclustered.
+    Index(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -507,6 +584,63 @@ mod tests {
             !column.has_required_add_value_source(),
             "the shared default keeps SQL Server's answer"
         );
+    }
+
+    /// The selector names an object of this table or says `heap` of a keyed
+    /// one; anything else cannot be the table it claims (#1178).
+    #[test]
+    fn a_clustered_selector_must_name_something_this_table_declares() {
+        let mut t = sample();
+        t.unique.insert(
+            "uq_email".into(),
+            UniqueConstraint {
+                columns: vec!["email".into()],
+            },
+        );
+        for fine in [
+            None,
+            Some(Clustered::Heap),
+            Some(Clustered::Unique("uq_email".into())),
+        ] {
+            t.clustered = fine.clone();
+            assert!(t.clustered_problems().is_empty(), "{fine:?}");
+        }
+        // Negative: an index of that name does not exist, and the constraint
+        // of that name is a constraint, not an index.
+        for dangling in [
+            Clustered::Index("uq_email".into()),
+            Clustered::Unique("uq_missing".into()),
+        ] {
+            t.clustered = Some(dangling.clone());
+            assert_eq!(t.clustered_problems().len(), 1, "{dangling:?}");
+        }
+        // Negative: without a key, `heap` says nothing.
+        t.primary_key = None;
+        t.clustered = Some(Clustered::Heap);
+        assert!(t.clustered_problems()[0].contains("says nothing"));
+        // The helpers answer from the one selector.
+        t.primary_key = sample().primary_key;
+        t.clustered = None;
+        assert!(t.primary_key_is_clustered());
+        t.clustered = Some(Clustered::Unique("uq_email".into()));
+        assert!(!t.primary_key_is_clustered());
+        assert!(t.unique_is_clustered("uq_email"));
+        assert!(!t.index_is_clustered("uq_email"));
+    }
+
+    /// A snapshot or plan from before the field reads as the default layout,
+    /// and the default is written as nothing, so no existing file changes.
+    #[test]
+    fn the_default_layout_is_absent_from_json_and_read_back_from_its_absence() {
+        let json = serde_json::to_string(&sample()).unwrap();
+        assert!(!json.contains("clustered"), "{json}");
+        let back: Table = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.clustered, None);
+        let mut heap = sample();
+        heap.clustered = Some(Clustered::Heap);
+        let json = serde_json::to_string(&heap).unwrap();
+        assert!(json.contains(r#""clustered":"heap""#), "{json}");
+        assert_eq!(serde_json::from_str::<Table>(&json).unwrap(), heap);
     }
 
     /// Column order affects CREATE TABLE output, so it has to be preserved.

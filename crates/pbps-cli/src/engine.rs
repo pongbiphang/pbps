@@ -61,7 +61,7 @@ pub async fn operational_cost(conn: &mut Conn, cs: &ChangeSet) -> crate::cost::C
             if estimates.peek().is_none() && !cs.changes.is_empty() {
                 return CostReport::Unavailable {
                     engine: "sqlserver",
-                    reason: "operational_cost currently measures SQL Server column type and nullability changes; this plan contains neither".to_owned(),
+                    reason: "operational_cost currently measures SQL Server column type and nullability changes and clustered index changes; this plan contains none".to_owned(),
                 };
             }
             let mut changes = Vec::with_capacity(cs.changes.len());

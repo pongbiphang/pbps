@@ -835,3 +835,51 @@ baseline column each final name holds. The earlier read's columns are re-keyed
 to those names, and the later read's constraint columns are undone to the
 baseline names, before the usual comparison. Tables where no name changes
 hands keep the one-hop rule of DECISIONS 189 and 474 unchanged.
+
+<a id="dec-1178-1"></a>
+
+**DEC-1178.1. A SQL Server table's clustered index is one table-level
+selector, absent means the key, and the emitter always spells the key's
+layout.** `clustered:` is `heap`, `{unique: <name>}` or `{index: <name>}`;
+absent is the engine's own default, a clustered primary key or a heap without
+one. That default is what every table pbps created before this had, which is
+why a state or plan without the field reads as it rather than being refused.
+A flag on each key and index was the other shape. It lets two objects both say
+clustered, which the engine refuses (1902), and a validator would have to catch
+what the selector cannot express at all. It also has no good default: a
+`clustered: false` default on the key re-plans every existing key as a
+rebuild, and a `true` default has to be switched off by hand whenever another
+object is clustered. The selector names the object by its declared name and
+by kind, since a UNIQUE constraint and an index may share a name in the
+declarations. Constraints and indexes are never renamed in place, so the
+selector follows a rename by naming the new object.
+
+A move of the clustered index rebuilds the object that gives it up and the
+one that takes it, each as a drop and an add; the engine has no in-place form
+(`DROP_EXISTING` refuses clustered to nonclustered, 1925, and the reverse
+while a foreign key references the key, 1930). A key rebuilt this way takes
+its foreign keys through the rebuild, as any replaced key does. The clustered
+object is added ahead of the rest of the addition class, because building it
+rebuilds every nonclustered index already on the table.
+
+The emitter writes `CLUSTERED` or `NONCLUSTERED` on every primary key it
+creates, although the clustered case is the engine's default. Measured on
+17.0, a bare `PRIMARY KEY` added beside a clustered index nobody declared is
+silently nonclustered, and the recording then says clustered; spelled
+`CLUSTERED`, the same statement is refused (1902). A UNIQUE constraint's and
+an index's default does not depend on the table, so only `CLUSTERED` is ever
+spelled on them. Drops stay offline: `ONLINE = ON` on a drop is accepted only
+for a clustered index (3745 otherwise), and the drop change does not carry the
+layout of what it drops. This replaces ADR-0003's reason ("this emitter writes
+no `CLUSTERED`"), which no longer holds.
+
+`pull` declares a clustered rowstore index or key (narrowing DECISIONS 14 and
+#1186's limitation). It still leaves out a key backed by any other index
+kind, a disabled clustered index, and a nonclustered key whose table's
+clustered index it left out: without that index the key's layout is one no
+declaration can write. PostgreSQL refuses the field, since `CLUSTER` is a
+one-time reorder rather than a layout. The operational estimate calls a
+clustered build, and the drop of an object the catalog confirms is clustered,
+a rewrite of every row under Sch-M (measured on 17.0: new partition ids for
+the table and each nonclustered index); every other index change stays
+unmeasured.

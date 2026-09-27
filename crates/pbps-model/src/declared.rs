@@ -275,7 +275,9 @@ impl Declared {
                     remove_nested(&mut self.expressions.checks, table, name);
                     remove_nested(&mut self.bindings.checks, table, name);
                 }
-                Change::AddIndex { table, name, index } => {
+                Change::AddIndex {
+                    table, name, index, ..
+                } => {
                     remove_nested(&mut self.expressions.filters, table, name);
                     remove_nested(&mut self.bindings.filters, table, name);
                     if let Some(filter) = &index.filter {

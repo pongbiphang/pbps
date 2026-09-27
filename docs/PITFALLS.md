@@ -2479,3 +2479,25 @@ A `tokio::time::timeout` measures the wall clock, not the work: anything that
 stops the runtime's thread spends every other task's budget for it. On a
 current-thread runtime, a synchronous loop over input whose size the engine
 decides is that.
+
+## An engine default that depends on what else is there
+
+SQL Server's `PRIMARY KEY` with neither keyword is clustered — unless the
+table already has a clustered index, in which case it is nonclustered, with no
+message. For years that was harmless here: the emitter created no clustered
+index, so every key it created came out clustered. It was still wrong twice
+over. `pull` never read the layout back, so a heap's nonclustered key was
+declared as a plain key and bootstrapped clustered (#1186). And a managed
+table carrying a clustered index nobody declared took a plain `ADD PRIMARY
+KEY` as a nonclustered key, while the recording said the default.
+
+**The shape:** leaving a choice to a default whose value depends on state the
+statement does not name. The statement is correct on the tables the author
+pictured, and silently different on the rest.
+
+**The rule.** Spell a property whose default is contextual, even where it
+matches the default today. The explicit `PRIMARY KEY CLUSTERED` fails loudly
+(1902) on exactly the tables where the bare one would have gone quiet
+(DEC-1178.1). A default that is the same everywhere — a UNIQUE constraint is
+nonclustered whatever else is on the table — needs no spelling.
+

@@ -14,7 +14,9 @@
 
 use std::fmt::Write as _;
 
-use pbps_model::{Intent, Module, ModuleId, ObjectName, PrimaryKey, Strategy, Table, TableName};
+use pbps_model::{
+    Clustered, Intent, Module, ModuleId, ObjectName, PrimaryKey, Strategy, Table, TableName,
+};
 
 /// Renders one table as canonical YAML.
 ///
@@ -162,6 +164,19 @@ pub fn render(
             if let Some(f) = &ix.filter {
                 let _ = writeln!(s, "    where: {}", scalar(f));
             }
+        }
+    }
+
+    // After the indexes it may name, and on one line: a layout is a single
+    // choice, not a block.
+    match &table.clustered {
+        None => {}
+        Some(Clustered::Heap) => s.push_str("\nclustered: heap\n"),
+        Some(Clustered::Unique(n)) => {
+            let _ = writeln!(s, "\nclustered: {{unique: {}}}", scalar(n));
+        }
+        Some(Clustered::Index(n)) => {
+            let _ = writeln!(s, "\nclustered: {{index: {}}}", scalar(n));
         }
     }
 
@@ -682,6 +697,56 @@ indexes:
 
     /// Output must be stable, or fmt would manufacture a phantom git diff on
     /// every run.
+    /// Each form of the layout selector reads back as the model value it
+    /// names and renders to the same text again (#1178).
+    #[test]
+    fn every_clustered_layout_round_trips() {
+        let base = "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  code: {type: int, nullable: false}\n\nprimary_key: [id]\n\nunique:\n  uq_code: [code]\n\nindexes:\n  ix_code:\n    columns: [code]\n";
+        for (line, expected) in [
+            ("clustered: heap", pbps_model::Clustered::Heap),
+            (
+                "clustered: {unique: uq_code}",
+                pbps_model::Clustered::Unique("uq_code".into()),
+            ),
+            (
+                "clustered: {index: ix_code}",
+                pbps_model::Clustered::Index("ix_code".into()),
+            ),
+        ] {
+            let yaml = format!("{base}\n{line}\n");
+            round_trip(&yaml);
+            let t = crate::load_table_str(Path::new("t.yml"), &yaml).unwrap();
+            assert_eq!(t.table.clustered, Some(expected), "{yaml}");
+            let out = render(&t.name, &t.table, &t.intents, None);
+            assert!(out.contains(&format!("\n{line}\n")), "{out}");
+        }
+        // The default says nothing, so a pulled table in the default layout
+        // grows no line.
+        let t = crate::load_table_str(Path::new("t.yml"), base).unwrap();
+        assert_eq!(t.table.clustered, None);
+        assert!(!render(&t.name, &t.table, &t.intents, None).contains("clustered"));
+    }
+
+    /// A kind the selector does not have is a load error, not a default
+    /// layout: a misspelt `clustered: {indx: ix}` read as "absent" would
+    /// rebuild the table's key as the clustered one.
+    #[test]
+    fn an_unknown_clustered_kind_is_rejected() {
+        for line in [
+            "clustered: {indx: ix_code}",
+            "clustered: table",
+            "clustered: [ix_code]",
+        ] {
+            let yaml = format!(
+                "table: dbo.t\ncolumns:\n  code: {{type: int}}\nindexes:\n  ix_code:\n    columns: [code]\n{line}\n"
+            );
+            assert!(
+                crate::load_table_str(Path::new("t.yml"), &yaml).is_err(),
+                "{line} should not load"
+            );
+        }
+    }
+
     #[test]
     fn output_is_stable() {
         let yaml = "table: dbo.t\ncolumns:\n  b: {type: int}\n  a: {type: int}\n";

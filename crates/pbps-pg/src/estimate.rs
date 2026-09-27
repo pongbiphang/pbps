@@ -598,7 +598,9 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             Some(estimate)
         }
 
-        Change::AddIndex { table, name, index } => {
+        Change::AddIndex {
+            table, name, index, ..
+        } => {
             // A concurrent build is the one statement here that lets writes
             // through — measured from a second session,
             // `ShareUpdateExclusiveLock` against the plain build's `ShareLock`.
@@ -841,6 +843,7 @@ mod tests {
                     unique: false,
                     filter: None,
                 }),
+                clustered: false,
             });
             p.strategy = Strategy { online };
             p
@@ -1018,6 +1021,7 @@ mod tests {
                     unique: false,
                     filter: None,
                 }),
+                clustered: false,
             })
         };
         let cs = ChangeSet {
@@ -1422,6 +1426,7 @@ mod tests {
                 unique: false,
                 filter: filter.map(str::to_owned),
             }),
+            clustered: false,
         };
         let online = Strategy { online: true };
         let lock = |change: &Change, strategy: Strategy| {

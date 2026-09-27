@@ -105,6 +105,9 @@ where both meet.
   writes no `CLUSTERED`, so `DROP INDEX`, `DROP CONSTRAINT` for a unique key,
   and a primary-key drop all take no clause at all. A foreign key and a check
   are metadata only, where it is a syntax error rather than a no-op.
+  *Amended by #1178:* the emitter now writes `CLUSTERED`; drops still take no
+  clause, because a drop change does not carry the layout of what it drops
+  (DEC-1178.1).
 - **Whether a statement carries the clause is asked of the emitter, and by
   comparing two emissions rather than searching the text.** A second list of
   change kinds would drift from the emitter; searching the SQL would read the

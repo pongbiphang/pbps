@@ -212,6 +212,7 @@ impl Reconstruction {
                                 table: name.clone(),
                                 name: index.clone(),
                                 index: Box::new(spec),
+                                clustered: false,
                             },
                             vec![(Nameable::Index, name.schema.clone(), index)],
                             None,

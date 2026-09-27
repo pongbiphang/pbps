@@ -67,7 +67,7 @@ pub use plan::{
 pub use rename::Renames;
 pub use role::{GrantTarget, Permission, Role};
 pub use schema::{
-    CheckConstraint, Column, ForeignKey, Identity, Index, IndexColumn, PrimaryKey,
+    CheckConstraint, Clustered, Column, ForeignKey, Identity, Index, IndexColumn, PrimaryKey,
     ReferentialAction, Schema, Table, UniqueConstraint,
 };
 pub use state::{StagedProgress, StateKind, StateSnapshot, Unreadable, check_readable_version};

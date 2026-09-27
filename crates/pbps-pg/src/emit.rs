@@ -2200,7 +2200,18 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         // rather than a statement that pretends to do something.
         Change::SetColumnDeprecated { .. } => Ok(Vec::new()),
 
-        Change::SetPrimaryKey { table, from, to } => {
+        Change::SetPrimaryKey {
+            table,
+            from,
+            to,
+            nonclustered,
+        } => {
+            // Only a SQL Server declaration can make a key nonclustered, and
+            // `validate` refuses the selector here; a change that says so
+            // anyway came from somewhere else and has no statement.
+            if *nonclustered {
+                return Err(no_clustered_layout(table));
+            }
             let mut out = Vec::new();
             if let Some(pk) = from {
                 out.push(on(pg, table, &drop_primary_key(table, pk)?)?);
@@ -2227,10 +2238,17 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         // would be a change the gate never approved, so the hint is dropped
         // (see `built_concurrently`) rather than honoured by splitting one
         // declared constraint into two committed steps.
+        Change::AddUnique { table, .. } | Change::AddIndex { table, .. }
+            if change_is_clustered(change) =>
+        {
+            Err(no_clustered_layout(table))
+        }
+
         Change::AddUnique {
             table,
             name,
             constraint,
+            ..
         } => one(
             pg,
             table,
@@ -2282,7 +2300,9 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             ),
         ),
 
-        Change::AddIndex { table, name, index } => {
+        Change::AddIndex {
+            table, name, index, ..
+        } => {
             let sql = create_index(table, name, index, strategy)?;
             if built_concurrently(index, strategy) {
                 // Alone in its batch and outside the transaction, because the
@@ -2574,9 +2594,34 @@ fn rename_table(pg: &Postgres, from: &TableName, to: &TableName) -> Sql {
     Ok(out)
 }
 
+/// Whether an added UNIQUE constraint or index claims the clustered layout.
+fn change_is_clustered(change: &Change) -> bool {
+    matches!(
+        change,
+        Change::AddUnique {
+            clustered: true,
+            ..
+        } | Change::AddIndex {
+            clustered: true,
+            ..
+        }
+    )
+}
+
+/// The refusal for a SQL Server table layout reaching this emitter (#1178).
+fn no_clustered_layout(table: &TableName) -> DialectError {
+    invalid(format!(
+        "`{table}`: a clustered or nonclustered layout is SQL Server's; PostgreSQL has no \
+         clustered index to create"
+    ))
+}
+
 fn create_table(pg: &Postgres, name: &TableName, table: &Table) -> Sql {
     if table.columns.is_empty() {
         return Err(invalid(format!("table `{name}` has no columns")));
+    }
+    if table.clustered.is_some() {
+        return Err(no_clustered_layout(name));
     }
     let q = qualified(name)?;
 
@@ -3321,6 +3366,100 @@ mod tests {
 
     fn permissions(list: &[Permission]) -> BTreeSet<Permission> {
         list.iter().copied().collect()
+    }
+
+    /// A layout only SQL Server has reaches this emitter only by a path that
+    /// skipped `validate`; it is refused, never emitted as an ordinary key or
+    /// index (#1178). The same changes without it emit as before.
+    #[test]
+    fn a_clustered_or_nonclustered_change_is_refused_here() {
+        let pg = Postgres::new();
+        let table = name("app", "t");
+        let key = pbps_model::PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        };
+        let index = pbps_model::Index {
+            columns: vec![IndexColumn {
+                name: "id".into(),
+                descending: false,
+            }],
+            include: vec![],
+            unique: false,
+            filter: None,
+        };
+        let unique = pbps_model::UniqueConstraint {
+            columns: vec!["id".into()],
+        };
+        let mut created = Table::default();
+        created
+            .columns
+            .insert("id".into(), Column::new(ty("integer")).not_null());
+        created.primary_key = Some(key.clone());
+        let mut clustered_table = created.clone();
+        clustered_table.clustered = Some(pbps_model::Clustered::Heap);
+        for (layout, plain) in [
+            (
+                Change::SetPrimaryKey {
+                    table: table.clone(),
+                    from: None,
+                    to: Some(key.clone()),
+                    nonclustered: true,
+                },
+                Change::SetPrimaryKey {
+                    table: table.clone(),
+                    from: None,
+                    to: Some(key.clone()),
+                    nonclustered: false,
+                },
+            ),
+            (
+                Change::AddUnique {
+                    table: table.clone(),
+                    name: "uq".into(),
+                    constraint: unique.clone(),
+                    clustered: true,
+                },
+                Change::AddUnique {
+                    table: table.clone(),
+                    name: "uq".into(),
+                    constraint: unique.clone(),
+                    clustered: false,
+                },
+            ),
+            (
+                Change::AddIndex {
+                    table: table.clone(),
+                    name: "ix".into(),
+                    index: Box::new(index.clone()),
+                    clustered: true,
+                },
+                Change::AddIndex {
+                    table: table.clone(),
+                    name: "ix".into(),
+                    index: Box::new(index.clone()),
+                    clustered: false,
+                },
+            ),
+            (
+                Change::CreateTable {
+                    uid: Uid::generate(UidKind::Table),
+                    name: table.clone(),
+                    table: Box::new(clustered_table.clone()),
+                },
+                Change::CreateTable {
+                    uid: Uid::generate(UidKind::Table),
+                    name: table.clone(),
+                    table: Box::new(created.clone()),
+                },
+            ),
+        ] {
+            let e = pg
+                .emit(&layout, Strategy::default())
+                .expect_err("a SQL Server layout");
+            assert!(e.to_string().contains("SQL Server"), "{e}");
+            assert!(!sql_of(&pg, &plain).is_empty(), "{plain:?}");
+        }
     }
 
     /// The class is written out, and which one it is comes off the
@@ -4935,6 +5074,7 @@ mod tests {
                     columns: vec!["id".into()],
                 }),
                 to: None,
+                nonclustered: false,
             },
         );
         let block = &sql[0];
@@ -4979,6 +5119,7 @@ mod tests {
                     columns: vec!["id".into()],
                 }),
                 to: None,
+                nonclustered: false,
             },
         );
         let block = &sql[0];
@@ -5004,6 +5145,7 @@ mod tests {
             table: name("app", "t"),
             name: "ix".into(),
             index: Box::new(index),
+            clustered: false,
         };
         let offline = sql_of(&Postgres::new(), &change).remove(0);
         assert!(
@@ -5121,6 +5263,7 @@ mod tests {
                     unique: false,
                     filter: Some("n > 0 -- why".into()),
                 }),
+                clustered: false,
             },
         )
         .remove(0);

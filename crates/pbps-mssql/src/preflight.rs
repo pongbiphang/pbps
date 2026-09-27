@@ -648,7 +648,7 @@ fn build(
         Change::AddUnique {
             table,
             name,
-            constraint,
+            constraint, ..
         } => {
             let Some(rows) = rows_after(
                 names,
@@ -708,7 +708,7 @@ fn build(
         // which YAML key the uniqueness was written under cannot decide
         // whether the data is counted. A plain index constrains nothing and
         // falls to the arm below.
-        Change::AddIndex { table, name, index } if index.unique => {
+        Change::AddIndex { table, name, index, .. } if index.unique => {
             // The key columns only. `INCLUDE` is payload the engine carries in
             // the leaf and never compares, so counting it would group rows the
             // index will still collide.
@@ -2634,6 +2634,7 @@ mod tests {
             constraint: UniqueConstraint {
                 columns: vec!["email".into(), "tenant".into()],
             },
+            clustered: false,
         });
         assert_eq!(sql.len(), 1);
         // Over the relation the statement will meet, keyed `k0`, `k1` — the
@@ -3000,6 +3001,7 @@ mod tests {
             constraint: pbps_model::UniqueConstraint {
                 columns: vec!["code".into()],
             },
+            clustered: false,
         };
         let delete = Change::DeleteRow {
             table: tname("dbo.customer"),
@@ -3058,6 +3060,7 @@ mod tests {
                 unique,
                 filter: filter.map(str::to_owned),
             }),
+            clustered: false,
         }
     }
 
@@ -3343,6 +3346,7 @@ mod tests {
             constraint: pbps_model::UniqueConstraint {
                 columns: vec!["seq".into()],
             },
+            clustered: false,
         };
 
         let sql = probes(&plan(vec![insert("a"), insert("b"), unique.clone()]))
@@ -3364,6 +3368,7 @@ mod tests {
             constraint: pbps_model::UniqueConstraint {
                 columns: vec!["label".into()],
             },
+            clustered: false,
         };
         let sql = probes(&plan(vec![insert("a"), insert("b"), nullable]))
             .into_iter()
@@ -3510,6 +3515,7 @@ mod tests {
             constraint: pbps_model::UniqueConstraint {
                 columns: vec!["region_id".into()],
             },
+            clustered: false,
         };
 
         // Every stored row shares the one value the `ALTER` will put there,
@@ -3599,6 +3605,7 @@ mod tests {
                 name: Some("pk_customer".into()),
                 columns: vec!["id".into()],
             }),
+            nonclustered: false,
         });
         assert_eq!(sql.len(), 2, "{sql:?}");
         assert!(sql[0].contains("r.k0 IS NULL"), "{sql:?}");
@@ -3638,6 +3645,7 @@ mod tests {
                     columns: vec!["id".into()],
                 }),
                 to: None,
+                nonclustered: false,
             },
         ] {
             assert!(sql_of(&change).is_empty(), "{change:?}");
@@ -4167,6 +4175,7 @@ mod tests {
                 constraint: UniqueConstraint {
                     columns: vec!["email".into()],
                 },
+                clustered: false,
             },
         ]);
         let all = probes(&changes);
@@ -4248,6 +4257,7 @@ mod tests {
             constraint: UniqueConstraint {
                 columns: vec!["id".into()],
             },
+            clustered: false,
         };
         let create = Change::CreateTable {
             uid: uid("t_aaaaaa"),

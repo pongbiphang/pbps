@@ -24,8 +24,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::DialectError;
 use pbps_model::{
-    CheckConstraint, Column, ColumnType, ForeignKey, Identity, Index, IndexColumn, Module,
-    ObjectName, PrimaryKey, ReferentialAction, Schema, Table, TableName, TypeArg, UniqueConstraint,
+    CheckConstraint, Clustered, Column, ColumnType, ForeignKey, Identity, Index, IndexColumn,
+    Module, ObjectName, PrimaryKey, ReferentialAction, Schema, Table, TableName, TypeArg,
+    UniqueConstraint,
 };
 
 use crate::types;
@@ -144,7 +145,8 @@ pub struct RawCheck {
 
 /// The physical kind of an index, as `sys.indexes.type` reports it.
 ///
-/// The declarations hold one kind of index: a nonclustered rowstore one. Every
+/// The declarations hold rowstore B-tree indexes, clustered or not (the
+/// clustered one through the table's `clustered` selector, #1178). Every
 /// other kind is a different physical object with the same catalog shape, so
 /// the code travels rather than a `is_clustered` yes/no. Read as "clustered or
 /// not", a columnstore, XML, spatial or hash index answered "not clustered"
@@ -153,8 +155,9 @@ pub struct RawCheck {
 /// rejects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexKind {
-    /// `type = 2`: nonclustered rowstore, the only kind [`pbps_model::Index`]
-    /// expresses.
+    /// `type = 1`: the clustered rowstore index, which is the table's rows.
+    Clustered,
+    /// `type = 2`: a nonclustered rowstore index.
     Nonclustered,
     /// Any other type, carried whole so the limitation can name what it was.
     /// A type this build does not know about lands here too: an unknown
@@ -165,10 +168,20 @@ pub enum IndexKind {
 impl IndexKind {
     pub fn from_type_code(code: u8) -> Self {
         match code {
+            1 => Self::Clustered,
             2 => Self::Nonclustered,
             other => Self::Unmodelled(other),
         }
     }
+}
+
+/// Whether the reader leaves this clustered index out. A unique one with
+/// unmodelled write behavior is left out by the rule every unique index
+/// follows; a disabled one of any kind is too, because disabling the
+/// clustered index makes the table's rows unreadable, and a declaration has no
+/// way to say so (#1178).
+fn clustered_index_left_out(i: &RawIndexColumn) -> bool {
+    i.is_disabled || (i.is_unique && i.ignore_dup_key)
 }
 
 /// How an unmodelled index type is named to the operator.
@@ -904,6 +917,29 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         table.columns.insert(c.name.clone(), column);
     }
 
+    // The tables whose clustered index the loops below leave out. A
+    // nonclustered primary key on one of them cannot be declared: absent,
+    // the table's layout says the key is clustered, and `heap` says there is
+    // no clustered index at all — both are a different table on bootstrap.
+    // Asked before the keys, because a key left out takes the foreign keys
+    // that reference it with it (#1178).
+    let lost_clustered: BTreeMap<i32, String> = raw
+        .key_columns
+        .iter()
+        .filter(|k| !k.is_primary && k.index_type == 1 && (k.is_disabled || k.ignore_dup_key))
+        .map(|k| (k.object_id, k.constraint_name.clone()))
+        .chain(
+            raw.index_columns
+                .iter()
+                .filter(|i| i.kind == IndexKind::Clustered && clustered_index_left_out(i))
+                .map(|i| (i.object_id, i.index_name.clone())),
+        )
+        .collect();
+    // Which object each table's rows are clustered on, where that is not its
+    // primary key, and which tables have a primary key that is not.
+    let mut clustered_on: BTreeMap<i32, Clustered> = BTreeMap::new();
+    let mut nonclustered_primary: BTreeSet<i32> = BTreeSet::new();
+
     let mut unsupported_keys = BTreeSet::new();
     for k in &raw.key_columns {
         let Some(table) = tables.get_mut(&k.object_id) else {
@@ -926,37 +962,57 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             }
             continue;
         }
-        // A declaration spells neither CLUSTERED nor NONCLUSTERED, so
-        // bootstrap gets the engine's default: a clustered primary key (when
-        // the table has no clustered index yet) and a nonclustered unique
-        // constraint. A key laid out otherwise would come back swapped or
-        // turn a heap into a clustered table, and nothing would compare
-        // unequal afterwards. Report it, the rule a standalone clustered
-        // index already follows, until clusteredness is modelled (#1178).
-        let default_type = if k.is_primary { 1 } else { 2 };
-        if k.index_type != default_type {
+        // A key is backed by a rowstore index, clustered (1) or not (2), and
+        // the table's `clustered` selector says which (#1178). Any other kind
+        // — a hash index on a memory-optimized table — is a key neither
+        // keyword spells, and bootstrap would build a different object.
+        if !matches!(k.index_type, 1 | 2) {
             if unsupported_keys.insert((k.object_id, k.constraint_name.clone())) {
-                let (kind, default) = if k.is_primary {
-                    ("primary key", "clustered")
+                let kind = if k.is_primary {
+                    "primary key"
                 } else {
-                    ("unique constraint", "nonclustered")
-                };
-                let layout = match k.index_type {
-                    2 => "nonclustered".to_owned(),
-                    other => index_type_name(other),
+                    "unique constraint"
                 };
                 push_limitation(
                     &mut warnings,
                     &mut limitations,
                     names.get(&k.object_id),
                     format!(
-                        "{}: {kind} `{}` is backed by an index that is {layout}; a declaration cannot spell that layout, and bootstrap would recreate the key {default}, so it was left out of the declarations",
+                        "{}: {kind} `{}` is backed by an index that is {}; a declaration cannot spell that layout, so it was left out of the declarations",
+                        name_of(k.object_id, &names),
+                        k.constraint_name,
+                        index_type_name(k.index_type),
+                    ),
+                );
+            }
+            continue;
+        }
+        if k.is_primary
+            && k.index_type == 2
+            && let Some(clustered) = lost_clustered.get(&k.object_id)
+        {
+            if unsupported_keys.insert((k.object_id, k.constraint_name.clone())) {
+                push_limitation(
+                    &mut warnings,
+                    &mut limitations,
+                    names.get(&k.object_id),
+                    format!(
+                        "{}: primary key `{}` is nonclustered beside the clustered index `{clustered}`, which was left out of the declarations; without it the key's layout cannot be declared, so the key was left out too",
                         name_of(k.object_id, &names),
                         k.constraint_name,
                     ),
                 );
             }
             continue;
+        }
+        match (k.is_primary, k.index_type) {
+            (true, 2) => {
+                nonclustered_primary.insert(k.object_id);
+            }
+            (false, 1) => {
+                clustered_on.insert(k.object_id, Clustered::Unique(k.constraint_name.clone()));
+            }
+            _ => {}
         }
         if k.is_primary {
             let pk = table.primary_key.get_or_insert_with(|| PrimaryKey {
@@ -1007,8 +1063,23 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             }
             continue;
         }
+        if i.kind == IndexKind::Clustered && clustered_index_left_out(i) {
+            if unmodelled_indexes.insert((i.object_id, i.index_name.clone())) {
+                push_limitation(
+                    &mut warnings,
+                    &mut limitations,
+                    names.get(&i.object_id),
+                    format!(
+                        "{}: clustered index `{}` is disabled, which leaves the table's rows unreadable until it is rebuilt; a declaration cannot say so, and bootstrap would create it enabled, so it was left out of the declarations",
+                        name_of(i.object_id, &names),
+                        i.index_name,
+                    ),
+                );
+            }
+            continue;
+        }
         if let IndexKind::Unmodelled(code) = i.kind {
-            // The model holds a nonclustered rowstore index and nothing else;
+            // The model holds a rowstore B-tree index and nothing else;
             // recording any other kind without what makes it that kind would
             // make bootstrap create a different physical object — or, for the
             // kinds `CREATE INDEX` cannot spell at all, a statement the engine
@@ -1030,6 +1101,9 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 );
             }
             continue;
+        }
+        if i.kind == IndexKind::Clustered {
+            clustered_on.insert(i.object_id, Clustered::Index(i.index_name.clone()));
         }
         let index = table
             .indexes
@@ -1203,6 +1277,20 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
              uses this default before bootstrapping",
             raw.database_collation
         ));
+    }
+
+    // The layout, once every key and index is in: another object named as
+    // the clustered one, or `heap` for a nonclustered key with none. A
+    // clustered key, and a table with neither key nor clustered index, are
+    // the default and say nothing.
+    for (id, table) in &mut tables {
+        table.clustered = match clustered_on.remove(id) {
+            Some(owner) => Some(owner),
+            None if table.primary_key.is_some() && nonclustered_primary.contains(id) => {
+                Some(Clustered::Heap)
+            }
+            None => None,
+        };
     }
 
     let mut schema = Schema::default();
@@ -2487,12 +2575,14 @@ mod tests {
     }
 
     /// #1199: a foreign key bound to a standalone unique index the assembler
-    /// leaves out — clustered, or with `IGNORE_DUP_KEY` — went on being
-    /// declared, and bootstrap then had no candidate key to bind it to.
+    /// leaves out — of a kind the model does not hold, or with
+    /// `IGNORE_DUP_KEY` — went on being declared, and bootstrap then had no
+    /// candidate key to bind it to. Since #1178 a clustered unique index is
+    /// declared, so a foreign key into one stays.
     #[test]
     fn a_foreign_key_into_a_left_out_unique_index_is_left_out_too() {
         let mut raw = RawCatalog::default();
-        for (id, name) in [(1, "p"), (2, "q"), (3, "r"), (4, "ch")] {
+        for (id, name) in [(1, "p"), (2, "q"), (3, "r"), (4, "ch"), (5, "s")] {
             raw.tables.push(raw_table(id, "dbo", name));
             raw.columns.push(raw_column(id, "code", "int"));
         }
@@ -2509,15 +2599,17 @@ mod tests {
             is_descending: false,
         };
         raw.index_columns = vec![
-            index(1, "ux_p_code", IndexKind::Unmodelled(1), false),
+            index(1, "ux_p_code", IndexKind::Unmodelled(7), false),
             index(2, "ux_q_code", IndexKind::Nonclustered, true),
-            // The control: a unique index the declarations hold.
+            // The controls: unique indexes the declarations hold.
             index(3, "ux_r_code", IndexKind::Nonclustered, false),
+            index(5, "ux_s_code", IndexKind::Clustered, false),
         ];
         for (name, ref_object_id, ref_table, ref_key) in [
             ("fk_ch_p", 1, "p", "ux_p_code"),
             ("fk_ch_q", 2, "q", "ux_q_code"),
             ("fk_ch_r", 3, "r", "ux_r_code"),
+            ("fk_ch_s", 5, "s", "ux_s_code"),
         ] {
             raw.foreign_key_columns.push(RawForeignKeyColumn {
                 object_id: 4,
@@ -2539,7 +2631,7 @@ mod tests {
         let pulled = assemble(&raw);
 
         let ch = &pulled.schema.tables[&TableName::new("dbo", "ch")].foreign_keys;
-        assert_eq!(ch.keys().collect::<Vec<_>>(), ["fk_ch_r"]);
+        assert_eq!(ch.keys().collect::<Vec<_>>(), ["fk_ch_r", "fk_ch_s"]);
         for (fk, index, table) in [("fk_ch_p", "ux_p_code", "p"), ("fk_ch_q", "ux_q_code", "q")] {
             assert!(
                 pulled.limitations.iter().any(|l| {
@@ -2556,13 +2648,24 @@ mod tests {
         assert_eq!(pulled.limitations.len(), 4, "{:?}", pulled.limitations);
     }
 
-    /// #1186: the declarations spell no key layout, so bootstrap takes the
-    /// engine's default for each kind. A key laid out otherwise is reported
-    /// and left out rather than declared and silently swapped.
+    /// #1186 left a key laid out against its kind's default out of the
+    /// declarations, because none could spell the layout. Since #1178 the
+    /// table's `clustered` selector spells it, so both shapes #1186 found are
+    /// declared, with their foreign keys. A key no rowstore keyword spells is
+    /// still left out, and so is a nonclustered key whose table's clustered
+    /// index was left out: neither layout a declaration can write is that
+    /// table.
     #[test]
-    fn a_key_whose_layout_is_not_its_kinds_default_is_reported_instead_of_declared() {
+    fn a_key_laid_out_either_way_is_declared_with_the_tables_layout() {
         let mut raw = RawCatalog::default();
-        for (id, name) in [(1, "h"), (2, "u"), (3, "c"), (4, "m"), (5, "child")] {
+        for (id, name) in [
+            (1, "h"),
+            (2, "u"),
+            (3, "c"),
+            (4, "m"),
+            (5, "child"),
+            (6, "l"),
+        ] {
             raw.tables.push(raw_table(id, "dbo", name));
             raw.columns.push(raw_column(id, "id", "int"));
             raw.columns.push(raw_column(id, "code", "int"));
@@ -2579,13 +2682,26 @@ mod tests {
             // A kind neither keyword spells (a memory-optimized hash key).
             key(4, "pk_m", true, 7, "id"),
             key(4, "pk_m", true, 7, "code"),
+            // A nonclustered key beside a clustered index that is left out.
+            key(6, "pk_l", true, 2, "id"),
         ];
-        // A child referencing each omitted key, and one referencing the
-        // control's key, which stays.
+        raw.index_columns.push(RawIndexColumn {
+            is_disabled: true,
+            ignore_dup_key: false,
+            object_id: 6,
+            index_name: "cx_l".into(),
+            is_unique: false,
+            kind: IndexKind::Clustered,
+            filter: None,
+            column: "code".into(),
+            is_included: false,
+            is_descending: false,
+        });
         for (name, ref_object_id, ref_table, ref_key, ref_column) in [
             ("fk_child_h", 1, "h", "pk_h", "id"),
             ("fk_child_u_code", 2, "u", "uq_u_code", "code"),
             ("fk_child_c", 3, "c", "pk_c", "id"),
+            ("fk_child_l", 6, "l", "pk_l", "id"),
         ] {
             raw.foreign_key_columns.push(RawForeignKeyColumn {
                 object_id: 5,
@@ -2607,65 +2723,58 @@ mod tests {
         let pulled = assemble(&raw);
 
         let table = |name: &str| &pulled.schema.tables[&TableName::new("dbo", name)];
-        for name in ["h", "u", "m"] {
-            assert_eq!(table(name).primary_key, None, "{name}");
-        }
-        assert!(table("u").unique.is_empty());
-        assert_eq!(
-            table("c").primary_key,
+        let pk = |name: &str| {
             Some(PrimaryKey {
-                name: Some("pk_c".into()),
+                name: Some(name.into()),
                 columns: vec!["id".into()],
             })
+        };
+        assert_eq!(table("h").primary_key, pk("pk_h"));
+        assert_eq!(table("h").clustered, Some(Clustered::Heap));
+        assert_eq!(table("u").primary_key, pk("pk_u"));
+        assert!(table("u").unique.contains_key("uq_u_code"));
+        assert_eq!(
+            table("u").clustered,
+            Some(Clustered::Unique("uq_u_code".into()))
         );
+        // The control declares no layout at all: the default is not spelled.
+        assert_eq!(table("c").primary_key, pk("pk_c"));
         assert!(table("c").unique.contains_key("uq_c_code"));
-        for (name, key, detail) in [
-            (
-                "h",
-                "pk_h",
-                "primary key `pk_h` is backed by an index that is nonclustered",
-            ),
-            (
-                "u",
-                "pk_u",
-                "primary key `pk_u` is backed by an index that is nonclustered",
-            ),
-            (
-                "u",
-                "uq_u_code",
-                "unique constraint `uq_u_code` is backed by an index that is clustered",
-            ),
+        assert_eq!(table("c").clustered, None);
+        // Negative: what the selector cannot spell stays out.
+        assert_eq!(table("m").primary_key, None);
+        assert_eq!(table("l").primary_key, None);
+        assert_eq!(table("l").clustered, None);
+        assert!(table("l").indexes.is_empty());
+        let child = &table("child").foreign_keys;
+        assert_eq!(
+            child.keys().collect::<Vec<_>>(),
+            ["fk_child_c", "fk_child_h", "fk_child_u_code"]
+        );
+        for (name, detail) in [
             (
                 "m",
-                "pk_m",
                 "primary key `pk_m` is backed by an index that is a hash index",
             ),
+            ("l", "clustered index `cx_l` is disabled"),
+            (
+                "l",
+                "primary key `pk_l` is nonclustered beside the clustered index `cx_l`, which was left out",
+            ),
+            ("child", "foreign key `fk_child_l` references key `pk_l`"),
         ] {
             assert!(
                 pulled.limitations.iter().any(|l| {
                     l.target.object_name() == TableName::new("dbo", name)
                         && l.detail.contains(detail)
                 }),
-                "{key}: {:?}",
+                "{detail}: {:?}",
                 pulled.limitations
             );
         }
-        let child = &table("child").foreign_keys;
-        assert_eq!(child.keys().collect::<Vec<_>>(), ["fk_child_c"]);
-        for (fk, key) in [("fk_child_h", "pk_h"), ("fk_child_u_code", "uq_u_code")] {
-            assert!(
-                pulled.limitations.iter().any(|l| {
-                    l.target.object_name() == TableName::new("dbo", "child")
-                        && l.detail
-                            .contains(&format!("foreign key `{fk}` references key `{key}`"))
-                }),
-                "{fk}: {:?}",
-                pulled.limitations
-            );
-        }
-        // One limitation per key and per foreign key, however many columns
-        // each has; none for the control table.
-        assert_eq!(pulled.limitations.len(), 6, "{:?}", pulled.limitations);
+        // One limitation per key, index and foreign key, however many columns
+        // each has; none for the three tables whose layout is declared.
+        assert_eq!(pulled.limitations.len(), 4, "{:?}", pulled.limitations);
     }
 
     #[test]
@@ -2697,9 +2806,14 @@ mod tests {
         assert_eq!(ix.filter.as_deref(), Some("[email] IS NOT NULL"));
     }
 
+    /// A clustered rowstore index is declared, and named as the table's
+    /// layout; before #1178 it was left out with a limitation. One per table
+    /// even where two tables use the same index name.
     #[test]
-    fn clustered_indexes_are_warned_about_and_left_out() {
+    fn a_clustered_rowstore_index_is_declared_as_the_tables_layout() {
         let mut raw = one_table_catalog();
+        // The key cannot be clustered too: one clustered index per table.
+        raw.key_columns[0].index_type = 2;
         raw.tables.push(raw_table(20, "dbo", "archive"));
         raw.columns.push(raw_column(20, "id", "bigint"));
         let customer_index = RawIndexColumn {
@@ -2708,48 +2822,68 @@ mod tests {
             object_id: 10,
             index_name: "cx_shared".into(),
             is_unique: false,
-            kind: IndexKind::Unmodelled(1),
+            kind: IndexKind::Clustered,
             filter: None,
             column: "id".into(),
             is_included: false,
             is_descending: false,
         };
-        // Multiple columns of one clustered index produce one limitation.
         raw.index_columns.push(customer_index.clone());
         raw.index_columns.push(RawIndexColumn {
             column: "email".into(),
+            is_descending: true,
+            ..customer_index.clone()
+        });
+        raw.index_columns.push(RawIndexColumn {
+            object_id: 20,
             ..customer_index
         });
-        // The same index name on a different table is a distinct limitation.
+        let p = assemble(&raw);
+        assert!(p.limitations.is_empty(), "{:?}", p.limitations);
+        for (table, columns) in [("customer", 2), ("archive", 1)] {
+            let t = &p.schema.tables[&TableName::new("dbo", table)];
+            assert_eq!(t.clustered, Some(Clustered::Index("cx_shared".into())));
+            assert_eq!(t.indexes["cx_shared"].columns.len(), columns, "{table}");
+        }
+    }
+
+    /// Negative: a disabled clustered index leaves the table's rows
+    /// unreadable, which no declaration says, so it is reported rather than
+    /// declared as an ordinary clustered index bootstrap would build enabled.
+    #[test]
+    fn a_disabled_clustered_index_is_reported_and_left_out() {
+        let mut raw = one_table_catalog();
+        raw.key_columns[0].index_type = 2;
         raw.index_columns.push(RawIndexColumn {
-            is_disabled: false,
+            is_disabled: true,
             ignore_dup_key: false,
-            object_id: 20,
-            index_name: "cx_shared".into(),
+            object_id: 10,
+            index_name: "cx_customer".into(),
             is_unique: false,
-            kind: IndexKind::Unmodelled(1),
+            kind: IndexKind::Clustered,
             filter: None,
             column: "id".into(),
             is_included: false,
             is_descending: false,
         });
         let p = assemble(&raw);
+        let t = &p.schema.tables[&TableName::new("dbo", "customer")];
+        assert!(t.indexes.is_empty());
+        // And the nonclustered key beside it goes too: declared without the
+        // index, it would read as the clustered one, or as a heap's.
+        assert_eq!(t.primary_key, None);
+        assert_eq!(t.clustered, None);
+        let said = p
+            .limitations
+            .iter()
+            .map(|l| l.detail.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(p.limitations.len(), 2, "{said}");
+        assert!(said.contains("`cx_customer` is disabled"), "{said}");
         assert!(
-            p.schema.tables[&TableName::new("dbo", "customer")]
-                .indexes
-                .is_empty()
-        );
-        assert_eq!(p.warnings.len(), 2, "{:?}", p.warnings);
-        assert_eq!(p.limitations.len(), 2, "{:?}", p.limitations);
-        assert_eq!(
-            p.limitations
-                .iter()
-                .map(|limitation| limitation.target.object_name())
-                .collect::<Vec<_>>(),
-            [
-                TableName::new("dbo", "customer"),
-                TableName::new("dbo", "archive")
-            ]
+            said.contains("primary key `pk_customer` is nonclustered"),
+            "{said}"
         );
     }
 
@@ -2801,9 +2935,10 @@ mod tests {
     }
 
     #[test]
-    fn only_the_nonclustered_rowstore_type_reads_as_an_expressible_index() {
+    fn only_the_rowstore_types_read_as_expressible_indexes() {
+        assert_eq!(IndexKind::from_type_code(1), IndexKind::Clustered);
         assert_eq!(IndexKind::from_type_code(2), IndexKind::Nonclustered);
-        for code in [1, 3, 4, 5, 6, 7, 9] {
+        for code in [3, 4, 5, 6, 7, 9] {
             assert_eq!(
                 IndexKind::from_type_code(code),
                 IndexKind::Unmodelled(code),

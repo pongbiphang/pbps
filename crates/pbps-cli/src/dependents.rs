@@ -450,6 +450,7 @@ fn restoration_of(d: &Dependent, declared: &Schema, ids: &[&IdsFile]) -> Option<
                     table: table.clone(),
                     name: name.clone(),
                     index: Box::new(i.clone()),
+                    clustered: false,
                 }),
                 Part::Default(column) => {
                     let to = t.columns.get(column)?.default.clone()?;
@@ -729,10 +730,14 @@ pub(crate) fn split_new_tables(
             .collect();
         for index in filtered {
             if let Some(spec) = table.indexes.remove(&index) {
+                // Never the clustered index, which cannot be filtered; asked
+                // of the table anyway, so the split cannot say otherwise.
+                let clustered = table.index_is_clustered(&index);
                 parts.push(Change::AddIndex {
                     table: name.clone(),
                     name: index,
                     index: Box::new(spec),
+                    clustered,
                 });
             }
         }
@@ -1012,6 +1017,7 @@ mod tests {
                 unique: filter.is_none(),
                 filter: filter.map(Into::into),
             }),
+            clustered: false,
         }
     }
 

@@ -14,6 +14,7 @@ fn index(unique: bool, filtered: bool) -> Change {
             unique,
             filter: filtered.then(|| "id IS NOT NULL".into()),
         }),
+        clustered: false,
     }
 }
 
@@ -85,6 +86,7 @@ fn unspellable_constraint_values_and_check_predicates_are_reported() {
             constraint: UniqueConstraint {
                 columns: vec!["value".into()],
             },
+            clustered: false,
         },
         Change::SetPrimaryKey {
             table: table.clone(),
@@ -93,6 +95,7 @@ fn unspellable_constraint_values_and_check_predicates_are_reported() {
                 name: Some("pk".into()),
                 columns: vec!["value".into()],
             }),
+            nonclustered: false,
         },
         Change::AddForeignKey {
             table: table.clone(),

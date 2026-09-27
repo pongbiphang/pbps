@@ -47,6 +47,10 @@ use crate::schema::Schema;
 /// (ADR-0009 §2.2, ADR-0013 §3–§4). A version 6 state stays readable, with
 /// the field empty — see `OLDEST_READABLE_VERSION`.
 ///
+/// Bumped to 8 when a table gained [`crate::Clustered`], its layout
+/// (#1178). A version 7 state stays readable, and `None` is what it says:
+/// see `OLDEST_READABLE_VERSION`.
+///
 /// Readers refuse a version they do not understand rather than reading it
 /// partially.
 ///
@@ -65,7 +69,7 @@ use crate::schema::Schema;
 /// order, which can drop a schema-bound dependency before its dependent.
 /// Refused, with the remedy `check_version` already names: re-record it with
 /// `pbps baseline --reason ...`.
-pub const CURRENT_VERSION: u32 = 7;
+pub const CURRENT_VERSION: u32 = 8;
 
 /// The oldest snapshot version this build reads as its own.
 ///
@@ -75,6 +79,17 @@ pub const CURRENT_VERSION: u32 = 7;
 /// version 6 state recorded none of it — so "nothing declared here" is what
 /// that state truly says, and the differ falls back to the read-back it always
 /// compared (DECISIONS 207, the same rule that keeps 4 readable).
+///
+/// Still 6 at version 8, whose `clustered` a version 6 or 7 state lacks
+/// (#1178), and by the same rule: absent means the default layout, a
+/// clustered primary key or a heap without one, and that is true of every
+/// table the old reader wrote a state for, with one exception that is not
+/// silent. The old reader adopted no clustered index other than a key's, and
+/// since #1186 no key laid out otherwise; a table it recorded from before
+/// #1186 with a nonclustered key now reads back with a `clustered` line its
+/// state lacks, and the drift check stops on that before anything is planned
+/// against the wrong layout — which is a finding with a remedy (`baseline`),
+/// not a wrong recording carried forward.
 pub const OLDEST_READABLE_VERSION: u32 = 6;
 
 /// How this state came about.
@@ -477,7 +492,7 @@ mod tests {
         // the whole story rather than a sample of it; 6 is readable because
         // the field 7 added is one it truly lacks.
         assert_eq!(OLDEST_READABLE_VERSION, 6);
-        assert_eq!(CURRENT_VERSION, 7);
+        assert_eq!(CURRENT_VERSION, 8);
     }
 
     fn schema_with(ty: &str) -> Schema {
@@ -673,7 +688,7 @@ mod tests {
         assert!(json.contains("\"declared\""), "{json}");
         let back: StateSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(back, snap);
-        assert_eq!(back.version, 7);
+        assert_eq!(back.version, CURRENT_VERSION);
     }
 
     /// The one a deployed environment is most likely to hit, and the reason
@@ -765,8 +780,17 @@ mod tests {
                 .as_deref(),
             Some("((0))")
         );
+        // Nor any layout (#1178): a state from before `clustered` is the
+        // default layout, at version 6 and at 7 alike (DEC-1178.2).
+        assert_eq!(
+            snap.schema.tables[&"dbo.t".parse::<TableName>().unwrap()].clustered,
+            None
+        );
+        let seven: StateSnapshot =
+            serde_json::from_str(&json.replace("\"version\":6", "\"version\":7")).unwrap();
+        assert!(seven.check_version().is_ok());
         let newer: StateSnapshot =
-            serde_json::from_str(&json.replace("\"version\":6", "\"version\":8")).unwrap();
+            serde_json::from_str(&json.replace("\"version\":6", "\"version\":9")).unwrap();
         assert!(newer.check_version().unwrap_err().contains("newer pbps"));
     }
 

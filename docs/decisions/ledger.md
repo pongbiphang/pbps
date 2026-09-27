@@ -1077,3 +1077,26 @@ Pinned by `a_lock_names_its_holders_process_and_says_how_to_find_its_session`
 (`crates/pbps-cli/tests/flow.rs` and `flow_pg.rs`) and
 `a_session_is_named_for_this_process_unless_the_string_names_it`
 (`crates/pbps-db/tests/live_mssql.rs` and `live_pg.rs`).
+
+<a id="dec-1178-2"></a>
+
+**DEC-1178.2. State version 8 adds a table's clustered layout and still reads
+6 and 7; plan version 11 turns 10 away.** A state that lacks `clustered` reads
+as the default layout, and that is a true reading of what the old reader
+recorded, which is the rule that keeps 6 readable (DECISIONS 207). The old
+reader declared no clustered index but a key's. Since #1186 it declared no key
+laid out otherwise, either. A table it recorded before #1186 with a
+nonclustered key is the exception, and it is not silent: the live read now
+carries `clustered: heap` or names the clustered object, so the drift check
+stops the next plan and `verify` names the table. Re-recording is `baseline`.
+Raising the oldest readable version would force that on every environment to
+catch a case the drift check already catches.
+
+A plan is the other way round. A version 10 plan would deserialize, every key
+in it clustered by default, and this build spells `CLUSTERED` where the old
+one left it to the engine: the reviewed plan could be refused (1902) or build
+a layout nobody reviewed. It is turned away as stale, and the remedy is a new
+`plan --db`. Pinned by
+`a_clustered_layout_round_trips_and_moves_through_the_cli`
+(`crates/pbps-cli/tests/flow.rs`), whose last step removes the layout from the
+recorded state and expects drift.

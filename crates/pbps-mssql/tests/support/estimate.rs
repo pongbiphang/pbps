@@ -320,3 +320,111 @@ async fn connected_estimates_keep_storage_and_identity_uncertainty_visible() {
     }
     db.drop().await;
 }
+
+/// A layout change's two halves are estimated from what they do to the
+/// stored rows (#1178). Building the clustered index rewrites the table;
+/// dropping an index-backed object does only when the catalog says it is
+/// the clustered one, and the change alone cannot say which it is — so a
+/// nonclustered drop stays unmeasured rather than borrowing either answer.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_clustered_index_change_is_a_rewrite_only_where_the_catalog_says_so() {
+    let mut db = TestDb::create("estimate_layout1178").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.l(id int NOT NULL CONSTRAINT pk_l PRIMARY KEY CLUSTERED, v int NULL);
+             CREATE INDEX ix_v ON dbo.l(v);
+             INSERT dbo.l VALUES(1,1),(2,2),(3,3);",
+        )
+        .await
+        .unwrap();
+    let table: TableName = "dbo.l".parse().unwrap();
+    let key = pbps_model::PrimaryKey {
+        name: Some("pk_l".into()),
+        columns: vec!["id".into()],
+    };
+    let index = |column: &str| pbps_model::Index {
+        columns: vec![pbps_model::IndexColumn {
+            name: column.into(),
+            descending: false,
+        }],
+        include: Vec::new(),
+        unique: false,
+        filter: None,
+    };
+    let cs = ChangeSet {
+        changes: vec![
+            PlannedChange::new(Change::SetPrimaryKey {
+                table: table.clone(),
+                from: Some(key.clone()),
+                to: None,
+                nonclustered: false,
+            }),
+            PlannedChange::new(Change::DropIndex {
+                table: table.clone(),
+                name: "ix_v".into(),
+            }),
+            PlannedChange::new(Change::AddIndex {
+                table: table.clone(),
+                name: "cx_v".into(),
+                index: Box::new(index("v")),
+                clustered: true,
+            }),
+            PlannedChange::new(Change::SetPrimaryKey {
+                table: table.clone(),
+                from: None,
+                to: Some(key),
+                nonclustered: true,
+            }),
+        ],
+    };
+    let mut estimates = estimate::planned_estimates(&cs);
+    // The nonclustered key's build is not one of them: nothing is measured
+    // for it, and it does not move the rows.
+    assert_eq!(
+        estimates.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+    for (_, e) in &mut estimates {
+        estimate::against(&mut db.conn, e).await.unwrap();
+        assert_eq!(e.rows, Some(3), "{}", e.about);
+        assert_eq!(e.lock, "Sch-M", "{}", e.about);
+    }
+    let work = |i: usize| (estimates[i].1.rewrite.clone(), estimates[i].1.reads.clone());
+    // The clustered key's drop and the clustered index's build rewrite.
+    assert_eq!(work(0), (Rewrite::Yes, Reads::EveryRow));
+    assert!(estimates[0].1.about.contains("rewritten as a heap"));
+    assert_eq!(work(2), (Rewrite::Yes, Reads::EveryRow));
+    // Negative: the nonclustered index's drop is not the clustered one, and
+    // is left unmeasured rather than called a rewrite.
+    assert!(matches!(work(1).0, Rewrite::Unknown(_)), "{:?}", work(1));
+
+    // Negative: ONLINE is not measured, and a table the plan creates has
+    // no rows to rewrite yet.
+    let mut online = cs.changes[2].clone();
+    online.strategy.online = true;
+    let mut e = estimate::planned_estimates(&ChangeSet {
+        changes: vec![online],
+    })
+    .pop()
+    .unwrap()
+    .1;
+    estimate::against(&mut db.conn, &mut e).await.unwrap();
+    assert!(matches!(e.rewrite, Rewrite::Unknown(_)));
+    assert!(e.lock.contains("unknown"));
+    let created = ChangeSet {
+        changes: vec![
+            PlannedChange::new(Change::CreateTable {
+                uid: pbps_model::Uid::generate(UidKind::Table),
+                name: table.clone(),
+                table: Box::default(),
+            }),
+            cs.changes[2].clone(),
+        ],
+    };
+    let mut e = estimate::planned_estimates(&created).pop().unwrap().1;
+    estimate::against(&mut db.conn, &mut e).await.unwrap();
+    assert!(matches!(e.rewrite, Rewrite::Unknown(_)));
+    assert!(e.rows.is_none() && e.rows_unknown.is_some());
+    db.drop().await;
+}
