@@ -202,13 +202,13 @@ fn one_blocker(b: &Blocker) -> String {
         // Keeping the occupant can leave the source without a disposition, and
         // taking the annotation away cannot supply one: the disappearance
         // needs its own recorded intent (SPEC 7.1, #554). Conditional, since
-        // another rename may already account for the source, and then dropping
-        // the erroneous statement is all it takes. The drop command is named
+        // another rename or a companion drop may already account for the
+        // source, and then dropping the erroneous statement is all it takes. The drop command is named
         // by the source's own finding, which carries its kind.
         Blocker::RenameTargetExists { target } => format!(
             "  rename target {target} already exists in the declarations\n\n    \
              to keep the existing declaration, remove or correct the `renamed_from:` annotation or rename intent, \
-             and unless another rename already accounts for the source, decide what becomes of it: \
+             and unless another rename or a recorded drop already accounts for the source, decide what becomes of it: \
              declare it again, record its drop with a reason, or rename it to a name nothing holds; \
              to reuse that name for the source, first free the occupied target in an earlier revision\n"
         ),
@@ -1274,7 +1274,7 @@ mod tests {
         // another rename already accounts for it.
         assert!(
             text.contains(
-                "unless another rename already accounts for the source, decide what becomes of it"
+                "unless another rename or a recorded drop already accounts for the source, decide what becomes of it"
             ),
             "{text}"
         );

@@ -389,7 +389,8 @@ fn an_occupied_rename_command_cannot_borrow_a_loaded_annotations_match() {
     // The annotation already accounts for the source, so the guidance about
     // it is conditional rather than a second decision to make (#554).
     assert!(
-        stderr(&o).contains("unless another rename already accounts for the source"),
+        stderr(&o)
+            .contains("unless another rename or a recorded drop already accounts for the source"),
         "{}",
         stderr(&o)
     );
