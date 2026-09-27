@@ -199,9 +199,15 @@ fn one_blocker(b: &Blocker) -> String {
             );
             s
         }
+        // Keeping the occupant leaves the source without a disposition, and
+        // taking the annotation away cannot supply one: the disappearance
+        // needs its own recorded intent (SPEC 7.1, #554). The drop command is
+        // named by the source's own finding, which carries its kind.
         Blocker::RenameTargetExists { target } => format!(
             "  rename target {target} already exists in the declarations\n\n    \
-             to keep the existing declaration, remove or correct the `renamed_from:` annotation or rename intent; \
+             to keep the existing declaration, remove or correct the `renamed_from:` annotation or rename intent, \
+             and decide what becomes of the source: declare it again, record its drop with a reason, \
+             or rename it to a name nothing holds; \
              to reuse that name for the source, first free the occupied target in an earlier revision\n"
         ),
         // No command fixes this one: unlike an ambiguous rename or a drop
@@ -1262,6 +1268,15 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("reuse that name for the source"), "{text}");
+        // And the source the keep branch leaves behind (#554).
+        assert!(text.contains("decide what becomes of the source"), "{text}");
+        for choice in [
+            "declare it again",
+            "record its drop with a reason",
+            "rename it to a name nothing holds",
+        ] {
+            assert!(text.contains(choice), "{choice}: {text}");
+        }
         assert!(
             text.contains("free the occupied target in an earlier revision"),
             "{text}"
