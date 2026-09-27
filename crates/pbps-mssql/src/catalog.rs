@@ -55,7 +55,26 @@ pub(crate) fn is_ours(name: &pbps_model::TableName) -> bool {
 // server). A trailing space now sits before the `|`, where padding cannot reach.
 const TABLES: &str = "\
 SELECT t.object_id, s.name AS schema_name, t.name AS table_name, t.temporal_type,
-       CONVERT(bit, CASE WHEN p.object_id IS NULL THEN 0 ELSE 1 END) AS has_period
+       CONVERT(bit, CASE WHEN p.object_id IS NULL THEN 0 ELSE 1 END) AS has_period,
+       t.ledger_type, t.is_dropped_ledger_table, t.ledger_view_id
+  FROM sys.tables t
+  JOIN sys.schemas s ON s.schema_id = t.schema_id
+  LEFT JOIN sys.periods p ON p.object_id = t.object_id
+ WHERE t.is_ms_shipped = 0
+   AND NOT ((s.name + N'|') COLLATE Latin1_General_BIN2 = N'dbo|'
+            AND (t.name + N'|') COLLATE Latin1_General_BIN2
+                IN (N'__pbps_state|', N'__pbps_lock|'))
+ ORDER BY s.name, t.name;";
+
+// SQL Server added the ledger columns of `sys.tables` in 2022. A server
+// without them reads temporal metadata but must not be asked for them: naming
+// a column the view lacks fails the whole pull. No ledger table can exist
+// there.
+const PRE_LEDGER_TABLES: &str = "\
+SELECT t.object_id, s.name AS schema_name, t.name AS table_name, t.temporal_type,
+       CONVERT(bit, CASE WHEN p.object_id IS NULL THEN 0 ELSE 1 END) AS has_period,
+       CONVERT(tinyint, 0) AS ledger_type, CONVERT(bit, 0) AS is_dropped_ledger_table,
+       CONVERT(int, NULL) AS ledger_view_id
   FROM sys.tables t
   JOIN sys.schemas s ON s.schema_id = t.schema_id
   LEFT JOIN sys.periods p ON p.object_id = t.object_id
@@ -70,7 +89,9 @@ SELECT t.object_id, s.name AS schema_name, t.name AS table_name, t.temporal_type
 // column would still make an older server compile a join to a view it lacks.
 const LEGACY_TABLES: &str = "\
 SELECT t.object_id, s.name AS schema_name, t.name AS table_name,
-       CONVERT(tinyint, 0) AS temporal_type, CONVERT(bit, 0) AS has_period
+       CONVERT(tinyint, 0) AS temporal_type, CONVERT(bit, 0) AS has_period,
+       CONVERT(tinyint, 0) AS ledger_type, CONVERT(bit, 0) AS is_dropped_ledger_table,
+       CONVERT(int, NULL) AS ledger_view_id
   FROM sys.tables t
   JOIN sys.schemas s ON s.schema_id = t.schema_id
  WHERE t.is_ms_shipped = 0
@@ -79,7 +100,14 @@ SELECT t.object_id, s.name AS schema_name, t.name AS table_name,
                 IN (N'__pbps_state|', N'__pbps_lock|'))
  ORDER BY s.name, t.name;";
 
-fn tables_query(product_version: &str, edition: &str) -> String {
+/// `has_ledger` is the server's own answer to whether `sys.tables` carries
+/// the ledger columns, not a guess from the banner: Azure SQL Edge says
+/// "Azure" on a 15.x engine without them, and Azure SQL Database says 12.x on
+/// one with them.
+fn tables_query(product_version: &str, edition: &str, has_ledger: bool) -> String {
+    if has_ledger {
+        return TABLES.to_owned();
+    }
     let major = product_version
         .split('.')
         .next()
@@ -87,7 +115,7 @@ fn tables_query(product_version: &str, edition: &str) -> String {
     if !edition.to_ascii_lowercase().contains("azure") && major.is_some_and(|v| v < 13) {
         LEGACY_TABLES.to_owned()
     } else {
-        TABLES.to_owned()
+        PRE_LEDGER_TABLES.to_owned()
     }
 }
 
@@ -280,13 +308,19 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
         .query(
             "SELECT CONVERT(nvarchar(128), SERVERPROPERTY('ProductVersion')) AS version,
                 CONVERT(nvarchar(128), SERVERPROPERTY('Edition')) AS edition,
-                CONVERT(nvarchar(128), DATABASEPROPERTYEX(DB_NAME(), 'Collation')) AS db_collation;",
+                CONVERT(nvarchar(128), DATABASEPROPERTYEX(DB_NAME(), 'Collation')) AS db_collation,
+                CONVERT(bit, CASE WHEN COL_LENGTH('sys.tables', 'ledger_type') IS NULL
+                                  THEN 0 ELSE 1 END) AS has_ledger;",
         )
         .await?;
     let version = versions
         .first()
         .ok_or_else(|| DbError::BadRow("the server version query returned no row".into()))?;
-    let tables = tables_query(get(version, "version")?, get(version, "edition")?);
+    let tables = tables_query(
+        get(version, "version")?,
+        get(version, "edition")?,
+        get(version, "has_ledger")?,
+    );
     raw.database_collation = get::<&str>(version, "db_collation")?.to_owned();
     for row in conn.query(&tables).await? {
         raw.tables.push(RawTable {
@@ -295,6 +329,9 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             name: get::<&str>(&row, "table_name")?.to_owned(),
             temporal_type: get(&row, "temporal_type")?,
             has_period: get(&row, "has_period")?,
+            ledger_type: get(&row, "ledger_type")?,
+            is_dropped_ledger_table: get(&row, "is_dropped_ledger_table")?,
+            ledger_view_id: opt(&row, "ledger_view_id")?,
         });
     }
 
@@ -1113,7 +1150,7 @@ mod tests {
     #[test]
     fn old_servers_are_not_asked_for_a_temporal_catalog_column() {
         for version in ["10.50.6000.34", "11.0.7001.0", "12.0.6024.0"] {
-            let query = tables_query(version, "Developer Edition");
+            let query = tables_query(version, "Developer Edition", false);
             assert!(!query.contains("t.temporal_type"), "{query}");
             assert!(!query.contains("sys.periods"), "{query}");
             assert!(query.contains("CONVERT(tinyint, 0) AS temporal_type"));
@@ -1125,9 +1162,45 @@ mod tests {
             ("12.0.2000.8", "SQL Azure"),
             ("unknown", "Developer Edition"),
         ] {
-            let query = tables_query(version, edition);
-            assert!(query.contains("t.temporal_type"));
-            assert!(query.contains("sys.periods"));
+            for has_ledger in [false, true] {
+                let query = tables_query(version, edition, has_ledger);
+                assert!(query.contains("t.temporal_type"));
+                assert!(query.contains("sys.periods"));
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_server_whose_catalog_has_the_ledger_columns_is_asked_for_them() {
+        // Azure SQL Edge's banner says Azure on a 15.x engine whose
+        // `sys.tables` has no ledger columns; the probe, not the banner, decides.
+        for (version, edition) in [
+            ("11.0.7001.0", "Developer Edition"),
+            ("13.0.1601.5", "Developer Edition"),
+            ("15.0.4355.3", "Developer Edition"),
+            ("15.0.2000.1574", "Azure SQL Edge Developer"),
+            ("12.0.2000.8", "SQL Azure"),
+            ("unknown", "Developer Edition"),
+        ] {
+            let query = tables_query(version, edition, false);
+            for column in [
+                "t.ledger_type",
+                "t.is_dropped_ledger_table",
+                "t.ledger_view_id",
+            ] {
+                assert!(!query.contains(column), "{version} {edition}: {query}");
+            }
+            assert!(query.contains("CONVERT(tinyint, 0) AS ledger_type"));
+        }
+        for (version, edition) in [
+            ("16.0.1000.6", "Developer Edition"),
+            ("17.0.4075.5", "Enterprise Developer Edition (64-bit)"),
+            ("12.0.2000.8", "SQL Azure"),
+        ] {
+            let query = tables_query(version, edition, true);
+            assert!(query.contains("t.ledger_type"), "{version}");
+            assert!(query.contains("t.is_dropped_ledger_table"), "{version}");
+            assert!(query.contains("t.ledger_view_id"), "{version}");
         }
     }
 
