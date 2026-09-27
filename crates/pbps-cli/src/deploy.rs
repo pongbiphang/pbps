@@ -3027,6 +3027,31 @@ fn refuse_unplanned_movement(
             );
             named_alike(n, Part::Check, "check", &was.checks, &now.checks, s, m);
             named_alike(n, Part::Index, "index", &was.indexes, &now.indexes, s, m);
+            // And which of them holds the rows (#1178). Every part can read
+            // back unchanged while another session moves the clustered index
+            // between them, so the layout is compared on its own. The plan
+            // moves it only through the key or the object a selector names,
+            // on either side, so those are what excuse a difference.
+            // A free function: the name it returns borrows from the layout,
+            // which a closure cannot say.
+            fn named_by(layout: &Option<pbps_model::Clustered>) -> Option<(Part, &str)> {
+                match layout {
+                    Some(pbps_model::Clustered::Unique(n)) => Some((Part::Unique, n.as_str())),
+                    Some(pbps_model::Clustered::Index(n)) => Some((Part::Index, n.as_str())),
+                    Some(pbps_model::Clustered::Heap) | None => None,
+                }
+            }
+            let plan_moves_layout = keys.contains(now_name)
+                || [&was.clustered, &now.clustered]
+                    .into_iter()
+                    .filter_map(named_by)
+                    .any(|part| moved_parts.contains(&part));
+            if was.clustered != now.clustered && !plan_moves_layout {
+                moved.push(format!(
+                    "{now_name} is clustered differently from the table the plan was approved \
+                     over, and no change of this plan moves its clustered index"
+                ));
+            }
         }
         // Dropped, or outside the row scope on one side: there is no pair of
         // row sets to compare, and "absent" is not "empty".
@@ -10459,6 +10484,94 @@ mod tests {
                 assert!(format!("{e:#}").contains("index `ix`"), "{other:?}: {e:#}");
             }
         }
+    }
+
+    /// An existing table the plan touches for something else is held to its
+    /// layout (#1178): its parts can all read back unchanged while another
+    /// session moves the clustered index between them. The plan's own move
+    /// of the clustered index is not movement.
+    #[test]
+    fn a_touched_tables_layout_moved_by_someone_else_is_movement() {
+        use pbps_model::{Change, Clustered, Column, Index, IndexColumn, PlannedChange, Table};
+        let name = TableName::new("app", "t");
+        let mut t = Table::default();
+        t.columns
+            .insert("id".into(), Column::new("int".parse().unwrap()).not_null());
+        t.primary_key = Some(pbps_model::PrimaryKey {
+            name: Some("pk_t".into()),
+            columns: vec!["id".into()],
+        });
+        let ix = Index {
+            columns: vec![IndexColumn {
+                name: "id".into(),
+                descending: false,
+            }],
+            include: vec![],
+            unique: false,
+            filter: None,
+        };
+        t.indexes.insert("ix".into(), ix.clone());
+        let schema = |layout: Option<Clustered>| {
+            let mut t = t.clone();
+            t.clustered = layout;
+            Schema {
+                tables: [(name.clone(), t)].into(),
+                ..Default::default()
+            }
+        };
+        let unrelated = pbps_model::ChangeSet {
+            changes: vec![PlannedChange::new(Change::AddCheck {
+                table: name.clone(),
+                name: "ck".into(),
+                constraint: pbps_model::CheckConstraint {
+                    expression: "id > 0".into(),
+                },
+            })],
+        };
+        let check = |plan: &pbps_model::ChangeSet, after: &Schema| {
+            refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                plan,
+                &schema(None),
+                after,
+                "test",
+                Settled::SoFar,
+            )
+        };
+        // The control: nothing moved the layout.
+        check(&unrelated, &schema(None)).expect("the layout as approved");
+        let e = check(&unrelated, &schema(Some(Clustered::Index("ix".into()))))
+            .expect_err("another session made ix the clustered index");
+        assert!(format!("{e:#}").contains("clustered differently"), "{e:#}");
+        // The plan's own move is not movement.
+        let moving = pbps_model::ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::SetPrimaryKey {
+                    table: name.clone(),
+                    from: t.primary_key.clone(),
+                    to: None,
+                    nonclustered: false,
+                }),
+                PlannedChange::new(Change::DropIndex {
+                    table: name.clone(),
+                    name: "ix".into(),
+                }),
+                PlannedChange::new(Change::AddIndex {
+                    table: name.clone(),
+                    name: "ix".into(),
+                    index: Box::new(ix),
+                    clustered: true,
+                }),
+                PlannedChange::new(Change::SetPrimaryKey {
+                    table: name.clone(),
+                    from: None,
+                    to: t.primary_key.clone(),
+                    nonclustered: true,
+                }),
+            ],
+        };
+        check(&moving, &schema(Some(Clustered::Index("ix".into()))))
+            .expect("the plan moved it itself");
     }
 
     /// A created table's layout is held with its parts (#1178): read back
