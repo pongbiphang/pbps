@@ -28515,9 +28515,14 @@ async fn doctor_reports_an_absent_recorded_managed_table() {
         .execute("CREATE TABLE public.kept(id integer); CREATE TABLE public.lingering(id integer)")
         .await
         .unwrap();
-    // #1109: a pending drop another role owns.
+    // #1109: a pending drop another role owns, and one another role owns in
+    // a schema the deployer owns, which the deployer may drop all the same.
     db.conn
-        .execute("CREATE TABLE public.foreign_owned(id integer)")
+        .execute(&format!(
+            "CREATE TABLE public.foreign_owned(id integer); \
+             CREATE SCHEMA mine AUTHORIZATION {role}; \
+             CREATE TABLE mine.foreign_in_mine(id integer)"
+        ))
         .await
         .unwrap();
     let (moving, kept, fresh) = (
@@ -28547,6 +28552,10 @@ async fn doctor_reports_an_absent_recorded_managed_table() {
         pbps_model::Uid::generate(pbps_model::UidKind::Table),
         "public.foreign_owned".parse().unwrap(),
     );
+    recorded.tables.insert(
+        pbps_model::Uid::generate(pbps_model::UidKind::Table),
+        "mine.foreign_in_mine".parse().unwrap(),
+    );
     // `staged` is recorded in the ids only: a staged checkpoint after its
     // committed `DROP TABLE`, whose absence is the plan's own doing.
     recorded.tables.insert(
@@ -28562,6 +28571,7 @@ async fn doctor_reports_an_absent_recorded_managed_table() {
             "public.dropped",
             "public.lingering",
             "public.foreign_owned",
+            "mine.foreign_in_mine",
         ],
     )
     .await;
@@ -28612,7 +28622,8 @@ async fn doctor_reports_an_absent_recorded_managed_table() {
     );
     // #1109: a pending drop that is there needs ownership for its
     // `DROP TABLE`. The one another role owns is a gap; `lingering`, which
-    // the deployer owns, is not.
+    // the deployer owns, is not, and neither is `mine.foreign_in_mine`, whose
+    // schema the deployer owns.
     let dropping: Vec<String> = held
         .declaration_gaps
         .iter()

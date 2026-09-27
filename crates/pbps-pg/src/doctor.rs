@@ -760,15 +760,18 @@ pub async fn permissions(
                 why: "the recorded table is absent; its ownership cannot be established".to_owned(),
                 securable: Securable::Object(object),
             });
-        } else if !rights.owned {
+        } else if !rights.owned && !owns_schema(conn, &object.schema).await? {
             // A `DROP TABLE` needs ownership (DECISIONS 289), and nothing
             // else asks this table for it: it is out of the managed rights
             // above, so a table another role owns read as ready here and
-            // failed at the drop (#1109).
+            // failed at the drop (#1109). The schema's owner may drop it too
+            // (measured on 18: `DROP TABLE` succeeds for the owner of the
+            // schema of a table another role owns), and a drop is all the
+            // plan does to it, so that ownership is enough here.
             held.declaration_gaps.push(Gap {
                 permission: OWNERSHIP,
                 why: "the declarations no longer name this recorded table, so the next plan \
-                      drops it, which needs ownership"
+                      drops it, which needs ownership of the table or of its schema"
                     .to_owned(),
                 securable: Securable::Object(object),
             });
@@ -829,6 +832,26 @@ async fn read_schemas(
             ))
         })
         .collect()
+}
+
+/// Whether the current user holds the owner of `schema`, by the same
+/// `pg_has_role(.., 'USAGE')` the table rights use. An absent schema is not
+/// one this user owns.
+async fn owns_schema(conn: &mut Conn, schema: &str) -> Result<bool, DbError> {
+    let rows = conn
+        .query_with(
+            "SELECT pg_catalog.pg_has_role(current_user, n.nspowner, 'USAGE') AS owned \
+               FROM pg_catalog.pg_namespace n WHERE n.nspname = $1",
+            &[Param::Str(schema)],
+        )
+        .await?;
+    match rows.as_slice() {
+        [] => Ok(false),
+        [row] => flag(row, "owned"),
+        _ => Err(DbError::BadRow(format!(
+            "the owner of schema {schema} came back more than once"
+        ))),
+    }
 }
 
 async fn read_tables(
