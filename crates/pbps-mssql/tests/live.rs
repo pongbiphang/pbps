@@ -2845,6 +2845,73 @@ async fn a_renamed_tables_and_columns_generated_defaults_follow_them() {
     db.drop().await;
 }
 
+/// #991: a generated default is found by its column as well as its table and
+/// name. A default someone wrote by hand on another column, under exactly the
+/// name `pbps` would generate for the renamed one, is not that column's, and
+/// a column or table rename leaves it as it is.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_hand_written_default_on_another_column_is_not_renamed_with_this_one() {
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+    let mut db = TestDb::create("defaultcolumn991").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.t (a int NULL, b int NOT NULL CONSTRAINT DF_pbps_t_a DEFAULT 0); \
+             CREATE TABLE dbo.s (a int NULL, b int NOT NULL CONSTRAINT DF_pbps_s_a DEFAULT 0);",
+        )
+        .await
+        .unwrap();
+    apply(
+        &mut db.conn,
+        &ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::RenameColumn {
+                    uid: "t_aaa991".parse().unwrap(),
+                    table: "dbo.t".parse().unwrap(),
+                    from: "a".into(),
+                    to: "c".into(),
+                    table_was: None,
+                }),
+                // A table rename names the columns that carry a generated
+                // default; `a` is named here to put the lookup on the spot.
+                PlannedChange::new(Change::RenameTable {
+                    uid: "t_aaa992".parse().unwrap(),
+                    from: "dbo.s".parse().unwrap(),
+                    to: "dbo.r".parse().unwrap(),
+                    defaults: vec!["a".into()],
+                }),
+            ],
+        },
+    )
+    .await;
+    let rows = db
+        .conn
+        .query(
+            "SELECT OBJECT_NAME(parent_object_id) + N'.' \
+             + COL_NAME(parent_object_id, parent_column_id) AS c, name \
+             FROM sys.default_constraints ORDER BY c;",
+        )
+        .await
+        .unwrap();
+    let names: Vec<(String, String)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.try_get::<&str>("c").unwrap().unwrap().to_owned(),
+                r.try_get::<&str>("name").unwrap().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        names,
+        [
+            ("r.b".to_owned(), "DF_pbps_s_a".to_owned()),
+            ("t.b".to_owned(), "DF_pbps_t_a".to_owned()),
+        ]
+    );
+    db.drop().await;
+}
+
 /// SPEC §8.1: the whole state goes in and comes back out unchanged. Everything
 /// downstream — drift, the plan checksum, `status` — reads this row, so a
 /// serialization that lost a field would make every one of them quietly wrong.
