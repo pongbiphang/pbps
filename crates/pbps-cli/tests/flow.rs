@@ -386,11 +386,107 @@ fn an_occupied_rename_command_cannot_borrow_a_loaded_annotations_match() {
     let o = d.run(&["rename", "dbo.t.old", "occupied"]);
     assert_eq!(code(&o), FINDING, "{}{}", stdout(&o), stderr(&o));
     assert!(stderr(&o).contains("dbo.t.occupied"), "{}", stderr(&o));
+    // The annotation already accounts for the source, so the guidance about
+    // it is conditional rather than a second decision to make (#554).
+    assert!(
+        stderr(&o)
+            .contains("unless another rename or a recorded drop already accounts for the source"),
+        "{}",
+        stderr(&o)
+    );
     assert_eq!(
         std::fs::read_to_string(d.ids_path()).unwrap(),
         before,
         "a refused command must not record the annotation's different rename"
     );
+}
+
+/// #554: an occupied rename target, kept. The source still disappears, and
+/// its disposition is a decision of its own: the plan names both decisions,
+/// in text and in JSON, and each complete answer converges. Removing the
+/// annotation alone still leaves the disappearance unexplained, and nothing a
+/// refused attempt does changes the identities.
+#[test]
+fn keeping_an_occupied_rename_target_still_asks_what_becomes_of_the_source() {
+    let columns = |body: &str| {
+        format!("table: dbo.t\ncolumns:\n  id: {{type: bigint, nullable: false}}\n{body}")
+    };
+    let start = |slug: &str| {
+        let d = Demo::new(slug);
+        d.table(&columns("  old: {type: int}\n  occupied: {type: int}\n"));
+        assert_eq!(code(&d.run(&["plan"])), 0);
+        d.commit();
+        let ids = std::fs::read_to_string(d.ids_path()).unwrap();
+        (d, ids)
+    };
+
+    // The occupied annotation: both decisions are asked for, in both forms.
+    let (d, ids) = start("occupied-keep-source");
+    d.table(&columns("  occupied: {type: int, renamed_from: old}\n"));
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), FINDING, "{}{}", stdout(&o), stderr(&o));
+    let text = stderr(&o);
+    assert!(text.contains("decide what becomes of it"), "{text}");
+    assert!(text.contains("--reason"), "{text}");
+    let o = d.run(&["plan", "--format", "json"]);
+    assert_eq!(code(&o), FINDING);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let ids_of: Vec<&str> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert!(ids_of.contains(&"identity.rename-target-exists"), "{json}");
+    assert!(
+        ids_of.contains(&"identity.drop-column-needs-reason"),
+        "{json}"
+    );
+    let occupied = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "identity.rename-target-exists")
+        .unwrap();
+    assert!(
+        occupied["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("decide what becomes of it"),
+        "{occupied}"
+    );
+    assert_eq!(std::fs::read_to_string(d.ids_path()).unwrap(), ids);
+
+    // Removing the annotation alone keeps the occupant and answers nothing
+    // about the source.
+    d.table(&columns("  occupied: {type: int}\n"));
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), FINDING, "{}{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("--reason"), "{}", stderr(&o));
+    assert_eq!(std::fs::read_to_string(d.ids_path()).unwrap(), ids);
+
+    // Each complete answer converges.
+    // 1. Declare the source again.
+    d.table(&columns("  old: {type: int}\n  occupied: {type: int}\n"));
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(std::fs::read_to_string(d.ids_path()).unwrap(), ids);
+
+    // 2. Record its drop with a reason.
+    let (d, _) = start("occupied-keep-drop");
+    d.table(&columns("  occupied: {type: int}\n"));
+    let o = d.run(&["drop", "dbo.t.old", "--reason", "no longer used"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    // 3. Rename it to a name nothing holds.
+    let (d, _) = start("occupied-keep-redirect");
+    d.table(&columns(
+        "  fresh: {type: int, renamed_from: old}\n  occupied: {type: int}\n",
+    ));
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
 }
 
 #[test]
