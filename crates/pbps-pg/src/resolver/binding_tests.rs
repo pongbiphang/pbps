@@ -995,6 +995,60 @@ async fn a_dropped_overload_is_held_by_its_declared_identity_not_by_a_count() {
             ),
             "{variable} aggregate: {assessment:#?}"
         );
+        // A plan that turns the function into a procedure drops the function:
+        // the target holds the function, or has lost it to an aggregate, and
+        // that is what the DROP addresses, not the procedure scratch compiled
+        // under the same signature (#1182).
+        let procedure = || {
+            view().module(
+                "app.f(integer)",
+                ModuleKind::Procedure,
+                "(integer) LANGUAGE sql AS $$ SELECT 1 $$",
+            )
+        };
+        for (tag, holder, unresolved) in [
+            (
+                "kind_changed",
+                "CREATE FUNCTION app.f(integer) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;",
+                false,
+            ),
+            (
+                "kind_changed_drifted",
+                "CREATE AGGREGATE app.f(integer) (SFUNC = int4pl, STYPE = integer);",
+                true,
+            ),
+        ] {
+            let assessment = analyze(
+                &server,
+                tag,
+                Case {
+                    schemas: &["app"],
+                    extras: &[],
+                    target: &format!(
+                        "CREATE FUNCTION app.f(numeric) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;
+                         SET search_path = app;
+                         CREATE VIEW app.v AS SELECT f(1.0) AS x;
+                         {holder}"
+                    ),
+                    base: view().function(
+                        "app.f(integer)",
+                        "(integer) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1",
+                    ),
+                    desired: procedure(),
+                },
+            )
+            .await
+            .unwrap();
+            let verdict = only(&assessment, "app", "v");
+            if unresolved {
+                assert!(
+                    matches!(verdict, Verdict::Unresolved { condition } if condition.contains("not reconstructed")),
+                    "{variable} {tag}: {assessment:#?}"
+                );
+            } else {
+                assert_eq!(verdict, Verdict::Unaffected, "{variable} {tag}");
+            }
+        }
     }
 }
 

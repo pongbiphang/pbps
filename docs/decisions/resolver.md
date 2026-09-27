@@ -996,7 +996,9 @@ target capture's own snapshot so that it is read coherently with the
 candidates it is assessed against (#1148), and only
 if it is of the declared kind: an aggregate holding a declared function's
 signature is not that function, and the plan's `DROP FUNCTION` refuses it
-(#1126). On the
+(#1126). A declaration whose kind the plan changes under the same signature is
+dropped as its old kind, and the target's routine is held by that identity,
+not by what scratch compiled for the new kind (#1182). On the
 target and not on scratch, because scratch holds the desired namespace, where
 a type the plan adds can shadow the one the `DROP` finds and a table's array
 type keeps the name an unmanaged type holds on the target (#1124). A signature

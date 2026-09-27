@@ -81,7 +81,14 @@ impl Managed {
         self.routines
             .values()
             .flatten()
-            .filter(|(id, _)| !desired.routines.values().any(|kept| kept.contains_key(*id)))
+            // A routine the desired schema keeps under another kind is
+            // dropped as this kind: the plan's DROP names this one (#1182).
+            .filter(|(id, kind)| {
+                !desired
+                    .routines
+                    .values()
+                    .any(|kept| kept.get(*id) == Some(*kind))
+            })
             .map(|(id, kind)| (id.clone(), *kind))
             .collect()
     }
@@ -130,11 +137,13 @@ impl Managed {
             // scratch, which gives its catalog identity; one the plan drops is
             // identified from its declared signature. Only those identities
             // are it: a count would let an unmanaged overload stand in for a
-            // declared one the target lacks (#1063).
+            // declared one the target lacks (#1063). Where the plan drops one
+            // kind and creates another under the same signature, the target
+            // holds the one it drops, so that identity is it (#1182).
             CandidateClass::Routine => self.routines.get(&key(name)).is_some_and(|declared| {
                 declared
                     .keys()
-                    .filter_map(|id| order.created(id).or_else(|| order.dropped(id)))
+                    .filter_map(|id| order.known(id))
                     .any(|known| known == member)
             }),
             CandidateClass::Operator
