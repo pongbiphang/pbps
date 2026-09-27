@@ -420,6 +420,39 @@ plan can clear a name first, and an occupant it clears is not one:
 
 A name taken after the plan was saved is left to the apply. The `CREATE` fails
 inside the transaction and the ledger records nothing, which is the outcome a
-recheck could only have reported earlier. SQL Server is unchanged: its module
-path is `CREATE OR ALTER`, whose adoption of an existing module is a separate
-question.
+recheck could only have reported earlier. SQL Server is answered by
+DEC-1077.1.
+
+<a id="dec-1077-1"></a>
+
+**DEC-1077.1. A SQL Server plan that creates a name another object in its
+schema holds is refused at plan time (#1077; follows DEC-316.1).** SQL Server
+keeps tables, views, routines, triggers, sequences, synonyms and constraints
+in one `sys.objects` namespace per schema. A `CREATE TABLE` at any of their
+names fails with Msg 2714. A module's `CREATE OR ALTER` fails when the name
+holds another kind of object, and silently replaces one of its own kind. The
+catalog inventory reads tables and modules, not sequences, synonyms or
+constraints, and nothing asked about the rest, so the plan was saved and the
+statement failed at apply.
+
+`plan --db` now asks `sys.objects` for every name the plan creates, in the
+read-only planning transaction:
+
+- each `CreateTable`;
+- each `CreateModule` not preceded by its own `DropModule` (a rebuild);
+- a trigger in its table's schema.
+
+Names are matched under the database's collation. An occupant is refused with
+its `type_desc` and, for a constraint or trigger, its table. As in DEC-316.1,
+the plan can clear a name first, and an occupant it clears is not one:
+
+- an object it drops, or a table it renames away;
+- a unique, foreign-key or check constraint it drops, or a named primary key
+  it replaces;
+- a constraint or trigger of a table it drops or transfers to another schema.
+  A rename within the schema leaves the constraint's name where it was.
+
+Refusing the same-kind module rather than letting `CREATE OR ALTER` replace it
+is DEC-316.1's reasoning. Replacing an object this project never recorded is
+the silent replacement ADR-0002 rules out, and `baseline` is the explicit act
+that adopts it.

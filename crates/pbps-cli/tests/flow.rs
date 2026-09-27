@@ -1858,6 +1858,71 @@ fn pull_round_trips_ordinary_engine_names_without_a_name_warning() {
     assert_eq!(code(&validate), 0, "{}", stderr(&validate));
 }
 
+/// A sequence or a synonym already at the name of a table this plan creates
+/// refuses the plan by name, and no plan is written (#1077). SQL Server keeps
+/// tables, views, routines, sequences, synonyms and constraints in one
+/// `sys.objects` namespace per schema, so the `CREATE TABLE` used to reach
+/// apply and fail there with Msg 2714. Control: the same table at a free
+/// name plans and applies.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_sequence_or_synonym_at_a_new_tables_name_refuses_the_plan() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "object_namespace_occupant");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE TABLE dbo.keep (id int); \
+         CREATE SEQUENCE dbo.s; \
+         CREATE SYNONYM dbo.y FOR dbo.keep;",
+    );
+    // Each case from a fresh project, so one case's ids file names nothing
+    // the next one has to decide about.
+    let adopted = |case: &str| {
+        let d = Demo::new(&format!("object-namespace-occupant-{case}"));
+        let o = d.run(&["pull", "--db", connection]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        d.commit();
+        let o = d.run(&["baseline", "--db", connection, "--reason", "adopt"]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        d
+    };
+    let declare = |d: &Demo, name: &str| {
+        std::fs::write(
+            d.dir.join(format!("schema/dbo.{name}.yml")),
+            format!("table: dbo.{name}\ncolumns:\n  id: {{type: int}}\n"),
+        )
+        .unwrap();
+        assert_eq!(code(&d.run(&["plan"])), 0);
+        d.commit();
+        d.dir.join("plan.json")
+    };
+    for (name, kind) in [("s", "sequence object `dbo.s`"), ("y", "synonym `dbo.y`")] {
+        let d = adopted(name);
+        let plan = declare(&d, name);
+        let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+        assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+        let err = stderr(&o);
+        assert!(err.contains(&format!("already has {kind}")), "{err}");
+        assert!(!plan.exists(), "a refused plan wrote {}", plan.display());
+    }
+
+    let d = adopted("free");
+    let plan = declare(&d, "free");
+    let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = d.run(&[
+        "apply",
+        "--db",
+        connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+    ]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+}
+
 // ---- pull (the paths that need no database) ----
 
 /// pull must never clobber an existing project by accident: the connection is

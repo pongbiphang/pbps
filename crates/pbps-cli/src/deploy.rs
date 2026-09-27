@@ -426,6 +426,130 @@ fn refuse_uninventoried_occupants(
     );
 }
 
+/// The `sys.objects` names this plan creates on SQL Server: its tables, and
+/// the modules it creates that it does not also drop. A module dropped and
+/// created in one plan is a rebuild, and its name is already its own. A
+/// trigger's object is in its table's schema.
+// The complement is every change that creates no object name.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn created_object_names(cs: &pbps_model::ChangeSet) -> Vec<TableName> {
+    use pbps_model::Change;
+    let dropped: BTreeSet<&ModuleId> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::DropModule { id, .. } => Some(id),
+            _ => None,
+        })
+        .collect();
+    cs.changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::CreateTable { name, .. } => Some(name.clone()),
+            Change::CreateModule { id, .. } if !dropped.contains(id) => Some(module_object(id)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The `sys.objects` entry a module is, on SQL Server.
+fn module_object(id: &ModuleId) -> TableName {
+    match id {
+        ModuleId::Named(name) => name.clone(),
+        ModuleId::Routine(routine) => routine.name.clone(),
+        ModuleId::Trigger { on, name } => TableName::new(on.schema.clone(), name.clone()),
+    }
+}
+
+/// Refuses a name this plan creates on SQL Server that another object in
+/// the schema's `sys.objects` namespace already holds (#1077): a sequence, a
+/// synonym, a constraint, or a table or module this project does not record.
+/// `CREATE TABLE` there fails with Msg 2714, and `CREATE OR ALTER` fails or
+/// replaces what is there. One this plan frees first is not an occupant: an
+/// object it drops or renames away, a constraint it drops, and the
+/// constraints and triggers of a table it drops or moves to another schema.
+// The complement is every change that frees no object name.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn refuse_occupied_objects(
+    cs: &pbps_model::ChangeSet,
+    occupants: &[pbps_mssql::catalog::NameOccupant],
+    label: &str,
+) -> anyhow::Result<()> {
+    use pbps_model::Change;
+    // The catalog spells every name as the database does now, and a change
+    // on a table the plan also renames carries the new name (the differ
+    // sorts renames first): each is read back to the catalog's name.
+    let renamed_from: BTreeMap<&TableName, &TableName> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::RenameTable { from, to, .. } => Some((to, from)),
+            _ => None,
+        })
+        .collect();
+    let now = |t: &TableName| (*renamed_from.get(t).unwrap_or(&t)).clone();
+    let freed: BTreeSet<TableName> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::DropTable { name, .. } => Some(name.clone()),
+            Change::RenameTable { from, .. } => Some(from.clone()),
+            Change::DropModule { id, .. } => Some(module_object(id)),
+            Change::DropUnique { table, name }
+            | Change::DropForeignKey { table, name }
+            | Change::DropCheck { table, name } => {
+                Some(TableName::new(now(table).schema, name.clone()))
+            }
+            Change::SetPrimaryKey {
+                table,
+                from: Some(key),
+                ..
+            } => key
+                .name
+                .as_ref()
+                .map(|name| TableName::new(now(table).schema, name.clone())),
+            _ => None,
+        })
+        .collect();
+    // Parents whose constraints and triggers leave the schema with them.
+    let released: BTreeSet<&TableName> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::DropTable { name, .. } => Some(name),
+            Change::RenameTable { from, to, .. } if from.schema != to.schema => Some(from),
+            _ => None,
+        })
+        .collect();
+    let taken: Vec<String> = occupants
+        .iter()
+        .filter(|o| !freed.contains(&o.name))
+        .filter(|o| !o.parent.as_ref().is_some_and(|p| released.contains(p)))
+        .map(|o| {
+            let name = &o.wanted;
+            match &o.parent {
+                Some(parent) => format!(
+                    "`{name}`: the database already has {} `{}` on `{parent}`",
+                    o.kind, o.name
+                ),
+                None => format!("`{name}`: the database already has {} `{}`", o.kind, o.name),
+            }
+        })
+        .collect();
+    if taken.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "`{label}` already uses {} name(s) this plan would create, for objects that share \
+         one namespace per schema on SQL Server:\n  {}\nEach `CREATE` would fail at apply, or \
+         replace an object this project does not record. Rename the declaration, drop or \
+         rename the object in the database, or — for a table or module pbps can read — adopt \
+         it as it stands with `pbps baseline --reason ...`.",
+        taken.len(),
+        taken.join("\n  ")
+    );
+}
+
 /// Refuses to use a catalog projection that omitted facts inside the managed
 /// set. Both recording and connected planning need the same guard: a partial
 /// schema is neither an honest snapshot nor a safe baseline for an artifact.
@@ -4258,6 +4382,16 @@ pub fn cmd_plan_db(
                 .await?;
                 refuse_uninventoried_occupants(&cs, &occupants, &target.label)?;
             }
+            // The same question on SQL Server, of its one `sys.objects`
+            // namespace per schema (#1077).
+            if conn.driver() == pbps_db::Driver::Mssql {
+                let occupants = pbps_mssql::catalog::object_name_occupants(
+                    &mut conn,
+                    &created_object_names(&cs),
+                )
+                .await?;
+                refuse_occupied_objects(&cs, &occupants, &target.label)?;
+            }
             let rename_evidence = crate::engine::external_role_renames(
                 &mut conn,
                 &recorded_snapshot.ids,
@@ -6577,6 +6711,173 @@ fn dropped_referrer_names(changes: &pbps_model::ChangeSet) -> BTreeSet<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// #1077: on SQL Server, any other object at a name the plan creates
+    /// refuses it, with its kind and parent named. One the plan frees first
+    /// does not: an object it drops or renames away, a constraint it drops,
+    /// and a constraint of a table it drops or moves to another schema. A
+    /// constraint of a table renamed within its schema stays behind, and a
+    /// module the plan rebuilds already owns its name.
+    #[test]
+    fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
+        use pbps_model::{Change, ChangeSet, Module, ModuleKind, PlannedChange};
+        use pbps_mssql::catalog::NameOccupant;
+        let x = TableName::new("dbo", "x");
+        let old = TableName::new("dbo", "old");
+        let create_table = || {
+            PlannedChange::new(Change::CreateTable {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.x", 0),
+                name: x.clone(),
+                table: Box::default(),
+            })
+        };
+        let occupant = |kind: &str, parent: Option<&TableName>| NameOccupant {
+            wanted: x.clone(),
+            name: x.clone(),
+            kind: kind.into(),
+            parent: parent.cloned(),
+        };
+        let plan = |changes: Vec<PlannedChange>| ChangeSet { changes };
+        let refused = |changes: Vec<PlannedChange>, o: NameOccupant| {
+            refuse_occupied_objects(&plan(changes), &[o], "prod")
+                .err()
+                .map(|e| e.to_string())
+        };
+
+        let e = refused(vec![create_table()], occupant("sequence object", None)).unwrap();
+        assert!(e.contains("already has sequence object `dbo.x`"), "{e}");
+        let e = refused(
+            vec![create_table()],
+            occupant("check constraint", Some(&old)),
+        )
+        .unwrap();
+        assert!(
+            e.contains("already has check constraint `dbo.x` on `dbo.old`"),
+            "{e}"
+        );
+        // Spelled as the catalog spells it, under the plan's own name.
+        let e = refuse_occupied_objects(
+            &plan(vec![create_table()]),
+            &[NameOccupant {
+                name: TableName::new("dbo", "X"),
+                ..occupant("synonym", None)
+            }],
+            "prod",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("`dbo.x`: the database already has synonym `dbo.X`"),
+            "{e}"
+        );
+
+        // Freed by the plan itself.
+        let drop_table = |name: &TableName| {
+            PlannedChange::new(Change::DropTable {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.gone", 0),
+                name: name.clone(),
+            })
+        };
+        let rename = |to: TableName| {
+            PlannedChange::new(Change::RenameTable {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.old", 0),
+                from: old.clone(),
+                to,
+                defaults: Vec::new(),
+            })
+        };
+        assert_eq!(
+            refused(
+                vec![drop_table(&x), create_table()],
+                occupant("user table", None)
+            ),
+            None
+        );
+        assert_eq!(
+            refused(
+                vec![
+                    PlannedChange::new(Change::DropCheck {
+                        table: old.clone(),
+                        name: "x".into(),
+                    }),
+                    create_table()
+                ],
+                occupant("check constraint", Some(&old))
+            ),
+            None
+        );
+        // A check dropped from a table the plan also renames names the
+        // table by its new name; the constraint is still where it was.
+        let new = TableName::new("dbo", "new");
+        assert_eq!(
+            refused(
+                vec![
+                    rename(new.clone()),
+                    PlannedChange::new(Change::DropCheck {
+                        table: new.clone(),
+                        name: "x".into(),
+                    }),
+                    create_table()
+                ],
+                occupant("check constraint", Some(&old))
+            ),
+            None
+        );
+        assert_eq!(
+            refused(
+                vec![drop_table(&old), create_table()],
+                occupant("check constraint", Some(&old))
+            ),
+            None
+        );
+        assert_eq!(
+            refused(
+                vec![rename(TableName::new("archive", "old")), create_table()],
+                occupant("check constraint", Some(&old))
+            ),
+            None,
+            "a transfer takes the table's constraints to the other schema"
+        );
+        assert!(
+            refused(
+                vec![rename(new.clone()), create_table()],
+                occupant("check constraint", Some(&old))
+            )
+            .is_some(),
+            "a rename within the schema leaves the constraint's name where it is"
+        );
+        let view = || Module {
+            kind: ModuleKind::View,
+            description: None,
+            definition: "SELECT 1".into(),
+        };
+        let rebuild = plan(vec![
+            PlannedChange::new(Change::DropModule {
+                id: ModuleId::Named(x.clone()),
+                kind: ModuleKind::View,
+            }),
+            PlannedChange::new(Change::CreateModule {
+                id: ModuleId::Named(x.clone()),
+                module: Box::new(view()),
+            }),
+        ]);
+        assert!(created_object_names(&rebuild).is_empty());
+        // A trigger is asked of its table's schema.
+        let trigger = plan(vec![PlannedChange::new(Change::CreateModule {
+            id: ModuleId::Trigger {
+                on: TableName::new("sales", "t"),
+                name: "tr".into(),
+            },
+            module: Box::new(Module {
+                kind: ModuleKind::Trigger,
+                ..view()
+            }),
+        })]);
+        assert_eq!(
+            created_object_names(&trigger),
+            [TableName::new("sales", "tr")]
+        );
+    }
 
     /// #951: a sequence, index or composite type at a name the plan creates
     /// refuses it, with the kind and owning table named. One the plan frees

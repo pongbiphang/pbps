@@ -564,6 +564,87 @@ pub async fn matching_table_names(
     Ok(found)
 }
 
+/// An object at a name a plan creates (#1077). SQL Server keeps tables,
+/// views, routines, triggers, sequences, synonyms and constraints in one
+/// `sys.objects` namespace per schema, so `CREATE TABLE` at any of their
+/// names fails with Msg 2714, and `CREATE OR ALTER` at a module's name
+/// fails or replaces it. The inventory reads tables and modules, never
+/// sequences, synonyms or constraints, so the names are asked here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameOccupant {
+    /// The name as the plan spells it.
+    pub wanted: TableName,
+    /// The name as the catalog spells it, which the database's collation may
+    /// match to `wanted` without being equal to it.
+    pub name: TableName,
+    /// Its `type_desc`, lower-cased and spaced: `sequence object`, `synonym`,
+    /// `check constraint`.
+    pub kind: String,
+    /// The table or view a constraint or trigger belongs to.
+    pub parent: Option<TableName>,
+}
+
+/// The [`NameOccupant`]s at `names`, compared under the database's
+/// collation, read in the caller's transaction.
+pub async fn object_name_occupants(
+    conn: &mut Conn,
+    names: &[TableName],
+) -> Result<Vec<NameOccupant>, DbError> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let values = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            format!(
+                "({i}, {}, {})",
+                crate::ident::literal(&n.schema),
+                crate::ident::literal(&n.name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT w.i, s.name AS schema_name, o.name AS object_name,
+                CONVERT(nvarchar(60), o.type_desc) AS type_desc,
+                ps.name AS parent_schema, p.name AS parent_name
+           FROM (VALUES {values}) AS w(i, schema_name, object_name)
+           JOIN sys.schemas s ON s.name = w.schema_name COLLATE DATABASE_DEFAULT
+           JOIN sys.objects o
+             ON o.schema_id = s.schema_id AND o.name = w.object_name COLLATE DATABASE_DEFAULT
+           LEFT JOIN sys.objects p ON p.object_id = o.parent_object_id
+           LEFT JOIN sys.schemas ps ON ps.schema_id = p.schema_id
+          ORDER BY w.i;"
+    );
+    let mut out = Vec::new();
+    for row in conn.query(&sql).await? {
+        let i = get::<i32>(&row, "i")? as usize;
+        let wanted = names.get(i).cloned().ok_or_else(|| {
+            DbError::BadRow(format!("the name-occupant query returned index {i}"))
+        })?;
+        let parent = match (
+            row.try_get::<&str>("parent_schema")?,
+            row.try_get::<&str>("parent_name")?,
+        ) {
+            (Some(schema), Some(name)) => Some(TableName::new(schema, name)),
+            _ => None,
+        };
+        out.push(NameOccupant {
+            wanted,
+            name: TableName::new(
+                get::<&str>(&row, "schema_name")?,
+                get::<&str>(&row, "object_name")?,
+            ),
+            kind: get::<&str>(&row, "type_desc")?
+                .to_lowercase()
+                .replace('_', " "),
+            parent,
+        });
+    }
+    Ok(out)
+}
+
 /// Of the groups in `added`, the ones where an added column's name is a name
 /// the same group's `recorded` columns have, compared under the database's
 /// collation (#676). A group is one table, by the caller's index. Asked of the
