@@ -23463,6 +23463,84 @@ async fn a_generated_fallback_is_the_one_the_engine_uses_and_order_decides_it() 
         .expect("drop");
 }
 
+/// #1111: two groups of unnamed keys with different first choices share a
+/// fallback, and the group that retries second takes the one after it.
+/// Four 60-byte tables agreeing on 57 bytes: the first of each group gets
+/// its own `_pkey`, the second of the first group `_pkey1`, and the second
+/// of the other group `_pkey2`, which neither group's count alone reaches.
+/// A declared index there is refused when created after all four.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn groups_sharing_a_fallback_push_the_later_group_past_it() {
+    use pbps_model::{Column, PrimaryKey, Table};
+    let mut conn = connect().await;
+    let s = probe_schema_9("sharedfb");
+    let name = |group: char, member: char| format!("{}{group}b{member}", "a".repeat(57));
+    let mut keyed = Table::default();
+    keyed.columns.insert(
+        "id".into(),
+        Column::new("integer".parse().unwrap()).not_null(),
+    );
+    keyed.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+    });
+    let pg = Postgres::new();
+    let first = |group| {
+        pg.implicit_relation_names(&TableName::new(&s, name(group, 'p')), &keyed)[0]
+            .name
+            .clone()
+    };
+    let fallback = |group, n| {
+        pg.implicit_relation_fallbacks(&TableName::new(&s, name(group, 'q')), &keyed, n)[0].clone()
+    };
+    assert_eq!(
+        fallback('x', 1),
+        fallback('y', 1),
+        "the groups share `_pkey1`"
+    );
+    let keys = format!(
+        "SELECT string_agg(c.relname, ',' ORDER BY c.oid) FROM pg_class c JOIN pg_namespace n \
+         ON n.oid = c.relnamespace WHERE n.nspname = '{s}' AND c.relkind = 'i'"
+    );
+
+    fresh(&mut conn, &s).await;
+    for (group, member) in [('x', 'p'), ('x', 'q'), ('y', 'p'), ('y', 'q')] {
+        conn.execute(&format!(
+            "CREATE TABLE {s}.\"{}\" (id integer PRIMARY KEY)",
+            name(group, member)
+        ))
+        .await
+        .expect("a table");
+    }
+    assert_eq!(
+        text(&mut conn, &keys).await,
+        format!(
+            "{},{},{},{}",
+            first('x'),
+            fallback('x', 1),
+            first('y'),
+            fallback('y', 2)
+        )
+    );
+    let refused = conn
+        .execute(&format!(
+            "CREATE INDEX \"{}\" ON {s}.\"{}\" (id)",
+            fallback('y', 2),
+            name('x', 'p')
+        ))
+        .await
+        .expect_err("the shared fallback's successor is taken");
+    assert_eq!(
+        refused.server_error_code().as_deref(),
+        Some("42P07"),
+        "{refused:?}"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
 /// #465: what the dialect predicts PostgreSQL generates for an unnamed
 /// primary key and an identity column is what the engine generates, for
 /// short, long and multibyte names alike; a declared index created after the

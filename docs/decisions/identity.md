@@ -598,10 +598,24 @@ a 60-byte table's key falls back to a 57-byte cut plus `_pkey1` (measured on 16
 and 18). A declared name equal to one of those fallbacks lands by creation
 order: created after both tables it fails with `42P07`, and created between
 them it pushes the second key to the next fallback. It is refused like a
-declared name that meets a first choice. Its remedy is the claimant's own only
-at the last fallback in play, `c - 1`: taking one claimant out leaves `c - 1`,
-which retry only up to `c - 2`. At an earlier fallback the rest still reach it,
-so the refusal says to rename the other object alone. SQL Server names these objects per table and reports no
+declared name that meets a first choice. Fallbacks are shared across groups
+(#1111): two groups with different first choices can cut to the same fallback,
+and then the group that retries second takes the one after it. Four 60-byte
+tables agreeing on 57 bytes put the fourth key at `_pkey2` though each group
+has two members (measured on 16 and 18). So the check does not bound each group
+by its own count. It grows each generated name's reach to a fixpoint: a
+claimant can reach its `s`th fallback when its first choice and the fallbacks
+before it can each be taken by a different other claimant that reaches them.
+Each claimant is judged against the others' reach separately, not as one
+creation order, so this may over-approximate. A declared name in any reach is
+refused. Its remedy is a landing claimant's own when taking that claimant out
+puts the name out of every reach. Each landing claimant is asked, since the
+over-approximation can keep a name in reach without one claimant and not
+without another. It is asked once per first choice, because claimants meeting
+at one first choice are alike and each question reruns the fixpoint. With `c` names meeting at one first choice, that
+is the last fallback, `c - 1`, since the `c - 1` left retry only up to
+`c - 2`. Otherwise the refusal says to rename the other object alone. SQL
+Server names these objects per table and reports no
 generated relation names. Measured on PostgreSQL 16 and 18: short, 60-byte and
 multibyte table names generate exactly the predicted names, the declared index
 created afterwards fails with `42P07`, and a name taken first yields

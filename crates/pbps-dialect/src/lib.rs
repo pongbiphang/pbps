@@ -2465,8 +2465,7 @@ pub fn check_index_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> 
     // itself (#465, DEC-465.1). It resolves it by suffixing the later one,
     // so the names it may fall back to are in play as well (#987).
     let declared_names: BTreeSet<ObjectName> = claimed.keys().cloned().collect();
-    let mut generated: BTreeMap<ObjectName, Vec<(&TableName, usize, ImplicitRelation)>> =
-        BTreeMap::new();
+    let mut claimants = Vec::new();
     for (table_name, table) in &schema.tables {
         for (i, relation) in dialect
             .implicit_relation_names(table_name, table)
@@ -2486,55 +2485,174 @@ pub fn check_index_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> 
                     relation.remedy
                 ));
             }
-            generated
-                .entry(claim_name)
-                .or_default()
-                .push((table_name, i, relation));
+            claimants.push(Claimant {
+                table_name,
+                table,
+                i,
+                relation,
+                first: claim_name,
+            });
         }
     }
-    // `c` generated names meeting at one name: the engine keeps it for the
-    // first created and gives the others its 1st to `c - 1`th fallback, in an
-    // order the plan decides. Any of them may be where any claimant lands.
-    for claimants in generated.values().filter(|c| c.len() > 1) {
-        let retries = u32::try_from(claimants.len() - 1).unwrap_or(u32::MAX);
-        let mut reported = BTreeSet::new();
-        for (table_name, i, relation) in claimants {
-            let descriptor = &relation.descriptor;
-            let table = &schema.tables[*table_name];
-            for suffix in 1..=retries {
-                let Some(fallback) = dialect
-                    .implicit_relation_fallbacks(table_name, table, suffix)
-                    .into_iter()
-                    .nth(*i)
-                else {
-                    continue;
-                };
-                let claim_name = ObjectName::new(table_name.schema.clone(), fallback);
-                if declared_names.contains(&claim_name) && reported.insert(claim_name.clone()) {
-                    let existing = &claimed[&claim_name];
-                    // A claimant's own remedy takes that one claimant out,
-                    // and `c - 1` claimants retry only up to fallback
-                    // `c - 2`: it frees the last fallback and no other. Any
-                    // earlier one stays in play, so only moving the declared
-                    // object is a remedy there.
-                    let remedy = if suffix < retries {
-                        "Rename the other object."
-                    } else {
-                        relation.remedy
-                    };
-                    problems.push(format!(
-                        "{} and {descriptor} may both be named `{claim_name}`: {descriptor} \
-                         meets another generated name, and {} gives one of them this name \
-                         instead, which one depending on the order they are created in. {}",
-                        existing.descriptor,
-                        dialect.name(),
-                        remedy
-                    ));
-                }
+    let reach = fallback_reach(&claimants, None, dialect);
+    let mut reported = BTreeSet::new();
+    for (k, names) in reach.iter().enumerate() {
+        for claim_name in names.iter().skip(1) {
+            if !declared_names.contains(claim_name) || !reported.insert(claim_name.clone()) {
+                continue;
             }
+            // A claimant's own remedy takes that one claimant out. It is
+            // the remedy only if the name is then out of every claimant's
+            // reach; otherwise only moving the declared object is. Reach may
+            // over-approximate, so one claimant's failing to free the name
+            // says nothing of another's: ask each that lands there. Once
+            // per first choice, though: claimants meeting at one first
+            // choice are alike, and each question reruns the fixpoint.
+            let mut asked = BTreeSet::new();
+            let freeing = (k..reach.len())
+                .filter(|j| reach[*j].iter().skip(1).any(|n| n == claim_name))
+                .filter(|j| asked.insert(&claimants[*j].first))
+                .find(|j| {
+                    !fallback_reach(&claimants, Some(*j), dialect)
+                        .iter()
+                        .flatten()
+                        .any(|n| n == claim_name)
+                });
+            let (landing, remedy) = match freeing {
+                Some(j) => (j, claimants[j].relation.remedy),
+                None => (k, "Rename the other object."),
+            };
+            let descriptor = &claimants[landing].relation.descriptor;
+            let existing = &claimed[claim_name];
+            problems.push(format!(
+                "{} and {descriptor} may both be named `{claim_name}`: {descriptor} \
+                 meets another generated name, and {} gives one of them this name \
+                 instead, which one depending on the order they are created in. {}",
+                existing.descriptor,
+                dialect.name(),
+                remedy
+            ));
         }
     }
     problems
+}
+
+/// One name the engine generates for a table, and where it retries from.
+struct Claimant<'a> {
+    table_name: &'a TableName,
+    table: &'a Table,
+    /// Its position in [`Dialect::implicit_relation_names`], which is also
+    /// its position in [`Dialect::implicit_relation_fallbacks`].
+    i: usize,
+    relation: ImplicitRelation,
+    first: ObjectName,
+}
+
+/// Every name each generated claimant can land on, in some creation order,
+/// its first choice first (#1111). A claimant retries its `s`th fallback
+/// only when its first choice and the fallbacks before it are all taken, so
+/// it can reach that fallback when each of those names can be taken by a
+/// *different* other claimant: a matching of names to claimants that reach
+/// them. Grown to a fixpoint, because a fallback one claimant reaches is a
+/// name another claimant's retry can meet — two groups with different first
+/// choices can share a fallback, and a name only a group's own count would
+/// bound is then reached by more claimants than that group has.
+///
+/// Each claimant's reach is judged against the others' separately, not as
+/// one creation order, so it may over-approximate. With `without`, the
+/// fixpoint runs as if that claimant generated nothing.
+///
+/// Reaches only grow, so a claimant's matching stays valid as they do: each
+/// keeps its own and matches only the names added since, which keeps
+/// hundreds of names meeting at one first choice cheap.
+fn fallback_reach(
+    claimants: &[Claimant<'_>],
+    without: Option<usize>,
+    dialect: &dyn Dialect,
+) -> Vec<Vec<ObjectName>> {
+    let live: Vec<usize> = (0..claimants.len())
+        .filter(|k| Some(*k) != without)
+        .collect();
+    let mut reach: Vec<Vec<ObjectName>> = vec![Vec::new(); claimants.len()];
+    let mut holders: BTreeMap<ObjectName, Vec<usize>> = BTreeMap::new();
+    for &k in &live {
+        reach[k].push(claimants[k].first.clone());
+        holders
+            .entry(claimants[k].first.clone())
+            .or_default()
+            .push(k);
+    }
+    // Per claimant: which other claimant takes which of its names.
+    let mut takers: Vec<BTreeMap<usize, usize>> = vec![BTreeMap::new(); claimants.len()];
+    loop {
+        let mut grew = false;
+        for &k in &live {
+            let retry = reach[k].len();
+            // `retry` names to take needs `retry` other claimants.
+            if retry >= live.len() {
+                continue;
+            }
+            let taker = &mut takers[k];
+            while taker.len() < retry {
+                let t = taker.len();
+                if !augment(t, &reach[k], k, &holders, &mut BTreeSet::new(), taker) {
+                    break;
+                }
+            }
+            if taker.len() < retry {
+                continue;
+            }
+            let claimant = &claimants[k];
+            let Some(fallback) = u32::try_from(retry).ok().and_then(|suffix| {
+                dialect
+                    .implicit_relation_fallbacks(claimant.table_name, claimant.table, suffix)
+                    .into_iter()
+                    .nth(claimant.i)
+            }) else {
+                continue;
+            };
+            let fallback = ObjectName::new(claimant.table_name.schema.clone(), fallback);
+            holders.entry(fallback.clone()).or_default().push(k);
+            reach[k].push(fallback);
+            grew = true;
+        }
+        if !grew {
+            return reach;
+        }
+    }
+}
+
+/// Match `names[t]` to a claimant other than `k` that reaches it, moving
+/// earlier matches along an augmenting path if every such claimant is
+/// taken. A free one is tried first, which is nearly always there.
+fn augment(
+    t: usize,
+    names: &[ObjectName],
+    k: usize,
+    holders: &BTreeMap<ObjectName, Vec<usize>>,
+    seen: &mut BTreeSet<usize>,
+    taker: &mut BTreeMap<usize, usize>,
+) -> bool {
+    let Some(reaching) = holders.get(&names[t]) else {
+        return false;
+    };
+    if let Some(&j) = reaching
+        .iter()
+        .find(|&&j| j != k && !taker.contains_key(&j))
+    {
+        taker.insert(j, t);
+        return true;
+    }
+    for &j in reaching {
+        if j == k || !seen.insert(j) {
+            continue;
+        }
+        if augment(taker[&j], names, k, holders, seen, taker) {
+            taker.insert(j, t);
+            return true;
+        }
+    }
+    false
 }
 
 /// The whole-schema question of whether a declared constraint's name is taken
