@@ -188,14 +188,6 @@ fn index_type_name(code: u8) -> String {
     }
 }
 
-/// Whether the assembler leaves this index out of the declarations: a unique
-/// index whose write behaviour the model cannot hold, or any kind but a
-/// nonclustered rowstore one.
-fn index_is_left_out(i: &RawIndexColumn) -> bool {
-    (i.is_unique && (i.is_disabled || i.ignore_dup_key))
-        || matches!(i.kind, IndexKind::Unmodelled(_))
-}
-
 /// One column of an index that is not backing a PK or UNIQUE constraint.
 #[derive(Debug, Clone)]
 pub struct RawIndexColumn {
@@ -984,18 +976,85 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         }
     }
 
+    // Before the foreign keys, which read what this pass left out: a foreign key
+    // may be bound to a standalone unique index as well as to a key
+    // (`key_index_id`), and one bound to an index left out here goes with it
+    // rather than being declared against no candidate key (#1199). The set is
+    // what this pass recorded, not a second copy of its predicate — the rule
+    // DECISIONS 256 set for the PostgreSQL pull.
+    let mut unmodelled_indexes = BTreeSet::new();
+    for i in &raw.index_columns {
+        let Some(table) = tables.get_mut(&i.object_id) else {
+            continue;
+        };
+        // Ordinary disabled indexes affect access paths only. Unique indexes
+        // change which writes survive, so rebuilding them must not silently
+        // enable enforcement or replace IGNORE_DUP_KEY with rejection.
+        if i.is_unique && (i.is_disabled || i.ignore_dup_key) {
+            if unmodelled_indexes.insert((i.object_id, i.index_name.clone())) {
+                push_limitation(
+                    &mut warnings,
+                    &mut limitations,
+                    names.get(&i.object_id),
+                    format!(
+                        "{}: unique index `{}` has unmodelled write behavior (disabled={}, IGNORE_DUP_KEY={}); it was left out of the declarations",
+                        name_of(i.object_id, &names),
+                        i.index_name,
+                        i.is_disabled,
+                        i.ignore_dup_key
+                    ),
+                );
+            }
+            continue;
+        }
+        if let IndexKind::Unmodelled(code) = i.kind {
+            // The model holds a nonclustered rowstore index and nothing else;
+            // recording any other kind without what makes it that kind would
+            // make bootstrap create a different physical object — or, for the
+            // kinds `CREATE INDEX` cannot spell at all, a statement the engine
+            // rejects.
+            let table_name = name_of(i.object_id, &names);
+            // One catalog row is returned per index column. Deduplicate those
+            // rows by the owning object as well as the index name: SQL Server
+            // permits two tables to use the same index name.
+            if unmodelled_indexes.insert((i.object_id, i.index_name.clone())) {
+                push_limitation(
+                    &mut warnings,
+                    &mut limitations,
+                    names.get(&i.object_id),
+                    format!(
+                        "{table_name}: index `{}` is {}, which is not modelled yet; it was left out of the declarations",
+                        i.index_name,
+                        index_type_name(code)
+                    ),
+                );
+            }
+            continue;
+        }
+        let index = table
+            .indexes
+            .entry(i.index_name.clone())
+            .or_insert_with(|| Index {
+                columns: Vec::new(),
+                include: Vec::new(),
+                unique: i.is_unique,
+                filter: i
+                    .filter
+                    .as_deref()
+                    .map(|f| strip_stored_parens(f).to_owned()),
+            });
+        if i.is_included {
+            index.include.push(i.column.clone());
+        } else {
+            index.columns.push(IndexColumn {
+                name: i.column.clone(),
+                descending: i.is_descending,
+            });
+        }
+    }
+
     let mut unsupported_omitted_foreign_keys = BTreeSet::new();
     let mut unsupported_fk_enforcement = BTreeSet::new();
-    // A foreign key may be bound to a standalone unique index as well as to a
-    // key (`key_index_id`), and the index loop below leaves some of those out.
-    // Known before the foreign keys are read, so one bound to such an index
-    // goes with it rather than being declared against no candidate key (#1199).
-    let left_out_indexes: BTreeSet<(i32, String)> = raw
-        .index_columns
-        .iter()
-        .filter(|i| index_is_left_out(i))
-        .map(|i| (i.object_id, i.index_name.clone()))
-        .collect();
     for f in &raw.foreign_key_columns {
         if !tables.contains_key(&f.object_id) {
             continue;
@@ -1033,7 +1092,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             if unsupported_keys.contains(&bound) {
                 Some((key, "key"))
             } else {
-                left_out_indexes
+                unmodelled_indexes
                     .contains(&bound)
                     .then_some((key, "unique index"))
             }
@@ -1124,79 +1183,6 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 expression: strip_stored_parens(&c.definition).to_owned(),
             },
         );
-    }
-
-    let mut unmodelled_indexes = BTreeSet::new();
-    for i in &raw.index_columns {
-        let Some(table) = tables.get_mut(&i.object_id) else {
-            continue;
-        };
-        // Ordinary disabled indexes affect access paths only. Unique indexes
-        // change which writes survive, so rebuilding them must not silently
-        // enable enforcement or replace IGNORE_DUP_KEY with rejection.
-        // The two branches below are exactly `index_is_left_out`, which the
-        // foreign keys read first; keep them in step.
-        if i.is_unique && (i.is_disabled || i.ignore_dup_key) {
-            if unmodelled_indexes.insert((i.object_id, i.index_name.clone())) {
-                push_limitation(
-                    &mut warnings,
-                    &mut limitations,
-                    names.get(&i.object_id),
-                    format!(
-                        "{}: unique index `{}` has unmodelled write behavior (disabled={}, IGNORE_DUP_KEY={}); it was left out of the declarations",
-                        name_of(i.object_id, &names),
-                        i.index_name,
-                        i.is_disabled,
-                        i.ignore_dup_key
-                    ),
-                );
-            }
-            continue;
-        }
-        if let IndexKind::Unmodelled(code) = i.kind {
-            // The model holds a nonclustered rowstore index and nothing else;
-            // recording any other kind without what makes it that kind would
-            // make bootstrap create a different physical object — or, for the
-            // kinds `CREATE INDEX` cannot spell at all, a statement the engine
-            // rejects.
-            let table_name = name_of(i.object_id, &names);
-            // One catalog row is returned per index column. Deduplicate those
-            // rows by the owning object as well as the index name: SQL Server
-            // permits two tables to use the same index name.
-            if unmodelled_indexes.insert((i.object_id, i.index_name.clone())) {
-                push_limitation(
-                    &mut warnings,
-                    &mut limitations,
-                    names.get(&i.object_id),
-                    format!(
-                        "{table_name}: index `{}` is {}, which is not modelled yet; it was left out of the declarations",
-                        i.index_name,
-                        index_type_name(code)
-                    ),
-                );
-            }
-            continue;
-        }
-        let index = table
-            .indexes
-            .entry(i.index_name.clone())
-            .or_insert_with(|| Index {
-                columns: Vec::new(),
-                include: Vec::new(),
-                unique: i.is_unique,
-                filter: i
-                    .filter
-                    .as_deref()
-                    .map(|f| strip_stored_parens(f).to_owned()),
-            });
-        if i.is_included {
-            index.include.push(i.column.clone());
-        } else {
-            index.columns.push(IndexColumn {
-                name: i.column.clone(),
-                descending: i.is_descending,
-            });
-        }
     }
 
     // This is source context for bootstrapping the emitted declarations, not
