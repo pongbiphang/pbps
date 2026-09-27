@@ -28770,6 +28770,89 @@ async fn doctor_reports_an_absent_recorded_managed_table() {
     );
 }
 
+/// #1195: a recorded table the declarations dropped is the next plan's
+/// `DROP TABLE`, which names it through its schema and needs `USAGE` there.
+/// When no declared table is left in that schema, the schema is out of the
+/// managed set and nothing else asks it. Doctor reports the missing `USAGE`
+/// on such a schema, and reports nothing for one where the deployer holds it.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn doctor_asks_a_pending_drops_schema_for_usage() {
+    let mut db = TestDb::create("doctor_usage1195").await;
+    let (role, mut theirs) = grant_deployer(&mut db, "usage1195").await;
+    db.conn
+        .execute(&format!(
+            "CREATE SCHEMA closed; CREATE TABLE closed.t(id integer); \
+             ALTER TABLE closed.t OWNER TO {role}; \
+             CREATE SCHEMA open; CREATE TABLE open.t(id integer); \
+             ALTER TABLE open.t OWNER TO {role}; GRANT USAGE ON SCHEMA open TO {role}"
+        ))
+        .await
+        .unwrap();
+    // The premise, measured: the owner cannot drop it without `USAGE`.
+    let denied = theirs
+        .execute("DROP TABLE closed.t")
+        .await
+        .expect_err("a drop through a schema without USAGE");
+    assert!(
+        denied.to_string().contains("permission denied for schema"),
+        "{denied}"
+    );
+    let (closed, open) = (
+        pbps_model::Uid::generate(pbps_model::UidKind::Table),
+        pbps_model::Uid::generate(pbps_model::UidKind::Table),
+    );
+    let mut recorded = IdsFile::default();
+    recorded
+        .tables
+        .insert(closed.clone(), "closed.t".parse().unwrap());
+    recorded
+        .tables
+        .insert(open.clone(), "open.t".parse().unwrap());
+    doctor_record_state(&mut theirs, &recorded, &["closed.t", "open.t"]).await;
+    // Both dropped from the declarations: only their tombstones remain.
+    let mut project = IdsFile::default();
+    for (uid, was) in [(closed, "closed.t"), (open, "open.t")] {
+        project.tombstones.insert(
+            uid,
+            pbps_model::ids::Tombstone {
+                was: was.to_owned(),
+                dropped_at: "2026-09-28".to_owned(),
+                reason: "the schema's last table goes".to_owned(),
+                operator: "doctor-live".to_owned(),
+            },
+        );
+    }
+    let empty = pbps_db::doctor::GrantTargets::default();
+    let ask = doctor::Ask {
+        managed_schemas: &[],
+        managed_tables: &[],
+        referenced: &[],
+        referenced_columns: &Default::default(),
+        declared_keys: &Default::default(),
+        granted: &empty,
+        data: &Default::default(),
+    };
+    let held = doctor::permissions(&mut theirs, &ask, &project)
+        .await
+        .unwrap();
+    drop(theirs);
+    cleanup_role(&mut db, &role).await;
+    db.drop().await;
+    let usage: Vec<String> = held
+        .declaration_gaps
+        .iter()
+        .filter(|g| g.permission == "USAGE")
+        .map(|g| g.securable())
+        .collect();
+    assert_eq!(
+        usage,
+        ["SCHEMA \"closed\"".to_owned()],
+        "{:?}",
+        held.declaration_gaps
+    );
+}
+
 /// Review of #1104: when the project's last table is dropped, its ids file
 /// holds only that table's tombstone. The environment still records the table,
 /// and when it is already gone the next plan's `DROP TABLE` fails, so doctor
