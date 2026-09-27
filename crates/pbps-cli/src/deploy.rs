@@ -466,7 +466,11 @@ async fn baseline_state(
     scopes: &DataScopes,
     recorded: &Schema,
     as_the_apply_reads_it: &DataScopes,
-) -> anyhow::Result<(pbps_diff::Scoped, Schema)> {
+) -> anyhow::Result<(
+    pbps_diff::Scoped,
+    Schema,
+    Vec<pbps_db::catalog::Unrevocable>,
+)> {
     // Before the plan's transaction opens: the baseline is the database as
     // it stands, not as this apply is about to leave it.
     let managed = managed_state_full(
@@ -488,7 +492,10 @@ async fn baseline_state(
     scoped.schema = scoped
         .schema
         .with_observed_rows(&managed.rows, scopes, recorded)?;
-    Ok((scoped, comparable))
+    // The grants this connection could not revoke come from the same read:
+    // like ownership, they are beside the checksum, and the apply rechecks
+    // them against the connection that runs the statements (#1057).
+    Ok((scoped, comparable, managed.unrevocable))
 }
 
 /// The same two projections for a staged apply, which needs a third
@@ -515,7 +522,11 @@ async fn staged_baseline(
     checked_scopes: &DataScopes,
     recorded: &Schema,
     watched_scopes: &DataScopes,
-) -> anyhow::Result<(pbps_diff::Scoped, Schema)> {
+) -> anyhow::Result<(
+    pbps_diff::Scoped,
+    Schema,
+    Vec<pbps_db::catalog::Unrevocable>,
+)> {
     let pulled = pull(conn, crate::engine::Read::Snapshot).await?;
     let unreadable = unreadable_modules(&pulled.unmanaged_modules);
     // Over the *watched* set, which contains the checked one: a module this
@@ -557,7 +568,7 @@ async fn staged_baseline(
     scoped.schema = scoped
         .schema
         .with_observed_rows(&rows, checked_scopes, recorded)?;
-    Ok((scoped, previous))
+    Ok((scoped, previous, pulled.unrevocable.clone()))
 }
 
 /// Introspects, cuts the result down to the managed set, reads the rows of
@@ -5030,7 +5041,7 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
     // database has *now* — the second projection is compared against that
     // read, so it has to ask it the same question.
     let planned_scopes = scopes_under(&plan.data, &plan.ids, &entry.snapshot.ids);
-    let (scoped, mut before) = baseline_state(
+    let (scoped, mut before, unrevocable) = baseline_state(
         conn,
         &recorded_ids,
         &recorded_modules,
@@ -5074,6 +5085,12 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         &scoped.owners,
         &scoped.session_role,
     )?;
+    // And whether *this* connection can take back what the plan revokes,
+    // which `plan` asked of the connection it planned over (#1057). A plan
+    // made as the owner and applied as a least-privilege deployer otherwise
+    // passes the baseline and fails at its `REVOKE`, after earlier statements
+    // of a staged run are already committed.
+    crate::engine::unrevocable_grants(conn.driver(), &plan.changes, &unrevocable)?;
 
     // Before the probes, which run declared expressions and so the routines
     // they call (DEC-319.1). Every module the plan holds at any point of its
@@ -5366,7 +5383,7 @@ async fn apply_staged_under_lock(
         // The state the checkpoints to come are measured against comes out of
         // *this* read — the one the comparison below validates — and not out
         // of a second one taken after these checks (DECISIONS 174).
-        let (scoped, watching) = staged_baseline(
+        let (scoped, watching, unrevocable) = staged_baseline(
             conn,
             at_checkpoint,
             &after_modules,
@@ -5402,13 +5419,15 @@ async fn apply_staged_under_lock(
         // written without it.
         refuse_unexpressible(&scoped, &target.label, "resume again")?;
         // And ownership, which is beside the checksum for the same reason
-        // (#692).
+        // (#692), and whether this connection can revoke what is left to
+        // revoke (#1057).
         crate::engine::owned_targets(
             conn.driver(),
             &plan.changes,
             &scoped.owners,
             &scoped.session_role,
         )?;
+        crate::engine::unrevocable_grants(conn.driver(), &plan.changes, &unrevocable)?;
         // The role a `DROP ROLE` will meet is the role as the plan left it:
         // the members whose `DROP MEMBER` has not run yet, and nothing
         // owned. Membership and ownership are outside the checksum on
@@ -5456,7 +5475,7 @@ async fn apply_staged_under_lock(
         // pinned to, and beside it the state the checkpoints are measured
         // against, which watches every module the plan names as well
         // (DECISIONS 174).
-        let (scoped, mut watching) = staged_baseline(
+        let (scoped, mut watching, unrevocable) = staged_baseline(
             conn,
             &recorded_ids,
             &recorded_modules,
@@ -5485,13 +5504,15 @@ async fn apply_staged_under_lock(
             );
         }
         refuse_unexpressible(&scoped, &target.label, "apply again")?;
-        // Ownership, as in the transactional apply (#692).
+        // Ownership and revocability, as in the transactional apply (#692,
+        // #1057).
         crate::engine::owned_targets(
             conn.driver(),
             &plan.changes,
             &scoped.owners,
             &scoped.session_role,
         )?;
+        crate::engine::unrevocable_grants(conn.driver(), &plan.changes, &unrevocable)?;
         // Before the probes, as in the transactional apply (DEC-319.1).
         crate::pins::check(
             conn,
