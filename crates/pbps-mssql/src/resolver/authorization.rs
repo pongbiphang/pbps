@@ -143,27 +143,57 @@ impl AuthorizationContext {
 /// as a user holding no permission). They are also what spells every grantee
 /// in the context, so the two agree. A name with no principal behind it stays
 /// as planned: the plan may be the one that creates it (DEC-726.1).
+///
+/// One statement for every distinct name, however many grants name each one
+/// (#1016). This runs inside [`super::scope_facts`]'s bracket, so each round
+/// trip saved also shortens the window in which a concurrent change refuses
+/// the scope.
 pub async fn resolve_spellings(
     conn: &mut impl QueryConnection,
     context: &mut AuthorizationContext,
     planned: &[String],
 ) -> Result<(), DbError> {
-    for name in planned {
-        let rows = conn
-            .query(&format!(
-                "SELECT USER_NAME(USER_ID({})) AS name;",
-                literal(name)
-            ))
-            .await?;
-        let [row] = rows.as_slice() else {
-            return Err(DbError::BadRow(format!(
-                "the catalog's spelling of the principal {name} expected one row"
-            )));
-        };
+    let names: BTreeSet<&str> = planned.iter().map(String::as_str).collect();
+    let Some(sql) = spellings_query(&names) else {
+        return Ok(());
+    };
+    for row in conn.query(&sql).await? {
+        let planned = required(&row, "planned", "a planned principal's name")?;
         let catalog = row.try_get::<&str>("name")?.map(str::to_owned);
-        context.spellings.insert(name.clone(), catalog);
+        context.spellings.insert(planned, catalog);
+    }
+    // Each name comes back exactly once; one that did not is unread, and an
+    // unread spelling is not a principal the catalog lacks.
+    if let Some(missing) = names
+        .iter()
+        .find(|name| !context.spellings.contains_key(**name))
+    {
+        return Err(DbError::BadRow(format!(
+            "the catalog's spelling of the principal {missing} did not come back"
+        )));
     }
     Ok(())
+}
+
+/// The statement [`resolve_spellings`] runs: one row per distinct name, or
+/// nothing to run when the plan names no principal. The planned spelling
+/// travels in the result under a binary collation, so each row is matched to
+/// the name it answers, and not to another spelling the database's collation
+/// holds equal.
+fn spellings_query(names: &BTreeSet<&str>) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
+    let values = names
+        .iter()
+        .map(|name| format!("({})", literal(name)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "SELECT n.planned COLLATE Latin1_General_BIN2 AS planned, \
+                USER_NAME(USER_ID(n.planned)) AS name \
+         FROM (VALUES {values}) AS n(planned);"
+    ))
 }
 
 /// The catalog's name for `planned`, or `planned` itself when the catalog
@@ -1015,6 +1045,24 @@ mod tests {
                 "GRANT EXECUTE to dep by wgo",
             ]
         );
+    }
+
+    /// #1016: a plan with many grants to one principal asks for its spelling
+    /// once. Names the database's collation may hold equal but that differ
+    /// in bytes are still each asked for, since each is a spelling the plan
+    /// used, and a name with an apostrophe stays one literal.
+    #[test]
+    fn each_distinct_planned_principal_is_resolved_once_in_one_statement() {
+        let planned = ["readers", "Readers", "readers", "o'brien", "readers"];
+        let names: BTreeSet<&str> = planned.into_iter().collect();
+        let sql = spellings_query(&names).unwrap();
+        assert_eq!(sql.matches("SELECT").count(), 1, "{sql}");
+        assert_eq!(sql.matches("(N'readers')").count(), 1, "{sql}");
+        assert_eq!(sql.matches("(N'Readers')").count(), 1, "{sql}");
+        assert_eq!(sql.matches("(N'o''brien')").count(), 1, "{sql}");
+        // Nothing planned is nothing to ask, not an empty VALUES list the
+        // engine would refuse.
+        assert_eq!(spellings_query(&BTreeSet::new()), None);
     }
 
     #[test]

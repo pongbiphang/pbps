@@ -624,11 +624,16 @@ mod recon611 {
         resolve_spellings(
             &mut planning,
             &mut context,
+            // A name planned by several grants, and one in two casings, are
+            // answered by one statement (#1016) and each keyed as planned.
             &[
                 "readers".to_owned(),
                 "PUBLIC".to_owned(),
                 "hidden".to_owned(),
+                "readers".to_owned(),
                 "auditors".to_owned(),
+                "READERS".to_owned(),
+                "readers".to_owned(),
             ],
         )
         .await
@@ -641,6 +646,7 @@ mod recon611 {
                 .collect::<Vec<_>>(),
             [
                 ("PUBLIC", Some("public")),
+                ("READERS", Some("Readers")),
                 ("auditors", None),
                 ("hidden", Some("Hidden")),
                 ("readers", Some("Readers"))
