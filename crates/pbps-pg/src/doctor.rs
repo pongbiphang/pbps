@@ -610,24 +610,46 @@ pub async fn permissions(
     // The recorded tables are kept beside the ids: a staged checkpoint keeps
     // the ids of a table its committed `DROP TABLE` already removed, and only
     // its schema says the table is gone on purpose.
-    let (recorded_ids, recorded_tables) = if project_ids.tables.is_empty()
+    // The recorded tables with foreign keys are kept too: a dropped table's
+    // keys are dropped first, by an `ALTER TABLE` only its owner may run.
+    let (recorded_ids, recorded_tables, recorded_with_keys) = if project_ids.tables.is_empty()
         && project_ids.columns.is_empty()
         && project_ids.tombstones.is_empty()
     {
-        (pbps_model::IdsFile::default(), BTreeSet::new())
+        (
+            pbps_model::IdsFile::default(),
+            BTreeSet::new(),
+            BTreeSet::new(),
+        )
     } else {
         match crate::state::latest(conn).await {
             Ok(recorded) => recorded.map_or_else(
-                || (pbps_model::IdsFile::default(), BTreeSet::new()),
+                || {
+                    (
+                        pbps_model::IdsFile::default(),
+                        BTreeSet::new(),
+                        BTreeSet::new(),
+                    )
+                },
                 |state| {
                     let tables: BTreeSet<ObjectName> =
                         state.snapshot.schema.tables.keys().cloned().collect();
-                    (state.snapshot.ids, tables)
+                    let with_keys: BTreeSet<ObjectName> = state
+                        .snapshot
+                        .schema
+                        .tables
+                        .iter()
+                        .filter(|(_, table)| !table.foreign_keys.is_empty())
+                        .map(|(name, _)| name.clone())
+                        .collect();
+                    (state.snapshot.ids, tables, with_keys)
                 },
             ),
-            Err(pbps_db::ledger::LedgerError::NotInitialized) => {
-                (pbps_model::IdsFile::default(), BTreeSet::new())
-            }
+            Err(pbps_db::ledger::LedgerError::NotInitialized) => (
+                pbps_model::IdsFile::default(),
+                BTreeSet::new(),
+                BTreeSet::new(),
+            ),
             Err(pbps_db::ledger::LedgerError::Db(error)) => {
                 return Err(error.context("cannot read recorded identities for doctor"));
             }
@@ -760,14 +782,18 @@ pub async fn permissions(
                 why: "the recorded table is absent; its ownership cannot be established".to_owned(),
                 securable: Securable::Object(object),
             });
-        } else if !rights.owned && !owns_schema(conn, &object.schema).await? {
+        } else if !rights.owned
+            && (recorded_with_keys.contains(&object) || !owns_schema(conn, &object.schema).await?)
+        {
             // A `DROP TABLE` needs ownership (DECISIONS 289), and nothing
             // else asks this table for it: it is out of the managed rights
             // above, so a table another role owns read as ready here and
             // failed at the drop (#1109). The schema's owner may drop it too
             // (measured on 18: `DROP TABLE` succeeds for the owner of the
-            // schema of a table another role owns), and a drop is all the
-            // plan does to it, so that ownership is enough here.
+            // schema of a table another role owns), so that ownership is
+            // enough when the drop is all the plan does to it. A table with
+            // foreign keys has them dropped first, by `ALTER TABLE ... DROP
+            // CONSTRAINT`, which only the table's owner may run.
             held.declaration_gaps.push(Gap {
                 permission: OWNERSHIP,
                 why: "the declarations no longer name this recorded table, so the next plan \

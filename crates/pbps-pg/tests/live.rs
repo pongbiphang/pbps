@@ -28521,7 +28521,8 @@ async fn doctor_reports_an_absent_recorded_managed_table() {
         .execute(&format!(
             "CREATE TABLE public.foreign_owned(id integer); \
              CREATE SCHEMA mine AUTHORIZATION {role}; \
-             CREATE TABLE mine.foreign_in_mine(id integer)"
+             CREATE TABLE mine.foreign_in_mine(id integer); \
+             CREATE TABLE mine.keyed_in_mine(id integer)"
         ))
         .await
         .unwrap();
@@ -28556,25 +28557,53 @@ async fn doctor_reports_an_absent_recorded_managed_table() {
         pbps_model::Uid::generate(pbps_model::UidKind::Table),
         "mine.foreign_in_mine".parse().unwrap(),
     );
+    recorded.tables.insert(
+        pbps_model::Uid::generate(pbps_model::UidKind::Table),
+        "mine.keyed_in_mine".parse().unwrap(),
+    );
     // `staged` is recorded in the ids only: a staged checkpoint after its
     // committed `DROP TABLE`, whose absence is the plan's own doing.
     recorded.tables.insert(
         pbps_model::Uid::generate(pbps_model::UidKind::Table),
         "public.staged".parse().unwrap(),
     );
-    doctor_record_state(
+    // Recorded with a foreign key on `keyed_in_mine`, which the plan drops
+    // before the table, by an `ALTER TABLE` only the table's owner may run.
+    let mut schema = Schema::default();
+    for table in [
+        "public.t",
+        "public.kept",
+        "public.dropped",
+        "public.lingering",
+        "public.foreign_owned",
+        "mine.foreign_in_mine",
+        "mine.keyed_in_mine",
+    ] {
+        schema
+            .tables
+            .insert(table.parse().unwrap(), pbps_model::Table::default());
+    }
+    schema
+        .tables
+        .get_mut(&"mine.keyed_in_mine".parse().unwrap())
+        .unwrap()
+        .foreign_keys
+        .insert(
+            "fk_keyed".to_owned(),
+            pbps_model::ForeignKey {
+                columns: vec!["id".to_owned()],
+                references_table: "public.kept".parse().unwrap(),
+                references_columns: vec!["id".to_owned()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+    state::record(
         &mut theirs,
-        &recorded,
-        &[
-            "public.t",
-            "public.kept",
-            "public.dropped",
-            "public.lingering",
-            "public.foreign_owned",
-            "mine.foreign_in_mine",
-        ],
+        &StateSnapshot::new(StateKind::Baseline, schema, recorded.clone(), "doctor-live"),
     )
-    .await;
+    .await
+    .unwrap();
     let mut project = IdsFile::default();
     project
         .tables
@@ -28623,8 +28652,10 @@ async fn doctor_reports_an_absent_recorded_managed_table() {
     // #1109: a pending drop that is there needs ownership for its
     // `DROP TABLE`. The one another role owns is a gap; `lingering`, which
     // the deployer owns, is not, and neither is `mine.foreign_in_mine`, whose
-    // schema the deployer owns.
-    let dropping: Vec<String> = held
+    // schema the deployer owns. `mine.keyed_in_mine` is in that schema too,
+    // but its foreign key is dropped first, which needs the table's owner.
+    // Sorted: the scan follows the recorded ids, whose uids are random.
+    let dropping: std::collections::BTreeSet<String> = held
         .declaration_gaps
         .iter()
         .filter(|g| g.why.contains("the next plan drops it"))
@@ -28632,7 +28663,10 @@ async fn doctor_reports_an_absent_recorded_managed_table() {
         .collect();
     assert_eq!(
         dropping,
-        ["TABLE \"public\".\"foreign_owned\"".to_owned()],
+        std::collections::BTreeSet::from([
+            "TABLE \"mine\".\"keyed_in_mine\"".to_owned(),
+            "TABLE \"public\".\"foreign_owned\"".to_owned(),
+        ]),
         "{:?}",
         held.declaration_gaps
     );
