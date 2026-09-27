@@ -20,6 +20,10 @@ async fn connect_live(connection: &str) -> Result<pbps_db::Conn, pbps_db::DbErro
 
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
+#[cfg(target_os = "linux")]
+#[path = "support/pty.rs"]
+mod pty;
+
 #[path = "support/envelope_archives.rs"]
 mod envelope_archives;
 
@@ -5080,30 +5084,7 @@ fn a_terminal_turns_the_prompt_on_and_the_answer_is_recorded() {
     d.commit();
     d.table("table: dbo.t\ncolumns:\n  full_name: {type: nvarchar(50)}\n");
 
-    let out = Command::new("script")
-        .args([
-            "-qec",
-            &format!("{BIN} --project {} plan", d.dir.display()),
-            "/dev/null",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write as _;
-            child
-                .stdin
-                .as_mut()
-                .expect("stdin was piped")
-                .write_all(b"1\n")?;
-            child.wait_with_output()
-        });
-    let Ok(out) = out else {
-        // `script` is not installed. Skipping beats failing a suite over a
-        // missing test fixture, and the conversation is covered by unit tests.
-        return;
-    };
+    let out = pty::run(&format!("{BIN} --project {} plan", d.dir.display()), b"1\n");
     let text = stdout(&out);
     assert!(
         text.contains("customer_name was renamed to full_name"),
@@ -5430,30 +5411,11 @@ fn the_prompt_keeps_asking_until_every_ambiguity_is_answered() {
         "  postcode: {type: nvarchar(10)}\n"
     ));
 
-    let out = Command::new("script")
-        .args([
-            "-qec",
-            &format!("{BIN} --project {} plan", d.dir.display()),
-            "/dev/null",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write as _;
-            // The likeliest pairing is offered first each round, so "1" twice
-            // is the ordinary answer to "yes, both of these".
-            child
-                .stdin
-                .as_mut()
-                .expect("stdin was piped")
-                .write_all(b"1\n1\n")?;
-            child.wait_with_output()
-        });
-    let Ok(out) = out else {
-        return; // `script` is not installed; the conversation is unit-tested.
-    };
+    // The likeliest pairing is first each round: accept both renames.
+    let out = pty::run(
+        &format!("{BIN} --project {} plan", d.dir.display()),
+        b"1\n1\n",
+    );
     let text = stdout(&out);
     assert_eq!(code(&out), 0, "{text}");
     assert!(
@@ -5496,29 +5458,11 @@ fn stopping_part_way_through_the_loop_still_records_nothing() {
         "  postcode: {type: nvarchar(10)}\n"
     ));
 
-    let out = Command::new("script")
-        .args([
-            "-qec",
-            &format!("{BIN} --project {} plan", d.dir.display()),
-            "/dev/null",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write as _;
-            // Answer the first, then decline the second.
-            child
-                .stdin
-                .as_mut()
-                .expect("stdin was piped")
-                .write_all(b"1\n\n")?;
-            child.wait_with_output()
-        });
-    let Ok(out) = out else {
-        return;
-    };
+    // Answer the first, then decline the second.
+    let out = pty::run(
+        &format!("{BIN} --project {} plan", d.dir.display()),
+        b"1\n\n",
+    );
     assert_eq!(code(&out), FINDING, "{}", stdout(&out));
     assert_eq!(
         std::fs::read_to_string(d.ids_path()).unwrap(),
