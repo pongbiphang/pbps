@@ -32,6 +32,14 @@ impl InputManifest {
         {
             return Err(ManifestError::Invalid);
         }
+        // Checking supplied entries alone accepts an empty inventory for a
+        // DROP, leaving the closing manifest at the pre-DDL state (SPEC 9.3.2).
+        if changes.changes.iter().any(|p| {
+            changes_catalog(&p.change)
+                && !transitions.iter().any(|t| touches(&p.change, &t.surface))
+        }) {
+            return Err(ManifestError::Incomplete);
+        }
         let mut removed = BTreeSet::new();
         let mut installed = BTreeSet::new();
         let mut owners = BTreeSet::new();
@@ -135,21 +143,16 @@ impl InputManifest {
 // Only typed changes authorize transitions. The adapter identifies catalog
 // records; it cannot use an unrelated plan as permission to change an input.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn touches(c: &Change, surface: &Surface) -> bool {
+pub(super) fn touches(c: &Change, surface: &Surface) -> bool {
+    if !changes_catalog(c) {
+        return false;
+    }
     match surface {
         Surface::Namespace(name) => {
             grant_target(c).is_some_and(|g| matches!(g, GrantTarget::Schema(s) if s == name))
         }
         Surface::Table(t) => {
-            (c.objects().any(|o| o == t)
-                && !matches!(
-                    c,
-                    Change::InsertRow { .. }
-                        | Change::UpdateRow { .. }
-                        | Change::DeleteRow { .. }
-                        | Change::SetDataMode { .. }
-                        | Change::SetColumnDeprecated { .. }
-                ))
+            c.objects().any(|o| o == t)
                 || grant_target(c).is_some_and(|g| matches!(g, GrantTarget::Object(o) if o == t))
         }
         Surface::Column(column) => {
@@ -185,4 +188,20 @@ fn grant_target(c: &Change) -> Option<&GrantTarget> {
     } else {
         None
     }
+}
+
+// Role identity is sealed separately by AuthorizationCondition. Reference
+// rows and pbps-only metadata cannot change catalog prerequisites.
+fn changes_catalog(c: &Change) -> bool {
+    !matches!(
+        c,
+        Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::CreateRole { .. }
+            | Change::RenameRole { .. }
+            | Change::DropRole { .. }
+    )
 }

@@ -280,7 +280,31 @@ impl ResolverEvidence {
         {
             return Err(EvidenceError::Incomplete);
         }
+        let removed: BTreeSet<_> = self.transitions.iter().flat_map(|t| &t.before).collect();
+        let installed: BTreeSet<_> = self.transitions.iter().flat_map(|t| &t.after).collect();
         for surface in &self.surfaces {
+            // Ownership may aggregate internal expression records under a
+            // table transition. Require the actual observed records, not just
+            // a transition carrying the right surface name.
+            let changed = surface.current != surface.desired
+                || changes
+                    .changes
+                    .iter()
+                    .any(|p| super::projection::touches(&p.change, &surface.surface));
+            let covered = surface
+                .current
+                .as_ref()
+                .is_none_or(|o| removed.contains(&o.object))
+                && surface
+                    .desired
+                    .as_ref()
+                    .is_none_or(|o| installed.contains(&o.object));
+            if changed && !covered {
+                return Err(EvidenceError::Incomplete);
+            }
+            // Absence of a binding surface does not imply absence of its
+            // catalog record: removing an index predicate leaves a plain
+            // index. The qualified adapter supplies that inventory.
             if surface.current.is_none() && surface.desired.is_none() {
                 return Err(EvidenceError::Incomplete);
             }
@@ -371,7 +395,7 @@ mod tests {
         .unwrap()
     }
 
-    fn plan() -> SavedPlan {
+    pub(super) fn plan() -> SavedPlan {
         let changes = ChangeSet {
             changes: vec![PlannedChange::new(Change::CreateModule {
                 id: "app.v".parse().unwrap(),
@@ -620,3 +644,6 @@ mod tests {
         assert_eq!(plan.validate_analysis(), Err(EvidenceError::Incomplete));
     }
 }
+
+#[cfg(test)]
+mod transition_tests;
