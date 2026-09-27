@@ -2577,6 +2577,38 @@ async fn an_absent_ledger_is_not_misspelt_when_null_concatenation_is_off() {
     db.drop().await;
 }
 
+/// #1188: `locked_by` is `NVARCHAR(256)`, measured in UTF-16 code units, so a
+/// holder budgeted in characters overflowed it for a name outside the Basic
+/// Multilingual Plane, and the lock — and with it a valid apply — failed. The
+/// widest holder pbps renders is taken, and read back whole.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn the_widest_rendered_holder_fits_the_lock_column() {
+    let mut db = TestDb::create("lock_width1188").await;
+    let operator = "\u{1F600}".repeat(300);
+    let name = "\u{1F600}".repeat(64);
+    let holder = pbps_db::LockHolder {
+        operator: &operator,
+        host: Some(&"\u{1F600}".repeat(64)),
+        pid: u32::MAX,
+        ci_job: Some(&"\u{1F600}".repeat(64)),
+        application_name: &name,
+    }
+    .render();
+    let taken = pbps_mssql::state::lock(&mut db.conn, &holder).await;
+    let read = pbps_mssql::state::lock_holder(&mut db.conn).await;
+    db.drop().await;
+    taken.expect("the widest rendered holder is taken");
+    let read = read.unwrap().expect("the lock is held");
+    assert_eq!(read.locked_by, holder);
+    assert!(
+        read.session_lookup
+            .as_deref()
+            .is_some_and(|lookup| lookup.contains(&format!("program_name = N'{name}'"))),
+        "{read:?}"
+    );
+}
+
 /// #894: the same fold for the ordinary ledger. On a case-insensitive database
 /// `OBJECT_ID(N'dbo.__pbps_state')` resolves to a project's own
 /// `dbo.__PBPS_STATE`, so `ensure_tables` skipped creating the ledger and every

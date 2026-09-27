@@ -234,18 +234,21 @@ const CONTEXT_CHARS: usize = 64;
 
 impl LockHolder<'_> {
     /// `operator [host h, pid p, CI job j, application_name "a"]`, within
-    /// [`LOCKED_BY_CHARS`]. The application name is kept whole and JSON-quoted
-    /// so it can be read back exactly ([`holder_application_name`]); what
-    /// gives way to the width is the job, then the host, then the operator's
-    /// name.
+    /// [`LOCKED_BY_CHARS`]. The application name is JSON-quoted so it can be
+    /// read back exactly ([`holder_application_name`]); what gives way to the
+    /// width is the operator's name, then the job, then the host, and only
+    /// last the application name — dropped whole rather than cut, since a cut
+    /// name would find nothing, and the lock must still be taken.
+    ///
+    /// Width is counted in UTF-16 code units, which is how SQL Server's
+    /// `NVARCHAR(256)` measures it: a character outside the Basic
+    /// Multilingual Plane takes two. PostgreSQL's `varchar(256)` counts
+    /// characters, never more than code units, so the same budget fits both.
     #[must_use]
     pub fn render(&self) -> String {
+        let width = |text: &str| text.encode_utf16().count();
         let clip = |text: &str| text.chars().take(CONTEXT_CHARS).collect::<String>();
-        let application_name = format!(
-            "{APPLICATION_NAME_MARKER}{}",
-            serde_json::Value::from(self.application_name)
-        );
-        let suffix = |host: bool, job: bool| {
+        let suffix = |host: bool, job: bool, name: bool| {
             let mut parts = Vec::new();
             if let Some(h) = self.host.filter(|_| host) {
                 parts.push(format!("host {}", clip(h)));
@@ -254,16 +257,36 @@ impl LockHolder<'_> {
             if let Some(j) = self.ci_job.filter(|_| job) {
                 parts.push(format!("CI job {}", clip(j)));
             }
-            parts.push(application_name.clone());
+            if name {
+                parts.push(format!(
+                    "{APPLICATION_NAME_MARKER}{}",
+                    serde_json::Value::from(self.application_name)
+                ));
+            }
             format!(" [{}]", parts.join(", "))
         };
-        let suffix = [(true, true), (true, false), (false, false)]
-            .into_iter()
-            .map(|(host, job)| suffix(host, job))
-            .find(|s| s.chars().count() < LOCKED_BY_CHARS)
-            .unwrap_or_else(|| suffix(false, false));
-        let room = LOCKED_BY_CHARS.saturating_sub(suffix.chars().count());
-        let operator: String = self.operator.chars().take(room).collect();
+        let suffix = [
+            (true, true, true),
+            (true, false, true),
+            (false, false, true),
+            (false, false, false),
+        ]
+        .into_iter()
+        .map(|(host, job, name)| suffix(host, job, name))
+        .find(|s| width(s) <= LOCKED_BY_CHARS)
+        .unwrap_or_else(|| suffix(false, false, false));
+        let mut room = LOCKED_BY_CHARS.saturating_sub(width(&suffix));
+        let operator: String = self
+            .operator
+            .chars()
+            .take_while(|c| {
+                let fits = c.len_utf16() <= room;
+                if fits {
+                    room -= c.len_utf16();
+                }
+                fits
+            })
+            .collect();
         format!("{operator}{suffix}")
     }
 }
@@ -397,17 +420,51 @@ mod tests {
             application_name: &name,
         }
         .render();
-        assert!(long.chars().count() <= LOCKED_BY_CHARS, "{}", long.len());
+        assert!(
+            long.encode_utf16().count() <= LOCKED_BY_CHARS,
+            "{}",
+            long.len()
+        );
         assert_eq!(
             holder_application_name(&long).as_deref(),
             Some(name.as_str())
         );
         let short = holder(&"o".repeat(300), "pbps/1/2").render();
-        assert!(short.chars().count() <= LOCKED_BY_CHARS);
+        assert!(short.encode_utf16().count() <= LOCKED_BY_CHARS);
         assert!(
             short.contains("host build-7") && short.contains("CI job"),
             "{short}"
         );
+    }
+
+    /// SQL Server's `NVARCHAR(256)` counts UTF-16 code units, so a name
+    /// outside the Basic Multilingual Plane takes twice the room it seems to;
+    /// and a name that JSON-escapes to more than the column holds cannot be
+    /// recorded whole. Either way the row still fits and the lock is taken: a
+    /// name that fits reads back exactly, one that cannot is left out whole
+    /// rather than cut into a name no session carries.
+    #[test]
+    fn the_width_is_the_columns_own_measure_and_the_row_always_fits() {
+        let emoji = "\u{1F600}".repeat(64);
+        for (operator, name, kept) in [
+            ("\u{1F600}".repeat(300), "pbps/1/2".to_owned(), true),
+            ("leon".to_owned(), emoji.clone(), true),
+            ("leon".to_owned(), "\"".repeat(128), false),
+            ("leon".to_owned(), "\u{1}".repeat(128), false),
+        ] {
+            let rendered = holder(&operator, &name).render();
+            assert!(
+                rendered.encode_utf16().count() <= LOCKED_BY_CHARS,
+                "{} code units: {rendered}",
+                rendered.encode_utf16().count()
+            );
+            assert!(rendered.contains("pid 4242"), "{rendered}");
+            assert_eq!(
+                holder_application_name(&rendered),
+                kept.then_some(name.clone()),
+                "{rendered}"
+            );
+        }
     }
 
     /// A holder written by hand or by an older pbps has no application name,
