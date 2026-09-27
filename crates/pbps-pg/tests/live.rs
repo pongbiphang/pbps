@@ -28563,6 +28563,18 @@ async fn doctor_reports_an_absent_recorded_managed_table() {
         .execute("CREATE TABLE public.kept(id integer); CREATE TABLE public.lingering(id integer)")
         .await
         .unwrap();
+    // #1109: a pending drop another role owns, and one another role owns in
+    // a schema the deployer owns, which the deployer may drop all the same.
+    db.conn
+        .execute(&format!(
+            "CREATE TABLE public.foreign_owned(id integer); \
+             CREATE SCHEMA mine AUTHORIZATION {role}; \
+             CREATE TABLE mine.foreign_in_mine(id integer); \
+             CREATE TABLE mine.keyed_in_mine(id integer); \
+             CREATE TABLE mine.triggered_in_mine(id integer)"
+        ))
+        .await
+        .unwrap();
     let (moving, kept, fresh) = (
         pbps_model::Uid::generate(pbps_model::UidKind::Table),
         pbps_model::Uid::generate(pbps_model::UidKind::Table),
@@ -28586,23 +28598,79 @@ async fn doctor_reports_an_absent_recorded_managed_table() {
         pbps_model::Uid::generate(pbps_model::UidKind::Table),
         "public.lingering".parse().unwrap(),
     );
+    recorded.tables.insert(
+        pbps_model::Uid::generate(pbps_model::UidKind::Table),
+        "public.foreign_owned".parse().unwrap(),
+    );
+    recorded.tables.insert(
+        pbps_model::Uid::generate(pbps_model::UidKind::Table),
+        "mine.foreign_in_mine".parse().unwrap(),
+    );
+    recorded.tables.insert(
+        pbps_model::Uid::generate(pbps_model::UidKind::Table),
+        "mine.keyed_in_mine".parse().unwrap(),
+    );
+    recorded.tables.insert(
+        pbps_model::Uid::generate(pbps_model::UidKind::Table),
+        "mine.triggered_in_mine".parse().unwrap(),
+    );
     // `staged` is recorded in the ids only: a staged checkpoint after its
     // committed `DROP TABLE`, whose absence is the plan's own doing.
     recorded.tables.insert(
         pbps_model::Uid::generate(pbps_model::UidKind::Table),
         "public.staged".parse().unwrap(),
     );
-    doctor_record_state(
+    // Recorded with a foreign key on `keyed_in_mine`, which the plan drops
+    // before the table, by an `ALTER TABLE` only the table's owner may run.
+    let mut schema = Schema::default();
+    for table in [
+        "public.t",
+        "public.kept",
+        "public.dropped",
+        "public.lingering",
+        "public.foreign_owned",
+        "mine.foreign_in_mine",
+        "mine.keyed_in_mine",
+        "mine.triggered_in_mine",
+    ] {
+        schema
+            .tables
+            .insert(table.parse().unwrap(), pbps_model::Table::default());
+    }
+    schema
+        .tables
+        .get_mut(&"mine.keyed_in_mine".parse().unwrap())
+        .unwrap()
+        .foreign_keys
+        .insert(
+            "fk_keyed".to_owned(),
+            pbps_model::ForeignKey {
+                columns: vec!["id".to_owned()],
+                references_table: "public.kept".parse().unwrap(),
+                references_columns: vec!["id".to_owned()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+    // And a trigger on `triggered_in_mine`, dropped before the table by a
+    // `DROP TRIGGER ... ON` only the table's owner may run.
+    schema.modules.insert(
+        pbps_model::ModuleId::Trigger {
+            on: "mine.triggered_in_mine".parse().unwrap(),
+            name: "trg".to_owned(),
+        },
+        module(
+            pbps_model::ModuleKind::Trigger,
+            "CREATE TRIGGER trg BEFORE INSERT ON mine.triggered_in_mine \
+             FOR EACH ROW EXECUTE FUNCTION mine.f()",
+        ),
+    );
+    state::record(
         &mut theirs,
-        &recorded,
-        &[
-            "public.t",
-            "public.kept",
-            "public.dropped",
-            "public.lingering",
-        ],
+        &StateSnapshot::new(StateKind::Baseline, schema, recorded.clone(), "doctor-live"),
     )
-    .await;
+    .await
+    .unwrap();
     let mut project = IdsFile::default();
     project
         .tables
@@ -28648,6 +28716,47 @@ async fn doctor_reports_an_absent_recorded_managed_table() {
         "{:?}",
         held.declaration_gaps
     );
+    // #1109: a pending drop that is there needs ownership for its
+    // `DROP TABLE`. The one another role owns is a gap; `lingering`, which
+    // the deployer owns, is not, and neither is `mine.foreign_in_mine`, whose
+    // schema the deployer owns. `mine.keyed_in_mine` is in that schema too,
+    // but its foreign key is dropped first, which needs the table's owner.
+    // Sorted: the scan follows the recorded ids, whose uids are random.
+    let dropping: std::collections::BTreeSet<String> = held
+        .declaration_gaps
+        .iter()
+        .filter(|g| g.why.contains("the next plan drops it"))
+        .map(|g| g.securable())
+        .collect();
+    assert_eq!(
+        dropping,
+        std::collections::BTreeSet::from([
+            "TABLE \"mine\".\"keyed_in_mine\"".to_owned(),
+            "TABLE \"mine\".\"triggered_in_mine\"".to_owned(),
+            "TABLE \"public\".\"foreign_owned\"".to_owned(),
+        ]),
+        "{:?}",
+        held.declaration_gaps
+    );
+    // Each reason names the ownership that would do: the table's or the
+    // schema's for a plain drop, the table's alone where a key goes first.
+    let reason = |table: &str| {
+        held.declaration_gaps
+            .iter()
+            .find(|g| g.securable() == table)
+            .map(|g| g.why.clone())
+            .unwrap()
+    };
+    assert!(reason("TABLE \"public\".\"foreign_owned\"").contains("of the table or of its schema"));
+    for table in [
+        "TABLE \"mine\".\"keyed_in_mine\"",
+        "TABLE \"mine\".\"triggered_in_mine\"",
+    ] {
+        assert!(
+            reason(table).contains("ownership of the table itself"),
+            "{table}"
+        );
+    }
     assert!(
         held.absent_tables
             .contains(&"public.fresh".parse().unwrap()),

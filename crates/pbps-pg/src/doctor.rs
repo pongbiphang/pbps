@@ -610,24 +610,53 @@ pub async fn permissions(
     // The recorded tables are kept beside the ids: a staged checkpoint keeps
     // the ids of a table its committed `DROP TABLE` already removed, and only
     // its schema says the table is gone on purpose.
-    let (recorded_ids, recorded_tables) = if project_ids.tables.is_empty()
+    // The recorded tables with foreign keys or triggers are kept too: a
+    // dropped table's keys and triggers are dropped first, by an `ALTER
+    // TABLE ... DROP CONSTRAINT` and a `DROP TRIGGER ... ON` only its owner
+    // may run.
+    let (recorded_ids, recorded_tables, recorded_with_keys) = if project_ids.tables.is_empty()
         && project_ids.columns.is_empty()
         && project_ids.tombstones.is_empty()
     {
-        (pbps_model::IdsFile::default(), BTreeSet::new())
+        (
+            pbps_model::IdsFile::default(),
+            BTreeSet::new(),
+            BTreeSet::new(),
+        )
     } else {
         match crate::state::latest(conn).await {
             Ok(recorded) => recorded.map_or_else(
-                || (pbps_model::IdsFile::default(), BTreeSet::new()),
+                || {
+                    (
+                        pbps_model::IdsFile::default(),
+                        BTreeSet::new(),
+                        BTreeSet::new(),
+                    )
+                },
                 |state| {
                     let tables: BTreeSet<ObjectName> =
                         state.snapshot.schema.tables.keys().cloned().collect();
-                    (state.snapshot.ids, tables)
+                    let schema = &state.snapshot.schema;
+                    let with_keys: BTreeSet<ObjectName> = schema
+                        .tables
+                        .iter()
+                        .filter(|(_, table)| !table.foreign_keys.is_empty())
+                        .map(|(name, _)| name.clone())
+                        .chain(schema.modules.keys().filter_map(|id| match id {
+                            pbps_model::ModuleId::Trigger { on, .. } => Some(on.clone()),
+                            pbps_model::ModuleId::Named(_) | pbps_model::ModuleId::Routine(_) => {
+                                None
+                            }
+                        }))
+                        .collect();
+                    (state.snapshot.ids, tables, with_keys)
                 },
             ),
-            Err(pbps_db::ledger::LedgerError::NotInitialized) => {
-                (pbps_model::IdsFile::default(), BTreeSet::new())
-            }
+            Err(pbps_db::ledger::LedgerError::NotInitialized) => (
+                pbps_model::IdsFile::default(),
+                BTreeSet::new(),
+                BTreeSet::new(),
+            ),
             Err(pbps_db::ledger::LedgerError::Db(error)) => {
                 return Err(error.context("cannot read recorded identities for doctor"));
             }
@@ -753,14 +782,56 @@ pub async fn permissions(
         })
         .cloned()
         .collect();
-    for (object, present, _) in read_tables(conn, &dropping, &MANAGED_KINDS).await? {
+    let pending = read_tables(conn, &dropping, &MANAGED_KINDS).await?;
+    // One question for every schema a plain drop might rely on, however many
+    // schemas and tables the plan drops.
+    let schemas: BTreeSet<&str> = pending
+        .iter()
+        .filter(|(object, present, rights)| {
+            *present && !rights.owned && !recorded_with_keys.contains(object)
+        })
+        .map(|(object, _, _)| object.schema.as_str())
+        .collect();
+    let schema_owned = owned_schemas(conn, &schemas).await?;
+    for (object, present, rights) in pending {
         if !present {
             held.declaration_gaps.push(Gap {
                 permission: OWNERSHIP,
                 why: "the recorded table is absent; its ownership cannot be established".to_owned(),
                 securable: Securable::Object(object),
             });
+            continue;
         }
+        if rights.owned {
+            continue;
+        }
+        // A `DROP TABLE` needs ownership (DECISIONS 289), and nothing else
+        // asks this table for it: it is out of the managed rights above, so a
+        // table another role owns read as ready here and failed at the drop
+        // (#1109). The schema's owner may drop it too (measured on 18: `DROP
+        // TABLE` succeeds for the owner of the schema of a table another role
+        // owns), so that ownership is enough when the drop is all the plan
+        // does to it. A table with foreign keys has them dropped first, by
+        // `ALTER TABLE ... DROP CONSTRAINT`, and one with triggers has them
+        // dropped by `DROP TRIGGER ... ON`; only the table's owner may run
+        // either, and its reason says so.
+        let why = if recorded_with_keys.contains(&object) {
+            "the declarations no longer name this recorded table, so the next plan drops it; \
+             its foreign keys or triggers are dropped first, which needs ownership of the \
+             table itself"
+        } else {
+            let owned = schema_owned.get(&object.schema).copied().unwrap_or(false);
+            if owned {
+                continue;
+            }
+            "the declarations no longer name this recorded table, so the next plan drops it, \
+             which needs ownership of the table or of its schema"
+        };
+        held.declaration_gaps.push(Gap {
+            permission: OWNERSHIP,
+            why: why.to_owned(),
+            securable: Securable::Object(object),
+        });
     }
 
     // An owner who revoked its own object-level `SELECT` may have granted it
@@ -816,6 +887,35 @@ async fn read_schemas(
                 },
             ))
         })
+        .collect()
+}
+
+/// Whether the current user holds the owner of each schema in `schemas`, by
+/// the same `pg_has_role(.., 'USAGE')` the table rights use, in one query. An
+/// absent schema is not one this user owns.
+async fn owned_schemas(
+    conn: &mut Conn,
+    schemas: &BTreeSet<&str>,
+) -> Result<BTreeMap<String, bool>, DbError> {
+    if schemas.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let params: Vec<Param<'_>> = schemas.iter().map(|name| Param::Str(name)).collect();
+    let rows = conn
+        .query_with(
+            &format!(
+                "WITH wanted(schema_name) AS (VALUES {})
+SELECT w.schema_name,
+       COALESCE(pg_catalog.pg_has_role(current_user, n.nspowner, 'USAGE'), false) AS owned
+  FROM wanted w
+  LEFT JOIN pg_catalog.pg_namespace n ON n.nspname = w.schema_name",
+                values_list(schemas.len(), 1)
+            ),
+            &params,
+        )
+        .await?;
+    rows.iter()
+        .map(|row| Ok((text(row, "schema_name")?, flag(row, "owned")?)))
         .collect()
 }
 
