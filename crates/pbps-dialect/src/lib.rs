@@ -2503,19 +2503,26 @@ pub fn check_index_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> 
             }
             // A claimant's own remedy takes that one claimant out. It is
             // the remedy only if the name is then out of every claimant's
-            // reach; otherwise only moving the declared object is. Asked of
-            // the first claimant that lands there alone: the fixpoint is
-            // not cheap, and claimants meeting at one name are alike.
-            let frees = !fallback_reach(&claimants, Some(k), dialect)
-                .iter()
-                .flatten()
-                .any(|n| n == claim_name);
-            let remedy = if frees {
-                claimants[k].relation.remedy
-            } else {
-                "Rename the other object."
+            // reach; otherwise only moving the declared object is. Reach may
+            // over-approximate, so one claimant's failing to free the name
+            // says nothing of another's: ask each that lands there. Once
+            // per first choice, though: claimants meeting at one first
+            // choice are alike, and each question reruns the fixpoint.
+            let mut asked = BTreeSet::new();
+            let freeing = (k..reach.len())
+                .filter(|j| reach[*j].iter().skip(1).any(|n| n == claim_name))
+                .filter(|j| asked.insert(&claimants[*j].first))
+                .find(|j| {
+                    !fallback_reach(&claimants, Some(*j), dialect)
+                        .iter()
+                        .flatten()
+                        .any(|n| n == claim_name)
+                });
+            let (landing, remedy) = match freeing {
+                Some(j) => (j, claimants[j].relation.remedy),
+                None => (k, "Rename the other object."),
             };
-            let descriptor = &claimants[k].relation.descriptor;
+            let descriptor = &claimants[landing].relation.descriptor;
             let existing = &claimed[claim_name];
             problems.push(format!(
                 "{} and {descriptor} may both be named `{claim_name}`: {descriptor} \

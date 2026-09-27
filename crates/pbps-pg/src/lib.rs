@@ -1339,9 +1339,10 @@ mod tests {
         };
         let pg = super::Postgres::new();
         // `shared` bytes in common, then the group, then padding to 60.
-        let schema = |shared: usize, index_name: &str| {
+        let four = [('x', 'p'), ('x', 'q'), ('y', 'p'), ('y', 'q')];
+        let tables = |members: &[(char, char)], shared: usize, index_name: &str| {
             let mut s = Schema::default();
-            for (group, member) in [('x', 'p'), ('x', 'q'), ('y', 'p'), ('y', 'q')] {
+            for &(group, member) in members {
                 let name = format!(
                     "{}{group}{}{member}",
                     "a".repeat(shared),
@@ -1355,6 +1356,7 @@ mod tests {
             }
             s
         };
+        let schema = |shared: usize, index_name: &str| tables(&four, shared, index_name);
 
         let pkey2 = format!("{}_pkey2", "a".repeat(57));
         let found = pbps_dialect::check_index_names(&schema(57, &pkey2), &pg);
@@ -1377,6 +1379,17 @@ mod tests {
             1,
             "its first fallback it does reach"
         );
+
+        // Groups of three and two sharing their fallbacks: `_pkey3` is in
+        // reach. Taking a key out of the group of three leaves a reach that
+        // is judged per claimant and still says `_pkey3`; taking one out of
+        // the group of two does not. The refusal must find that remedy
+        // though the group of three comes first.
+        let five = [('x', 'p'), ('x', 'q'), ('x', 'r'), ('y', 'p'), ('y', 'q')];
+        let pkey3 = format!("{}_pkey3", "a".repeat(57));
+        let found = pbps_dialect::check_index_names(&tables(&five, 57, &pkey3), &pg);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("Name the primary key"), "{found:?}");
     }
 
     /// #1111: the reach fixpoint stays cheap when many generated names meet
