@@ -931,7 +931,14 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         .chain(
             raw.index_columns
                 .iter()
-                .filter(|i| i.kind == IndexKind::Clustered && clustered_index_left_out(i))
+                .filter(|i| {
+                    (i.kind == IndexKind::Clustered && clustered_index_left_out(i))
+                        // A clustered columnstore holds the rows too, and is
+                        // always left out: declared beside it, a
+                        // nonclustered key would read as a heap's (#1209
+                        // review).
+                        || i.kind == IndexKind::Unmodelled(5)
+                })
                 .map(|i| (i.object_id, i.index_name.clone())),
         )
         .collect();
@@ -2845,6 +2852,56 @@ mod tests {
             assert_eq!(t.clustered, Some(Clustered::Index("cx_shared".into())));
             assert_eq!(t.indexes["cx_shared"].columns.len(), columns, "{table}");
         }
+    }
+
+    /// A clustered columnstore holds the rows, is left out, and so takes the
+    /// nonclustered key beside it along: declared alone, the key would read
+    /// as a heap's and bootstrap would build a rowstore heap (#1209 review).
+    #[test]
+    fn a_nonclustered_key_beside_a_clustered_columnstore_is_left_out() {
+        let columnstore = |code: u8, name: &str| RawIndexColumn {
+            is_disabled: false,
+            ignore_dup_key: false,
+            object_id: 10,
+            index_name: name.into(),
+            is_unique: false,
+            kind: IndexKind::from_type_code(code),
+            filter: None,
+            column: "id".into(),
+            is_included: false,
+            is_descending: false,
+        };
+        let mut raw = one_table_catalog();
+        raw.key_columns[0].index_type = 2;
+        raw.index_columns.push(columnstore(5, "cci"));
+        let p = assemble(&raw);
+        let t = &p.schema.tables[&TableName::new("dbo", "customer")];
+        assert_eq!(t.primary_key, None);
+        assert_eq!(t.clustered, None);
+        let said = p
+            .limitations
+            .iter()
+            .map(|l| l.detail.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            said.contains("`cci` is a clustered columnstore index"),
+            "{said}"
+        );
+        assert!(
+            said.contains(
+                "primary key `pk_customer` is nonclustered beside the clustered index `cci`"
+            ),
+            "{said}"
+        );
+        // Negative: a nonclustered columnstore holds no rows and takes no key.
+        let mut raw = one_table_catalog();
+        raw.key_columns[0].index_type = 2;
+        raw.index_columns.push(columnstore(6, "ncci"));
+        let p = assemble(&raw);
+        let t = &p.schema.tables[&TableName::new("dbo", "customer")];
+        assert!(t.primary_key.is_some());
+        assert_eq!(t.clustered, Some(Clustered::Heap));
     }
 
     /// Negative: a disabled clustered index leaves the table's rows

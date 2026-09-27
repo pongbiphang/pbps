@@ -2370,6 +2370,18 @@ async fn an_index_whose_physical_kind_the_model_cannot_hold_is_never_adopted_as_
         )
         .await
         .expect("create archive");
+    // The same, with a nonclustered key beside the columnstore (#1209
+    // review): declared without it, the key would read as a heap's.
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.keyed_archive (
+                 id int NOT NULL CONSTRAINT pk_keyed_archive PRIMARY KEY NONCLUSTERED,
+                 note nvarchar(50) NULL
+             );
+             CREATE CLUSTERED COLUMNSTORE INDEX cci_keyed ON dbo.keyed_archive;",
+        )
+        .await
+        .expect("create keyed archive");
     db.conn
         .execute(
             "CREATE TABLE dbo.docs (
@@ -2397,6 +2409,17 @@ async fn an_index_whose_physical_kind_the_model_cannot_hold_is_never_adopted_as_
     assert_eq!(indexes("dbo", "wide"), ["ix_wide_note"]);
     assert!(indexes("dbo", "archive").is_empty());
     assert!(indexes("dbo", "docs").is_empty());
+    let keyed = &pulled.schema.tables[&TableName::new("dbo", "keyed_archive")];
+    assert_eq!(keyed.primary_key, None);
+    assert_eq!(keyed.clustered, None);
+    assert!(
+        pulled
+            .warnings
+            .iter()
+            .any(|w| w.contains("pk_keyed_archive") && w.contains("cci_keyed")),
+        "{:?}",
+        pulled.warnings
+    );
 
     let said = pulled.warnings.join("\n");
     for (name, kind) in [
