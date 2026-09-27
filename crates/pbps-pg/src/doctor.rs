@@ -782,9 +782,18 @@ pub async fn permissions(
         })
         .cloned()
         .collect();
-    // One question per schema, however many of its tables the plan drops.
-    let mut schema_owned: BTreeMap<String, bool> = BTreeMap::new();
-    for (object, present, rights) in read_tables(conn, &dropping, &MANAGED_KINDS).await? {
+    let pending = read_tables(conn, &dropping, &MANAGED_KINDS).await?;
+    // One question for every schema a plain drop might rely on, however many
+    // schemas and tables the plan drops.
+    let schemas: BTreeSet<&str> = pending
+        .iter()
+        .filter(|(object, present, rights)| {
+            *present && !rights.owned && !recorded_with_keys.contains(object)
+        })
+        .map(|(object, _, _)| object.schema.as_str())
+        .collect();
+    let schema_owned = owned_schemas(conn, &schemas).await?;
+    for (object, present, rights) in pending {
         if !present {
             held.declaration_gaps.push(Gap {
                 permission: OWNERSHIP,
@@ -811,14 +820,7 @@ pub async fn permissions(
              its foreign keys or triggers are dropped first, which needs ownership of the \
              table itself"
         } else {
-            let owned = match schema_owned.get(&object.schema) {
-                Some(owned) => *owned,
-                None => {
-                    let owned = owns_schema(conn, &object.schema).await?;
-                    schema_owned.insert(object.schema.clone(), owned);
-                    owned
-                }
-            };
+            let owned = schema_owned.get(&object.schema).copied().unwrap_or(false);
             if owned {
                 continue;
             }
@@ -888,24 +890,33 @@ async fn read_schemas(
         .collect()
 }
 
-/// Whether the current user holds the owner of `schema`, by the same
-/// `pg_has_role(.., 'USAGE')` the table rights use. An absent schema is not
-/// one this user owns.
-async fn owns_schema(conn: &mut Conn, schema: &str) -> Result<bool, DbError> {
+/// Whether the current user holds the owner of each schema in `schemas`, by
+/// the same `pg_has_role(.., 'USAGE')` the table rights use, in one query. An
+/// absent schema is not one this user owns.
+async fn owned_schemas(
+    conn: &mut Conn,
+    schemas: &BTreeSet<&str>,
+) -> Result<BTreeMap<String, bool>, DbError> {
+    if schemas.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let params: Vec<Param<'_>> = schemas.iter().map(|name| Param::Str(name)).collect();
     let rows = conn
         .query_with(
-            "SELECT pg_catalog.pg_has_role(current_user, n.nspowner, 'USAGE') AS owned \
-               FROM pg_catalog.pg_namespace n WHERE n.nspname = $1",
-            &[Param::Str(schema)],
+            &format!(
+                "WITH wanted(schema_name) AS (VALUES {})
+SELECT w.schema_name,
+       COALESCE(pg_catalog.pg_has_role(current_user, n.nspowner, 'USAGE'), false) AS owned
+  FROM wanted w
+  LEFT JOIN pg_catalog.pg_namespace n ON n.nspname = w.schema_name",
+                values_list(schemas.len(), 1)
+            ),
+            &params,
         )
         .await?;
-    match rows.as_slice() {
-        [] => Ok(false),
-        [row] => flag(row, "owned"),
-        _ => Err(DbError::BadRow(format!(
-            "the owner of schema {schema} came back more than once"
-        ))),
-    }
+    rows.iter()
+        .map(|row| Ok((text(row, "schema_name")?, flag(row, "owned")?)))
+        .collect()
 }
 
 async fn read_tables(
