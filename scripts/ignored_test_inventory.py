@@ -452,6 +452,8 @@ def validate(root, inventory, targets, platform):
     for group in inventory["groups"]:
         key = tuple(group["target"]); owner = owners[group["owner"]]
         require(group["validate_on"] == owner["platform"], f"owner platform cannot discover its cases: {group['owner']}")
+        require(not owner.get("ordinary") or owner["platform"] not in group["ignored_on"],
+                f"ordinary runner skips ignored cases: {group['owner']} ({key})")
         if "case" in owner:
             require(group["cases"] == [owner["case"]], f"nested helper mapping differs from its witnessed case: {group['owner']}")
             require(any(owner["case"] in json.dumps(w) for w in owner.get("witnesses", [])), "nested helper witness must name its case")
