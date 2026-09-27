@@ -189,15 +189,19 @@ async fn exercise(
             format!("REVOKE {subject} FROM {member}"),
         ),
     ] {
-        let observed = owned(&mut conn, |catalog, _| {
-            assert!(
-                catalog.rows["pg_roles"]
-                    .iter()
-                    .any(|r| r["rolname"].as_str() == Some(&subject))
-            );
-            committed(&connection, change)?;
-            Ok(Selection::default())
-        })
+        let observed = owned(
+            &mut conn,
+            &std::collections::BTreeSet::new(),
+            |catalog, _| {
+                assert!(
+                    catalog.rows["pg_roles"]
+                        .iter()
+                        .any(|r| r["rolname"].as_str() == Some(&subject))
+                );
+                committed(&connection, change)?;
+                Ok(Selection::default())
+            },
+        )
         .await;
         committed(&connection, restore).unwrap();
         let refused = matches!(observed, Err(Failure::Changed));
@@ -209,7 +213,7 @@ async fn exercise(
     // Membership removal has its own physical witness, even when both public
     // role records retain the same identity and properties.
     committed(&connection, format!("GRANT {subject} TO {member}")).unwrap();
-    let revoked = owned(&mut conn, |_, _| {
+    let revoked = owned(&mut conn, &std::collections::BTreeSet::new(), |_, _| {
         committed(&connection, format!("REVOKE {subject} FROM {member}"))?;
         Ok(Selection::default())
     })
@@ -221,7 +225,7 @@ async fn exercise(
 
     // Equality of safe public values is not a history/ABA detector. Do not
     // acquire password-verifier access to claim a stronger interval boundary.
-    let restored = owned(&mut conn, |_, _| {
+    let restored = owned(&mut conn, &std::collections::BTreeSet::new(), |_, _| {
         committed(
             &connection,
             format!("ALTER ROLE {subject} NOINHERIT; ALTER ROLE {subject} INHERIT"),
@@ -233,7 +237,7 @@ async fn exercise(
         restored.is_ok(),
         "restored public values are an explicit observation limit"
     );
-    let unreadable = owned(&mut conn, |_, _| {
+    let unreadable = owned(&mut conn, &std::collections::BTreeSet::new(), |_, _| {
         committed(
             &connection,
             "REVOKE SELECT ON pg_catalog.pg_roles FROM PUBLIC".into(),

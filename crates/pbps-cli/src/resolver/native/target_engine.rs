@@ -31,15 +31,17 @@ pub(in crate::resolver::native) use pbps_pg::resolver::capture::{
 // the engine's held-lock state (DECISIONS 417). Source-free refusals and
 // comparison reports use pbps-db's shared answer types. No catalog can mint
 // the separate native source capability (DEC-974.1).
-pub(super) use pbps_pg::resolver::capture::{CaptureScope, CapturedInputs};
+pub(super) use pbps_pg::resolver::capture::{CaptureScope, CapturedInputs, DroppedSignature};
 
 pub(super) async fn capture_with_runtime_inputs(
     connection: &mut PeerVerifiedConn,
     scope: &CaptureScope,
+    dropped: &std::collections::BTreeSet<DroppedSignature>,
 ) -> Result<(CapturedInputs, RuntimeInputs), CaptureError> {
     match connection.driver() {
         Driver::Postgres => {
-            pbps_pg::resolver::capture::capture_with_runtime_inputs(connection, scope).await
+            pbps_pg::resolver::capture::capture_with_runtime_inputs(connection, scope, dropped)
+                .await
         }
         Driver::Mssql => Err(CaptureError::Unsupported {
             engine: "SQL Server",
@@ -50,36 +52,11 @@ pub(super) async fn capture_with_runtime_inputs(
 pub(super) async fn capture(
     connection: &mut PeerVerifiedConn,
     scope: &CaptureScope,
+    dropped: &std::collections::BTreeSet<DroppedSignature>,
 ) -> Result<CapturedInputs, CaptureError> {
     match connection.driver() {
-        Driver::Postgres => pbps_pg::resolver::capture::capture(connection, scope).await,
-        Driver::Mssql => Err(CaptureError::Unsupported {
-            engine: "SQL Server",
-        }),
-    }
-}
-
-/// The routine each dropped declaration's signature names on the target, as
-/// the plan's `DROP` resolves it.
-pub(super) async fn identify_dropped(
-    connection: &mut PeerVerifiedConn,
-    write_path_extras: &[String],
-    routines: Vec<(pbps_model::ModuleId, pbps_model::ModuleKind)>,
-) -> Result<
-    std::collections::BTreeMap<
-        pbps_model::ModuleId,
-        Option<pbps_db::resolver::capture::ObjectIdentity>,
-    >,
-    CaptureError,
-> {
-    match connection.driver() {
         Driver::Postgres => {
-            pbps_pg::resolver::reconstruct::identify_dropped(
-                connection,
-                &pbps_pg::Postgres::with_write_path_extras(write_path_extras.to_vec()),
-                routines,
-            )
-            .await
+            pbps_pg::resolver::capture::capture_identifying(connection, scope, dropped).await
         }
         Driver::Mssql => Err(CaptureError::Unsupported {
             engine: "SQL Server",

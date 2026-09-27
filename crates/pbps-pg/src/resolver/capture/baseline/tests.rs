@@ -20,9 +20,11 @@ fn snapshot() -> StateSnapshot {
 }
 
 async fn baseline(conn: &mut Conn) -> Result<Baseline, Failure> {
-    super::super::read::owned(conn, |catalog, major| {
-        Ok(scope::prepare(catalog, major, &empty_scope())?.render)
-    })
+    super::super::read::owned(
+        conn,
+        &std::collections::BTreeSet::new(),
+        |catalog, major| Ok(scope::prepare(catalog, major, &empty_scope())?.render),
+    )
     .await
     .map(|read| read.baseline)
 }
@@ -294,26 +296,30 @@ async fn exercise(connection: String, (owner, group, reader): (String, String, S
     // A committed change between the raw snapshot and rendering cannot use
     // live catalog caches to qualify a different recipe than we captured.
     let writer = connection.clone();
-    let result = super::super::read::owned(&mut conn, |catalog, major| {
-        let selected = scope::prepare(catalog, major, &empty_scope())?.render;
-        std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async move {
-                    let mut conn = Conn::connect(Driver::Postgres, &writer).await.unwrap();
-                    conn.execute(
-                        "ALTER TABLE public.__pbps_state ALTER COLUMN kind TYPE varchar(17)",
-                    )
-                    .await
-                    .unwrap();
-                });
-        })
-        .join()
-        .unwrap();
-        Ok(selected)
-    })
+    let result = super::super::read::owned(
+        &mut conn,
+        &std::collections::BTreeSet::new(),
+        |catalog, major| {
+            let selected = scope::prepare(catalog, major, &empty_scope())?.render;
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async move {
+                        let mut conn = Conn::connect(Driver::Postgres, &writer).await.unwrap();
+                        conn.execute(
+                            "ALTER TABLE public.__pbps_state ALTER COLUMN kind TYPE varchar(17)",
+                        )
+                        .await
+                        .unwrap();
+                    });
+            })
+            .join()
+            .unwrap();
+            Ok(selected)
+        },
+    )
     .await;
     assert!(
         result.is_err(),

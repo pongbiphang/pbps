@@ -243,9 +243,10 @@ async fn exercise_capture(connection: String) {
     )
     .await
     .unwrap();
-    let (before_extension, extension_runtime) = capture_with_runtime_inputs(&mut conn, &scope)
-        .await
-        .unwrap();
+    let (before_extension, extension_runtime) =
+        capture_with_runtime_inputs(&mut conn, &scope, &Default::default())
+            .await
+            .unwrap();
     assert!(
         extension_runtime
             .libraries
@@ -263,7 +264,7 @@ async fn exercise_capture(connection: String) {
         }]),
     };
     let (standalone, standalone_runtime) =
-        capture_with_runtime_inputs(&mut conn, &standalone_scope)
+        capture_with_runtime_inputs(&mut conn, &standalone_scope, &Default::default())
             .await
             .unwrap();
     let ordinary = capture(&mut conn, &standalone_scope).await.unwrap();

@@ -1663,13 +1663,11 @@ impl ScratchRun {
         // session is mid-transaction, and the next check must end the run.
         let base = engine::Managed::from_schema(request.base);
         let desired = engine::Managed::from_schema(request.desired);
-        // An overload the plan drops is identified on the target, where the
-        // plan's DROP resolves its signature (#1124).
-        let dropped = target
-            .identify_dropped(extras, base.dropped_by(&desired))
-            .await
-            .map_err(|error| Error::Binding(error.to_string()))?;
-        reconstruction.identified(dropped);
+        // An overload the plan drops is identified by the target capture, in
+        // its own snapshot and where the plan's DROP resolves its signature
+        // (#1124, #1148).
+        let dropped = engine::dropped_signatures(extras, base.dropped_by(&desired))
+            .map_err(Error::Binding)?;
         let scratch = self.scratch.as_mut().ok_or(Error::Cancelled)?;
         self.in_flight = true;
         let compiled = engine::compile(reconstruction, extras, &mut scratch.connection).await;
@@ -1692,11 +1690,22 @@ impl ScratchRun {
         self.retire_admin();
         let (compiled, scope) = captured.map_err(Error::Binding)?;
         self.check(target).await?;
+        let signatures = dropped.iter().filter_map(|(_, s)| s.clone()).collect();
         let current = target
-            .capture_postgres(&scope)
+            .capture_postgres(&scope, &signatures)
             .await
             .map_err(|error| Error::Binding(error.to_string()))?;
         self.check(target).await?;
+        let identified = current.catalog().dropped();
+        reconstruction.identified(
+            dropped
+                .into_iter()
+                .map(|(id, signature)| {
+                    let identity = signature.and_then(|s| identified.get(&s).cloned().flatten());
+                    (id, identity)
+                })
+                .collect(),
+        );
         Ok(engine::assess(
             current.catalog(),
             &compiled,
