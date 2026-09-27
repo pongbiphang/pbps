@@ -50,6 +50,30 @@ pub struct FingerprintKey {
     bytes: Vec<u8>,
 }
 
+/// A configured environment key, suitable for persisted resolver evidence.
+/// A process-local comparison key cannot inhabit this type, even when cloned.
+/// The loader chooses the target environment before constructing it.
+#[derive(Clone, Debug)]
+pub struct EnvironmentFingerprintKey(FingerprintKey);
+
+impl EnvironmentFingerprintKey {
+    pub fn from_env(name: &str) -> Result<Self, KeyError> {
+        FingerprintKey::from_env(name).map(Self)
+    }
+
+    pub fn from_file(path: &Path) -> Result<Self, KeyError> {
+        FingerprintKey::from_file(path).map(Self)
+    }
+
+    pub fn id(&self) -> KeyId {
+        self.0.id()
+    }
+
+    pub fn fingerprint(&self, rule: &str, component: &str, input: &[u8]) -> [u8; 32] {
+        self.0.fingerprint(rule, component, input)
+    }
+}
+
 /// A public name for a key: the first 8 bytes of an HMAC under the key, in
 /// hex. It tells two keys apart without saying anything usable about either.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]

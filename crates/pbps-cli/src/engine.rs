@@ -1798,6 +1798,22 @@ pub async fn check_data_write(
     }
 }
 
+/// Artifact readers route by the engine named in the saved file, without a
+/// connection or resolver. Connected apply separately checks that engine
+/// against its actual target before accepting the artifact.
+pub fn validate_plan_analysis(plan: &pbps_model::SavedPlan) -> anyhow::Result<()> {
+    plan.validate_analysis()?;
+    if let pbps_model::resolver::PlanAnalysis::Resolved(evidence) = &plan.analysis {
+        match plan.dialect.as_str() {
+            "postgres" => pbps_pg::resolver::validate_evidence(evidence)?,
+            engine => anyhow::bail!("this build cannot enforce resolver evidence for {engine}"),
+        }
+        pbps_cli::resolver::sealing::validate_runtime(&evidence.qualification().runtime)
+            .map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

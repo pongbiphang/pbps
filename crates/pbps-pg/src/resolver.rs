@@ -11,6 +11,8 @@ pub mod reconstruct;
 // server, so these run in the serial suite beside the capture's own.
 #[cfg(test)]
 mod binding_tests;
+#[cfg(test)]
+mod evidence_tests;
 
 use pbps_db::resolver::environment::{CatalogFacts, DatabaseRecipe, LocaleProvider};
 use pbps_db::resolver::{
@@ -19,6 +21,23 @@ use pbps_db::resolver::{
 };
 use pbps_db::transport::{QueryConnection, StreamConn};
 use pbps_db::{Conn, DbError};
+
+/// Pure reader support for the evidence versions this PostgreSQL adapter
+/// knows how to repeat. Neither an environment label nor an unknown newer
+/// rule is accepted as compatibility with this build.
+pub fn validate_evidence(
+    evidence: &pbps_model::resolver::ResolverEvidence,
+) -> Result<(), pbps_model::resolver::EvidenceError> {
+    use pbps_model::resolver::EvidenceError;
+    if evidence.before().adapter() != "postgres-catalog-inputs-v1"
+        || !matches!(evidence.before().engine_major(), 16 | 18)
+        || evidence.qualification().rule != compatibility::RULE
+        || evidence.authorization().rule != authorization::RULE
+    {
+        return Err(EvidenceError::Version);
+    }
+    Ok(())
+}
 
 /// The cluster identifier is observed alongside, never instead of, qualified
 /// process provenance. Cloned clusters can share a system identifier.

@@ -195,3 +195,31 @@ agreed stage needs successful supported cases; permanent refusal is not delivery
 - No planning DDL on the target, production-row cloning, arbitrary image
   synthesis, semantic SQL parser, runtime workload discovery, snapshot-derived
   deployable plan, resolver-backed staged apply or new service/plugin engine.
+
+## Sealed planning foundations (#614)
+
+Saved-plan version 12 requires an explicit ordinary/resolved analysis contract.
+Resolved evidence records versioned qualified-environment fingerprints,
+authorization pre-/postconditions, complete input properties and candidate
+membership/absence, current/desired logical bindings and the final typed order.
+All persisted input fingerprints use the target environment's configured HMAC
+key and identify that key without recording it. Missing keys name
+`pbps key generate`. See DEC-614.1 and the amended DEC-952.1 contract.
+
+The pure resolver planner combines proven bindings with structural, identity,
+data, authorization and restoration constraints. It emits explicit typed
+expression/module rebuilds, supports table-before-routine-before-expression
+orders and refuses cycles. Ordinary plans retain their existing ordering.
+A projected closing manifest permits approved catalog/grant changes while
+preserving untouched external inputs. Serialization, version and downgrade
+negatives accompany engine-backed creation, replacement and grant/data cases
+on PostgreSQL 16 and 18.
+
+These are internal foundations. Connected selection still does not publish a
+resolved plan: #615 must connect the qualified lifecycle, complete adapter
+ownership/binding inventory and fresh closing capture to artifact publication.
+#616 must implement transactional pre-/postcondition checks; this build refuses
+resolved apply before DDL until those checks exist. #617 owns private-source
+handling, #618 artifact/report integration, and #619/#620 the independently
+qualified SQL Server adapter. No protected verifier table or legacy-reader
+confidentiality proof is reintroduced.

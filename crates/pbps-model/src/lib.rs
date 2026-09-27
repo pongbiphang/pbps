@@ -34,6 +34,7 @@ pub mod module;
 pub mod name;
 pub mod plan;
 pub mod rename;
+pub mod resolver;
 pub mod role;
 pub mod schema;
 pub mod state;

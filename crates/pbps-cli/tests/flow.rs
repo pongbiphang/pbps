@@ -3558,6 +3558,7 @@ fn write_plan(d: &Demo, name: &str, mode: &str) -> PathBuf {
         r#"{{
   "version": {version},
   "origin": "database",
+  "analysis": {{ "kind": "ordinary" }},
   "mode": "{mode}",
   "dialect": "mssql",
   "created_at": "2026-08-31T09:00:00Z",

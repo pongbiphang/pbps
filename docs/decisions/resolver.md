@@ -1057,3 +1057,52 @@ Pinned by `a_grant_on_a_principal_is_replayed_so_the_deployer_sees_what_it_sees`
 `principal:grants` cases and
 `a_context_without_principal_grants_keeps_its_canonical_form` in
 `crates/pbps-mssql/src/resolver/authorization.rs`.
+
+<a id="dec-614-1"></a>
+
+**DEC-614.1. Persist a checked resolver contract and the final typed order, beside Schema.**
+A resolver result cannot be an optional metadata bag: omitting it would let a
+binding-dependent deployment be read as an ordinary plan. Saved-plan version 12
+requires `analysis`, and resolved database provenance requires the complete,
+transactional evidence variant. The model checks the versions, required scope
+and absence predicates, logical-property closure, binding occurrences,
+authorization step inventory, projected closing manifest and exact ChangeSet
+order. Engine readers separately recognize the adapter, major version and
+qualification rules they can enforce. This adds no resolver I/O to the differ
+or pure dialect, and no transient observations to semantic `Schema` equality.
+
+Persisted catalog properties, session and baseline observations use the target
+environment's configured HMAC key (DEC-952.1), with its identifier alone in the
+artifact. A distinct environment-key type excludes the process comparison key.
+The PG sealing operation is private on a captured result: making it public
+would let a recipient choose a known key and test guesses about private source.
+The public operation instead performs a fresh authorized catalog read. The CLI
+key loader refuses a missing key with the `pbps key generate` remedy. Private
+source never becomes a serialized property map.
+
+Measured on PostgreSQL 16 and 18, a new table's default cannot name an absent
+routine, while an SQL-standard routine cannot bind an absent table. Splitting
+new-table defaults, CHECKs and indexes into existing typed changes lets the bare
+table precede the routine and the expressions follow it. ADD COLUMN DEFAULT
+stays atomic because it fills existing rows. On a rebuilding dialect, module
+replacement is explicit DROP/CREATE, with the ordinary differ's grant and
+PUBLIC-execution obligations retained. Observed binding edges combine with
+structural, identity, reference-data, authorization and restoration edges;
+independent tables do not inherit a false dependency from alphabetical order.
+A stable topological order refuses cycles before emission. Emitters and apply
+receive that sealed sequence, never instructions to discover another order.
+Ordinary planning still uses its existing ordering path. Table/column renames
+connect current and desired expression owners only through their recorded UIDs:
+teardown uses the old name, restoration the approved final name, and both keep
+the final owner's strategy. Comparing surface names alone lost these dependent
+rebuilds; PostgreSQL refused the resulting routine drop with `2BP01`.
+
+The expected closing manifest is projected from approved typed changes and
+engine-observed ownership transitions. It preserves untouched external
+properties and changes only the approved objects' properties, candidate
+membership and lookup results; row changes cannot authorize a catalog change.
+Schema grant transitions have their own namespace surface. An unprovable
+transition is a planning refusal, not an apply-time choice. Qualified lifecycle
+and ownership/binding inventory production remain #615, transactional checking
+#616 and plaintext handling #617. Until the apply guard exists, the CLI refuses
+resolved deployment artifacts before executing changes.

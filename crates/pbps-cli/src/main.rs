@@ -3126,6 +3126,7 @@ pub(crate) fn validate_saved_plan(
     plan: &pbps_model::SavedPlan,
     dialect: &dyn Dialect,
 ) -> anyhow::Result<()> {
+    crate::engine::validate_plan_analysis(plan)?;
     // A matching checksum approves these bytes, not a broader execution mode
     // than the planner accepts. Count logical changes, since one rename may
     // emit a schema transfer and a rename (ADR-0003, decision 2) — and the
