@@ -654,6 +654,22 @@ mod recon611 {
             "a name with no principal behind it is recorded as absent"
         );
 
+        // A read that comes back short is refused, even when the context
+        // already holds every name from the read above: a spelling from an
+        // earlier state must not stand in for one this read lost (review of
+        // #1016). `SET ROWCOUNT 1` cuts the answer to its first row.
+        planning.execute("SET ROWCOUNT 1;").await.unwrap();
+        let short = resolve_spellings(
+            &mut planning,
+            &mut context,
+            &["readers".to_owned(), "hidden".to_owned()],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        planning.execute("SET ROWCOUNT 0;").await.unwrap();
+        assert!(short.contains("did not come back"), "{short}");
+
         // The combined read resolves them inside its bracket, so both halves
         // carry the spellings and are compared with them (review of #1010).
         let (_, bracketed) = pbps_mssql::resolver::scope_facts(

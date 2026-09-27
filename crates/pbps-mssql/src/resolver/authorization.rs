@@ -157,21 +157,22 @@ pub async fn resolve_spellings(
     let Some(sql) = spellings_query(&names) else {
         return Ok(());
     };
+    let mut answered = BTreeMap::new();
     for row in conn.query(&sql).await? {
         let planned = required(&row, "planned", "a planned principal's name")?;
         let catalog = row.try_get::<&str>("name")?.map(str::to_owned);
-        context.spellings.insert(planned, catalog);
+        answered.insert(planned, catalog);
     }
     // Each name comes back exactly once; one that did not is unread, and an
-    // unread spelling is not a principal the catalog lacks.
-    if let Some(missing) = names
-        .iter()
-        .find(|name| !context.spellings.contains_key(**name))
-    {
+    // unread spelling is not a principal the catalog lacks. Checked against
+    // this statement's rows alone, so a spelling a caller's context already
+    // held from an earlier read cannot stand in for one missing now.
+    if let Some(missing) = names.iter().find(|name| !answered.contains_key(**name)) {
         return Err(DbError::BadRow(format!(
             "the catalog's spelling of the principal {missing} did not come back"
         )));
     }
+    context.spellings.extend(answered);
     Ok(())
 }
 
