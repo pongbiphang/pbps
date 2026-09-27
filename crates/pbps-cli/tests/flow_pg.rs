@@ -8146,6 +8146,107 @@ fn the_resume_status_prints_carries_the_approval_the_gate_asks_for_again() {
     );
 }
 
+/// #1203: the printed resume carries `--allow "<approved-risk-classes>"` for
+/// every plan, and a staged plan with no gated class had no value to put
+/// there — `--allow` takes one. Filled with nothing, the command resumes as
+/// printed.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn an_ungated_staged_resume_runs_as_printed_with_the_approval_left_empty() {
+    let own = OwnDatabase::new(&server(), "resume_ungated");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "resume-ungated", ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: postgres\nenvironments:\n  dev:\n    url_env: PBPS_RESUME_DB\n",
+    )
+    .unwrap();
+    d.commit();
+    let env = [("PBPS_RESUME_DB", connection)];
+    // A new table and two checks on it: three statements, none of them gated.
+    std::fs::write(
+        d.dir.join("schema/app.u.yml"),
+        "table: app.u\ncolumns:\n  id: {type: integer, nullable: false}\n  n: {type: integer}\n\
+         primary_key: [id]\nchecks:\n  a_positive: \"n > 0\"\n  b_small: \"n < 100\"\n",
+    )
+    .unwrap();
+    let plan = connected_artifact(&d, connection, true);
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+    assert!(saved.changes.gated_risks().is_empty(), "{saved:?}");
+    on_server(
+        connection,
+        r#"
+        CREATE SCHEMA witness;
+        CREATE FUNCTION witness.stop_after_first() RETURNS event_trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF to_regclass('app.u') IS NOT NULL
+             AND EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'app.u'::regclass AND contype = 'c') THEN
+            RAISE EXCEPTION 'stop before a check commits';
+          END IF;
+        END $$;
+        CREATE EVENT TRIGGER stop_after_first ON ddl_command_end WHEN TAG IN ('ALTER TABLE')
+          EXECUTE FUNCTION witness.stop_after_first();
+    "#,
+    );
+    let stopped = approved_apply(&d, connection, &plan, &["--staged"]);
+    assert_eq!(
+        code(&stopped),
+        1,
+        "{}{}",
+        stdout(&stopped),
+        stderr(&stopped)
+    );
+    on_server(connection, "DROP EVENT TRIGGER stop_after_first");
+    let progress = latest_snapshot(connection).staged.expect("a checkpoint");
+    assert!(
+        progress.completed >= 1 && progress.completed < progress.total,
+        "{progress:?}"
+    );
+
+    let status = d.run_with_env(&["status", "--format", "json"], &env);
+    let report: serde_json::Value = serde_json::from_str(&stdout(&status))
+        .unwrap_or_else(|e| panic!("{e}: {}{}", stdout(&status), stderr(&status)));
+    let staged = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "state.mid-deployment")
+        .unwrap_or_else(|| panic!("{report}"));
+    assert!(
+        staged["message"]
+            .as_str()
+            .unwrap()
+            .contains("(empty if it had none)"),
+        "{report}"
+    );
+    let remedy = staged["remedy"].as_str().unwrap();
+    let checksum = plan_checksum(&plan);
+    // The printed command, every placeholder filled; the approval with
+    // nothing, as the plan approved no class.
+    let words: Vec<String> = remedy
+        .split_whitespace()
+        .skip(1)
+        .map(|word| match word {
+            "\"<plan.json>\"" => plan.to_str().unwrap().to_owned(),
+            "\"<approved-checksum>\"" => checksum.clone(),
+            "\"<approved-risk-classes>\"" => String::new(),
+            other => other.to_owned(),
+        })
+        .collect();
+    assert!(words.iter().any(|w| w == "--allow"), "{remedy}");
+    assert!(!words.iter().any(|w| w.contains('<')), "{words:?}");
+    succeeds(d.run_with_env(&words.iter().map(String::as_str).collect::<Vec<_>>(), &env));
+    assert!(latest_snapshot(connection).staged.is_none());
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_constraint WHERE conrelid = 'app.u'::regclass AND contype = 'c'"
+        ),
+        2
+    );
+}
+
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_staged_cli_checkpoint_survives_state_json_and_resume_checks_its_intermediate_name() {
