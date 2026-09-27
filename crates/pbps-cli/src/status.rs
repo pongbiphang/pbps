@@ -478,6 +478,10 @@ fn record_catalog_findings(
     }
 }
 
+/// What a printed resume command puts after `--allow`: the risk classes the
+/// plan was approved with, which the gate asks for again on `--resume`.
+pub(crate) const RESUME_ALLOW: &str = "approved-risk-classes";
+
 /// Makes an interrupted staged apply the primary human state while retaining
 /// a failed ledger entry as a separate machine-readable finding.
 fn record_staged(
@@ -498,14 +502,21 @@ fn record_staged(
     // Through `env_arg`, like every other command this tool prints. An
     // environment name is a YAML map key, so `US West` is valid, and
     // interpolated bare it becomes multiple arguments or executable syntax.
+    //
+    // A resume passes the risk gate again, so the command carries `--allow`
+    // too: without it the one way forward offered here is refused for any
+    // plan with a gated class — a staged plan's canonical rename among them.
+    // The checkpoint does not record which classes were approved, so this is
+    // a placeholder rather than the list.
     let mut detail = format!(
         "a staged apply stopped after {completed} of {total} statement(s); continue it with \
-         `pbps apply --staged --resume --env {} --plan ... --checksum {}`",
+         `pbps apply --staged --resume --env {} --plan ... --checksum {} --allow {}`",
         crate::report::env_arg(environment),
         checksum.map_or_else(
             || crate::report::placeholder("approved-checksum"),
             str::to_owned
-        )
+        ),
+        crate::report::placeholder(RESUME_ALLOW),
     );
     if let Some(failure) = failure {
         append_detail(&mut detail, &failure);
@@ -734,10 +745,11 @@ fn status_finding(environment: &str, state: &'static str, detail: Option<&str>) 
         // Named, for the same reason as `doctor`'s: `apply` requires a target,
         // and `status` reports on several environments at once.
         finding = finding.remedy(format!(
-            "pbps apply --env {} --plan {} --checksum {} --staged --resume",
+            "pbps apply --env {} --plan {} --checksum {} --allow {} --staged --resume",
             crate::report::env_arg(environment),
             crate::report::placeholder("plan.json"),
             crate::report::placeholder("approved-checksum"),
+            crate::report::placeholder(RESUME_ALLOW),
         ));
     }
     finding
@@ -886,6 +898,32 @@ mod tests {
         let found = findings(&[r]);
         let ids: Vec<&str> = found.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(ids, ["state.mid-deployment", "state.drift"]);
+    }
+
+    /// #1187: `--resume` passes the risk gate again, so a printed resume
+    /// without `--allow` is refused for every plan with a gated class. Both
+    /// the row's detail (which `--format json` carries too) and the finding's
+    /// remedy name the approval.
+    #[test]
+    fn the_printed_resume_carries_the_approval_the_gate_asks_for_again() {
+        for checksum in [None, Some("abc123")] {
+            let mut r = row("prod", "ok");
+            record_staged(&mut r, "prod", 1, 2, checksum);
+            let detail = r.detail.clone().unwrap();
+            assert!(
+                detail.contains("--allow \"<approved-risk-classes>\"`"),
+                "{detail}"
+            );
+            let found = findings(&[r]);
+            let remedy = found[0].remedy.as_deref().unwrap();
+            assert!(
+                remedy.contains("--allow \"<approved-risk-classes>\" --staged --resume"),
+                "{remedy}"
+            );
+            for text in [detail.as_str(), remedy] {
+                assert!(!crate::report::has_bare_placeholder(text), "{text}");
+            }
+        }
     }
 
     #[test]
