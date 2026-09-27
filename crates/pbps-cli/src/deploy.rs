@@ -598,10 +598,12 @@ pub(crate) fn refuse_occupied_objects(
         planned: true,
     };
     // `sp_rename` of a generated default, taken only when it is at `old` on
-    // `table`: to `new` when nothing holds it, else to `fallback` when nothing
-    // holds that (the emitter's own guards, DEC-981.1).
+    // `column` of `table`: to `new` when nothing holds it, else to `fallback`
+    // when nothing holds that (the emitter's own guards, #991, DEC-981.1). A
+    // hand-named default of another column under that name is not moved.
     let move_default = |held: &mut Vec<Held>,
                         table: &TableName,
+                        column: &str,
                         old: TableName,
                         new: TableName,
                         fallback: TableName| {
@@ -616,7 +618,10 @@ pub(crate) fn refuse_occupied_objects(
             return;
         };
         if let Some(h) = held.iter_mut().find(|h| {
-            h.name == old && h.kind == "default constraint" && h.parent.as_ref() == Some(table)
+            h.name == old
+                && h.kind == "default constraint"
+                && h.parent.as_ref() == Some(table)
+                && h.column.as_deref() == Some(column)
         }) {
             h.name = new;
             h.planned = true;
@@ -673,6 +678,7 @@ pub(crate) fn refuse_occupied_objects(
                         move_default(
                             &mut held,
                             to,
+                            column,
                             in_schema(to, &old),
                             in_schema(to, &generated(to, column)),
                             in_schema(to, &digested(to, column)),
@@ -690,10 +696,13 @@ pub(crate) fn refuse_occupied_objects(
                 let new = in_schema(table, &generated(table, to));
                 let fallback = in_schema(table, &digested(table, to));
                 for was in std::iter::once(table).chain(table_was) {
+                    // Still under `from`: the walk renames the column's
+                    // entries below, after the default has moved.
                     for old in left_under(was, from) {
                         move_default(
                             &mut held,
                             table,
+                            from,
                             in_schema(table, &old),
                             new.clone(),
                             fallback.clone(),
@@ -7249,6 +7258,17 @@ mod tests {
         let moves = plan(vec![rename_column(), create_at(&generated)]);
         refuse_occupied_objects(&moves, std::slice::from_ref(&the_default), "prod")
             .expect("the rename moves the default out of the way");
+        // A default another column owns under that name is not this
+        // column's: the emitter matches the column (#991), so the rename
+        // leaves it and the name stays held.
+        let on_another_column = NameOccupant {
+            parent_column: Some("b".into()),
+            ..the_default.clone()
+        };
+        assert!(
+            refuse_occupied_objects(&moves, &[on_another_column], "prod").is_err(),
+            "another column's default under this column's name is not moved"
+        );
         // #981: a taken target sends it to its digested fallback, which
         // frees the old name for the table created after it, as the emitted
         // SQL does. Only a taken fallback too keeps it where it is.
