@@ -1841,6 +1841,80 @@ async fn ledger_tables_their_history_and_their_views_are_not_pulled() {
     );
 }
 
+/// #1186: a key's backing index layout was never read, and the declarations
+/// spell no `CLUSTERED` or `NONCLUSTERED`, so bootstrap turned a heap's
+/// nonclustered primary key clustered and swapped a nonclustered primary key
+/// with a clustered unique constraint, and nothing compared unequal after.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_key_laid_out_against_its_kinds_default_is_reported_and_left_out() {
+    let mut db = TestDb::create("keys1186").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.h (id int NOT NULL CONSTRAINT pk_h PRIMARY KEY NONCLUSTERED (id));
+             CREATE TABLE dbo.u (
+                 id int NOT NULL, code int NOT NULL,
+                 CONSTRAINT pk_u PRIMARY KEY NONCLUSTERED (id),
+                 CONSTRAINT uq_u_code UNIQUE CLUSTERED (code)
+             );
+             CREATE TABLE dbo.c (
+                 id int NOT NULL CONSTRAINT pk_c PRIMARY KEY,
+                 code int NOT NULL CONSTRAINT uq_c_code UNIQUE
+             );",
+        )
+        .await
+        .expect("create keyed tables");
+    let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect keyed tables");
+    db.drop().await;
+
+    let table = |name: &str| &pulled.schema.tables[&TableName::new("dbo", name)];
+    assert_eq!(table("h").primary_key, None);
+    assert_eq!(table("u").primary_key, None);
+    assert!(table("u").unique.is_empty());
+    for (name, detail) in [
+        (
+            "h",
+            "primary key `pk_h` is backed by an index that is nonclustered",
+        ),
+        (
+            "u",
+            "primary key `pk_u` is backed by an index that is nonclustered",
+        ),
+        (
+            "u",
+            "unique constraint `uq_u_code` is backed by an index that is clustered",
+        ),
+    ] {
+        assert!(
+            pulled.limitations.iter().any(|l| {
+                l.target.object_name() == TableName::new("dbo", name) && l.detail.contains(detail)
+            }),
+            "{detail}: {:?}",
+            pulled.limitations
+        );
+    }
+    // The control table keeps both keys and adds no limitation.
+    assert_eq!(
+        table("c")
+            .primary_key
+            .as_ref()
+            .and_then(|pk| pk.name.as_deref()),
+        Some("pk_c")
+    );
+    assert!(table("c").unique.contains_key("uq_c_code"));
+    assert!(
+        !pulled
+            .limitations
+            .iter()
+            .any(|l| l.target.object_name() == TableName::new("dbo", "c")),
+        "{:?}",
+        pulled.limitations
+    );
+    assert_eq!(pulled.limitations.len(), 3, "{:?}", pulled.limitations);
+}
+
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {

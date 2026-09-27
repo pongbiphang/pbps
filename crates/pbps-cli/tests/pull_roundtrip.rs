@@ -55,6 +55,7 @@ fn full_catalog() -> RawCatalog {
             RawKeyColumn {
             is_disabled: false,
             ignore_dup_key: false,
+                index_type: 1,
                 object_id: 1,
                 constraint_name: "pk_customer".into(),
                 is_primary: true,
@@ -63,6 +64,7 @@ fn full_catalog() -> RawCatalog {
             RawKeyColumn {
             is_disabled: false,
             ignore_dup_key: false,
+                index_type: 2,
                 object_id: 1,
                 constraint_name: "uq_customer_email".into(),
                 is_primary: false,
@@ -71,6 +73,7 @@ fn full_catalog() -> RawCatalog {
             RawKeyColumn {
             is_disabled: false,
             ignore_dup_key: false,
+                index_type: 1,
                 object_id: 2,
                 constraint_name: "pk_region".into(),
                 is_primary: true,
