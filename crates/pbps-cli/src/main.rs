@@ -317,8 +317,12 @@ enum Command {
         checksum: String,
 
         /// Risk classes this deployment is approved for, comma-separated; an
-        /// empty value approves none
-        #[arg(long, value_delimiter = ',')]
+        /// empty value, or none at all, approves none
+        //
+        // Valueless as well as empty: Windows PowerShell 5.1 drops an empty
+        // `""` argument on its way to a native program, so the printed resume
+        // filled with nothing arrives as `--allow --staged` (#1203).
+        #[arg(long, value_delimiter = ',', num_args = 0..=1, default_missing_value = "")]
         allow: Vec<AllowedRisk>,
 
         /// Apply a staged plan: outside a transaction, one statement at a time
@@ -3319,6 +3323,33 @@ mod tests {
             })
         };
         assert_eq!(allowed("").unwrap(), vec![]);
+        // What Windows PowerShell 5.1 hands over for `--allow ""`: the empty
+        // argument dropped, so the next flag follows `--allow` directly.
+        let valueless = Cli::try_parse_from([
+            "pbps",
+            "apply",
+            "--db",
+            "x",
+            "--plan",
+            "p.json",
+            "--checksum",
+            &checksum,
+            "--allow",
+            "--staged",
+            "--resume",
+        ])
+        .unwrap();
+        let Command::Apply {
+            allow,
+            staged,
+            resume,
+            ..
+        } = valueless.command
+        else {
+            panic!("`pbps apply` parsed as another command");
+        };
+        assert!(allow.into_iter().all(|a| a.0.is_none()));
+        assert!(staged && resume);
         assert_eq!(
             allowed("rename,").unwrap(),
             vec![pbps_model::RiskClass::Rename]
