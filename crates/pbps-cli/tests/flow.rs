@@ -1968,6 +1968,66 @@ fn pull_round_trips_ordinary_engine_names_without_a_name_warning() {
     assert_eq!(code(&validate), 0, "{}", stderr(&validate));
 }
 
+/// #1214: a constraint the plan adds is checked against the database too,
+/// not only against what the plan itself puts there. A synonym already at
+/// the name of a check the plan adds refuses the plan by name, where the
+/// `ADD CONSTRAINT` used to reach apply and fail with Msg 2714. Control: the
+/// same check under a free name plans and applies.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_synonym_at_an_added_checks_name_refuses_the_plan() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "added_constraint_occupant");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE TABLE dbo.t (id int NOT NULL); CREATE SYNONYM dbo.ck_taken FOR dbo.t;",
+    );
+    let with_check = |case: &str, check: &str| {
+        let d = Demo::new(&format!("added-constraint-occupant-{case}"));
+        let o = d.run(&["pull", "--db", connection]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        d.commit();
+        let o = d.run(&["baseline", "--db", connection, "--reason", "adopt"]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        std::fs::write(
+            d.dir.join("schema/dbo.t.yml"),
+            format!(
+                "table: dbo.t\ncolumns:\n  id: {{type: int, nullable: false}}\n\
+                 checks:\n  {check}: id > 0\n"
+            ),
+        )
+        .unwrap();
+        let o = d.run(&["plan"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        d.commit();
+        let plan = d.dir.join("plan.json");
+        let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+        (d, plan, o)
+    };
+    let (_d, plan, o) = with_check("taken", "ck_taken");
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    let err = stderr(&o);
+    assert!(err.contains("already has synonym `dbo.ck_taken`"), "{err}");
+    assert!(!plan.exists(), "a refused plan wrote {}", plan.display());
+
+    let (d, plan, o) = with_check("free", "ck_free");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let checksum = plan_checksum(&plan);
+    let o = d.run(&[
+        "apply",
+        "--db",
+        connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+        "--allow",
+        "constraint",
+    ]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+}
+
 /// A sequence or a synonym already at the name of a table this plan creates
 /// refuses the plan by name, and no plan is written (#1077). SQL Server keeps
 /// tables, views, routines, sequences, synonyms and constraints in one
