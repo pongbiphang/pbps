@@ -85,30 +85,40 @@ impl InputManifest {
                 }
             }
         }
-        // A Table/Column label grants permission to aggregate children, but
-        // it proves neither that the owner nor that all its captured children
-        // were listed. Check the independent manifests (SPEC 9.3.2). Split
-        // inventories and rename endpoints may jointly account for the records.
+        // An aggregate label permits children but proves no inventory. Every
+        // catalog mutation must account for its independently captured owner
+        // and all owned records, even when that owner is not created/dropped.
         for step in &changes.changes {
-            if let Some((owner, opening, closing)) = lifecycle_owner(&step.change) {
-                for (manifest, inventory, required) in
-                    [(self, &removed, opening), (compiled, &installed, closing)]
-                {
-                    if !required {
-                        continue;
-                    }
-                    let mut owner_present = false;
-                    for record in manifest.prerequisites() {
-                        if record.ownership.permits(&owner, changes) {
-                            owner_present |= record.ownership.matches_surface(&owner, changes);
-                            if !inventory.contains(&record.object) {
-                                return Err(ManifestError::Incomplete);
-                            }
+            if let Some((candidates, opening, closing)) = changed_owners(&step.change) {
+                let complete = candidates.iter().any(|owner| {
+                    [
+                        (self, &removed, opening, true),
+                        (compiled, &installed, closing, false),
+                    ]
+                    .into_iter()
+                    .all(|(manifest, inventory, required, before)| {
+                        if !required {
+                            return true;
                         }
-                    }
-                    if !owner_present {
-                        return Err(ManifestError::Incomplete);
-                    }
+                        let records: Vec<_> = manifest
+                            .prerequisites()
+                            .iter()
+                            .filter(|p| p.ownership.permits(owner, changes))
+                            .collect();
+                        // A grant or constraint may follow an approved CREATE,
+                        // or precede a DROP. The typed plan must prove why the
+                        // owner is absent at that snapshot, not the inventory.
+                        if records.is_empty() && planned_absence(owner, changes, before) {
+                            return true;
+                        }
+                        records
+                            .iter()
+                            .any(|p| p.ownership.matches_surface(owner, changes))
+                            && records.iter().all(|p| inventory.contains(&p.object))
+                    })
+                });
+                if !complete {
+                    return Err(ManifestError::Incomplete);
                 }
             }
         }
@@ -188,24 +198,145 @@ impl InputManifest {
     }
 }
 
-// These changes create/remove the owner or relocate its complete catalog
-// inventory. An ADD COLUMN may aggregate under Table without changing every
-// other child of that table, so derive the owner from the typed change itself.
-#[allow(clippy::wildcard_enum_match_arm)]
-fn lifecycle_owner(change: &Change) -> Option<(Surface, bool, bool)> {
-    match change {
-        Change::CreateTable { name, .. } => Some((Surface::Table(name.clone()), false, true)),
-        Change::DropTable { name, .. } => Some((Surface::Table(name.clone()), true, false)),
-        Change::RenameTable { from, .. } => Some((Surface::Table(from.clone()), true, true)),
-        Change::AddColumn { table, name, .. } => {
-            Some((Surface::Column(table.column(name)), false, true))
-        }
-        Change::DropColumn { column, .. } => Some((Surface::Column(column.clone()), true, false)),
+// Exhaustive: adding a catalog mutation must explicitly name the owner and
+// its endpoints. An ADD COLUMN may aggregate under Table without changing
+// unrelated children, so the typed change determines the minimum owner.
+fn changed_owners(change: &Change) -> Option<(Vec<Surface>, bool, bool)> {
+    let (owner, opening, closing) = match change {
+        Change::CreateTable { name, .. } => (Surface::Table(name.clone()), false, true),
+        Change::DropTable { name, .. } => (Surface::Table(name.clone()), true, false),
+        Change::RenameTable { from, .. } => (Surface::Table(from.clone()), true, true),
+        Change::AddColumn { table, name, .. } => (Surface::Column(table.column(name)), false, true),
+        Change::DropColumn { column, .. } => (Surface::Column(column.clone()), true, false),
         Change::RenameColumn { table, from, .. } => {
-            Some((Surface::Column(table.column(from)), true, true))
+            (Surface::Column(table.column(from)), true, true)
         }
-        _ => None,
-    }
+        Change::AlterColumnType { column, .. } | Change::AlterColumnNullability { column, .. } => {
+            (Surface::Column(column.clone()), true, true)
+        }
+        Change::AlterColumnDefault {
+            column, from, to, ..
+        } => (
+            Surface::Default(column.clone()),
+            from.is_some(),
+            to.is_some(),
+        ),
+        Change::SetPrimaryKey { table, .. }
+        | Change::AddUnique { table, .. }
+        | Change::DropUnique { table, .. }
+        | Change::AddForeignKey { table, .. }
+        | Change::DropForeignKey { table, .. } => (Surface::Table(table.clone()), true, true),
+        Change::AddCheck { table, name, .. } => (
+            Surface::Check {
+                table: table.clone(),
+                name: name.clone(),
+            },
+            false,
+            true,
+        ),
+        Change::DropCheck { table, name } => (
+            Surface::Check {
+                table: table.clone(),
+                name: name.clone(),
+            },
+            true,
+            false,
+        ),
+        Change::AddIndex { table, name, .. } => (
+            Surface::Index {
+                table: table.clone(),
+                name: name.clone(),
+            },
+            false,
+            true,
+        ),
+        Change::DropIndex { table, name } => (
+            Surface::Index {
+                table: table.clone(),
+                name: name.clone(),
+            },
+            true,
+            false,
+        ),
+        Change::CreateModule { id, .. } => (Surface::Module(id.clone()), false, true),
+        Change::AlterModule { id, .. } => (Surface::Module(id.clone()), true, true),
+        Change::DropModule { id, .. } => (Surface::Module(id.clone()), true, false),
+        Change::PublicExecution { routine, .. } => (
+            Surface::Module(ModuleId::Routine(routine.clone())),
+            true,
+            true,
+        ),
+        Change::Grant { target, .. } | Change::Revoke { target, .. } => match target {
+            GrantTarget::Schema(name) => (Surface::Namespace(name.clone()), true, true),
+            GrantTarget::Routine(id) => {
+                (Surface::Module(ModuleId::Routine(id.clone())), true, true)
+            }
+            // An object grant may address a table or a named module. One
+            // independently owned target must account for both endpoints.
+            GrantTarget::Object(name) => {
+                return Some((
+                    vec![
+                        Surface::Table(name.clone()),
+                        Surface::Module(ModuleId::Named(name.clone())),
+                    ],
+                    true,
+                    true,
+                ));
+            }
+        },
+        Change::InsertRow { .. }
+        | Change::UpdateRow { .. }
+        | Change::DeleteRow { .. }
+        | Change::SetDataMode { .. }
+        | Change::SetColumnDeprecated { .. }
+        | Change::CreateRole { .. }
+        | Change::RenameRole { .. }
+        | Change::DropRole { .. } => return None,
+    };
+    Some((vec![owner], opening, closing))
+}
+
+// Only an approved lifecycle operation can explain a missing endpoint for a
+// mutation. Parent creation/removal owns its children; unrelated DDL cannot
+// excuse a missing prerequisite (SPEC 9.3.2).
+#[allow(clippy::wildcard_enum_match_arm)]
+fn planned_absence(owner: &Surface, changes: &ChangeSet, before: bool) -> bool {
+    let ownership = super::ObjectOwnership::Surface(owner.clone());
+    changes.changes.iter().any(|step| {
+        let boundary = match &step.change {
+            Change::CreateTable { name, .. } if before => Surface::Table(name.clone()),
+            Change::DropTable { name, .. } if !before => Surface::Table(name.clone()),
+            Change::AddColumn { table, name, .. } if before => Surface::Column(table.column(name)),
+            Change::DropColumn { column, .. } if !before => Surface::Column(column.clone()),
+            Change::CreateModule { id, .. } if before => Surface::Module(id.clone()),
+            Change::DropModule { id, .. } if !before => Surface::Module(id.clone()),
+            Change::AddCheck { table, name, .. } if before => Surface::Check {
+                table: table.clone(),
+                name: name.clone(),
+            },
+            Change::DropCheck { table, name } if !before => Surface::Check {
+                table: table.clone(),
+                name: name.clone(),
+            },
+            Change::AddIndex { table, name, .. } if before => Surface::Index {
+                table: table.clone(),
+                name: name.clone(),
+            },
+            Change::DropIndex { table, name } if !before => Surface::Index {
+                table: table.clone(),
+                name: name.clone(),
+            },
+            Change::AlterColumnDefault {
+                column, from, to, ..
+            } if (before && from.is_none() && to.is_some())
+                || (!before && from.is_some() && to.is_none()) =>
+            {
+                Surface::Default(column.clone())
+            }
+            _ => return false,
+        };
+        ownership.permits(&boundary, changes)
+    })
 }
 
 // A child record can be touched by its owner's DDL without accounting for

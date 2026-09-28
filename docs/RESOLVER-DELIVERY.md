@@ -215,9 +215,11 @@ preserving untouched external inputs. Each transitioned record must carry an
 independently captured typed owner on its opening/closing prerequisite. An
 inventory cannot confer ownership merely by listing an object. Aggregate table
 and column owners and explicitly approved rename endpoints remain valid.
-Table/column creation, removal and rename inventories must include the changed
-owner and all of its qualified records present in the corresponding manifest;
-an aggregate label cannot hide an omitted owner behind a listed child.
+Every catalog mutation inventory must include the changed owner and all of its
+qualified records in each applicable manifest, including type/nullability,
+constraint, module and authorization changes. Only an approved creation/removal
+can explain an absent endpoint; a grant on a newly created target remains valid.
+An aggregate label cannot hide an omitted owner behind a listed child.
 References to external objects are not ownership. Raw catalog captures mark
 ownership unqualified and cannot authorize transitions until #615's qualified
 adapter bridge supplies that evidence. Missing ownership refuses on read.

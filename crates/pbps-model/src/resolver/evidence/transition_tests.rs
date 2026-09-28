@@ -1156,3 +1156,261 @@ fn aggregate_renames_require_owned_records_at_both_endpoints() {
         }
     }
 }
+
+// Both opaque records belong to the changed owner, but only the first is
+// the owner itself. A subordinate-only inventory must not keep its old hash.
+fn mutation_inventory(change: Change, owner: Surface, child: Surface) {
+    let table: TableName = "app.v".parse().unwrap();
+    let (_, mut evidence) = owner_coverage(
+        Change::DropTable {
+            uid: "t_000000".parse().unwrap(),
+            name: table.clone(),
+        },
+        Surface::Table(table.clone()),
+        Surface::Default(table.column("n")),
+        false,
+    );
+    let root = evidence
+        .before
+        .prerequisites()
+        .iter()
+        .find(|p| p.ownership == ObjectOwnership::Surface(Surface::Table(table.clone())))
+        .unwrap()
+        .object
+        .clone();
+    let subordinate = evidence.transitions[0]
+        .before
+        .iter()
+        .find(|id| **id != root)
+        .unwrap()
+        .clone();
+    own(&mut evidence.before, &root, owner.clone());
+    own(&mut evidence.before, &subordinate, child);
+    let mut compiled = serde_json::to_value(&evidence.before).unwrap();
+    for p in compiled["prerequisites"].as_array_mut().unwrap() {
+        if p["object"] == serde_json::to_value(&root).unwrap() {
+            p["properties"] = serde_json::json!("ab".repeat(32));
+        }
+    }
+    let compiled: InputManifest = serde_json::from_value(compiled).unwrap();
+    let changes = ChangeSet {
+        changes: vec![PlannedChange::new(change)],
+    };
+    evidence.surfaces.clear();
+    if matches!(owner, Surface::Module(_)) {
+        let observed = crate::resolver::BoundSurface {
+            object: root.clone(),
+            bindings: vec![],
+            managed_inputs: BTreeSet::new(),
+        };
+        evidence.surfaces.push(SurfaceResolution {
+            surface: owner.clone(),
+            current: Some(observed.clone()),
+            desired: Some(observed),
+        });
+    }
+    evidence.transitions[0].surface = owner;
+    evidence.transitions[0].after = evidence.transitions[0].before.clone();
+    evidence.after = evidence
+        .before
+        .project(&changes, &compiled, &evidence.transitions)
+        .unwrap();
+    evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
+    if matches!(
+        changes.changes[0].change,
+        Change::Grant { .. } | Change::Revoke { .. }
+    ) {
+        evidence.authorization.changes = BTreeSet::from([0]);
+    }
+    evidence.validate(&changes).unwrap();
+    assert_eq!(evidence.after, compiled);
+    for missing in [&root, &subordinate] {
+        let mut omitted = evidence.clone();
+        omitted.transitions[0].before.remove(missing);
+        omitted.transitions[0].after.remove(missing);
+        assert!(
+            evidence
+                .before
+                .project(&changes, &compiled, &omitted.transitions)
+                .is_err(),
+            "mutation projection accepted an omitted owned record"
+        );
+        assert!(
+            ResolverEvidence::new(
+                &changes,
+                evidence.qualification.clone(),
+                evidence.authorization.clone(),
+                evidence.before.clone(),
+                &compiled,
+                evidence.surfaces.clone(),
+                omitted.transitions.clone(),
+                evidence.ordering.clone()
+            )
+            .is_err(),
+            "mutation constructor accepted an omitted owned record"
+        );
+        // Retaining the old owner fingerprint is exactly what the bad
+        // projection does; membership and identities remain well formed.
+        omitted.after = evidence.before.clone();
+        let decoded: ResolverEvidence =
+            serde_json::from_value(serde_json::to_value(omitted).unwrap()).unwrap();
+        assert!(
+            decoded.validate(&changes).is_err(),
+            "mutation reader accepted a stale owner"
+        );
+    }
+}
+
+#[test]
+fn column_type_mutations_require_complete_owner_inventories() {
+    let table: TableName = "app.v".parse().unwrap();
+    mutation_inventory(
+        Change::AlterColumnType {
+            uid: "c_000000".parse().unwrap(),
+            column: table.column("n"),
+            from: "integer".parse().unwrap(),
+            to: "bigint".parse().unwrap(),
+            from_nullable: true,
+            to_nullable: true,
+        },
+        Surface::Column(table.column("n")),
+        Surface::Default(table.column("n")),
+    );
+}
+
+#[test]
+fn nullability_mutations_require_complete_owner_inventories() {
+    let table: TableName = "app.v".parse().unwrap();
+    for to_nullable in [false, true] {
+        mutation_inventory(
+            Change::AlterColumnNullability {
+                uid: "c_000000".parse().unwrap(),
+                column: table.column("n"),
+                ty: "integer".parse().unwrap(),
+                to_nullable,
+            },
+            Surface::Column(table.column("n")),
+            Surface::Default(table.column("n")),
+        );
+    }
+}
+
+#[test]
+fn table_constraint_mutations_require_complete_owner_inventories() {
+    let table: TableName = "app.v".parse().unwrap();
+    for change in [
+        Change::SetPrimaryKey {
+            table: table.clone(),
+            from: None,
+            to: Some(serde_json::from_value(serde_json::json!({"columns":["n"]})).unwrap()),
+        },
+        Change::AddUnique {
+            table: table.clone(),
+            name: "uq".into(),
+            constraint: serde_json::from_value(serde_json::json!({"columns":["n"]})).unwrap(),
+        },
+        Change::DropUnique {
+            table: table.clone(),
+            name: "uq".into(),
+        },
+        Change::DropForeignKey {
+            table: table.clone(),
+            name: "fk".into(),
+        },
+    ] {
+        mutation_inventory(
+            change,
+            Surface::Table(table.clone()),
+            Surface::Default(table.column("n")),
+        );
+    }
+}
+
+#[test]
+fn authorization_mutations_require_complete_target_inventories() {
+    let table: TableName = "app.v".parse().unwrap();
+    for change in [
+        Change::Grant {
+            role: "reader".into(),
+            target: crate::GrantTarget::Object(table.clone()),
+            permissions: BTreeSet::from([crate::Permission::Select]),
+        },
+        Change::Revoke {
+            role: "reader".into(),
+            target: crate::GrantTarget::Object(table.clone()),
+            permissions: BTreeSet::from([crate::Permission::Select]),
+        },
+    ] {
+        mutation_inventory(
+            change,
+            Surface::Table(table.clone()),
+            Surface::Default(table.column("n")),
+        );
+    }
+}
+
+#[test]
+fn module_mutations_require_complete_owned_inventories() {
+    let plan = super::tests::plan();
+    let Change::CreateModule { id, module } = plan.changes.changes[0].change.clone() else {
+        panic!("module")
+    };
+    let owner = Surface::Module(id.clone());
+    mutation_inventory(Change::AlterModule { id, module }, owner.clone(), owner);
+}
+
+#[test]
+fn mutations_of_created_or_removed_targets_use_the_planned_endpoint() {
+    let table: TableName = "app.v".parse().unwrap();
+    for creating in [false, true] {
+        let change = if creating {
+            Change::CreateTable { uid: "t_000000".parse().unwrap(), name: table.clone(),
+                table: Box::new(serde_json::from_value(serde_json::json!({"columns":{"n":{"type":"integer","nullable":true,"default":"7"}}})).unwrap()) }
+        } else {
+            Change::DropTable {
+                uid: "t_000000".parse().unwrap(),
+                name: table.clone(),
+            }
+        };
+        let (mut changes, mut evidence) = owner_coverage(
+            change,
+            Surface::Table(table.clone()),
+            Surface::Default(table.column("n")),
+            creating,
+        );
+        let grant = Change::Grant {
+            role: "reader".into(),
+            target: crate::GrantTarget::Object(table.clone()),
+            permissions: BTreeSet::from([crate::Permission::Select]),
+        };
+        if creating {
+            changes.changes.push(PlannedChange::new(grant));
+            changes
+                .changes
+                .push(PlannedChange::new(Change::SetPrimaryKey {
+                    table: table.clone(),
+                    from: None,
+                    to: Some(serde_json::from_value(serde_json::json!({"columns":["n"]})).unwrap()),
+                }));
+            evidence.authorization.changes = BTreeSet::from([1]);
+        } else {
+            changes.changes.insert(0, PlannedChange::new(grant));
+            evidence.authorization.changes = BTreeSet::from([0]);
+        }
+        evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
+        evidence.validate(&changes).unwrap();
+        let mut unplanned = changes.clone();
+        unplanned.changes.retain(|p| {
+            !matches!(
+                p.change,
+                Change::CreateTable { .. } | Change::DropTable { .. }
+            )
+        });
+        evidence.authorization.changes = BTreeSet::from([0]);
+        evidence.ordering = OrderingProof::new(&unplanned, BTreeSet::new()).unwrap();
+        assert!(
+            evidence.validate(&unplanned).is_err(),
+            "unplanned absent endpoint accepted"
+        );
+    }
+}
