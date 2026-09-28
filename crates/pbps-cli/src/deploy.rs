@@ -5489,6 +5489,15 @@ fn apply_identified(
         );
     }
     crate::validate_saved_plan(plan, dialect)?;
+    // #614 defines the artifact contract; #616 supplies coherent transactional
+    // rechecks. Until those exist, never apply evidence as an ordinary plan.
+    if matches!(
+        plan.analysis,
+        pbps_model::resolver::PlanAnalysis::Resolved(_)
+    ) {
+        bail!("this build cannot yet enforce resolver pre/postconditions during apply (#616)");
+    }
+
     // The mode lives in the file because that is what the gate approved; the
     // flag exists so that the CI configuration says out loud which kind of
     // deployment this is. A disagreement between them is somebody's mistake,

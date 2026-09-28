@@ -277,6 +277,7 @@ fn read_plan(path: &std::path::Path) -> anyhow::Result<SavedPlan> {
             pbps_model::plan::CURRENT_VERSION
         );
     }
+    crate::engine::validate_plan_analysis(&plan)?;
     Ok(plan)
 }
 
@@ -589,6 +590,8 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
         "  origin      {}\n",
         match plan.origin {
             PlanOrigin::Database => "computed against the target environment — applyable",
+            PlanOrigin::ResolvedDatabase =>
+                "computed against the target with sealed resolver evidence",
             PlanOrigin::Preview => "computed offline — a preview; `apply` will refuse it",
         }
     ));
@@ -850,5 +853,35 @@ mod tests {
     #[test]
     fn an_empty_value_is_not_silently_dropped() {
         assert_eq!(shell_arg("").unwrap(), "\"\"");
+    }
+    #[test]
+    fn explain_refuses_downgraded_required_analysis_before_showing_approval() {
+        let path =
+            std::env::temp_dir().join(format!("pbps614-explain-{}.json", rand::random::<u64>()));
+        let mut plan = SavedPlan::new(
+            pbps_model::PlanOrigin::Database,
+            "postgres",
+            "fixture",
+            pbps_model::PlanBaseline {
+                description: "fixture".into(),
+                checksum: "00".repeat(32),
+            },
+            pbps_model::ChangeSet::default(),
+            pbps_model::IdsFile::default(),
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        use std::io::Write;
+        file.write_all(serde_json::to_string(&plan).unwrap().as_bytes())
+            .unwrap();
+        assert!(read_plan(&path).is_ok());
+        plan.origin = pbps_model::PlanOrigin::ResolvedDatabase;
+        std::fs::write(&path, serde_json::to_vec(&plan).unwrap()).unwrap();
+        let result = read_plan(&path);
+        std::fs::remove_file(path).unwrap();
+        assert!(result.is_err());
     }
 }

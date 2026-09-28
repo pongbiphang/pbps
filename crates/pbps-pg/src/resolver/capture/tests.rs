@@ -363,3 +363,83 @@ async fn exercise_capture(connection: String) {
                 .is_some_and(|id| id.class == "pg_namespace" && id.name == ["app"])
     }));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn persisted_inputs_use_the_environment_key_and_never_export_source() {
+    use pbps_db::fingerprint::EnvironmentFingerprintKey;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let token = crate::catalog::probe_token().replace('-', "_");
+    let mut keys = Vec::new();
+    for (i, encoded) in [
+        "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+        "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let path = std::env::temp_dir().join(format!("pbps614-key-{token}-{i}"));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        file.write_all(encoded.as_bytes()).unwrap();
+        let key = EnvironmentFingerprintKey::from_file(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        keys.push(key);
+    }
+    for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+        let base = std::env::var(variable).expect("live PostgreSQL fixture setting");
+        let name = format!("pbps_seal614_{token}");
+        let mut admin = Conn::connect(Driver::Postgres, &base).await.unwrap();
+        admin
+            .execute(&format!("CREATE DATABASE {name}"))
+            .await
+            .unwrap();
+        let connection = format!("{base} dbname={name}");
+        let a = keys[0].clone();
+        let b = keys[1].clone();
+        let result = tokio::task::LocalSet::new().run_until(async move {
+            tokio::task::spawn_local(async move {
+                let mut conn = Conn::connect(Driver::Postgres, &connection).await.unwrap();
+                conn.execute("CREATE SCHEMA app; CREATE TABLE app.t(id integer); CREATE FUNCTION app.private_value() RETURNS text LANGUAGE SQL AS 'SELECT ''private-literal-614''::text'; CREATE VIEW app.historical AS SELECT app.private_value() AS value FROM app.t").await.unwrap();
+                let captured = capture(&mut conn, &fixture_scope()).await.unwrap();
+                let first = captured.seal(&a).unwrap();
+                let second = captured.seal(&b).unwrap();
+                assert_ne!(first.key_id(), second.key_id());
+                assert_eq!(first.prerequisites().len(), second.prerequisites().len());
+                assert!(!first.prerequisites().is_empty());
+                assert!(first.prerequisites().iter().all(|p| matches!(
+                    p.ownership, pbps_model::resolver::ObjectOwnership::Unqualified
+                )), "raw catalog capture cannot authorize managed transitions");
+                for (left, right) in first.prerequisites().iter().zip(second.prerequisites()) {
+                    assert_eq!(left.object, right.object);
+                    assert_ne!(left.properties, right.properties);
+                    // Compare with the actual canonical private bytes, not an
+                    // unrelated hash that would make the negative trivial.
+                    use sha2::{Digest, Sha256};
+                    let properties = &captured.inputs[&left.object].properties;
+                    let bare = format!("{:x}", Sha256::digest(serde_json::to_vec(properties).unwrap()));
+                    assert_ne!(left.properties, bare);
+                }
+                let json = serde_json::to_string(&first).unwrap();
+                assert!(!json.contains("private-literal-614"));
+                assert!(!json.contains("SELECT"));
+                assert_eq!(serde_json::from_str::<pbps_model::resolver::InputManifest>(&json).unwrap(), first);
+                assert_eq!(captured.seal(&a).unwrap(), first);
+                conn.execute("CREATE OR REPLACE FUNCTION app.private_value() RETURNS text LANGUAGE SQL AS 'SELECT ''changed-literal-614''::text'").await.unwrap();
+                let changed = capture(&mut conn, &fixture_scope()).await.unwrap().seal(&a).unwrap();
+                assert_ne!(first, changed, "private literal changes must remain pinned");
+            }).await
+        }).await;
+        admin
+            .execute(&format!("DROP DATABASE {name} WITH (FORCE)"))
+            .await
+            .unwrap();
+        result.expect("sealing API fixture failed after cleanup");
+    }
+}

@@ -1,7 +1,7 @@
 //! Private target-input capture components (ADR-0016; issue #612).
 //!
-//! Source and derived verifiers stay in memory. No saved-plan or publication
-//! path is enabled by these components; the engine adapter must qualify the
+//! Source stays in memory; a fresh authorized read can seal keyed fingerprints.
+//! No saved-plan publication path is enabled by these components; the engine adapter must qualify the
 //! requested read scope and the lifecycle must qualify non-snapshot inputs.
 
 mod bindings;
@@ -119,6 +119,20 @@ pub async fn capture_identifying(
     .map_err(CaptureError::Coverage)
 }
 
+/// Read and seal on behalf of the holder of catalog-read authority. A
+/// previously captured result cannot be fingerprinted under a recipient's
+/// chosen key: that would expose its private properties as a guessing oracle.
+/// Runtime qualification is still separate; this is not verified plan evidence.
+pub async fn capture_sealed(
+    connection: &mut impl pbps_db::transport::QueryConnection,
+    scope: &CaptureScope,
+    dropped: &BTreeSet<DroppedSignature>,
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+) -> Result<pbps_model::resolver::InputManifest, CaptureError> {
+    let captured = capture_identifying(connection, scope, dropped).await?;
+    captured.seal(key).map_err(|_| CaptureError::Incomplete)
+}
+
 /// Give the producer of a fresh coherent database read its native-input
 /// capability separately from ordinary captured evidence (DEC-974.1).
 ///
@@ -209,3 +223,9 @@ mod native_inputs;
 pub use native_inputs::{
     NativeLibrary, NativeLibraryReader, RuntimeResolution, native_library_candidates,
 };
+
+#[cfg(test)]
+mod ordering_tests;
+
+#[cfg(test)]
+mod metadata_tests;

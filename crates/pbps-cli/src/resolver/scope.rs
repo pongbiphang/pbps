@@ -281,6 +281,88 @@ impl Authorization {
         }
     }
 
+    /// Persist both sides under the configured environment key. These bytes
+    /// come from the measured context and the adapter's grant projection, not
+    /// from a process-key digest or a caller-chosen expected hash.
+    pub fn persisted(
+        &self,
+        key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+        changes: &pbps_model::ChangeSet,
+    ) -> Result<pbps_model::resolver::AuthorizationCondition, String> {
+        use pbps_model::{Change, GrantTarget};
+        let mut planned = Vec::new();
+        for p in &changes.changes {
+            if matches!(
+                p.change,
+                Change::CreateRole { .. } | Change::RenameRole { .. } | Change::DropRole { .. }
+            ) {
+                return Err("persistent PostgreSQL authorization cannot project cluster role identity changes".into());
+            }
+            if let Change::Grant {
+                role,
+                target: GrantTarget::Schema(schema),
+                permissions,
+            }
+            | Change::Revoke {
+                role,
+                target: GrantTarget::Schema(schema),
+                permissions,
+            } = &p.change
+            {
+                for permission in permissions {
+                    planned.push(PlannedGrant {
+                        principal: role.clone(),
+                        schema: schema.clone(),
+                        privilege: permission.as_str().to_ascii_uppercase().replace('-', " "),
+                        revoke: matches!(p.change, Change::Revoke { .. }),
+                    });
+                }
+            }
+        }
+        if !self.unpredictable(&planned).is_empty() {
+            return Err("the adapter cannot derive the approved authorization transition".into());
+        }
+        let (before, after) = match self {
+            Self::Postgres(context) => (
+                context.canonical(),
+                pg_auth::with_planned(context.clone(), &pg_planned(&planned)).canonical(),
+            ),
+            Self::Mssql(_) => {
+                return Err(
+                    "persistent SQL Server resolver authorization is not implemented".into(),
+                );
+            }
+        };
+        let fingerprint = |bytes: &[u8]| {
+            key.fingerprint(AUTHORIZATION_RULE, "authorization", bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        Ok(pbps_model::resolver::AuthorizationCondition {
+            rule: self.rule().into(),
+            before: fingerprint(&before),
+            after: fingerprint(&after),
+            changes: changes
+                .changes
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| {
+                    matches!(
+                        p.change,
+                        Change::Grant { .. }
+                            | Change::Revoke { .. }
+                            | Change::PublicExecution { .. }
+                            | Change::CreateRole { .. }
+                            | Change::RenameRole { .. }
+                            | Change::DropRole { .. }
+                    )
+                })
+                .map(|(i, _)| i)
+                .collect(),
+        })
+    }
+
     /// Planned grants whose outcome the adapter cannot stand behind, named.
     /// PostgreSQL's is a grantor the engine would pick among several
     /// inherited option holders; SQL Server runs the grants through the
@@ -613,7 +695,7 @@ mod tests {
                 "app".to_owned(),
                 pg_auth::SchemaAuthorization {
                     owner: "d".into(),
-                    privileges: BTreeMap::new(),
+                    privileges: BTreeMap::from([("USAGE".into(), true), ("CREATE".into(), true)]),
                     acl: BTreeMap::new(),
                 },
             )]
@@ -628,5 +710,48 @@ mod tests {
         );
         assert_eq!(postgres.digest(), postgres.clone().digest());
         assert_eq!(postgres.rule(), "pg-auth-v1");
+        #[cfg(unix)]
+        {
+            use pbps_db::fingerprint::EnvironmentFingerprintKey;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let path =
+                std::env::temp_dir().join(format!("pbps614-auth-key-{}", rand::random::<u64>()));
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .unwrap();
+            file.write_all(b"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=")
+                .unwrap();
+            let key = EnvironmentFingerprintKey::from_file(&path).unwrap();
+            std::fs::remove_file(path).unwrap();
+            let unchanged = postgres
+                .persisted(&key, &pbps_model::ChangeSet::default())
+                .unwrap();
+            assert_eq!(unchanged.before, unchanged.after);
+            let changes = pbps_model::ChangeSet {
+                changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Grant {
+                    role: "PUBLIC".into(),
+                    target: pbps_model::GrantTarget::Schema("app".into()),
+                    permissions: std::collections::BTreeSet::from([pbps_model::Permission::Usage]),
+                })],
+            };
+            let projected = postgres.persisted(&key, &changes).unwrap();
+            assert_eq!(projected.before, unchanged.before);
+            assert_ne!(projected.before, projected.after);
+            assert_ne!(projected.before, postgres.digest());
+            assert_eq!(projected.changes, std::collections::BTreeSet::from([0]));
+            let unsupported = pbps_model::ChangeSet {
+                changes: vec![pbps_model::PlannedChange::new(
+                    pbps_model::Change::CreateRole {
+                        uid: "r_aaaaaa".parse().unwrap(),
+                        name: "new_role".into(),
+                    },
+                )],
+            };
+            assert!(postgres.persisted(&key, &unsupported).is_err());
+        }
     }
 }

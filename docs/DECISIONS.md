@@ -622,3 +622,4 @@ other numbers before landing. Some records still mention them as proposals.
 | 541 | [compose-and-ui](decisions/compose-and-ui.md#decision-541) | A compose destination is a credential-free identity; authentication is reacquired per invocation, and an endpoint that cannot be represented without a secret is refused. |
 | 542 | [resolver](decisions/resolver.md#decision-542) | The resolver qualifies inherited seccomp behavior before releasing its fixed bootstrap, without tracing processes (#633). |
 | 543 | [connection](decisions/connection.md#decision-543) | A PostgreSQL connection string that names no `sslmode` is connected with verified TLS, not the driver's `prefer`. |
+| DEC-614.1 | [resolver](decisions/resolver.md#dec-614-1) | Resolver evidence and its final typed order are required, versioned and separate from Schema; closing inputs derive from approved changes. |

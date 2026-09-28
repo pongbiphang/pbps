@@ -123,7 +123,10 @@ use crate::schema::Schema;
 /// old one left the layout to the engine, so the same plan could be refused
 /// (1902) where it was reviewed as applying, or build a layout nobody
 /// reviewed. Turned away as stale; the remedy is a new `plan --db`.
-pub const CURRENT_VERSION: u32 = 11;
+///
+/// Bumped to 12 for required analysis provenance and sealed resolver evidence.
+/// Omitting analysis must never downgrade a resolved plan to an ordinary one.
+pub const CURRENT_VERSION: u32 = 12;
 
 /// Where a plan came from, and therefore whether it may be applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -134,11 +137,13 @@ pub enum PlanOrigin {
     Preview,
     /// Computed against the target environment as queried (`plan --db`).
     Database,
+    /// Computed against the target with required, sealed resolver evidence.
+    ResolvedDatabase,
 }
 
 impl PlanOrigin {
     pub const fn is_applyable(self) -> bool {
-        matches!(self, PlanOrigin::Database)
+        matches!(self, PlanOrigin::Database | PlanOrigin::ResolvedDatabase)
     }
 }
 
@@ -199,6 +204,10 @@ pub struct SavedPlan {
     pub version: u32,
 
     pub origin: PlanOrigin,
+
+    /// Required even for ordinary plans. A missing resolver contract is not
+    /// interpreted as absence of resolver requirements.
+    pub analysis: crate::resolver::PlanAnalysis,
 
     /// How this plan is to be executed.
     ///
@@ -317,6 +326,7 @@ impl SavedPlan {
         Self {
             version: CURRENT_VERSION,
             origin,
+            analysis: crate::resolver::PlanAnalysis::Ordinary,
             mode: PlanMode::Transactional,
             dialect: dialect.into(),
             created_at: created_at.into(),
@@ -327,6 +337,34 @@ impl SavedPlan {
             ids,
             data: BTreeMap::new(),
             routine_pins: None,
+        }
+    }
+
+    /// Attach already sealed evidence without permitting an offline or staged
+    /// artifact to acquire resolver provenance.
+    pub fn with_resolution(
+        mut self,
+        evidence: crate::resolver::ResolverEvidence,
+    ) -> Result<Self, crate::resolver::EvidenceError> {
+        if self.origin != PlanOrigin::Database || self.mode != PlanMode::Transactional {
+            return Err(crate::resolver::EvidenceError::Incomplete);
+        }
+        evidence.validate(&self.changes)?;
+        self.origin = PlanOrigin::ResolvedDatabase;
+        self.analysis = crate::resolver::PlanAnalysis::Resolved(Box::new(evidence));
+        Ok(self)
+    }
+
+    pub fn validate_analysis(&self) -> Result<(), crate::resolver::EvidenceError> {
+        use crate::resolver::{EvidenceError, PlanAnalysis};
+        match (&self.analysis, self.origin, self.mode) {
+            (PlanAnalysis::Ordinary, PlanOrigin::Database | PlanOrigin::Preview, _) => Ok(()),
+            (
+                PlanAnalysis::Resolved(evidence),
+                PlanOrigin::ResolvedDatabase,
+                PlanMode::Transactional,
+            ) => evidence.validate(&self.changes),
+            _ => Err(EvidenceError::Incomplete),
         }
     }
 
@@ -533,7 +571,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 11);
+        assert_eq!(CURRENT_VERSION, 12);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads

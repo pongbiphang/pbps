@@ -52,6 +52,15 @@ pub(super) struct Input {
 ///     captured.runtime_inputs().unwrap()
 /// }
 /// ```
+/// A result consumer cannot select a known key and test guesses of private
+/// properties. Only a fresh catalog read grants sealing authority:
+/// ```compile_fail,E0624
+/// use pbps_pg::resolver::capture::CapturedInputs;
+/// use pbps_db::fingerprint::EnvironmentFingerprintKey;
+/// fn probe(captured: &CapturedInputs, chosen: &EnvironmentFingerprintKey) {
+///     let _ = captured.seal(chosen);
+/// }
+/// ```
 pub struct CapturedInputs {
     baseline: super::baseline::Baseline,
     session: super::session::Facts,
@@ -66,6 +75,106 @@ pub struct CapturedInputs {
 }
 
 impl CapturedInputs {
+    /// Persistable catalog facts, keyed by the target environment. This is
+    /// still catalog evidence only: it does not confer runtime qualification.
+    /// No property value, including an external definition's literals, crosses
+    /// this boundary. The process-key comparison API cannot supply this key.
+    /// Only the producer of a fresh read may seal private inputs. An ordinary
+    /// recipient must not test guesses by supplying a known key (DEC-974.1).
+    /// ```compile_fail,E0624
+    /// use pbps_pg::resolver::capture::CapturedInputs;
+    /// use pbps_db::fingerprint::FingerprintKey;
+    /// fn persist(captured: &CapturedInputs) {
+    ///     let _ = captured.seal(FingerprintKey::process());
+    /// }
+    /// ```
+    pub(super) fn seal(
+        &self,
+        key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+    ) -> Result<pbps_model::resolver::InputManifest, pbps_model::resolver::ManifestError> {
+        use pbps_model::resolver::{
+            Binding, CandidateSet, InputManifest, Membership, Prerequisite, ReadScope,
+            RoutineLookup,
+        };
+        let digest = |component: &str, bytes: Vec<u8>| -> String {
+            key.fingerprint(self.rule, component, &bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        let candidate = |q: &super::CandidateSet| CandidateSet {
+            class: q.class.catalog().into(),
+            namespace: q.namespace.clone(),
+            name: q.name.clone(),
+        };
+        let mut membership: Vec<_> = self
+            .candidates
+            .iter()
+            .map(|(q, members)| Membership {
+                predicate: candidate(q),
+                members: members.clone(),
+            })
+            .collect();
+        membership.sort_by(|a, b| a.predicate.cmp(&b.predicate));
+        InputManifest::new(
+            self.rule.into(),
+            self.major,
+            key.id().as_str().into(),
+            ReadScope {
+                retained: self.scope.retained.clone(),
+                candidates: self.scope.candidates.iter().map(candidate).collect(),
+            },
+            digest(
+                "baseline",
+                serde_json::to_vec(&self.baseline).expect("baseline serializes"),
+            ),
+            digest(
+                "session",
+                serde_json::to_vec(&self.session).expect("session serializes"),
+            ),
+            self.inputs
+                .iter()
+                .map(|(object, input)| {
+                    let mut bindings: Vec<_> = input
+                        .bindings
+                        .iter()
+                        .map(|b| Binding {
+                            node: b.node.clone(),
+                            path: b.path.clone(),
+                            target: b.target.clone(),
+                        })
+                        .collect();
+                    bindings.sort();
+                    Prerequisite {
+                        object: object.clone(),
+                        // A raw capture supplies read prerequisites. The qualified
+                        // producer's ownership bridge must prove managed ownership
+                        // before any record may enter a transition (#615).
+                        ownership: pbps_model::resolver::ObjectOwnership::Unqualified,
+                        canonicalization: self.rule.into(),
+                        properties: digest(
+                            "properties",
+                            serde_json::to_vec(&input.properties)
+                                .expect("canonical properties serialize"),
+                        ),
+                        bindings,
+                    }
+                })
+                .collect(),
+            membership,
+            self.limitations.clone(),
+            self.dropped
+                .iter()
+                .map(|(query, resolved)| RoutineLookup {
+                    signature: query.spelled.clone(),
+                    search_path: query.path.clone(),
+                    kind: query.kind.into(),
+                    resolved: resolved.clone(),
+                })
+                .collect(),
+        )
+    }
+
     /// What each requested dropped signature named in this capture's
     /// snapshot: the routine the plan's `DROP` of it would address.
     pub fn dropped(&self) -> &BTreeMap<super::DroppedSignature, Option<ObjectIdentity>> {
