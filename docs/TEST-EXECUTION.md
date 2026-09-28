@@ -61,7 +61,10 @@ assignment RHS values also count as escapes inside compound statements,
 augmented assignments and assignment expressions. Proven top-level literal
 replacement, string prefixes and the existing list comprehensions remain
 supported. Unknown calls and containers are not evaluated to guess their
-effects. Function-local bodies are not interpreted as module assignments; this
+effects. Class-local shadows are discarded before reads in statements that may
+delete them, including implicit exception-handler cleanup. This is conservative
+about conditional execution; deletions in separate local scopes stay separate.
+Function-local bodies are not interpreted as module assignments; this
 bounded extraction does not execute helper calls or prove arbitrary runtime
 control flow.
 
