@@ -57,7 +57,8 @@ How a difference becomes an ordered list of changes and statements. Part of the
     case-insensitive collation — held nothing in the catalog, passed, and
     the second `CREATE ROLE` failed after everything before it had run,
     committed under a staged apply. The wanted names go to the engine
-    numbered, joined to themselves under `COLLATE DATABASE_DEFAULT` on
+    numbered, joined to themselves under `COLLATE DATABASE_DEFAULT` (now
+    `CATALOG_DEFAULT`, DEC-1243.1) on
     `a.i < b.i`, and any pair refuses the plan by name before the catalog
     is asked. Declared tables and modules have the same latent shape —
     `dbo.Foo` beside `dbo.foo` — but it predates this phase and is not
@@ -887,3 +888,38 @@ clustered build, and the drop of an object the catalog confirms is clustered,
 a rewrite of every row under Sch-M (measured on 17.0: new partition ids for
 the table and each nonclustered index); every other index change stays
 unmeasured.
+
+<a id="dec-1243-1"></a>
+
+**DEC-1243.1. A SQL Server identifier is compared under `CATALOG_DEFAULT`,
+not `DATABASE_DEFAULT` (#1215, #1243; amends DECISIONS 119, 123 and DEC-384.1).**
+Those entries asked the engine to compare names under the database's default
+collation. That is the collation a database stores its data under. It is not
+necessarily the one it names things under. A partially contained database
+names its objects, columns and principals under a fixed catalog collation of
+its own. Measured on 17.0, with `CONTAINMENT = PARTIAL COLLATE
+Latin1_General_100_CI_AI`: a role, a table, a column and a constraint named
+`cafe` can each stand beside one named `café`. `DATABASE_DEFAULT` reads each
+pair as one name, so a check under it refuses a valid plan or pairs the wrong
+objects. On a database that is not contained, the two collations are the same,
+so the rule changes nothing there.
+
+The rule applies to every catalog comparison of an identifier in
+`pbps-mssql::catalog`:
+- `principals_holding`;
+- `matching_table_names`;
+- `tables_reusing_a_column_name`;
+- `names_alike`;
+- `object_names_alike`;
+- `object_name_occupants`.
+
+It does not apply to two other kinds of `COLLATE` clause:
+- a comparison of data values, as in `preflight.rs`, which stays under the
+  database default;
+- a clause that only gives a `UNION` column one collation without comparing
+  anything, as in `owned_query`.
+
+Pinned by `a_partially_contained_target_needs_a_server_that_allows_contained_databases`
+(`crates/pbps-mssql/tests/support/resolver.rs`). It is the only test allowed
+to switch `contained database authentication`. It asks all six functions about
+`cafe` and `café` on a `PARTIAL` and a `NONE` database.

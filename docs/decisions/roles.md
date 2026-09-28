@@ -256,7 +256,8 @@ an entry here.
     collation says they are one name. The names a plan's remaining
     statements need free (`CREATE ROLE`, the new name of a rename) and the
     ones they free first (`DROP ROLE`, the old name of a rename) go to the
-    engine in one query, compared under `COLLATE DATABASE_DEFAULT`, and the
+    engine in one query, compared under `COLLATE DATABASE_DEFAULT` (now
+    `CATALOG_DEFAULT`, DEC-1243.1), and the
     answer names the holder in its own spelling. Asked by `plan --db` and
     `bootstrap`, and again by `apply` before statement one and on a staged
     resume: a principal is outside the managed state, so the checksum cannot
