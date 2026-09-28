@@ -52,7 +52,9 @@ an execution owner.
 Module-level selector data is kept only while its supported literal assignment
 remains valid. Unsupported writes, deletion and conditional rebinding discard
 that name; visible mutation or escape of a mutable selector also discards its
-shared aliases, including aliases inside supported containers. Literal
+shared aliases, including aliases inside supported containers. Unsupported
+assignment RHS values also count as escapes inside compound statements,
+augmented assignments and assignment expressions. Proven top-level literal
 replacement, string prefixes and the existing list comprehensions remain
 supported. Unknown calls and containers are not evaluated to guess their
 effects. Function-local bodies are not interpreted as module assignments; this

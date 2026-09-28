@@ -109,7 +109,8 @@ def static_value(node, values):
 
 class SelectorEffects(ast.NodeVisitor):
     """Visible writes/escapes outside function-local bodies invalidate evidence."""
-    def __init__(self):
+    def __init__(self, proven_assignment=None):
+        self.proven_assignment = proven_assignment
         self.writes = set()
         self.mutations = set()
         self.global_writes = set()
@@ -125,9 +126,21 @@ class SelectorEffects(ast.NodeVisitor):
         elif isinstance(node.ctx, ast.Load):
             self.loads.add(node.id)
 
+    def visit_Assign(self, node):
+        # Only the already evaluated top-level literal has known alias identity.
+        # A nested/unsupported assignment can retain a mutable RHS elsewhere.
+        if node is not self.proven_assignment:
+            self.references(node.value)
+        self.generic_visit(node)
+
+    def visit_NamedExpr(self, node):
+        self.references(node.value)
+        self.generic_visit(node)
+
     def visit_AugAssign(self, node):
         # A list += changes its aliases too; rebinding a name normally does not.
         self.references(node.target)
+        self.references(node.value)
         self.generic_visit(node)
 
     def visit_Subscript(self, node):
@@ -150,6 +163,7 @@ class SelectorEffects(ast.NodeVisitor):
 
     def visit_AnnAssign(self, node):
         if node.value is not None:
+            self.references(node.value)
             self.visit(node.target)
             self.visit(node.value)
         self.references(node.annotation)
@@ -244,11 +258,8 @@ def python_values(tree):
                 replacement = (node.targets[0].id, static_value(node.value, values))
             except (InventoryError, TypeError):
                 pass
-        effects = SelectorEffects()
+        effects = SelectorEffects(node if replacement is not None else None)
         effects.visit(node)
-        if isinstance(node, (ast.Assign, ast.AnnAssign)) and replacement is None and node.value is not None:
-            # Unsupported containers/expressions can hide a mutable alias.
-            effects.references(node.value)
         mutated = set().union(*(mutable_ids(values[name]) for name in effects.mutations if name in values))
         for name in list(values):
             if name in effects.writes or mutable_ids(values[name]) & mutated or "*" in effects.writes:
