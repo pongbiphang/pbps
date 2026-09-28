@@ -40,7 +40,7 @@ fn fixture(case: &str) -> (Schema, Schema, Vec<Intent>) {
                 name.into(),
                 Index {
                     columns: vec![IndexColumn {
-                        name: "id".into(),
+                        key: pbps_model::IndexKey::Column("id".into()),
                         descending: false,
                         opclass: None,
                     }],

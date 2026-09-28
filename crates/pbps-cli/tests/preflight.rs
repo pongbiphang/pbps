@@ -7,7 +7,7 @@ fn index(unique: bool, filtered: bool) -> Change {
         name: "ix_items".into(),
         index: Box::new(Index {
             columns: vec![IndexColumn {
-                name: "id".into(),
+                key: pbps_model::IndexKey::Column("id".into()),
                 descending: false,
                 opclass: None,
             }],

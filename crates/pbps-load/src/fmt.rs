@@ -146,24 +146,45 @@ pub fn render(
         s.push_str("\nindexes:\n");
         for (n, ix) in &table.indexes {
             let _ = writeln!(s, "  {}:", scalar(n));
-            let cols: Vec<String> = ix
-                .columns
-                .iter()
-                .map(|c| {
-                    let mut spelled = c.name.clone();
-                    if let Some(class) = &c.opclass {
-                        spelled = format!("{spelled} {class}");
-                    }
-                    if c.descending {
-                        spelled.push_str(" desc");
-                    }
-                    spelled
-                })
-                .collect();
             if !ix.method.is_btree() {
                 let _ = writeln!(s, "    method: {}", ix.method.as_str());
             }
-            let _ = writeln!(s, "    columns: {}", seq(&cols));
+            // `columns:` while every key is a column, as every index was
+            // written before expressions; `keys:`, one mapping each, once any
+            // is an expression (DEC-1169.2).
+            if ix.columns.iter().all(|c| c.key.column().is_some()) {
+                let cols: Vec<String> = ix
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        let mut spelled = c.key.text().to_owned();
+                        if let Some(class) = &c.opclass {
+                            spelled = format!("{spelled} {class}");
+                        }
+                        if c.descending {
+                            spelled.push_str(" desc");
+                        }
+                        spelled
+                    })
+                    .collect();
+                let _ = writeln!(s, "    columns: {}", seq(&cols));
+            } else {
+                s.push_str("    keys:\n");
+                for c in &ix.columns {
+                    let (field, text) = match &c.key {
+                        pbps_model::IndexKey::Column(name) => ("column", name),
+                        pbps_model::IndexKey::Expression(text) => ("expression", text),
+                    };
+                    let _ = write!(s, "      - {field}: {}", scalar(text));
+                    if let Some(class) = &c.opclass {
+                        let _ = write!(s, "\n        opclass: {}", scalar(class));
+                    }
+                    if c.descending {
+                        s.push_str("\n        order: desc");
+                    }
+                    s.push('\n');
+                }
+            }
             if !ix.include.is_empty() {
                 let _ = writeln!(s, "    include: {}", seq(&ix.include));
             }

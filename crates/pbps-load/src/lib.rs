@@ -448,7 +448,7 @@ indexes:
         assert!(ix.unique);
         assert_eq!(ix.include, ["email"]);
         assert_eq!(ix.filter.as_deref(), Some("legacy_code IS NULL"));
-        assert_eq!(ix.columns[0].name, "full_name");
+        assert_eq!(ix.columns[0].key.column(), Some("full_name"));
         assert!(!ix.columns[0].descending);
         assert!(
             ix.columns[1].descending,
@@ -581,6 +581,60 @@ indexes:
                 "{columns}: {}",
                 render(&e)
             );
+        }
+    }
+
+    /// Expression keys load from `keys:`, one mapping each and in order, and
+    /// the writer puts an index with one back under `keys:`; an index of
+    /// columns alone stays under `columns:` (DEC-1169.2). Naming both lists,
+    /// a key with both or neither, and an empty expression are refused.
+    #[test]
+    fn expression_keys_load_from_keys_and_round_trip() {
+        let text = "table: app.t\ncolumns:\n  id: {type: integer}\n  email: {type: text}\n\
+                    indexes:\n  ix:\n    keys:\n      - expression: \"lower(email)\"\n\
+                    \x20       order: desc\n      - column: id\n";
+        let t = load(text);
+        let ix = &t.table.indexes["ix"];
+        assert_eq!(
+            ix.columns[0].key,
+            pbps_model::IndexKey::Expression("lower(email)".into())
+        );
+        assert!(ix.columns[0].descending);
+        assert_eq!(ix.columns[1].key, pbps_model::IndexKey::Column("id".into()));
+        // A text of what Rust calls whitespace is not refused here: a
+        // non-breaking space is an identifier character to PostgreSQL, and
+        // the dialect's lexis decides (DECISIONS 504).
+        let nbsp = load(
+            "table: app.t\ncolumns:\n  id: {type: integer}\nindexes:\n  ix:\n    keys:\n      - {expression: \"\u{a0}\"}\n",
+        );
+        assert_eq!(
+            nbsp.table.indexes["ix"].columns[0].key,
+            pbps_model::IndexKey::Expression("\u{a0}".into())
+        );
+        let written = crate::render(&t.name, &t.table, &[], None);
+        assert!(written.contains("    keys:\n"), "{written}");
+        assert!(!written.contains("columns: ["), "{written}");
+        assert_eq!(load(&written).table, t.table);
+
+        for (keys, expected) in [
+            (
+                "    columns: [id]\n    keys:\n      - column: id\n",
+                "both `columns:` and `keys:`",
+            ),
+            (
+                "    keys:\n      - {column: id, expression: \"id + 1\"}\n",
+                "not both",
+            ),
+            (
+                "    keys:\n      - {order: desc}\n",
+                "a column or an expression",
+            ),
+            ("    keys:\n      - {expression: \"\"}\n", "empty"),
+        ] {
+            let e = errors(&format!(
+                "table: app.t\ncolumns:\n  id: {{type: integer}}\nindexes:\n  ix:\n{keys}"
+            ));
+            assert!(render(&e).contains(expected), "{expected}: {}", render(&e));
         }
     }
 

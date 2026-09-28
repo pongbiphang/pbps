@@ -43,12 +43,36 @@ pub struct DeclaredExpressions {
     /// `Index::filter`, by table and index name; only filtered indexes appear.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub filters: BTreeMap<TableName, BTreeMap<String, String>>,
+    /// An index's keys, by table and index name, one entry per key: the
+    /// declared text of an expression key and `None` for a column key. Only
+    /// indexes with an expression key appear (DEC-1169.2).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub keys: BTreeMap<TableName, BTreeMap<String, Vec<Option<String>>>>,
 }
 
 impl DeclaredExpressions {
     pub fn is_empty(&self) -> bool {
-        self.defaults.is_empty() && self.checks.is_empty() && self.filters.is_empty()
+        self.defaults.is_empty()
+            && self.checks.is_empty()
+            && self.filters.is_empty()
+            && self.keys.is_empty()
     }
+}
+
+/// An index's keys as `DeclaredExpressions::keys` records them, or `None`
+/// where every key is a column and there is nothing to record.
+fn declared_keys(index: &crate::schema::Index) -> Option<Vec<Option<String>>> {
+    index
+        .columns
+        .iter()
+        .any(|c| c.key.expression().is_some())
+        .then(|| {
+            index
+                .columns
+                .iter()
+                .map(|c| c.key.expression().map(str::to_owned))
+                .collect()
+        })
 }
 
 /// What one declaration's unqualified references resolved to when it was
@@ -187,6 +211,13 @@ impl Declared {
                         .or_default()
                         .insert(index.clone(), filter.clone());
                 }
+                if let Some(keys) = declared_keys(spec) {
+                    d.expressions
+                        .keys
+                        .entry(name.clone())
+                        .or_default()
+                        .insert(index.clone(), keys);
+                }
             }
         }
         d
@@ -212,12 +243,14 @@ impl Declared {
                     self.expressions.defaults.extend(fresh.expressions.defaults);
                     self.expressions.checks.extend(fresh.expressions.checks);
                     self.expressions.filters.extend(fresh.expressions.filters);
+                    self.expressions.keys.extend(fresh.expressions.keys);
                 }
                 Change::DropTable { name, .. } => self.forget_table(name),
                 Change::RenameTable { from, to, .. } => {
                     rekey_table(&mut self.expressions.defaults, from, to);
                     rekey_table(&mut self.expressions.checks, from, to);
                     rekey_table(&mut self.expressions.filters, from, to);
+                    rekey_table(&mut self.expressions.keys, from, to);
                     rekey_table(&mut self.bindings.defaults, from, to);
                     rekey_table(&mut self.bindings.checks, from, to);
                     rekey_table(&mut self.bindings.filters, from, to);
@@ -279,6 +312,7 @@ impl Declared {
                     table, name, index, ..
                 } => {
                     remove_nested(&mut self.expressions.filters, table, name);
+                    remove_nested(&mut self.expressions.keys, table, name);
                     remove_nested(&mut self.bindings.filters, table, name);
                     if let Some(filter) = &index.filter {
                         self.expressions
@@ -287,9 +321,17 @@ impl Declared {
                             .or_default()
                             .insert(name.clone(), filter.clone());
                     }
+                    if let Some(keys) = declared_keys(index) {
+                        self.expressions
+                            .keys
+                            .entry(table.clone())
+                            .or_default()
+                            .insert(name.clone(), keys);
+                    }
                 }
                 Change::DropIndex { table, name } => {
                     remove_nested(&mut self.expressions.filters, table, name);
+                    remove_nested(&mut self.expressions.keys, table, name);
                     remove_nested(&mut self.bindings.filters, table, name);
                 }
                 Change::CreateModule { id, module } | Change::AlterModule { id, module } => {
@@ -327,6 +369,7 @@ impl Declared {
         self.expressions.defaults.remove(name);
         self.expressions.checks.remove(name);
         self.expressions.filters.remove(name);
+        self.expressions.keys.remove(name);
         self.bindings.defaults.remove(name);
         self.bindings.checks.remove(name);
         self.bindings.filters.remove(name);
@@ -373,6 +416,30 @@ impl Declared {
                     }
                 }
             }
+            // Only where the read-back has the recorded shape, an expression
+            // where one was declared and a column where one was: the texts are
+            // compared by presence, as a filter's are, and a key that became a
+            // column or the other way round is a difference the differ must
+            // see (DEC-1169.2).
+            if let Some(keys) = self.expressions.keys.get(name) {
+                for (index, spec) in &mut table.indexes {
+                    let Some(declared) = keys.get(index) else {
+                        continue;
+                    };
+                    let same_shape = declared.len() == spec.columns.len()
+                        && declared
+                            .iter()
+                            .zip(&spec.columns)
+                            .all(|(d, c)| d.is_some() == c.key.expression().is_some());
+                    if same_shape {
+                        for (d, c) in declared.iter().zip(&mut spec.columns) {
+                            if let Some(text) = d {
+                                c.key = crate::IndexKey::Expression(text.clone());
+                            }
+                        }
+                    }
+                }
+            }
         }
         base
     }
@@ -408,7 +475,7 @@ mod tests {
             "ix_n".to_owned(),
             Index {
                 columns: vec![IndexColumn {
-                    name: "n".to_owned(),
+                    key: crate::IndexKey::Column("n".to_owned()),
                     descending: false,
                     opclass: None,
                 }],
@@ -422,7 +489,7 @@ mod tests {
             "ix_m".to_owned(),
             Index {
                 columns: vec![IndexColumn {
-                    name: "m".to_owned(),
+                    key: crate::IndexKey::Column("m".to_owned()),
                     descending: false,
                     opclass: None,
                 }],
@@ -454,6 +521,108 @@ mod tests {
         ChangeSet {
             changes: list.into_iter().map(PlannedChange::new).collect(),
         }
+    }
+
+    /// An index with an expression key records one entry per key, the
+    /// declared text for the expression and `None` for the column; the
+    /// overlay puts that text over the engine's respelling only where the
+    /// read-back has the same shape; and a plan's `AddIndex`, `DropIndex`
+    /// and table rename carry the record as they carry a filter's
+    /// (DEC-1169.2). An index of columns alone records nothing.
+    #[test]
+    fn an_expression_keys_declared_text_is_recorded_overlaid_and_advanced() {
+        use crate::IndexKey;
+        let key = |k: IndexKey| IndexColumn {
+            key: k,
+            descending: false,
+            opclass: None,
+        };
+        let expression_index = |text: &str| Index {
+            columns: vec![
+                key(IndexKey::Expression(text.to_owned())),
+                key(IndexKey::Column("n".to_owned())),
+            ],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method: Default::default(),
+        };
+        let mut declared = schema();
+        declared
+            .tables
+            .get_mut(&t())
+            .unwrap()
+            .indexes
+            .insert("ix_expr".to_owned(), expression_index("n+m"));
+        let d = Declared::from_schema(&declared);
+        assert_eq!(
+            d.expressions.keys[&t()]["ix_expr"],
+            [Some("n+m".to_owned()), None]
+        );
+        // Negative: indexes of columns alone record nothing.
+        assert_eq!(d.expressions.keys[&t()].len(), 1);
+
+        // The engine's respelling is overlaid where the shape matches...
+        let mut read = schema();
+        read.tables
+            .get_mut(&t())
+            .unwrap()
+            .indexes
+            .insert("ix_expr".to_owned(), expression_index("(n + m)"));
+        let base = d.overlay(&read);
+        assert_eq!(
+            base.tables[&t()].indexes["ix_expr"].columns[0].key,
+            IndexKey::Expression("n+m".to_owned())
+        );
+        // ...and not where a key changed kind: that is a difference to plan.
+        let mut changed = read.clone();
+        changed.tables.get_mut(&t()).unwrap().indexes.insert(
+            "ix_expr".to_owned(),
+            Index {
+                columns: vec![
+                    key(IndexKey::Column("m".to_owned())),
+                    key(IndexKey::Column("n".to_owned())),
+                ],
+                ..expression_index("unused")
+            },
+        );
+        let base = d.overlay(&changed);
+        assert_eq!(
+            base.tables[&t()].indexes["ix_expr"].columns[0].key,
+            IndexKey::Column("m".to_owned())
+        );
+
+        // A plan's index changes and a table rename carry the record.
+        let mut advanced = Declared::default();
+        advanced.advance(&changes(vec![Change::AddIndex {
+            table: t(),
+            name: "ix_expr".to_owned(),
+            index: Box::new(expression_index("lower(x)")),
+            clustered: false,
+        }]));
+        assert_eq!(
+            advanced.expressions.keys[&t()]["ix_expr"][0].as_deref(),
+            Some("lower(x)")
+        );
+        let u: TableName = "dbo.u".parse().unwrap();
+        advanced.advance(&changes(vec![Change::RenameTable {
+            uid: "t_a1b2c3".parse().unwrap(),
+            from: t(),
+            to: u.clone(),
+            defaults: Vec::new(),
+        }]));
+        assert!(advanced.expressions.keys[&u].contains_key("ix_expr"));
+        advanced.advance(&changes(vec![Change::DropIndex {
+            table: u.clone(),
+            name: "ix_expr".to_owned(),
+        }]));
+        assert!(
+            advanced
+                .expressions
+                .keys
+                .get(&u)
+                .is_none_or(|m| m.is_empty())
+        );
     }
 
     /// Only what is compared as text is recorded: a default, a check, a

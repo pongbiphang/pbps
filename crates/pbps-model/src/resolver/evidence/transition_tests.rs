@@ -337,7 +337,7 @@ fn removing_a_predicate_can_retain_the_plain_index_catalog_record() {
         clustered: false,
         index: Box::new(crate::Index {
             columns: vec![crate::IndexColumn {
-                name: "n".into(),
+                key: crate::IndexKey::Column("n".into()),
                 descending: false,
                 opclass: None,
             }],

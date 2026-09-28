@@ -19,7 +19,7 @@ fn surfaces(schema: &Schema) -> BTreeSet<Surface> {
             });
         }
         for (name, index) in &definition.indexes {
-            if index.filter.is_some() {
+            if index.holds_expression() {
                 result.insert(Surface::Index {
                     table: table.clone(),
                     name: name.clone(),

@@ -854,7 +854,11 @@ fn build(
             // The key columns only. `INCLUDE` is payload the engine carries in
             // the leaf and never compares, so counting it would group rows the
             // index will still collide.
-            let columns: Vec<String> = index.columns.iter().map(|c| c.name.clone()).collect();
+            // Refused by validation on this engine; unchecked rather than
+            // counted over text that is not a column (DEC-1169.2).
+            let Some(columns) = index.column_keys() else {
+                return Ok(skip(change, "an index over an expression cannot be counted", unchecked));
+            };
             let applies = match &index.filter {
                 Some(predicate) => Applies::Where(predicate),
                 None => Applies::AllRows,
@@ -3525,7 +3529,7 @@ mod tests {
                 columns: columns
                     .iter()
                     .map(|c| pbps_model::IndexColumn {
-                        name: (*c).to_owned(),
+                        key: pbps_model::IndexKey::Column((*c).to_owned()),
                         descending: false,
                         opclass: None,
                     })

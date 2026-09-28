@@ -640,7 +640,7 @@ async fn every_covered_expression_surface_gets_the_engines_answer() {
                 "ix".into(),
                 pbps_model::Index {
                     columns: vec![pbps_model::IndexColumn {
-                        name: "c".into(),
+                        key: pbps_model::IndexKey::Column("c".into()),
                         descending: false,
                         opclass: None,
                     }],
@@ -1287,7 +1287,7 @@ async fn a_module_naming_an_index_is_refused_for_its_oid_alias_constant() {
                 "ix".into(),
                 pbps_model::Index {
                     columns: vec![pbps_model::IndexColumn {
-                        name: "c".into(),
+                        key: pbps_model::IndexKey::Column("c".into()),
                         descending: false,
                         opclass: None,
                     }],
@@ -1685,7 +1685,7 @@ async fn a_later_object_of_another_kind_is_no_candidate() {
                 "ix".into(),
                 pbps_model::Index {
                     columns: vec![pbps_model::IndexColumn {
-                        name: "c".into(),
+                        key: pbps_model::IndexKey::Column("c".into()),
                         descending: false,
                         opclass: None,
                     }],
@@ -1979,7 +1979,7 @@ async fn a_later_object_outside_the_path_is_no_candidate() {
                 "t".into(),
                 pbps_model::Index {
                     columns: vec![pbps_model::IndexColumn {
-                        name: "id".into(),
+                        key: pbps_model::IndexKey::Column("id".into()),
                         descending: false,
                         opclass: None,
                     }],
@@ -2363,7 +2363,7 @@ async fn a_managed_index_does_not_account_for_a_same_named_type() {
                 "foo".into(),
                 pbps_model::Index {
                     columns: vec![pbps_model::IndexColumn {
-                        name: "c".into(),
+                        key: pbps_model::IndexKey::Column("c".into()),
                         descending: false,
                         opclass: None,
                     }],

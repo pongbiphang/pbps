@@ -686,10 +686,11 @@ fn last_function_create(cs: &ChangeSet) -> Option<usize> {
 /// The differ writes a new table as one `CreateTable` carrying its checks,
 /// indexes and column defaults, and emits them together. Moving that change
 /// is not an option, since views and routines may read the table. So its
-/// checks become `AddCheck`, its filtered indexes `AddIndex`, and its column
-/// defaults `AlterColumnDefault`, each right after the table. The same rule
-/// as for an existing table then places them. An unfiltered index stays in
-/// the table: it holds no expression. A default stays when a row the plan
+/// checks become `AddCheck`, its indexes that hold an expression (a filter
+/// or an expression key, DEC-1169.2) `AddIndex`, and its column defaults
+/// `AlterColumnDefault`, each right after the table. The same rule as for an
+/// existing table then places them. An index over plain columns stays in the
+/// table: it holds no expression. A default stays when a row the plan
 /// writes takes it (an insert that omits the column, an update that sets it
 /// back to its default, #1030), and when no ids file names the column, since
 /// `AlterColumnDefault` needs its uid.
@@ -725,7 +726,7 @@ pub(crate) fn split_new_tables(
         let filtered: Vec<String> = table
             .indexes
             .iter()
-            .filter(|(_, index)| index.filter.is_some())
+            .filter(|(_, index)| index.holds_expression())
             .map(|(n, _)| n.clone())
             .collect();
         for index in filtered {
@@ -813,7 +814,7 @@ pub(crate) fn after_the_rebuilds(cs: &mut ChangeSet) -> usize {
         .iter()
         .map(|p| match &p.change {
             Change::AddCheck { .. } => true,
-            Change::AddIndex { index, .. } => index.filter.is_some(),
+            Change::AddIndex { index, .. } => index.holds_expression(),
             Change::AlterColumnDefault {
                 column,
                 to: Some(_),
@@ -1010,7 +1011,7 @@ mod tests {
             name: name.into(),
             index: Box::new(pbps_model::Index {
                 columns: vec![pbps_model::IndexColumn {
-                    name: "id".into(),
+                    key: pbps_model::IndexKey::Column("id".into()),
                     descending: false,
                     opclass: None,
                 }],
@@ -1169,7 +1170,7 @@ mod tests {
                 name.into(),
                 pbps_model::Index {
                     columns: vec![pbps_model::IndexColumn {
-                        name: "id".into(),
+                        key: pbps_model::IndexKey::Column("id".into()),
                         descending: false,
                         opclass: None,
                     }],

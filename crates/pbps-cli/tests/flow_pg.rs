@@ -647,7 +647,10 @@ CREATE EVENT TRIGGER replace_part ON ddl_command_end WHEN TAG IN ('{tag}') EXECU
         assert_ne!(checkpoint.kind, pbps_model::StateKind::Apply);
         let recorded = &checkpoint.schema.tables[&"app.u".parse().unwrap()];
         if index {
-            assert_eq!(recorded.indexes["ix"].columns[0].name, "other");
+            assert_eq!(
+                recorded.indexes["ix"].columns[0].key.column(),
+                Some("other")
+            );
         } else {
             assert_eq!(recorded.unique["uq"].columns, ["other"]);
         }
@@ -1899,6 +1902,97 @@ fn additions_calling_a_rebuilt_function_are_created_after_it() {
     assert!(!script.contains("DROP FUNCTION"), "{script}");
     assert!(script.contains("ADD CONSTRAINT \"ck_u\""), "{script}");
     succeeds(approved_apply(&d, connection, &plan, &allow));
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
+/// An index over an expression that calls a function is a declared table part
+/// once the model holds expression keys: a rebuild of the function drops it
+/// first and creates it again after, where before it refused the plan as
+/// something no declaration could restore (DEC-1169.2). The pull writes it
+/// under `keys:`, and the round trip ends in an empty plan.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_declared_expression_index_is_dropped_and_restored_around_a_function_rebuild() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "expression-index-rebuild");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE TABLE app.t (id integer PRIMARY KEY); \
+         CREATE INDEX ix_f ON app.t (app.f(id)); \
+         INSERT INTO app.t (id) VALUES (1), (2)",
+    );
+    let d = Demo::new("expression-index-rebuild");
+    succeeds(d.run(&["pull", "--db", connection]));
+    let table = std::fs::read_to_string(d.dir.join("schema/app.t.yml")).unwrap();
+    assert!(
+        table.contains("keys:") && table.contains("- expression:"),
+        "the pull writes the expression key under `keys:`:\n{table}"
+    );
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+
+    let function = d.dir.join("schema/app.f%28integer%29.function.yml");
+    let text = std::fs::read_to_string(&function).unwrap();
+    std::fs::write(&function, text.replace("SELECT x", "SELECT x + 0")).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    assert!(
+        at("DROP INDEX \"app\".\"ix_f\"") < at("DROP FUNCTION"),
+        "{script}"
+    );
+    assert!(
+        at("CREATE FUNCTION") < at("CREATE INDEX \"ix_f\""),
+        "{script}"
+    );
+    // Dropping the index is the approver's to accept, as any `DropIndex` is,
+    // even on its way to being restored.
+    let allow = ["--allow", "destructive", "--allow", "grant-widen"];
+    succeeds(approved_apply(&d, connection, &plan, &allow));
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_index WHERE indexrelid = to_regclass('app.ix_f') AND indexprs IS NOT NULL"
+        ),
+        1
+    );
+
+    // A respelling is a declared change, applied once; the engine then
+    // renders it its own way, and the recorded declaration is what the next
+    // plan compares, so it is empty rather than replacing the index forever.
+    let path = d.dir.join("schema/app.t.yml");
+    let table = std::fs::read_to_string(&path).unwrap();
+    assert!(table.contains("app.f(id)"), "{table}");
+    std::fs::write(&path, table.replace("app.f(id)", "app.f( id )")).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    std::fs::remove_file(&plan).unwrap();
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(&d, connection, &plan, &allow));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
     succeeds(d.run(&["verify", "--db", connection]));
 }
 

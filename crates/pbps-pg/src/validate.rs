@@ -130,8 +130,24 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
     }
     for (name, index) in &table.indexes {
         let what = format!("index `{name}`");
-        let keys: Vec<_> = index.columns.iter().map(|c| c.name.clone()).collect();
-        found.extend(key_columns(&what, &keys, table, false));
+        // Column keys are held to the table; an expression key to being an
+        // expression at all, as a filter is (DEC-1169.2). An index of
+        // expression keys alone names no column and is not empty.
+        let keys: Vec<_> = index
+            .columns
+            .iter()
+            .filter_map(|c| c.key.column().map(str::to_owned))
+            .collect();
+        if index.columns.is_empty() || !keys.is_empty() {
+            found.extend(key_columns(&what, &keys, table, false));
+        }
+        for key in &index.columns {
+            if let Some(expression) = key.key.expression()
+                && crate::LEXICON.expression_in(expression) == Expression::Absent
+            {
+                found.push(invalid(format!("{what} has an empty key expression")));
+            }
+        }
         for column in &index.include {
             if !table.columns.contains_key(column) {
                 found.push(invalid(format!(
@@ -169,7 +185,7 @@ fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
                         "{what} indexes `{}` with operator class `{class}`; a B-tree index here \
                          takes only its type's default class, so leave the class out \
                          (or, if `{class}` was meant as a direction, it is `asc` or `desc`)",
-                        key.name
+                        key.key.text()
                     )));
                 }
             }
@@ -192,32 +208,37 @@ fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
                 if key.descending {
                     found.push(invalid(format!(
                         "{what} orders `{}` descending, and a GIN index has no order",
-                        key.name
+                        key.key.text()
                     )));
                 }
-                let jsonb = table.columns.get(&key.name).is_some_and(|c| {
+                let Some(column) = key.key.column() else {
+                    found.push(invalid(format!(
+                        "{what} is a GIN index over the expression `{}`, and this model holds \
+                         GIN only over `jsonb` columns",
+                        key.key.text()
+                    )));
+                    continue;
+                };
+                let jsonb = table.columns.get(column).is_some_and(|c| {
                     crate::types::normalize(&c.ty).is_ok_and(|t| t.base == "jsonb")
                 });
                 // A missing column is already named by `key_columns`.
-                if table.columns.contains_key(&key.name) && !jsonb {
+                if table.columns.contains_key(column) && !jsonb {
                     found.push(invalid(format!(
-                        "{what} is a GIN index over `{}`, and this model holds GIN only over \
+                        "{what} is a GIN index over `{column}`, and this model holds GIN only over \
                          `jsonb` columns",
-                        key.name
                     )));
                 }
                 match key.opclass.as_deref() {
                     None | Some("jsonb_path_ops") => {}
                     Some("jsonb_ops") => found.push(invalid(format!(
-                        "{what} names `jsonb_ops` for `{}`, which is GIN's default for `jsonb`; \
-                         leave the class out",
-                        key.name
+                        "{what} names `jsonb_ops` for `{column}`, which is GIN's default for \
+                         `jsonb`; leave the class out",
                     ))),
                     Some(class) => found.push(invalid(format!(
-                        "{what} indexes `{}` with operator class `{class}`; a GIN index over \
-                         `jsonb` here takes `jsonb_path_ops` or, by leaving it out, the default \
-                         `jsonb_ops`",
-                        key.name
+                        "{what} indexes `{column}` with operator class `{class}`; a GIN index \
+                         over `jsonb` here takes `jsonb_path_ops` or, by leaving it out, the \
+                         default `jsonb_ops`",
                     ))),
                 }
             }
@@ -755,7 +776,7 @@ mod tests {
                 columns: keys
                     .iter()
                     .map(|(name, class, descending)| pbps_model::IndexColumn {
-                        name: (*name).into(),
+                        key: pbps_model::IndexKey::Column((*name).into()),
                         descending: *descending,
                         opclass: class.map(str::to_owned),
                     })
@@ -812,6 +833,52 @@ mod tests {
         let mut include = indexed(Gin, &[("body", None, false)]);
         include.indexes.get_mut("ix").unwrap().include = vec!["n".into()];
         refused(include, "cannot include");
+    }
+
+    /// An expression key is held on a B-tree, and refused on GIN, empty, or
+    /// with a class; an index of expression keys alone names no column and
+    /// is not "empty" (DEC-1169.2).
+    #[test]
+    fn an_expression_key_is_held_to_a_btree_and_to_being_an_expression() {
+        let with_key = |method: IndexMethod, text: &str, class: Option<&str>| {
+            let mut table = indexed(method, &[("body", None, false)]);
+            table.indexes.get_mut("ix").unwrap().columns = vec![pbps_model::IndexColumn {
+                key: pbps_model::IndexKey::Expression(text.into()),
+                descending: false,
+                opclass: class.map(str::to_owned),
+            }];
+            structure(&table)
+        };
+        assert!(with_key(IndexMethod::Btree, "lower(body::text)", None).is_empty());
+        let refused = |found: Vec<String>, expected: &str| {
+            assert!(
+                found.iter().any(|m| m.contains(expected)),
+                "expected `{expected}` in {found:?}"
+            );
+        };
+        refused(
+            with_key(IndexMethod::Gin, "body", None),
+            "over the expression",
+        );
+        refused(
+            with_key(IndexMethod::Btree, " -- nothing", None),
+            "empty key expression",
+        );
+        // A non-breaking space is an identifier to this engine, not blank
+        // (DECISIONS 504): not refused as empty.
+        let nbsp = with_key(IndexMethod::Btree, "\u{a0}", None);
+        assert!(
+            !nbsp.iter().any(|m| m.contains("empty key expression")),
+            "{nbsp:?}"
+        );
+        refused(
+            with_key(
+                IndexMethod::Btree,
+                "lower(body::text)",
+                Some("text_pattern_ops"),
+            ),
+            "operator class",
+        );
     }
 
     /// A B-tree takes no operator class here, and a class that looks like a

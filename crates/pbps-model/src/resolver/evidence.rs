@@ -246,7 +246,7 @@ impl ResolverEvidence {
                 }
                 Change::AddIndex {
                     table, name, index, ..
-                } if index.filter.is_some() => Some(super::Surface::Index {
+                } if index.holds_expression() => Some(super::Surface::Index {
                     table: table.clone(),
                     name: name.clone(),
                 }),

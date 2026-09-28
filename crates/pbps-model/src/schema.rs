@@ -604,6 +604,26 @@ pub struct Index {
     pub method: IndexMethod,
 }
 
+impl Index {
+    /// The key's columns, where every key is a column; `None` where any key is
+    /// an expression. What a question about "the columns an index is over"
+    /// has to ask, so an expression is never read as a column (DEC-1169.2).
+    /// Whether the index holds an expression the engine resolves names in:
+    /// a filter, or any expression key. Such an index can call a module, so
+    /// it is built after the modules it may call, and observed wherever a
+    /// filtered index is (DEC-1169.2).
+    pub fn holds_expression(&self) -> bool {
+        self.filter.is_some() || self.columns.iter().any(|c| c.key.expression().is_some())
+    }
+
+    pub fn column_keys(&self) -> Option<Vec<String>> {
+        self.columns
+            .iter()
+            .map(|c| c.key.column().map(str::to_owned))
+            .collect()
+    }
+}
+
 /// How an index is built. A closed list: a method this model does not name is
 /// left out of a pull and reported, never stood in for by one it does.
 #[derive(
@@ -643,17 +663,120 @@ impl IndexMethod {
     }
 }
 
+/// One key of an index, in the index's order.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "RawIndexColumn", into = "RawIndexColumn")]
 pub struct IndexColumn {
-    pub name: String,
-    #[serde(default)]
+    pub key: IndexKey,
     pub descending: bool,
     /// The operator class this key is indexed with, where it is not the
-    /// method's default for the column's type; absent is that default. Which
+    /// method's default for the key's type; absent is that default. Which
     /// names are accepted is the dialect's question (DEC-1169.1).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opclass: Option<String>,
+}
+
+/// What an index key orders by: a column of the table, or an expression over
+/// its columns, kept verbatim as declared (DEC-1169.2).
+///
+/// An enum and not an optional expression beside the name, so a key cannot be
+/// both or neither, and a reader that wants a column has to say what it does
+/// with an expression rather than read one as a column named `lower(email)`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum IndexKey {
+    Column(String),
+    Expression(String),
+}
+
+impl IndexKey {
+    /// The column this key is, or `None` for an expression.
+    pub fn column(&self) -> Option<&str> {
+        match self {
+            IndexKey::Column(name) => Some(name),
+            IndexKey::Expression(_) => None,
+        }
+    }
+
+    /// The expression this key is, or `None` for a column.
+    pub fn expression(&self) -> Option<&str> {
+        match self {
+            IndexKey::Column(_) => None,
+            IndexKey::Expression(text) => Some(text),
+        }
+    }
+
+    /// The column's name or the expression's text, for display only: which
+    /// of the two it is does not survive this.
+    pub fn text(&self) -> &str {
+        match self {
+            IndexKey::Column(text) | IndexKey::Expression(text) => text,
+        }
+    }
+}
+
+impl IndexColumn {
+    /// An ascending key on `name` under its default class: what most
+    /// indexes are made of.
+    pub fn column(name: impl Into<String>) -> Self {
+        IndexColumn {
+            key: IndexKey::Column(name.into()),
+            descending: false,
+            opclass: None,
+        }
+    }
+}
+
+/// How a key is written to a state or a plan: `name` for a column, as every
+/// key was before expressions existed, so an older file reads unchanged and a
+/// column key writes byte for byte what it always did; `expression` for an
+/// expression. One and only one of the two.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawIndexColumn {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expression: Option<String>,
+    #[serde(default)]
+    descending: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    opclass: Option<String>,
+}
+
+impl TryFrom<RawIndexColumn> for IndexColumn {
+    type Error = String;
+
+    fn try_from(raw: RawIndexColumn) -> Result<Self, String> {
+        let key = match (raw.name, raw.expression) {
+            (Some(name), None) => IndexKey::Column(name),
+            (None, Some(expression)) => IndexKey::Expression(expression),
+            (Some(_), Some(_)) => {
+                return Err("an index key names a column or an expression, not both".into());
+            }
+            (None, None) => {
+                return Err("an index key names neither a column nor an expression".into());
+            }
+        };
+        Ok(IndexColumn {
+            key,
+            descending: raw.descending,
+            opclass: raw.opclass,
+        })
+    }
+}
+
+impl From<IndexColumn> for RawIndexColumn {
+    fn from(c: IndexColumn) -> Self {
+        let (name, expression) = match c.key {
+            IndexKey::Column(name) => (Some(name), None),
+            IndexKey::Expression(text) => (None, Some(text)),
+        };
+        RawIndexColumn {
+            name,
+            expression,
+            descending: c.descending,
+            opclass: c.opclass,
+        }
+    }
 }
 
 #[cfg(test)]

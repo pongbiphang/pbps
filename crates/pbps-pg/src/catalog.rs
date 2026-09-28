@@ -578,6 +578,14 @@ fn constraints_query() -> String {
 /// rather than passing it as the default — not being able to tell is not the
 /// same as there being nothing to tell.
 ///
+/// An expression key has no column to take a type from; its type is the index
+/// relation's own attribute at that position, which is the expression's result
+/// type, so its default class is resolved the same way (DEC-1169.2).
+/// `key_texts` holds each expression key's text as the engine renders it, and
+/// `''` for a column key. An expression's own collation is not in the
+/// catalog, so an expression key under anything but the database default
+/// (`100`) is reported rather than guessed at.
+///
 /// `key_classes` holds one entry per key, `''` for the default and
 /// `schema.name` otherwise, so the reader can accept exactly the classes the
 /// model holds and name every other one (DEC-1169.1). A collation that is not the
@@ -628,8 +636,18 @@ fn indexes_query() -> String {
                      WHERE t.oid = a.atttypid AND t.typtype = 'd' AND t.typbasetype <> 0),
                    a.atttypid) AS coltype
                    FROM pg_catalog.pg_attribute a
-                  WHERE a.attrelid = i.indrelid AND a.attnum = i.indkey[k.n - 1]) AS col ON true
+                  WHERE (i.indkey[k.n - 1] <> 0
+                         AND a.attrelid = i.indrelid AND a.attnum = i.indkey[k.n - 1])
+                     OR (i.indkey[k.n - 1] = 0
+                         AND a.attrelid = i.indexrelid AND a.attnum = k.n)) AS col ON true
             ) AS key_classes,
+            (SELECT COALESCE(pg_catalog.json_agg(
+                      CASE WHEN i.indkey[k.n - 1] = 0
+                           THEN pg_catalog.pg_get_indexdef(i.indexrelid, k.n::int4, true)
+                           ELSE '' END
+                      ORDER BY k.n), '[]'::pg_catalog.json)
+               FROM pg_catalog.generate_series(1, i.indnkeyatts) AS k(n)
+            ) AS key_texts,
             EXISTS (
               SELECT 1
                 FROM pg_catalog.generate_series(1, i.indnkeyatts) AS k(n)
@@ -637,6 +655,11 @@ fn indexes_query() -> String {
                   ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k.n - 1]
                WHERE i.indcollation[k.n - 1] <> 0
                  AND i.indcollation[k.n - 1] <> a.attcollation
+            ) OR EXISTS (
+              SELECT 1
+                FROM pg_catalog.generate_series(1, i.indnkeyatts) AS k(n)
+               WHERE i.indkey[k.n - 1] = 0
+                 AND i.indcollation[k.n - 1] NOT IN (0, 100)
             ) AS nondefault_collation
        FROM pg_catalog.pg_index i
        JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
@@ -1059,6 +1082,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             has_expressions: flag(row, "has_expressions")?,
             method: text(row, "method")?,
             key_classes: strings(row, "key_classes")?,
+            key_texts: strings(row, "key_texts")?,
             nondefault_collation: flag(row, "nondefault_collation")?,
         });
     }

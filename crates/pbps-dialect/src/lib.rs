@@ -3547,7 +3547,7 @@ mod tests {
             name.to_owned(),
             Index {
                 columns: vec![IndexColumn {
-                    name: "n".to_owned(),
+                    key: pbps_model::IndexKey::Column("n".to_owned()),
                     descending: false,
                     opclass: None,
                 }],

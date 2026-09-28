@@ -568,7 +568,7 @@ fn splitting_table_creation_preserves_the_declared_index_layout() {
                 "ix".into(),
                 Index {
                     columns: vec![IndexColumn {
-                        name: "id".into(),
+                        key: pbps_model::IndexKey::Column("id".into()),
                         descending: false,
                         opclass: None,
                     }],
@@ -637,7 +637,7 @@ fn new_table_indexes_are_offline_while_existing_table_indexes_keep_the_requested
                     "ix".into(),
                     Index {
                         columns: vec![IndexColumn {
-                            name: "id".into(),
+                            key: pbps_model::IndexKey::Column("id".into()),
                             descending: false,
                             opclass: None,
                         }],

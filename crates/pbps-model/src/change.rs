@@ -2523,7 +2523,7 @@ mod tests {
             name: "ix_customer_email".into(),
             index: Box::new(crate::schema::Index {
                 columns: vec![crate::schema::IndexColumn {
-                    name: "email".into(),
+                    key: crate::IndexKey::Column("email".into()),
                     descending: false,
                     opclass: None,
                 }],

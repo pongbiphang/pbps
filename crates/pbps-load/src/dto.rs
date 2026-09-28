@@ -476,11 +476,21 @@ pub struct ForeignKeyDto {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct IndexDto {
-    /// Each entry is `column`, optionally followed by an operator class
-    /// (PostgreSQL), then optionally by `asc` or `desc`: `column`,
-    /// `column desc`, `body jsonb_path_ops`.
+    /// The keys, where every one is a column. Each entry is `column`,
+    /// optionally followed by an operator class (PostgreSQL), then optionally
+    /// by `asc` or `desc`: `column`, `column desc`, `body jsonb_path_ops`.
+    /// An index names its keys here or under `keys:`, not both.
+    #[serde(default)]
     #[schemars(with = "Vec<String>")]
     pub columns: Vec<Spanned<String>>,
+
+    /// The keys, one mapping each, where any is an expression (PostgreSQL):
+    /// `{column: id}` or `{expression: "lower(email)"}`, each with optional
+    /// `opclass:` and `order: asc|desc`. An index names its keys here or
+    /// under `columns:`, not both.
+    #[serde(default)]
+    #[schemars(with = "Vec<IndexKeyDto>")]
+    pub keys: Vec<Spanned<IndexKeyDto>>,
 
     #[serde(default)]
     pub include: Vec<String>,
@@ -497,6 +507,35 @@ pub struct IndexDto {
     /// means) or `gin` (PostgreSQL, over `jsonb` columns).
     #[serde(default)]
     pub method: pbps_model::IndexMethod,
+}
+
+/// One index key under `keys:`: a column or an expression, and which of the
+/// two is what its key says, never inferred from parentheses (DEC-1169.2). A
+/// mapping of named fields and not a string-or-mapping list entry: read
+/// without a type, a plain `n` or `on` is a YAML boolean, and a column may be
+/// named either.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IndexKeyDto {
+    /// A column of the table.
+    #[serde(default)]
+    pub column: Option<String>,
+    /// An expression over the table's columns, kept verbatim.
+    #[serde(default)]
+    pub expression: Option<String>,
+    /// The operator class, where it is not the key's default.
+    #[serde(default)]
+    pub opclass: Option<String>,
+    /// `asc`, the default, or `desc`.
+    #[serde(default)]
+    pub order: Option<IndexOrder>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum IndexOrder {
+    Asc,
+    Desc,
 }
 
 // The doc comment below becomes the schema's own `description`, which an editor

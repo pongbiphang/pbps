@@ -157,9 +157,9 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
             .iter()
             .map(|c| {
                 if c.descending {
-                    format!("`{}` desc", c.name)
+                    format!("`{}` desc", c.key.text())
                 } else {
-                    format!("`{}`", c.name)
+                    format!("`{}`", c.key.text())
                 }
             })
             .collect();

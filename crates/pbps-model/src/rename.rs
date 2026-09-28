@@ -83,7 +83,12 @@ impl Renames {
         }
         for ix in t.indexes.values_mut() {
             for c in &mut ix.columns {
-                c.name = self.column(name, &c.name);
+                // An expression is left as written, as a filter is: the
+                // engine renames inside the expression it stores, and the
+                // declaration spells the new name (DEC-1169.2).
+                if let crate::IndexKey::Column(column) = &mut c.key {
+                    *column = self.column(name, column);
+                }
             }
             ix.include = self.column_list(name, &ix.include);
         }
@@ -126,7 +131,7 @@ mod tests {
             "ix".into(),
             Index {
                 columns: vec![IndexColumn {
-                    name: "tag".into(),
+                    key: crate::IndexKey::Column("tag".into()),
                     descending: false,
                     opclass: None,
                 }],
@@ -169,7 +174,7 @@ mod tests {
         let out = r.apply(&table, &t("dbo.t"));
         assert_eq!(out.primary_key.as_ref().unwrap().columns, ["row_id"]);
         assert_eq!(out.unique["uq"].columns, ["label"]);
-        assert_eq!(out.indexes["ix"].columns[0].name, "label");
+        assert_eq!(out.indexes["ix"].columns[0].key.column(), Some("label"));
         assert_eq!(out.indexes["ix"].include, ["remark"]);
         assert_eq!(out.foreign_keys["fk"].references_table, t("dbo.ancestor"));
         assert_eq!(out.foreign_keys["fk"].references_columns, ["parent_id"]);

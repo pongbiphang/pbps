@@ -347,7 +347,7 @@ async fn a_clustered_index_change_is_a_rewrite_only_where_the_catalog_says_so() 
     };
     let index = |column: &str| pbps_model::Index {
         columns: vec![pbps_model::IndexColumn {
-            name: column.into(),
+            key: pbps_model::IndexKey::Column(column.into()),
             descending: false,
             opclass: None,
         }],

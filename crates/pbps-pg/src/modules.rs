@@ -1522,12 +1522,14 @@ pub enum Holds {
     TablePart { table: TableName, part: Part },
     /// Something no declaration can hold, whatever this project declares.
     ///
-    /// "Managed" means **representable**, and two of the four objects
-    /// ADR-0009 §4 measured are not: `Column` has no generated-expression
-    /// field and `IndexColumn` is a name and a direction, so a generated column
-    /// and an expression index have nothing for a planner to recreate them
-    /// from. Promising to restore them would be promising to emit a statement
-    /// pbps cannot write.
+    /// "Managed" means **representable**, and one of the four objects
+    /// ADR-0009 §4 measured is not: `Column` has no generated-expression
+    /// field, so a generated column has nothing for a planner to recreate it
+    /// from. Promising to restore it would be promising to emit a statement
+    /// pbps cannot write. An expression index was the second until an index
+    /// key could be an expression (DEC-1169.2): a declared one is now a table
+    /// part like any other index, and one the model still cannot hold is
+    /// never declared, so it is refused as unmanaged.
     Unrepresentable(String),
 }
 
@@ -1994,9 +1996,7 @@ fn dependents_query(refclass: &str) -> String {
           WHERE {edge} AND d.classid = 'pg_catalog.pg_attrdef'::regclass
           UNION ALL
          SELECT 'index', {described}, n2.nspname, c2.relname, ic.relname, 0::int8,
-                CASE WHEN i.indexprs IS NOT NULL
-                     THEN 'an index over an expression, which `IndexColumn` has no field for'
-                     WHEN ic.relkind <> 'i'
+                CASE WHEN ic.relkind <> 'i'
                      THEN 'a relation of a kind this reader does not know'
                      ELSE '' END
            FROM pg_catalog.pg_depend d

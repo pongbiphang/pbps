@@ -2219,11 +2219,30 @@ fn column_as_declared(
 /// access method is read back exactly, and a GIN index rebuilt as a B-tree
 /// answers other queries (DEC-1169.1).
 fn index_as_declared(declared: &pbps_model::Index, now: &pbps_model::Index) -> bool {
-    declared.columns == now.columns
+    declared.columns.len() == now.columns.len()
+        && declared
+            .columns
+            .iter()
+            .zip(&now.columns)
+            .all(|(d, n)| key_as_declared(d, n))
         && declared.include == now.include
         && declared.unique == now.unique
         && declared.filter.is_some() == now.filter.is_some()
         && declared.method == now.method
+}
+
+/// Whether an index key read back is the one declared: a column by its name,
+/// and an expression by being one — its text is the engine's to respell, as a
+/// filter's is (DEC-1169.2) — each with the same direction and class.
+fn key_as_declared(declared: &pbps_model::IndexColumn, now: &pbps_model::IndexColumn) -> bool {
+    declared.descending == now.descending
+        && declared.opclass == now.opclass
+        && match (&declared.key, &now.key) {
+            (pbps_model::IndexKey::Column(a), pbps_model::IndexKey::Column(b)) => a == b,
+            (pbps_model::IndexKey::Expression(_), pbps_model::IndexKey::Expression(_)) => true,
+            (pbps_model::IndexKey::Column(_), pbps_model::IndexKey::Expression(_))
+            | (pbps_model::IndexKey::Expression(_), pbps_model::IndexKey::Column(_)) => false,
+        }
 }
 
 /// Whether a primary key read back is the one declared. The name only where
@@ -10176,7 +10195,7 @@ mod tests {
                     name.to_owned(),
                     pbps_model::Index {
                         columns: vec![pbps_model::IndexColumn {
-                            name: "note".to_owned(),
+                            key: pbps_model::IndexKey::Column("note".to_owned()),
                             descending: false,
                             opclass: None,
                         }],
@@ -10296,7 +10315,7 @@ mod tests {
                     name: "ix_note".to_owned(),
                     index: Box::new(pbps_model::Index {
                         columns: vec![pbps_model::IndexColumn {
-                            name: "note".to_owned(),
+                            key: pbps_model::IndexKey::Column("note".to_owned()),
                             descending: false,
                             opclass: None,
                         }],
@@ -10800,7 +10819,7 @@ mod tests {
         }
         let index = |column: &str, unique: bool, filter: Option<&str>| Index {
             columns: vec![IndexColumn {
-                name: column.into(),
+                key: pbps_model::IndexKey::Column(column.into()),
                 descending: false,
                 opclass: None,
             }],
@@ -10879,7 +10898,7 @@ mod tests {
         });
         let ix = Index {
             columns: vec![IndexColumn {
-                name: "id".into(),
+                key: pbps_model::IndexKey::Column("id".into()),
                 descending: false,
                 opclass: None,
             }],
@@ -11191,7 +11210,7 @@ mod tests {
             "ix".into(),
             Index {
                 columns: vec![IndexColumn {
-                    name: "id".into(),
+                    key: pbps_model::IndexKey::Column("id".into()),
                     descending: false,
                     opclass: None,
                 }],
@@ -11267,7 +11286,10 @@ mod tests {
                         .references_columns = vec!["other".into()]
                 }
                 "check" => changed.checks.get_mut("ck").unwrap().expression = "([id]>(1))".into(),
-                "index" => changed.indexes.get_mut("ix").unwrap().columns[0].name = "other".into(),
+                "index" => {
+                    changed.indexes.get_mut("ix").unwrap().columns[0].key =
+                        pbps_model::IndexKey::Column("other".into())
+                }
                 "removed" => {
                     changed.checks.remove("ck");
                 }
@@ -11428,7 +11450,7 @@ mod tests {
             "ix_rogue".to_owned(),
             pbps_model::Index {
                 columns: vec![pbps_model::IndexColumn {
-                    name: "id".to_owned(),
+                    key: pbps_model::IndexKey::Column("id".to_owned()),
                     descending: false,
                     opclass: None,
                 }],
@@ -11540,7 +11562,7 @@ mod tests {
                 "ix_new".to_owned(),
                 pbps_model::Index {
                     columns: vec![pbps_model::IndexColumn {
-                        name: "id".to_owned(),
+                        key: pbps_model::IndexKey::Column("id".to_owned()),
                         descending: false,
                         opclass: None,
                     }],
@@ -12029,7 +12051,7 @@ mod tests {
     fn a_redefined_index_is_judged_by_its_net_result() {
         let index = |unique: bool| pbps_model::Index {
             columns: vec![pbps_model::IndexColumn {
-                name: "note".to_owned(),
+                key: pbps_model::IndexKey::Column("note".to_owned()),
                 descending: false,
                 opclass: None,
             }],
@@ -12108,7 +12130,7 @@ mod tests {
                             "gone".into(),
                             Index {
                                 columns: vec![IndexColumn {
-                                    name: "id".into(),
+                                    key: pbps_model::IndexKey::Column("id".into()),
                                     descending: false,
                                     opclass: None,
                                 }],
@@ -13759,7 +13781,7 @@ mod tests {
         let dbo_p: TableName = "dbo.p".parse().unwrap();
         let index = |on: &str, unique: bool| pbps_model::Index {
             columns: vec![pbps_model::IndexColumn {
-                name: on.to_owned(),
+                key: pbps_model::IndexKey::Column(on.to_owned()),
                 descending: false,
                 opclass: None,
             }],
@@ -13851,6 +13873,43 @@ mod tests {
                 t.indexes.insert("ix".to_owned(), gin);
             }),
             "the index came back under another method",
+        );
+        // An expression key is held to being one, not to its text, which
+        // the engine respells (DEC-1169.2); the same position read back as a
+        // column is another index.
+        let over = |key: pbps_model::IndexKey| pbps_model::Index {
+            columns: vec![pbps_model::IndexColumn {
+                key,
+                descending: false,
+                opclass: None,
+            }],
+            ..index("id", false)
+        };
+        let adding_expression = plan(pbps_model::Change::AddIndex {
+            table: dbo_t.clone(),
+            name: "ix".to_owned(),
+            index: Box::new(over(pbps_model::IndexKey::Expression("id+1".into()))),
+            clustered: false,
+        });
+        check(
+            &adding_expression,
+            &with(&|t| {
+                t.indexes.insert(
+                    "ix".to_owned(),
+                    over(pbps_model::IndexKey::Expression("(id + 1)".into())),
+                );
+            }),
+        )
+        .expect("the expression as the engine respells it");
+        refused(
+            &adding_expression,
+            &with(&|t| {
+                t.indexes.insert(
+                    "ix".to_owned(),
+                    over(pbps_model::IndexKey::Column("id".into())),
+                );
+            }),
+            "the expression key came back as a column",
         );
         let adding_clustered = plan(pbps_model::Change::AddIndex {
             table: dbo_t.clone(),

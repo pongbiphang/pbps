@@ -1011,3 +1011,57 @@ declaration schema is published as set 20.
 Pinned by `a_gin_index_over_jsonb_round_trips_and_changes_as_a_typed_plan`
 (`crates/pbps-pg/tests/live.rs`), which reads hand-written DDL, rebuilds it,
 replaces and drops an index, and refuses to take a B-tree for the GIN index.
+
+<a id="dec-1169-2"></a>
+
+**DEC-1169.2. An index key is a column or an expression, and which one is
+what its declaration says, never what its text looks like.** The model's key
+is `IndexKey::Column` or `IndexKey::Expression`. It is an enum and not an
+optional text beside the name, so a key cannot be both or neither, and a
+reader that wants a column must say what it does with an expression. A
+column key serializes exactly as every key did before (`name`), so older
+states and plans read unchanged and a column key's fingerprint does not move.
+
+YAML keeps `columns: [a, b desc]` for an index of columns and adds `keys:`,
+one mapping each (`{column: id}` or `{expression: "lower(email)"}`, with
+optional `opclass:` and `order:`), for an index with any expression. An
+index names its keys under one list, not both. `columns:` cannot also hold
+mappings: an entry read without a declared type makes a plain `n` or `on` a
+YAML boolean, and a column may be named either. Parentheses decide nothing,
+because a quoted identifier may contain them.
+
+PostgreSQL holds expression keys on a B-tree only, under the default class
+and the database's default collation. Neither an expression's own collation
+nor its class's default is in the catalog by name, so anything else is left
+out and named. Measured on 18.6, `lower(email) COLLATE "C"` shows
+`indcollation` 950 against 100. The reader takes each expression's text by
+position (`pg_get_indexdef(oid, k, true)`), and its type from the index
+relation's own attribute. It never guesses a column from an expression.
+
+The declared text is recorded, advanced and overlaid as a filter's is
+(`DeclaredExpressions::keys`, one entry per key), and compared by presence
+(SPEC §7.6). It is overlaid only where the read-back has the same shape, an
+expression where one was declared and a column where one was. An expression
+binds names as a filter does, so an index with one is never built
+`CONCURRENTLY`. It is observed wherever a filtered index is, and it is split
+out of a new table to be built after the modules it may call
+(`Index::holds_expression`).
+
+A declared expression index is now a table part, dropped and restored around
+the rebuild of a function it calls. It was `Unrepresentable` until an index
+key could hold it. One the model still cannot hold is never declared, and is
+refused as unmanaged. A unique expression index is accepted and its collision
+probe is unchecked, since no probe here evaluates the expression over the
+planned rows. SQL Server refuses expression keys. A renamed column is not
+rewritten inside an expression, as it is not inside a filter: the engine
+renames what it stores, and the declaration spells the new name.
+
+State version 11 carries expression keys and their declared texts, and still
+reads 6 to 10: an older reader recorded every key as the column it was.
+Plan version 15 turns 14 away. The declaration schema is published as set
+21.
+
+Pinned by `a_btree_expression_index_round_trips_and_changes_as_a_typed_plan`
+(`crates/pbps-pg/tests/live.rs`) and
+`a_declared_expression_index_is_dropped_and_restored_around_a_function_rebuild`
+(`crates/pbps-cli/tests/flow_pg.rs`).

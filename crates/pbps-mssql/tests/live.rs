@@ -1205,12 +1205,12 @@ fn rich_schema() -> Schema {
         Index {
             columns: vec![
                 IndexColumn {
-                    name: "region_id".into(),
+                    key: pbps_model::IndexKey::Column("region_id".into()),
                     descending: false,
                     opclass: None,
                 },
                 IndexColumn {
-                    name: "created_at".into(),
+                    key: pbps_model::IndexKey::Column("created_at".into()),
                     descending: true,
                     opclass: None,
                 },
@@ -1314,10 +1314,7 @@ async fn dotted_names_survive_introspection_in_keys_indexes_and_foreign_keys() {
         );
         let ix = &parent.indexes["ix_parent"];
         assert_eq!(
-            ix.columns
-                .iter()
-                .map(|c| c.name.as_str())
-                .collect::<Vec<_>>(),
+            ix.columns.iter().map(|c| c.key.text()).collect::<Vec<_>>(),
             [column],
             "{tag}: index key members"
         );
@@ -1390,7 +1387,7 @@ async fn applying_a_planned_migration_converges_on_the_target() {
             "ix_customer_loyalty".into(),
             Index {
                 columns: vec![IndexColumn {
-                    name: "loyalty".into(),
+                    key: pbps_model::IndexKey::Column("loyalty".into()),
                     descending: false,
                     opclass: None,
                 }],
@@ -5860,7 +5857,7 @@ async fn a_unique_index_is_probed_and_a_filtered_one_only_over_the_rows_it_keeps
         name: "ix_customer_email".into(),
         index: Box::new(Index {
             columns: vec![IndexColumn {
-                name: "email".into(),
+                key: pbps_model::IndexKey::Column("email".into()),
                 descending: false,
                 opclass: None,
             }],
@@ -6010,7 +6007,7 @@ async fn a_filtered_predicate_reads_a_retyped_column_through_the_type_it_has_now
                     name: "ix_flagged".into(),
                     index: Box::new(Index {
                         columns: vec![IndexColumn {
-                            name: "email".into(),
+                            key: pbps_model::IndexKey::Column("email".into()),
                             descending: false,
                             opclass: None,
                         }],
@@ -13576,7 +13573,7 @@ async fn an_expression_ending_in_a_line_comment_still_applies() {
         "ix_commented_status".into(),
         Index {
             columns: vec![IndexColumn {
-                name: "status".into(),
+                key: pbps_model::IndexKey::Column("status".into()),
                 descending: false,
                 opclass: None,
             }],
@@ -14675,7 +14672,7 @@ async fn constraint_name_validation_preserves_legal_index_sharing() {
         "shared".into(),
         Index {
             columns: vec![IndexColumn {
-                name: "id".into(),
+                key: pbps_model::IndexKey::Column("id".into()),
                 descending: false,
                 opclass: None,
             }],

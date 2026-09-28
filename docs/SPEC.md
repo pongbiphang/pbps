@@ -233,6 +233,12 @@ indexes:
   slice holds `method: gin` over `jsonb` columns, with the class left out or
   `jsonb_path_ops`. SQL Server has only the default method and no classes, so
   it refuses `method: gin` and any class (DEC-1169.1).
+- **An index with an expression key lists its keys under `keys:`**, one
+  mapping each: `{column: id}` or `{expression: "lower(email)"}`, with
+  optional `opclass:` and `order: desc`. An index names its keys under
+  `columns:` or `keys:`, never both, and an expression is never inferred from
+  parentheses. PostgreSQL holds expression keys on a B-tree; SQL Server
+  refuses them (DEC-1169.2).
 - **Comments belong in `description` fields only.** The tool owns the file format
   and `pbps fmt` rewrites files canonically, so ordinary YAML comments are lost.
   `description` doubles as the source for data-catalogue integration.

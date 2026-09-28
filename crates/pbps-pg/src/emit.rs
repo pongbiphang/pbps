@@ -819,8 +819,13 @@ fn foreign_key_clause(name: &str, fk: &ForeignKey) -> Result<String, DialectErro
 /// than refusing a plan whose destination is the same either way. An index
 /// without a filter has no expression to bind and needs no path at all, so
 /// nothing is lost by leaving the scope off it.
-pub(crate) const fn built_concurrently(index: &Index, strategy: Strategy) -> bool {
-    strategy.online && index.filter.is_none()
+///
+/// A key expression binds its names exactly as a filter does, so an index over
+/// one is built the ordinary way too, under the scope (DEC-1169.2).
+pub(crate) fn built_concurrently(index: &Index, strategy: Strategy) -> bool {
+    strategy.online
+        && index.filter.is_none()
+        && index.columns.iter().all(|c| c.key.column().is_some())
 }
 
 fn create_index(
@@ -836,7 +841,13 @@ fn create_index(
         .columns
         .iter()
         .map(|c| {
-            let mut key = quote(&c.name)?;
+            // An expression is written as declared, parenthesised, and ended
+            // with a newline so a trailing line comment in it cannot swallow
+            // the rest of the statement (DECISIONS 281, DEC-1169.2).
+            let mut key = match &c.key {
+                pbps_model::IndexKey::Column(name) => quote(name)?,
+                pbps_model::IndexKey::Expression(text) => format!("({})", verbatim(text)),
+            };
             // Qualified, so a class of the same name earlier on the
             // `search_path` cannot stand in for the one declared: every class
             // this model accepts is the engine's own.
@@ -3468,7 +3479,7 @@ mod tests {
         };
         let index = pbps_model::Index {
             columns: vec![IndexColumn {
-                name: "id".into(),
+                key: pbps_model::IndexKey::Column("id".into()),
                 descending: false,
                 opclass: None,
             }],
@@ -5218,13 +5229,53 @@ mod tests {
         assert_eq!(block.matches("$pbps1$").count(), 2, "{block}");
     }
 
+    /// An expression key is written parenthesised and as declared, ended
+    /// by a newline so a trailing comment cannot swallow the statement, and an
+    /// index with one is never built concurrently, as a filtered one is not
+    /// (DEC-1169.2).
+    #[test]
+    fn an_expression_key_is_written_as_declared_and_never_concurrently() {
+        let index = Index {
+            columns: vec![
+                IndexColumn {
+                    key: pbps_model::IndexKey::Expression("lower(email) -- why".into()),
+                    descending: true,
+                    opclass: None,
+                },
+                IndexColumn::column("id"),
+            ],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method: Default::default(),
+        };
+        let change = Change::AddIndex {
+            table: name("app", "t"),
+            name: "ix".into(),
+            index: Box::new(index.clone()),
+            clustered: false,
+        };
+        let sql = sql_of(&Postgres::new(), &change).remove(0);
+        assert!(
+            sql.contains("(lower(email) -- why\n) DESC, \"id\" ASC)"),
+            "{sql}"
+        );
+        assert!(!built_concurrently(&index, Strategy { online: true }));
+        // Negative: the same index over columns alone is built concurrently.
+        let plain = Index {
+            columns: vec![IndexColumn::column("id")],
+            ..index
+        };
+        assert!(built_concurrently(&plain, Strategy { online: true }));
+    }
+
     /// A GIN index is built `USING gin`, with no direction on its keys, which
     /// the method refuses, and with a non-default class qualified so the
     /// `search_path` cannot swap it for another (DEC-1169.1).
     #[test]
     fn a_gin_index_names_its_method_and_qualifies_its_class() {
         let key = |name: &str, opclass: Option<&str>| IndexColumn {
-            name: name.into(),
+            key: pbps_model::IndexKey::Column(name.into()),
             descending: false,
             opclass: opclass.map(str::to_owned),
         };
@@ -5258,7 +5309,7 @@ mod tests {
     fn only_the_concurrent_index_leaves_the_scope_off() {
         let index = Index {
             columns: vec![IndexColumn {
-                name: "n".into(),
+                key: pbps_model::IndexKey::Column("n".into()),
                 descending: true,
                 opclass: None,
             }],
@@ -5382,7 +5433,7 @@ mod tests {
                 name: "ix".into(),
                 index: Box::new(Index {
                     columns: vec![IndexColumn {
-                        name: "n".into(),
+                        key: pbps_model::IndexKey::Column("n".into()),
                         descending: false,
                         opclass: None,
                     }],

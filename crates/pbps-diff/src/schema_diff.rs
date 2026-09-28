@@ -942,21 +942,17 @@ fn recreate_referenced_foreign_keys(
                 (table, key.columns.iter().cloned().collect::<BTreeSet<_>>())
             }
             Change::DropIndex { table, name } => {
-                let Some(index) = aligned
+                // Only a unique index over plain columns can back a foreign
+                // key: the engine refuses one over an expression (DEC-1169.2).
+                let Some(columns) = aligned
                     .get(table)
                     .and_then(|t| t.indexes.get(name))
                     .filter(|i| i.unique && i.filter.is_none())
+                    .and_then(|i| i.column_keys())
                 else {
                     continue;
                 };
-                (
-                    table,
-                    index
-                        .columns
-                        .iter()
-                        .map(|c| c.name.clone())
-                        .collect::<BTreeSet<_>>(),
-                )
+                (table, columns.into_iter().collect::<BTreeSet<_>>())
             }
             Change::CreateTable { .. }
             | Change::DropTable { .. }
@@ -1225,9 +1221,18 @@ fn recreate_retyped_dependents(
         for (n, index) in &before.indexes {
             if after.indexes.get(n) == Some(index)
                 && before.index_is_clustered(n) == after.index_is_clustered(n)
-                && (index.columns.iter().any(|c| key_column(&c.name))
+                && (index
+                    .columns
+                    .iter()
+                    .any(|c| c.key.column().is_some_and(key_column))
                     || index.include.iter().any(|c| key_column(c))
-                    || (filters && index.filter.is_some()))
+                    // An expression names its columns inside text this does
+                    // not parse, so it is treated as a filter is: rebuilt
+                    // wherever the dialect rebuilds filtered indexes
+                    // (DEC-1169.2).
+                    || (filters
+                        && (index.filter.is_some()
+                            || index.columns.iter().any(|c| c.key.expression().is_some()))))
             {
                 changes.push(Change::DropIndex {
                     table: name.clone(),
@@ -2840,7 +2845,7 @@ mod tests {
             "ix_v".into(),
             Index {
                 columns: vec![IndexColumn {
-                    name: "v".into(),
+                    key: pbps_model::IndexKey::Column("v".into()),
                     descending: false,
                     opclass: None,
                 }],
@@ -3560,7 +3565,7 @@ mod tests {
                 "ix_n".to_owned(),
                 pbps_model::Index {
                     columns: vec![pbps_model::IndexColumn {
-                        name: "n".to_owned(),
+                        key: pbps_model::IndexKey::Column("n".to_owned()),
                         descending: false,
                         opclass: None,
                     }],
@@ -6123,7 +6128,7 @@ mod tests {
     fn changed_index_becomes_drop_then_add() {
         let ix = |c: &str| Index {
             columns: vec![IndexColumn {
-                name: c.into(),
+                key: pbps_model::IndexKey::Column(c.into()),
                 descending: false,
                 opclass: None,
             }],
@@ -6193,7 +6198,7 @@ mod tests {
                     "old_key".into(),
                     pbps_model::Index {
                         columns: vec![pbps_model::IndexColumn {
-                            name: "id".into(),
+                            key: pbps_model::IndexKey::Column("id".into()),
                             descending: false,
                             opclass: None,
                         }],
@@ -6299,7 +6304,7 @@ mod tests {
                 "old_index".into(),
                 pbps_model::Index {
                     columns: vec![pbps_model::IndexColumn {
-                        name: "id".into(),
+                        key: pbps_model::IndexKey::Column("id".into()),
                         descending: false,
                         opclass: None,
                     }],
@@ -6472,7 +6477,7 @@ mod tests {
             "ux_product_sku".into(),
             Index {
                 columns: vec![IndexColumn {
-                    name: "sku".into(),
+                    key: pbps_model::IndexKey::Column("sku".into()),
                     descending: false,
                     opclass: None,
                 }],
@@ -6618,7 +6623,7 @@ mod tests {
             "ix_t_old".into(),
             Index {
                 columns: vec![IndexColumn {
-                    name: "old".into(),
+                    key: pbps_model::IndexKey::Column("old".into()),
                     descending: false,
                     opclass: None,
                 }],
@@ -6639,7 +6644,7 @@ mod tests {
             "ix_t_old".into(),
             Index {
                 columns: vec![IndexColumn {
-                    name: "new".into(),
+                    key: pbps_model::IndexKey::Column("new".into()),
                     descending: false,
                     opclass: None,
                 }],
@@ -6824,7 +6829,7 @@ mod tests {
     fn a_filtered_index_is_dropped_before_the_rename_it_blocks() {
         let ix = |column: &str| Index {
             columns: vec![IndexColumn {
-                name: column.into(),
+                key: pbps_model::IndexKey::Column(column.into()),
                 descending: false,
                 opclass: None,
             }],
@@ -6998,7 +7003,7 @@ mod tests {
             "target".into(),
             Index {
                 columns: vec![IndexColumn {
-                    name: "n".into(),
+                    key: pbps_model::IndexKey::Column("n".into()),
                     descending: false,
                     opclass: None,
                 }],
@@ -7097,7 +7102,7 @@ mod tests {
             "ix".into(),
             Index {
                 columns: vec![IndexColumn {
-                    name: "id".into(),
+                    key: pbps_model::IndexKey::Column("id".into()),
                     descending: false,
                     opclass: None,
                 }],
@@ -7508,7 +7513,7 @@ mod tests {
             "target".into(),
             Index {
                 columns: vec![IndexColumn {
-                    name: "id".into(),
+                    key: pbps_model::IndexKey::Column("id".into()),
                     descending: false,
                     opclass: None,
                 }],
@@ -7557,7 +7562,7 @@ mod tests {
             "old".into(),
             Index {
                 columns: vec![IndexColumn {
-                    name: "n".into(),
+                    key: pbps_model::IndexKey::Column("n".into()),
                     descending: false,
                     opclass: None,
                 }],
@@ -7600,7 +7605,7 @@ mod tests {
             "target".into(),
             Index {
                 columns: vec![IndexColumn {
-                    name: "id".into(),
+                    key: pbps_model::IndexKey::Column("id".into()),
                     descending: false,
                     opclass: None,
                 }],
@@ -7821,7 +7826,7 @@ mod tests {
             "ix_doomed".into(),
             Index {
                 columns: vec![IndexColumn {
-                    name: "doomed".into(),
+                    key: pbps_model::IndexKey::Column("doomed".into()),
                     descending: false,
                     opclass: None,
                 }],
