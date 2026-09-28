@@ -987,7 +987,9 @@ leaving the class out) or `jsonb_path_ops`, and a B-tree only under default
 classes. Spelling `jsonb_ops` is refused, as is `unique`, `include` or `desc`
 on GIN. Measured on 18.6, the engine refuses the last three itself. Anything
 else is refused before apply, because the reader would report it as a
-limitation after apply. SQL Server refuses any method or class.
+limitation after apply. SQL Server builds every index as a B-tree and has no
+classes, so it refuses `method: gin` and any class. `method: btree` is only
+the default spelled out, and `fmt` writes it back out of the file.
 
 The reader takes each key's class from the catalog as `schema.name`, or empty
 for the resolved default. It accepts only `pg_catalog.jsonb_path_ops`. A class
