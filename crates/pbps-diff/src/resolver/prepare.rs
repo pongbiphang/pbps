@@ -202,6 +202,7 @@ pub(super) fn changes(
                 );
                 parts.extend(indexes.into_iter().map(|(index, spec)| Change::AddIndex {
                     table: name.clone(),
+                    clustered: table.index_is_clustered(&index),
                     name: index,
                     index: Box::new(spec),
                 }));
@@ -325,10 +326,13 @@ pub(super) fn changes(
                 else {
                     unreachable!("surface kind is preserved")
                 };
-                let index = desired
+                let definition = desired
                     .tables
                     .get(table)
-                    .and_then(|t| t.indexes.get(name))
+                    .ok_or_else(|| Error::Definition(surface.clone()))?;
+                let index = definition
+                    .indexes
+                    .get(name)
                     .ok_or_else(|| Error::Definition(surface.clone()))?
                     .clone();
                 vec![
@@ -340,6 +344,7 @@ pub(super) fn changes(
                         table: table.clone(),
                         name: name.clone(),
                         index: Box::new(index),
+                        clustered: definition.index_is_clustered(name),
                     },
                 ]
             }

@@ -244,12 +244,12 @@ impl ResolverEvidence {
                         name: name.clone(),
                     })
                 }
-                Change::AddIndex { table, name, index } if index.filter.is_some() => {
-                    Some(super::Surface::Index {
-                        table: table.clone(),
-                        name: name.clone(),
-                    })
-                }
+                Change::AddIndex {
+                    table, name, index, ..
+                } if index.filter.is_some() => Some(super::Surface::Index {
+                    table: table.clone(),
+                    name: name.clone(),
+                }),
                 _ => None,
             };
             if let Some(surface) = surface

@@ -334,6 +334,7 @@ fn removing_a_predicate_can_retain_the_plain_index_catalog_record() {
     changes.changes.push(PlannedChange::new(Change::AddIndex {
         table: "app.v".parse().unwrap(),
         name: "ix".into(),
+        clustered: false,
         index: Box::new(crate::Index {
             columns: vec![crate::IndexColumn {
                 name: "n".into(),
@@ -1300,11 +1301,13 @@ fn table_constraint_mutations_require_complete_owner_inventories() {
     let table: TableName = "app.v".parse().unwrap();
     for change in [
         Change::SetPrimaryKey {
+            nonclustered: false,
             table: table.clone(),
             from: None,
             to: Some(serde_json::from_value(serde_json::json!({"columns":["n"]})).unwrap()),
         },
         Change::AddUnique {
+            clustered: false,
             table: table.clone(),
             name: "uq".into(),
             constraint: serde_json::from_value(serde_json::json!({"columns":["n"]})).unwrap(),
@@ -1388,6 +1391,7 @@ fn mutations_of_created_or_removed_targets_use_the_planned_endpoint() {
             changes
                 .changes
                 .push(PlannedChange::new(Change::SetPrimaryKey {
+                    nonclustered: false,
                     table: table.clone(),
                     from: None,
                     to: Some(serde_json::from_value(serde_json::json!({"columns":["n"]})).unwrap()),

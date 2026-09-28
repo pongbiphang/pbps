@@ -555,3 +555,64 @@ fn deprecation_does_not_rebuild_unchanged_column_dependents() {
         );
     }
 }
+
+#[test]
+fn splitting_table_creation_preserves_the_declared_index_layout() {
+    use pbps_model::{Clustered, Hints, IdsFile, Index, IndexColumn, Schema};
+    for clustered in [false, true] {
+        let base = Schema::default();
+        let old_ids = IdsFile::default();
+        let mut desired = tables();
+        for table in desired.tables.values_mut() {
+            table.indexes.insert(
+                "ix".into(),
+                Index {
+                    columns: vec![IndexColumn {
+                        name: "id".into(),
+                        descending: false,
+                    }],
+                    include: vec![],
+                    unique: false,
+                    filter: None,
+                },
+            );
+            table.clustered = clustered.then(|| Clustered::Index("ix".into()));
+        }
+        let wanted_ids = ids(&desired, &old_ids);
+        let ordered = plan(
+            crate::Side {
+                schema: &base,
+                ids: &old_ids,
+            },
+            crate::Side {
+                schema: &desired,
+                ids: &wanted_ids,
+            },
+            &Hints::default(),
+            &[],
+            &pbps_dialect::MinimalDialect,
+        )
+        .unwrap();
+        let indexes: Vec<_> = ordered
+            .changes
+            .changes
+            .iter()
+            .filter_map(|step| {
+                if let Change::AddIndex { clustered, .. } = &step.change {
+                    Some(*clustered)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(indexes, vec![clustered; 2]);
+        ordered.proof.validate(&ordered.changes).unwrap();
+        let mut changed = ordered.changes.clone();
+        for step in &mut changed.changes {
+            if let Change::AddIndex { clustered, .. } = &mut step.change {
+                *clustered = !*clustered;
+            }
+        }
+        assert!(ordered.proof.validate(&changed).is_err());
+    }
+}
