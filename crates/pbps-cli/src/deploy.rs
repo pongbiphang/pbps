@@ -559,6 +559,39 @@ pub(crate) fn object_reads(cs: &pbps_model::ChangeSet) -> (Vec<TableName>, Vec<T
     (names, parents)
 }
 
+/// Every name the walk may hold that the collation question has to see
+/// (#1215): the names the plan reads (`object_reads`), the names the catalog
+/// found, and the destination of each occupant a cross-schema `RenameTable`
+/// carries. The walk moves a carried constraint into the new schema under
+/// its own name, so `archive.Ck_Name` arrives there without ever being read,
+/// and a later `archive.ck_name` must still meet it (review of #1240).
+// The complement is every change that moves no table between schemas.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub(crate) fn alike_candidates(
+    cs: &pbps_model::ChangeSet,
+    names: &[TableName],
+    occupants: &[pbps_mssql::catalog::NameOccupant],
+) -> Vec<TableName> {
+    use pbps_model::Change;
+    let mut out: Vec<TableName> = names.to_vec();
+    out.extend(occupants.iter().map(|o| o.name.clone()));
+    for p in &cs.changes {
+        if let Change::RenameTable { from, to, .. } = &p.change
+            && from.schema != to.schema
+        {
+            out.extend(
+                occupants
+                    .iter()
+                    .filter(|o| o.parent.as_ref() == Some(from))
+                    .map(|o| TableName::new(to.schema.clone(), o.name.name.clone())),
+            );
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// One entry of a schema's `sys.objects` namespace while a plan is walked:
 /// read from the catalog, or put there by an earlier change of the plan.
 #[derive(Debug, Clone)]
@@ -7784,6 +7817,49 @@ mod tests {
         );
         refuse_occupied_objects_under(&both, &[], &[], "prod")
             .expect("two names where the database reads them as two");
+
+        // A transfer's carried constraint is asked about under the name it
+        // arrives with in the new schema (review of #1240).
+        let carried = NameOccupant {
+            wanted: TableName::new("dbo", "Ck_Name"),
+            name: TableName::new("dbo", "Ck_Name"),
+            kind: "check constraint".into(),
+            parent: Some(old.clone()),
+            parent_column: None,
+        };
+        let transfer_old = plan(vec![PlannedChange::new(Change::RenameTable {
+            uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.old", 0),
+            from: old.clone(),
+            to: TableName::new("archive", "old"),
+            defaults: Vec::new(),
+        })]);
+        let candidates = alike_candidates(&transfer_old, &[], std::slice::from_ref(&carried));
+        assert!(
+            candidates.contains(&TableName::new("archive", "Ck_Name")),
+            "{candidates:?}"
+        );
+        assert!(
+            candidates.contains(&TableName::new("dbo", "Ck_Name")),
+            "{candidates:?}"
+        );
+        // And the walk meets it there under the database's answer.
+        let archive_other = TableName::new("archive", "other");
+        let mut carried_then_added = transfer_old.clone();
+        carried_then_added
+            .changes
+            .push(check_on(&archive_other, "ck_name"));
+        let e = refuse_occupied_objects_under(
+            &carried_then_added,
+            std::slice::from_ref(&carried),
+            &[(
+                TableName::new("archive", "Ck_Name"),
+                TableName::new("archive", "ck_name"),
+            )],
+            "prod",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("`archive.ck_name`"), "{e}");
 
         // #1214: every name the walk claims for an addition is read too, so
         // one already held in the database is found.
