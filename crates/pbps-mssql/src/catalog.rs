@@ -784,7 +784,8 @@ pub async fn tables_reusing_a_column_name(
 /// database names its objects under a fixed catalog collation of its own.
 /// Measured on 17.0: with an accent-insensitive database collation, `cafe` and
 /// `café` are two constraints there and one anywhere else, and the two
-/// collations agree on a database that is not contained (review of #1240).
+/// collations agree on a database that is not contained (review of #1240,
+/// DEC-1243.1).
 /// Each pair comes once, as `(earlier, later)` in the order given. The same
 /// question as [`names_alike`], with the schema taking part (#1215). A fold done
 /// in Rust would refuse a valid plan on a case-sensitive database, so it is

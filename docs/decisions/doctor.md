@@ -660,7 +660,8 @@ comparisons decided it in Rust:
 The last two asked a managed table a second time under another spelling.
 
 All three now go through `catalog::matching_table_names`, which compares under
-`DATABASE_DEFAULT` (DECISIONS 119, 142), in `pbps-mssql::doctor`. That is where
+`DATABASE_DEFAULT` (DECISIONS 119, 142; `CATALOG_DEFAULT` since DEC-1243.1), in
+`pbps-mssql::doctor`. That is where
 the engine is known. The CLI's `referenced_targets` stays exact, because it
 reads the declarations offline and serves PostgreSQL, where the exact
 comparison is right. On a case-sensitive database the engine keeps the
