@@ -1,6 +1,6 @@
 //! Expected closing prerequisites, derived only from approved typed changes.
 
-use super::{InputManifest, ManifestError, ObjectIdentity, Surface};
+use super::{InputManifest, ManifestError, ObjectIdentity, ObjectOwnership, Surface};
 use crate::{Change, ChangeSet, GrantTarget, ModuleId};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -79,7 +79,7 @@ impl InputManifest {
                                     (if before { opening } else { closing })
                                         && candidates
                                             .iter()
-                                            .any(|owner| ownership.permits(owner, changes))
+                                            .any(|owner| owner.contains(ownership, changes))
                                 },
                             )
                     });
@@ -101,7 +101,8 @@ impl InputManifest {
         }
         // An aggregate label permits children but proves no inventory. Every
         // catalog mutation must account for its independently captured owner
-        // and all owned records, even when that owner is not created/dropped.
+        // and its affected records. Containment alone is not a mutation: a
+        // table grant preserves columns/defaults/checks/indexes (SPEC 9.3.2).
         for step in &changes.changes {
             if let Some((candidates, opening, closing)) = changed_owners(&step.change) {
                 let complete = candidates.iter().any(|owner| {
@@ -117,17 +118,17 @@ impl InputManifest {
                         let records: Vec<_> = manifest
                             .prerequisites()
                             .iter()
-                            .filter(|p| p.ownership.permits(owner, changes))
+                            .filter(|p| owner.contains(&p.ownership, changes))
                             .collect();
                         // A grant or constraint may follow an approved CREATE,
                         // or precede a DROP. The typed plan must prove why the
                         // owner is absent at that snapshot, not the inventory.
-                        if records.is_empty() && planned_absence(owner, changes, before) {
+                        if records.is_empty() && planned_absence(owner.surface(), changes, before) {
                             return true;
                         }
                         records
                             .iter()
-                            .any(|p| p.ownership.matches_surface(owner, changes))
+                            .any(|p| p.ownership.matches_surface(owner.surface(), changes))
                             && records.iter().all(|p| inventory.contains(&p.object))
                     })
                 });
@@ -212,26 +213,65 @@ impl InputManifest {
     }
 }
 
-// Exhaustive: adding a catalog mutation must explicitly name the owner and
-// its endpoints. An ADD COLUMN may aggregate under Table without changing
-// unrelated children, so the typed change determines the minimum owner.
-fn changed_owners(change: &Change) -> Option<(Vec<Surface>, bool, bool)> {
-    let (owner, opening, closing) = match change {
-        Change::CreateTable { name, .. } => (Surface::Table(name.clone()), false, true),
-        Change::DropTable { name, .. } => (Surface::Table(name.clone()), true, false),
-        Change::RenameTable { from, .. } => (Surface::Table(from.clone()), true, true),
-        Change::AddColumn { table, name, .. } => (Surface::Column(table.column(name)), false, true),
-        Change::DropColumn { column, .. } => (Surface::Column(column.clone()), true, false),
-        Change::RenameColumn { table, from, .. } => {
-            (Surface::Column(table.column(from)), true, true)
+// Internal records share their qualified surface's atomic properties. Child
+// surfaces need separate mutation authority: a table ACL/constraint change
+// does not replace its columns, defaults, checks or independently named indexes.
+enum OwnerScope {
+    Exact(Surface),
+    WithChildren(Surface),
+}
+
+impl OwnerScope {
+    fn surface(&self) -> &Surface {
+        match self {
+            Self::Exact(surface) | Self::WithChildren(surface) => surface,
         }
-        Change::AlterColumnType { column, .. } | Change::AlterColumnNullability { column, .. } => {
-            (Surface::Column(column.clone()), true, true)
+    }
+
+    fn contains(&self, ownership: &ObjectOwnership, changes: &ChangeSet) -> bool {
+        match self {
+            Self::Exact(surface) => ownership.matches_surface(surface, changes),
+            Self::WithChildren(surface) => ownership.permits(surface, changes),
+        }
+    }
+}
+
+// Exhaustive: every catalog mutation names its owner, extent and endpoints.
+// Parent lifecycles move/create/remove children. Type conversion can replace
+// a column's default, but nullability and table ACL/constraint edits do not.
+fn changed_owners(change: &Change) -> Option<(Vec<OwnerScope>, bool, bool)> {
+    use OwnerScope::{Exact, WithChildren};
+    let (owner, opening, closing) = match change {
+        Change::CreateTable { name, .. } => {
+            (WithChildren(Surface::Table(name.clone())), false, true)
+        }
+        Change::DropTable { name, .. } => (WithChildren(Surface::Table(name.clone())), true, false),
+        Change::RenameTable { from, .. } => {
+            (WithChildren(Surface::Table(from.clone())), true, true)
+        }
+        Change::AddColumn { table, name, .. } => (
+            WithChildren(Surface::Column(table.column(name))),
+            false,
+            true,
+        ),
+        Change::DropColumn { column, .. } => {
+            (WithChildren(Surface::Column(column.clone())), true, false)
+        }
+        Change::RenameColumn { table, from, .. } => (
+            WithChildren(Surface::Column(table.column(from))),
+            true,
+            true,
+        ),
+        Change::AlterColumnType { column, .. } => {
+            (WithChildren(Surface::Column(column.clone())), true, true)
+        }
+        Change::AlterColumnNullability { column, .. } => {
+            (Exact(Surface::Column(column.clone())), true, true)
         }
         Change::AlterColumnDefault {
             column, from, to, ..
         } => (
-            Surface::Default(column.clone()),
+            Exact(Surface::Default(column.clone())),
             from.is_some(),
             to.is_some(),
         ),
@@ -239,59 +279,63 @@ fn changed_owners(change: &Change) -> Option<(Vec<Surface>, bool, bool)> {
         | Change::AddUnique { table, .. }
         | Change::DropUnique { table, .. }
         | Change::AddForeignKey { table, .. }
-        | Change::DropForeignKey { table, .. } => (Surface::Table(table.clone()), true, true),
+        | Change::DropForeignKey { table, .. } => {
+            (Exact(Surface::Table(table.clone())), true, true)
+        }
         Change::AddCheck { table, name, .. } => (
-            Surface::Check {
+            Exact(Surface::Check {
                 table: table.clone(),
                 name: name.clone(),
-            },
+            }),
             false,
             true,
         ),
         Change::DropCheck { table, name } => (
-            Surface::Check {
+            Exact(Surface::Check {
                 table: table.clone(),
                 name: name.clone(),
-            },
+            }),
             true,
             false,
         ),
         Change::AddIndex { table, name, .. } => (
-            Surface::Index {
+            Exact(Surface::Index {
                 table: table.clone(),
                 name: name.clone(),
-            },
+            }),
             false,
             true,
         ),
         Change::DropIndex { table, name } => (
-            Surface::Index {
+            Exact(Surface::Index {
                 table: table.clone(),
                 name: name.clone(),
-            },
+            }),
             true,
             false,
         ),
-        Change::CreateModule { id, .. } => (Surface::Module(id.clone()), false, true),
-        Change::AlterModule { id, .. } => (Surface::Module(id.clone()), true, true),
-        Change::DropModule { id, .. } => (Surface::Module(id.clone()), true, false),
+        Change::CreateModule { id, .. } => (Exact(Surface::Module(id.clone())), false, true),
+        Change::AlterModule { id, .. } => (Exact(Surface::Module(id.clone())), true, true),
+        Change::DropModule { id, .. } => (Exact(Surface::Module(id.clone())), true, false),
         Change::PublicExecution { routine, .. } => (
-            Surface::Module(ModuleId::Routine(routine.clone())),
+            Exact(Surface::Module(ModuleId::Routine(routine.clone()))),
             true,
             true,
         ),
         Change::Grant { target, .. } | Change::Revoke { target, .. } => match target {
-            GrantTarget::Schema(name) => (Surface::Namespace(name.clone()), true, true),
-            GrantTarget::Routine(id) => {
-                (Surface::Module(ModuleId::Routine(id.clone())), true, true)
-            }
+            GrantTarget::Schema(name) => (Exact(Surface::Namespace(name.clone())), true, true),
+            GrantTarget::Routine(id) => (
+                Exact(Surface::Module(ModuleId::Routine(id.clone()))),
+                true,
+                true,
+            ),
             // An object grant may address a table or a named module. One
             // independently owned target must account for both endpoints.
             GrantTarget::Object(name) => {
                 return Some((
                     vec![
-                        Surface::Table(name.clone()),
-                        Surface::Module(ModuleId::Named(name.clone())),
+                        Exact(Surface::Table(name.clone())),
+                        Exact(Surface::Module(ModuleId::Named(name.clone()))),
                     ],
                     true,
                     true,

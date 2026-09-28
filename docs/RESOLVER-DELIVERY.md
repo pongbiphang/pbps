@@ -216,8 +216,11 @@ independently captured typed owner on its opening/closing prerequisite. An
 inventory cannot confer ownership merely by listing an object. Aggregate table
 and column owners and explicitly approved rename endpoints remain valid.
 Every catalog mutation inventory must include the changed owner and all of its
-qualified records in each applicable manifest, including type/nullability,
-constraint, module and authorization changes. Only an approved creation/removal
+affected qualified records in each applicable manifest. Table constraint/ACL
+changes and column nullability changes affect the owner itself, including its
+proved internal records, while preserving separately owned child surfaces.
+Table/column lifecycles include their children; column type conversion also
+includes its default. Independent child mutations retain their own authority. Only an approved creation/removal
 can explain an absent endpoint; a grant on a newly created target remains valid.
 An aggregate label cannot hide an omitted owner behind a listed child, or
 authorize records outside the changed owners and their applicable endpoints.

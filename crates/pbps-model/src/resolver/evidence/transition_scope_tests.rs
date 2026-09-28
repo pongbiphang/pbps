@@ -2,7 +2,7 @@ use super::*;
 use crate::resolver::{BoundSurface, ObjectIdentity, ObjectOwnership, Prerequisite, Surface};
 use crate::{PlannedChange, TableName};
 
-fn object(name: &str) -> ObjectIdentity {
+pub(super) fn object(name: &str) -> ObjectIdentity {
     ObjectIdentity {
         class: "opaque-fixture-record".into(),
         name: vec![name.into()],
@@ -10,7 +10,7 @@ fn object(name: &str) -> ObjectIdentity {
     }
 }
 
-fn fixture() -> (ChangeSet, ResolverEvidence) {
+pub(super) fn fixture() -> (ChangeSet, ResolverEvidence) {
     let PlanAnalysis::Resolved(mut evidence) = super::tests::plan().analysis else {
         panic!("resolved")
     };
@@ -83,7 +83,7 @@ fn fixture() -> (ChangeSet, ResolverEvidence) {
     (changes, *evidence)
 }
 
-fn seal(
+pub(super) fn seal(
     changes: &ChangeSet,
     evidence: &ResolverEvidence,
 ) -> Result<ResolverEvidence, EvidenceError> {
@@ -99,7 +99,7 @@ fn seal(
     )
 }
 
-fn refuses(changes: &ChangeSet, evidence: &ResolverEvidence) {
+pub(super) fn refuses(changes: &ChangeSet, evidence: &ResolverEvidence) {
     assert!(
         evidence
             .before

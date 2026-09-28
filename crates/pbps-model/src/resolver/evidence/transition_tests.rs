@@ -1158,8 +1158,8 @@ fn aggregate_renames_require_owned_records_at_both_endpoints() {
     }
 }
 
-// Both opaque records belong to the changed owner, but only the first is
-// the owner itself. A subordinate-only inventory must not keep its old hash.
+// Both opaque records belong to the changed scope: a directly owned internal
+// record, or a child the mutation affects. Neither can hide an omitted owner.
 fn mutation_inventory(change: Change, owner: Surface, child: Surface) {
     let table: TableName = "app.v".parse().unwrap();
     let (_, mut evidence) = owner_coverage(
@@ -1291,7 +1291,7 @@ fn nullability_mutations_require_complete_owner_inventories() {
                 to_nullable,
             },
             Surface::Column(table.column("n")),
-            Surface::Default(table.column("n")),
+            Surface::Column(table.column("n")),
         );
     }
 }
@@ -1324,7 +1324,7 @@ fn table_constraint_mutations_require_complete_owner_inventories() {
         mutation_inventory(
             change,
             Surface::Table(table.clone()),
-            Surface::Default(table.column("n")),
+            Surface::Table(table.clone()),
         );
     }
 }
@@ -1347,7 +1347,7 @@ fn authorization_mutations_require_complete_target_inventories() {
         mutation_inventory(
             change,
             Surface::Table(table.clone()),
-            Surface::Default(table.column("n")),
+            Surface::Table(table.clone()),
         );
     }
 }

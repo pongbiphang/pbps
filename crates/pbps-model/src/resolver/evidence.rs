@@ -654,3 +654,6 @@ mod transition_tests;
 
 #[cfg(test)]
 mod transition_scope_tests;
+
+#[cfg(test)]
+mod owner_mutation_scope_tests;
