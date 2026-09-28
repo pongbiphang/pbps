@@ -2622,7 +2622,7 @@ fn sqlstate(e: &DbError) -> &str {
 /// GIN over `jsonb` is read from DDL written by hand, rebuilt from that read
 /// in another database, read back the same, and changed as a typed plan: a
 /// class change replaces the index, a removal drops it, and each converges to
-/// an empty next plan (#1169). The ordinary B-tree beside them is the control,
+/// an empty next plan (DEC-1169.1). The ordinary B-tree beside them is the control,
 /// and a B-tree declared over the same column is not taken for the GIN index.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]

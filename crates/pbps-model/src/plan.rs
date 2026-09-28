@@ -134,7 +134,7 @@ use crate::schema::Schema;
 /// this build's emitter reads as the database default — moving a collated
 /// column to it, the silent reset the fields exist to prevent.
 ///
-/// Bumped to 14 for index methods and operator classes (#1169): `method` and
+/// Bumped to 14 for index methods and operator classes (DEC-1169.1): `method` and
 /// each key's `opclass` in an `AddIndex` or created table's payload. An older
 /// build would refuse such a plan on an unknown field; the version says why.
 pub const CURRENT_VERSION: u32 = 14;

@@ -580,7 +580,7 @@ fn constraints_query() -> String {
 ///
 /// `key_classes` holds one entry per key, `''` for the default and
 /// `schema.name` otherwise, so the reader can accept exactly the classes the
-/// model holds and name every other one (#1169). A collation that is not the
+/// model holds and name every other one (DEC-1169.1). A collation that is not the
 /// column's own is its own flag: no class makes up for it.
 ///
 /// `indkey` and `indoption` are `int2vector`s, which no driver here reads.

@@ -489,7 +489,7 @@ fn parse_reference(
 ///
 /// A second part that is a direction is the direction; anything else there is
 /// an operator class, which has to be a plain identifier. Whether the dialect
-/// accepts that class for that column is its validator's question (#1169).
+/// accepts that class for that column is its validator's question (DEC-1169.1).
 fn parse_index_column(src: &SourceFile, v: &Spanned<String>) -> Result<IndexColumn, LoadError> {
     let parts: Vec<&str> = v.value.split_whitespace().collect();
     let bad = |msg: &str| {

@@ -55,7 +55,7 @@ use crate::schema::Schema;
 /// stay readable, for the reason 8 kept them: see `OLDEST_READABLE_VERSION`.
 ///
 /// Bumped to 10 when an index gained its method and each key its operator
-/// class (#1169). Versions 6 to 9 stay readable: see
+/// class (DEC-1169.1). Versions 6 to 9 stay readable: see
 /// `OLDEST_READABLE_VERSION`.
 ///
 /// Readers refuse a version they do not understand rather than reading it
@@ -105,7 +105,7 @@ pub const CURRENT_VERSION: u32 = 10;
 /// report, with a collated column recorded plain, reads back as drift.
 ///
 /// Still 6 at version 10, whose index `method` and key `opclass` an older
-/// state lacks (#1169): absent is the B-tree under default classes, which is
+/// state lacks (DEC-1169.1): absent is the B-tree under default classes, which is
 /// every index an older reader recorded. It reported every other one as a
 /// limitation, and no recorder accepts one of those on a managed table.
 pub const OLDEST_READABLE_VERSION: u32 = 6;

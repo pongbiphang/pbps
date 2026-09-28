@@ -571,7 +571,7 @@ indexes:
     fn malformed_index_direction_is_rejected() {
         // A third part has to be a direction, and a class a plain identifier;
         // a second part that is neither a direction nor an identifier is
-        // neither (#1169).
+        // neither (DEC-1169.1).
         for columns in ["[a jsonb_path_ops sideways]", "[\"a b-c\"]", "[a b c d]"] {
             let e = errors(&format!(
                 "table: dbo.t\ncolumns:\n  a: {{type: int}}\nindexes:\n  ix:\n    columns: {columns}\n"
@@ -586,7 +586,7 @@ indexes:
 
     /// A method and an operator class load, and the writer puts them back in
     /// the order they were read: PostgreSQL's own, class before direction
-    /// (#1169). Absent, each is the default a declaration has always meant.
+    /// (DEC-1169.1). Absent, each is the default a declaration has always meant.
     #[test]
     fn an_index_method_and_operator_class_round_trip() {
         let text = "table: app.doc\ncolumns:\n  body: {type: jsonb}\n  tags: {type: jsonb}\n  n: {type: int}\n\

@@ -154,7 +154,7 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
     found
 }
 
-/// The access methods and operator classes this model holds (#1169): the
+/// The access methods and operator classes this model holds (DEC-1169.1): the
 /// B-tree under each type's default class, and GIN over `jsonb` under
 /// `jsonb_ops`, its default, or `jsonb_path_ops`. Anything else would be
 /// created as declared but read back as a limitation, so it is refused here
@@ -779,7 +779,7 @@ mod tests {
     /// GIN over `jsonb` is accepted with its default class or
     /// `jsonb_path_ops`, filtered or not; everything the engine refuses for
     /// GIN, or this model would read back as a limitation, is refused before
-    /// it is applied (#1169).
+    /// it is applied (DEC-1169.1).
     #[test]
     fn a_gin_index_is_held_to_jsonb_and_to_what_the_engine_accepts() {
         use IndexMethod::Gin;
@@ -815,7 +815,7 @@ mod tests {
     }
 
     /// A B-tree takes no operator class here, and a class that looks like a
-    /// misspelt direction says so (#1169); without one it is unchanged.
+    /// misspelt direction says so (DEC-1169.1); without one it is unchanged.
     #[test]
     fn a_btree_index_takes_no_operator_class() {
         assert!(structure(&indexed(IndexMethod::Btree, &[("n", None, true)])).is_empty());

@@ -830,7 +830,7 @@ fn create_index(
     strategy: Strategy,
 ) -> Result<String, DialectError> {
     // A GIN key has no order: measured on 18.6, `ASC`/`DESC` on one is
-    // "access method \"gin\" does not support ASC/DESC options" (#1169).
+    // "access method \"gin\" does not support ASC/DESC options" (DEC-1169.1).
     let ordered = index.method.is_btree();
     let keys = index
         .columns
@@ -5220,7 +5220,7 @@ mod tests {
 
     /// A GIN index is built `USING gin`, with no direction on its keys, which
     /// the method refuses, and with a non-default class qualified so the
-    /// `search_path` cannot swap it for another (#1169).
+    /// `search_path` cannot swap it for another (DEC-1169.1).
     #[test]
     fn a_gin_index_names_its_method_and_qualifies_its_class() {
         let key = |name: &str, opclass: Option<&str>| IndexColumn {

@@ -599,7 +599,7 @@ pub struct Index {
 
     /// The access method. Absent is the B-tree every engine builds by
     /// default, so an index declared before methods existed reads as the
-    /// index it always was (#1169).
+    /// index it always was (DEC-1169.1).
     #[serde(default, skip_serializing_if = "IndexMethod::is_btree")]
     pub method: IndexMethod,
 }
@@ -651,7 +651,7 @@ pub struct IndexColumn {
     pub descending: bool,
     /// The operator class this key is indexed with, where it is not the
     /// method's default for the column's type; absent is that default. Which
-    /// names are accepted is the dialect's question (#1169).
+    /// names are accepted is the dialect's question (DEC-1169.1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opclass: Option<String>,
 }

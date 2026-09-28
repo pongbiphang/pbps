@@ -779,7 +779,7 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
                 "index `{n}` has an empty filter expression"
             )));
         }
-        // PostgreSQL's words (#1169): SQL Server builds every index this model
+        // PostgreSQL's words (DEC-1169.1): SQL Server builds every index this model
         // holds as a B-tree, and has no operator classes to choose among.
         if !idx.method.is_btree() {
             errs.push(invalid(format!(
@@ -892,7 +892,7 @@ mod tests {
     }
 
     /// A GIN method or an operator class is PostgreSQL's, and is refused on
-    /// SQL Server by name; an index with neither is unchanged (#1169).
+    /// SQL Server by name; an index with neither is unchanged (DEC-1169.1).
     #[test]
     fn an_index_method_or_operator_class_is_refused_on_sql_server() {
         let mut table = Table::default();

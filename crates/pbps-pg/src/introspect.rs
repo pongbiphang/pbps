@@ -2668,7 +2668,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
 }
 
 /// A key's operator class as the model holds it, or `None` after naming why
-/// the index is left out (#1169).
+/// the index is left out (DEC-1169.1).
 ///
 /// A B-tree holds only each type's default class: `text_pattern_ops` answers
 /// different queries, and read back as an ordinary index it would compare
@@ -4975,7 +4975,7 @@ mod tests {
     }
 
     /// A collation that is not the column's own is left out on its own
-    /// account, whatever the class (#1169).
+    /// account, whatever the class (DEC-1169.1).
     #[test]
     fn an_index_under_another_collation_is_left_out() {
         let mut ix = index(50, 1, "t_ix");
@@ -4998,7 +4998,7 @@ mod tests {
     /// GIN over `jsonb` is read back with its method and, where it is not the
     /// default, its class; every other class, a same-named class outside
     /// `pg_catalog`, and a key the catalog did not describe are named and
-    /// left out rather than read as the default (#1169).
+    /// left out rather than read as the default (DEC-1169.1).
     #[test]
     fn a_gin_index_over_jsonb_is_read_back_with_its_class() {
         let gin = |classes: &[&str]| {
