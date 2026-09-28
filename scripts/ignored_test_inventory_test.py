@@ -729,6 +729,72 @@ class Ownership(unittest.TestCase):
                 self.assertEqual(self.check(), 1)
 
 
+    def test_callable_metaclasses_cannot_mutate_positional_selector_bases(self):
+        setup = ('def clear(value):\n'
+                 '    if isinstance(value, tuple) or (value and isinstance(value[0], (list, tuple))):\n'
+                 '        for child in value: clear(child)\n'
+                 '    else: value.clear()\n'
+                 'def construct(name, bases, namespace):\n'
+                 '    for base in bases: clear(base)\n'
+                 '    return type(name, (), namespace)\n'
+                 'TESTS = ["owned"]\nALIAS = TESTS\nWRAPPED = (TESTS,)\n'
+                 'NESTED = (WRAPPED,)\nLIST_WRAPPER = [TESTS]\n')
+        bases = ['TESTS', 'ALIAS', '(TESTS,)', 'WRAPPED', 'NESTED', '[TESTS]',
+                 'LIST_WRAPPER', '*(TESTS,)', '*WRAPPED', '*LIST_WRAPPER',
+                 '*([TESTS],)', 'TESTS, ALIAS', '(), TESTS']
+        self.inventory['owners']['live']['selection'] = {
+            'kind': 'data', 'file': 'runner.py', 'expression': 'TESTS'}
+        for base in bases:
+            with self.subTest(base=base):
+                source = setup + f'class Holder({base}, metaclass=construct): pass\n'
+                actual = subprocess.run([sys.executable, '-c', source + 'print(TESTS)'],
+                                        check=True, capture_output=True, text=True, timeout=10)
+                self.assertEqual(actual.stdout, '[]\n')
+                (self.root / 'runner.py').write_text(source, encoding='utf-8')
+                with self.assertRaises(audit.InventoryError):
+                    self.check()
+
+    def test_ordinary_and_immutable_class_bases_preserve_selectors(self):
+        setup = ('def construct(name, bases, namespace): return type(name, (), namespace)\n'
+                 'class Base: pass\n')
+        controls = [
+            ('TESTS = ["owned"]', 'Base'),
+            ('TESTS = ["owned"]', 'object'),
+            ('TESTS = ["owned"]', ''),
+            ('TESTS = ("owned",)', 'TESTS, metaclass=construct'),
+            ('TESTS = ("owned",)\nALIAS = TESTS', 'ALIAS, metaclass=construct'),
+            ('TESTS = ("owned",)\nWRAPPED = (TESTS,)', 'WRAPPED, metaclass=construct'),
+            ('TESTS = ("owned",)', '*(TESTS,), metaclass=construct'),
+            ('TESTS = ["owned"]', '("local",), metaclass=construct'),
+            ('TESTS = ["owned"]\nLABEL = "local"', 'LABEL, metaclass=construct'),
+        ]
+        self.inventory['owners']['live']['selection'] = {
+            'kind': 'data', 'file': 'runner.py', 'expression': 'TESTS'}
+        for selectors, bases in controls:
+            with self.subTest(selectors=selectors, bases=bases):
+                source = setup + selectors + '\n' + f'class Holder({bases}): pass\n'
+                actual = subprocess.run([sys.executable, '-c', source + 'print(list(TESTS))'],
+                                        check=True, capture_output=True, text=True, timeout=10)
+                self.assertEqual(actual.stdout, "['owned']\n")
+                (self.root / 'runner.py').write_text(source, encoding='utf-8')
+                self.assertEqual(self.check(), 1)
+
+    def test_uncalled_class_construction_does_not_escape_module_selectors(self):
+        setup = ('def construct(name, bases, namespace):\n'
+                 '    bases[0].clear()\n    return type(name, (), namespace)\n'
+                 'TESTS = ["owned"]\n')
+        self.inventory['owners']['live']['selection'] = {
+            'kind': 'data', 'file': 'runner.py', 'expression': 'TESTS'}
+        for definition in ('def unused():', 'async def unused():'):
+            with self.subTest(definition=definition):
+                source = setup + definition + '\n    class Holder(TESTS, metaclass=construct): pass\n'
+                actual = subprocess.run([sys.executable, '-c', source + 'print(TESTS)'],
+                                        check=True, capture_output=True, text=True, timeout=10)
+                self.assertEqual(actual.stdout, "['owned']\n")
+                (self.root / 'runner.py').write_text(source, encoding='utf-8')
+                self.assertEqual(self.check(), 1)
+
+
 
 class CargoSelectors(unittest.TestCase):
     def test_ambiguous_or_unsupported_cargo_arguments_supply_no_owner(self):
