@@ -166,6 +166,8 @@ before the next issue is claimed. #597 is complete; #606 through #613 are delive
 | 7 | [#612](https://github.com/pongbiphang/pbps/issues/612) | capture coherent binding inputs and complete prerequisite manifests |
 | 8 | [#613](https://github.com/pongbiphang/pbps/issues/613) | reconstruct desired namespaces and extract covered creation bindings |
 | 9 | [#614](https://github.com/pongbiphang/pbps/issues/614) | seal versioned evidence and deterministic cross-kind change ordering |
+| 10a | [#1273](https://github.com/pongbiphang/pbps/issues/1273) | share scratch analysis lifecycle across supplied-server and run-owned container controls |
+| 10b | [#1274](https://github.com/pongbiphang/pbps/issues/1274) | construct qualified resolver evidence for the shared analysis run |
 | 10 | [#615](https://github.com/pongbiphang/pbps/issues/615) | integrate lazy target planning and pre-publication verification |
 | 11 | [#616](https://github.com/pongbiphang/pbps/issues/616) | verify sealed prerequisites and closing bindings during apply |
 | 12 | [#617](https://github.com/pongbiphang/pbps/issues/617) | qualify private source logging transport and disposable storage |
