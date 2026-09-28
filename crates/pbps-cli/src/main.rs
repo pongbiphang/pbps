@@ -2740,6 +2740,7 @@ fn cmd_plan(
             pbps_model::PlanBaseline {
                 description: base.description.clone(),
                 checksum: pbps_model::state_checksum(&base.schema, &base.ids),
+                database_collation: None,
             },
             cs.clone(),
             res.ids.clone(),
@@ -3706,6 +3707,7 @@ mod tests {
                     PlanBaseline {
                         description: "test".into(),
                         checksum: "a".repeat(64),
+                        database_collation: None,
                     },
                     ChangeSet {
                         changes: vec![planned],

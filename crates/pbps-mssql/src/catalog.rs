@@ -594,6 +594,19 @@ pub async fn principals_holding(
 /// Compare captured table names under the catalog collation that names them,
 /// part by part (DECISIONS 119, 142). Only values from the caller's read are
 /// compared: a second catalog lookup could miss a name that read already saw.
+/// The connected database's default collation (#1175), as the pull reads it.
+pub async fn database_collation(conn: &mut Conn) -> Result<String, DbError> {
+    let rows = conn
+        .query("SELECT CONVERT(nvarchar(128), DATABASEPROPERTYEX(DB_NAME(), 'Collation')) AS c;")
+        .await?;
+    let Some(name) = rows.first().map(|r| get::<&str>(r, "c")).transpose()? else {
+        return Err(DbError::Refused(
+            "the database's default collation could not be read".to_owned(),
+        ));
+    };
+    Ok(name.to_owned())
+}
+
 /// The declared collation names this server does not have (#1175).
 ///
 /// Asked of `sys.fn_helpcollations()`, which lists every collation the

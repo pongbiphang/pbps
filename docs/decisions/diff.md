@@ -936,10 +936,16 @@ collation equal to the live default taken out (`Schema::without_collation`).
 Compared as written, an unchanged column was altered to the collation it
 already has on every plan, and a created one read back without it failed the
 apply's postcondition. An offline preview cannot do that, and shows such a
-column as a change; the connected plan is the one that is applied. The
-baseline checksum pins the default implicitly: if it changes after the plan,
-every character column's read-back changes with it. A name is compared
-without ASCII case (`Collation`), as the engine resolves it.
+column as a change; the connected plan is the one that is applied. The plan
+records the live default (`PlanBaseline::database_collation`), and `apply`
+refuses before its first statement if the database's default has changed
+since. The baseline checksum only sees that when a managed character column
+sits under the default. A column the plan adds without a collation takes the
+default in force when it runs, and reads back as none either way. (Measured
+on 17.0: the ledger's own `CHECK` on `__pbps_lock` makes the engine refuse
+`ALTER DATABASE ... COLLATE` (5075) until that check is removed, so this is
+rare, but it is not impossible.) A name is compared without ASCII case
+(`Collation`), as the engine resolves it.
 
 The emitter spells `COLLATE` on every statement that writes a column
 definition, `ALTER COLUMN` included, whether or not the collation changes.

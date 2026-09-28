@@ -2202,6 +2202,77 @@ fn a_column_collation_round_trips_and_changes_through_the_cli() {
     ok(&d.run(&["plan"]));
     d.commit();
     ok(&d.run(&["plan", "--db", source.connection()]));
+
+    // A column added with no collation takes the default in force when it
+    // runs, and no managed column sits under the default here to move the
+    // checksum. So the plan pins the default, and an apply after it changed
+    // is refused before the first statement (#1247 review); put back, the
+    // same plan applies.
+    let with_extra = file(&d).replacen(
+        "\nprimary_key:",
+        "\n  extra:\n    type: varchar(5)\n\nprimary_key:",
+        1,
+    );
+    assert_ne!(with_extra, file(&d));
+    std::fs::write(&path, with_extra).unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan-extra.json");
+    ok(&d.run(&[
+        "plan",
+        "--db",
+        source.connection(),
+        "--out",
+        plan.to_str().unwrap(),
+    ]));
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+    assert_eq!(
+        saved["baseline"]["database_collation"], "Latin1_General_CI_AS",
+        "{saved}"
+    );
+    let checksum = plan_checksum(&plan);
+    // Measured: the ledger's own CHECK on `__pbps_lock` depends on the
+    // database collation, so the engine refuses to change it (5075) until
+    // that check is gone — which is what someone changing it has to do.
+    let recollate_database = |collation: &str| {
+        on_server(
+            &server,
+            &format!(
+                "USE [{0}]; ALTER TABLE dbo.__pbps_lock DROP CONSTRAINT ck___pbps_lock_single;
+                 USE master;
+                 ALTER DATABASE [{0}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+                 ALTER DATABASE [{0}] COLLATE {collation};
+                 ALTER DATABASE [{0}] SET MULTI_USER;
+                 USE [{0}];
+                 ALTER TABLE dbo.__pbps_lock ADD CONSTRAINT ck___pbps_lock_single CHECK (id = 1);",
+                source.name()
+            ),
+        );
+    };
+    let apply_extra = || {
+        d.run(&[
+            "apply",
+            "--db",
+            source.connection(),
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+            "--allow",
+            "constraint",
+        ])
+    };
+    recollate_database("Latin1_General_BIN2");
+    let refused = apply_extra();
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        stderr(&refused).contains("default collation `Latin1_General_BIN2` now"),
+        "{}",
+        stderr(&refused)
+    );
+    recollate_database("Latin1_General_CI_AS");
+    ok(&apply_extra());
 }
 
 /// A table's clustered layout goes the whole way through the CLI (#1178):
@@ -3296,6 +3367,7 @@ fn apply_refuses_a_plan_that_relabels_a_rebuilt_routine_as_a_fresh_one() {
         pbps_model::PlanBaseline {
             description: "test as queried".into(),
             checksum: "0".repeat(64),
+            database_collation: None,
         },
         pbps_model::ChangeSet {
             changes: vec![
@@ -3362,6 +3434,7 @@ fn apply_refuses_a_plan_that_builds_a_routine_and_settles_nothing_about_public()
         pbps_model::PlanBaseline {
             description: "test as queried".into(),
             checksum: "0".repeat(64),
+            database_collation: None,
         },
         pbps_model::ChangeSet {
             changes: vec![pbps_model::PlannedChange {
@@ -3418,6 +3491,7 @@ fn apply_refuses_a_plan_whose_risks_were_removed() {
         pbps_model::PlanBaseline {
             description: "test as queried".into(),
             checksum: "0".repeat(64),
+            database_collation: None,
         },
         pbps_model::ChangeSet {
             changes: vec![pbps_model::PlannedChange {
@@ -3850,6 +3924,7 @@ fn staged_cardinality_plan(dialect: &str, count: usize, staged: bool) -> pbps_mo
         PlanBaseline {
             description: "cardinality fixture".into(),
             checksum: "0".repeat(64),
+            database_collation: None,
         },
         ChangeSet { changes },
         ids,
@@ -12868,6 +12943,7 @@ fn a_failed_resume_does_not_relabel_the_interrupted_plan() {
         pbps_model::PlanBaseline {
             description: "interrupted checkpoint".into(),
             checksum: pbps_model::state_checksum(&checkpoint.schema, &checkpoint.ids),
+            database_collation: None,
         },
         pbps_model::ChangeSet {
             changes: vec![pbps_model::PlannedChange::new(

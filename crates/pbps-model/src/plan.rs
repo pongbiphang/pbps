@@ -205,6 +205,16 @@ pub struct PlanBaseline {
     /// [`state_checksum`] of the baseline. `apply` recomputes it from the live
     /// database; a mismatch is drift and stops the apply.
     pub checksum: String,
+
+    /// The target database's default collation when the plan was computed,
+    /// where the engine has column collations (#1175). A column the plan
+    /// creates or alters with no collation takes whatever the default is when
+    /// the statement runs, and the read-back reads that as no collation
+    /// again, so a default changed since planning is invisible to the
+    /// checksum above whenever no managed character column sits under it.
+    /// `apply` refuses before the first statement unless it is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_collation: Option<String>,
 }
 
 /// A plan as written to disk by `pbps plan --out`.
@@ -524,6 +534,7 @@ mod tests {
             PlanBaseline {
                 description: "prod as queried".into(),
                 checksum: state_checksum(&schema_with("nvarchar(255)"), &IdsFile::default()),
+                database_collation: None,
             },
             cs,
             ids_with("t_a1b2c3"),
@@ -596,6 +607,7 @@ mod tests {
             PlanBaseline {
                 description: "d".into(),
                 checksum: "c".into(),
+                database_collation: None,
             },
             ChangeSet::default(),
             IdsFile::default(),

@@ -1166,6 +1166,34 @@ async fn managed_state_full(
     })
 }
 
+/// Refuses a plan whose target's default collation has changed since it was
+/// computed (#1175). What a column declared with no collation means is that
+/// default, and the checksum cannot see it move when no managed character
+/// column sits under it (see [`pbps_model::PlanBaseline::database_collation`]).
+/// A plan from an engine without column collations carries none and is not
+/// asked.
+async fn refuse_moved_database_collation(
+    conn: &mut Conn,
+    plan: &pbps_model::SavedPlan,
+    label: &str,
+) -> anyhow::Result<()> {
+    let Some(planned) = &plan.baseline.database_collation else {
+        return Ok(());
+    };
+    let now = crate::engine::database_collation(conn)
+        .await
+        .context("cannot read the database's default collation")?;
+    if now.as_deref() != Some(planned.as_str()) {
+        bail!(
+            "`{label}` has default collation {} now, and this plan was computed against `{planned}`.\n\
+             A column it creates or alters without a collation would take the new default, \
+             which is not what was approved. Recompute the plan with `pbps plan --db`.",
+            now.map_or_else(|| "none readable".to_owned(), |n| format!("`{n}`"))
+        );
+    }
+    Ok(())
+}
+
 /// The catalog, read once.
 ///
 /// Split out so a caller that needs two *cuts* of one database state can take
@@ -4731,7 +4759,7 @@ pub fn cmd_plan_db(
 
     let (
         cs,
-        baseline_checksum,
+        (baseline_checksum, baseline_collation),
         baseline_description,
         connected_checks,
         findings,
@@ -5203,7 +5231,7 @@ pub fn cmd_plan_db(
         .await?;
         Ok((
             cs,
-            baseline,
+            (baseline, managed.database_collation.clone()),
             format!("{} as queried (entry #{})", target.label, entry.id),
             vec![
                 permission_support,
@@ -5281,6 +5309,7 @@ pub fn cmd_plan_db(
         pbps_model::PlanBaseline {
             description: baseline_description,
             checksum: baseline_checksum,
+            database_collation: baseline_collation,
         },
         cs,
         resolved.ids,
@@ -5783,6 +5812,7 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
             plan.baseline.checksum
         );
     }
+    refuse_moved_database_collation(conn, plan, &target.label).await?;
 
     // And the same guard the recording commands use (110): a permission the
     // declarations cannot hold is invisible to the checksum above, so it
@@ -6218,6 +6248,7 @@ async fn apply_staged_under_lock(
                 plan.baseline.checksum
             );
         }
+        refuse_moved_database_collation(conn, plan, &target.label).await?;
         refuse_unexpressible(&scoped, &target.label, "apply again")?;
         // Ownership and revocability, as in the transactional apply (#692,
         // #1057).

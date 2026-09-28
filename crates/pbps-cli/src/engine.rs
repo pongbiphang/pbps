@@ -448,6 +448,17 @@ pub async fn introspect(conn: &mut Conn, read: Read) -> Result<Pulled, DbError> 
     }
 }
 
+/// The connected database's default collation, where the engine's model has
+/// column collations (#1175); `None` on PostgreSQL.
+pub async fn database_collation(conn: &mut Conn) -> Result<Option<String>, DbError> {
+    match conn.driver() {
+        Driver::Mssql => pbps_mssql::catalog::database_collation(conn)
+            .await
+            .map(Some),
+        Driver::Postgres => Ok(None),
+    }
+}
+
 /// Refuses a declared column collation the target does not have (#1175), by
 /// name and before any statement runs. PostgreSQL declares none: `validate`
 /// refuses the field there.
