@@ -76,9 +76,18 @@ Visible `globals()`, `locals()`, `vars()` and unknown dynamic execution can
 retain the module namespace: later literal assignments cannot restore evidence
 after that exposure. A direct module-level `vars(SimpleNamespace())` call is
 recognized as unrelated only with an untouched `types` import and builtin
-`vars`; imported aliases are supported. The constructor must receive no
-arguments. Other reflective object forms remain conservatively unsupported;
-this check does not import fixtures or resolve arbitrary Python runtime state.
+`vars`; imported aliases follow their final left-to-right binding. The
+constructor must receive no arguments, and the call must be an expression or
+assign only plain names. Its preceding execution must also be proven inert:
+literal data, uncalled helper definitions, direct `types`/`sys`/`builtins`
+imports, and the supported `types` constructor imports. Unknown imports,
+callbacks, decorators, class construction and custom targets permanently remove
+this exception; importing a constructor again cannot restore it. Writing inert
+values under literal string keys into a directly proven fresh dictionary remains
+safe.
+This boundary limits the reflection exception, not ordinary literal selectors.
+Other reflective object forms remain conservatively unsupported; this check
+does not import fixtures or resolve arbitrary Python runtime state.
 
 The inventory is a scheduling contract, not runtime coverage or proof that every
 branch was visited. Fixture success assertions and exact-case execution checks

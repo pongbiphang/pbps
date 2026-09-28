@@ -442,6 +442,168 @@ class Ownership(unittest.TestCase):
                 with self.assertRaises(audit.InventoryError):
                     self.check()
 
+    def test_opaque_execution_cannot_preserve_fresh_namespace_provenance(self):
+        patch_type = 'types.SimpleNamespace = lambda: sys.modules[__name__]'
+        setups = {
+            'implicit module': 'setattr(__builtins__, "vars", lambda ignored: globals())',
+            'implicit dictionary': '__builtins__.__dict__["vars"] = lambda ignored: globals()',
+            'dictionary builtins': ('__builtins__ = __builtins__.__dict__\n'
+                                    '__builtins__["vars"] = lambda ignored: globals()'),
+            'dynamic import': '__import__("types").SimpleNamespace = lambda: sys.modules[__name__]',
+            'dynamic import alias': 'load = __import__\nload("types").SimpleNamespace = lambda: sys.modules[__name__]',
+            'zero argument call': f'def replace():\n    {patch_type}\nreplace()',
+            'callable alias': f'def replace():\n    {patch_type}\ncallback = replace\ncallback()',
+            'function decorator': (f'def replace(value):\n    {patch_type}\n    return value\n'
+                                   '@replace\ndef decorated(): pass'),
+            'class decorator': (f'def replace(value):\n    {patch_type}\n    return value\n'
+                                '@replace\nclass Decorated: pass'),
+            'subclass hook': ('class Base:\n    def __init_subclass__(cls):\n'
+                              f'        {patch_type}\nclass Child(Base): pass'),
+            'metaclass hook': ('class Meta(type):\n    def __new__(meta, name, bases, body):\n'
+                               f'        {patch_type}\n'
+                               '        return super().__new__(meta, name, bases, body)\n'
+                               'class Child(metaclass=Meta): pass'),
+        }
+        self.inventory['owners']['live']['selection'] = {
+            'kind': 'data', 'file': 'runner.py', 'expression': 'TESTS'}
+        for label, setup in setups.items():
+            for import_ in ('import types', 'from types import SimpleNamespace'):
+                constructor = 'types.SimpleNamespace' if import_ == 'import types' else 'SimpleNamespace'
+                with self.subTest(label=label, import_=import_):
+                    source = ('import sys\nimport types\n' + setup + '\n' + import_ + '\n'
+                              f'namespace = vars({constructor}())\nTESTS = ["owned"]\n'
+                              'namespace["TESTS"] = []\n')
+                    actual = subprocess.run([sys.executable, '-c', source + 'print(TESTS)'],
+                                            check=True, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(actual.stdout, '[]\n')
+                    (self.root / 'runner.py').write_text(source, encoding='utf-8')
+                    with self.assertRaises(audit.InventoryError):
+                        self.check()
+
+    def test_imported_module_execution_cannot_restore_namespace_provenance(self):
+        (self.root / 'side_effect.py').write_text(
+            'import sys, types\ntypes.SimpleNamespace = lambda: sys.modules["__main__"]\n',
+            encoding='utf-8')
+        self.inventory['owners']['live']['selection'] = {
+            'kind': 'data', 'file': 'runner.py', 'expression': 'TESTS'}
+        for imports in ('import types\nimport side_effect', 'import side_effect\nimport types',
+                        'import side_effect, types', 'import types, side_effect'):
+            with self.subTest(imports=imports):
+                source = (imports + '\nnamespace = vars(types.SimpleNamespace())\n'
+                          'TESTS = ["owned"]\nnamespace["TESTS"] = []\n')
+                actual = subprocess.run([sys.executable, '-c', source + 'print(TESTS)'],
+                                        cwd=self.root, check=True, capture_output=True, text=True, timeout=10)
+                self.assertEqual(actual.stdout, '[]\n')
+                (self.root / 'runner.py').write_text(source, encoding='utf-8')
+                with self.assertRaises(audit.InventoryError):
+                    self.check()
+
+    def test_a_fresh_rhs_cannot_prove_assignment_targets_are_inert(self):
+        controls = [
+            ('', 'sys.modules[__name__].TESTS'),
+            ('', 'sys.modules[__name__].__dict__["TESTS"]'),
+            ('', 'namespace = sys.modules[__name__].TESTS'),
+            ('class Holder:\n    def __setattr__(self, name, value): globals()["TESTS"] = []\n'
+             'holder = Holder()\n', 'holder.value'),
+            ('class Holder:\n    def __setitem__(self, key, value): globals()["TESTS"] = []\n'
+             'holder = Holder()\n', 'holder[0]'),
+        ]
+        self.inventory['owners']['live']['selection'] = {
+            'kind': 'data', 'file': 'runner.py', 'expression': 'TESTS'}
+        for setup, target in controls:
+            with self.subTest(target=target):
+                # The first three have no earlier opaque call or class whose
+                # refusal could mask the current assignment-target boundary.
+                source = ('import sys\n' + setup + 'from types import SimpleNamespace\n'
+                          'TESTS = ["owned"]\n' + target + ' = vars(SimpleNamespace())\n')
+                actual = subprocess.run([sys.executable, '-c', source + 'print(TESTS == ["owned"])'],
+                                        check=True, capture_output=True, text=True, timeout=10)
+                self.assertEqual(actual.stdout, 'False\n')
+                (self.root / 'runner.py').write_text(source, encoding='utf-8')
+                with self.assertRaises(audit.InventoryError):
+                    self.check()
+
+    def test_final_import_binding_determines_the_fresh_constructor(self):
+        cases = [
+            ('import types as kinds, sys as kinds', 'kinds.SimpleNamespace', False),
+            ('import types as kinds, builtins as kinds', 'kinds.SimpleNamespace', False),
+            ('from types import SimpleNamespace as N, ModuleType as N', 'N', False),
+            ('import sys as kinds, types as kinds', 'kinds.SimpleNamespace', True),
+            ('import builtins as kinds, types as kinds', 'kinds.SimpleNamespace', True),
+            ('from types import ModuleType as N, SimpleNamespace as N', 'N', True),
+        ]
+        self.inventory['owners']['live']['selection'] = {
+            'kind': 'data', 'file': 'runner.py', 'expression': 'TESTS'}
+        for imports, constructor, valid in cases:
+            with self.subTest(imports=imports):
+                # No monkey-patch setup: an earlier opaque-execution guard
+                # must not mask this import-binding boundary. Invalid final
+                # bindings fail in Python before they can select any tests.
+                source = imports + f'\nnamespace = vars({constructor}())\nTESTS = ["owned"]\n'
+                actual = subprocess.run([sys.executable, '-c', source + 'print(TESTS)'],
+                                        capture_output=True, text=True, timeout=10)
+                (self.root / 'runner.py').write_text(source, encoding='utf-8')
+                if valid:
+                    self.assertEqual(actual.returncode, 0, actual.stderr)
+                    self.assertEqual(actual.stdout, "['owned']\n")
+                    self.assertEqual(self.check(), 1)
+                else:
+                    self.assertNotEqual(actual.returncode, 0)
+                    self.assertEqual(actual.stdout, '')
+                    self.assertRegex(actual.stderr, 'AttributeError|TypeError')
+                    with self.assertRaises(audit.InventoryError):
+                        self.check()
+
+        # Keep the original mutation repro too; the earlier opaque target
+        # correctly invalidates provenance, while the controls above isolate
+        # import ordering without that separate guard masking the boundary.
+        source = ('import sys\nsys.SimpleNamespace = lambda: sys.modules[__name__]\n'
+                  'import types as kinds, sys as kinds\n'
+                  'namespace = vars(kinds.SimpleNamespace())\n'
+                  'TESTS = ["owned"]\nnamespace["TESTS"] = []\n')
+        actual = subprocess.run([sys.executable, '-c', source + 'print(TESTS)'],
+                                check=True, capture_output=True, text=True, timeout=10)
+        self.assertEqual(actual.stdout, '[]\n')
+        (self.root / 'runner.py').write_text(source, encoding='utf-8')
+        with self.assertRaises(audit.InventoryError):
+            self.check()
+
+    def test_inert_helpers_and_fresh_dictionaries_preserve_the_exemption(self):
+        setups = [
+            'def unused():\n    types.SimpleNamespace = lambda: globals()\n',
+            'async def unused():\n    types.SimpleNamespace = lambda: globals()\n',
+            'unused = lambda: globals()\n',
+            'def unused(): return globals()\ncallback = unused\n',
+            'LABEL = "owned"\nALIASES = [LABEL]\n',
+        ]
+        self.inventory['owners']['live']['selection'] = {
+            'kind': 'data', 'file': 'runner.py', 'expression': 'TESTS'}
+        for setup in setups:
+            with self.subTest(setup=setup):
+                source = ('import types\n' + setup + 'TESTS = ["owned"]\n'
+                          'first = second = vars(types.SimpleNamespace())\n'
+                          'first["TESTS"] = []\nsecond["again"] = [1, 2]\n'
+                          'vars(types.SimpleNamespace())\n')
+                actual = subprocess.run([sys.executable, '-c', source + 'print(TESTS)'],
+                                        check=True, capture_output=True, text=True, timeout=10)
+                self.assertEqual(actual.stdout, "['owned']\n")
+                (self.root / 'runner.py').write_text(source, encoding='utf-8')
+                self.assertEqual(self.check(), 1)
+
+    def test_opaque_execution_only_restricts_the_reflection_exemption(self):
+        controls = ['import pathlib\n', 'class Holder: pass\n',
+                    'def noop(): pass\nnoop()\n', 'value = object()\n']
+        self.inventory['owners']['live']['selection'] = {
+            'kind': 'data', 'file': 'runner.py', 'expression': 'TESTS'}
+        for control in controls:
+            with self.subTest(control=control):
+                source = control + 'TESTS = ["owned"]\n'
+                actual = subprocess.run([sys.executable, '-c', source + 'print(TESTS)'],
+                                        check=True, capture_output=True, text=True, timeout=10)
+                self.assertEqual(actual.stdout, "['owned']\n")
+                (self.root / 'runner.py').write_text(source, encoding='utf-8')
+                self.assertEqual(self.check(), 1)
+
     def test_duplicate_and_cyclic_owners_are_refused(self):
         self.inventory["groups"].append(copy.deepcopy(self.inventory["groups"][0]))
         with self.assertRaisesRegex(audit.InventoryError, "duplicate case"):

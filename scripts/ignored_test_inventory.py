@@ -276,9 +276,66 @@ class NamespaceImports:
         self.types_pristine = True
         self.builtin_modules = set()
         self.vars_builtin = True
+        self.inert_prefix = True
+        self.inert_names = set()
+        self.fresh_dicts = set()
+
+    def inert_expression(self, node):
+        # This proves absence of callbacks, not the expression's value.
+        if isinstance(node, ast.Constant):
+            return True
+        if isinstance(node, ast.Name):
+            return node.id in self.inert_names
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            return all(self.inert_expression(item) for item in node.elts)
+        if isinstance(node, ast.Dict):
+            return all(isinstance(key, ast.Constant) and self.inert_expression(value)
+                       for key, value in zip(node.keys, node.values))
+        if isinstance(node, ast.Lambda):
+            return self.inert_arguments(node.args)
+        return False
+
+    def inert_arguments(self, arguments):
+        annotations = [arg.annotation for arg in [*arguments.posonlyargs, *arguments.args,
+                       *arguments.kwonlyargs, *([arguments.vararg] if arguments.vararg else []),
+                       *([arguments.kwarg] if arguments.kwarg else [])]]
+        return all(value is None or self.inert_expression(value)
+                   for value in [*arguments.defaults, *arguments.kw_defaults, *annotations])
+
+    def inert_statement(self, statement, harmless):
+        if isinstance(statement, ast.Import):
+            return all(alias.name in ("types", "sys", "builtins") for alias in statement.names)
+        if isinstance(statement, ast.ImportFrom):
+            return (statement.module == "types" and not statement.level
+                    and all(alias.name in ("SimpleNamespace", "ModuleType")
+                            for alias in statement.names))
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return (not statement.decorator_list and not getattr(statement, "type_params", [])
+                    and self.inert_arguments(statement.args)
+                    and (statement.returns is None or self.inert_expression(statement.returns)))
+        if isinstance(statement, ast.Pass):
+            return True
+        if isinstance(statement, ast.Expr):
+            return harmless is not None or self.inert_expression(statement.value)
+        if isinstance(statement, ast.Assign):
+            if all(isinstance(target, ast.Name) for target in statement.targets):
+                return harmless is not None or self.inert_expression(statement.value)
+            # Existing safe inspections may populate their own fresh dict.
+            # Only literal keys and inert values exclude user-defined hooks.
+            return (self.inert_expression(statement.value)
+                    and all(isinstance(target, ast.Subscript)
+                            and isinstance(target.value, ast.Name)
+                            and target.value.id in self.fresh_dicts
+                            and isinstance(target.slice, ast.Constant)
+                            and isinstance(target.slice.value, str)
+                            for target in statement.targets))
+        return False
 
     def harmless_call(self, statement):
-        if not self.vars_builtin or not isinstance(statement, (ast.Assign, ast.Expr)):
+        if not self.inert_prefix or not self.vars_builtin or not isinstance(statement, (ast.Assign, ast.Expr)):
+            return None
+        if isinstance(statement, ast.Assign) and not all(isinstance(target, ast.Name)
+                                                        for target in statement.targets):
             return None
         call = statement.value
         if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
@@ -294,6 +351,21 @@ class NamespaceImports:
         return call if direct or qualified else None
 
     def advance(self, statement, effects):
+        harmless = self.harmless_call(statement)
+        inert = self.inert_statement(statement, harmless)
+        # Later imports cannot undo effects of a call, import, decorator or
+        # class hook whose execution was not proved inert. This restricts only
+        # the reflection exemption; ordinary literal selectors remain usable.
+        self.inert_prefix &= inert
+        self.inert_names.difference_update(effects.writes)
+        self.fresh_dicts.difference_update(effects.writes)
+        if inert and isinstance(statement, ast.Assign):
+            names = {target.id for target in statement.targets if isinstance(target, ast.Name)}
+            self.inert_names.update(names)
+            if harmless is not None:
+                self.fresh_dicts.update(names)
+        if inert and isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            self.inert_names.add(statement.name)
         # Rebinding, an attribute write or an opaque escape loses provenance.
         touched = effects.writes | effects.mutations
         if self.builtin_modules & effects.mutations:
@@ -315,15 +387,23 @@ class NamespaceImports:
             self.modules.difference_update(touched)
             if "vars" in effects.writes:
                 self.vars_builtin = False
-        if (self.types_pristine and isinstance(statement, ast.ImportFrom)
-                and statement.module == "types" and not statement.level):
-            self.constructors.update(alias.asname or alias.name for alias in statement.names
-                                     if alias.name == "SimpleNamespace")
-        if isinstance(statement, ast.Import):
-            self.builtin_modules.update(alias.asname or alias.name for alias in statement.names
-                                        if alias.name == "builtins")
-        if self.types_pristine and isinstance(statement, ast.Import):
-            self.modules.update(alias.asname or alias.name for alias in statement.names if alias.name == "types")
+        # A repeated alias keeps the final import binding, not a union of
+        # every module/constructor assigned to that spelling in the statement.
+        if isinstance(statement, (ast.Import, ast.ImportFrom)):
+            for alias in statement.names:
+                name = alias.asname or alias.name.split(".")[0]
+                self.constructors.discard(name)
+                self.modules.discard(name)
+                self.builtin_modules.discard(name)
+                if isinstance(statement, ast.Import):
+                    if alias.name == "builtins":
+                        self.builtin_modules.add(name)
+                    if self.types_pristine and alias.name == "types":
+                        self.modules.add(name)
+                elif (self.types_pristine and statement.module == "types"
+                      and not statement.level and alias.name == "SimpleNamespace"):
+                    self.constructors.add(name)
+
 
 
 def python_values(tree):
