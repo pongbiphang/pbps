@@ -87,6 +87,7 @@ pub struct ImageIdentity {
 pub struct CandidateImage {
     identity: ImageIdentity,
     environment_keys: Option<Vec<String>>,
+    postgres_layout: Option<profile::engine::PostgresLayout>,
     acquisition: Option<[u8; 32]>,
 }
 
@@ -102,6 +103,16 @@ impl std::fmt::Debug for CandidateImage {
 impl CandidateImage {
     pub fn identity(&self) -> &ImageIdentity {
         &self.identity
+    }
+
+    fn layout(&self, driver: pbps_db::Driver) -> Result<profile::engine::Layout, Error> {
+        match driver {
+            pbps_db::Driver::Postgres => self
+                .postgres_layout
+                .map(profile::engine::Layout::Postgres)
+                .ok_or(Error::UnsupportedLaunch),
+            pbps_db::Driver::Mssql => Ok(profile::engine::Layout::Mssql),
+        }
     }
 }
 
@@ -120,6 +131,7 @@ struct ImageInspect {
 #[serde(rename_all = "PascalCase")]
 struct ImageConfig {
     env: Option<Vec<String>>,
+    volumes: Option<serde_json::Value>,
 }
 
 impl TryFrom<ImageInspect> for CandidateImage {
@@ -143,6 +155,10 @@ impl TryFrom<ImageInspect> for CandidateImage {
         if variant.as_deref().is_some_and(|v| !platform_word(v)) {
             return Err(Error::ImageIdentity);
         }
+        let postgres_layout = raw
+            .config
+            .as_ref()
+            .and_then(|config| postgres_layout(config.volumes.as_ref()));
         Ok(Self {
             identity: ImageIdentity {
                 image_id: raw.id,
@@ -154,8 +170,35 @@ impl TryFrom<ImageInspect> for CandidateImage {
             environment_keys: raw
                 .config
                 .and_then(|config| environment_keys(config.env.unwrap_or_default())),
+            postgres_layout,
             acquisition: None,
         })
+    }
+}
+
+/// Image declarations select one fixed recipe; they do not prove the running
+/// engine's version, executable content or effective storage. Docker may omit
+/// Volumes, emit null, or emit an empty object for no declared volumes.
+fn postgres_layout(volumes: Option<&serde_json::Value>) -> Option<profile::engine::PostgresLayout> {
+    use profile::engine::PostgresLayout;
+    let Some(volumes) = volumes else {
+        return Some(PostgresLayout::Root);
+    };
+    let declared = volumes.as_object()?;
+    if declared.is_empty() {
+        return Some(PostgresLayout::Root);
+    }
+    if declared.len() != 1
+        || !declared
+            .values()
+            .all(|value| value.as_object().is_some_and(|value| value.is_empty()))
+    {
+        return None;
+    }
+    match declared.keys().next()?.as_str() {
+        "/var/lib/postgresql" => Some(PostgresLayout::Root),
+        "/var/lib/postgresql/data" => Some(PostgresLayout::Data),
+        _ => None,
     }
 }
 

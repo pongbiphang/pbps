@@ -192,7 +192,7 @@ impl ReservedSession {
         .map_err(|_| Error::RuntimeChanged)?;
         let execution = ExecutionLease::capture(
             self.workload.native_pid()?,
-            engine::workload_limits(self.driver),
+            engine::workload_limits_for(self.image.layout(self.driver)?),
         )
         .map_err(|_| Error::RuntimeChanged)?;
         for namespace in ["pid", "mnt", "net"] {

@@ -19,16 +19,25 @@ import time
 import uuid
 
 
+PG_IMAGES = {
+    16: "postgres@sha256:485935f94cc7165afa896978809c37b592dc07f0a37d2c8f645f12412d0212c8",
+    18: "postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280",
+}
 IMAGES = {
-    "pg": "postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280",
+    "pg": PG_IMAGES[18],
     "mssql": "mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1",
 }
 PASSWORD = "Pbps!NativeFixture12345"
 TARGET_TEST = "resolver::native::target::tests::native_aliases_share_one_instance_and_backend_children_cannot_claim_another"
 FACTORY_TEST = "resolver::docker::session::native_factory_tests::native_factory_qualifies_before_bootstrap_and_rejects_rebound_target_connections"
+RECIPE_TEST = "resolver::docker::session::pg_recipe_tests::the_public_factory_runs_the_pinned_engine_on_bounded_private_storage"
 DAEMON_TEST = "resolver::docker::tests::direct_native_daemon_is_accepted_but_a_root_owned_proxy_is_not"
 QUIET = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
 DOCKER_SOCKET = "/var/run/docker.sock"
+
+
+def fixture_image(engine, pg_major):
+    return PG_IMAGES[pg_major] if engine == "pg" else IMAGES[engine]
 
 
 def run(*args, **kwargs):
@@ -45,7 +54,9 @@ def interrupted(signum, _frame):
 def native_tests(binary, env):
     # The daemon/proxy case needs the same disposable root host as the factory;
     # the ordinary library run only compiles it and leaves it ignored.
-    for test in (DAEMON_TEST, TARGET_TEST, FACTORY_TEST):
+    for test in (DAEMON_TEST, TARGET_TEST, FACTORY_TEST, RECIPE_TEST):
+        if test == RECIPE_TEST and env.get("PBPS_NATIVE_DRIVER") != "pg":
+            continue
         result = run(binary, "--ignored", "--exact", test, "--nocapture",
                      env=dict(os.environ, **env), stdout=subprocess.PIPE,
                      stderr=subprocess.STDOUT, check=False)
@@ -80,6 +91,7 @@ def certificates(root):
 def fixture(args, binary, root, owned):
     certificates(root)
     engine = args.engine
+    image = fixture_image(engine, args.pg_major)
     name = "pbps-native-target-" + uuid.uuid4().hex
     if engine == "pg":
         environment = ["-e", f"POSTGRES_PASSWORD={PASSWORD}"]
@@ -104,7 +116,7 @@ def fixture(args, binary, root, owned):
     target = run("docker", "create", "--name", name, "--pull", "never", "--network",
                  "host" if args.native_host else "none", "--user", "0", "--memory", "3g",
                  "--cpus", "2", "--pids-limit", "512", *pid_scope, *environment,
-                 "--entrypoint", "/bin/bash", IMAGES[engine], "-ec", boot,
+                 "--entrypoint", "/bin/bash", image, "-ec", boot,
                  stdout=subprocess.PIPE).stdout.strip()
     for leaf in ("peer.key", "peer.pem"):
         run("docker", "cp", str(root / leaf), target + ":/tmp/" + leaf, **QUIET)
@@ -166,7 +178,9 @@ def fixture(args, binary, root, owned):
     env["PBPS_NATIVE_PROXY_KEY"] = str(root / "peer.key") if args.native_host else "/tmp/proxy.key"
     if args.native_host:
         env.update(PBPS_NATIVE_FACTORY_FIXTURE="1", PBPS_RESOLVER_TEST_SOCKET=args.socket,
-                   PBPS_RESOLVER_TEST_IMAGE=IMAGES[engine])
+                   PBPS_RESOLVER_TEST_IMAGE=image)
+        if engine == "pg":
+            env["PBPS_NATIVE_PG_MAJOR"] = str(args.pg_major)
         native_tests(binary, env)
         return
     reader = "pbps-native-reader-" + uuid.uuid4().hex
@@ -195,10 +209,14 @@ def main():
     global DOCKER_SOCKET
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("engine", choices=IMAGES)
+    parser.add_argument("--pg-major", type=int, choices=PG_IMAGES, default=18,
+                        help="pinned PostgreSQL fixture image; default: 18")
     parser.add_argument("--native-host", action="store_true")
     parser.add_argument("--socket", default="/var/run/docker.sock")
     parser.add_argument("--test-binary", type=Path, help="prebuilt CLI library test executable")
     args = parser.parse_args()
+    if args.engine != "pg" and args.pg_major != 18:
+        parser.error("--pg-major applies only to pg")
     if sys.platform != "linux":
         parser.error("native process qualification requires Linux")
     if not Path(args.socket).is_absolute():

@@ -49,7 +49,7 @@ impl Launch {
         {
             return Err(Error::UnsupportedLaunch);
         }
-        let bootstrap = engine::bootstrap(driver, password);
+        let bootstrap = engine::bootstrap(image.layout(driver)?, password);
         let mut tmpfs = serde_json::Map::new();
         tmpfs.insert(
             "/tmp".into(),
@@ -63,7 +63,7 @@ impl Launch {
             "Image": image.identity.image_id,
             "User": "0:0",
             "Entrypoint": ["/usr/bin/timeout"],
-            "Cmd": guarded_command(bootstrap.privileges, LIFETIME_SECS, bootstrap.program)?,
+            "Cmd": guarded_command(bootstrap.privileges, LIFETIME_SECS, &bootstrap.program)?,
             "Env": isolated_environment(image, bootstrap.environment)?,
             "Healthcheck": {"Test": ["NONE"]},
             "Labels": { OWNER_LABEL: owner, "io.pbps.resolver.profile": PROFILE },
@@ -467,6 +467,9 @@ mod tests {
             .unwrap()
             .try_into()
             .unwrap();
+        // Keep the storage recipe known so only missing environment metadata
+        // can cause the refusal this test is meant to pin.
+        image.postgres_layout = Some(engine::PostgresLayout::Root);
         assert!(matches!(
             Launch::new(&image, Driver::Postgres, "owner"),
             Err(Error::UnsupportedLaunch)

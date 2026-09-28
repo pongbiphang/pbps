@@ -51,7 +51,8 @@ class LiveExecution(unittest.TestCase):
 
     def test_native_root_runner_executes_daemon_target_and_factory(self):
         env = {"PBPS_RESOLVER_TEST_SOCKET": "/owned/docker.sock",
-               "PBPS_RESOLVER_TEST_IMAGE": "owned-image"}
+               "PBPS_RESOLVER_TEST_IMAGE": "owned-image",
+               "PBPS_NATIVE_DRIVER": "pg"}
         completed = subprocess.CompletedProcess([], 0, "test result: ok. 1 passed\n")
         with patch.object(native, "run", return_value=completed) as run:
             with contextlib.redirect_stdout(io.StringIO()):
@@ -60,12 +61,28 @@ class LiveExecution(unittest.TestCase):
             ("/owned/tests", "--ignored", "--exact", name, "--nocapture")
             for name in (
                 "resolver::docker::tests::direct_native_daemon_is_accepted_but_a_root_owned_proxy_is_not",
-                native.TARGET_TEST, native.FACTORY_TEST,
+                native.TARGET_TEST, native.FACTORY_TEST, native.RECIPE_TEST,
             )
         ])
         for call in run.call_args_list:
             for key, value in env.items():
                 self.assertEqual(call.kwargs["env"][key], value)
+
+    def test_sql_server_native_runner_keeps_its_original_three_cases(self):
+        completed = subprocess.CompletedProcess([], 0, "test result: ok. 1 passed\n")
+        with patch.object(native, "run", return_value=completed) as run:
+            with contextlib.redirect_stdout(io.StringIO()):
+                native.native_tests("/owned/tests", {"PBPS_NATIVE_DRIVER": "mssql"})
+        self.assertEqual([call.args[3] for call in run.call_args_list],
+                         [native.DAEMON_TEST, native.TARGET_TEST, native.FACTORY_TEST])
+
+    def test_pinned_pg16_selector_keeps_the_default_and_sql_server_images(self):
+        self.assertEqual(native.fixture_image("pg", 16), native.PG_IMAGES[16])
+        self.assertEqual(native.fixture_image("pg", 18), native.IMAGES["pg"])
+        self.assertNotEqual(native.PG_IMAGES[16], native.PG_IMAGES[18])
+        self.assertEqual(native.fixture_image("mssql", 18), native.IMAGES["mssql"])
+        for image in native.PG_IMAGES.values():
+            self.assertRegex(image, r"^postgres@sha256:[0-9a-f]{64}$")
 
     def test_a_missing_or_failing_native_case_stops_the_fixture(self):
         for code, output in ((0, "test result: ok. 0 passed"),

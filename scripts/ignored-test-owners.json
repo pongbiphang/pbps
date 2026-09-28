@@ -157,7 +157,7 @@
       "selection": {
         "kind": "data",
         "file": "scripts/live-resolver-target.py",
-        "expression": "[DAEMON_TEST, TARGET_TEST, FACTORY_TEST]",
+        "expression": "[DAEMON_TEST, TARGET_TEST, FACTORY_TEST, RECIPE_TEST]",
         "prefix": ""
       },
       "witnesses": [
@@ -191,7 +191,7 @@
           "language": "python",
           "scope": "native_tests",
           "requires": [
-            "for test in (DAEMON_TEST, TARGET_TEST, FACTORY_TEST):",
+            "for test in (DAEMON_TEST, TARGET_TEST, FACTORY_TEST, RECIPE_TEST):",
             "run(binary, \"--ignored\", \"--exact\", test,"
           ]
         },
@@ -851,6 +851,7 @@
       ],
       "cases": [
         "resolver::docker::session::native_factory_tests::native_factory_qualifies_before_bootstrap_and_rejects_rebound_target_connections",
+        "resolver::docker::session::pg_recipe_tests::the_public_factory_runs_the_pinned_engine_on_bounded_private_storage",
         "resolver::docker::tests::direct_native_daemon_is_accepted_but_a_root_owned_proxy_is_not",
         "resolver::native::target::tests::native_aliases_share_one_instance_and_backend_children_cannot_claim_another"
       ]
