@@ -158,7 +158,7 @@ fn malformed_ambiguous_or_unexpected_image_storage_cannot_select_a_recipe() {
     assert!(
         absent
             .map_err(|error| error.to_string())
-            .and_then(|raw| candidate_from_raw(raw))
+            .and_then(candidate_from_raw)
             .and_then(
                 |image| Launch::reserved(&image, Driver::Postgres, "owner", "password")
                     .map_err(|error| error.to_string())
