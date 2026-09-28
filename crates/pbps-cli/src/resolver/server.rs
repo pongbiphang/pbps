@@ -1458,9 +1458,13 @@ impl ScratchRun {
         request: &ScopeRequest,
     ) -> Result<Verdict, Error> {
         self.begin_operation()?;
-        let outcome = self.qualify_inner(target, request).await;
+        let mut entered_runtime = false;
+        let outcome = self
+            .qualify_inner(target, request, &mut entered_runtime)
+            .await;
         self.operation_in_flight = false;
-        if let Err(cause) = &outcome {
+        let must_retire = entered_runtime || self.inner.refusal().is_some();
+        if let (true, Err(cause)) = (must_retire, &outcome) {
             self.refuse_and_retire(cause.clone());
         }
         outcome
@@ -1470,6 +1474,7 @@ impl ScratchRun {
         &mut self,
         target: &mut NativeTarget,
         request: &ScopeRequest,
+        entered_runtime: &mut bool,
     ) -> Result<Verdict, Error> {
         // A cancelled step's session, or a refusal already recorded, ends
         // the run before anything below records new cleanup state.
@@ -1487,6 +1492,10 @@ impl ScratchRun {
         let scope_schemas =
             scope::scope_schemas(driver, &request.schemas, &request.write_path_extras)
                 .map_err(Error::Scope)?;
+        // Input validation above has not touched either engine. Once a read
+        // starts, a failed or cancelled qualification cannot be retried on
+        // this run without risking stale scope or scratch state.
+        *entered_runtime = true;
         let (mut target_facts, target_auth) = target
             .scope_facts(
                 &request.schemas,
@@ -1846,11 +1855,13 @@ impl ScratchRun {
     /// the reproduced deployer, captures what they bound and what the target
     /// binds under one scope derived from scratch's bindings, and compares
     /// the two per surface (ADR-0016 decision 2; #613). Only a scope that
-    /// qualified as `Verified` may be resolved on, every step is bracketed by
-    /// a full check, and any failure ends the analysis: a namespace that
-    /// changed under the run, or a compilation that stopped part-way, cannot
-    /// supply a verdict. A run resolves once; another question needs a fresh
-    /// run and a fresh scratch database.
+    /// qualified as `Verified` may be resolved on, every runtime step is
+    /// bracketed by a full check, and any runtime failure ends the analysis:
+    /// a namespace that changed under the run, or a compilation that stopped
+    /// part-way, cannot supply a verdict. A precondition or request-preparation
+    /// error before the first runtime check leaves the run usable. A run
+    /// resolves once; another question needs a fresh run and a fresh scratch
+    /// database.
     ///
     /// Only managed declarations are transferred. A retained external object
     /// the declarations could bind is not reconstructed (#617); the surfaces
@@ -1861,9 +1872,13 @@ impl ScratchRun {
         request: &BindingRequest<'_>,
     ) -> Result<pbps_db::resolver::capture::Assessment, Error> {
         self.begin_operation()?;
-        let outcome = self.resolve_inner(target, request).await;
+        let mut entered_runtime = false;
+        let outcome = self
+            .resolve_inner(target, request, &mut entered_runtime)
+            .await;
         self.operation_in_flight = false;
-        if let Err(cause) = &outcome {
+        let must_retire = entered_runtime || self.inner.refusal().is_some();
+        if let (true, Err(cause)) = (must_retire, &outcome) {
             self.refuse_and_retire(cause.clone());
         }
         outcome
@@ -1873,6 +1888,7 @@ impl ScratchRun {
         &mut self,
         target: &mut NativeTarget,
         request: &BindingRequest<'_>,
+        entered_runtime: &mut bool,
     ) -> Result<pbps_db::resolver::capture::Assessment, Error> {
         // A held session, or a refusal already recorded, ends the run before
         // the scope and compiled guards below can answer in its place.
@@ -1896,6 +1912,9 @@ impl ScratchRun {
         let mut reconstruction =
             engine::reconstruction(self.inner.driver(), &extras, request.bootstrap)
                 .map_err(Error::Binding)?;
+        // The guards and request preparation above have no scratch effect.
+        // From the first runtime check onward, failures end this run.
+        *entered_runtime = true;
         // Requalifies the scope and enters the reproduced deployer.
         self.check_inner(target).await?;
         self.compiled = true;
