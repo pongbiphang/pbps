@@ -507,10 +507,12 @@ fn record_staged(
     // too: without it the one way forward offered here is refused for any
     // plan with a gated class — a staged plan's canonical rename among them.
     // The checkpoint does not record which classes were approved, so this is
-    // a placeholder rather than the list.
+    // a placeholder rather than the list, and a plan with none fills it with
+    // nothing: `--allow ""` approves no class (#1203).
     let mut detail = format!(
         "a staged apply stopped after {completed} of {total} statement(s); continue it with \
-         `pbps apply --staged --resume --env {} --plan ... --checksum {} --allow {}`",
+         `pbps apply --staged --resume --env {} --plan ... --checksum {} --allow {}`, \
+         naming the risk classes the plan was approved with (empty if it had none)",
         crate::report::env_arg(environment),
         checksum.map_or_else(
             || crate::report::placeholder("approved-checksum"),
@@ -914,6 +916,9 @@ mod tests {
                 detail.contains("--allow \"<approved-risk-classes>\"`"),
                 "{detail}"
             );
+            // A plan with no gated class fills the placeholder with nothing
+            // (#1203), and the detail says so.
+            assert!(detail.contains("(empty if it had none)"), "{detail}");
             let found = findings(&[r]);
             let remedy = found[0].remedy.as_deref().unwrap();
             assert!(

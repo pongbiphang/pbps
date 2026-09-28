@@ -316,9 +316,14 @@ enum Command {
         #[arg(long, value_parser = plan_checksum_arg)]
         checksum: String,
 
-        /// Risk classes this deployment is approved for, comma-separated
-        #[arg(long, value_delimiter = ',')]
-        allow: Vec<pbps_model::RiskClass>,
+        /// Risk classes this deployment is approved for, comma-separated; an
+        /// empty value, or none at all, approves none
+        //
+        // Valueless as well as empty: Windows PowerShell 5.1 drops an empty
+        // `""` argument on its way to a native program, so the printed resume
+        // filled with nothing arrives as `--allow --staged` (#1203).
+        #[arg(long, value_delimiter = ',', num_args = 0..=1, default_missing_value = "")]
+        allow: Vec<AllowedRisk>,
 
         /// Apply a staged plan: outside a transaction, one statement at a time
         #[arg(long)]
@@ -905,7 +910,7 @@ fn run() -> anyhow::Result<()> {
                 &deploy::ApplyRequest {
                     plan_path: &plan,
                     approved_checksum: &checksum,
-                    allow: &allow.into_iter().collect(),
+                    allow: &allow.into_iter().filter_map(|a| a.0).collect(),
                     staged,
                     resume,
                 },
@@ -3178,6 +3183,26 @@ fn operator(root: &std::path::Path) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
+/// One value of `apply --allow`: a risk class, or nothing (#1203).
+///
+/// Empty is accepted so a printed resume command has one shape for every plan:
+/// `status` and `doctor` cannot know a checkpoint's classes and print
+/// `--allow "<approved-risk-classes>"`, and a plan with none fills that with
+/// nothing. An empty value approves no class, so it widens nothing; an
+/// unknown name is still refused.
+#[derive(Debug, Clone)]
+struct AllowedRisk(Option<pbps_model::RiskClass>);
+
+impl std::str::FromStr for AllowedRisk {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.is_empty() {
+            return Ok(Self(None));
+        }
+        s.parse().map(|class| Self(Some(class)))
+    }
+}
+
 /// This machine's name, for the lock row (#1188); `None` when none can be read.
 ///
 /// Read without a dependency: the environment where a shell or Windows sets
@@ -3267,6 +3292,78 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1203: a printed resume fills `--allow "<approved-risk-classes>"`
+    /// with nothing for a plan that has no gated class, so an empty value
+    /// parses and approves none; an unknown class is still refused.
+    #[test]
+    fn an_empty_allow_approves_nothing_and_an_unknown_one_is_still_refused() {
+        use clap::Parser;
+        let checksum = "a".repeat(64);
+        let allowed = |value: &str| {
+            Cli::try_parse_from([
+                "pbps",
+                "apply",
+                "--db",
+                "x",
+                "--plan",
+                "p.json",
+                "--checksum",
+                &checksum,
+                "--allow",
+                value,
+                "--staged",
+                "--resume",
+            ])
+            .map(|cli| {
+                let Command::Apply { allow, .. } = cli.command else {
+                    panic!("`pbps apply` parsed as another command");
+                };
+                allow.into_iter().filter_map(|a| a.0).collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(allowed("").unwrap(), vec![]);
+        // What Windows PowerShell 5.1 hands over for `--allow ""`: the empty
+        // argument dropped, so the next flag follows `--allow` directly.
+        let valueless = Cli::try_parse_from([
+            "pbps",
+            "apply",
+            "--db",
+            "x",
+            "--plan",
+            "p.json",
+            "--checksum",
+            &checksum,
+            "--allow",
+            "--staged",
+            "--resume",
+        ])
+        .unwrap();
+        let Command::Apply {
+            allow,
+            staged,
+            resume,
+            ..
+        } = valueless.command
+        else {
+            panic!("`pbps apply` parsed as another command");
+        };
+        assert!(allow.into_iter().all(|a| a.0.is_none()));
+        assert!(staged && resume);
+        assert_eq!(
+            allowed("rename,").unwrap(),
+            vec![pbps_model::RiskClass::Rename]
+        );
+        assert_eq!(
+            allowed("rename,destructive").unwrap(),
+            vec![
+                pbps_model::RiskClass::Rename,
+                pbps_model::RiskClass::Destructive
+            ]
+        );
+        let refused = allowed("bogus").unwrap_err().to_string();
+        assert!(refused.contains("unknown risk class `bogus`"), "{refused}");
+    }
 
     /// #1188: the lock row names the CI job by the identifier each system
     /// searches by, and nothing outside the systems named.
