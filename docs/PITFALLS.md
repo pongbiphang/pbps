@@ -2519,3 +2519,23 @@ every such statement, not only to the one that changes that property.
 that writes a column definition — create, add, and each alter — and restate it
 there (DEC-1175.1).
 
+## A conversion reads its input under the input's collation
+
+Converting into `char`, `varchar` or `text` uses the code page of the
+*input's* collation. A literal's collation is the database default. Measured
+on 17.0, on a `SQL_Latin1_General_CP1_CI_AS` database,
+`TRY_CONVERT(varchar(10), N'中')` is `?`. Assigning the same `N'中'` to a
+UTF-8 column stores `中`. Collating the result afterwards is too late, since
+the character is already gone. #1247 review found four places where a literal
+was converted to stand in for a cell: spelling probes, projected key values,
+the default-cell read-back, and the row guards. Each read a valid UTF-8 value
+as `?`, then refused the plan or reported drift nobody made.
+
+**The shape:** an expression that models an assignment must model it under
+the collation of the column being assigned. A bare literal models it under
+the database default.
+
+**The rule.** Put the column's collation on the *input* before a conversion
+into a code-page type. Where the column is in scope, it lends its own
+collation (`rows::in_column_collation`). Where it does not exist yet, use the
+declared one, `COLLATE` on the input.

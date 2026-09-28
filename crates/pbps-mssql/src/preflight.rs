@@ -1645,6 +1645,23 @@ fn rows_after(
         // about. Such a row cannot survive the `AlterColumnType` either, and
         // it is that change's own conversion probe which counts it and names
         // the column. Here it reads as NULL, which the constraint exempts.
+        // Under the collation the column will have, applied to the input
+        // before the conversion (#1247 review): measured on 17.0, a
+        // `varchar` conversion takes the code page of its input's collation,
+        // so `TRY_CONVERT(varchar(10), N'中')` under a legacy default is `?`
+        // where the UTF-8 column the plan builds keeps `中`, and a collation
+        // applied afterwards is too late. Through `nvarchar` first, so a
+        // `NULL` or a non-text stand-in takes a `COLLATE` at all (447).
+        let sql = match names.recollated.get(&table.column(column)) {
+            Some(to) => {
+                let collate = match to {
+                    Some(c) => crate::emit::collate_clause(Some(c))?,
+                    None => " COLLATE DATABASE_DEFAULT".to_owned(),
+                };
+                format!("CONVERT(nvarchar(max), {sql}){collate}")
+            }
+            None => sql,
+        };
         let value = match ty {
             Some(ty) => format!(
                 "TRY_CONVERT({}, {sql})",
@@ -1652,7 +1669,7 @@ fn rows_after(
             ),
             None => sql,
         };
-        format!("{value} AS k{i}")
+        Ok::<_, DialectError>(format!("{value} AS k{i}"))
     };
 
     // What the table already holds, where it already exists.
@@ -1666,7 +1683,7 @@ fn rows_after(
         for (i, (stored_column, column)) in stored_columns.iter().zip(columns).enumerate() {
             let read = format!("{alias}.{}", quote(stored_column)?);
             match names.reads(&table.column(column), read) {
-                Some(read) => selected.push(projected(i, column, read)),
+                Some(read) => selected.push(projected(i, column, read)?),
                 None => {
                     selected.clear();
                     unspellable = true;
@@ -1756,13 +1773,13 @@ fn rows_after(
             let mut values = Vec::new();
             for (i, column) in columns.iter().enumerate() {
                 match cells.get(column) {
-                    Some(sql) => values.push(projected(i, column, sql.clone())),
+                    Some(sql) => values.push(projected(i, column, sql.clone())?),
                     None if unprobeable(column, key) || engine_assigned(column, key) => {
                         values.clear();
                         unspellable = true;
                         break;
                     }
-                    None => values.push(projected(i, column, "NULL".to_owned())),
+                    None => values.push(projected(i, column, "NULL".to_owned())?),
                 }
             }
             if !values.is_empty() {
@@ -1785,7 +1802,7 @@ fn rows_after(
             let mut values = Vec::new();
             for (i, (column, stored_column)) in columns.iter().zip(&stored_columns).enumerate() {
                 match cells.get(column) {
-                    Some(Some(sql)) => values.push(projected(i, column, sql.clone())),
+                    Some(Some(sql)) => values.push(projected(i, column, sql.clone())?),
                     Some(None) if unprobeable(column, key) => {
                         values.clear();
                         unspellable = true;
@@ -1793,12 +1810,12 @@ fn rows_after(
                     }
                     // Set to NULL: exempt, and spelled so rather than read
                     // from the row it is about to leave.
-                    Some(None) => values.push(projected(i, column, "NULL".to_owned())),
+                    Some(None) => values.push(projected(i, column, "NULL".to_owned())?),
                     None => values.push(projected(
                         i,
                         column,
                         format!("{alias}.{}", quote(stored_column)?),
-                    )),
+                    )?),
                 }
             }
             if !values.is_empty() {
@@ -2446,6 +2463,42 @@ mod tests {
         assert!(
             got.iter().any(|q| q.contains("GROUP BY r.k0 HAVING")),
             "{got:?}"
+        );
+    }
+
+    /// A projected value is given the column's new collation *before* it is
+    /// converted: afterwards, a legacy default has already turned `中` into
+    /// `?` (#1247 review).
+    #[test]
+    fn a_projected_value_is_collated_before_it_is_converted() {
+        let mut column = pbps_model::Column::new(ty("varchar(10)"));
+        column.collation = Some(pbps_model::Collation::new(
+            "Latin1_General_100_CI_AS_SC_UTF8",
+        ));
+        let changes = ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::AddColumn {
+                    uid: uid("c_bbbbbb"),
+                    table: tname("dbo.customer"),
+                    name: "code".into(),
+                    column: Box::new(column),
+                }),
+                PlannedChange::new(Change::AddUnique {
+                    table: tname("dbo.customer"),
+                    name: "uq_code".into(),
+                    constraint: UniqueConstraint {
+                        columns: vec!["code".into()],
+                    },
+                    clustered: false,
+                }),
+            ],
+        };
+        let sql: Vec<String> = probes(&changes).into_iter().map(|p| p.sql).collect();
+        assert!(
+            sql.iter().any(|q| q.contains(
+                "TRY_CONVERT(varchar(10), CONVERT(nvarchar(max), NULL) COLLATE Latin1_General_100_CI_AS_SC_UTF8)"
+            )),
+            "{sql:?}"
         );
     }
 

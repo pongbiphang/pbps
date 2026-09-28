@@ -216,8 +216,11 @@ pub fn query(
                 // the column calls equal to its default is left out of the
                 // read-back entirely, so the drift is not in the observed
                 // state and no plan proposes to settle it.
+                // Under the column's own collation, which a literal default
+                // does not carry (#1247 review).
+                let lent = in_column_collation(&quoted, &default, &ty.base);
                 let at_default =
-                    same_value(&quoted, &format!("TRY_CONVERT({ty}, {default})"), &ty.base);
+                    same_value(&quoted, &format!("TRY_CONVERT({ty}, {lent})"), &ty.base);
                 select.push(format!(
                     // A failed assignment is unknown, not a NULL default.
                     // Keep that third answer local to this query/decode wire
@@ -360,12 +363,32 @@ pub fn spelling_queries(name: &TableName, table: &Table) -> Result<Vec<SpellingQ
         })?,
         None => " COLLATE DATABASE_DEFAULT".to_owned(),
     };
+    // The input each column's values are converted from, under the
+    // collation the column declares (#1247 review). Measured on 17.0, a
+    // `varchar` conversion takes its input's code page, so
+    // `TRY_CONVERT(varchar(10), N'中')` under a legacy default reads `?`
+    // where a UTF-8 column stores `中` — a valid value refused as misspelt.
+    let input_for = |column: &str| -> Result<String, RowsError> {
+        Ok(
+            match table.columns.get(column).and_then(|c| c.collation.as_ref()) {
+                Some(c) => format!(
+                    "v.s{}",
+                    crate::emit::collate_clause(Some(c)).map_err(|e| RowsError::Unreadable {
+                        table: name.clone(),
+                        why: e.to_string(),
+                    })?
+                ),
+                None => "v.s".to_owned(),
+            },
+        )
+    };
     let query = |column: Option<String>,
+                 input: String,
                  base: &str,
                  ty: String,
                  literals: Vec<(RowKey, String)>|
      -> SpellingQuery {
-        let rendered = read_expr(&format!("TRY_CONVERT({ty}, v.s)"), base);
+        let rendered = read_expr(&format!("TRY_CONVERT({ty}, {input})"), base);
         let values = literals
             .iter()
             .enumerate()
@@ -376,8 +399,8 @@ pub fn spelling_queries(name: &TableName, table: &Table) -> Result<Vec<SpellingQ
             let grouped = format!(
                 "SELECT MIN(v.i) AS first, MAX(v.i) AS second, MIN({rendered}) AS canonical\n  \
                  FROM (VALUES {values}) AS v(i, s)\n \
-                 WHERE TRY_CONVERT({ty}, v.s) IS NOT NULL\n \
-                 GROUP BY TRY_CONVERT({ty}, v.s)"
+                 WHERE TRY_CONVERT({ty}, {input}) IS NOT NULL\n \
+                 GROUP BY TRY_CONVERT({ty}, {input})"
             );
             let tail = "\nHAVING COUNT(*) > 1;";
             if ValueKind::of(base) != ValueKind::Text {
@@ -418,7 +441,7 @@ pub fn spelling_queries(name: &TableName, table: &Table) -> Result<Vec<SpellingQ
         .map(|k| (k.clone(), k.as_str().to_owned()))
         .collect();
     if !keys.is_empty() {
-        out.push(query(None, &base, ty, keys));
+        out.push(query(None, input_for(&key)?, &base, ty, keys));
     }
     for (column, spec) in &table.columns {
         if *column == key || spec.identity.is_some() {
@@ -437,7 +460,13 @@ pub fn spelling_queries(name: &TableName, table: &Table) -> Result<Vec<SpellingQ
             })
             .collect();
         if !literals.is_empty() {
-            out.push(query(Some(column.clone()), &base, ty, literals));
+            out.push(query(
+                Some(column.clone()),
+                input_for(column)?,
+                &base,
+                ty,
+                literals,
+            ));
         }
     }
     Ok(out)
@@ -597,6 +626,31 @@ pub(crate) fn from_text(literal: &str, ty: &ColumnType) -> Option<String> {
         "image" | "geometry" | "geography" => return None,
         _ => format!("TRY_CONVERT({ty}, {literal})"),
     })
+}
+
+/// `value` under the collation the column `stored` has when the query runs,
+/// where `base` — the column's type then — is one a conversion into reads
+/// under its input's collation.
+///
+/// A conversion into a code-page type (`char`, `varchar`, `text`) takes the
+/// code page of its *input's* collation, and a literal's is the database
+/// default. Measured on 17.0, on a `SQL_Latin1_General_CP1_CI_AS` database:
+/// `TRY_CONVERT(varchar(10), N'中')` is `?`, while the same `N'中'` assigned to
+/// a UTF-8 column — as its default, say — stores `中`, so a cell at its
+/// default read as one that is not. The column lends its own collation: in a
+/// `CASE` beside a literal its implicit collation outranks the literal's
+/// coercible default, and the branch is never taken. Through `varchar(max)`
+/// because it has the lowest precedence of the character types and takes any
+/// value's type without a clash — `text` beside `0x41` is Msg 206 — and a
+/// conversion keeps the column's collation. Any other type has no code page
+/// to lose, and a `CASE` beside it could convert the value to it and throw.
+pub(crate) fn in_column_collation(stored: &str, value: &str, base: &str) -> String {
+    match base {
+        "char" | "varchar" | "text" => {
+            format!("CASE WHEN 1 = 0 THEN CONVERT(varchar(max), {stored}) ELSE {value} END")
+        }
+        _ => value.to_owned(),
+    }
 }
 
 /// Whether a cell of this column stands at the value `other` gives, as one
@@ -1226,6 +1280,48 @@ mod tests {
         TableName::new("dbo", "status")
     }
 
+    /// A declared value is converted under its column's declared collation,
+    /// on the input, so a UTF-8 `varchar` column is asked about `中` in its own
+    /// code page rather than the database default's (#1247 review).
+    #[test]
+    fn a_spelling_is_converted_under_the_columns_declared_collation() {
+        let mut t = table(
+            Some(vec!["code"]),
+            &[
+                ("code", "varchar(10)", None),
+                ("label", "varchar(10)", None),
+            ],
+        );
+        t.columns.get_mut("label").unwrap().collation = Some(pbps_model::Collation::new(
+            "Latin1_General_100_CI_AS_SC_UTF8",
+        ));
+        let mut row = pbps_model::Row::default();
+        row.0
+            .insert("label".into(), pbps_model::Value::Text("中".into()));
+        t.data = Some(pbps_model::TableData {
+            mode: pbps_model::DataMode::Exact,
+            rows: [(RowKey::from("k"), row)].into_iter().collect(),
+        });
+        let qs = spelling_queries(&name(), &t).unwrap();
+        let label = qs
+            .iter()
+            .find(|q| q.column.as_deref() == Some("label"))
+            .unwrap();
+        assert!(
+            label
+                .sql
+                .contains("TRY_CONVERT(varchar(10), v.s COLLATE Latin1_General_100_CI_AS_SC_UTF8)"),
+            "{}",
+            label.sql
+        );
+        // Negative: the key column declares none and is converted bare.
+        assert!(
+            qs[0].sql.contains("TRY_CONVERT(varchar(10), v.s)"),
+            "{}",
+            qs[0].sql
+        );
+    }
+
     /// Two row keys are one when the key column's collation says so, and
     /// that is the collation the column *declares*: what it has once the plan
     /// has run, whether the plan creates it, changes it or leaves it (#1175).
@@ -1306,14 +1402,19 @@ mod tests {
 
     #[test]
     fn default_comparisons_use_the_normalized_column_type() {
-        for (ty, expected) in [
-            ("varchar(10)", "varchar(10)"),
-            ("nvarchar(max)", "nvarchar(max)"),
-            ("numeric(8,2)", "decimal(8, 2)"),
-            ("integer", "int"),
+        // A code-page type converts its default under the column's own
+        // collation (#1247 review); no other type is given the `CASE`.
+        let lent =
+            "CASE WHEN 1 = 0 THEN CONVERT(varchar(max), [n]]ame]) ELSE -CAST('1' AS int)\n END";
+        let bare = "-CAST('1' AS int)\n";
+        for (ty, expected, input) in [
+            ("varchar(10)", "varchar(10)", lent),
+            ("nvarchar(max)", "nvarchar(max)", bare),
+            ("numeric(8,2)", "decimal(8, 2)", bare),
+            ("integer", "int", bare),
             // A type with no native `=` is asked about like any other: the
             // comparison is of the text the read-back renders.
-            ("text", "text"),
+            ("text", "text", lent),
         ] {
             let t = table(
                 Some(vec!["id"]),
@@ -1333,7 +1434,7 @@ mod tests {
             .unwrap();
             assert!(
                 q.sql.contains(&format!(
-                    "CONVERT(nvarchar(max), [n]]ame]) = CONVERT(nvarchar(max), TRY_CONVERT({expected}, -CAST('1' AS int)\n)) COLLATE Latin1_General_BIN2"
+                    "CONVERT(nvarchar(max), [n]]ame]) = CONVERT(nvarchar(max), TRY_CONVERT({expected}, {input})) COLLATE Latin1_General_BIN2"
                 )),
                 "{}",
                 q.sql
@@ -1606,7 +1707,7 @@ mod tests {
         // The ordinary column keeps the text comparison alone.
         assert!(
             q.sql.contains(
-                "CONVERT(nvarchar(max), [n]) = CONVERT(nvarchar(max), TRY_CONVERT(varchar(10), ('new'"
+                "CONVERT(nvarchar(max), [n]) = CONVERT(nvarchar(max), TRY_CONVERT(varchar(10), CASE WHEN 1 = 0 THEN CONVERT(varchar(max), [n]) ELSE ('new'"
             ),
             "{}",
             q.sql
@@ -1652,7 +1753,7 @@ mod tests {
         for held in [
             "CONVERT(nvarchar(max), [doc]) = CONVERT(nvarchar(max), TRY_CONVERT(xml, ''",
             "CONVERT(nvarchar(max), CONVERT(varbinary(max), [blob]), 1) = CONVERT(nvarchar(max), CONVERT(varbinary(max), TRY_CONVERT(image, 0x",
-            "CONVERT(nvarchar(max), [note]) = CONVERT(nvarchar(max), TRY_CONVERT(text, 'new'",
+            "CONVERT(nvarchar(max), [note]) = CONVERT(nvarchar(max), TRY_CONVERT(text, CASE WHEN 1 = 0 THEN CONVERT(varchar(max), [note]) ELSE 'new'",
             "CONVERT(nvarchar(max), [wide]) = CONVERT(nvarchar(max), TRY_CONVERT(ntext, N'new'",
         ] {
             assert!(q.sql.contains(held), "{held}\n{}", q.sql);

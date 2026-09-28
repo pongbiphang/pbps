@@ -1051,7 +1051,7 @@ fn recorded_cell(
             // `geography` (DECISIONS 471): there is no expression that puts
             // the recorded text back through that type, so there is nothing
             // to compare the converted column with.
-            let Some(expected) = ty.as_stored(&recorded) else {
+            let Some(expected) = ty.as_stored(&recorded, &quoted) else {
                 return Ok(None);
             };
             Some(format!(
@@ -1124,10 +1124,18 @@ impl<'a> Held<'a> {
     /// `TRY_CONVERT` so that a recorded value the new type cannot hold reads
     /// as "not what the plan recorded" rather than raising Msg 245 from
     /// inside the write.
-    fn converted(self, value: &str) -> String {
+    ///
+    /// The `ALTER` converted under the column's collation, which `value` does
+    /// not carry: `stored` is the column, to lend it
+    /// ([`crate::rows::in_column_collation`]).
+    fn converted(self, value: &str, stored: &str) -> String {
         match self.retyped() {
             false => value.to_owned(),
-            true => format!("TRY_CONVERT({}, {value})", self.now()),
+            true => {
+                let now = self.now();
+                let value = crate::rows::in_column_collation(stored, value, &now.base);
+                format!("TRY_CONVERT({now}, {value})")
+            }
         }
     }
 
@@ -1149,13 +1157,13 @@ impl<'a> Held<'a> {
     /// `geography` ([`crate::rows::from_text`], which measures why for each).
     /// A column this plan leaves alone never converts anything, so it is
     /// always held, whatever its type.
-    fn as_stored(self, recorded: &str) -> Option<String> {
+    fn as_stored(self, recorded: &str, stored: &str) -> Option<String> {
         if !self.retyped() {
             return Some(recorded.to_owned());
         }
         let now = self.now();
         Some(crate::rows::read_expr(
-            &self.converted(&crate::rows::from_text(recorded, &self.read())?),
+            &self.converted(&crate::rows::from_text(recorded, &self.read())?, stored),
             &now.base,
         ))
     }
@@ -1255,7 +1263,10 @@ fn defaulted_cell(
     // The default converted to the type the column had when the row was
     // written, and then — where this plan retypes it — the way the `ALTER`
     // converted the column itself.
-    let at_default = ty.converted(&format!("CONVERT({read}, {default})"));
+    // Both under the column's collation, which a literal default does not
+    // carry (#1247 review).
+    let lent = crate::rows::in_column_collation(&quoted, &default, &now.base);
+    let at_default = ty.converted(&format!("CONVERT({read}, {lent})"), &quoted);
     // A default of `NULL` references nothing and compares to nothing; both
     // halves are spelled so the one predicate covers it.
     Ok(Some(format!(

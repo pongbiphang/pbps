@@ -2419,6 +2419,224 @@ async fn a_foreign_key_between_recollated_columns_is_probed_under_their_new_coll
     applied.unwrap_or_else(|e| panic!("the valid plan was refused: {e}"));
 }
 
+/// A new UTF-8 `varchar` column on a database whose default is a legacy code
+/// page keeps `中` and `?` apart, so a unique key over the two planned values
+/// is not reported as a collision (#1247 review).
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_new_column_s_planned_values_are_keyed_under_its_collation() {
+    use pbps_model::{DataMode, Row, RowKey, TableData, Value};
+    let mut db = TestDb::create_collated("coll_proj", "SQL_Latin1_General_CP1_CI_AS").await;
+    db.conn
+        .execute(
+            // Empty: the plan inserts both rows, so its values are the only
+            // ones the new key holds.
+            "CREATE TABLE dbo.t (code varchar(10) NOT NULL CONSTRAINT pk_t PRIMARY KEY);",
+        )
+        .await
+        .expect("create");
+    let start = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    let ids = mint_ids(&start.schema, &IdsFile::default(), &[]);
+    let declare = |collation: Option<&str>| {
+        let mut declared = start.schema.clone();
+        let t = declared
+            .tables
+            .get_mut(&TableName::new("dbo", "t"))
+            .unwrap();
+        let mut label = Column::new(ty("varchar(10)"));
+        label.collation = collation.map(pbps_model::Collation::new);
+        t.columns.insert("label".into(), label);
+        t.unique.insert(
+            "uq_t_label".into(),
+            UniqueConstraint {
+                columns: vec!["label".into()],
+            },
+        );
+        let row = |v: &str| {
+            [("label".to_owned(), Value::Text(v.into()))]
+                .into_iter()
+                .collect::<Row>()
+        };
+        t.data = Some(TableData {
+            mode: DataMode::Exact,
+            rows: [
+                (RowKey::from("a"), row("中")),
+                (RowKey::from("b"), row("?")),
+            ]
+            .into_iter()
+            .collect(),
+        });
+        let declared_ids = mint_ids(&declared, &ids, &[]);
+        plan(&start.schema, &ids, &declared, &declared_ids)
+    };
+    let utf8 = probe_counts(
+        &mut db.conn,
+        &declare(Some("Latin1_General_100_CI_AS_SC_UTF8")),
+    )
+    .await;
+    // Negative: under the legacy default the engine itself reads both as `?`,
+    // and both rows are counted.
+    let legacy = probe_counts(&mut db.conn, &declare(None)).await;
+    db.drop().await;
+    let collisions = |counts: &[(String, i32)]| {
+        counts
+            .iter()
+            .find(|(d, _)| d.contains("uq_t_label"))
+            .unwrap_or_else(|| panic!("no probe for uq_t_label in {counts:?}"))
+            .1
+    };
+    assert_eq!(collisions(&utf8), 0, "{utf8:?}");
+    assert_eq!(collisions(&legacy), 2, "{legacy:?}");
+}
+
+/// A UTF-8 `varchar` cell on a database whose default is a legacy code page is
+/// compared under the column's own collation wherever a literal is converted
+/// into it (#1247 review): the insert's guard holding it to its `N'中'`
+/// default, the read-back asking whether it stands at that default, and the
+/// update's guard across the retype that made the column UTF-8. Under the
+/// database default each of those reads `中` as `?`, and the first and last
+/// refuse the valid plan while the second reports drift nobody made.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_literal_is_converted_under_the_utf8_column_it_is_compared_with() {
+    use pbps_model::{DataMode, Row, RowKey, TableData, Value};
+    const UTF8: &str = "Latin1_General_100_CI_AS_SC_UTF8";
+    let declare = |label: &str, note: &str| {
+        let mut t = Table::default();
+        t.columns
+            .insert("code".to_owned(), Column::new(ty("varchar(20)")).not_null());
+        let mut label_column = Column::new(ty(label));
+        if label.starts_with("varchar") {
+            label_column.collation = Some(pbps_model::Collation::new(UTF8));
+        }
+        t.columns.insert("label".to_owned(), label_column);
+        t.columns
+            .insert("note".to_owned(), Column::new(ty("nvarchar(50)")));
+        let mut tag = Column::new(ty("varchar(10)"));
+        tag.collation = Some(pbps_model::Collation::new(UTF8));
+        tag.default = Some("(N'中')".into());
+        t.columns.insert("tag".to_owned(), tag);
+        t.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["code".to_owned()],
+        });
+        // `tag` left to its default.
+        t.data = Some(TableData {
+            mode: DataMode::Exact,
+            rows: [(
+                RowKey::from("k"),
+                [
+                    ("label".to_owned(), Value::Text("中".into())),
+                    ("note".to_owned(), Value::Text(note.into())),
+                ]
+                .into_iter()
+                .collect::<Row>(),
+            )]
+            .into_iter()
+            .collect(),
+        });
+        let mut s = Schema::default();
+        s.tables.insert(TableName::new("dbo", "t"), t);
+        s
+    };
+    let mut db = TestDb::create_collated("coll_lent", "SQL_Latin1_General_CP1_CI_AS").await;
+
+    let first = declare("nvarchar(10)", "first");
+    let ids = mint_ids(&first, &IdsFile::default(), &[]);
+    let inserted = try_apply(
+        &mut db.conn,
+        &plan(&Schema::default(), &IdsFile::default(), &first, &ids),
+    )
+    .await;
+
+    let scopes = first.data_scopes();
+    let read: std::collections::BTreeMap<TableName, pbps_model::RowScope> = scopes
+        .iter()
+        .map(|(n, s)| (n.clone(), s.rows_to_read()))
+        .collect();
+    let live = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect")
+        .schema;
+    let observed = pbps_mssql::catalog::read_rows(&mut db.conn, &live, &read)
+        .await
+        .expect("read rows");
+    let live = live.with_observed_rows(&observed, &scopes, &first).unwrap();
+
+    let second = declare("varchar(10)", "second");
+    let second_ids = mint_ids(&second, &ids, &[]);
+    let updated = try_apply(&mut db.conn, &plan(&first, &ids, &second, &second_ids)).await;
+    let rows = db
+        .conn
+        .query(
+            "SELECT COUNT(*) FROM dbo.t WHERE label = N'中' AND tag = N'中' AND note = N'second';",
+        )
+        .await
+        .expect("count");
+    let stored: i32 = rows[0].try_get_at(0).unwrap().unwrap();
+    db.drop().await;
+
+    inserted.unwrap_or_else(|e| panic!("the insert was refused: {e}"));
+    assert_eq!(
+        live.tables[&TableName::new("dbo", "t")].data,
+        first.tables[&TableName::new("dbo", "t")].data,
+        "a cell at its default read back as another value"
+    );
+    updated.unwrap_or_else(|e| panic!("the update across the retype was refused: {e}"));
+    assert_eq!(stored, 1);
+}
+
+/// A declared value in a UTF-8 `varchar` column on a database whose default
+/// is a legacy code page is spelled as the column stores it, not as the
+/// default would: `中` is not reported as misspelt (#1247 review).
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_value_is_spelled_under_its_columns_collation() {
+    use pbps_model::{DataMode, Row, RowKey, TableData, Value};
+    let mut db = TestDb::create_collated("coll_spell", "SQL_Latin1_General_CP1_CI_AS").await;
+    let mut t = Table::default();
+    t.columns
+        .insert("code".to_owned(), Column::new(ty("varchar(10)")).not_null());
+    let mut label = Column::new(ty("varchar(10)"));
+    label.collation = Some(pbps_model::Collation::new(
+        "Latin1_General_100_CI_AS_SC_UTF8",
+    ));
+    t.columns.insert("label".to_owned(), label);
+    t.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".to_owned()],
+    });
+    t.data = Some(TableData {
+        mode: DataMode::Exact,
+        rows: [(
+            RowKey::from("k"),
+            [("label".to_owned(), Value::Text("中".into()))]
+                .into_iter()
+                .collect::<Row>(),
+        )]
+        .into_iter()
+        .collect(),
+    });
+    let mut schema = Schema::default();
+    schema.tables.insert(TableName::new("dbo", "t"), t.clone());
+    let spellings = pbps_mssql::catalog::misspelt(&mut db.conn, &schema, &Default::default())
+        .await
+        .expect("ask the engine");
+    // Negative: the same value in a column under the legacy default is `?`.
+    let mut plain = t;
+    plain.columns.get_mut("label").unwrap().collation = None;
+    let mut schema = Schema::default();
+    schema.tables.insert(TableName::new("dbo", "t"), plain);
+    let legacy = pbps_mssql::catalog::misspelt(&mut db.conn, &schema, &Default::default())
+        .await
+        .expect("ask the engine");
+    db.drop().await;
+    assert!(spellings.misspelt.is_empty(), "{:?}", spellings.misspelt);
+    assert_eq!(legacy.misspelt.len(), 1, "{:?}", legacy.misspelt);
+}
+
 /// A collation the server lacks is named before any statement runs, and a
 /// known one in another case is not (#1175).
 #[tokio::test]
