@@ -157,6 +157,69 @@ class Ownership(unittest.TestCase):
         with self.assertRaisesRegex(audit.InventoryError, "stale case/target"):
             self.check("win32")
 
+    def test_immutable_tuple_selectors_survive_read_calls_and_aliases(self):
+        controls = [
+            ('TESTS = ("owned",)', "('owned',)"),
+            ('TESTS = ("owned",)\nprint(TESTS)', "('owned',)"),
+            ('TESTS = ("owned",)\ndef consume(value): return len(value)\nconsume(TESTS)', "('owned',)"),
+            ('TESTS = ("owned",)\nALIAS = TESTS\nprint(ALIAS)', "('owned',)"),
+            ('TESTS = ("owned",)\nBOX = ((TESTS,),)\nprint(BOX)', "('owned',)"),
+            ('TESTS = ("owned",) + ()\nprint(TESTS)', "('owned',)"),
+            ('TESTS = ("owned",)\nBOX = ([], TESTS)\nBOX[0].clear()', "('owned',)"),
+            ('TESTS = [name for name in ("owned",)]', "['owned']"),
+            ('TESTS = ["owned"]\nCOPY = TESTS + []\nBOX = (COPY,)\nBOX[0].clear()', "['owned']"),
+            ('PREFIX = "ow"\nTESTS = (PREFIX + "ned",)\nprint(TESTS)', "('owned',)"),
+        ]
+        self.inventory["owners"]["live"]["selection"] = {
+            "kind": "data", "file": "runner.py", "expression": "TESTS"}
+        for source, expected in controls:
+            with self.subTest(source=source):
+                actual = subprocess.run([sys.executable, "-c", source + '\nprint(repr(TESTS))'],
+                                        check=True, capture_output=True, text=True, timeout=10)
+                self.assertEqual(actual.stdout.splitlines()[-1], expected)
+                (self.root / "runner.py").write_text(source + '\n', encoding="utf-8")
+                self.assertEqual(self.check(), 1)
+
+    def test_tuple_wrappers_do_not_hide_mutable_selector_children(self):
+        mutations = [
+            'BOX = (TESTS,)\nBOX[0].clear()',
+            'BOX = ((TESTS,),)\nBOX[0][0].clear()',
+            'BOX = [(TESTS,)]\nBOX[0][0].clear()',
+            'BOX = (TESTS,)\ndef mutate(value): value[0].clear()\nmutate(BOX)',
+            'BOX = (TESTS,) + ()\nBOX[0].clear()',
+        ]
+        self.inventory["owners"]["live"]["selection"] = {
+            "kind": "data", "file": "runner.py", "expression": "TESTS"}
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                source = 'TESTS = ["owned"]\n' + mutation + '\n'
+                # Observe separately: print in the audited source would itself
+                # invalidate the list and hide missing tuple-child tracking.
+                actual = subprocess.run([sys.executable, "-c", source + 'print(TESTS)'],
+                                        check=True, capture_output=True, text=True, timeout=10)
+                self.assertEqual(actual.stdout, "[]\n")
+                (self.root / "runner.py").write_text(source, encoding="utf-8")
+                with self.assertRaises(audit.InventoryError):
+                    self.check()
+
+    def test_mixed_tuple_list_concatenation_cannot_invent_a_selector(self):
+        for literal, suffix in [('("owned",)', '[]'), ('["owned"]', '()')]:
+            for expression_only in (False, True):
+                with self.subTest(literal=literal, expression_only=expression_only):
+                    source = f'PARTS = {literal}\n'
+                    assignment = f'TESTS = PARTS + {suffix}\n'
+                    actual = subprocess.run([sys.executable, "-c", source + assignment],
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertNotEqual(actual.returncode, 0)
+                    self.assertIn("TypeError", actual.stderr)
+                    self.inventory["owners"]["live"]["selection"] = {
+                        "kind": "data", "file": "runner.py",
+                        "expression": f'PARTS + {suffix}' if expression_only else "TESTS"}
+                    (self.root / "runner.py").write_text(
+                        source if expression_only else source + assignment, encoding="utf-8")
+                    with self.assertRaises(audit.InventoryError):
+                        self.check()
+
     def test_a_stale_selector_cannot_hide_in_a_valid_python_runner(self):
         script = self.root / "runner.py"
         script.write_text('TESTS = ["owned", "stale"]\n')
