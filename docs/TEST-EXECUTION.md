@@ -26,7 +26,9 @@ to compile the workspace; a checkout that just ran its tests reuses those builds
 Ordinary live targets are checked against their actual CI Cargo selectors,
 including target identity, exact/substring filtering and `--skip`. Cargo's
 optional TESTNAME before `--` joins the libtest filters after it: any matching
-filter selects a case. Package, target and profile option values are not test
+filter selects a case. `--exact` applies to both positive filters and `--skip`: a
+case is excluded only when a skip matches its complete name in exact mode, or
+a substring otherwise. Package, target and profile option values are not test
 names. Unsupported Cargo options, multiple TESTNAME arguments and ambiguous
 target selectors are refused rather than silently discarded. Dedicated
 Python fixtures have explicit selector data plus scheduling witnesses in the
