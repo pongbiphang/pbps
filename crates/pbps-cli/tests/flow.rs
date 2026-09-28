@@ -2275,6 +2275,95 @@ fn a_column_collation_round_trips_and_changes_through_the_cli() {
     ok(&apply_extra());
 }
 
+/// A staged run resumed after the database's default collation changed is
+/// refused before its remaining statements, as a fresh apply is: the plan
+/// pinned the default, and a statement still to run that leaves a column with
+/// no collation would take the new one (#1247 review). Pinned to the default
+/// the database has, the same resume runs.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_staged_resume_rechecks_the_pinned_default_collation() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::collated(&server, "coll1175_resume", "Latin1_General_CI_AS");
+    let connection = own.connection().to_owned();
+    let d = Demo::new("coll1175-resume");
+    d.table("table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n");
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    ok(&d.run(&["plan"]));
+    d.commit();
+    ok(&d.run(&["bootstrap", "--db", &connection]));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let resume = |pinned: &str, view: &str| {
+        let latest = rt.block_on(async {
+            let mut conn = connect_live(&connection).await.unwrap();
+            pbps_mssql::state::latest(&mut conn).await.unwrap().unwrap()
+        });
+        let plan = pbps_model::SavedPlan::new(
+            pbps_model::PlanOrigin::Database,
+            "mssql",
+            "2026-09-28T00:00:00Z",
+            pbps_model::PlanBaseline {
+                description: "paused".into(),
+                checksum: pbps_model::state_checksum(&latest.snapshot.schema, &latest.snapshot.ids),
+                database_collation: Some(pinned.to_owned()),
+            },
+            pbps_model::ChangeSet {
+                changes: vec![pbps_model::PlannedChange::new(
+                    pbps_model::Change::CreateModule {
+                        id: format!("dbo.{view}").parse().unwrap(),
+                        module: Box::new(pbps_model::Module {
+                            kind: pbps_model::ModuleKind::View,
+                            description: None,
+                            definition: "SELECT 1 AS id".into(),
+                        }),
+                    },
+                )],
+            },
+            latest.snapshot.ids.clone(),
+        )
+        .staged();
+        let path = d.dir.join(format!("{view}.json"));
+        std::fs::write(&path, serde_json::to_string_pretty(&plan).unwrap()).unwrap();
+        let checksum = plan.checksum();
+        rt.block_on(async {
+            let mut conn = connect_live(&connection).await.unwrap();
+            let mut checkpoint = latest.snapshot.clone();
+            checkpoint.kind = pbps_model::StateKind::Staged;
+            checkpoint.plan_checksum = Some(checksum.clone());
+            checkpoint.staged = Some(pbps_model::StagedProgress {
+                completed: 0,
+                total: 1,
+                last_statement: String::new(),
+            });
+            pbps_mssql::state::record(&mut conn, &checkpoint)
+                .await
+                .unwrap();
+        });
+        d.run(&[
+            "apply",
+            "--db",
+            &connection,
+            "--plan",
+            path.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+            "--staged",
+            "--resume",
+        ])
+    };
+    let refused = resume("Latin1_General_BIN2", "v_refused");
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        stderr(&refused).contains("computed against `Latin1_General_BIN2`"),
+        "{}",
+        stderr(&refused)
+    );
+    ok(&resume("Latin1_General_CI_AS", "v_resumed"));
+}
+
 /// A table's clustered layout goes the whole way through the CLI (#1178):
 /// `pull` declares it, `bootstrap` rebuilds it in an empty database, and a
 /// second `pull` from there writes the same files. Moving it on an adopted,

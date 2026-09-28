@@ -123,10 +123,12 @@ struct AsStored {
     /// row already in it will hold in one. See [`Added`]: not `alias.[name]`,
     /// because the column is not there when the probe runs.
     added: BTreeMap<ColumnRef, Added>,
-    /// Columns whose collation this plan changes, and the one each will have
-    /// (`None` being the database default). A key over one is rebuilt after
-    /// the change, and its values collide or not under the new collation, not
-    /// the one the probe would otherwise group them by (#1175).
+    /// Columns whose collation the probes must spell, and the one each will
+    /// have (`None` being the database default): one this plan recollates,
+    /// and one it adds under a named collation. A key over either is built
+    /// after the column has it, and its values collide or not under that
+    /// collation, not under the database default a probe's projected values
+    /// otherwise carry (#1175, #1247 review).
     recollated: BTreeMap<ColumnRef, Option<pbps_model::Collation>>,
     /// The foreign keys this plan takes away before the deletes run: a
     /// `DropForeignKey`, and every key into the table a `DropTable` removes.
@@ -297,6 +299,10 @@ impl AsStored {
                     ..
                 } => {
                     this.types.insert(table.column(name), column.ty.clone());
+                    if column.collation.is_some() {
+                        this.recollated
+                            .insert(table.column(name), column.collation.clone());
+                    }
                     // Nullable first: the engine backfills only a NOT NULL
                     // column, so a declared default on a nullable one reaches
                     // no row that is already there (DECISIONS 171).
@@ -2394,6 +2400,53 @@ mod tests {
         );
         // Negative: a Unicode column's characters survive any collation.
         assert!(sql_of(&alter("nvarchar(5)", Some("Latin1_General_CS_AS"))).is_empty());
+    }
+
+    /// A column the plan adds under a named collation is grouped under it
+    /// when a key over it is counted: its projected values otherwise carry
+    /// the database default, and a case-insensitive default called `a` and
+    /// `A` one key in a case-sensitive column (#1247 review).
+    #[test]
+    fn an_added_columns_collation_reaches_the_key_probe() {
+        let mut column = pbps_model::Column::new(ty("varchar(10)"));
+        column.collation = Some(pbps_model::Collation::new("Latin1_General_CS_AS"));
+        let add = |column: pbps_model::Column| {
+            PlannedChange::new(Change::AddColumn {
+                uid: uid("c_bbbbbb"),
+                table: tname("dbo.customer"),
+                name: "code".into(),
+                column: Box::new(column),
+            })
+        };
+        let unique = PlannedChange::new(Change::AddUnique {
+            table: tname("dbo.customer"),
+            name: "uq_code".into(),
+            constraint: UniqueConstraint {
+                columns: vec!["code".into()],
+            },
+            clustered: false,
+        });
+        let sql = |changes: Vec<PlannedChange>| -> Vec<String> {
+            probes(&ChangeSet { changes })
+                .into_iter()
+                .map(|p| p.sql)
+                .collect()
+        };
+        let got = sql(vec![add(column), unique.clone()]);
+        assert!(
+            got.iter()
+                .any(|q| q.contains("GROUP BY r.k0 COLLATE Latin1_General_CS_AS")),
+            "{got:?}"
+        );
+        // Negative: an added column under the default is grouped bare.
+        let got = sql(vec![
+            add(pbps_model::Column::new(ty("varchar(10)"))),
+            unique,
+        ]);
+        assert!(
+            got.iter().any(|q| q.contains("GROUP BY r.k0 HAVING")),
+            "{got:?}"
+        );
     }
 
     /// A foreign key added over columns whose collation this plan changes is

@@ -939,7 +939,7 @@ apply's postcondition. An offline preview cannot do that, and shows such a
 column as a change; the connected plan is the one that is applied. The plan
 records the live default (`PlanBaseline::database_collation`), and `apply`
 refuses before its first statement if the database's default has changed
-since. The baseline checksum only sees that when a managed character column
+since — a staged resume before the statements it has left. The baseline checksum only sees that when a managed character column
 sits under the default. A column the plan adds without a collation takes the
 default in force when it runs, and reads back as none either way. (Measured
 on 17.0: the ledger's own `CHECK` on `__pbps_lock` makes the engine refuse

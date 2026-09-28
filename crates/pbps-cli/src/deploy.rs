@@ -6158,6 +6158,11 @@ async fn apply_staged_under_lock(
                 entry.id
             );
         }
+        // Nor the database's default collation, which the plan pinned and
+        // the checkpoint's checksum cannot see move (#1247 review): a
+        // statement still to run that leaves a column with no collation
+        // would take the new one.
+        refuse_moved_database_collation(conn, plan, &target.label).await?;
         // Nor can it see a permission the declarations cannot hold, for the
         // same reason: it is beside the comparison, not in it (110). A
         // resume that ran on would close the deployment with a snapshot

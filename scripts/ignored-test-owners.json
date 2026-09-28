@@ -961,6 +961,7 @@
         "a_sequence_or_synonym_at_a_new_tables_name_refuses_the_plan",
         "a_staged_apply_stops_at_a_change_that_is_not_its_own",
         "a_staged_rename_checks_recreated_names_under_the_database_collation",
+        "a_staged_resume_rechecks_the_pinned_default_collation",
         "a_state_list_envelope_with_a_zero_limit_is_refused_by_the_published_schema",
         "a_synonym_at_an_added_checks_name_refuses_the_plan",
         "a_table_and_one_of_its_columns_renamed_in_one_revision_apply_together",
