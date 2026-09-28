@@ -2526,9 +2526,9 @@ Converting into `char`, `varchar` or `text` uses the code page of the
 on 17.0, on a `SQL_Latin1_General_CP1_CI_AS` database,
 `TRY_CONVERT(varchar(10), N'中')` is `?`. Assigning the same `N'中'` to a
 UTF-8 column stores `中`. Collating the result afterwards is too late, since
-the character is already gone. #1247 review found four places where a literal
+the character is already gone. #1247 review found five places where a literal
 was converted to stand in for a cell: spelling probes, projected key values,
-the default-cell read-back, and the row guards. Each read a valid UTF-8 value
+planned defaults, the default-cell read-back, and the row guards. Each read a valid UTF-8 value
 as `?`, then refused the plan or reported drift nobody made.
 
 **The shape:** an expression that models an assignment must model it under

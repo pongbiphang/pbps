@@ -245,15 +245,36 @@ fn constant_default(default: &str) -> Option<&str> {
     (crate::rows::is_constant(d) && !is_null_default(d)).then_some(d)
 }
 
-fn assigned_default(default: &str, ty: Option<&ColumnType>) -> String {
+/// A constant default as the column it is assigned to stores it.
+///
+/// Under `collation`, where this plan gives the column one, applied to the
+/// default *before* it is converted (#1247 review): a conversion into
+/// `varchar` takes its input's code page, and a literal's is the database
+/// default's, so `CONVERT(varchar(10), N'中')` on a legacy-code-page database
+/// is `?` although the UTF-8 column the plan builds stores `中`. Through
+/// `nvarchar` first, so a non-text default takes a `COLLATE` at all (447).
+///
+/// `None` where the collation cannot be spelled: the default is then not
+/// assigned at all rather than assigned under the wrong collation, and the
+/// caller reports what depends on it as unchecked.
+fn assigned_default(
+    default: &str,
+    ty: Option<&ColumnType>,
+    collation: Option<&pbps_model::Collation>,
+) -> Option<String> {
     let default = verbatim(default);
-    match ty {
-        Some(ty) => format!(
-            "CONVERT({}, ({default}))",
-            types::normalize(ty).unwrap_or_else(|_| ty.clone())
+    let Some(ty) = ty else {
+        return Some(format!("({default})"));
+    };
+    let ty = types::normalize(ty).unwrap_or_else(|_| ty.clone());
+    let input = match collation.filter(|_| types::takes_collation(&ty.base)) {
+        Some(c) => format!(
+            "CONVERT(nvarchar(max), ({default})){}",
+            crate::emit::collate_clause(Some(c)).ok()?
         ),
         None => format!("({default})"),
-    }
+    };
+    Some(format!("CONVERT({ty}, {input})"))
 }
 
 /// `NULL` under any number of parentheses and comments: a default that
@@ -276,6 +297,82 @@ fn unwrapped(default: &str) -> &str {
 impl AsStored {
     fn of(changes: &ChangeSet) -> Self {
         let mut this = Self::default();
+        // Every collation this plan gives a column, first: a row change may
+        // precede the change that creates or recollates its column, and its
+        // defaults are assigned under that collation (#1247 review).
+        for p in &changes.changes {
+            match &p.change {
+                // A table this plan creates has exactly the collations it
+                // declares, and none of them is what the database default
+                // would give a literal.
+                Change::CreateTable { name, table, .. } => {
+                    for (column, spec) in &table.columns {
+                        if spec.collation.is_some() {
+                            this.recollated
+                                .insert(name.column(column), spec.collation.clone());
+                        }
+                    }
+                }
+                Change::AddColumn {
+                    table,
+                    name,
+                    column,
+                    ..
+                } if column.collation.is_some() => {
+                    this.recollated
+                        .insert(table.column(name), column.collation.clone());
+                }
+                Change::AlterColumnType {
+                    column,
+                    to,
+                    from_collation,
+                    to_collation,
+                    ..
+                } => {
+                    // Only onto a type that has a collation at all: a
+                    // collated `varchar` retyped to `int` loses its collation
+                    // rather than moving it, and a `COLLATE` on the `int` it
+                    // becomes is 447 (#1247 review).
+                    let collated =
+                        types::normalize(to).is_ok_and(|t| types::takes_collation(&t.base));
+                    if from_collation != to_collation && collated {
+                        this.recollated.insert(column.clone(), to_collation.clone());
+                    }
+                }
+                // Exhaustive rather than `_`, as below: a change added later
+                // that gives a column a collation has to be counted here.
+                Change::AddColumn { .. }
+                | Change::DropTable { .. }
+                | Change::RenameTable { .. }
+                | Change::DropColumn { .. }
+                | Change::RenameColumn { .. }
+                | Change::AlterColumnNullability { .. }
+                | Change::AlterColumnDefault { .. }
+                | Change::SetColumnDeprecated { .. }
+                | Change::SetPrimaryKey { .. }
+                | Change::AddUnique { .. }
+                | Change::DropUnique { .. }
+                | Change::AddForeignKey { .. }
+                | Change::DropForeignKey { .. }
+                | Change::AddCheck { .. }
+                | Change::DropCheck { .. }
+                | Change::AddIndex { .. }
+                | Change::DropIndex { .. }
+                | Change::InsertRow { .. }
+                | Change::UpdateRow { .. }
+                | Change::DeleteRow { .. }
+                | Change::SetDataMode { .. }
+                | Change::CreateModule { .. }
+                | Change::AlterModule { .. }
+                | Change::DropModule { .. }
+                | Change::CreateRole { .. }
+                | Change::DropRole { .. }
+                | Change::RenameRole { .. }
+                | Change::Grant { .. }
+                | Change::Revoke { .. }
+                | Change::PublicExecution { .. } => {}
+            }
+        }
         for p in &changes.changes {
             match &p.change {
                 Change::RenameTable { from, to, .. } => {
@@ -299,40 +396,23 @@ impl AsStored {
                     ..
                 } => {
                     this.types.insert(table.column(name), column.ty.clone());
-                    if column.collation.is_some() {
-                        this.recollated
-                            .insert(table.column(name), column.collation.clone());
-                    }
                     // Nullable first: the engine backfills only a NOT NULL
                     // column, so a declared default on a nullable one reaches
                     // no row that is already there (DECISIONS 171).
                     let added = if column.nullable {
                         Added::Null
                     } else {
-                        match column.default.as_deref().and_then(constant_default) {
-                            Some(e) => Added::Backfilled(assigned_default(e, Some(&column.ty))),
+                        match column.default.as_deref().and_then(constant_default).and_then(|e| {
+                            assigned_default(e, Some(&column.ty), column.collation.as_ref())
+                        }) {
+                            Some(sql) => Added::Backfilled(sql),
                             None => Added::Unspellable,
                         }
                     };
                     this.added.insert(table.column(name), added);
                 }
-                Change::AlterColumnType {
-                    column,
-                    to,
-                    from_collation,
-                    to_collation,
-                    ..
-                } => {
+                Change::AlterColumnType { column, to, .. } => {
                     this.types.insert(column.clone(), to.clone());
-                    // Only onto a type that has a collation at all: a
-                    // collated `varchar` retyped to `int` loses its collation
-                    // rather than moving it, and a `COLLATE` on the `int` it
-                    // becomes is 447 (#1247 review).
-                    let collated = types::normalize(to).is_ok_and(|t| types::takes_collation(&t.base));
-                    if from_collation != to_collation && collated {
-                        this.recollated
-                            .insert(column.clone(), to_collation.clone());
-                    }
                 }
                 // Both run before the deletes, so a child counted through
                 // either would refuse a delete that will be valid by then.
@@ -377,7 +457,19 @@ impl AsStored {
                                 if constant.is_some() && ty.is_none() {
                                     moved.untyped_defaults.entry(key.clone()).or_default().insert(column.clone());
                                 }
-                                constant.map(|e| assigned_default(e, ty))
+                                let collation = this
+                                    .recollated
+                                    .get(&table.column(column))
+                                    .and_then(Option::as_ref);
+                                let assigned = constant.and_then(|e| assigned_default(e, ty, collation));
+                                if constant.is_some() && assigned.is_none() {
+                                    moved
+                                        .unprobeable
+                                        .entry(column.clone())
+                                        .or_default()
+                                        .insert(key.clone());
+                                }
+                                assigned
                             }
                         };
                         updated.insert(column.clone(), sql);
@@ -407,7 +499,22 @@ impl AsStored {
                             if ty.is_none() {
                                 moved.untyped_defaults.entry(key.clone()).or_default().insert(column.clone());
                             }
-                            inserted.insert(column.clone(), assigned_default(expr, ty));
+                            let collation = this
+                                .recollated
+                                .get(&table.column(column))
+                                .and_then(Option::as_ref);
+                            match assigned_default(expr, ty, collation) {
+                                Some(sql) => {
+                                    inserted.insert(column.clone(), sql);
+                                }
+                                None => {
+                                    moved
+                                        .unprobeable
+                                        .entry(column.clone())
+                                        .or_default()
+                                        .insert(key.clone());
+                                }
+                            }
                         } else if !is_null_default(default) {
                             moved
                                 .unprobeable
@@ -2923,7 +3030,7 @@ mod tests {
     #[test]
     fn a_commented_default_keeps_the_typed_and_legacy_probe_closers() {
         for ty in [Some(ty("int")), None] {
-            let sql = assigned_default("7 -- reason", ty.as_ref());
+            let sql = assigned_default("7 -- reason", ty.as_ref(), None).unwrap();
             assert!(sql.contains("-- reason\n)"), "{sql}");
         }
         assert!(constant_default("NEWID() -- reason").is_none());
@@ -4229,10 +4336,43 @@ mod tests {
         );
         assert!(names.moved[&table].untyped_defaults.is_empty());
         assert_eq!(
-            assigned_default("1.25", Some(&ty("numeric(8,2)"))),
-            "CONVERT(decimal(8, 2), (1.25\n))"
+            assigned_default("1.25", Some(&ty("numeric(8,2)")), None).as_deref(),
+            Some("CONVERT(decimal(8, 2), (1.25\n))")
         );
-        assert_eq!(assigned_default("1.25", None), "(1.25\n)");
+        assert_eq!(
+            assigned_default("1.25", None, None).as_deref(),
+            Some("(1.25\n)")
+        );
+    }
+
+    /// A default is given the collation its column will have *before* it is
+    /// converted, since the conversion takes its input's code page (#1247
+    /// review); a type with no collation is converted bare, and a collation
+    /// that cannot be spelled assigns nothing rather than the wrong value.
+    #[test]
+    fn a_default_is_collated_before_it_is_converted() {
+        let utf8 = pbps_model::Collation::new("Latin1_General_100_CI_AS_SC_UTF8");
+        assert_eq!(
+            assigned_default("N'中'", Some(&ty("varchar(10)")), Some(&utf8)).as_deref(),
+            Some(
+                "CONVERT(varchar(10), CONVERT(nvarchar(max), (N'中'\n)) \
+                 COLLATE Latin1_General_100_CI_AS_SC_UTF8)"
+            )
+        );
+        // Negative: no collation, or a type that takes none, converts bare.
+        assert_eq!(
+            assigned_default("N'中'", Some(&ty("varchar(10)")), None).as_deref(),
+            Some("CONVERT(varchar(10), (N'中'\n))")
+        );
+        assert_eq!(
+            assigned_default("1", Some(&ty("int")), Some(&utf8)).as_deref(),
+            Some("CONVERT(int, (1\n))")
+        );
+        let bad = pbps_model::Collation::new("not a name");
+        assert_eq!(
+            assigned_default("N'x'", Some(&ty("varchar(10)")), Some(&bad)),
+            None
+        );
     }
 
     /// A foreign key is a tuple: an update that sets two of its columns is

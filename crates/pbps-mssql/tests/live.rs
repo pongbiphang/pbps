@@ -2588,6 +2588,163 @@ async fn a_literal_is_converted_under_the_utf8_column_it_is_compared_with() {
     assert_eq!(stored, 1);
 }
 
+/// A foreign key between two tables this plan creates is probed under the
+/// collation both declare, not the database's (#1247 review). On a
+/// case-sensitive database with case-insensitive key columns, a child `a`
+/// has its parent in `A`, as the created key will agree.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_key_between_created_tables_is_probed_under_their_declared_collation() {
+    use pbps_model::{DataMode, Row, RowKey, TableData, Value};
+    let mut db = TestDb::create_collated("coll_created", "Latin1_General_CS_AS").await;
+    let declare = |collation: Option<&str>| {
+        let column = || {
+            let mut c = Column::new(ty("varchar(10)")).not_null();
+            c.collation = collation.map(pbps_model::Collation::new);
+            c
+        };
+        let mut parent = Table::default();
+        parent.columns.insert("code".to_owned(), column());
+        parent.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["code".to_owned()],
+        });
+        parent.data = Some(TableData {
+            mode: DataMode::Exact,
+            rows: [(RowKey::from("A"), Row::default())].into_iter().collect(),
+        });
+        let mut child = Table::default();
+        child
+            .columns
+            .insert("id".to_owned(), Column::new(ty("int")).not_null());
+        child.columns.insert("code".to_owned(), column());
+        child.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".to_owned()],
+        });
+        child.foreign_keys.insert(
+            "fk_c_p".into(),
+            ForeignKey {
+                columns: vec!["code".into()],
+                references_table: TableName::new("dbo", "p"),
+                references_columns: vec!["code".into()],
+                on_delete: ReferentialAction::NoAction,
+                on_update: ReferentialAction::NoAction,
+            },
+        );
+        child.data = Some(TableData {
+            mode: DataMode::Exact,
+            rows: [(
+                RowKey::from("1"),
+                [("code".to_owned(), Value::Text("a".into()))]
+                    .into_iter()
+                    .collect::<Row>(),
+            )]
+            .into_iter()
+            .collect(),
+        });
+        let mut s = Schema::default();
+        s.tables.insert(TableName::new("dbo", "p"), parent);
+        s.tables.insert(TableName::new("dbo", "c"), child);
+        let ids = mint_ids(&s, &IdsFile::default(), &[]);
+        plan(&Schema::default(), &IdsFile::default(), &s, &ids)
+    };
+    let insensitive = declare(Some("Latin1_General_CI_AS"));
+    let counts = probe_counts(&mut db.conn, &insensitive).await;
+    // Negative: under the case-sensitive default, `a` has no parent.
+    let sensitive = probe_counts(&mut db.conn, &declare(None)).await;
+    let applied = try_apply(&mut db.conn, &insensitive).await;
+    db.drop().await;
+    let orphans = |counts: &[(String, i32)]| {
+        counts
+            .iter()
+            .find(|(d, _)| d.contains("fk_c_p"))
+            .unwrap_or_else(|| panic!("no probe for fk_c_p in {counts:?}"))
+            .1
+    };
+    assert_eq!(orphans(&counts), 0, "{counts:?}");
+    assert_eq!(orphans(&sensitive), 1, "{sensitive:?}");
+    applied.unwrap_or_else(|e| panic!("the engine refused the plan the probe passed: {e}"));
+}
+
+/// A default is assigned under the collation of the column it fills
+/// (#1247 review): a UTF-8 column added with `DEFAULT N'中'` backfills the row
+/// already in the table with `中`, which the new UTF-8 parent holds, where a
+/// conversion under the legacy default first would have made it `?`.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn an_added_column_s_default_is_assigned_under_its_collation() {
+    use pbps_model::{DataMode, Row, RowKey, TableData};
+    const UTF8: &str = "Latin1_General_100_CI_AS_SC_UTF8";
+    let mut db = TestDb::create_collated("coll_backfill", "SQL_Latin1_General_CP1_CI_AS").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.c (id int NOT NULL CONSTRAINT pk_c PRIMARY KEY);
+             INSERT dbo.c VALUES (1);",
+        )
+        .await
+        .expect("create");
+    let start = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    let ids = mint_ids(&start.schema, &IdsFile::default(), &[]);
+    let declare = |parent_key: &str| {
+        let mut declared = start.schema.clone();
+        let mut parent = Table::default();
+        let mut code = Column::new(ty("varchar(10)")).not_null();
+        code.collation = Some(pbps_model::Collation::new(UTF8));
+        parent.columns.insert("code".to_owned(), code);
+        parent.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["code".to_owned()],
+        });
+        parent.data = Some(TableData {
+            mode: DataMode::Exact,
+            rows: [(RowKey::from(parent_key), Row::default())]
+                .into_iter()
+                .collect(),
+        });
+        declared.tables.insert(TableName::new("dbo", "p"), parent);
+        let child = declared
+            .tables
+            .get_mut(&TableName::new("dbo", "c"))
+            .unwrap();
+        let mut reference = Column::new(ty("varchar(10)")).not_null();
+        reference.collation = Some(pbps_model::Collation::new(UTF8));
+        reference.default = Some("(N'中')".into());
+        child.columns.insert("code".to_owned(), reference);
+        child.foreign_keys.insert(
+            "fk_c_p".into(),
+            ForeignKey {
+                columns: vec!["code".into()],
+                references_table: TableName::new("dbo", "p"),
+                references_columns: vec!["code".into()],
+                on_delete: ReferentialAction::NoAction,
+                on_update: ReferentialAction::NoAction,
+            },
+        );
+        let declared_ids = mint_ids(&declared, &ids, &[]);
+        plan(&start.schema, &ids, &declared, &declared_ids)
+    };
+    let matching = declare("中");
+    let counts = probe_counts(&mut db.conn, &matching).await;
+    // Negative: a parent that does not hold the default leaves the row an
+    // orphan.
+    let missing = probe_counts(&mut db.conn, &declare("x")).await;
+    let applied = try_apply(&mut db.conn, &matching).await;
+    db.drop().await;
+    let orphans = |counts: &[(String, i32)]| {
+        counts
+            .iter()
+            .find(|(d, _)| d.contains("fk_c_p"))
+            .unwrap_or_else(|| panic!("no probe for fk_c_p in {counts:?}"))
+            .1
+    };
+    assert_eq!(orphans(&counts), 0, "{counts:?}");
+    assert_eq!(orphans(&missing), 1, "{missing:?}");
+    applied.unwrap_or_else(|e| panic!("the engine refused the plan the probe passed: {e}"));
+}
+
 /// A declared value in a UTF-8 `varchar` column on a database whose default
 /// is a legacy code page is spelled as the column stores it, not as the
 /// default would: `中` is not reported as misspelt (#1247 review).
