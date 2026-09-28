@@ -1104,10 +1104,10 @@ recorded state and expects drift.
 <a id="dec-1175-3"></a>
 
 **DEC-1175.3. State version 9 adds a column's collation and still reads 6 to
-8; plan version 12 turns 11 away.** An absent collation is the database
+8; plan version 13 turns 12 away.** An absent collation is the database
 default. That is what every column an older reader recorded was: a column
 under another collation was reported as a limitation (DECISIONS 443), and no
 recorder accepts a managed table carrying one. A state older than that report
-reads back as drift. A version 11 plan would restate every `ALTER COLUMN`
+reads back as drift. A version 12 plan would restate every `ALTER COLUMN`
 without a collation, which this build's emitter reads as the default, moving
 a collated column to it. So it is refused as stale.

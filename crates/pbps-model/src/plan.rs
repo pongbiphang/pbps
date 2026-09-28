@@ -592,7 +592,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 12);
+        assert_eq!(CURRENT_VERSION, 13);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads

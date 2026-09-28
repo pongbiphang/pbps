@@ -390,7 +390,7 @@ fn a_delayed_child_rename_does_not_lose_its_foreign_key_drop_dependency() {
     let changes = ChangeSet { changes: vec![
         PlannedChange::new(Change::RenameTable { uid: old_ids.table_uid(&old).unwrap().clone(), from: old.clone(), to: new.clone(), defaults: vec![] }),
         PlannedChange::new(Change::DropForeignKey { table: new.clone(), name: "fk".into() }),
-        PlannedChange::new(Change::AlterColumnType { uid: old_ids.column_uid(&parent.column("id")).unwrap().clone(), column: parent.column("id"), from: "int".parse::<ColumnType>().unwrap(), to: "text".parse().unwrap(), from_nullable: false, to_nullable: false }),
+        PlannedChange::new(Change::AlterColumnType { uid: old_ids.column_uid(&parent.column("id")).unwrap().clone(), column: parent.column("id"), from: "int".parse::<ColumnType>().unwrap(), to: "text".parse().unwrap(), from_nullable: false, to_nullable: false, from_collation: None, to_collation: None }),
         PlannedChange::new(Change::DropModule { id: routine.clone(), kind: ModuleKind::Function }),
         PlannedChange::new(Change::CreateModule { id: routine.clone(), module: Box::new(Module { kind: ModuleKind::Function, description: None, definition: "() RETURNS integer LANGUAGE SQL RETURN (SELECT count(*)::integer FROM app.u)".into() }) }),
     ] };
