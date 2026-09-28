@@ -530,7 +530,11 @@ pub async fn refuse_created_name_occupants(
             let (names, parents) = crate::deploy::object_reads(cs);
             let occupants =
                 pbps_mssql::catalog::object_name_occupants(conn, &names, &parents).await?;
-            crate::deploy::refuse_occupied_objects(cs, &occupants, label)
+            // Which of the plan's own names are one under the database's
+            // collation (#1215).
+            let candidates = crate::deploy::alike_candidates(cs, &names, &occupants);
+            let alike = pbps_mssql::catalog::object_names_alike(conn, &candidates).await?;
+            crate::deploy::refuse_occupied_objects_under(cs, &occupants, &alike, label)
         }
     }
 }

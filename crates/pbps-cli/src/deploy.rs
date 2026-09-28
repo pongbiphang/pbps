@@ -559,6 +559,48 @@ pub(crate) fn object_reads(cs: &pbps_model::ChangeSet) -> (Vec<TableName>, Vec<T
     (names, parents)
 }
 
+/// Every name the walk may hold that the collation question has to see
+/// (#1215): the names the plan reads (`object_reads`), the names the catalog
+/// found, each renamed table's new name, each module it creates (a rebuilt
+/// one too), and the destination of each occupant a cross-schema
+/// `RenameTable` carries. The walk moves a carried constraint into the new schema under
+/// its own name, so `archive.Ck_Name` arrives there without ever being read,
+/// and a later `archive.ck_name` must still meet it (review of #1240).
+// The complement is every change that moves no table between schemas.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub(crate) fn alike_candidates(
+    cs: &pbps_model::ChangeSet,
+    names: &[TableName],
+    occupants: &[pbps_mssql::catalog::NameOccupant],
+) -> Vec<TableName> {
+    use pbps_model::Change;
+    let mut out: Vec<TableName> = names.to_vec();
+    out.extend(occupants.iter().map(|o| o.name.clone()));
+    for p in &cs.changes {
+        // A renamed table's new name, which the plan uses without reading,
+        // and every module the plan creates, a rebuilt one included, which
+        // `created_object_names` leaves out of the read (review of #1240).
+        match &p.change {
+            Change::RenameTable { to, .. } => out.push(to.clone()),
+            Change::CreateModule { id, .. } => out.push(module_object(id)),
+            _ => {}
+        }
+        if let Change::RenameTable { from, to, .. } = &p.change
+            && from.schema != to.schema
+        {
+            out.extend(
+                occupants
+                    .iter()
+                    .filter(|o| o.parent.as_ref() == Some(from))
+                    .map(|o| TableName::new(to.schema.clone(), o.name.name.clone())),
+            );
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// One entry of a schema's `sys.objects` namespace while a plan is walked:
 /// read from the catalog, or put there by an earlier change of the plan.
 #[derive(Debug, Clone)]
@@ -592,11 +634,30 @@ struct Held {
 ///
 /// So a name freed before the `CREATE` runs is free, and a name something
 /// moves into first is taken, whatever order the changes that do it come in.
-// The complement is every change that touches no object name.
-#[allow(clippy::wildcard_enum_match_arm)]
+///
+/// The connected check calls [`refuse_occupied_objects_under`] with the
+/// database's answer on which names are one; this is that call with none,
+/// which is how a case-sensitive database answers.
+#[cfg(test)]
 pub(crate) fn refuse_occupied_objects(
     cs: &pbps_model::ChangeSet,
     occupants: &[pbps_mssql::catalog::NameOccupant],
+    label: &str,
+) -> anyhow::Result<()> {
+    refuse_occupied_objects_under(cs, occupants, &[], label)
+}
+
+/// [`refuse_occupied_objects`], with `alike`: the pairs of names the plan
+/// uses that the database reads as one name under its collation, as
+/// `catalog::object_names_alike` answers (#1215). Two names the plan itself
+/// adds have no catalog spelling to meet at, so without this `Ck_Name` and
+/// `ck_name` passed as two names and the second failed at apply.
+// The complement is every change that touches no object name.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub(crate) fn refuse_occupied_objects_under(
+    cs: &pbps_model::ChangeSet,
+    occupants: &[pbps_mssql::catalog::NameOccupant],
+    alike: &[(TableName, TableName)],
     label: &str,
 ) -> anyhow::Result<()> {
     use pbps_model::Change;
@@ -620,10 +681,18 @@ pub(crate) fn refuse_occupied_objects(
             });
         }
     }
+    // Each name the database reads as another points at the first spelling
+    // of it, so two names meet exactly when they point at the same one.
+    let mut first: BTreeMap<&TableName, &TableName> = BTreeMap::new();
+    for (earlier, later) in alike {
+        let root = *first.get(earlier).unwrap_or(&earlier);
+        first.insert(later, root);
+    }
+    let one = |name: &TableName| -> TableName { (*first.get(name).unwrap_or(&name)).clone() };
     let at = |held: &[Held], name: &TableName| {
         let spelled = catalog_spelling.get(name).copied();
         held.iter()
-            .position(|h| &h.name == name || Some(&h.name) == spelled)
+            .position(|h| &h.name == name || Some(&h.name) == spelled || one(&h.name) == one(name))
     };
     let default_of = |table: &TableName, column: &str| Held {
         name: in_schema(table, &generated(table, column)),
@@ -720,6 +789,20 @@ pub(crate) fn refuse_occupied_objects(
                             h.planned = true;
                         }
                     }
+                }
+                // The table itself holds its new name from here on, whether
+                // or not the read found it: a later change adding a name the
+                // database reads as the same one fails (review of #1240). Not
+                // claimed: whether the rename's own target is free is the
+                // ordering question #981 keeps, not this walk's.
+                if !held.iter().any(|h| &h.name == to) {
+                    held.push(Held {
+                        name: to.clone(),
+                        kind: "user table".into(),
+                        parent: None,
+                        column: None,
+                        planned: true,
+                    });
                 }
                 for column in defaults {
                     for old in left_under(from, column) {
@@ -7731,6 +7814,123 @@ mod tests {
             )),
             "{names:?}"
         );
+        // #1215: two checks the plan adds meet under the database's answer on
+        // which names are one; with no such answer they are two names.
+        let other = TableName::new("dbo", "other_t");
+        let check_on = |table: &TableName, name: &str| {
+            PlannedChange::new(Change::AddCheck {
+                table: table.clone(),
+                name: name.into(),
+                constraint: pbps_model::CheckConstraint {
+                    expression: "1 = 1".into(),
+                },
+            })
+        };
+        let both = plan(vec![check_on(&old, "Ck_Name"), check_on(&other, "ck_name")]);
+        let alike = [(
+            TableName::new("dbo", "Ck_Name"),
+            TableName::new("dbo", "ck_name"),
+        )];
+        let e = refuse_occupied_objects_under(&both, &[], &alike, "prod")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("this plan puts check constraint `dbo.Ck_Name`"),
+            "{e}"
+        );
+        refuse_occupied_objects_under(&both, &[], &[], "prod")
+            .expect("two names where the database reads them as two");
+
+        // A transfer's carried constraint is asked about under the name it
+        // arrives with in the new schema (review of #1240).
+        let carried = NameOccupant {
+            wanted: TableName::new("dbo", "Ck_Name"),
+            name: TableName::new("dbo", "Ck_Name"),
+            kind: "check constraint".into(),
+            parent: Some(old.clone()),
+            parent_column: None,
+        };
+        let transfer_old = plan(vec![PlannedChange::new(Change::RenameTable {
+            uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.old", 0),
+            from: old.clone(),
+            to: TableName::new("archive", "old"),
+            defaults: Vec::new(),
+        })]);
+        let candidates = alike_candidates(&transfer_old, &[], std::slice::from_ref(&carried));
+        assert!(
+            candidates.contains(&TableName::new("archive", "Ck_Name")),
+            "{candidates:?}"
+        );
+        assert!(
+            candidates.contains(&TableName::new("dbo", "Ck_Name")),
+            "{candidates:?}"
+        );
+        // A renamed table's new name is held and asked about too, so a later
+        // name the database reads as the same one meets it.
+        let into_ck = plan(vec![
+            PlannedChange::new(Change::RenameTable {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.old", 0),
+                from: old.clone(),
+                to: TableName::new("dbo", "Ck_Name"),
+                defaults: Vec::new(),
+            }),
+            check_on(&other, "ck_name"),
+        ]);
+        assert!(alike_candidates(&into_ck, &[], &[]).contains(&TableName::new("dbo", "Ck_Name")));
+        let e = refuse_occupied_objects_under(
+            &into_ck,
+            &[],
+            &[(
+                TableName::new("dbo", "Ck_Name"),
+                TableName::new("dbo", "ck_name"),
+            )],
+            "prod",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("this plan puts user table `dbo.Ck_Name`"), "{e}");
+        refuse_occupied_objects_under(&into_ck, &[], &[], "prod")
+            .expect("two names where the database reads them as two");
+        // A rebuilt module is a name the plan creates too, though the read
+        // leaves it out: it is asked about all the same.
+        let rebuilt_view = ModuleId::Named(TableName::new("dbo", "Ck_Name"));
+        let rebuild_view = plan(vec![
+            PlannedChange::new(Change::DropModule {
+                id: rebuilt_view.clone(),
+                kind: pbps_model::ModuleKind::View,
+            }),
+            PlannedChange::new(Change::CreateModule {
+                id: rebuilt_view,
+                module: Box::new(pbps_model::Module {
+                    kind: pbps_model::ModuleKind::View,
+                    description: None,
+                    definition: "CREATE VIEW dbo.Ck_Name AS SELECT 1 AS x".into(),
+                }),
+            }),
+        ]);
+        assert!(
+            alike_candidates(&rebuild_view, &[], &[]).contains(&TableName::new("dbo", "Ck_Name")),
+            "a rebuilt module is a candidate"
+        );
+        // And the walk meets it there under the database's answer.
+        let archive_other = TableName::new("archive", "other");
+        let mut carried_then_added = transfer_old.clone();
+        carried_then_added
+            .changes
+            .push(check_on(&archive_other, "ck_name"));
+        let e = refuse_occupied_objects_under(
+            &carried_then_added,
+            std::slice::from_ref(&carried),
+            &[(
+                TableName::new("archive", "Ck_Name"),
+                TableName::new("archive", "ck_name"),
+            )],
+            "prod",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("`archive.ck_name`"), "{e}");
+
         // #1214: every name the walk claims for an addition is read too, so
         // one already held in the database is found.
         let cs = plan(vec![

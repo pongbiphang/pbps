@@ -2199,6 +2199,77 @@ fn a_clustered_layout_round_trips_and_moves_through_the_cli() {
     assert!(!said.contains("dbo.p"), "{said}");
 }
 
+/// #1215: two names the plan adds are compared the way the database compares
+/// them. `Ck_Name` on one table and `ck_name` on another are two names to
+/// `validate`, which compares exactly, and one `sys.objects` name under a
+/// case-insensitive collation, where the second `ADD CONSTRAINT` used to fail
+/// at apply with Msg 2714. `plan --db` refuses that pair on such a database.
+/// On a case-sensitive database they are two names, and the same plan plans
+/// and applies.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn two_added_checks_one_name_under_the_collation_refuse_the_plan() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let run = |case: &str, collation: Option<&str>| {
+        let own = OwnDatabase::new(&server, &format!("planned_alike_{case}"));
+        let connection = own.connection().to_owned();
+        if let Some(collation) = collation {
+            on_server(
+                &connection,
+                &format!("ALTER DATABASE CURRENT COLLATE {collation};"),
+            );
+        }
+        on_server(
+            &connection,
+            "CREATE TABLE dbo.t (id int NOT NULL); CREATE TABLE dbo.u (id int NOT NULL);",
+        );
+        let d = Demo::new(&format!("planned-alike-{case}"));
+        let o = d.run(&["pull", "--db", &connection]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        d.commit();
+        let o = d.run(&["baseline", "--db", &connection, "--reason", "adopt"]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        for (table, check) in [("t", "Ck_Name"), ("u", "ck_name")] {
+            std::fs::write(
+                d.dir.join(format!("schema/dbo.{table}.yml")),
+                format!(
+                    "table: dbo.{table}\ncolumns:\n  id: {{type: int, nullable: false}}\n\
+                     checks:\n  {check}: id > 0\n"
+                ),
+            )
+            .unwrap();
+        }
+        let o = d.run(&["plan"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        d.commit();
+        let plan = d.dir.join("plan.json");
+        let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+        (own, d, plan, o)
+    };
+
+    let (_own, _d, plan, o) = run("ci", None);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    let err = stderr(&o);
+    assert!(err.contains("this plan puts check constraint"), "{err}");
+    assert!(!plan.exists(), "a refused plan wrote {}", plan.display());
+
+    let (own, d, plan, o) = run("cs", Some("Latin1_General_100_CS_AS"));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let checksum = plan_checksum(&plan);
+    let o = d.run(&[
+        "apply",
+        "--db",
+        own.connection(),
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+        "--allow",
+        "constraint",
+    ]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+}
+
 /// A sequence or a synonym already at the name of a table this plan creates
 /// refuses the plan by name, and no plan is written (#1077). SQL Server keeps
 /// tables, views, routines, sequences, synonyms and constraints in one
