@@ -592,11 +592,30 @@ struct Held {
 ///
 /// So a name freed before the `CREATE` runs is free, and a name something
 /// moves into first is taken, whatever order the changes that do it come in.
-// The complement is every change that touches no object name.
-#[allow(clippy::wildcard_enum_match_arm)]
+///
+/// The connected check calls [`refuse_occupied_objects_under`] with the
+/// database's answer on which names are one; this is that call with none,
+/// which is how a case-sensitive database answers.
+#[cfg(test)]
 pub(crate) fn refuse_occupied_objects(
     cs: &pbps_model::ChangeSet,
     occupants: &[pbps_mssql::catalog::NameOccupant],
+    label: &str,
+) -> anyhow::Result<()> {
+    refuse_occupied_objects_under(cs, occupants, &[], label)
+}
+
+/// [`refuse_occupied_objects`], with `alike`: the pairs of names the plan
+/// uses that the database reads as one name under its collation, as
+/// `catalog::object_names_alike` answers (#1215). Two names the plan itself
+/// adds have no catalog spelling to meet at, so without this `Ck_Name` and
+/// `ck_name` passed as two names and the second failed at apply.
+// The complement is every change that touches no object name.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub(crate) fn refuse_occupied_objects_under(
+    cs: &pbps_model::ChangeSet,
+    occupants: &[pbps_mssql::catalog::NameOccupant],
+    alike: &[(TableName, TableName)],
     label: &str,
 ) -> anyhow::Result<()> {
     use pbps_model::Change;
@@ -620,10 +639,18 @@ pub(crate) fn refuse_occupied_objects(
             });
         }
     }
+    // Each name the database reads as another points at the first spelling
+    // of it, so two names meet exactly when they point at the same one.
+    let mut first: BTreeMap<&TableName, &TableName> = BTreeMap::new();
+    for (earlier, later) in alike {
+        let root = *first.get(earlier).unwrap_or(&earlier);
+        first.insert(later, root);
+    }
+    let one = |name: &TableName| -> TableName { (*first.get(name).unwrap_or(&name)).clone() };
     let at = |held: &[Held], name: &TableName| {
         let spelled = catalog_spelling.get(name).copied();
         held.iter()
-            .position(|h| &h.name == name || Some(&h.name) == spelled)
+            .position(|h| &h.name == name || Some(&h.name) == spelled || one(&h.name) == one(name))
     };
     let default_of = |table: &TableName, column: &str| Held {
         name: in_schema(table, &generated(table, column)),
@@ -7731,6 +7758,33 @@ mod tests {
             )),
             "{names:?}"
         );
+        // #1215: two checks the plan adds meet under the database's answer on
+        // which names are one; with no such answer they are two names.
+        let other = TableName::new("dbo", "other_t");
+        let check_on = |table: &TableName, name: &str| {
+            PlannedChange::new(Change::AddCheck {
+                table: table.clone(),
+                name: name.into(),
+                constraint: pbps_model::CheckConstraint {
+                    expression: "1 = 1".into(),
+                },
+            })
+        };
+        let both = plan(vec![check_on(&old, "Ck_Name"), check_on(&other, "ck_name")]);
+        let alike = [(
+            TableName::new("dbo", "Ck_Name"),
+            TableName::new("dbo", "ck_name"),
+        )];
+        let e = refuse_occupied_objects_under(&both, &[], &alike, "prod")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("this plan puts check constraint `dbo.Ck_Name`"),
+            "{e}"
+        );
+        refuse_occupied_objects_under(&both, &[], &[], "prod")
+            .expect("two names where the database reads them as two");
+
         // #1214: every name the walk claims for an addition is read too, so
         // one already held in the database is found.
         let cs = plan(vec![

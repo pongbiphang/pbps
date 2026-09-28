@@ -775,6 +775,58 @@ pub async fn tables_reusing_a_column_name(
     Ok(found)
 }
 
+/// Among `names`, the pairs of schema-scoped objects the database reads as one
+/// `sys.objects` name: the same schema and the same name under its collation,
+/// such as `dbo.Ck_Name` and `dbo.ck_name` on a case-insensitive database.
+/// Each pair comes once, as `(earlier, later)` in the order given. The same
+/// question as [`names_alike`], with the schema taking part (#1215). A fold done
+/// in Rust would refuse a valid plan on a case-sensitive database, so it is
+/// the database that answers.
+pub async fn object_names_alike(
+    conn: &mut Conn,
+    names: &[TableName],
+) -> Result<Vec<(TableName, TableName)>, DbError> {
+    if names.len() < 2 {
+        return Ok(Vec::new());
+    }
+    let values = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            format!(
+                "({i}, {}, {})",
+                crate::ident::literal(&n.schema),
+                crate::ident::literal(&n.name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT a.i AS earlier, b.i AS later
+           FROM (VALUES {values}) AS a(i, schema_name, object_name)
+           JOIN (VALUES {values}) AS b(i, schema_name, object_name)
+             ON a.i < b.i
+            AND a.schema_name = b.schema_name COLLATE DATABASE_DEFAULT
+            AND a.object_name = b.object_name COLLATE DATABASE_DEFAULT
+          ORDER BY a.i, b.i;"
+    );
+    let mut out = Vec::new();
+    for row in conn.query(&sql).await? {
+        let index = |column: &str| -> Result<usize, DbError> {
+            let i = get::<i32>(&row, column)?;
+            usize::try_from(i)
+                .ok()
+                .filter(|i| *i < names.len())
+                .ok_or_else(|| DbError::BadRow(format!("an alike-name index out of range: {i}")))
+        };
+        out.push((
+            names[index("earlier")?].clone(),
+            names[index("later")?].clone(),
+        ));
+    }
+    Ok(out)
+}
+
 /// Among `names`, the pairs the database reads as one name — `Reader` and
 /// `reader` under a case-insensitive collation — each as `(earlier, later)`
 /// in the order given. A plan that creates both passes every check against
