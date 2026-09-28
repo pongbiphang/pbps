@@ -2667,6 +2667,70 @@ async fn a_key_between_created_tables_is_probed_under_their_declared_collation()
     applied.unwrap_or_else(|e| panic!("the engine refused the plan the probe passed: {e}"));
 }
 
+/// A column that changes type and keeps a named collation is probed under
+/// it (#1247 review): a UTF-8 `nvarchar` becoming a UTF-8 `varchar` holds the
+/// `中` a planned update writes, where a conversion under the legacy default
+/// makes it `?` and a collision with the stored `?`.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_retype_that_keeps_its_collation_is_probed_under_it() {
+    use pbps_model::{DataMode, Row, RowKey, TableData, Value};
+    const UTF8: &str = "Latin1_General_100_CI_AS_SC_UTF8";
+    let mut db = TestDb::create_collated("coll_kept", "SQL_Latin1_General_CP1_CI_AS").await;
+    db.conn
+        .execute(&format!(
+            "CREATE TABLE dbo.t (id int NOT NULL CONSTRAINT pk_t PRIMARY KEY,
+                                 n nvarchar(10) COLLATE {UTF8} NULL CONSTRAINT uq_t_n UNIQUE);
+             INSERT dbo.t VALUES (1, N'a'), (2, N'?');"
+        ))
+        .await
+        .expect("create");
+    let mut start = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect")
+        .schema;
+    let rows = |one: &str| TableData {
+        mode: DataMode::Exact,
+        rows: [("1", one), ("2", "?")]
+            .into_iter()
+            .map(|(k, n)| {
+                (
+                    RowKey::from(k),
+                    [("n".to_owned(), Value::Text(n.into()))]
+                        .into_iter()
+                        .collect::<Row>(),
+                )
+            })
+            .collect(),
+    };
+    let t = TableName::new("dbo", "t");
+    start.tables.get_mut(&t).unwrap().data = Some(rows("a"));
+    let ids = mint_ids(&start, &IdsFile::default(), &[]);
+    let declare = |one: &str| {
+        let mut declared = start.clone();
+        let table = declared.tables.get_mut(&t).unwrap();
+        table.columns.get_mut("n").unwrap().ty = ty("varchar(10)");
+        table.data = Some(rows(one));
+        plan(&start, &ids, &declared, &ids)
+    };
+    let kept = declare("中");
+    let counts = probe_counts(&mut db.conn, &kept).await;
+    // Negative: a planned `?` beside the stored one is a real collision.
+    let duplicate = probe_counts(&mut db.conn, &declare("?")).await;
+    let applied = try_apply(&mut db.conn, &kept).await;
+    db.drop().await;
+    let collisions = |counts: &[(String, i32)]| {
+        counts
+            .iter()
+            .find(|(d, _)| d.contains("uq_t_n"))
+            .unwrap_or_else(|| panic!("no probe for uq_t_n in {counts:?}"))
+            .1
+    };
+    assert_eq!(collisions(&counts), 0, "{counts:?}");
+    assert_eq!(collisions(&duplicate), 2, "{duplicate:?}");
+    applied.unwrap_or_else(|e| panic!("the engine refused the plan the probe passed: {e}"));
+}
+
 /// A default is assigned under the collation of the column it fills
 /// (#1247 review): a UTF-8 column added with `DEFAULT N'中'` backfills the row
 /// already in the table with `中`, which the new UTF-8 parent holds, where a

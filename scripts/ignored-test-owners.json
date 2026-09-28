@@ -1358,6 +1358,7 @@
         "a_refused_ledger_create_leaves_no_transaction_open",
         "a_renamed_and_a_reused_name_keep_their_own_distinct_demands",
         "a_renamed_tables_and_columns_generated_defaults_follow_them",
+        "a_retype_that_keeps_its_collation_is_probed_under_it",
         "a_retyped_column_gives_up_its_old_default_before_the_type_moves",
         "a_reused_column_name_is_found_by_the_databases_collation",
         "a_reused_name_collides_by_the_databases_collation_not_by_a_case_fold",

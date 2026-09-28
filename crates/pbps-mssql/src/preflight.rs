@@ -125,7 +125,8 @@ struct AsStored {
     added: BTreeMap<ColumnRef, Added>,
     /// Columns whose collation the probes must spell, and the one each will
     /// have (`None` being the database default): one this plan recollates,
-    /// and one it adds under a named collation. A key over either is built
+    /// one it retypes and keeps under a named collation, and one it adds or
+    /// creates under a named collation. A key over any of them is built
     /// after the column has it, and its values collide or not under that
     /// collation, not under the database default a probe's projected values
     /// otherwise carry (#1175, #1247 review).
@@ -335,7 +336,13 @@ impl AsStored {
                     // becomes is 447 (#1247 review).
                     let collated =
                         types::normalize(to).is_ok_and(|t| types::takes_collation(&t.base));
-                    if from_collation != to_collation && collated {
+                    // And a named collation the column *keeps* counts too
+                    // (#1247 review): a retype converts planned values into
+                    // the new type, and a UTF-8 `nvarchar` becoming a UTF-8
+                    // `varchar` holds `中` where a conversion under a legacy
+                    // default makes it `?`. Only "stays at the database
+                    // default" needs nothing: a literal already has it.
+                    if collated && (from_collation != to_collation || to_collation.is_some()) {
                         this.recollated.insert(column.clone(), to_collation.clone());
                     }
                 }
