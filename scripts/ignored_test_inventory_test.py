@@ -43,6 +43,25 @@ class Ownership(unittest.TestCase):
     def test_compiled_ignored_case_has_a_real_owner(self):
         self.assertEqual(self.check(), 1)
 
+    def test_ordinary_owners_cannot_hide_ignored_cases_on_their_execution_platform(self):
+        self.inventory["owners"]["live"]["ordinary"] = True
+        self.workflow.write_text(WORKFLOW.replace(
+            "cargo test -p demo --lib -- --ignored", "cargo test --workspace --all-targets"))
+        for platform in ("linux", "win32", "darwin"):
+            with self.subTest(platform=platform):
+                with self.assertRaisesRegex(audit.InventoryError, "ordinary runner skips ignored"):
+                    self.check(platform)
+
+    def test_ordinary_owners_may_run_cases_ignored_only_on_another_platform(self):
+        self.inventory["owners"]["live"]["ordinary"] = True
+        self.inventory["groups"][0]["ignored_on"] = ["darwin"]
+        self.targets[KEY]["ignored"].clear()
+        self.workflow.write_text(WORKFLOW.replace(
+            "cargo test -p demo --lib -- --ignored", "cargo test --workspace --all-targets"))
+        for platform in ("linux", "win32"):
+            with self.subTest(platform=platform):
+                self.assertEqual(self.check(platform), 1)
+
     def test_new_case_is_refused_until_an_owner_is_registered(self):
         self.targets[KEY]["all"].add("orphan")
         self.targets[KEY]["ignored"].add("orphan")
