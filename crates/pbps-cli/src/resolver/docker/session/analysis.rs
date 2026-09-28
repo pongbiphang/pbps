@@ -740,6 +740,15 @@ impl CandidateSession {
         if !self.analysis_in_flight {
             return Err(failed(Error::Consumed, Vec::new()));
         }
+        // Pending scratch removal can fail before the owner containers are
+        // closed. Keep their names in the report from the first await onward,
+        // and clear each only after its close confirms removal.
+        if let Some(state) = self.state.as_ref() {
+            self.analysis_recovery.extend([
+                state.control.resource_name().to_owned(),
+                state.workload.resource_name().to_owned(),
+            ]);
+        }
         #[cfg(test)]
         crate::resolver::server::container_tests::pause("container-discard-owned").await;
         if let Some(state) = self.state.as_ref()
@@ -761,8 +770,6 @@ impl CandidateSession {
         if let Some(state) = self.state.take() {
             let control_name = state.control.resource_name().to_owned();
             let workload_name = state.workload.resource_name().to_owned();
-            self.analysis_recovery
-                .extend([control_name.clone(), workload_name.clone()]);
             drop(state.connection);
             if state.control.close().await.is_ok() {
                 self.analysis_recovery.retain(|name| name != &control_name);
