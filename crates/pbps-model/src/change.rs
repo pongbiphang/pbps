@@ -1219,8 +1219,9 @@ impl Change {
     /// first set for the second question, so the shape comparison read a
     /// plan's own `ALTER COLUMN ... NOT NULL` as somebody else's work and
     /// refused it. The catalog reads `is_nullable` back; the two questions
-    /// have different answers and now have different functions
-    /// (DECISIONS 170).
+    /// have different answers and now have different functions. DECISIONS 170
+    /// records the historical reason for that split; its account of set
+    /// membership predates the current [`ColumnField`] representation.
     ///
     /// This set includes the declaration-only [`ColumnField::Deprecated`]
     /// marker for exhaustiveness. Deprecation emits no statement and no
