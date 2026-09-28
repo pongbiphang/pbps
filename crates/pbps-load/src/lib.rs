@@ -601,6 +601,16 @@ indexes:
         );
         assert!(ix.columns[0].descending);
         assert_eq!(ix.columns[1].key, pbps_model::IndexKey::Column("id".into()));
+        // A text of what Rust calls whitespace is not refused here: a
+        // non-breaking space is an identifier character to PostgreSQL, and
+        // the dialect's lexis decides (DECISIONS 504).
+        let nbsp = load(
+            "table: app.t\ncolumns:\n  id: {type: integer}\nindexes:\n  ix:\n    keys:\n      - {expression: \"\u{a0}\"}\n",
+        );
+        assert_eq!(
+            nbsp.table.indexes["ix"].columns[0].key,
+            pbps_model::IndexKey::Expression("\u{a0}".into())
+        );
         let written = crate::render(&t.name, &t.table, &[], None);
         assert!(written.contains("    keys:\n"), "{written}");
         assert!(!written.contains("columns: ["), "{written}");
@@ -619,7 +629,7 @@ indexes:
                 "    keys:\n      - {order: desc}\n",
                 "a column or an expression",
             ),
-            ("    keys:\n      - {expression: \"  \"}\n", "empty"),
+            ("    keys:\n      - {expression: \"\"}\n", "empty"),
         ] {
             let e = errors(&format!(
                 "table: app.t\ncolumns:\n  id: {{type: integer}}\nindexes:\n  ix:\n{keys}"

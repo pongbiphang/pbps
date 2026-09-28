@@ -569,7 +569,10 @@ fn is_opclass_name(o: &str) -> bool {
 /// `{column: id}` or `{expression: "lower(email)"}`, each with optional
 /// `opclass:` and `order:`. An expression is kept verbatim, as a filter is:
 /// whether it is one the engine accepts is the dialect's and then the
-/// engine's question (DEC-1169.2); here it is only never empty.
+/// engine's question (DEC-1169.2); here it is only never the empty string.
+/// Not "blank" by Rust's whitespace class: PostgreSQL reads a non-breaking
+/// space as part of an identifier, so which texts hold no expression is the
+/// dialect's lexis to say (DECISIONS 504), and its validator asks it.
 fn parse_index_key(
     src: &SourceFile,
     v: &Spanned<crate::dto::IndexKeyDto>,
@@ -589,7 +592,7 @@ fn parse_index_key(
     let e = &v.value;
     let key = match (&e.column, &e.expression) {
         (Some(column), None) => pbps_model::IndexKey::Column(column.clone()),
-        (None, Some(expression)) if expression.trim().is_empty() => {
+        (None, Some(expression)) if expression.is_empty() => {
             return Err(bad("the expression is empty"));
         }
         (None, Some(expression)) => pbps_model::IndexKey::Expression(expression.clone()),

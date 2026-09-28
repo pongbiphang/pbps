@@ -864,6 +864,13 @@ mod tests {
             with_key(IndexMethod::Btree, " -- nothing", None),
             "empty key expression",
         );
+        // A non-breaking space is an identifier to this engine, not blank
+        // (DECISIONS 504): not refused as empty.
+        let nbsp = with_key(IndexMethod::Btree, "\u{a0}", None);
+        assert!(
+            !nbsp.iter().any(|m| m.contains("empty key expression")),
+            "{nbsp:?}"
+        );
         refused(
             with_key(
                 IndexMethod::Btree,
