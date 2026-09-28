@@ -24,7 +24,11 @@ to compile the workspace; a checkout that just ran its tests reuses those builds
 ## What an owner means
 
 Ordinary live targets are checked against their actual CI Cargo selectors,
-including target identity, exact/substring filtering and `--skip`. Dedicated
+including target identity, exact/substring filtering and `--skip`. Cargo's
+optional TESTNAME before `--` joins the libtest filters after it: any matching
+filter selects a case. Package, target and profile option values are not test
+names. Unsupported Cargo options, multiple TESTNAME arguments and ambiguous
+target selectors are refused rather than silently discarded. Dedicated
 Python fixtures have explicit selector data plus scheduling witnesses in the
 CI job and relevant Python functions. A nested Rust helper names its compiled
 parent and the command construction/launch in that parent's call chain. Rust

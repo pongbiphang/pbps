@@ -3,6 +3,8 @@
 
 import copy
 import json
+import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -97,6 +99,16 @@ class Ownership(unittest.TestCase):
             self.workflow.write_text(WORKFLOW.replace("--ignored", arguments))
             self.assertEqual(self.check(), 1)
 
+    def test_cargo_filter_cannot_claim_an_unexecuted_case(self):
+        for name in ("missing", "own"):
+            self.workflow.write_text(WORKFLOW.replace("--lib --", f"--lib {name} --")
+                                     .replace("--ignored", "--ignored --exact"))
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(audit.InventoryError, "no longer executes"):
+                    self.check()
+        self.workflow.write_text(WORKFLOW.replace("--lib --", "--lib owned --"))
+        self.assertEqual(self.check(), 1)
+
     def test_profile_and_named_multiline_steps_keep_the_same_selection(self):
         self.workflow.write_text(WORKFLOW.replace(
             "      - run: cargo test -p demo --lib -- --ignored",
@@ -190,6 +202,58 @@ class Ownership(unittest.TestCase):
         self.targets[KEY]["all"].remove("ordinary")
         with self.assertRaisesRegex(audit.InventoryError, "missing parent test"):
             self.check()
+
+
+class CargoSelectors(unittest.TestCase):
+    def test_ambiguous_or_unsupported_cargo_arguments_supply_no_owner(self):
+        for arguments in (["--profile"], ["--profile", "--lib"], ["--profile="],
+                          ["--package"], ["--test"], ["--bin"], ["--offline", "--offline"],
+                          ["--unknown", "owned"], ["--help"],
+                          ["owned", "other"], ["--test", "integration"],
+                          ["--package", "other"], ["--lib"], ["--profile", "a", "--profile", "b"]):
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(audit.InventoryError):
+                    audit.cargo_selection(["cargo", "test", "-p", "demo", "--lib",
+                                           *arguments, "--", "--ignored"])
+        self.assertIsNone(audit.cargo_selection(
+            ["cargo", "test", "-p", "demo", "--lib", "owned", "--no-run", "--", "--ignored"]))
+
+    def test_supported_cargo_filters_agree_with_actual_executed_cases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            (root / "Cargo.toml").write_text(
+                '[package]\nname="demo"\nversion="0.0.0"\nedition="2021"\n'
+                '[profile.live-test]\ninherits="test"\n', encoding="utf-8")
+            (root / "src/lib.rs").write_text(
+                '#[test] #[ignore] fn owned() {}\n#[test] #[ignore] fn other() {}\n', encoding="utf-8")
+            environment = dict(os.environ, CARGO_TARGET_DIR=str(root / "target"))
+            cases = [
+                (["missing"], ["--ignored"], set()),
+                (["owned"], ["--ignored"], {"owned"}),
+                (["own"], ["--ignored"], {"owned"}),
+                (["own"], ["--ignored", "--exact"], set()),
+                (["owned"], ["--ignored", "--exact"], {"owned"}),
+                (["missing"], ["--ignored", "owned"], {"owned"}),
+                (["owned"], ["--ignored", "other"], {"owned", "other"}),
+                (["owned"], ["--ignored", "--exact", "other"], {"owned", "other"}),
+                (["owned"], ["--ignored", "--skip", "owned"], set()),
+                (["owned"], ["--ignored", "--exact", "--skip", "owned"], set()),
+                (["--profile", "live-test"], ["--ignored"], {"owned", "other"}),
+                (["--profile", "live-test", "owned"], ["--ignored"], {"owned"}),
+                (["--profile=live-test", "owned"], ["--ignored"], {"owned"}),
+            ]
+            for before, after, expected in cases:
+                with self.subTest(before=before, after=after):
+                    command = ["cargo", "test", "--offline", "-p", "demo", "--lib",
+                               *before, "--", *after]
+                    result = subprocess.run(command, cwd=root, env=environment, check=True,
+                                            capture_output=True, text=True, timeout=120)
+                    actual = set(re.findall(r"^test (\w+) \.\.\. ok$", result.stdout, re.M))
+                    self.assertEqual(actual, expected, result.stdout + result.stderr)
+                    selection = audit.cargo_selection(command)
+                    self.assertEqual({name for name in ("owned", "other")
+                                      if audit.selects(selection, KEY, name)}, actual)
 
 
 class SourceWitnesses(unittest.TestCase):
