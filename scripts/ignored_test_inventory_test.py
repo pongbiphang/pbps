@@ -177,6 +177,52 @@ class Ownership(unittest.TestCase):
         script.write_text('TESTS = ["removed"]\nTESTS = ["owned"]\n')
         self.assertEqual(self.check(), 1)
 
+    def test_unsupported_assignments_cannot_escape_mutable_selector_aliases(self):
+        mutations = [
+            'BOX = []\nBOX += [TESTS]\nBOX[0].clear()',
+            'BOX = list()\nBOX += [TESTS]\nBOX[0].clear()',
+            'if (ALIAS := TESTS): pass\nALIAS.clear()',
+            'for _ in [0]: ALIAS = TESTS\nALIAS.clear()',
+            'try: ALIAS = TESTS\nfinally: pass\nALIAS.clear()',
+            'if True: ALIAS: list = TESTS\nALIAS.clear()',
+            'if True: BOX = {"nested": TESTS}\nBOX["nested"].clear()',
+            'if True: ALIAS = SECOND = TESTS\nSECOND.clear()',
+        ]
+        self.inventory["owners"]["live"]["selection"] = {
+            "kind": "data", "file": "runner.py", "expression": "TESTS"}
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                source = 'TESTS = ["owned"]\n' + mutation + '\n'
+                # Observe real execution separately: adding print(TESTS) to
+                # the analyzed fixture would itself look like an escape.
+                actual = subprocess.run([sys.executable, "-c", source + 'print(TESTS)'],
+                                        check=True, capture_output=True, text=True, timeout=10)
+                self.assertEqual(actual.stdout, "[]\n")
+                (self.root / "runner.py").write_text(source, encoding="utf-8")
+                with self.assertRaises(audit.InventoryError):
+                    self.check()
+
+    def test_supported_copies_and_immutable_rhs_preserve_selectors(self):
+        controls = [
+            'ALIAS = TESTS',
+            'COPY = TESTS + []\nBOX = []\nBOX += [COPY]\nBOX[0].clear()',
+            'COPY = [name for name in TESTS]\nif True: ALIAS = COPY\nALIAS.clear()',
+            'LABEL = "owned"\nBOX = []\nBOX += [LABEL]\nBOX.clear()\nTESTS = [LABEL]',
+            'LABEL = "owned"\nif (ALIAS := LABEL): pass\nTESTS = [LABEL]',
+            'def unused():\n    ALIAS = TESTS\n    ALIAS.clear()',
+            'class Local:\n    TESTS = []\n    ALIAS = TESTS\n    ALIAS.clear()',
+        ]
+        self.inventory["owners"]["live"]["selection"] = {
+            "kind": "data", "file": "runner.py", "expression": "TESTS"}
+        for control in controls:
+            with self.subTest(control=control):
+                source = 'TESTS = ["owned"]\n' + control + '\n'
+                actual = subprocess.run([sys.executable, "-c", source + 'print(TESTS)'],
+                                        check=True, capture_output=True, text=True, timeout=10)
+                self.assertEqual(actual.stdout, "['owned']\n")
+                (self.root / "runner.py").write_text(source, encoding="utf-8")
+                self.assertEqual(self.check(), 1)
+
     def test_duplicate_and_cyclic_owners_are_refused(self):
         self.inventory["groups"].append(copy.deepcopy(self.inventory["groups"][0]))
         with self.assertRaisesRegex(audit.InventoryError, "duplicate case"):
