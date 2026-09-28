@@ -274,16 +274,8 @@ pub fn cmd_explain(
 fn read_plan(path: &std::path::Path) -> anyhow::Result<SavedPlan> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read the plan `{}`", path.display()))?;
-    let plan: SavedPlan = serde_json::from_str(&raw)
-        .with_context(|| format!("`{}` is not a pbps plan", path.display()))?;
-    if plan.version != pbps_model::plan::CURRENT_VERSION {
-        anyhow::bail!(
-            "`{}` is a version {} plan and this tool understands version {}",
-            path.display(),
-            plan.version,
-            pbps_model::plan::CURRENT_VERSION
-        );
-    }
+    let plan = crate::saved_plan::decode(&raw, path)?;
+    crate::saved_plan::require_current(plan.version, path)?;
     crate::engine::validate_plan_analysis(&plan)?;
     Ok(plan)
 }

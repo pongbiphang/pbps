@@ -19,6 +19,7 @@ mod output;
 mod pins;
 mod prompt;
 mod report;
+mod saved_plan;
 mod state_list;
 mod status;
 #[cfg(test)]

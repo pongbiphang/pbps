@@ -221,6 +221,74 @@ fn malformed_or_unsupported_resolver_evidence_is_refused_before_presentation() {
 }
 
 #[test]
+fn current_resolver_artifacts_cannot_bypass_required_evidence_on_apply() {
+    let plan = resolved_plan();
+    let valid = serde_json::to_value(&plan).unwrap();
+    let mut missing = valid.clone();
+    missing.as_object_mut().unwrap().remove("analysis");
+    let mut cases = vec![missing];
+    for (path, replacement) in [
+        ("/analysis", serde_json::json!({"kind": "ordinary"})),
+        ("/analysis/evidence/version", serde_json::json!(99)),
+        (
+            "/analysis/evidence/before/adapter",
+            serde_json::json!("postgres-catalog-inputs-v99"),
+        ),
+        (
+            "/analysis/evidence/qualification/runtime/profile",
+            serde_json::json!("linux-dedicated-v99"),
+        ),
+    ] {
+        let mut value = valid.clone();
+        *value.pointer_mut(path).unwrap() = replacement;
+        cases.push(value);
+    }
+    for value in cases {
+        // If the wire shape is readable, supply its own checksum so a checksum
+        // refusal cannot conceal a missing evidence/provenance validation.
+        let checksum = serde_json::from_value::<SavedPlan>(value.clone())
+            .map(|p| p.checksum())
+            .unwrap_or_else(|_| plan.checksum());
+        let artifact = Artifact::new(&value);
+        std::fs::write(artifact.0.join("pbps.yml"), "dialect: postgres\n").unwrap();
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let connection = format!(
+            "postgres://unused@{}/unused?sslmode=disable",
+            target.local_addr().unwrap()
+        );
+        let out = Command::new(env!("CARGO_BIN_EXE_pbps"))
+            .current_dir(&artifact.0)
+            .args([
+                "apply",
+                "--plan",
+                "plan.json",
+                "--db",
+                &connection,
+                "--checksum",
+                &checksum,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !error.contains("no longer matches the artifact approved"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("cannot yet enforce resolver pre/postconditions"),
+            "invalid evidence must fail validation before the capability refusal: {error}"
+        );
+        assert!(!error.is_empty(), "{out:?}");
+        assert_eq!(
+            target.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+}
+
+#[test]
 fn unsupported_resolver_apply_still_refuses_before_contacting_the_target() {
     let plan = resolved_plan();
     let artifact = Artifact::new(&serde_json::to_value(&plan).unwrap());

@@ -5352,8 +5352,7 @@ pub fn cmd_apply(
     // artifact against this environment, and the hook sees all of them.
     let raw = std::fs::read_to_string(plan_path)
         .with_context(|| format!("cannot read `{}`", plan_path.display()))?;
-    let plan: pbps_model::SavedPlan = serde_json::from_str(&raw)
-        .with_context(|| format!("`{}` is not a pbps plan", plan_path.display()))?;
+    let plan = crate::saved_plan::decode(&raw, plan_path)?;
     let plan_checksum = plan.checksum();
 
     let attempt = apply_identified(
@@ -5451,14 +5450,7 @@ fn apply_identified(
         resume,
     } = *request;
 
-    if plan.version != pbps_model::plan::CURRENT_VERSION {
-        bail!(
-            "`{}` is a version {} plan and this tool understands version {}",
-            plan_path.display(),
-            plan.version,
-            pbps_model::plan::CURRENT_VERSION
-        );
-    }
+    crate::saved_plan::require_current(plan.version, plan_path)?;
     if plan_checksum != approved_checksum {
         bail!(
             "`{}` no longer matches the artifact approved at the deployment gate.\n\
