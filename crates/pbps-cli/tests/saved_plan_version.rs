@@ -64,6 +64,62 @@ fn refused(out: &Output) -> String {
     format!("{stdout}{}", String::from_utf8_lossy(&out.stderr))
 }
 
+fn assert_non_plan_artifact(name: &str, raw: &str, version: u32) {
+    let mut wrong_diagnostics = Vec::new();
+    for command in ["text", "json", "apply"] {
+        let out = Artifact::new(raw).run(command, &"00".repeat(32));
+        let diagnostic = refused(&out);
+        let misleading = [
+            format!("version {version} plan"),
+            "understands version".to_owned(),
+            "pbps plan --db".to_owned(),
+            "approval".to_owned(),
+        ];
+        if !diagnostic.contains("not a pbps plan")
+            || misleading.iter().any(|phrase| diagnostic.contains(phrase))
+        {
+            wrong_diagnostics.push(format!("{command}: {diagnostic}"));
+        }
+        if command == "json" {
+            let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(report["command"], "explain", "{name}: {report}");
+            assert_eq!(
+                report["findings"][0]["id"], "plan.unreadable",
+                "{name}: {report}"
+            );
+        }
+    }
+    assert!(
+        wrong_diagnostics.is_empty(),
+        "{name}: {}",
+        wrong_diagnostics.join("\n")
+    );
+}
+
+#[test]
+fn serialized_identity_file_is_not_diagnosed_as_an_old_plan() {
+    let ids = serde_json::to_string_pretty(&IdsFile::default()).unwrap();
+    let ids_value: serde_json::Value = serde_json::from_str(&ids).unwrap();
+    assert_eq!(ids_value["version"], 1);
+    assert_eq!(ids_value["tables"], serde_json::json!({}));
+    assert_eq!(ids_value["columns"], serde_json::json!({}));
+    assert_non_plan_artifact("serialized identity file", &ids, 1);
+}
+
+#[test]
+fn unrelated_future_versioned_json_is_not_diagnosed_as_a_plan() {
+    assert_non_plan_artifact(
+        "unrelated versioned document",
+        r#"{"version":999,"payload":{"kind":"report"}}"#,
+        999,
+    );
+}
+
+#[test]
+fn bare_version_object_is_not_diagnosed_as_a_plan() {
+    assert_non_plan_artifact("bare version", r#"{"version":1}"#, 1);
+}
+
 #[test]
 fn old_wire_shape_names_the_version_and_replan_remedy_before_any_target_contact() {
     let fixture: serde_json::Value = serde_json::from_str(V11).unwrap();
