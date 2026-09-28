@@ -562,14 +562,42 @@ def cargo_selection(command):
     if command[:2] != ["cargo", "test"] or "--" not in command: return None
     split = command.index("--"); build, args = command[2:split], command[split + 1:]
     if "--no-run" in build: return None
-    def option(name):
-        return build[build.index(name) + 1] if name in build else None
-    package = option("-p") or option("--package")
-    if "--lib" in build: kind, target = "lib", package.replace("-", "_") if package else None
-    elif option("--test"): kind, target = "test", option("--test")
-    elif option("--bin"): kind, target = "bin", option("--bin")
-    else: return None
-    exact, filters, skips, ignored = False, [], [], False
+    # Cargo forwards its optional TESTNAME to libtest alongside the arguments
+    # after `--`. Consume known option values first so they cannot become names.
+    options, filters, targets = {}, [], []
+    value_options = {"-p": "package", "--package": "package", "--profile": "profile",
+                     "--test": "test", "--bin": "bin"}
+    flags = {"--offline", "--locked", "--frozen"}
+    seen_flags = set()
+    i = 0
+    while i < len(build):
+        arg = build[i]
+        name, equals, value = arg.partition("=") if arg.startswith("--") else (arg, "", "")
+        if name in value_options:
+            key = value_options[name]
+            require(key not in options, f"repeated Cargo selector option: {name}")
+            if not equals:
+                i += 1
+                require(i < len(build), f"missing Cargo option value: {name}")
+                value = build[i]
+            require(value and not value.startswith("-"), f"missing Cargo option value: {name}")
+            options[key] = value
+            if key in ("test", "bin"): targets.append((key, value))
+        elif arg == "--lib": targets.append(("lib", None))
+        elif arg in flags:
+            require(arg not in seen_flags, f"repeated Cargo selector option: {arg}")
+            seen_flags.add(arg)
+        elif arg.startswith("-"): raise InventoryError(f"unrecognized Cargo selector option: {arg}")
+        else:
+            require(not filters, "multiple Cargo TESTNAME arguments")
+            filters.append(arg)
+        i += 1
+    require(len(targets) <= 1, "multiple Cargo target selectors")
+    package = options.get("package")
+    if not package or not targets: return None
+    kind, target = targets[0]
+    if kind == "lib": target = package.replace("-", "_")
+    exact, skips, ignored = False, [], False
     i = 0
     while i < len(args):
         arg = args[i]
