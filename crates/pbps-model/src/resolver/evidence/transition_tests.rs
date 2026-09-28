@@ -1,6 +1,18 @@
 use super::*;
-use crate::resolver::{ObjectIdentity, Surface};
+use crate::resolver::{ObjectIdentity, ObjectOwnership, Surface};
 use crate::{ModuleKind, PlannedChange, TableName};
+
+fn own(manifest: &mut InputManifest, object: &ObjectIdentity, owner: Surface) {
+    let mut json = serde_json::to_value(&*manifest).unwrap();
+    let record = json["prerequisites"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|p| p["object"] == serde_json::to_value(object).unwrap())
+        .unwrap();
+    record["ownership"] = serde_json::to_value(ObjectOwnership::Surface(owner)).unwrap();
+    *manifest = serde_json::from_value(json).unwrap();
+}
 
 // The model treats catalog addresses as opaque adapter-owned identities. Reuse
 // one fixture record to check every typed surface without inventing engine SQL.
@@ -18,7 +30,9 @@ fn drop_fixture(change: Change, surface: Surface) -> (ChangeSet, ResolverEvidenc
     observation.surface = surface.clone();
     let transition = &mut evidence.transitions[0];
     std::mem::swap(&mut transition.before, &mut transition.after);
-    transition.surface = surface;
+    transition.surface = surface.clone();
+    let object = transition.before.iter().next().unwrap().clone();
+    own(&mut evidence.before, &object, surface);
     // Compilation's external hash differs from the target. Projection must
     // preserve the target's untouched record, even on an otherwise empty drop.
     evidence.after = evidence
@@ -239,7 +253,12 @@ fn renamed_surfaces_can_share_one_transition_between_their_old_and_new_names() {
     let mut compiled = serde_json::to_value(&evidence.before).unwrap();
     compiled["prerequisites"][0]["object"] = serde_json::to_value(&desired.object).unwrap();
     compiled["membership"][0]["members"][0] = serde_json::to_value(&desired.object).unwrap();
-    let compiled = serde_json::from_value(compiled).unwrap();
+    let mut compiled = serde_json::from_value(compiled).unwrap();
+    own(
+        &mut compiled,
+        &desired.object,
+        Surface::Table("app.w".parse().unwrap()),
+    );
     evidence.surfaces.push(SurfaceResolution {
         surface: Surface::Table("app.w".parse().unwrap()),
         current: None,
@@ -288,9 +307,15 @@ fn a_dropped_view_can_be_replaced_by_a_table_at_the_same_logical_address() {
             after: BTreeSet::from([desired.object]),
         },
     );
+    let mut compiled = evidence.before.clone();
+    own(
+        &mut compiled,
+        &evidence.transitions[0].after.iter().next().unwrap().clone(),
+        Surface::Table("app.v".parse().unwrap()),
+    );
     evidence.after = evidence
         .before
-        .project(&changes, &evidence.before, &evidence.transitions)
+        .project(&changes, &compiled, &evidence.transitions)
         .unwrap();
     evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
     evidence.validate(&changes).unwrap();
@@ -370,6 +395,11 @@ fn owner_coverage(change: Change, owner: Surface, child: Surface, creating: bool
         if !records.iter().any(|p| &p.object == object) {
             records.push(Prerequisite {
                 object: object.clone(),
+                ownership: ObjectOwnership::Surface(if object == &owner_object {
+                    owner.clone()
+                } else {
+                    child.clone()
+                }),
                 canonicalization: "fixture-v1".into(),
                 properties: "dd".repeat(32),
                 bindings: vec![],
@@ -604,7 +634,9 @@ fn rename_endpoints(column: bool) {
     if !column {
         compiled["membership"][0]["members"][0] = serde_json::to_value(&new_object).unwrap();
     }
-    let compiled: InputManifest = serde_json::from_value(compiled).unwrap();
+    let mut compiled: InputManifest = serde_json::from_value(compiled).unwrap();
+    own(&mut evidence.before, &old_object, from.clone());
+    own(&mut compiled, &new_object, to.clone());
     // Plain tables and columns need not occur in a binding-surface inventory.
     evidence.surfaces.clear();
     evidence.transitions = vec![ObjectTransition {
@@ -707,4 +739,154 @@ fn plain_table_renames_require_opening_and_closing_inventories() {
 #[test]
 fn plain_column_renames_require_opening_and_closing_inventories() {
     rename_endpoints(true);
+}
+
+#[test]
+fn transitions_cannot_rewrite_an_unrelated_prerequisite() {
+    let plan = super::tests::plan();
+    let PlanAnalysis::Resolved(mut evidence) = plan.analysis else {
+        panic!("resolved")
+    };
+    let external = evidence.before.prerequisites()[0].object.clone();
+    let mut compiled = serde_json::to_value(&evidence.after).unwrap();
+    let external_record = compiled["prerequisites"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|p| p["object"] == serde_json::to_value(&external).unwrap())
+        .unwrap();
+    external_record["properties"] = serde_json::json!("aa".repeat(32));
+    let compiled: InputManifest = serde_json::from_value(compiled).unwrap();
+    evidence.transitions[0].before.insert(external.clone());
+    evidence.transitions[0].after.insert(external);
+    // The retained target record has a different fingerprint from scratch.
+    // Claiming it under the changed view must never authorize replacing it.
+    let projected = evidence
+        .before
+        .project(&plan.changes, &compiled, &evidence.transitions);
+    assert!(
+        projected.is_err(),
+        "projection accepted an unrelated prerequisite"
+    );
+    assert!(
+        ResolverEvidence::new(
+            &plan.changes,
+            evidence.qualification.clone(),
+            evidence.authorization.clone(),
+            evidence.before.clone(),
+            &compiled,
+            evidence.surfaces.clone(),
+            evidence.transitions.clone(),
+            evidence.ordering.clone(),
+        )
+        .is_err(),
+        "constructor accepted an unrelated prerequisite"
+    );
+    evidence.after = compiled;
+    let decoded: ResolverEvidence =
+        serde_json::from_value(serde_json::to_value(evidence).unwrap()).unwrap();
+    assert!(
+        decoded.validate(&plan.changes).is_err(),
+        "reader accepted an unrelated prerequisite"
+    );
+}
+
+fn assert_projection_refuses(changes: &ChangeSet, evidence: ResolverEvidence) {
+    assert!(
+        evidence
+            .before
+            .project(changes, &evidence.after, &evidence.transitions)
+            .is_err(),
+        "projection accepted unqualified or unrelated ownership"
+    );
+    assert!(
+        ResolverEvidence::new(
+            changes,
+            evidence.qualification.clone(),
+            evidence.authorization.clone(),
+            evidence.before.clone(),
+            &evidence.after,
+            evidence.surfaces.clone(),
+            evidence.transitions.clone(),
+            evidence.ordering.clone()
+        )
+        .is_err(),
+        "constructor accepted unqualified or unrelated ownership"
+    );
+    let decoded: ResolverEvidence =
+        serde_json::from_value(serde_json::to_value(evidence).unwrap()).unwrap();
+    assert!(
+        decoded.validate(changes).is_err(),
+        "reader accepted unqualified or unrelated ownership"
+    );
+}
+
+#[test]
+fn opening_inventory_requires_its_own_qualified_ownership() {
+    let (change, surface) = dropped_surfaces().remove(0);
+    let (changes, evidence) = drop_fixture(change, surface);
+    for ownership in [
+        ObjectOwnership::Unqualified,
+        ObjectOwnership::Surface(Surface::Module("other.v".parse().unwrap())),
+    ] {
+        let mut wrong = evidence.clone();
+        let mut before = serde_json::to_value(&wrong.before).unwrap();
+        before["prerequisites"][0]["ownership"] = serde_json::to_value(ownership).unwrap();
+        wrong.before = serde_json::from_value(before).unwrap();
+        assert_projection_refuses(&changes, wrong);
+    }
+}
+
+#[test]
+fn closing_inventory_requires_its_own_qualified_ownership() {
+    let plan = super::tests::plan();
+    let PlanAnalysis::Resolved(evidence) = plan.analysis else {
+        panic!("resolved")
+    };
+    for ownership in [
+        ObjectOwnership::Unqualified,
+        ObjectOwnership::Surface(Surface::Module("app.other".parse().unwrap())),
+    ] {
+        let mut wrong = *evidence.clone();
+        let mut after = serde_json::to_value(&wrong.after).unwrap();
+        after["prerequisites"][0]["ownership"] = serde_json::to_value(ownership).unwrap();
+        wrong.after = serde_json::from_value(after).unwrap();
+        assert_projection_refuses(&plan.changes, wrong);
+    }
+}
+
+#[test]
+fn proved_internal_objects_are_allowed_but_referenced_objects_are_not_owned() {
+    let plan = super::tests::plan();
+    let PlanAnalysis::Resolved(mut evidence) = plan.analysis else {
+        panic!("resolved")
+    };
+    let owner = evidence.transitions[0].surface.clone();
+    // The pure contract accepts an adapter's opaque internal identity; neither
+    // its spelling nor a dependency edge establishes ownership by itself.
+    let internal = ObjectIdentity {
+        class: "adapter-internal-type".into(),
+        name: vec!["opaque".into()],
+        signature: vec![],
+    };
+    let mut records = evidence.after.prerequisites().to_vec();
+    records.push(crate::resolver::Prerequisite {
+        object: internal.clone(),
+        ownership: ObjectOwnership::Surface(owner),
+        canonicalization: "fixture-v1".into(),
+        properties: "ee".repeat(32),
+        bindings: vec![],
+    });
+    records.sort_by(|a, b| a.object.cmp(&b.object));
+    let mut after = serde_json::to_value(&evidence.after).unwrap();
+    after["prerequisites"] = serde_json::to_value(records).unwrap();
+    evidence.after = serde_json::from_value(after).unwrap();
+    evidence.transitions[0].after.insert(internal.clone());
+    evidence.validate(&plan.changes).unwrap();
+    own(
+        &mut evidence.after,
+        &internal,
+        Surface::Module("app.external".parse().unwrap()),
+    );
+    assert_projection_refuses(&plan.changes, *evidence);
 }

@@ -71,6 +71,21 @@ impl InputManifest {
             {
                 return Err(ManifestError::Invalid);
             }
+            for (inventory, manifest) in [(&transition.before, self), (&transition.after, compiled)]
+            {
+                for object in inventory {
+                    let records = manifest.prerequisites();
+                    let position = records
+                        .binary_search_by(|p| p.object.cmp(object))
+                        .map_err(|_| ManifestError::Incomplete)?;
+                    if !records[position]
+                        .ownership
+                        .permits(&transition.surface, changes)
+                    {
+                        return Err(ManifestError::Invalid);
+                    }
+                }
+            }
             for object in &transition.before {
                 if !removed.insert(object.clone()) {
                     return Err(ManifestError::Invalid);

@@ -147,6 +147,10 @@ impl CapturedInputs {
                     bindings.sort();
                     Prerequisite {
                         object: object.clone(),
+                        // A raw capture supplies read prerequisites. The qualified
+                        // producer's ownership bridge must prove managed ownership
+                        // before any record may enter a transition (#615).
+                        ownership: pbps_model::resolver::ObjectOwnership::Unqualified,
                         canonicalization: self.rule.into(),
                         properties: digest(
                             "properties",

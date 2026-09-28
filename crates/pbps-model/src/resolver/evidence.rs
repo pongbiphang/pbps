@@ -357,6 +357,7 @@ mod tests {
         let view = object("app", "v");
         let mut records = vec![Prerequisite {
             object: ext.clone(),
+            ownership: crate::resolver::ObjectOwnership::Unqualified,
             canonicalization: "fixture-v1".into(),
             properties: if new { "aa" } else { "bb" }.repeat(32),
             bindings: vec![],
@@ -364,6 +365,9 @@ mod tests {
         if new {
             records.push(Prerequisite {
                 object: view.clone(),
+                ownership: crate::resolver::ObjectOwnership::Surface(Surface::Module(
+                    "app.v".parse().unwrap(),
+                )),
                 canonicalization: "fixture-v1".into(),
                 properties: "cc".repeat(32),
                 bindings: vec![],

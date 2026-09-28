@@ -24,6 +24,7 @@ fn fixture() -> InputManifest {
         "03".repeat(32),
         vec![Prerequisite {
             object,
+            ownership: ObjectOwnership::Unqualified,
             canonicalization: "fixture-v1".into(),
             properties: "04".repeat(32),
             bindings: vec![],
@@ -100,4 +101,22 @@ fn duplicate_records_and_unknown_source_fields_are_not_canonical_evidence() {
     let mut value = serde_json::to_value(fixture()).unwrap();
     value["prerequisites"][0]["definition"] = json!("private source");
     assert!(serde_json::from_value::<InputManifest>(value).is_err());
+}
+
+#[test]
+fn catalog_ownership_is_required_and_not_inferred_from_an_object_name() {
+    let value = serde_json::to_value(fixture()).unwrap();
+    let mut missing = value.clone();
+    missing["prerequisites"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("ownership");
+    assert!(serde_json::from_value::<InputManifest>(missing).is_err());
+    let mut unknown = value;
+    unknown["prerequisites"][0]["ownership"] = json!({"kind":"assumed-owner"});
+    assert!(serde_json::from_value::<InputManifest>(unknown).is_err());
+    assert_eq!(
+        fixture().prerequisites()[0].ownership,
+        ObjectOwnership::Unqualified
+    );
 }

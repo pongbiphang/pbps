@@ -16,6 +16,9 @@ pub use ordering::{
     BoundSurface, OrderEdge, OrderError, OrderReason, OrderingProof, Surface, SurfaceResolution,
 };
 
+mod ownership;
+pub use ownership::ObjectOwnership;
+
 mod projection;
 pub use projection::ObjectTransition;
 

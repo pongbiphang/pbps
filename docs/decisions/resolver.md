@@ -1106,3 +1106,26 @@ transition is a planning refusal, not an apply-time choice. Qualified lifecycle
 and ownership/binding inventory production remain #615, transactional checking
 #616 and plaintext handling #617. Until the apply guard exists, the CLI refuses
 resolved deployment artifacts before executing changes.
+
+
+<a id="dec-614-2"></a>
+
+**DEC-614.2. Check transitions against independent per-record ownership facts.**
+A transition's surface name cannot authorize every identity in its inventory:
+a valid view transition could carry a retained external prerequisite in both
+sets and replace the target's fingerprint with the scratch fingerprint. The
+closing manifest would then reject a valid deployment or accept that unrelated
+drift. PostgreSQL 16/18 measurements distinguish a view's internally owned
+rule/row type from its normally referenced table/function; replacement and drop
+leave those external properties and objects intact.
+
+Each prerequisite therefore requires a typed ownership observation, separate
+from the proposed transitions. Projection checks every opening record against
+the opening manifest and every closing record against the compiled manifest.
+Only the named surface, its proved table/column parts, or owners related by
+explicit typed renames may participate. Logical addresses remain opaque to the
+pure model; name/signature similarity does not prove ownership. The adapter
+must qualify the mapping, including engine-internal records. Raw PG catalog
+capture records ownership as unqualified: useful read evidence, no authority to
+change a record. The complete qualified producer/mapping remains #615. No
+optional default turns omitted or unknown ownership into permission.

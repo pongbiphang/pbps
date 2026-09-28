@@ -413,6 +413,9 @@ async fn persisted_inputs_use_the_environment_key_and_never_export_source() {
                 assert_ne!(first.key_id(), second.key_id());
                 assert_eq!(first.prerequisites().len(), second.prerequisites().len());
                 assert!(!first.prerequisites().is_empty());
+                assert!(first.prerequisites().iter().all(|p| matches!(
+                    p.ownership, pbps_model::resolver::ObjectOwnership::Unqualified
+                )), "raw catalog capture cannot authorize managed transitions");
                 for (left, right) in first.prerequisites().iter().zip(second.prerequisites()) {
                     assert_eq!(left.object, right.object);
                     assert_ne!(left.properties, right.properties);

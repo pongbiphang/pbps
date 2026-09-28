@@ -1,3 +1,4 @@
+use super::ObjectOwnership;
 use std::collections::BTreeSet;
 
 /// A logical address, independent of any particular database's object numbers.
@@ -71,6 +72,7 @@ fn required_option<'de, D: serde::Deserializer<'de>, T: serde::Deserialize<'de>>
 #[serde(deny_unknown_fields)]
 pub struct Prerequisite {
     pub object: ObjectIdentity,
+    pub ownership: ObjectOwnership,
     pub canonicalization: String,
     pub properties: String,
     pub bindings: Vec<Binding>,
