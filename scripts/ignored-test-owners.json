@@ -1334,6 +1334,7 @@
         "a_granted_target_whose_name_is_reused_is_an_unconditional_gap",
         "a_half_populated_staged_pair_is_malformed_not_silently_unstaged",
         "a_hand_written_default_on_another_column_is_not_renamed_with_this_one",
+        "a_key_of_a_type_with_no_collation_is_grouped_without_one",
         "a_key_probe_counts_the_rows_the_plan_will_leave",
         "a_layout_on_partitioned_rows_is_left_out_and_named",
         "a_ledger_that_cannot_be_read_is_not_an_uninitialized_one",

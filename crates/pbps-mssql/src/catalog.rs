@@ -615,6 +615,12 @@ pub async fn database_collation(conn: &mut Conn) -> Result<String, DbError> {
 /// run. The comparison is case-insensitive under a binary collation of the
 /// uppercased names, the way the engine resolves a collation name — measured,
 /// `latin1_general_ci_as` names `Latin1_General_CI_AS`.
+///
+/// The names are collated *before* `UPPER`, which case-folds under its
+/// input's collation (#1247 review). Measured on 17.0, on a
+/// `Turkish_100_CI_AS` database, `UPPER(N'i')` is `İ` (U+0130): uppercased
+/// under the database default and collated afterwards, a lowercase name the
+/// engine accepts matched nothing and was refused as unknown.
 pub async fn unknown_collations(conn: &mut Conn, names: &[String]) -> Result<Vec<String>, DbError> {
     if names.is_empty() {
         return Ok(Vec::new());
@@ -629,8 +635,8 @@ pub async fn unknown_collations(conn: &mut Conn, names: &[String]) -> Result<Vec
         "SELECT w.i FROM (VALUES {values}) AS w(i, name)
           WHERE NOT EXISTS (
                 SELECT 1 FROM sys.fn_helpcollations() h
-                 WHERE UPPER(h.name) COLLATE Latin1_General_BIN2
-                     = UPPER(w.name) COLLATE Latin1_General_BIN2)
+                 WHERE UPPER(h.name COLLATE Latin1_General_BIN2)
+                     = UPPER(w.name COLLATE Latin1_General_BIN2))
           ORDER BY w.i;"
     );
     let mut unknown = Vec::new();

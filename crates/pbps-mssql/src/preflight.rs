@@ -324,7 +324,12 @@ impl AsStored {
                     ..
                 } => {
                     this.types.insert(column.clone(), to.clone());
-                    if from_collation != to_collation {
+                    // Only onto a type that has a collation at all: a
+                    // collated `varchar` retyped to `int` loses its collation
+                    // rather than moving it, and a `COLLATE` on the `int` it
+                    // becomes is 447 (#1247 review).
+                    let collated = types::normalize(to).is_ok_and(|t| types::takes_collation(&t.base));
+                    if from_collation != to_collation && collated {
                         this.recollated
                             .insert(column.clone(), to_collation.clone());
                     }

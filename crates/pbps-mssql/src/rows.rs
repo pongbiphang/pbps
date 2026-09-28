@@ -403,9 +403,12 @@ pub fn spelling_queries(name: &TableName, table: &Table) -> Result<Vec<SpellingQ
                  GROUP BY TRY_CONVERT({ty}, {input})"
             );
             let tail = "\nHAVING COUNT(*) > 1;";
-            if ValueKind::of(base) != ValueKind::Text {
-                // Nothing outside text has a collation, and `COLLATE` on a
-                // number is an error rather than a no-op.
+            if !crate::types::takes_collation(base) {
+                // Nothing outside the character types has a collation, and
+                // `COLLATE` on one is an error rather than a no-op (447). Not
+                // `ValueKind::Text`, which is every type spelled as text —
+                // `decimal`, `date`, `uniqueidentifier` among them (#1247
+                // review).
                 return format!("{grouped}{tail}");
             }
             // Whether two spellings are one key is the *key column's*

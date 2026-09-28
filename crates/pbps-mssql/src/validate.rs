@@ -490,12 +490,8 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
         // anything else (447, "Expression type xml is invalid for COLLATE
         // clause"), and an unknown name is 448 (#1175).
         if let Some(collation) = &col.collation {
-            let character = types::normalize(&col.ty).is_ok_and(|t| {
-                matches!(
-                    t.base.as_str(),
-                    "char" | "varchar" | "text" | "nchar" | "nvarchar" | "ntext" | "sysname"
-                )
-            });
+            let character =
+                types::normalize(&col.ty).is_ok_and(|t| types::takes_collation(&t.base));
             if !character {
                 errs.push(invalid(format!(
                     "column `{col_name}` is `{}`, which takes no collation; only character \

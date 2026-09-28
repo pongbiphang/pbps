@@ -2652,7 +2652,115 @@ async fn an_unknown_collation_is_named_before_it_is_used() {
     )
     .await
     .expect("ask");
+    // Asked on a database whose default folds `i` to `İ` (#1247 review):
+    // uppercased under that default, `latin1_general_ci_as` matched nothing.
+    let mut db = TestDb::create_collated("coll_tr", "Turkish_100_CI_AS").await;
+    let turkish = pbps_mssql::catalog::unknown_collations(
+        &mut db.conn,
+        &[
+            "latin1_general_ci_as".to_owned(),
+            "No_Such_Collation".to_owned(),
+        ],
+    )
+    .await;
+    db.drop().await;
     assert_eq!(unknown, ["No_Such_Collation"]);
+    assert_eq!(turkish.expect("ask"), ["No_Such_Collation"]);
+}
+
+/// A key of a type with no collation is grouped without one: `COLLATE` on a
+/// `decimal` or an `int` expression is 447, so a probe that appended one threw
+/// instead of counting (#1247 review). Once as a declared `decimal` key, whose
+/// spellings are asked about, and once as a collated `varchar` key retyped to
+/// `int`, which gives its collation up rather than moving it.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_key_of_a_type_with_no_collation_is_grouped_without_one() {
+    use pbps_model::{DataMode, RowKey, TableData};
+    let mut db = TestDb::create("coll_nokey").await;
+
+    let decimal_keyed = |keys: &[&str]| {
+        let mut t = Table::default();
+        t.columns.insert(
+            "code".to_owned(),
+            Column::new(ty("decimal(5,2)")).not_null(),
+        );
+        t.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["code".to_owned()],
+        });
+        t.data = Some(TableData {
+            mode: DataMode::Exact,
+            rows: keys
+                .iter()
+                .map(|k| (RowKey::from(*k), Default::default()))
+                .collect(),
+        });
+        let mut s = Schema::default();
+        s.tables.insert(TableName::new("dbo", "d"), t);
+        s
+    };
+    let distinct = pbps_mssql::catalog::misspelt(
+        &mut db.conn,
+        &decimal_keyed(&["1.5", "2.5"]),
+        &Default::default(),
+    )
+    .await;
+    // Negative: two spellings of one decimal are still one key.
+    let colliding = pbps_mssql::catalog::misspelt(
+        &mut db.conn,
+        &decimal_keyed(&["1.5", "1.50"]),
+        &Default::default(),
+    )
+    .await;
+
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.r (id int NOT NULL CONSTRAINT pk_r PRIMARY KEY,
+                                 n varchar(10) COLLATE Latin1_General_CS_AS NULL
+                                   CONSTRAINT uq_r_n UNIQUE);
+             INSERT dbo.r VALUES (1, '1'), (2, '2');",
+        )
+        .await
+        .expect("create");
+    let start = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    let ids = mint_ids(&start.schema, &IdsFile::default(), &[]);
+    let mut declared = start.schema.clone();
+    let n = declared
+        .tables
+        .get_mut(&TableName::new("dbo", "r"))
+        .unwrap()
+        .columns
+        .get_mut("n")
+        .unwrap();
+    n.ty = ty("int");
+    n.collation = None;
+    let step = plan(&start.schema, &ids, &declared, &ids);
+    let clean = probe_counts(&mut db.conn, &step).await;
+    // Negative: `01` becomes the `1` another row already holds.
+    db.conn
+        .execute("UPDATE dbo.r SET n = '01' WHERE id = 2;")
+        .await
+        .unwrap();
+    let dup = probe_counts(&mut db.conn, &step).await;
+    db.drop().await;
+
+    let distinct = distinct.unwrap_or_else(|e| panic!("the decimal key was not asked about: {e}"));
+    assert!(distinct.conflicts.is_empty(), "{:?}", distinct.conflicts);
+    let colliding =
+        colliding.unwrap_or_else(|e| panic!("the decimal key was not asked about: {e}"));
+    assert_eq!(colliding.conflicts.len(), 1, "{:?}", colliding.conflicts);
+    let collisions = |counts: &[(String, i32)]| {
+        counts
+            .iter()
+            .find(|(d, _)| d.contains("uq_r_n"))
+            .unwrap_or_else(|| panic!("no probe for uq_r_n in {counts:?}"))
+            .1
+    };
+    assert_eq!(collisions(&clean), 0, "{clean:?}");
+    assert_eq!(collisions(&dup), 2, "{dup:?}");
 }
 
 /// A key the plan adds as the clustered index spells `CLUSTERED`, so a
