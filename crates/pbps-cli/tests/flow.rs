@@ -503,6 +503,30 @@ fn keeping_an_occupied_rename_target_still_asks_what_becomes_of_the_source() {
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
 }
 
+/// #1205: the ledger's `operator` is cut to its column, but a tombstone goes
+/// into the identity file, which has no column to fit, and is the git audit
+/// record of who dropped what. It keeps the whole name.
+#[test]
+fn a_tombstone_keeps_the_operators_whole_name() {
+    let d = Demo::new("drop-wide-operator");
+    d.table("table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  pii: {type: nvarchar(20)}\n");
+    d.run(&["plan"]);
+    d.commit();
+    let name = format!("{}{}", "a".repeat(200), "\u{1F600}".repeat(10));
+    d.git(&["config", "user.name", &name]);
+    d.table(ONE_COLUMN);
+    let o = d.run(&["drop", "dbo.t.pii", "--reason", "REG-2026-042"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let ids: pbps_model::IdsFile =
+        serde_json::from_str(&std::fs::read_to_string(d.ids_path()).unwrap()).unwrap();
+    let operators: Vec<&str> = ids
+        .tombstones
+        .values()
+        .map(|t| t.operator.as_str())
+        .collect();
+    assert_eq!(operators, [name.as_str()], "{ids:?}");
+}
+
 #[test]
 fn deleting_a_column_requires_a_reason_and_leaves_a_tombstone() {
     let d = Demo::new("drop");

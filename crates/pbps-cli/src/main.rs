@@ -1743,7 +1743,9 @@ fn write_ids(project: &Project, ids: &IdsFile) -> anyhow::Result<()> {
 
 fn context(root: &std::path::Path) -> Context {
     Context {
-        operator: operator(root),
+        // Whole: a tombstone goes into the identity file, which has no column
+        // to fit, and cutting it there would weaken the git audit record.
+        operator: operator_name(root),
         today: today(),
     }
 }
@@ -3164,15 +3166,18 @@ pub(crate) fn validate_saved_plan(
 
 /// The operator. An audit asks "who did this", and git's configuration is the
 /// closest thing to the truth available.
-/// Who is running this command, as the ledger and the lock record it: git's
-/// `user.name`, else `$USER`.
-///
-/// Bounded to the ledger's `operator` column in that column's own measure
-/// (`pbps_db::clip_utf16`): unbounded, a long or emoji-heavy `user.name` was
-/// refused by both engines at the ledger write, which on `apply` comes after
-/// the statements have run (#1205).
+/// Who is running this command, as the ledger and the lock record it:
+/// [`operator_name`], bounded to the ledger's `operator` column in that
+/// column's own measure (`pbps_db::clip_utf16`). Unbounded, a long or
+/// emoji-heavy `user.name` was refused by both engines at the ledger write,
+/// which on `apply` comes after the statements have run (#1205).
 fn operator(root: &std::path::Path) -> String {
-    let name = std::process::Command::new("git")
+    pbps_db::clip_utf16(&operator_name(root), pbps_db::OPERATOR_CHARS)
+}
+
+/// Who is running this command, whole: git's `user.name`, else `$USER`.
+fn operator_name(root: &std::path::Path) -> String {
+    std::process::Command::new("git")
         .arg("-C")
         .arg(root)
         .args(["config", "user.name"])
@@ -3182,8 +3187,7 @@ fn operator(root: &std::path::Path) -> String {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
         .filter(|s| !s.is_empty())
         .or_else(|| std::env::var("USER").ok())
-        .unwrap_or_else(|| "unknown".to_owned());
-    pbps_db::clip_utf16(&name, pbps_db::OPERATOR_CHARS)
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 /// This machine's name, for the lock row (#1188); `None` when none can be read.
