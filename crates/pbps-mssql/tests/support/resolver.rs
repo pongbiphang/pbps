@@ -168,6 +168,26 @@ mod contained611 {
             let occupants = pbps_mssql::catalog::object_name_occupants(&mut conn, &names[..1], &[])
                 .await
                 .unwrap();
+            // #1243: every other identifier comparison asks the same
+            // collation: a role, a table name and a column name.
+            conn.execute("CREATE ROLE [café];").await.unwrap();
+            let holding = pbps_mssql::catalog::principals_holding(&mut conn, &["cafe"], &[])
+                .await
+                .unwrap();
+            let tables =
+                pbps_mssql::catalog::matching_table_names(&mut conn, &names[..1], &names[1..])
+                    .await
+                    .unwrap();
+            let columns = pbps_mssql::catalog::tables_reusing_a_column_name(
+                &mut conn,
+                &[(0, "cafe".to_owned())],
+                &[(0, "café".to_owned())],
+            )
+            .await
+            .unwrap();
+            let roles = pbps_mssql::catalog::names_alike(&mut conn, &["cafe", "café"])
+                .await
+                .unwrap();
             drop(conn);
             admin
                 .execute(&format!(
@@ -182,6 +202,10 @@ mod contained611 {
                 distinct,
                 "{containment}: {occupants:?}"
             );
+            assert_eq!(holding.is_empty(), distinct, "{containment}: {holding:?}");
+            assert_eq!(tables.is_empty(), distinct, "{containment}: {tables:?}");
+            assert_eq!(columns.is_empty(), distinct, "{containment}: {columns:?}");
+            assert_eq!(roles.is_empty(), distinct, "{containment}: {roles:?}");
         }
 
         // Off: refused by name, before any statement could fail halfway. The

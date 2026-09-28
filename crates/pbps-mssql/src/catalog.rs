@@ -536,7 +536,8 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
 /// is checked against these before a connected plan is written and again
 /// before it is applied (DECISIONS 118, 119).
 ///
-/// Asked of the engine under the database collation rather than compared
+/// Asked of the engine under the catalog collation (see
+/// [`object_names_alike`], #1243) rather than compared
 /// here: `Shadow` and `shadow` are one name to a case-insensitive database
 /// and two to a `BTreeMap`, and a map lookup said the name was free.
 /// `except` names the principals this plan vacates — the roles it drops or
@@ -561,14 +562,14 @@ pub async fn principals_holding(
         "SELECT d.name AS declared, p.name AS held, p.type_desc
            FROM (VALUES {}) AS d(name)
            JOIN sys.database_principals AS p
-             ON p.name = d.name COLLATE DATABASE_DEFAULT",
+             ON p.name = d.name COLLATE CATALOG_DEFAULT",
         values(names)
     );
     if !except.is_empty() {
         sql.push_str(&format!(
             "
  WHERE NOT EXISTS (SELECT 1 FROM (VALUES {}) AS v(name)
-                                WHERE v.name = p.name COLLATE DATABASE_DEFAULT)",
+                                WHERE v.name = p.name COLLATE CATALOG_DEFAULT)",
             values(except)
         ));
     }
@@ -590,7 +591,7 @@ pub async fn principals_holding(
     Ok(out)
 }
 
-/// Compare captured table names under the database's identifier collation,
+/// Compare captured table names under the catalog collation that names them,
 /// part by part (DECISIONS 119, 142). Only values from the caller's read are
 /// compared: a second catalog lookup could miss a name that read already saw.
 pub async fn matching_table_names(
@@ -618,8 +619,8 @@ pub async fn matching_table_names(
     let sql = format!(
         "SELECT DISTINCT a.i FROM (VALUES {}) AS a(i, schema_name, table_name)
          JOIN (VALUES {}) AS b(i, schema_name, table_name)
-           ON a.schema_name = b.schema_name COLLATE DATABASE_DEFAULT
-          AND a.table_name = b.table_name COLLATE DATABASE_DEFAULT ORDER BY a.i;",
+           ON a.schema_name = b.schema_name COLLATE CATALOG_DEFAULT
+          AND a.table_name = b.table_name COLLATE CATALOG_DEFAULT ORDER BY a.i;",
         values(wanted),
         values(observed)
     );
@@ -741,8 +742,8 @@ pub async fn object_name_occupants(
 }
 
 /// Of the groups in `added`, the ones where an added column's name is a name
-/// the same group's `recorded` columns have, compared under the database's
-/// collation (#676). A group is one table, by the caller's index. Asked of the
+/// the same group's `recorded` columns have, compared under the catalog
+/// collation (#676, #1243). A group is one table, by the caller's index. Asked of the
 /// engine for the reason [`matching_table_names`] is: an accent-, width- or
 /// kana-insensitive database reads `café` and `cafe` as one column, which no
 /// fold in Rust reproduces.
@@ -764,7 +765,7 @@ pub async fn tables_reusing_a_column_name(
     let sql = format!(
         "SELECT DISTINCT a.i FROM (VALUES {}) AS a(i, column_name)
          JOIN (VALUES {}) AS b(i, column_name)
-           ON a.i = b.i AND a.column_name = b.column_name COLLATE DATABASE_DEFAULT
+           ON a.i = b.i AND a.column_name = b.column_name COLLATE CATALOG_DEFAULT
          ORDER BY a.i;",
         values(added),
         values(recorded)
@@ -834,7 +835,8 @@ pub async fn object_names_alike(
 }
 
 /// Among `names`, the pairs the database reads as one name — `Reader` and
-/// `reader` under a case-insensitive collation — each as `(earlier, later)`
+/// `reader` under a case-insensitive catalog collation (#1243) — each as
+/// `(earlier, later)`
 /// in the order given. A plan that creates both passes every check against
 /// the catalog, and the second `CREATE ROLE` fails after everything before
 /// it has run (DECISIONS 123).
@@ -856,7 +858,7 @@ pub async fn names_alike(
         "SELECT a.name AS earlier, b.name AS later
            FROM (VALUES {values}) AS a(i, name)
            JOIN (VALUES {values}) AS b(i, name)
-             ON a.i < b.i AND a.name = b.name COLLATE DATABASE_DEFAULT
+             ON a.i < b.i AND a.name = b.name COLLATE CATALOG_DEFAULT
           ORDER BY a.i, b.i;"
     );
     let mut out = Vec::new();
