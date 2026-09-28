@@ -463,6 +463,7 @@ pub fn module(id: &ModuleId, module: &Module) -> Vec<DialectError> {
 pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
     let mut errs = Vec::new();
     errs.extend(table.constraint_name_conflicts().into_iter().map(invalid));
+    errs.extend(table.clustered_problems().into_iter().map(invalid));
 
     for part in [&name.schema, &name.name] {
         if let Err(e) = ident::quote(part) {
@@ -761,6 +762,24 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
                 "index `{n}` has an empty filter expression"
             )));
         }
+        // The engine's rules for the clustered index, which is the table's
+        // rows rather than a copy of some of them — so every column is in it
+        // already and it covers every row. Measured on 17.0: `INCLUDE` is
+        // refused (10601) and a `WHERE` is a syntax error.
+        if table.index_is_clustered(n) {
+            if !idx.include.is_empty() {
+                errs.push(invalid(format!(
+                    "index `{n}` is the clustered index, which cannot have INCLUDE columns: it \
+                     holds every column already"
+                )));
+            }
+            if idx.filter.is_some() {
+                errs.push(invalid(format!(
+                    "index `{n}` is the clustered index, which cannot be filtered: it holds \
+                     every row"
+                )));
+            }
+        }
     }
 
     errs
@@ -836,6 +855,38 @@ mod tests {
             },
         );
         assert_eq!(messages(&table(&name, &t)), "");
+    }
+
+    /// The clustered index holds every row and every column, so SQL Server
+    /// refuses a filter and INCLUDE on it (#1178); and the selector must name
+    /// something this table declares.
+    #[test]
+    fn a_clustered_index_can_be_neither_filtered_nor_including() {
+        use pbps_model::Clustered;
+        let (name, mut t) = base_table();
+        let index = |include: Vec<String>, filter: Option<&str>| Index {
+            columns: vec![IndexColumn {
+                name: "id".into(),
+                descending: false,
+            }],
+            include,
+            unique: false,
+            filter: filter.map(Into::into),
+        };
+        t.clustered = Some(Clustered::Index("cx".into()));
+        t.indexes.insert("cx".into(), index(Vec::new(), None));
+        assert_eq!(messages(&table(&name, &t)), "");
+        t.indexes
+            .insert("cx".into(), index(vec!["email".into()], Some("id > 0")));
+        let said = messages(&table(&name, &t));
+        assert!(said.contains("cannot have INCLUDE columns"), "{said}");
+        assert!(said.contains("cannot be filtered"), "{said}");
+        // Negative: the same index, not clustered, is an ordinary filtered
+        // covering index.
+        t.clustered = None;
+        assert_eq!(messages(&table(&name, &t)), "");
+        t.clustered = Some(Clustered::Index("cx_missing".into()));
+        assert!(messages(&table(&name, &t)).contains("does not declare"));
     }
 
     #[test]

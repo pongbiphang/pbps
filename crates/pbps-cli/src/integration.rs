@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 16;
+pub const SCHEMA_VERSION: u32 = 17;
+// 17: a table's `clustered:` layout selector (issue #1178).
 // 16: `explain`'s `unchecked`, the checks a plan implies that cannot be asked
 //     before it runs (issue #478).
 // 15: an environment's `fingerprint_key_env` / `fingerprint_key_file`, where

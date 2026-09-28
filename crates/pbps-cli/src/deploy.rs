@@ -801,7 +801,9 @@ pub(crate) fn refuse_occupied_objects(
             Change::AddCheck { table, name, .. } => {
                 claim(&mut held, constraint(table, name, "check constraint"));
             }
-            Change::SetPrimaryKey { table, from, to } => {
+            Change::SetPrimaryKey {
+                table, from, to, ..
+            } => {
                 match from.as_ref().map(|k| k.name.as_deref()) {
                     Some(Some(name)) => {
                         let name = in_schema(table, name);
@@ -2131,17 +2133,27 @@ fn part_as_planned(
     name: &str,
 ) -> Option<bool> {
     use pbps_model::PartDefinition;
+    // The layout is held with the rest: which index is clustered is read
+    // back as the table's selector, so a key the engine built nonclustered
+    // where the plan built it clustered is movement, not the plan's result
+    // (#1178).
     Some(match planned {
-        PartDefinition::PrimaryKey(was) => {
+        PartDefinition::PrimaryKey(was, clustered) => {
             primary_key_as_declared(was, table.primary_key.as_ref()?)
+                && table.primary_key_is_clustered() == clustered
         }
-        // A unique constraint is nothing but its columns.
-        PartDefinition::Unique(was) => table.unique.get(name)? == was,
+        // A unique constraint is nothing but its columns and its layout.
+        PartDefinition::Unique(was, clustered) => {
+            table.unique.get(name)? == was && table.unique_is_clustered(name) == clustered
+        }
         // And a foreign key nothing but structure — the columns, the parent
         // and the two referential actions — so all of it is comparable (182).
         PartDefinition::ForeignKey(was) => table.foreign_keys.get(name)? == was,
         PartDefinition::Check(_) => return None,
-        PartDefinition::Index(was) => index_as_declared(was, table.indexes.get(name)?),
+        PartDefinition::Index(was, clustered) => {
+            index_as_declared(was, table.indexes.get(name)?)
+                && table.index_is_clustered(name) == clustered
+        }
     })
 }
 
@@ -2450,7 +2462,10 @@ fn refuse_unplanned_movement(
         {
             added_fks.insert((table, name.as_str()), constraint.as_ref());
         }
-        if let pbps_model::Change::AddIndex { table, name, index } = &p.change {
+        if let pbps_model::Change::AddIndex {
+            table, name, index, ..
+        } = &p.change
+        {
             added_indexes.insert((table, name.as_str()), index.as_ref());
         }
         if let Some(dropped) = p.change.drops() {
@@ -2825,6 +2840,21 @@ fn refuse_unplanned_movement(
                     "{now_name} has a primary key, and this plan declares none"
                 ));
             }
+            // Which index holds the rows (#1178). A staged checkpoint can land
+            // between the `CREATE TABLE` and the `ALTER` that adds the
+            // clustered constraint or index, where the table is still a
+            // heap; that is the plan in progress, not movement, so the layout
+            // is held once the object it names is there.
+            let owner_built = match &declared.clustered {
+                Some(pbps_model::Clustered::Unique(n)) => now.unique.contains_key(n),
+                Some(pbps_model::Clustered::Index(n)) => now.indexes.contains_key(n),
+                Some(pbps_model::Clustered::Heap) | None => true,
+            };
+            if (owner_built || settled.whole()) && declared.clustered != now.clustered {
+                moved.push(format!(
+                    "{now_name} is not clustered the way this plan's `CREATE TABLE` declares"
+                ));
+            }
             if settled.whole() && declared.primary_key.is_some() && now.primary_key.is_none() {
                 moved.push(format!(
                     "{now_name} has no primary key, and this plan's `CREATE TABLE` declares one"
@@ -2997,6 +3027,126 @@ fn refuse_unplanned_movement(
             );
             named_alike(n, Part::Check, "check", &was.checks, &now.checks, s, m);
             named_alike(n, Part::Index, "index", &was.indexes, &now.indexes, s, m);
+            // And which of them holds the rows (#1178). Every part can read
+            // back unchanged while another session moves the clustered index
+            // between them, so the layout is compared on its own. The plan
+            // moves it only by changing the object that holds the rows on one
+            // side or the other — the clustered key, or the constraint or
+            // index a selector names — so only those excuse a difference. A
+            // change to a nonclustered key moves nothing (#1209 review).
+            // A free function: the name it returns borrows from the table,
+            // which a closure cannot say.
+            fn holds_the_rows(t: &pbps_model::Table) -> Option<(Part, &str)> {
+                match &t.clustered {
+                    None if t.primary_key.is_some() => Some((Part::PrimaryKey, "")),
+                    Some(pbps_model::Clustered::Unique(n)) => Some((Part::Unique, n.as_str())),
+                    Some(pbps_model::Clustered::Index(n)) => Some((Part::Index, n.as_str())),
+                    None | Some(pbps_model::Clustered::Heap) => None,
+                }
+            }
+            // Compared by what holds the rows, not by the selector's
+            // spelling: a nonclustered key added to a keyless heap turns an
+            // absent selector into `heap`, and the rows are where they were.
+            let (was_holder, now_holder) = (holds_the_rows(was), holds_the_rows(now));
+            if was_holder != now_holder {
+                let plan_moves_layout =
+                    [was_holder, now_holder]
+                        .into_iter()
+                        .flatten()
+                        .any(|part| match part {
+                            (Part::PrimaryKey, _) => keys.contains(now_name),
+                            part => moved_parts.contains(&part),
+                        });
+                // Touching the old holder does not license any new one: the
+                // plan moves the rows to one object, or to none, and a staged
+                // run's read can find them there or nowhere yet — never on an
+                // object another session made clustered while the plan was
+                // between its drop and its add (#1209 review). So follow this
+                // table's key and index changes, in plan order, from the
+                // approved holder to the one the plan leaves.
+                let mut planned = was_holder;
+                for p in &changes.changes {
+                    match &p.change {
+                        pbps_model::Change::SetPrimaryKey {
+                            table,
+                            from,
+                            to,
+                            nonclustered,
+                        } if table == now_name => {
+                            if from.is_some() && planned == Some((Part::PrimaryKey, "")) {
+                                planned = None;
+                            }
+                            if to.is_some() && !nonclustered {
+                                planned = Some((Part::PrimaryKey, ""));
+                            }
+                        }
+                        pbps_model::Change::DropUnique { table, name }
+                            if table == now_name
+                                && planned == Some((Part::Unique, name.as_str())) =>
+                        {
+                            planned = None;
+                        }
+                        pbps_model::Change::DropIndex { table, name }
+                            if table == now_name
+                                && planned == Some((Part::Index, name.as_str())) =>
+                        {
+                            planned = None;
+                        }
+                        pbps_model::Change::AddUnique {
+                            table,
+                            name,
+                            clustered: true,
+                            ..
+                        } if table == now_name => planned = Some((Part::Unique, name.as_str())),
+                        pbps_model::Change::AddIndex {
+                            table,
+                            name,
+                            clustered: true,
+                            ..
+                        } if table == now_name => planned = Some((Part::Index, name.as_str())),
+                        pbps_model::Change::CreateTable { .. }
+                        | pbps_model::Change::DropTable { .. }
+                        | pbps_model::Change::RenameTable { .. }
+                        | pbps_model::Change::AddColumn { .. }
+                        | pbps_model::Change::DropColumn { .. }
+                        | pbps_model::Change::RenameColumn { .. }
+                        | pbps_model::Change::AlterColumnType { .. }
+                        | pbps_model::Change::AlterColumnNullability { .. }
+                        | pbps_model::Change::AlterColumnDefault { .. }
+                        | pbps_model::Change::SetColumnDeprecated { .. }
+                        | pbps_model::Change::SetPrimaryKey { .. }
+                        | pbps_model::Change::AddUnique { .. }
+                        | pbps_model::Change::DropUnique { .. }
+                        | pbps_model::Change::AddForeignKey { .. }
+                        | pbps_model::Change::DropForeignKey { .. }
+                        | pbps_model::Change::AddCheck { .. }
+                        | pbps_model::Change::DropCheck { .. }
+                        | pbps_model::Change::AddIndex { .. }
+                        | pbps_model::Change::DropIndex { .. }
+                        | pbps_model::Change::InsertRow { .. }
+                        | pbps_model::Change::UpdateRow { .. }
+                        | pbps_model::Change::DeleteRow { .. }
+                        | pbps_model::Change::SetDataMode { .. }
+                        | pbps_model::Change::CreateModule { .. }
+                        | pbps_model::Change::AlterModule { .. }
+                        | pbps_model::Change::DropModule { .. }
+                        | pbps_model::Change::CreateRole { .. }
+                        | pbps_model::Change::DropRole { .. }
+                        | pbps_model::Change::RenameRole { .. }
+                        | pbps_model::Change::Grant { .. }
+                        | pbps_model::Change::Revoke { .. }
+                        | pbps_model::Change::PublicExecution { .. } => {}
+                    }
+                }
+                let passes_through = now_holder.is_none() || now_holder == planned;
+                if !plan_moves_layout || !passes_through {
+                    moved.push(format!(
+                        "{now_name} is clustered differently from the table the plan was \
+                         approved over, and no change of this plan moves its clustered index \
+                         there"
+                    ));
+                }
+            }
         }
         // Dropped, or outside the row scope on one side: there is no pair of
         // row sets to compare, and "absent" is not "empty".
@@ -7246,6 +7396,7 @@ mod tests {
                             columns: vec!["id".into()],
                         }),
                         to: None,
+                        nonclustered: false,
                     }),
                     create_table()
                 ],
@@ -7263,6 +7414,7 @@ mod tests {
                     columns: vec!["id".into()],
                 }),
                 to,
+                nonclustered: false,
             })
         };
         let replacement = || {
@@ -7595,6 +7747,7 @@ mod tests {
                 constraint: pbps_model::UniqueConstraint {
                     columns: vec!["id".into()],
                 },
+                clustered: false,
             }),
         ]);
         let (added, _) = object_reads(&cs);
@@ -7869,6 +8022,7 @@ mod tests {
                     columns: vec!["id".into()],
                 }),
                 to: None,
+                nonclustered: false,
             })
         };
         for dropped in [drop_unique, drop_key(Some("x"))] {
@@ -7966,6 +8120,7 @@ mod tests {
                     columns: vec!["id".into()],
                 }),
                 to: None,
+                nonclustered: false,
             })
         };
         refuse_uninventoried_occupants(
@@ -9872,6 +10027,7 @@ mod tests {
                         unique: false,
                         filter: None,
                     }),
+                    clustered: false,
                 },
             )],
         };
@@ -10384,6 +10540,7 @@ mod tests {
                     table: name.clone(),
                     name: "ix".into(),
                     index: Box::new(planned_index.clone()),
+                    clustered: false,
                 }),
             ],
         };
@@ -10422,6 +10579,231 @@ mod tests {
                 assert!(format!("{e:#}").contains("index `ix`"), "{other:?}: {e:#}");
             }
         }
+    }
+
+    /// An existing table the plan touches for something else is held to its
+    /// layout (#1178): its parts can all read back unchanged while another
+    /// session moves the clustered index between them. The plan's own move
+    /// of the clustered index is not movement.
+    #[test]
+    fn a_touched_tables_layout_moved_by_someone_else_is_movement() {
+        use pbps_model::{Change, Clustered, Column, Index, IndexColumn, PlannedChange, Table};
+        let name = TableName::new("app", "t");
+        let mut t = Table::default();
+        t.columns
+            .insert("id".into(), Column::new("int".parse().unwrap()).not_null());
+        t.primary_key = Some(pbps_model::PrimaryKey {
+            name: Some("pk_t".into()),
+            columns: vec!["id".into()],
+        });
+        let ix = Index {
+            columns: vec![IndexColumn {
+                name: "id".into(),
+                descending: false,
+            }],
+            include: vec![],
+            unique: false,
+            filter: None,
+        };
+        t.indexes.insert("ix".into(), ix.clone());
+        let schema = |layout: Option<Clustered>| {
+            let mut t = t.clone();
+            t.clustered = layout;
+            Schema {
+                tables: [(name.clone(), t)].into(),
+                ..Default::default()
+            }
+        };
+        let unrelated = pbps_model::ChangeSet {
+            changes: vec![PlannedChange::new(Change::AddCheck {
+                table: name.clone(),
+                name: "ck".into(),
+                constraint: pbps_model::CheckConstraint {
+                    expression: "id > 0".into(),
+                },
+            })],
+        };
+        let check = |plan: &pbps_model::ChangeSet, after: &Schema| {
+            refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                plan,
+                &schema(None),
+                after,
+                "test",
+                Settled::SoFar,
+            )
+        };
+        // The control: nothing moved the layout.
+        check(&unrelated, &schema(None)).expect("the layout as approved");
+        let e = check(&unrelated, &schema(Some(Clustered::Index("ix".into()))))
+            .expect_err("another session made ix the clustered index");
+        assert!(format!("{e:#}").contains("clustered differently"), "{e:#}");
+        let e = check(&unrelated, &schema(Some(Clustered::Heap)))
+            .expect_err("another session rebuilt the key nonclustered");
+        assert!(format!("{e:#}").contains("clustered differently"), "{e:#}");
+        // The plan's own move is not movement.
+        let moving = pbps_model::ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::SetPrimaryKey {
+                    table: name.clone(),
+                    from: t.primary_key.clone(),
+                    to: None,
+                    nonclustered: false,
+                }),
+                PlannedChange::new(Change::DropIndex {
+                    table: name.clone(),
+                    name: "ix".into(),
+                }),
+                PlannedChange::new(Change::AddIndex {
+                    table: name.clone(),
+                    name: "ix".into(),
+                    index: Box::new(ix),
+                    clustered: true,
+                }),
+                PlannedChange::new(Change::SetPrimaryKey {
+                    table: name.clone(),
+                    from: None,
+                    to: t.primary_key.clone(),
+                    nonclustered: true,
+                }),
+            ],
+        };
+        check(&moving, &schema(Some(Clustered::Index("ix".into()))))
+            .expect("the plan moved it itself");
+
+        // A change to a key that holds the rows on neither side moves
+        // nothing: with the key nonclustered beside a clustered `ix`, a
+        // second session moving the rows to `ix2` is still movement.
+        let mut t2 = t.clone();
+        t2.indexes.insert("ix2".into(), t.indexes["ix"].clone());
+        let beside = |layout: &str| {
+            let mut t = t2.clone();
+            t.clustered = Some(Clustered::Index(layout.into()));
+            Schema {
+                tables: [(name.clone(), t)].into(),
+                ..Default::default()
+            }
+        };
+        let rekeying = pbps_model::ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::SetPrimaryKey {
+                    table: name.clone(),
+                    from: t.primary_key.clone(),
+                    to: None,
+                    nonclustered: false,
+                }),
+                PlannedChange::new(Change::SetPrimaryKey {
+                    table: name.clone(),
+                    from: None,
+                    to: t.primary_key.clone(),
+                    nonclustered: true,
+                }),
+            ],
+        };
+        let recheck = |after: &Schema| {
+            refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                &rekeying,
+                &beside("ix"),
+                after,
+                "test",
+                Settled::SoFar,
+            )
+        };
+        recheck(&beside("ix")).expect("the nonclustered key replaced, as planned");
+        let e = recheck(&beside("ix2")).expect_err("someone else moved the rows to ix2");
+        assert!(format!("{e:#}").contains("clustered differently"), "{e:#}");
+
+        // A plan that leaves the rows on no index, caught between its key's
+        // drop and its add by a session that makes `ix` the clustered one:
+        // touching the old holder does not make `ix` the plan's. The heap it
+        // does leave, and the moment between, are the plan's own.
+        let to_heap = |after: &Schema| {
+            refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                &rekeying,
+                &schema(None),
+                after,
+                "test",
+                Settled::SoFar,
+            )
+        };
+        to_heap(&schema(Some(Clustered::Heap))).expect("the heap this plan leaves");
+        let mut keyless = schema(None);
+        keyless.tables.get_mut(&name).unwrap().primary_key = None;
+        to_heap(&keyless).expect("between the key's drop and its add");
+        let e = to_heap(&schema(Some(Clustered::Index("ix".into()))))
+            .expect_err("another session made ix clustered mid-plan");
+        assert!(format!("{e:#}").contains("clustered differently"), "{e:#}");
+    }
+
+    /// A created table's layout is held with its parts (#1178): read back
+    /// clustered otherwise than its `CREATE TABLE` says, it is movement. A
+    /// staged checkpoint between the `CREATE TABLE` and the `ALTER` that adds
+    /// the clustered constraint finds a heap, which is the plan in progress.
+    #[test]
+    fn a_created_tables_layout_is_held_once_its_clustered_object_is_there() {
+        use pbps_model::{Change, Clustered, Column, PlannedChange, PrimaryKey, Table};
+        let name = TableName::new("app", "t");
+        let mut created = Table::default();
+        for column in ["id", "code"] {
+            created.columns.insert(
+                column.into(),
+                Column::new("int".parse().unwrap()).not_null(),
+            );
+        }
+        created.primary_key = Some(PrimaryKey {
+            name: Some("pk_t".into()),
+            columns: vec!["id".into()],
+        });
+        created.unique.insert(
+            "uq_code".into(),
+            pbps_model::UniqueConstraint {
+                columns: vec!["code".into()],
+            },
+        );
+        created.clustered = Some(Clustered::Unique("uq_code".into()));
+        let changes = pbps_model::ChangeSet {
+            changes: vec![PlannedChange::new(Change::CreateTable {
+                uid: "t_aaaaaa".parse().unwrap(),
+                name: name.clone(),
+                table: Box::new(created.clone()),
+            })],
+        };
+        let read = |f: &dyn Fn(&mut Table)| {
+            let mut t = created.clone();
+            f(&mut t);
+            Schema {
+                tables: [(name.clone(), t)].into(),
+                ..Default::default()
+            }
+        };
+        let check = |after: &Schema, settled| {
+            refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                &changes,
+                &Schema::default(),
+                after,
+                "test",
+                settled,
+            )
+        };
+        for settled in [Settled::SoFar, Settled::Whole] {
+            check(&read(&|_| {}), settled).expect("clustered as declared");
+            let e = check(&read(&|t| t.clustered = None), settled)
+                .expect_err("the key came back clustered instead");
+            assert!(
+                format!("{e:#}").contains("is not clustered the way"),
+                "{e:#}"
+            );
+        }
+        // Midway, before the constraint exists: a heap is the plan in
+        // progress, and only the whole plan is held to the layout.
+        let midway = read(&|t| {
+            t.unique.clear();
+            t.clustered = Some(Clustered::Heap);
+        });
+        check(&midway, Settled::SoFar).expect("a checkpoint before the ALTER");
     }
 
     /// A created table's default set by a later change of the same plan
@@ -11378,6 +11760,7 @@ mod tests {
                     table: "dbo.t".parse().unwrap(),
                     name: "ix_note".to_owned(),
                     index: Box::new(index(true)),
+                    clustered: false,
                 }),
             ],
         };
@@ -11480,6 +11863,7 @@ mod tests {
                             table: source.clone(),
                             from: Some(key),
                             to: None,
+                            nonclustered: false,
                         }
                     }
                     _ => unreachable!(),
@@ -11536,6 +11920,7 @@ mod tests {
                             table: destination.clone(),
                             name: "gone".into(),
                             index: Box::new(original.indexes["gone"].clone()),
+                            clustered: false,
                         }));
                     let mut restored = Schema {
                         tables: [(destination.clone(), original.clone())].into(),
@@ -13058,6 +13443,7 @@ mod tests {
             table: dbo_t.clone(),
             name: "ix".to_owned(),
             index: Box::new(index("id", false)),
+            clustered: false,
         });
         check(
             &adding_index,
@@ -13066,6 +13452,65 @@ mod tests {
             }),
         )
         .expect("the index as planned");
+        // The layout is part of the definition (#1178): the same index read
+        // back as the clustered one is not the index this plan adds, and a
+        // clustered one read back nonclustered is not either.
+        refused(
+            &adding_index,
+            &with(&|t| {
+                t.indexes.insert("ix".to_owned(), index("id", false));
+                t.clustered = Some(pbps_model::Clustered::Index("ix".into()));
+            }),
+            "the index came back clustered",
+        );
+        let adding_clustered = plan(pbps_model::Change::AddIndex {
+            table: dbo_t.clone(),
+            name: "ix".to_owned(),
+            index: Box::new(index("id", false)),
+            clustered: true,
+        });
+        check(
+            &adding_clustered,
+            &with(&|t| {
+                t.indexes.insert("ix".to_owned(), index("id", false));
+                t.clustered = Some(pbps_model::Clustered::Index("ix".into()));
+            }),
+        )
+        .expect("the clustered index as planned");
+        refused(
+            &adding_clustered,
+            &with(&|t| {
+                t.indexes.insert("ix".to_owned(), index("id", false));
+            }),
+            "the index came back nonclustered",
+        );
+        let adding_key = |nonclustered: bool| {
+            plan(pbps_model::Change::SetPrimaryKey {
+                table: dbo_t.clone(),
+                from: None,
+                to: Some(key("id")),
+                nonclustered,
+            })
+        };
+        let keyed = |layout: Option<pbps_model::Clustered>| {
+            with(&|t| {
+                t.primary_key = Some(key("id"));
+                t.clustered = layout.clone();
+            })
+        };
+        check(&adding_key(false), &keyed(None)).expect("the clustered key as planned");
+        check(&adding_key(true), &keyed(Some(pbps_model::Clustered::Heap)))
+            .expect("the nonclustered key as planned");
+        refused(
+            &adding_key(false),
+            &keyed(Some(pbps_model::Clustered::Heap)),
+            "the key came back nonclustered",
+        );
+        refused(
+            &adding_key(true),
+            &keyed(None),
+            "the key came back clustered",
+        );
         refused(
             &adding_index,
             &with(&|t| {
@@ -13088,6 +13533,7 @@ mod tests {
             table: dbo_t.clone(),
             name: "uq".to_owned(),
             constraint: unique("id"),
+            clustered: false,
         });
         refused(
             &adding_unique,
@@ -13101,6 +13547,7 @@ mod tests {
             table: dbo_t.clone(),
             from: None,
             to: Some(key("id")),
+            nonclustered: false,
         });
         check(
             &keying,

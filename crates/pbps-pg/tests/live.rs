@@ -3438,6 +3438,7 @@ async fn an_online_index_is_built_concurrently_and_says_it_leaves_the_transactio
         table: table.clone(),
         name: name.to_owned(),
         index: Box::new(index.clone()),
+        clustered: false,
     };
 
     let concurrent = Postgres::new()
@@ -4498,6 +4499,7 @@ async fn an_unnamed_primary_key_is_dropped_by_the_name_the_catalog_holds() {
                     columns: vec!["id".into()],
                 }),
                 to: None,
+                nonclustered: false,
             },
             Strategy::default(),
         )
@@ -16051,6 +16053,7 @@ async fn narrowing_projection_counts_rounding_collisions_without_losing_nulls() 
                 constraint: pbps_model::UniqueConstraint {
                     columns: vec!["v".into()],
                 },
+                clustered: false,
             },
             "index" => Change::AddIndex {
                 table,
@@ -16064,6 +16067,7 @@ async fn narrowing_projection_counts_rounding_collisions_without_losing_nulls() 
                     unique: true,
                     filter: None,
                 }),
+                clustered: false,
             },
             _ => Change::SetPrimaryKey {
                 table,
@@ -16072,6 +16076,7 @@ async fn narrowing_projection_counts_rounding_collisions_without_losing_nulls() 
                     name: Some("uq_projection".into()),
                     columns: vec!["v".into()],
                 }),
+                nonclustered: false,
             },
         };
         let cs = narrowing_projection_plan(vec![
@@ -16254,6 +16259,7 @@ async fn narrowing_projection_keeps_inserted_and_updated_rows_in_composite_keys(
                 constraint: pbps_model::UniqueConstraint {
                     columns: vec!["v".into(), "tag".into()],
                 },
+                clustered: false,
             },
         ]);
         let report = Postgres::new().preflight(&cs);
@@ -22207,6 +22213,7 @@ async fn preflight_probes_count_the_rows_this_engine_would_refuse() {
             constraint: UniqueConstraint {
                 columns: vec!["id".into()],
             },
+            clustered: false,
         },
         Change::AlterColumnType {
             uid: "c_bbbbbb".parse().expect("a uid"),
@@ -22451,6 +22458,7 @@ async fn nulls_are_distinct_under_this_engines_unique_and_the_count_says_so() {
         constraint: UniqueConstraint {
             columns: vec!["a".into()],
         },
+        clustered: false,
     };
     let composite = Change::AddUnique {
         table: table.clone(),
@@ -22458,6 +22466,7 @@ async fn nulls_are_distinct_under_this_engines_unique_and_the_count_says_so() {
         constraint: UniqueConstraint {
             columns: vec!["a".into(), "b".into()],
         },
+        clustered: false,
     };
     let cs = ChangeSet {
         changes: vec![
@@ -24654,6 +24663,7 @@ async fn the_lock_each_statement_takes_is_the_one_the_estimate_names() {
                     unique: false,
                     filter: Some("v > 0".into()),
                 }),
+                clustered: false,
             },
             format!("CREATE INDEX ix ON {s}.t (v) WHERE v > 0"),
         ),
@@ -24674,6 +24684,7 @@ async fn the_lock_each_statement_takes_is_the_one_the_estimate_names() {
                     unique: false,
                     filter: None,
                 }),
+                clustered: false,
             },
             format!("CREATE INDEX ix_plain ON {s}.t (v)"),
         ),
@@ -27375,6 +27386,7 @@ async fn concurrent_build_recovery_preserves_existing_objects_and_quotes_its_own
                         unique,
                         filter: None,
                     }),
+                    clustered: false,
                 },
                 Strategy { online },
             )

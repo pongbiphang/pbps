@@ -321,6 +321,12 @@ pub struct TableDto {
     #[serde(default)]
     pub indexes: BTreeMap<String, IndexDto>,
 
+    /// Which index holds the table's rows, on SQL Server: `heap`, `{unique:
+    /// <constraint>}` or `{index: <index>}`. Absent means the primary key is
+    /// the clustered index, or the table is a heap if it has no primary key.
+    #[serde(default)]
+    pub clustered: Option<ClusteredDto>,
+
     /// Declared reference data (ADR-0004). Absent on almost every table: it is
     /// the opt-in that lets the tool touch rows at all.
     #[serde(default)]
@@ -426,6 +432,24 @@ const fn yes() -> bool {
 pub enum PrimaryKeyDto {
     Columns(Vec<String>),
     Named { name: String, columns: Vec<String> },
+}
+
+// A mirror of `pbps_model::Clustered`, which keeps `JsonSchema` off the model
+// the way every type but `ReferentialAction` does; the one conversion is in
+// `convert`. Tagged by kind because a UNIQUE constraint and an index may share
+// a name in the declarations, and the selector must not have to guess which
+// one it means. The doc comment below is the editor's description.
+
+/// A table layout other than the default, on SQL Server: no clustered index
+/// although the table has a primary key (`heap`), or the named UNIQUE
+/// constraint (`{unique: <name>}`) or index (`{index: <name>}`) as the
+/// clustered one.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ClusteredDto {
+    Heap,
+    Unique(String),
+    Index(String),
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]

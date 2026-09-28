@@ -59,7 +59,7 @@ fn full_catalog() -> RawCatalog {
                 object_id: 1,
                 constraint_name: "pk_customer".into(),
                 is_primary: true,
-                column: "id".into(),
+                column: "id".into(), rows_partitioned: false,
             },
             RawKeyColumn {
             is_disabled: false,
@@ -68,7 +68,7 @@ fn full_catalog() -> RawCatalog {
                 object_id: 1,
                 constraint_name: "uq_customer_email".into(),
                 is_primary: false,
-                column: "email".into(),
+                column: "email".into(), rows_partitioned: false,
             },
             RawKeyColumn {
             is_disabled: false,
@@ -77,7 +77,7 @@ fn full_catalog() -> RawCatalog {
                 object_id: 2,
                 constraint_name: "pk_region".into(),
                 is_primary: true,
-                column: "region_id".into(),
+                column: "region_id".into(), rows_partitioned: false,
             },
         ],
         foreign_key_columns: vec![RawForeignKeyColumn {
@@ -115,7 +115,7 @@ fn full_catalog() -> RawCatalog {
                 filter: Some("([email] IS NOT NULL)".into()),
                 column: "email".into(),
                 is_included: false,
-                is_descending: true,
+                is_descending: true, rows_partitioned: false,
             },
             RawIndexColumn {
             is_disabled: false,
@@ -127,7 +127,7 @@ fn full_catalog() -> RawCatalog {
                 filter: Some("([email] IS NOT NULL)".into()),
                 column: "status".into(),
                 is_included: true,
-                is_descending: false,
+                is_descending: false, rows_partitioned: false,
             },
         ],
         modules: vec![

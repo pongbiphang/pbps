@@ -27,8 +27,8 @@
 use pbps_db::Conn;
 use pbps_dialect::Dialect;
 use pbps_model::{
-    Column, ColumnType, ForeignKey, Identity, IdsFile, Index, IndexColumn, Intent, PrimaryKey,
-    ReferentialAction, Schema, StateSnapshot, Table, TableName, Uid, UniqueConstraint,
+    Clustered, Column, ColumnType, ForeignKey, Identity, IdsFile, Index, IndexColumn, Intent,
+    PrimaryKey, ReferentialAction, Schema, StateSnapshot, Table, TableName, Uid, UniqueConstraint,
 };
 use pbps_mssql::Mssql;
 
@@ -1478,11 +1478,14 @@ async fn pull_warns_about_what_it_cannot_express() {
         "{:?}",
         pulled.warnings
     );
+    // Since #1178 a clustered rowstore index is declared as the table's
+    // layout rather than warned about.
+    assert_eq!(
+        pulled.schema.tables[&TableName::new("dbo", "plain")].clustered,
+        Some(pbps_model::Clustered::Index("cx_plain".into()))
+    );
     assert!(
-        pulled
-            .warnings
-            .iter()
-            .any(|w| w.contains("cx_plain") && w.contains("clustered")),
+        !pulled.warnings.iter().any(|w| w.contains("cx_plain")),
         "{:?}",
         pulled.warnings
     );
@@ -1843,7 +1846,8 @@ async fn ledger_tables_their_history_and_their_views_are_not_pulled() {
 
 /// #1199: a foreign key the engine bound to a standalone unique index that
 /// pull leaves out was still declared, so bootstrap created it against no
-/// candidate key and the engine refused it.
+/// candidate key and the engine refused it. Since #1178 a clustered unique
+/// index is declared, so a foreign key into one is kept.
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn a_foreign_key_into_a_left_out_unique_index_is_left_out_too() {
@@ -1870,35 +1874,59 @@ async fn a_foreign_key_into_a_left_out_unique_index_is_left_out_too() {
     db.drop().await;
 
     let ch = &pulled.schema.tables[&TableName::new("dbo", "ch")].foreign_keys;
-    assert_eq!(ch.keys().collect::<Vec<_>>(), ["fk_ch_r"]);
-    for (fk, index, table) in [("fk_ch_p", "ux_p_code", "p"), ("fk_ch_q", "ux_q_code", "q")] {
-        assert!(
-            pulled.limitations.iter().any(|l| {
-                l.target.object_name() == TableName::new("dbo", "ch")
-                    && l.detail.contains(&format!(
-                        "foreign key `{fk}` references unique index `{index}` of dbo.{table}"
-                    ))
-            }),
-            "{fk}: {:?}",
-            pulled.limitations
-        );
-    }
+    assert_eq!(ch.keys().collect::<Vec<_>>(), ["fk_ch_p", "fk_ch_r"]);
+    assert_eq!(
+        pulled.schema.tables[&TableName::new("dbo", "p")].clustered,
+        Some(Clustered::Index("ux_p_code".into()))
+    );
+    assert!(
+        pulled.limitations.iter().any(|l| {
+            l.target.object_name() == TableName::new("dbo", "ch")
+                && l.detail
+                    .contains("foreign key `fk_ch_q` references unique index `ux_q_code` of dbo.q")
+        }),
+        "fk_ch_q: {:?}",
+        pulled.limitations
+    );
     assert!(
         pulled.schema.tables[&TableName::new("dbo", "r")]
             .indexes
             .contains_key("ux_r_code")
     );
-    assert_eq!(pulled.limitations.len(), 4, "{:?}", pulled.limitations);
+    assert_eq!(pulled.limitations.len(), 2, "{:?}", pulled.limitations);
 }
 
-/// #1186: a key's backing index layout was never read, and the declarations
-/// spell no `CLUSTERED` or `NONCLUSTERED`, so bootstrap turned a heap's
-/// nonclustered primary key clustered and swapped a nonclustered primary key
-/// with a clustered unique constraint, and nothing compared unequal after.
+/// `sys.indexes.type` of every index on `table`, by name (`None` for the
+/// heap row): the physical layout, read from the catalog itself rather than
+/// through the reader under test.
+async fn index_types(conn: &mut Conn, table: &str) -> std::collections::BTreeMap<String, u8> {
+    conn.query_with(
+        "SELECT ISNULL(name, N'(heap)') AS name, type FROM sys.indexes \
+         WHERE object_id = OBJECT_ID(@P1)",
+        &[table.into()],
+    )
+    .await
+    .expect("read sys.indexes")
+    .iter()
+    .map(|row| {
+        (
+            row.try_get::<&str>("name").unwrap().unwrap().to_owned(),
+            row.try_get::<u8>("type").unwrap().unwrap(),
+        )
+    })
+    .collect()
+}
+
+/// #1186 found a key's backing index layout was never read, so bootstrap
+/// turned a heap's nonclustered primary key clustered and swapped a
+/// nonclustered primary key with a clustered unique constraint; it left both
+/// out. Since #1178 the table's `clustered` selector declares them, and the
+/// declaration survives an empty-database rebuild with the same physical
+/// layout — read back from `sys.indexes`, not only through the reader.
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
-async fn a_key_laid_out_against_its_kinds_default_is_reported_and_left_out() {
-    let mut db = TestDb::create("keys1186").await;
+async fn every_rowstore_layout_round_trips_through_an_empty_database() {
+    let mut db = TestDb::create("keys1178").await;
     db.conn
         .execute(
             "CREATE TABLE dbo.h (id int NOT NULL CONSTRAINT pk_h PRIMARY KEY NONCLUSTERED (id));
@@ -1907,12 +1935,22 @@ async fn a_key_laid_out_against_its_kinds_default_is_reported_and_left_out() {
                  CONSTRAINT pk_u PRIMARY KEY NONCLUSTERED (id),
                  CONSTRAINT uq_u_code UNIQUE CLUSTERED (code)
              );
+             CREATE TABLE dbo.x (
+                 id int NOT NULL CONSTRAINT pk_x PRIMARY KEY NONCLUSTERED,
+                 at datetime2 NOT NULL,
+                 note int NULL
+             );
+             CREATE CLUSTERED INDEX cx_x_at ON dbo.x (at DESC, id);
+             CREATE INDEX ix_x_note ON dbo.x (note);
+             CREATE TABLE dbo.k (at datetime2 NOT NULL);
+             CREATE UNIQUE CLUSTERED INDEX cx_k ON dbo.k (at);
              CREATE TABLE dbo.c (
                  id int NOT NULL CONSTRAINT pk_c PRIMARY KEY,
                  code int NOT NULL CONSTRAINT uq_c_code UNIQUE
              );
              CREATE TABLE dbo.child (
                  id int NOT NULL,
+                 h_id int NULL CONSTRAINT fk_child_h REFERENCES dbo.h (id),
                  u_id int NULL CONSTRAINT fk_child_u REFERENCES dbo.u (id),
                  u_code int NULL CONSTRAINT fk_child_u_code REFERENCES dbo.u (code),
                  c_id int NULL CONSTRAINT fk_child_c REFERENCES dbo.c (id)
@@ -1924,67 +1962,258 @@ async fn a_key_laid_out_against_its_kinds_default_is_reported_and_left_out() {
         .await
         .expect("introspect keyed tables");
     db.drop().await;
+    assert!(pulled.limitations.is_empty(), "{:?}", pulled.limitations);
 
     let table = |name: &str| &pulled.schema.tables[&TableName::new("dbo", name)];
-    assert_eq!(table("h").primary_key, None);
-    assert_eq!(table("u").primary_key, None);
-    assert!(table("u").unique.is_empty());
-    for (name, detail) in [
-        (
-            "h",
-            "primary key `pk_h` is backed by an index that is nonclustered",
-        ),
-        (
-            "u",
-            "primary key `pk_u` is backed by an index that is nonclustered",
-        ),
-        (
-            "u",
-            "unique constraint `uq_u_code` is backed by an index that is clustered",
-        ),
-    ] {
-        assert!(
-            pulled.limitations.iter().any(|l| {
-                l.target.object_name() == TableName::new("dbo", name) && l.detail.contains(detail)
-            }),
-            "{detail}: {:?}",
-            pulled.limitations
-        );
-    }
-    // The control table keeps both keys and adds no limitation.
+    assert_eq!(table("h").clustered, Some(Clustered::Heap));
     assert_eq!(
-        table("c")
-            .primary_key
-            .as_ref()
-            .and_then(|pk| pk.name.as_deref()),
-        Some("pk_c")
+        table("u").clustered,
+        Some(Clustered::Unique("uq_u_code".into()))
     );
-    assert!(table("c").unique.contains_key("uq_c_code"));
-    assert!(
-        !pulled
-            .limitations
+    assert_eq!(
+        table("x").clustered,
+        Some(Clustered::Index("cx_x_at".into()))
+    );
+    assert_eq!(table("k").clustered, Some(Clustered::Index("cx_k".into())));
+    assert!(table("k").indexes["cx_k"].unique);
+    // The default is not spelled: a clustered key, and a heap with no key.
+    assert_eq!(table("c").clustered, None);
+    assert_eq!(table("child").clustered, None);
+    assert_eq!(
+        table("child").foreign_keys.keys().collect::<Vec<_>>(),
+        ["fk_child_c", "fk_child_h", "fk_child_u", "fk_child_u_code"]
+    );
+
+    // Rebuilt in an empty database from the declaration alone.
+    let ids = mint_ids(&pulled.schema, &IdsFile::default(), &[]);
+    let bootstrap = plan(
+        &Schema::default(),
+        &IdsFile::default(),
+        &pulled.schema,
+        &ids,
+    );
+    let mut target = TestDb::create("keys1178_target").await;
+    try_apply(&mut target.conn, &bootstrap)
+        .await
+        .unwrap_or_else(|e| panic!("bootstrap refused: {e}"));
+    let again = pbps_mssql::catalog::introspect(&mut target.conn)
+        .await
+        .expect("introspect the rebuild");
+    let mut physical = std::collections::BTreeMap::new();
+    for t in ["h", "u", "x", "k", "c"] {
+        physical.insert(t, index_types(&mut target.conn, &format!("dbo.{t}")).await);
+    }
+    let replan = plan(&again.schema, &ids, &pulled.schema, &ids);
+    target.drop().await;
+
+    assert_eq!(again.schema, pulled.schema);
+    assert!(replan.changes.is_empty(), "{replan:?}");
+    let types = |t: &str| {
+        physical[t]
             .iter()
-            .any(|l| l.target.object_name() == TableName::new("dbo", "c")),
-        "{:?}",
-        pulled.limitations
-    );
-    // A foreign key into an omitted key goes with it: bootstrap would find
-    // no candidate key to bind it to. The one into the control table stays.
-    let child = &table("child").foreign_keys;
-    assert_eq!(child.keys().collect::<Vec<_>>(), ["fk_child_c"]);
-    for (fk, key) in [("fk_child_u", "pk_u"), ("fk_child_u_code", "uq_u_code")] {
+            .map(|(n, ty)| (n.as_str(), *ty))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(types("h"), [("(heap)", 0), ("pk_h", 2)]);
+    assert_eq!(types("u"), [("pk_u", 2), ("uq_u_code", 1)]);
+    assert_eq!(types("x"), [("cx_x_at", 1), ("ix_x_note", 2), ("pk_x", 2)]);
+    assert_eq!(types("k"), [("cx_k", 1)]);
+    assert_eq!(types("c"), [("pk_c", 1), ("uq_c_code", 2)]);
+}
+
+/// Partitioned rows under a layout this reader adopts since #1178 — a
+/// clustered index, a clustered UNIQUE constraint, a nonclustered key on a
+/// partitioned heap — are left out and named: declared, bootstrap would build
+/// the table unpartitioned (#1209 review). Measured on 17.0: the partition
+/// scheme shows as data space type `PS` on the heap's or the clustered
+/// index's row, and a nonclustered key beside a partitioned clustered index
+/// can sit on a plain filegroup, so the rows' data space is what is read.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_layout_on_partitioned_rows_is_left_out_and_named() {
+    let mut db = TestDb::create("partition1178").await;
+    db.conn
+        .execute(
+            "CREATE PARTITION FUNCTION pf (int) AS RANGE RIGHT FOR VALUES (10, 20);
+             CREATE PARTITION SCHEME ps AS PARTITION pf ALL TO ([PRIMARY]);",
+        )
+        .await
+        .expect("create the partition scheme");
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.x (id int NOT NULL, v int NOT NULL,
+                 CONSTRAINT pk_x PRIMARY KEY NONCLUSTERED (id, v) ON [PRIMARY]);
+             CREATE CLUSTERED INDEX cx_x ON dbo.x (v) ON ps (v);
+             CREATE TABLE dbo.h (id int NOT NULL,
+                 CONSTRAINT pk_h PRIMARY KEY NONCLUSTERED (id) ON [PRIMARY]) ON ps (id);
+             CREATE TABLE dbo.u (id int NOT NULL,
+                 CONSTRAINT uq_u UNIQUE CLUSTERED (id) ON ps (id));
+             CREATE TABLE dbo.plain (id int NOT NULL CONSTRAINT pk_plain PRIMARY KEY NONCLUSTERED);",
+        )
+        .await
+        .expect("create partitioned tables");
+    let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    db.drop().await;
+
+    let t = |name: &str| &pulled.schema.tables[&TableName::new("dbo", name)];
+    assert!(t("x").indexes.is_empty());
+    assert_eq!(t("x").primary_key, None);
+    assert!(t("u").unique.is_empty());
+    assert_eq!(t("h").primary_key, None);
+    let said = pulled.warnings.join("\n");
+    for name in ["cx_x", "uq_u", "pk_h", "pk_x"] {
         assert!(
-            pulled.limitations.iter().any(|l| {
-                l.target.object_name() == TableName::new("dbo", "child")
-                    && l.detail.contains(&format!(
-                        "foreign key `{fk}` references key `{key}` of dbo.u"
-                    ))
-            }),
-            "{fk}: {:?}",
-            pulled.limitations
+            said.contains(&format!(
+                "`{name}`: the table's rows are on a partition scheme"
+            )),
+            "{name}: {said}"
         );
     }
-    assert_eq!(pulled.limitations.len(), 5, "{:?}", pulled.limitations);
+    // Negative: unpartitioned, the same key is declared as a heap's.
+    assert_eq!(t("plain").clustered, Some(Clustered::Heap));
+}
+
+/// A key the plan adds as the clustered index spells `CLUSTERED`, so a
+/// clustered index nobody declared stops the plan instead of turning the key
+/// nonclustered underneath it. Measured before the keyword was spelled: the
+/// same `PRIMARY KEY` beside an existing clustered index was created
+/// silently as `type = 2`, and the recording said the key was clustered.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_clustered_key_meeting_an_undeclared_clustered_index_is_refused() {
+    let mut db = TestDb::create("stray1178").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.s (id int NOT NULL, v int NULL);
+             CREATE CLUSTERED INDEX cx_stray ON dbo.s (v);",
+        )
+        .await
+        .expect("create a table with a stray clustered index");
+    let table: TableName = "dbo.s".parse().unwrap();
+    let cs = pbps_model::ChangeSet {
+        changes: vec![pbps_model::PlannedChange::new(
+            pbps_model::Change::SetPrimaryKey {
+                table: table.clone(),
+                from: None,
+                to: Some(PrimaryKey {
+                    name: Some("pk_s".into()),
+                    columns: vec!["id".into()],
+                }),
+                nonclustered: false,
+            },
+        )],
+    };
+    let refused = try_apply(&mut db.conn, &cs).await;
+    let types = index_types(&mut db.conn, "dbo.s").await;
+    db.drop().await;
+    let e = refused.expect_err("a second clustered index is refused");
+    assert!(
+        e.contains("1902") || e.contains("more than one clustered index"),
+        "{e}"
+    );
+    assert!(!types.contains_key("pk_s"), "{types:?}");
+}
+
+/// Moving the clustered index between the key, a UNIQUE constraint, an
+/// index and none, on populated tables with a foreign key into the key: each
+/// step is planned from the read-back, applied in one transaction, keeps
+/// every row and the foreign key, and leaves nothing to plan.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn the_clustered_index_moves_between_objects_and_keeps_the_rows() {
+    let mut db = TestDb::create("move1178").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.p (
+                 id int NOT NULL CONSTRAINT pk_p PRIMARY KEY,
+                 code int NOT NULL CONSTRAINT uq_p_code UNIQUE,
+                 v int NULL
+             );
+             CREATE INDEX ix_p_v ON dbo.p (v);
+             CREATE TABLE dbo.q (
+                 id int NOT NULL CONSTRAINT pk_q PRIMARY KEY,
+                 p_id int NOT NULL CONSTRAINT fk_q_p REFERENCES dbo.p (id)
+             );
+             INSERT dbo.p VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300);
+             INSERT dbo.q VALUES (1, 1), (2, 3);",
+        )
+        .await
+        .expect("create populated tables");
+    let start = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    let ids = mint_ids(&start.schema, &IdsFile::default(), &[]);
+    let p: TableName = "dbo.p".parse().unwrap();
+    let mut current = start.schema.clone();
+    let mut seen = Vec::new();
+    for (layout, expected) in [
+        (
+            Some(Clustered::Index("ix_p_v".into())),
+            [("ix_p_v", 1), ("pk_p", 2), ("uq_p_code", 2)],
+        ),
+        (
+            Some(Clustered::Heap),
+            [("ix_p_v", 2), ("pk_p", 2), ("uq_p_code", 2)],
+        ),
+        (
+            Some(Clustered::Unique("uq_p_code".into())),
+            [("ix_p_v", 2), ("pk_p", 2), ("uq_p_code", 1)],
+        ),
+        (None, [("ix_p_v", 2), ("pk_p", 1), ("uq_p_code", 2)]),
+    ] {
+        let mut declared = start.schema.clone();
+        declared.tables.get_mut(&p).unwrap().clustered = layout.clone();
+        let step = plan(&current, &ids, &declared, &ids);
+        assert!(!step.changes.is_empty(), "{layout:?}");
+        try_apply(&mut db.conn, &step)
+            .await
+            .unwrap_or_else(|e| panic!("{layout:?} refused: {e}"));
+        let read = pbps_mssql::catalog::introspect(&mut db.conn)
+            .await
+            .expect("introspect after the step");
+        assert_eq!(read.schema, declared, "{layout:?}");
+        assert!(
+            plan(&read.schema, &ids, &declared, &ids).changes.is_empty(),
+            "{layout:?}"
+        );
+        let types = index_types(&mut db.conn, "dbo.p").await;
+        let types: Vec<_> = types
+            .iter()
+            .filter(|(n, _)| n.as_str() != "(heap)")
+            .map(|(n, t)| (n.as_str().to_owned(), *t))
+            .collect();
+        assert_eq!(
+            types,
+            expected
+                .iter()
+                .map(|(n, t)| (n.to_string(), *t))
+                .collect::<Vec<_>>(),
+            "{layout:?}"
+        );
+        let rows = db
+            .conn
+            .query("SELECT (SELECT COUNT(*) FROM dbo.p) AS p, (SELECT COUNT(*) FROM dbo.q) AS q")
+            .await
+            .unwrap();
+        seen.push((
+            rows[0].try_get::<i32>("p").unwrap(),
+            rows[0].try_get::<i32>("q").unwrap(),
+        ));
+        current = read.schema;
+    }
+    // The referencing table's key survived every rebuild of the one it
+    // points at, still enforced.
+    let orphan = db.conn.execute("INSERT dbo.q VALUES (9, 99);").await;
+    db.drop().await;
+    assert_eq!(seen, vec![(Some(3), Some(2)); 4]);
+    assert!(orphan.is_err(), "fk_q_p no longer enforced");
+    assert!(
+        current.tables[&TableName::new("dbo", "q")]
+            .foreign_keys
+            .contains_key("fk_q_p")
+    );
 }
 
 #[tokio::test]
@@ -2080,7 +2309,16 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
             .tables
             .contains_key(&TableName::new("dbo", "disabled_history"))
     );
-    assert_eq!(pulled.limitations.len(), 7);
+    // With versioning off, the history is an ordinary table, and the
+    // clustered index the engine gave it is declared as its layout (#1178)
+    // rather than reported, as it was when clustered indexes were
+    // unmodelled.
+    let history = &pulled.schema.tables[&TableName::new("dbo", "disabled_history")];
+    assert!(
+        matches!(&history.clustered, Some(Clustered::Index(n)) if history.indexes.contains_key(n)),
+        "{history:?}"
+    );
+    assert_eq!(pulled.limitations.len(), 6, "{:?}", pulled.limitations);
     assert_eq!(pulled.schema.modules.len(), 1);
     assert!(
         pulled
@@ -2186,6 +2424,18 @@ async fn an_index_whose_physical_kind_the_model_cannot_hold_is_never_adopted_as_
         )
         .await
         .expect("create archive");
+    // The same, with a nonclustered key beside the columnstore (#1209
+    // review): declared without it, the key would read as a heap's.
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.keyed_archive (
+                 id int NOT NULL CONSTRAINT pk_keyed_archive PRIMARY KEY NONCLUSTERED,
+                 note nvarchar(50) NULL
+             );
+             CREATE CLUSTERED COLUMNSTORE INDEX cci_keyed ON dbo.keyed_archive;",
+        )
+        .await
+        .expect("create keyed archive");
     db.conn
         .execute(
             "CREATE TABLE dbo.docs (
@@ -2213,6 +2463,17 @@ async fn an_index_whose_physical_kind_the_model_cannot_hold_is_never_adopted_as_
     assert_eq!(indexes("dbo", "wide"), ["ix_wide_note"]);
     assert!(indexes("dbo", "archive").is_empty());
     assert!(indexes("dbo", "docs").is_empty());
+    let keyed = &pulled.schema.tables[&TableName::new("dbo", "keyed_archive")];
+    assert_eq!(keyed.primary_key, None);
+    assert_eq!(keyed.clustered, None);
+    assert!(
+        pulled
+            .warnings
+            .iter()
+            .any(|w| w.contains("pk_keyed_archive") && w.contains("cci_keyed")),
+        "{:?}",
+        pulled.warnings
+    );
 
     let said = pulled.warnings.join("\n");
     for (name, kind) in [
@@ -3863,6 +4124,7 @@ async fn preflight_probes_count_what_the_engine_would_refuse() {
                 constraint: UniqueConstraint {
                     columns: vec!["id".into()],
                 },
+                clustered: false,
             }),
         ],
     };
@@ -4682,6 +4944,7 @@ async fn a_unique_index_is_probed_and_a_filtered_one_only_over_the_rows_it_keeps
             unique,
             filter: filter.map(str::to_owned),
         }),
+        clustered: false,
     };
     let one = |change: Change| ChangeSet {
         changes: vec![PlannedChange::new(change)],
@@ -4827,6 +5090,7 @@ async fn a_filtered_predicate_reads_a_retyped_column_through_the_type_it_has_now
                         unique: true,
                         filter: Some("flag = '01'".into()),
                     }),
+                    clustered: false,
                 }),
             ],
         })
@@ -4869,6 +5133,7 @@ async fn a_key_probe_counts_the_rows_the_plan_will_leave() {
         constraint: UniqueConstraint {
             columns: vec!["email".into()],
         },
+        clustered: false,
     });
     let delete = PlannedChange::new(Change::DeleteRow {
         table: TableName::new("dbo", "customer"),
@@ -4955,6 +5220,7 @@ async fn probes_over_a_column_this_plan_adds_run_and_count_what_the_engine_refus
         constraint: UniqueConstraint {
             columns: vec!["region_id".into()],
         },
+        clustered: false,
     });
     let fk = PlannedChange::new(Change::AddForeignKey {
         table: TableName::new("dbo", "customer"),
@@ -14408,7 +14674,7 @@ fn retype_dependency_plans_preserve_identity_and_do_not_duplicate_explicit_chang
     );
     let changes = plan(&before, &ids, &after, &renamed_ids);
     assert!(changes.changes.iter().any(|p| matches!(&p.change,
-        Change::SetPrimaryKey { table, from: None, to: Some(key) }
+        Change::SetPrimaryKey { table, from: None, to: Some(key), .. }
         if table == &new_parent && key.columns == ["wide"])));
     assert!(changes.changes.iter().any(|p| matches!(&p.change,
         Change::AddForeignKey { constraint, .. } if constraint.references_table == new_parent

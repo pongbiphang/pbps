@@ -383,6 +383,7 @@ fn dropped_relation(
         table,
         from: Some(pk),
         to: None,
+        ..
     } = change
     {
         return pk.name.as_deref().map(|name| (table, name));

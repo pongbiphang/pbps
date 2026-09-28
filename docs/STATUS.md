@@ -21,6 +21,11 @@ a block has stopped looking like reference data.
 Declarations may carry database roles and their grants (`role:`, ADR-0005);
 membership stays each environment's own.
 
+A SQL Server table declares its clustered index with `clustered:` (`heap`, or
+the UNIQUE constraint or index that holds the rows; absent is a clustered
+primary key), and `pull` reads it (#1178, DEC-1178.1). PostgreSQL refuses the
+field. Columnstore, XML, spatial and hash indexes stay limitations.
+
 Offline: `plan` (`--check` / `--since` / `--base` / `--out` / `--sql` / `--dev`),
 `validate` (`--since`), `fmt` (`--check`), `rename`, `rename-table`, `rename-role`, `drop`,
 `drop-table`, `drop-role`,

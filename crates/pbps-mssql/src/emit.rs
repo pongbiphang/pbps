@@ -601,7 +601,12 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
         // pretends to do something.
         Change::SetColumnDeprecated { .. } => Ok(Vec::new()),
 
-        Change::SetPrimaryKey { table, from, to } => {
+        Change::SetPrimaryKey {
+            table,
+            from,
+            to,
+            nonclustered,
+        } => {
             let mut out = Vec::new();
             if let Some(pk) = from {
                 out.push(drop_primary_key(table, pk)?);
@@ -610,7 +615,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
                 out.push(Statement::new(format!(
                     "ALTER TABLE {} ADD {}{};",
                     qualified(table)?,
-                    primary_key_clause(pk)?,
+                    primary_key_clause(pk, !nonclustered)?,
                     online(strategy)
                 )));
             }
@@ -621,11 +626,11 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             table,
             name,
             constraint,
+            clustered,
         } => one(format!(
-            "ALTER TABLE {} ADD CONSTRAINT {} UNIQUE ({}){};",
+            "ALTER TABLE {} ADD {}{};",
             qualified(table)?,
-            quote(name)?,
-            column_list(&constraint.columns)?,
+            unique_clause(name, constraint, *clustered)?,
             online(strategy)
         )),
 
@@ -650,13 +655,18 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             verbatim(&constraint.expression)
         )),
 
-        // No ONLINE clause on any of the three, for two different reasons. A
-        // foreign key and a check are metadata only, where the clause is a
-        // syntax error rather than a no-op. A UNIQUE constraint *is* backed by
-        // an index, but dropping one takes the option only when that index is
-        // clustered — and this emitter writes no CLUSTERED, so every constraint
-        // it creates is nonclustered and the statement would be rejected even on
-        // Enterprise. Building one online is a different matter: see AddUnique.
+        // No ONLINE clause on any of the three. A foreign key and a check are
+        // metadata only, where the clause is a syntax error rather than a
+        // no-op. A UNIQUE constraint *is* backed by an index, and dropping one
+        // takes the option only when that index is clustered (3745 otherwise,
+        // measured). The change does not say whether the constraint it drops
+        // is the clustered one — the plan's baseline does, and the emitter is
+        // handed the change alone — so the clause would be a guess, and a
+        // wrong guess is a statement the server rejects. An offline drop of a
+        // clustered constraint is always accepted: it rebuilds the table as a
+        // heap while holding its lock, which the operational note on the
+        // layout change says (#1178). Building one online is a different
+        // matter: see AddUnique.
         Change::DropUnique { table, name }
         | Change::DropForeignKey { table, name }
         | Change::DropCheck { table, name } => one(format!(
@@ -665,15 +675,22 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             quote(name)?
         )),
 
-        Change::AddIndex { table, name, index } => one(create_index(table, name, index, strategy)?),
+        Change::AddIndex {
+            table,
+            name,
+            index,
+            clustered,
+        } => one(create_index(table, name, index, *clustered, strategy)?),
 
         // No ONLINE clause, deliberately. SQL Server accepts `WITH (ONLINE =
         // ON)` on a drop only for a **clustered** index, where the drop rebuilds
-        // the table as a heap and there is something to do online; every index
-        // this emitter creates is nonclustered (introspection adopts no other
-        // physical kind), so the clause would be rejected even on Enterprise.
-        // Dropping a nonclustered index is metadata anyway, which is why
-        // nothing is lost.
+        // the table as a heap and there is something to do online, and rejects
+        // it on a nonclustered one (3745, measured). Since #1178 an index this
+        // emitter drops can be either, and the change does not say which — so,
+        // as for a UNIQUE constraint above, the drop is always offline. That
+        // costs nothing on a nonclustered index, whose drop is metadata; on a
+        // clustered one it is the heap rebuild under the table lock that the
+        // layout change's operational note names.
         Change::DropIndex { table, name } => one(format!(
             "DROP INDEX {} ON {};",
             quote(name)?,
@@ -1458,20 +1475,43 @@ fn column_definition(
     Ok(s)
 }
 
-fn primary_key_clause(pk: &PrimaryKey) -> Result<String, DialectError> {
+/// The key, with its layout always spelled out.
+///
+/// Never left to the engine's default, although the default is what the
+/// clustered case asks for. A `PRIMARY KEY` that spells neither keyword is
+/// clustered only when the table has no clustered index yet; otherwise it is
+/// silently nonclustered — measured, `ALTER TABLE a ADD CONSTRAINT pk_a
+/// PRIMARY KEY (id)` beside a clustered index came back `type = 2`. Spelled
+/// `CLUSTERED`, the same statement is refused (1902) instead, so a plan that
+/// meets a clustered index it did not expect stops rather than recording a key
+/// laid out otherwise than declared (#1178).
+fn primary_key_clause(pk: &PrimaryKey, clustered: bool) -> Result<String, DialectError> {
     let cols = column_list(&pk.columns)?;
+    let layout = if clustered {
+        "CLUSTERED"
+    } else {
+        "NONCLUSTERED"
+    };
     Ok(match &pk.name {
-        Some(n) => format!("CONSTRAINT {} PRIMARY KEY ({cols})", quote(n)?),
+        Some(n) => format!("CONSTRAINT {} PRIMARY KEY {layout} ({cols})", quote(n)?),
         // Unnamed leaves the server to invent one. That is a real choice a user
         // can make, so it is emitted faithfully rather than named on their behalf.
-        None => format!("PRIMARY KEY ({cols})"),
+        None => format!("PRIMARY KEY {layout} ({cols})"),
     })
 }
 
-fn unique_clause(name: &str, u: &UniqueConstraint) -> Result<String, DialectError> {
+/// A UNIQUE constraint. `NONCLUSTERED` is not spelled: unlike a key's, a
+/// UNIQUE constraint's default does not depend on the table — it is
+/// nonclustered whatever else is there — so leaving it out changes nothing.
+fn unique_clause(
+    name: &str,
+    u: &UniqueConstraint,
+    clustered: bool,
+) -> Result<String, DialectError> {
     Ok(format!(
-        "CONSTRAINT {} UNIQUE ({})",
+        "CONSTRAINT {} UNIQUE {}({})",
         quote(name)?,
+        if clustered { "CLUSTERED " } else { "" },
         column_list(&u.columns)?
     ))
 }
@@ -1508,8 +1548,22 @@ fn create_index(
     table: &TableName,
     name: &str,
     index: &Index,
+    clustered: bool,
     strategy: Strategy,
 ) -> Result<String, DialectError> {
+    // Both are refused by `validate` before a plan exists; a change that
+    // arrives here with either anyway would be a statement the engine
+    // rejects (10601 for INCLUDE; a filter is a syntax error), so it is
+    // refused here too rather than sent.
+    if clustered && (!index.include.is_empty() || index.filter.is_some()) {
+        return Err(DialectError::Invalid {
+            dialect: DIALECT,
+            message: format!(
+                "index `{name}` on `{table}` is the clustered index, which can have neither \
+                 INCLUDE columns nor a WHERE filter"
+            ),
+        });
+    }
     let keys = index
         .columns
         .iter()
@@ -1524,8 +1578,9 @@ fn create_index(
         .join(", ");
 
     let mut s = format!(
-        "CREATE {}INDEX {} ON {} ({keys})",
+        "CREATE {}{}INDEX {} ON {} ({keys})",
         if index.unique { "UNIQUE " } else { "" },
+        if clustered { "CLUSTERED " } else { "" },
         quote(name)?,
         qualified(table)?
     );
@@ -1557,7 +1612,7 @@ fn create_table(name: &TableName, table: &Table) -> Sql {
     // so that creating a table and altering one take the same code path and cannot
     // drift apart.
     if let Some(pk) = &table.primary_key {
-        body.push(primary_key_clause(pk)?);
+        body.push(primary_key_clause(pk, table.primary_key_is_clustered())?);
     }
 
     let mut out = vec![Statement::new(format!(
@@ -1565,10 +1620,18 @@ fn create_table(name: &TableName, table: &Table) -> Sql {
         body.join(",\n    ")
     ))];
 
-    for (n, u) in &table.unique {
+    // The clustered constraint or index first, if another object is the
+    // clustered one: the table is empty, so the order costs nothing today,
+    // but it is the order `dependency_rank` gives the same objects on an
+    // existing table, where building nonclustered indexes first means
+    // rebuilding them (#1178).
+    let clustered_first = |clustered: bool| !clustered;
+    let mut unique: Vec<_> = table.unique.iter().collect();
+    unique.sort_by_key(|(n, _)| clustered_first(table.unique_is_clustered(n)));
+    for (n, u) in unique {
         out.push(Statement::new(format!(
             "ALTER TABLE {qualified_name} ADD {};",
-            unique_clause(n, u)?
+            unique_clause(n, u, table.unique_is_clustered(n))?
         )));
     }
     for (n, c) in &table.checks {
@@ -1584,13 +1647,16 @@ fn create_table(name: &TableName, table: &Table) -> Sql {
             foreign_key_clause(n, fk)?
         )));
     }
-    for (n, idx) in &table.indexes {
+    let mut indexes: Vec<_> = table.indexes.iter().collect();
+    indexes.sort_by_key(|(n, _)| clustered_first(table.index_is_clustered(n)));
+    for (n, idx) in indexes {
         // No ONLINE here: the table was created by the statement above it and
         // holds no rows, so there is nothing for an online build to spare.
         out.push(Statement::new(create_index(
             name,
             n,
             idx,
+            table.index_is_clustered(n),
             Strategy::default(),
         )?));
     }
@@ -1734,11 +1800,12 @@ fn rename_table(from: &TableName, to: &TableName, defaults: &[String]) -> Sql {
 /// Drops the primary key, looking its name up when the declarations do not
 /// carry one.
 /// No ONLINE clause: the option is accepted on a constraint drop only when the
-/// constraint's index is clustered, and the model does not record clusteredness
-/// — [`crate::introspect`] does not read it back, so a primary key adopted as
-/// `NONCLUSTERED` is indistinguishable here from a clustered one. Emitting the
-/// hint on a guess would produce a statement the server rejects outright, which
-/// is worse than an offline drop of a key that was going to be rebuilt anyway.
+/// constraint's index is clustered (3745 otherwise), and the drop half of a
+/// [`Change::SetPrimaryKey`] does not carry the layout of the key it removes —
+/// that is the baseline's, and only the key being *added* is resolved against
+/// its table's selector (#1178). Emitting the hint on a guess would produce a
+/// statement the server rejects outright, which is worse than an offline drop
+/// of a key that was going to be rebuilt anyway.
 fn drop_primary_key(table: &TableName, pk: &PrimaryKey) -> Result<Statement, DialectError> {
     let q = qualified(table)?;
     Ok(match &pk.name {
@@ -1864,8 +1931,198 @@ mod tests {
         });
         assert_eq!(
             sql[0],
-            "CREATE TABLE [dbo].[customer] (\n    [id] bigint NOT NULL,\n    [email] nvarchar(255) NULL,\n    CONSTRAINT [pk_customer] PRIMARY KEY ([id])\n);"
+            "CREATE TABLE [dbo].[customer] (\n    [id] bigint NOT NULL,\n    [email] nvarchar(255) NULL,\n    CONSTRAINT [pk_customer] PRIMARY KEY CLUSTERED ([id])\n);"
         );
+    }
+
+    /// A key's layout is always spelled, because a bare `PRIMARY KEY` beside
+    /// an existing clustered index is silently nonclustered; a UNIQUE
+    /// constraint or index spells `CLUSTERED` only when it is the one; and
+    /// the clustered one is built ahead of its siblings (#1178).
+    #[test]
+    fn every_key_spells_its_layout_and_the_clustered_object_is_built_first() {
+        use pbps_model::Clustered;
+        let mut t = Table::default();
+        t.columns
+            .insert("id".into(), Column::new(ty("int")).not_null());
+        t.columns
+            .insert("code".into(), Column::new(ty("int")).not_null());
+        t.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        });
+        for n in ["uq_a", "uq_b"] {
+            t.unique.insert(
+                n.into(),
+                UniqueConstraint {
+                    columns: vec!["code".into()],
+                },
+            );
+        }
+        for n in ["ix_a", "ix_b"] {
+            t.indexes.insert(
+                n.into(),
+                Index {
+                    columns: vec![IndexColumn {
+                        name: "code".into(),
+                        descending: false,
+                    }],
+                    include: vec![],
+                    unique: false,
+                    filter: None,
+                },
+            );
+        }
+        let create = |layout: Option<Clustered>| {
+            let mut t = t.clone();
+            t.clustered = layout;
+            sql_of(&Change::CreateTable {
+                uid: uid("t_k7x2mq"),
+                name: tname("dbo.t"),
+                table: Box::new(t),
+            })
+        };
+        let sql = create(None);
+        assert!(
+            sql[0].contains("PRIMARY KEY CLUSTERED ([id])"),
+            "{}",
+            sql[0]
+        );
+        assert!(sql.iter().all(|s| !s.contains("UNIQUE CLUSTERED")));
+        let sql = create(Some(Clustered::Heap));
+        assert!(
+            sql[0].contains("PRIMARY KEY NONCLUSTERED ([id])"),
+            "{}",
+            sql[0]
+        );
+        assert!(
+            sql[1..].iter().all(|s| !s.contains(" CLUSTERED")),
+            "{sql:?}"
+        );
+        let sql = create(Some(Clustered::Unique("uq_b".into())));
+        assert!(sql[0].contains("PRIMARY KEY NONCLUSTERED"), "{}", sql[0]);
+        assert_eq!(
+            sql[1],
+            "ALTER TABLE [dbo].[t] ADD CONSTRAINT [uq_b] UNIQUE CLUSTERED ([code]);"
+        );
+        assert!(sql[2].contains("[uq_a] UNIQUE ([code])"), "{}", sql[2]);
+        let sql = create(Some(Clustered::Index("ix_b".into())));
+        let at = |needle: &str| sql.iter().position(|s| s.contains(needle)).unwrap();
+        assert!(sql[at("[ix_b]")].starts_with("CREATE CLUSTERED INDEX [ix_b]"));
+        assert!(at("[ix_b]") < at("[ix_a]"), "{sql:?}");
+
+        // The same through the changes that alter an existing table.
+        let key = |nonclustered| {
+            sql_of(&Change::SetPrimaryKey {
+                table: tname("dbo.t"),
+                from: None,
+                to: t.primary_key.clone(),
+                nonclustered,
+            })
+        };
+        assert_eq!(
+            key(false),
+            ["ALTER TABLE [dbo].[t] ADD PRIMARY KEY CLUSTERED ([id]);"]
+        );
+        assert_eq!(
+            key(true),
+            ["ALTER TABLE [dbo].[t] ADD PRIMARY KEY NONCLUSTERED ([id]);"]
+        );
+        let index = |clustered| {
+            sql_of(&Change::AddIndex {
+                table: tname("dbo.t"),
+                name: "ix_a".into(),
+                index: Box::new(t.indexes["ix_a"].clone()),
+                clustered,
+            })
+        };
+        assert_eq!(
+            index(true),
+            ["CREATE CLUSTERED INDEX [ix_a] ON [dbo].[t] ([code] ASC);"]
+        );
+        assert_eq!(
+            index(false),
+            ["CREATE INDEX [ix_a] ON [dbo].[t] ([code] ASC);"]
+        );
+
+        // Negative: a clustered index with what the engine refuses on one is
+        // refused here too, not sent.
+        let mut filtered = t.indexes["ix_a"].clone();
+        filtered.filter = Some("code > 0".into());
+        assert!(
+            emit(
+                &Change::AddIndex {
+                    table: tname("dbo.t"),
+                    name: "ix_a".into(),
+                    index: Box::new(filtered),
+                    clustered: true,
+                },
+                Strategy::default()
+            )
+            .is_err()
+        );
+    }
+
+    /// The edition gate asks `takes_online`, so a clustered build under the
+    /// online hint is one it refuses off Enterprise, like any index build;
+    /// the drops take no clause and are never refused for it (#1178).
+    #[test]
+    fn a_clustered_build_takes_online_and_a_drop_does_not() {
+        let key = PrimaryKey {
+            name: Some("pk_t".into()),
+            columns: vec!["id".into()],
+        };
+        let index = Index {
+            columns: vec![IndexColumn {
+                name: "id".into(),
+                descending: false,
+            }],
+            include: vec![],
+            unique: false,
+            filter: None,
+        };
+        for build in [
+            Change::SetPrimaryKey {
+                table: tname("dbo.t"),
+                from: None,
+                to: Some(key.clone()),
+                nonclustered: false,
+            },
+            Change::AddIndex {
+                table: tname("dbo.t"),
+                name: "cx".into(),
+                index: Box::new(index.clone()),
+                clustered: true,
+            },
+            Change::AddUnique {
+                table: tname("dbo.t"),
+                name: "uq".into(),
+                constraint: UniqueConstraint {
+                    columns: vec!["id".into()],
+                },
+                clustered: true,
+            },
+        ] {
+            assert!(takes_online(&build), "{build:?}");
+        }
+        for drop in [
+            Change::SetPrimaryKey {
+                table: tname("dbo.t"),
+                from: Some(key),
+                to: None,
+                nonclustered: false,
+            },
+            Change::DropIndex {
+                table: tname("dbo.t"),
+                name: "cx".into(),
+            },
+            Change::DropUnique {
+                table: tname("dbo.t"),
+                name: "uq".into(),
+            },
+        ] {
+            assert!(!takes_online(&drop), "{drop:?}");
+        }
     }
 
     /// Nullability is never implicit: an omitted clause means NULL to the
@@ -2465,6 +2722,7 @@ mod tests {
                 columns: vec!["id".into()],
             }),
             to: None,
+            nonclustered: false,
         });
         assert!(sql[0].contains("sys.key_constraints"), "{}", sql[0]);
 
@@ -2475,6 +2733,7 @@ mod tests {
                 columns: vec!["id".into()],
             }),
             to: None,
+            nonclustered: false,
         });
         assert_eq!(named, ["ALTER TABLE [dbo].[t] DROP CONSTRAINT [pk_t];"]);
     }
@@ -2556,6 +2815,7 @@ mod tests {
                 unique: false,
                 filter: Some("a IS NOT NULL -- only the live ones".into()),
             }),
+            clustered: false,
         });
         assert_eq!(
             index,
@@ -2585,6 +2845,7 @@ mod tests {
                 unique: true,
                 filter: Some("a IS NOT NULL".into()),
             }),
+            clustered: false,
         });
         assert_eq!(
             sql,
@@ -2650,6 +2911,7 @@ mod tests {
                 columns: vec!["id".into()],
             }),
             to: None,
+            nonclustered: false,
         });
         let looked_up_default = sql_of(&Change::DropColumn {
             uid: uid("c_k7x2mq"),
@@ -2725,6 +2987,7 @@ mod tests {
                 unique: false,
                 filter: None,
             }),
+            clustered: false,
         }
     }
 
@@ -2757,6 +3020,7 @@ mod tests {
                 constraint: UniqueConstraint {
                     columns: vec!["order_id".into()],
                 },
+                clustered: false,
             }),
             [
                 "ALTER TABLE [dbo].[order_line] ADD CONSTRAINT [uq_line] UNIQUE ([order_id]) WITH (ONLINE = ON);"

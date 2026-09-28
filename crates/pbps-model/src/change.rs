@@ -267,11 +267,23 @@ pub enum Change {
         table: TableName,
         from: Option<PrimaryKey>,
         to: Option<PrimaryKey>,
+        /// The key `to` adds is nonclustered: its table declares another
+        /// layout ([`Table::clustered`]). `false` is the default layout, a
+        /// clustered key, which is what a change written before the field
+        /// existed meant. The table-level selector cannot travel here — the
+        /// change carries the key, not its table — so the differ resolves it
+        /// into the one fact the emitter needs.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        nonclustered: bool,
     },
     AddUnique {
         table: TableName,
         name: String,
         constraint: UniqueConstraint,
+        /// This constraint's index is the table's clustered one
+        /// ([`Table::clustered`]).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        clustered: bool,
     },
     DropUnique {
         table: TableName,
@@ -299,6 +311,9 @@ pub enum Change {
         table: TableName,
         name: String,
         index: Box<Index>,
+        /// This index is the table's clustered one ([`Table::clustered`]).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        clustered: bool,
     },
     DropIndex {
         table: TableName,
@@ -748,23 +763,28 @@ impl PartAfter<'_> {
 }
 
 /// The definition a plan adds a part with, by kind.
+///
+/// The `bool` on the three index-backed kinds is whether the part's index is
+/// the table's clustered one (#1178). A key read back with the right columns
+/// under the wrong layout is not the key the plan made: it is the silent swap
+/// #1186 found on bootstrap, arriving through an apply instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PartDefinition<'a> {
-    PrimaryKey(&'a PrimaryKey),
-    Unique(&'a UniqueConstraint),
+    PrimaryKey(&'a PrimaryKey, bool),
+    Unique(&'a UniqueConstraint, bool),
     ForeignKey(&'a ForeignKey),
     Check(&'a CheckConstraint),
-    Index(&'a Index),
+    Index(&'a Index, bool),
 }
 
 impl PartDefinition<'_> {
     pub fn part(&self) -> Part {
         match self {
-            PartDefinition::PrimaryKey(_) => Part::PrimaryKey,
-            PartDefinition::Unique(_) => Part::Unique,
+            PartDefinition::PrimaryKey(..) => Part::PrimaryKey,
+            PartDefinition::Unique(..) => Part::Unique,
             PartDefinition::ForeignKey(_) => Part::ForeignKey,
             PartDefinition::Check(_) => Part::Check,
-            PartDefinition::Index(_) => Part::Index,
+            PartDefinition::Index(..) => Part::Index,
         }
     }
 }
@@ -1636,11 +1656,16 @@ impl Change {
         let it = |table, name, after| Some(PartChange { table, name, after });
         let standing = |d| PartAfter::Standing(d);
         match self {
-            Change::SetPrimaryKey { table, to, .. } => it(
+            Change::SetPrimaryKey {
+                table,
+                to,
+                nonclustered,
+                ..
+            } => it(
                 table,
                 None,
                 match to {
-                    Some(key) => standing(PartDefinition::PrimaryKey(key)),
+                    Some(key) => standing(PartDefinition::PrimaryKey(key, !nonclustered)),
                     None => PartAfter::Gone(Part::PrimaryKey),
                 },
             ),
@@ -1648,10 +1673,11 @@ impl Change {
                 table,
                 name,
                 constraint,
+                clustered,
             } => it(
                 table,
                 Some(name),
-                standing(PartDefinition::Unique(constraint)),
+                standing(PartDefinition::Unique(constraint, *clustered)),
             ),
             Change::DropUnique { table, name, .. } => {
                 it(table, Some(name), PartAfter::Gone(Part::Unique))
@@ -1680,9 +1706,16 @@ impl Change {
             Change::DropCheck { table, name, .. } => {
                 it(table, Some(name), PartAfter::Gone(Part::Check))
             }
-            Change::AddIndex { table, name, index } => {
-                it(table, Some(name), standing(PartDefinition::Index(index)))
-            }
+            Change::AddIndex {
+                table,
+                name,
+                index,
+                clustered,
+            } => it(
+                table,
+                Some(name),
+                standing(PartDefinition::Index(index, *clustered)),
+            ),
             Change::DropIndex { table, name, .. } => {
                 it(table, Some(name), PartAfter::Gone(Part::Index))
             }
@@ -2450,6 +2483,7 @@ mod tests {
                 unique,
                 filter: None,
             }),
+            clustered: false,
         };
         assert_eq!(
             index(true).intrinsic_risks(),

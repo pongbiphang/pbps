@@ -8,12 +8,12 @@ use serde_saphyr::Spanned;
 use std::str::FromStr;
 
 use pbps_model::{
-    CheckConstraint, Column, ColumnType, DataMode, ForeignKey, GrantTarget, Identity, Index,
-    IndexColumn, Intent, Module, ModuleId, ModuleKind, Permission, PrimaryKey, Role, Row, RowKey,
-    Strategy, Table, TableData, TableName, UniqueConstraint, Value,
+    CheckConstraint, Clustered, Column, ColumnType, DataMode, ForeignKey, GrantTarget, Identity,
+    Index, IndexColumn, Intent, Module, ModuleId, ModuleKind, Permission, PrimaryKey, Role, Row,
+    RowKey, Strategy, Table, TableData, TableName, UniqueConstraint, Value,
 };
 
-use crate::dto::{DataDto, ModuleDto, PrimaryKeyDto, RoleDto, TableDto, ValueDto};
+use crate::dto::{ClusteredDto, DataDto, ModuleDto, PrimaryKeyDto, RoleDto, TableDto, ValueDto};
 use crate::error::{LoadError, SourceFile, to_span};
 
 /// The result of loading one declaration file.
@@ -352,6 +352,11 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
                 checks,
                 indexes,
                 data,
+                clustered: dto.clustered.map(|c| match c {
+                    ClusteredDto::Heap => Clustered::Heap,
+                    ClusteredDto::Unique(name) => Clustered::Unique(name),
+                    ClusteredDto::Index(name) => Clustered::Index(name),
+                }),
             },
             intents,
             strategy: dto.strategy.map(|s| Strategy { online: s.online }),

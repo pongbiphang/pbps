@@ -40,6 +40,18 @@ fn invalid(message: impl Into<String>) -> DialectError {
 pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
     let mut found = Vec::new();
     found.extend(table.constraint_name_conflicts().into_iter().map(invalid));
+    // Refused whatever it names, so its structural problems are not asked
+    // on top: the whole line is the mistake. `CLUSTER` is not the same
+    // thing under another name — the engine's documentation calls it "a
+    // one-time operation", after which new and updated rows go wherever
+    // there is room — so there is no statement a plan could emit to honour
+    // it (#1178).
+    if table.clustered.is_some() {
+        found.push(invalid(
+            "`clustered` is a SQL Server table layout: PostgreSQL has no clustered index \
+             (`CLUSTER` reorders a table once and keeps no order), so remove the line",
+        ));
+    }
     if let Some(pk) = &table.primary_key {
         found.extend(key_columns("primary key", &pk.columns, table, true));
     }

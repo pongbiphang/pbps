@@ -39,3 +39,5 @@ DECISIONS 465).
   naming where its fingerprint key is read from (issue #952, DEC-952.1).
 - `16/` adds `explain`'s `unchecked`, the checks a plan implies that cannot be asked
   before it runs, apart from its executable `probes` (issue #478).
+- `17/` adds a table's `clustered:` layout selector: `heap`, or the UNIQUE
+  constraint or index that is the clustered one (issue #1178).

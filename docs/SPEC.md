@@ -214,6 +214,13 @@ indexes:
   (`INT` / `int` / `integer` are one type).
 - **`deprecated` needs only a reason**; the date comes from git and is not written
   by hand.
+- **`clustered` says which index holds a SQL Server table's rows**, only where
+  that is not the default: `clustered: heap` for a primary key with no
+  clustered index, or `clustered: {unique: uq_x}` / `clustered: {index: ix_x}`
+  for the constraint or index that is clustered. Absent means a clustered
+  primary key, or a heap for a table without one — the engine's own default.
+  One selector per table, so two clustered indexes cannot be written;
+  PostgreSQL refuses the key (DEC-1178.1).
 - **Comments belong in `description` fields only.** The tool owns the file format
   and `pbps fmt` rewrites files canonically, so ordinary YAML comments are lost.
   `description` doubles as the source for data-catalogue integration.

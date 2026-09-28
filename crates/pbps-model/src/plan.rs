@@ -113,7 +113,17 @@ use crate::schema::Schema;
 /// has no pins and says nothing about the routines it can reach, and a missing
 /// field would read as "nothing to pin". The number turns it away as stale
 /// instead.
-pub const CURRENT_VERSION: u32 = 10;
+///
+/// Bumped to 11 for the clustered layout (#1178): `SetPrimaryKey`'s
+/// `nonclustered`, and `AddUnique`'s and `AddIndex`'s `clustered`, with
+/// `Table::clustered` inside a created table's payload. A version 10 reader
+/// denies the new fields, and that is the harmless direction. The other is
+/// not: a version 10 plan read by this build would deserialize, every key in
+/// it clustered by default — and this build now spells `CLUSTERED` where the
+/// old one left the layout to the engine, so the same plan could be refused
+/// (1902) where it was reviewed as applying, or build a layout nobody
+/// reviewed. Turned away as stale; the remedy is a new `plan --db`.
+pub const CURRENT_VERSION: u32 = 11;
 
 /// Where a plan came from, and therefore whether it may be applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -523,7 +533,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 10);
+        assert_eq!(CURRENT_VERSION, 11);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads
