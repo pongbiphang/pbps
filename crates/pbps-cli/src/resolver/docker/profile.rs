@@ -467,6 +467,9 @@ mod tests {
             .unwrap()
             .try_into()
             .unwrap();
+        // Keep the storage recipe known so only missing environment metadata
+        // can cause the refusal this test is meant to pin.
+        image.postgres_layout = Some(engine::PostgresLayout::Root);
         assert!(matches!(
             Launch::new(&image, Driver::Postgres, "owner"),
             Err(Error::UnsupportedLaunch)
