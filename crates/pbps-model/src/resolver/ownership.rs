@@ -20,6 +20,10 @@ pub enum ObjectOwnership {
 }
 
 impl ObjectOwnership {
+    pub(super) fn matches_surface(&self, surface: &Surface, changes: &ChangeSet) -> bool {
+        matches!(self, Self::Surface(owner) if relocated(owner, changes) == relocated(surface, changes))
+    }
+
     pub(super) fn permits(&self, surface: &Surface, changes: &ChangeSet) -> bool {
         let Self::Surface(owner) = self else {
             return false;

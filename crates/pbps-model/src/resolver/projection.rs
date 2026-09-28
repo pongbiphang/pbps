@@ -39,21 +39,9 @@ impl InputManifest {
             .iter()
             .filter(|p| changes_catalog(&p.change))
         {
-            let mut matching = transitions
+            if !transitions
                 .iter()
-                .filter(|t| covers_change(&step.change, &t.surface));
-            if matching.clone().next().is_none() {
-                return Err(ManifestError::Incomplete);
-            }
-            // Plain tables/columns need no binding observation. Their rename
-            // must still remove an opening inventory and install a closing
-            // one; otherwise a one-sided rename masquerades as DROP or ADD.
-            // Allow either one aggregate transition or separate old/new ones.
-            if matches!(
-                step.change,
-                Change::RenameTable { .. } | Change::RenameColumn { .. }
-            ) && (!matching.clone().any(|t| !t.before.is_empty())
-                || !matching.any(|t| !t.after.is_empty()))
+                .any(|t| covers_change(&step.change, &t.surface))
             {
                 return Err(ManifestError::Incomplete);
             }
@@ -94,6 +82,33 @@ impl InputManifest {
             for object in &transition.after {
                 if !installed.insert(object.clone()) {
                     return Err(ManifestError::Invalid);
+                }
+            }
+        }
+        // A Table/Column label grants permission to aggregate children, but
+        // it proves neither that the owner nor that all its captured children
+        // were listed. Check the independent manifests (SPEC 9.3.2). Split
+        // inventories and rename endpoints may jointly account for the records.
+        for step in &changes.changes {
+            if let Some((owner, opening, closing)) = lifecycle_owner(&step.change) {
+                for (manifest, inventory, required) in
+                    [(self, &removed, opening), (compiled, &installed, closing)]
+                {
+                    if !required {
+                        continue;
+                    }
+                    let mut owner_present = false;
+                    for record in manifest.prerequisites() {
+                        if record.ownership.permits(&owner, changes) {
+                            owner_present |= record.ownership.matches_surface(&owner, changes);
+                            if !inventory.contains(&record.object) {
+                                return Err(ManifestError::Incomplete);
+                            }
+                        }
+                    }
+                    if !owner_present {
+                        return Err(ManifestError::Incomplete);
+                    }
                 }
             }
         }
@@ -170,6 +185,26 @@ impl InputManifest {
             runtime_bound,
             lookups,
         )
+    }
+}
+
+// These changes create/remove the owner or relocate its complete catalog
+// inventory. An ADD COLUMN may aggregate under Table without changing every
+// other child of that table, so derive the owner from the typed change itself.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn lifecycle_owner(change: &Change) -> Option<(Surface, bool, bool)> {
+    match change {
+        Change::CreateTable { name, .. } => Some((Surface::Table(name.clone()), false, true)),
+        Change::DropTable { name, .. } => Some((Surface::Table(name.clone()), true, false)),
+        Change::RenameTable { from, .. } => Some((Surface::Table(from.clone()), true, true)),
+        Change::AddColumn { table, name, .. } => {
+            Some((Surface::Column(table.column(name)), false, true))
+        }
+        Change::DropColumn { column, .. } => Some((Surface::Column(column.clone()), true, false)),
+        Change::RenameColumn { table, from, .. } => {
+            Some((Surface::Column(table.column(from)), true, true))
+        }
+        _ => None,
     }
 }
 

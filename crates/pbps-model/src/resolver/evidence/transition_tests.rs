@@ -355,7 +355,12 @@ fn removing_a_predicate_can_retain_the_plain_index_catalog_record() {
 // A default and its owner are distinct catalog records. Keeping only the
 // child's transition must not leave a dropped owner, or omit a created one,
 // even when the binding-surface inventory contains only the expression.
-fn owner_coverage(change: Change, owner: Surface, child: Surface, creating: bool) {
+fn owner_coverage(
+    change: Change,
+    owner: Surface,
+    child: Surface,
+    creating: bool,
+) -> (ChangeSet, ResolverEvidence) {
     use crate::resolver::{BoundSurface, Prerequisite};
     let table: TableName = "app.v".parse().unwrap();
     let (_, mut evidence) = drop_fixture(
@@ -465,6 +470,7 @@ fn owner_coverage(change: Change, owner: Surface, child: Surface, creating: bool
         aggregate.transitions[0].surface = Surface::Table(table);
         aggregate.validate(&changes).unwrap();
     }
+    let valid = evidence.clone();
     let child_only = BTreeSet::from([child_object]);
     evidence.transitions = vec![ObjectTransition {
         surface: child,
@@ -515,6 +521,7 @@ fn owner_coverage(change: Change, owner: Surface, child: Surface, creating: bool
         decoded.validate(&changes).is_err(),
         "reader accepted a stale owner record"
     );
+    (changes, valid)
 }
 
 #[test]
@@ -579,7 +586,7 @@ fn adding_a_column_requires_more_than_its_default_transition() {
     );
 }
 
-fn rename_endpoints(column: bool) {
+fn rename_endpoints(column: bool) -> (ChangeSet, ResolverEvidence) {
     let table: TableName = "app.v".parse().unwrap();
     let (drop, surface) = dropped_surfaces().pop().unwrap();
     let (_, mut evidence) = drop_fixture(drop, surface);
@@ -729,6 +736,7 @@ fn rename_endpoints(column: bool) {
             "constructor accepted missing rename endpoint"
         );
     }
+    (changes, evidence)
 }
 
 #[test]
@@ -889,4 +897,262 @@ fn proved_internal_objects_are_allowed_but_referenced_objects_are_not_owned() {
         Surface::Module("app.external".parse().unwrap()),
     );
     assert_projection_refuses(&plan.changes, *evidence);
+}
+
+// Construct the wrong closing state caused by omitting exactly this record.
+// On DROP it survives; on CREATE it is absent. Membership follows that state
+// so the reader regression cannot pass merely because the fixture is malformed.
+fn omitted_closing_record(
+    before: &InputManifest,
+    after: &InputManifest,
+    object: &ObjectIdentity,
+    creating: bool,
+) -> InputManifest {
+    let mut records = after.prerequisites().to_vec();
+    if creating {
+        records.retain(|p| &p.object != object);
+    } else {
+        records.push(
+            before
+                .prerequisites()
+                .iter()
+                .find(|p| &p.object == object)
+                .unwrap()
+                .clone(),
+        );
+        records.sort_by(|a, b| a.object.cmp(&b.object));
+    }
+    let mut membership = after.membership().to_vec();
+    for (result, opening) in membership.iter_mut().zip(before.membership()) {
+        if creating {
+            result.members.remove(object);
+        } else if opening.members.contains(object) {
+            result.members.insert(object.clone());
+        }
+    }
+    let mut json = serde_json::to_value(after).unwrap();
+    json["prerequisites"] = serde_json::to_value(records).unwrap();
+    json["membership"] = serde_json::to_value(membership).unwrap();
+    serde_json::from_value(json).unwrap()
+}
+
+fn aggregate_records(change: Change, owner: Surface, child: Surface, creating: bool) {
+    let (changes, evidence) = owner_coverage(change, owner.clone(), child, creating);
+    let inventory = if creating {
+        &evidence.transitions[0].after
+    } else {
+        &evidence.transitions[0].before
+    };
+    let manifest = if creating {
+        &evidence.after
+    } else {
+        &evidence.before
+    };
+    let mut inventory: Vec<_> = inventory.iter().collect();
+    inventory.sort_by_key(|object| {
+        !manifest
+            .prerequisites()
+            .iter()
+            .any(|p| &p.object == *object && p.ownership == ObjectOwnership::Surface(owner.clone()))
+    });
+    // Omit either the owner or its child. Binding observations are deliberately
+    // absent: plain columns/defaults must not depend on an expression witness.
+    for object in inventory {
+        let mut omitted = evidence.clone();
+        omitted.surfaces.clear();
+        if creating {
+            omitted.transitions[0].after.remove(object);
+        } else {
+            omitted.transitions[0].before.remove(object);
+        }
+        assert!(
+            evidence
+                .before
+                .project(&changes, &evidence.after, &omitted.transitions)
+                .is_err(),
+            "aggregate projection accepted an omitted owned record"
+        );
+        assert!(
+            ResolverEvidence::new(
+                &changes,
+                evidence.qualification.clone(),
+                evidence.authorization.clone(),
+                evidence.before.clone(),
+                &evidence.after,
+                vec![],
+                omitted.transitions.clone(),
+                evidence.ordering.clone(),
+            )
+            .is_err(),
+            "aggregate constructor accepted an omitted owned record"
+        );
+        // The reader replays from the sealed closing manifest. Its typed
+        // lifecycle change independently requires an owner even when that
+        // owner was omitted from both the manifest and the transition. Child
+        // capture completeness itself remains the adapter's qualification.
+        if !manifest
+            .prerequisites()
+            .iter()
+            .any(|p| &p.object == object && p.ownership == ObjectOwnership::Surface(owner.clone()))
+        {
+            continue;
+        }
+        omitted.after = omitted_closing_record(&evidence.before, &evidence.after, object, creating);
+        let decoded: ResolverEvidence =
+            serde_json::from_value(serde_json::to_value(omitted).unwrap()).unwrap();
+        assert!(
+            decoded.validate(&changes).is_err(),
+            "aggregate reader accepted an omitted owned record"
+        );
+    }
+}
+
+#[test]
+fn aggregate_table_drops_require_all_owned_records() {
+    let table: TableName = "app.v".parse().unwrap();
+    aggregate_records(
+        Change::DropTable {
+            uid: "t_000000".parse().unwrap(),
+            name: table.clone(),
+        },
+        Surface::Table(table.clone()),
+        Surface::Default(table.column("n")),
+        false,
+    );
+}
+
+#[test]
+fn aggregate_table_creation_requires_all_owned_records() {
+    let table: TableName = "app.v".parse().unwrap();
+    let definition = serde_json::from_value(serde_json::json!({
+        "columns": {"n": {"type":"integer","nullable":true,"default":"7"}}
+    }))
+    .unwrap();
+    aggregate_records(
+        Change::CreateTable {
+            uid: "t_000000".parse().unwrap(),
+            name: table.clone(),
+            table: Box::new(definition),
+        },
+        Surface::Table(table.clone()),
+        Surface::Default(table.column("n")),
+        true,
+    );
+}
+
+#[test]
+fn aggregate_column_changes_require_all_owned_records() {
+    let table: TableName = "app.v".parse().unwrap();
+    let column =
+        serde_json::from_value(serde_json::json!({"type":"integer","nullable":true,"default":"7"}))
+            .unwrap();
+    for (change, creating) in [
+        (
+            Change::AddColumn {
+                uid: "c_000000".parse().unwrap(),
+                table: table.clone(),
+                name: "n".into(),
+                column: Box::new(column),
+            },
+            true,
+        ),
+        (
+            Change::DropColumn {
+                uid: "c_000000".parse().unwrap(),
+                column: table.column("n"),
+            },
+            false,
+        ),
+    ] {
+        aggregate_records(
+            change,
+            Surface::Column(table.column("n")),
+            Surface::Default(table.column("n")),
+            creating,
+        );
+    }
+}
+
+#[test]
+fn aggregate_renames_require_owned_records_at_both_endpoints() {
+    for column in [false, true] {
+        let (changes, mut evidence) = rename_endpoints(column);
+        let old = evidence.transitions[0]
+            .before
+            .iter()
+            .next()
+            .unwrap()
+            .clone();
+        let new = evidence.transitions[0].after.iter().next().unwrap().clone();
+        let mut children = Vec::new();
+        for (manifest, object) in [(&mut evidence.before, &old), (&mut evidence.after, &new)] {
+            let owner = manifest
+                .prerequisites()
+                .iter()
+                .find(|p| &p.object == object)
+                .unwrap()
+                .ownership
+                .clone();
+            let ObjectOwnership::Surface(surface) = owner else {
+                panic!("qualified")
+            };
+            let child_owner = match surface {
+                Surface::Table(t) => Surface::Default(t.column("n")),
+                Surface::Column(c) => Surface::Default(c),
+                Surface::Namespace(_)
+                | Surface::Default(_)
+                | Surface::Check { .. }
+                | Surface::Index { .. }
+                | Surface::Module(_) => panic!("table or column"),
+            };
+            let child = ObjectIdentity {
+                class: "adapter-owned-default".into(),
+                name: vec![],
+                signature: vec![object.clone()],
+            };
+            let mut records = manifest.prerequisites().to_vec();
+            records.push(crate::resolver::Prerequisite {
+                object: child.clone(),
+                ownership: ObjectOwnership::Surface(child_owner),
+                canonicalization: "fixture-v1".into(),
+                properties: "ee".repeat(32),
+                bindings: vec![],
+            });
+            records.sort_by(|a, b| a.object.cmp(&b.object));
+            let mut json = serde_json::to_value(&*manifest).unwrap();
+            json["prerequisites"] = serde_json::to_value(records).unwrap();
+            *manifest = serde_json::from_value(json).unwrap();
+            children.push(child);
+        }
+        evidence.transitions[0].before.insert(children[0].clone());
+        evidence.transitions[0].after.insert(children[1].clone());
+        evidence.validate(&changes).unwrap();
+        for omit_before in [true, false] {
+            let mut omitted = evidence.clone();
+            if omit_before {
+                omitted.transitions[0].before.remove(&old);
+            } else {
+                omitted.transitions[0].after.remove(&new);
+            }
+            assert!(
+                evidence
+                    .before
+                    .project(&changes, &evidence.after, &omitted.transitions)
+                    .is_err(),
+                "aggregate rename accepted a child in place of its owner"
+            );
+            omitted.after = omitted_closing_record(
+                &evidence.before,
+                &evidence.after,
+                if omit_before { &old } else { &new },
+                !omit_before,
+            );
+            let decoded: ResolverEvidence =
+                serde_json::from_value(serde_json::to_value(omitted).unwrap()).unwrap();
+            assert!(
+                decoded.validate(&changes).is_err(),
+                "aggregate rename reader accepted a missing owner"
+            );
+        }
+    }
 }

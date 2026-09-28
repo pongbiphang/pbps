@@ -214,8 +214,11 @@ A projected closing manifest permits approved catalog/grant changes while
 preserving untouched external inputs. Each transitioned record must carry an
 independently captured typed owner on its opening/closing prerequisite. An
 inventory cannot confer ownership merely by listing an object. Aggregate table
-and column owners and explicitly approved rename endpoints remain valid;
-references to external objects are not ownership. Raw catalog captures mark
+and column owners and explicitly approved rename endpoints remain valid.
+Table/column creation, removal and rename inventories must include the changed
+owner and all of its qualified records present in the corresponding manifest;
+an aggregate label cannot hide an omitted owner behind a listed child.
+References to external objects are not ownership. Raw catalog captures mark
 ownership unqualified and cannot authorize transitions until #615's qualified
 adapter bridge supplies that evidence. Missing ownership refuses on read.
 Serialization, version and downgrade negatives accompany engine-backed creation, replacement and grant/data cases
