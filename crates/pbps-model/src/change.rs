@@ -1222,10 +1222,12 @@ impl Change {
     /// have different answers and now have different functions
     /// (DECISIONS 170).
     ///
-    /// **Deprecation is in neither.** It emits no statement at all, and the
-    /// catalog reads back neither it nor the description, so it can move
-    /// nothing in a read-back — and excusing its column would drop a real
-    /// comparison to buy nothing.
+    /// This set includes the declaration-only [`ColumnField::Deprecated`]
+    /// marker for exhaustiveness. Deprecation emits no statement and no
+    /// catalog reads it back (SPEC §7.6); [`Change::columns`] excludes it.
+    /// Consumers deciding which bindings were invalidated must filter out
+    /// declaration-only fields. Checkpoint exclusions remain field-based:
+    /// this marker does not excuse comparisons of the column's other fields.
     // Exhaustive rather than a wildcard, for the reason [`Change::columns`]
     // gives: a change added later that alters a column has to be named here,
     // or the plan's own edit is reported as movement.
