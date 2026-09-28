@@ -301,11 +301,11 @@ async fn the_owned_container_resolves_the_overload_pair_on_its_qualified_connect
     let mut target = target().await;
     let mut candidate = candidate(&mut target, &socket, image).await;
     let recipe = target.database_recipe().await.unwrap();
-    let mut run = candidate
+    let mut unqualified_run = candidate
         .open_scratch(&recipe)
         .await
-        .expect("owned scratch opens");
-    let unqualified = run
+        .expect("prequalification refusal has its own owned run");
+    let unqualified = unqualified_run
         .resolve(&mut target, &request)
         .await
         .expect_err("declarations cannot cross before qualification");
@@ -313,6 +313,20 @@ async fn the_owned_container_resolves_the_overload_pair_on_its_qualified_connect
         unqualified.to_string().contains("not been qualified"),
         "{unqualified}"
     );
+    let refused_cleanup = unqualified_run.close().await;
+    let refused_recovery = refused_cleanup
+        .as_ref()
+        .err()
+        .map(|failure| failure.recovery_names.clone())
+        .unwrap_or_default();
+    cleanup_observation(&before, &refused_recovery);
+    target.check().await.unwrap();
+    let before = containers();
+    let mut candidate = candidate(&mut target, &socket, image).await;
+    let mut run = candidate
+        .open_scratch(&recipe)
+        .await
+        .expect("the positive binding oracle uses a fresh candidate and run");
     assert_eq!(
         run.qualify(
             &mut target,
@@ -338,14 +352,14 @@ async fn the_owned_container_resolves_the_overload_pair_on_its_qualified_connect
     let again = run.resolve(&mut target, &request).await.unwrap_err();
     assert!(again.to_string().contains("fresh run"), "{again}");
     let closed = run.close().await;
+    run.close().await.expect("completed cleanup is idempotent");
     let recovery = closed
         .as_ref()
         .err()
         .map(|failure| failure.recovery_names.clone())
         .unwrap_or_default();
     cleanup_observation(&before, &recovery);
-    closed.expect("successful analysis removes all run-owned resources");
-    run.close().await.expect("completed cleanup is idempotent");
+    closed.expect("successful analysis removes every transferred resource");
     target.check().await.unwrap();
     setup
         .query("DROP SCHEMA pbps_bind1273 CASCADE")
@@ -482,6 +496,7 @@ async fn a_changed_owned_runtime_or_target_ends_container_analysis_permanently()
                 .await
                 .is_err();
         let closed = run.close().await;
+        run.close().await.expect("refused cleanup is idempotent");
         let recovery = closed
             .as_ref()
             .err()
@@ -490,8 +505,7 @@ async fn a_changed_owned_runtime_or_target_ends_container_analysis_permanently()
         cleanup_observation(&before, &recovery);
         assert!(first.is_err(), "{cause} must invalidate the shared run");
         assert!(remains_terminal, "{cause} cannot regain a sealed scope");
-        closed.expect("a refused run still cleans its exact owned resources");
-        run.close().await.expect("refused cleanup is idempotent");
+        closed.expect("a refused run cleans every transferred resource");
         target.check().await.unwrap();
     }
 }
@@ -590,12 +604,11 @@ async fn cancelled_container_analysis_removes_or_names_every_owned_resource() {
                     .await
                     .expect("completed discard is idempotent");
             }
-            let closed = candidate.close().await;
-            let recovery: Vec<_> = [discarded.as_ref().err(), closed.as_ref().err()]
-                .into_iter()
-                .flatten()
-                .flat_map(|failure| failure.recovery_names.iter().cloned())
-                .collect();
+            let recovery = discarded
+                .as_ref()
+                .err()
+                .map(|failure| failure.recovery_names.clone())
+                .unwrap_or_default();
             cleanup_observation(&before, &recovery);
             assert!(
                 !unexpectedly_open,
@@ -633,6 +646,9 @@ async fn cancelled_container_analysis_removes_or_names_every_owned_resource() {
                 .is_err()
             && run.resolve(&mut target, &binding).await.is_err();
         let closed = run.close().await;
+        if closed.is_ok() {
+            run.close().await.expect("completed cleanup is idempotent");
+        }
         let recovery = closed
             .as_ref()
             .err()
@@ -643,9 +659,6 @@ async fn cancelled_container_analysis_removes_or_names_every_owned_resource() {
             terminal,
             "{stage}: cancellation must permanently end analysis"
         );
-        if closed.is_ok() {
-            run.close().await.expect("completed cleanup is idempotent");
-        }
         target.check().await.unwrap();
     }
 }
