@@ -81,9 +81,11 @@ recognized as unrelated only with an untouched `types` import and builtin
 `vars`; imported aliases follow their final left-to-right binding. The
 constructor must receive no arguments, and the call must be an expression or
 assign only plain names. Its preceding execution must also be proven inert:
-literal data, uncalled helper definitions, direct `types`/`sys`/`builtins`
-imports, and the supported `types` constructor imports. Unknown imports,
-callbacks, decorators, class construction and custom targets permanently remove
+literal data (using the same bounded proof for concatenations, aliases and
+supported comprehensions as selector extraction), uncalled helper definitions,
+direct `types`/`sys`/`builtins` imports, and the supported `types` constructor
+imports. Unknown imports, callbacks, decorators, class construction and custom
+targets permanently remove
 this exception; importing a constructor again cannot restore it. Writing inert
 values under literal string keys into a directly proven fresh dictionary remains
 safe.
