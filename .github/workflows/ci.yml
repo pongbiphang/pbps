@@ -414,6 +414,9 @@ jobs:
       - name: Preload explicitly trusted fixture images
         run: |
           docker pull postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
+          if [ "$FIXTURE_ENGINE" = pg ]; then
+            docker pull postgres@sha256:485935f94cc7165afa896978809c37b592dc07f0a37d2c8f645f12412d0212c8
+          fi
           if [ "$FIXTURE_ENGINE" = mssql ]; then
             docker pull mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1
           fi
@@ -435,6 +438,9 @@ jobs:
           sudo python3 scripts/live-resolver-target.py "$FIXTURE_ENGINE" --native-host --test-binary "$PBPS_FIXTURE_BINARY"
         env:
           FIXTURE_ENGINE: ${{ matrix.engine }}
+      - name: PG16 complete factory on the disposable native host
+        if: matrix.engine == 'pg'
+        run: sudo python3 scripts/live-resolver-target.py pg --pg-major 16 --native-host --test-binary "$PBPS_FIXTURE_BINARY"
       - name: Verified launch privileges before engine initialization
         run: sudo python3 scripts/live-resolver-launch.py "$FIXTURE_ENGINE" --test-binary "$PBPS_FIXTURE_BINARY"
         env:
