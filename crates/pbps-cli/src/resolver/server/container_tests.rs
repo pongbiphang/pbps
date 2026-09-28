@@ -557,6 +557,7 @@ async fn cancelled_container_analysis_removes_or_names_every_owned_resource() {
     };
     for stage in [
         "container-create-owned",
+        "container-discard-owned",
         "container-qualify-admin-owned",
         "container-capture-admin-owned",
         "container-close-owned",
@@ -565,8 +566,8 @@ async fn cancelled_container_analysis_removes_or_names_every_owned_resource() {
         let mut target = target().await;
         let mut candidate = candidate(&mut target, &socket, image).await;
         let recipe = target.database_recipe().await.unwrap();
-        if stage == "container-create-owned" {
-            cancel_after(stage, candidate.open_scratch(&recipe)).await;
+        if matches!(stage, "container-create-owned" | "container-discard-owned") {
+            cancel_after("container-create-owned", candidate.open_scratch(&recipe)).await;
             let identity_refused = candidate.identity().is_err();
             let check_refused = candidate.check().await.is_err();
             let retried = candidate.open_scratch(&recipe).await;
@@ -576,12 +577,25 @@ async fn cancelled_container_analysis_removes_or_names_every_owned_resource() {
             } else {
                 false
             };
+            if stage == "container-discard-owned" {
+                cancel_after(stage, candidate.discard()).await;
+                assert!(candidate.identity().is_err());
+                assert!(candidate.check().await.is_err());
+                assert!(candidate.open_scratch(&recipe).await.is_err());
+            }
+            let discarded = candidate.discard().await;
+            if discarded.is_ok() {
+                candidate
+                    .discard()
+                    .await
+                    .expect("completed discard is idempotent");
+            }
             let closed = candidate.close().await;
-            let recovery = closed
-                .as_ref()
-                .err()
-                .map(|failure| failure.recovery_names.clone())
-                .unwrap_or_default();
+            let recovery: Vec<_> = [discarded.as_ref().err(), closed.as_ref().err()]
+                .into_iter()
+                .flatten()
+                .flat_map(|failure| failure.recovery_names.iter().cloned())
+                .collect();
             cleanup_observation(&before, &recovery);
             assert!(
                 !unexpectedly_open,
