@@ -42,8 +42,8 @@ pub mod resolver;
 pub mod transport;
 
 pub use ledger::{
-    LedgerEntry, LedgerError, LockHolder, LockInfo, TimelineEntry, TimelineStaged, TimelineState,
-    holder_application_name,
+    LedgerEntry, LedgerError, LockHolder, LockInfo, OPERATOR_CHARS, TimelineEntry, TimelineStaged,
+    TimelineState, clip_utf16, holder_application_name,
 };
 
 /// The application name every connection this process opens carries, unless

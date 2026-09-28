@@ -103,6 +103,20 @@ END;";
 /// `NVARCHAR(4)` refused two emoji plus one ASCII letter with Msg 2628.
 pub const REASON_UTF16_UNITS: usize = 1000;
 
+/// The snapshot with its operator cut to the `NVARCHAR(128)` column in that
+/// column's measure, UTF-16 code units, and never inside a surrogate pair,
+/// which the engine refuses as invalid UTF-16; cloned only when it has to be
+/// (#1205). Cut in the snapshot rather than only in the bound column, so
+/// `state_json` and its projection agree on what was recorded.
+fn bounded_operator(snapshot: &StateSnapshot) -> std::borrow::Cow<'_, StateSnapshot> {
+    if snapshot.operator.encode_utf16().count() <= pbps_db::OPERATOR_CHARS {
+        return std::borrow::Cow::Borrowed(snapshot);
+    }
+    let mut bounded = snapshot.clone();
+    bounded.operator = pbps_db::clip_utf16(&snapshot.operator, pbps_db::OPERATOR_CHARS);
+    std::borrow::Cow::Owned(bounded)
+}
+
 /// Cuts a reason down to what the ledger column can hold.
 ///
 /// Counts `char::len_utf16`, because a Rust `char` above U+FFFF occupies two
@@ -616,6 +630,7 @@ fn saturating_i32(n: u64) -> i32 {
 /// issue #103 added follow the same rule (DECISIONS 435).
 pub async fn record(conn: &mut Conn, snapshot: &StateSnapshot) -> Result<i64, LedgerError> {
     ensure_tables(conn).await?;
+    let snapshot = &*bounded_operator(snapshot);
     let state_json = serde_json::to_string(snapshot).map_err(|e| LedgerError::BadEntry {
         id: 0,
         message: format!("the snapshot could not be serialized: {e}"),

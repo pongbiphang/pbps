@@ -3169,6 +3169,11 @@ pub(crate) fn validate_saved_plan(
 
 /// The operator. An audit asks "who did this", and git's configuration is the
 /// closest thing to the truth available.
+/// Who is running this command: git's `user.name`, else `$USER`, whole.
+///
+/// Not bounded here: a tombstone carries it into the identity file, which has
+/// no column to fit, and each engine's ledger cuts it to its own column in its
+/// own unit when it records (#1205).
 fn operator(root: &std::path::Path) -> String {
     std::process::Command::new("git")
         .arg("-C")

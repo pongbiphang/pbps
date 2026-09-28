@@ -503,6 +503,30 @@ fn keeping_an_occupied_rename_target_still_asks_what_becomes_of_the_source() {
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
 }
 
+/// #1205: the ledger's `operator` is cut to its column, but a tombstone goes
+/// into the identity file, which has no column to fit, and is the git audit
+/// record of who dropped what. It keeps the whole name.
+#[test]
+fn a_tombstone_keeps_the_operators_whole_name() {
+    let d = Demo::new("drop-wide-operator");
+    d.table("table: dbo.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  pii: {type: nvarchar(20)}\n");
+    d.run(&["plan"]);
+    d.commit();
+    let name = format!("{}{}", "a".repeat(200), "\u{1F600}".repeat(10));
+    d.git(&["config", "user.name", &name]);
+    d.table(ONE_COLUMN);
+    let o = d.run(&["drop", "dbo.t.pii", "--reason", "REG-2026-042"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let ids: pbps_model::IdsFile =
+        serde_json::from_str(&std::fs::read_to_string(d.ids_path()).unwrap()).unwrap();
+    let operators: Vec<&str> = ids
+        .tombstones
+        .values()
+        .map(|t| t.operator.as_str())
+        .collect();
+    assert_eq!(operators, [name.as_str()], "{ids:?}");
+}
+
 #[test]
 fn deleting_a_column_requires_a_reason_and_leaves_a_tombstone() {
     let d = Demo::new("drop");
@@ -14972,6 +14996,48 @@ fn text_on_server(connection: &str, sql: &str) -> String {
                 .unwrap()
                 .to_owned()
         })
+}
+
+/// #1205 on SQL Server: `NVARCHAR(128)` counts UTF-16 code units, so the
+/// operator is cut in that measure — 64 emoji, not 128 — and never inside a
+/// surrogate pair, which the engine refuses as invalid UTF-16.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB"]
+fn an_operator_wider_than_the_ledger_column_is_recorded_cut_to_it() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB");
+    let own = OwnDatabase::new(&server, "operator_width");
+    let connection = own.connection();
+    let d = Demo::new("operator-width");
+    d.table(ONE_COLUMN);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let built = d.run(&["bootstrap", "--db", connection]);
+    assert_eq!(code(&built), 0, "{}{}", stdout(&built), stderr(&built));
+    for (name, recorded) in [
+        ("a".repeat(300), "a".repeat(128)),
+        ("\u{1F600}".repeat(100), "\u{1F600}".repeat(64)),
+        (
+            format!("a{}", "\u{1F600}".repeat(100)),
+            format!("a{}", "\u{1F600}".repeat(63)),
+        ),
+    ] {
+        d.git(&["config", "user.name", &name]);
+        let baseline = d.run(&["baseline", "--db", connection, "--reason", "wide operator"]);
+        assert_eq!(
+            code(&baseline),
+            0,
+            "{}{}",
+            stdout(&baseline),
+            stderr(&baseline)
+        );
+        let listed = d.run(&["state", "list", "--db", connection, "--format", "json"]);
+        let v: serde_json::Value = serde_json::from_str(&stdout(&listed)).unwrap();
+        assert_eq!(
+            v["data"]["entries"][0]["operator"],
+            recorded.as_str(),
+            "{v}"
+        );
+    }
 }
 
 /// #1188 on SQL Server: the lock row names the holder's process and the

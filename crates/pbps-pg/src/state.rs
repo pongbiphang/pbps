@@ -148,6 +148,27 @@ pub fn truncate_reason(text: &str) -> String {
     text.chars().take(REASON_CHARS).collect()
 }
 
+/// The widest `operator` this ledger holds: `varchar(128)`, which counts
+/// characters here, not UTF-16 code units as SQL Server's `NVARCHAR` does.
+pub const OPERATOR_CHARS: usize = 128;
+
+/// The snapshot with its operator cut to [`OPERATOR_CHARS`], cloned only when
+/// it has to be (#1205).
+///
+/// The operator is git's `user.name`, which nothing bounds, and the insert of
+/// a longer one fails with `22001` — on `apply`, after the statements ran.
+/// Cut in the snapshot rather than only in the bound column, so `state_json`
+/// and its projection agree on what was recorded, and in this engine's own
+/// unit so a name the column can hold is kept whole.
+fn bounded_operator(snapshot: &StateSnapshot) -> std::borrow::Cow<'_, StateSnapshot> {
+    if snapshot.operator.chars().count() <= OPERATOR_CHARS {
+        return std::borrow::Cow::Borrowed(snapshot);
+    }
+    let mut bounded = snapshot.clone();
+    bounded.operator = snapshot.operator.chars().take(OPERATOR_CHARS).collect();
+    std::borrow::Cow::Owned(bounded)
+}
+
 /// The lock, whose one row is the gate.
 ///
 /// A **table**, not `pg_advisory_lock`. The advisory lock is the obvious
@@ -1444,6 +1465,7 @@ fn saturating_i32(n: u64) -> i32 {
 /// issue #103 added follow the same rule (DECISIONS 435).
 pub async fn record(conn: &mut Conn, snapshot: &StateSnapshot) -> Result<i64, LedgerError> {
     ensure_tables(conn).await?;
+    let snapshot = &*bounded_operator(snapshot);
     let state_json = serde_json::to_string(snapshot).map_err(|e| LedgerError::BadEntry {
         id: 0,
         message: format!("the snapshot could not be serialized: {e}"),
