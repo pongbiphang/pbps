@@ -219,7 +219,10 @@ Every catalog mutation inventory must include the changed owner and all of its
 qualified records in each applicable manifest, including type/nullability,
 constraint, module and authorization changes. Only an approved creation/removal
 can explain an absent endpoint; a grant on a newly created target remains valid.
-An aggregate label cannot hide an omitted owner behind a listed child.
+An aggregate label cannot hide an omitted owner behind a listed child, or
+authorize records outside the changed owners and their applicable endpoints.
+For example, a table transition for a column default replacement may include
+that default, but must preserve the other columns, defaults, checks and indexes.
 References to external objects are not ownership. Raw catalog captures mark
 ownership unqualified and cannot authorize transitions until #615's qualified
 adapter bridge supplies that evidence. Missing ownership refuses on read.

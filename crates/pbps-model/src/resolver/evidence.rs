@@ -651,3 +651,6 @@ mod tests {
 
 #[cfg(test)]
 mod transition_tests;
+
+#[cfg(test)]
+mod transition_scope_tests;

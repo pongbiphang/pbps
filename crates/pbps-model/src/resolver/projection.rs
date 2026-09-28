@@ -59,17 +59,31 @@ impl InputManifest {
             {
                 return Err(ManifestError::Invalid);
             }
-            for (inventory, manifest) in [(&transition.before, self), (&transition.after, compiled)]
-            {
+            for (inventory, manifest, before) in [
+                (&transition.before, self, true),
+                (&transition.after, compiled, false),
+            ] {
                 for object in inventory {
                     let records = manifest.prerequisites();
                     let position = records
                         .binary_search_by(|p| p.object.cmp(object))
                         .map_err(|_| ManifestError::Incomplete)?;
-                    if !records[position]
-                        .ownership
-                        .permits(&transition.surface, changes)
-                    {
+                    let ownership = &records[position].ownership;
+                    // Ownership permits aggregation, not unrelated mutations.
+                    // The same typed scope that requires a record below must
+                    // also authorize replacing it (SPEC 9.3.2).
+                    let affected = changes.changes.iter().any(|step| {
+                        touches(&step.change, &transition.surface)
+                            && changed_owners(&step.change).is_some_and(
+                                |(candidates, opening, closing)| {
+                                    (if before { opening } else { closing })
+                                        && candidates
+                                            .iter()
+                                            .any(|owner| ownership.permits(owner, changes))
+                                },
+                            )
+                    });
+                    if !ownership.permits(&transition.surface, changes) || !affected {
                         return Err(ManifestError::Invalid);
                     }
                 }
