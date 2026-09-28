@@ -561,8 +561,8 @@ pub(crate) fn object_reads(cs: &pbps_model::ChangeSet) -> (Vec<TableName>, Vec<T
 
 /// Every name the walk may hold that the collation question has to see
 /// (#1215): the names the plan reads (`object_reads`), the names the catalog
-/// found, and the destination of each occupant a cross-schema `RenameTable`
-/// carries. The walk moves a carried constraint into the new schema under
+/// found, each renamed table's new name, and the destination of each
+/// occupant a cross-schema `RenameTable` carries. The walk moves a carried constraint into the new schema under
 /// its own name, so `archive.Ck_Name` arrives there without ever being read,
 /// and a later `archive.ck_name` must still meet it (review of #1240).
 // The complement is every change that moves no table between schemas.
@@ -576,6 +576,10 @@ pub(crate) fn alike_candidates(
     let mut out: Vec<TableName> = names.to_vec();
     out.extend(occupants.iter().map(|o| o.name.clone()));
     for p in &cs.changes {
+        // A renamed table's new name, which the plan uses without reading.
+        if let Change::RenameTable { to, .. } = &p.change {
+            out.push(to.clone());
+        }
         if let Change::RenameTable { from, to, .. } = &p.change
             && from.schema != to.schema
         {
@@ -780,6 +784,20 @@ pub(crate) fn refuse_occupied_objects_under(
                             h.planned = true;
                         }
                     }
+                }
+                // The table itself holds its new name from here on, whether
+                // or not the read found it: a later change adding a name the
+                // database reads as the same one fails (review of #1240). Not
+                // claimed: whether the rename's own target is free is the
+                // ordering question #981 keeps, not this walk's.
+                if !held.iter().any(|h| &h.name == to) {
+                    held.push(Held {
+                        name: to.clone(),
+                        kind: "user table".into(),
+                        parent: None,
+                        column: None,
+                        planned: true,
+                    });
                 }
                 for column in defaults {
                     for old in left_under(from, column) {
@@ -7842,6 +7860,32 @@ mod tests {
             candidates.contains(&TableName::new("dbo", "Ck_Name")),
             "{candidates:?}"
         );
+        // A renamed table's new name is held and asked about too, so a later
+        // name the database reads as the same one meets it.
+        let into_ck = plan(vec![
+            PlannedChange::new(Change::RenameTable {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.old", 0),
+                from: old.clone(),
+                to: TableName::new("dbo", "Ck_Name"),
+                defaults: Vec::new(),
+            }),
+            check_on(&other, "ck_name"),
+        ]);
+        assert!(alike_candidates(&into_ck, &[], &[]).contains(&TableName::new("dbo", "Ck_Name")));
+        let e = refuse_occupied_objects_under(
+            &into_ck,
+            &[],
+            &[(
+                TableName::new("dbo", "Ck_Name"),
+                TableName::new("dbo", "ck_name"),
+            )],
+            "prod",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("this plan puts user table `dbo.Ck_Name`"), "{e}");
+        refuse_occupied_objects_under(&into_ck, &[], &[], "prod")
+            .expect("two names where the database reads them as two");
         // And the walk meets it there under the database's answer.
         let archive_other = TableName::new("archive", "other");
         let mut carried_then_added = transfer_old.clone();
