@@ -95,9 +95,13 @@ def static_value(node, values):
     if isinstance(node, ast.Name) and node.id in values:
         return values[node.id]
     if isinstance(node, (ast.List, ast.Tuple)):
-        return [static_value(x, values) for x in node.elts]
+        items = [static_value(x, values) for x in node.elts]
+        return tuple(items) if isinstance(node, ast.Tuple) else items
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        return static_value(node.left, values) + static_value(node.right, values)
+        try:
+            return static_value(node.left, values) + static_value(node.right, values)
+        except TypeError as error:
+            raise InventoryError("incompatible literal selector operands") from error
     if isinstance(node, ast.ListComp) and len(node.generators) == 1:
         loop = node.generators[0]
         require(isinstance(loop.target, ast.Name) and not loop.ifs and not loop.is_async,
@@ -244,8 +248,10 @@ class SelectorEffects(ast.NodeVisitor):
 
 
 def mutable_ids(value):
-    if isinstance(value, list):
-        return {id(value)}.union(*(mutable_ids(item) for item in value))
+    if isinstance(value, (list, tuple)):
+        # A tuple cannot change, but it can still expose a shared mutable child.
+        own = {id(value)} if isinstance(value, list) else set()
+        return own.union(*(mutable_ids(item) for item in value))
     return set()
 
 
@@ -640,7 +646,7 @@ def owner_selectors(root, owner):
     if kind == "data":
         names = static_value(ast.parse(selection["expression"], mode="eval").body, values)
         if isinstance(names, str): names = [names]
-        require(isinstance(names, list) and all(isinstance(n, str) for n in names), "selector must contain names")
+        require(isinstance(names, (list, tuple)) and all(isinstance(n, str) for n in names), "selector must contain names")
         return {selection.get("prefix", "") + n for n in names}
     if kind == "calls":
         scoped = ast.parse(python_scope(source, selection["scope"]))
