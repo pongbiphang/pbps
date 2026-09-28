@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 18;
+pub const SCHEMA_VERSION: u32 = 19;
+// 19: a column's `collation:` (issue #1175).
 // 18: explain distinguishes unsupported apply from offline previews (issue #1217).
 // 17: a table's `clustered:` layout selector (issue #1178).
 // 16: `explain`'s `unchecked`, the checks a plan implies that cannot be asked

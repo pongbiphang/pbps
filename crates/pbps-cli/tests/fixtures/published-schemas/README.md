@@ -43,3 +43,4 @@ DECISIONS 465).
   constraint or index that is the clustered one (issue #1178).
 - `18/` documents explain's current-build apply capability and adds its optional
   `apply_limitation`; unsupported artifacts carry an empty `approve_with`.
+- `19/` adds a column's `collation:` (issue #1175).

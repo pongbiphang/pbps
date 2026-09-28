@@ -65,6 +65,7 @@ fn resolved_plan() -> SavedPlan {
         PlanBaseline {
             description: "target database".into(),
             checksum: "00".repeat(32),
+            database_collation: None,
         },
         changes,
         IdsFile::default(),
