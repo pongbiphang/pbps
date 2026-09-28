@@ -306,10 +306,30 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
 
     let mut indexes = std::collections::BTreeMap::new();
     for (k, ix) in dto.indexes {
-        let mut cols = Vec::with_capacity(ix.columns.len());
+        let mut cols = Vec::with_capacity(ix.columns.len() + ix.keys.len());
         let mut ok = true;
+        // One list or the other (DEC-1169.2): two would leave the order of
+        // their keys unsaid, and the order is the index.
+        if !ix.columns.is_empty() && !ix.keys.is_empty() {
+            errs.push(LoadError::semantic(
+                src,
+                to_span(&ix.keys[0].defined),
+                format!("index `{k}` names its keys under both `columns:` and `keys:`"),
+                "one list or the other",
+            ));
+            ok = false;
+        }
         for c in &ix.columns {
             match parse_index_column(src, c) {
+                Ok(v) => cols.push(v),
+                Err(e) => {
+                    errs.push(e);
+                    ok = false;
+                }
+            }
+        }
+        for c in &ix.keys {
+            match parse_index_key(src, c) {
                 Ok(v) => cols.push(v),
                 Err(e) => {
                     errs.push(e);
@@ -511,19 +531,14 @@ fn parse_index_column(src: &SourceFile, v: &Spanned<String>) -> Result<IndexColu
         }
     };
     let opclass = |o: &str| {
-        let mut chars = o.chars();
-        let identifier = chars
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
-        if identifier {
+        if is_opclass_name(o) {
             Ok(o.to_owned())
         } else {
             Err(bad(&format!("`{o}` is not an operator class name")))
         }
     };
     let column = |name: &str, opclass: Option<String>, descending: bool| IndexColumn {
-        name: name.to_owned(),
+        key: pbps_model::IndexKey::Column(name.to_owned()),
         descending,
         opclass,
     };
@@ -540,6 +555,57 @@ fn parse_index_column(src: &SourceFile, v: &Spanned<String>) -> Result<IndexColu
         },
         _ => Err(bad("wrong number of parts")),
     }
+}
+
+/// A plain identifier, which is every operator class name this tool accepts.
+fn is_opclass_name(o: &str) -> bool {
+    let mut chars = o.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `{column: id}` or `{expression: "lower(email)"}`, each with optional
+/// `opclass:` and `order:`. An expression is kept verbatim, as a filter is:
+/// whether it is one the engine accepts is the dialect's and then the
+/// engine's question (DEC-1169.2); here it is only never empty.
+fn parse_index_key(
+    src: &SourceFile,
+    v: &Spanned<crate::dto::IndexKeyDto>,
+) -> Result<IndexColumn, LoadError> {
+    let bad = |msg: &str| {
+        LoadError::semantic(
+            src,
+            to_span(&v.defined),
+            format!("invalid index key: {msg}"),
+            msg,
+        )
+        .with_help(
+            "the format is `{column: <name>}` or `{expression: \"...\"}`, with optional \
+             `opclass:` and `order: asc|desc`",
+        )
+    };
+    let e = &v.value;
+    let key = match (&e.column, &e.expression) {
+        (Some(column), None) => pbps_model::IndexKey::Column(column.clone()),
+        (None, Some(expression)) if expression.trim().is_empty() => {
+            return Err(bad("the expression is empty"));
+        }
+        (None, Some(expression)) => pbps_model::IndexKey::Expression(expression.clone()),
+        (Some(_), Some(_)) => return Err(bad("a key names a column or an expression, not both")),
+        (None, None) => return Err(bad("a key names a column or an expression")),
+    };
+    if let Some(class) = &e.opclass
+        && !is_opclass_name(class)
+    {
+        return Err(bad(&format!("`{class}` is not an operator class name")));
+    }
+    Ok(IndexColumn {
+        key,
+        descending: e.order == Some(crate::dto::IndexOrder::Desc),
+        opclass: e.opclass.clone(),
+    })
 }
 
 /// DTO to domain model for one module.

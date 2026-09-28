@@ -836,7 +836,7 @@ mod tests {
                 name: "ix".into(),
                 index: Box::new(pbps_model::Index {
                     columns: vec![pbps_model::IndexColumn {
-                        name: "v".into(),
+                        key: pbps_model::IndexKey::Column("v".into()),
                         descending: false,
                         opclass: None,
                     }],
@@ -1023,7 +1023,7 @@ mod tests {
                 name: "ix".into(),
                 index: Box::new(pbps_model::Index {
                     columns: vec![pbps_model::IndexColumn {
-                        name: "v".into(),
+                        key: pbps_model::IndexKey::Column("v".into()),
                         descending: false,
                         opclass: None,
                     }],
@@ -1436,7 +1436,7 @@ mod tests {
             name: "ix".into(),
             index: Box::new(pbps_model::Index {
                 columns: vec![pbps_model::IndexColumn {
-                    name: "v".into(),
+                    key: pbps_model::IndexKey::Column("v".into()),
                     descending: false,
                     opclass: None,
                 }],

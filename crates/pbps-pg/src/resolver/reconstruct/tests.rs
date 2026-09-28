@@ -20,7 +20,7 @@ fn table() -> Table {
         "ix".into(),
         Index {
             columns: vec![IndexColumn {
-                name: "c".into(),
+                key: pbps_model::IndexKey::Column("c".into()),
                 descending: false,
                 opclass: None,
             }],
@@ -34,7 +34,7 @@ fn table() -> Table {
         "plain".into(),
         Index {
             columns: vec![IndexColumn {
-                name: "c".into(),
+                key: pbps_model::IndexKey::Column("c".into()),
                 descending: false,
                 opclass: None,
             }],

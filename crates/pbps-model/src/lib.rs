@@ -69,7 +69,7 @@ pub use rename::Renames;
 pub use role::{GrantTarget, Permission, Role};
 pub use schema::{
     CheckConstraint, Clustered, Collation, Column, ForeignKey, Identity, Index, IndexColumn,
-    IndexMethod, PrimaryKey, ReferentialAction, Schema, Table, UniqueConstraint,
+    IndexKey, IndexMethod, PrimaryKey, ReferentialAction, Schema, Table, UniqueConstraint,
 };
 pub use state::{StagedProgress, StateKind, StateSnapshot, Unreadable, check_readable_version};
 pub use strategy::{Strategies, Strategy};

@@ -24,7 +24,7 @@ fn declared(body: &str) -> Schema {
         "ix".into(),
         pbps_model::Index {
             columns: vec![pbps_model::IndexColumn {
-                name: "id".into(),
+                key: pbps_model::IndexKey::Column("id".into()),
                 descending: false,
                 opclass: None,
             }],
@@ -378,7 +378,7 @@ async fn exercise(target_connection: String, scratch_connection: String, worker:
     table.columns.insert("n".into(), column);
     table.checks.get_mut("positive").unwrap().expression = "n >= app.f()".into();
     let index = table.indexes.get_mut("ix").unwrap();
-    index.columns[0].name = "n".into();
+    index.columns[0].key = pbps_model::IndexKey::Column("n".into());
     index.filter = Some("n >= app.f()".into());
     renamed.tables.insert(u.clone(), table);
     let mut renamed_ids = wanted_ids.clone();
@@ -537,7 +537,7 @@ async fn new_table_online_indexes_are_transactional(target: &mut Conn) {
         "online_new_ix".into(),
         pbps_model::Index {
             columns: vec![pbps_model::IndexColumn {
-                name: "n".into(),
+                key: pbps_model::IndexKey::Column("n".into()),
                 descending: false,
                 opclass: None,
             }],

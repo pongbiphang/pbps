@@ -261,6 +261,9 @@ pub struct RawIndex {
     /// because what "default" means is a catalog lookup rather than a fact
     /// about the row.
     pub key_classes: Vec<String>,
+    /// Each expression key's text as the engine renders it
+    /// (`pg_get_indexdef(oid, k, true)`), and `""` for a column key.
+    pub key_texts: Vec<String>,
     /// Whether any key column is indexed under a collation that is not the
     /// column's own — `COLLATE "C"`.
     pub nondefault_collation: bool,
@@ -2535,13 +2538,15 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
             return false;
         }
     };
-    if raw.has_expressions || raw.columns.contains(&0) {
+    // A B-tree key may be an expression (DEC-1169.2); GIN is held only over
+    // `jsonb` columns (DEC-1169.1).
+    if method == IndexMethod::Gin && (raw.has_expressions || raw.columns.contains(&0)) {
         note(
             pulled,
             &parts.name,
             format!(
-                "index `{}` on `{}` is over an expression, which this model does not hold. It is \
-                 left out of the pull, so a plan cannot see it.",
+                "index `{}` on `{}` is a GIN index over an expression, which this model does not \
+                 hold. It is left out of the pull, so a plan cannot see it.",
                 raw.name, parts.name
             ),
         );
@@ -2607,8 +2612,8 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
     }
 
     let key_count = raw.key_count.min(raw.columns.len());
-    let (keys, included) = raw.columns.split_at(key_count);
-    let (Ok(keys), Ok(include)) = (parts.names(keys), parts.names(included)) else {
+    let (key_attnums, included) = raw.columns.split_at(key_count);
+    let Ok(include) = parts.names(included) else {
         unresolved(
             pulled,
             parts,
@@ -2618,13 +2623,46 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
         );
         return false;
     };
+    // A key is a column where `indkey` holds its attnum and an expression
+    // where it holds `0`, whose text the catalog renders by position. An
+    // expression the catalog did not render is left out and named, never read
+    // as an empty one (DEC-1169.2).
+    let mut keys = Vec::with_capacity(key_attnums.len());
+    for (position, attnum) in key_attnums.iter().enumerate() {
+        if *attnum == 0 {
+            let Some(text) = raw.key_texts.get(position).filter(|t| !t.is_empty()) else {
+                note(
+                    pulled,
+                    &parts.name,
+                    format!(
+                        "index `{}` on `{}`: the catalog did not render its expression key at \
+                         position {}, so the index is left out rather than read without it.",
+                        raw.name,
+                        parts.name,
+                        position + 1
+                    ),
+                );
+                return false;
+            };
+            keys.push(pbps_model::IndexKey::Expression(text.clone()));
+        } else {
+            match parts.names(&[*attnum]) {
+                Ok(mut name) => keys.push(pbps_model::IndexKey::Column(name.remove(0))),
+                Err(missing) => {
+                    unresolved(pulled, parts, "index", &raw.name, missing);
+                    return false;
+                }
+            }
+        }
+    }
 
     // Bit 0 is DESC and bit 1 is NULLS FIRST, and the model holds only the
     // first. A default `DESC` implies `NULLS FIRST` and a default `ASC` implies
     // `NULLS LAST`, so only the two crossed spellings are a difference — those
     // are reported rather than dropped.
     let mut columns = Vec::with_capacity(keys.len());
-    for (position, name) in keys.into_iter().enumerate() {
+    for (position, key) in keys.into_iter().enumerate() {
+        let name = key.text().to_owned();
         let option = raw.options.get(position).copied().unwrap_or(0);
         let descending = option & 1 == 1;
         let nulls_first = option & 2 == 2;
@@ -2647,7 +2685,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
             return false;
         };
         columns.push(IndexColumn {
-            name,
+            key,
             descending,
             opclass,
         });
@@ -4176,6 +4214,7 @@ mod tests {
             has_expressions: false,
             method: "btree".to_owned(),
             key_classes: vec![String::new()],
+            key_texts: vec![String::new()],
             nondefault_collation: false,
         }
     }
@@ -4405,9 +4444,9 @@ mod tests {
         };
         let pulled = assemble(&raw);
         let read = &only(&pulled).indexes["t_ix"];
-        assert_eq!(read.columns[0].name, "c");
+        assert_eq!(read.columns[0].key.column(), Some("c"));
         assert!(read.columns[0].descending, "indoption bit 0 is DESC");
-        assert_eq!(read.columns[1].name, "a");
+        assert_eq!(read.columns[1].key.column(), Some("a"));
         assert_eq!(read.include, ["b"]);
         assert_eq!(read.filter.as_deref(), Some("(c IS NOT NULL)"));
     }
@@ -4455,8 +4494,16 @@ mod tests {
             ("gin off jsonb", |ix: &mut RawIndex| {
                 ix.method = "gin".to_owned()
             }),
-            ("expression", |ix: &mut RawIndex| ix.has_expressions = true),
+            // GIN over an expression; a B-tree over one is held (DEC-1169.2).
+            ("gin expression", |ix: &mut RawIndex| {
+                ix.method = "gin".to_owned();
+                ix.has_expressions = true;
+                ix.columns = vec![0];
+                ix.key_texts = vec!["lower(a)".to_owned()];
+            }),
+            // An expression key whose text the catalog did not render.
             ("expression column", |ix: &mut RawIndex| {
+                ix.has_expressions = true;
                 ix.columns = vec![0];
             }),
             ("exclusion", |ix: &mut RawIndex| ix.exclusion = true),
@@ -4972,6 +5019,41 @@ mod tests {
         let pulled = assemble(&raw);
         assert!(only(&pulled).indexes.is_empty());
         assert!(pulled.warnings[0].contains("operator class"));
+    }
+
+    /// A B-tree's expression key is read back as an expression, in its
+    /// place among the keys and with its direction, never as a column; a
+    /// column key beside it stays a column (DEC-1169.2).
+    #[test]
+    fn a_btree_expression_key_is_read_back_as_an_expression() {
+        let mut ix = index(50, 1, "t_ix");
+        ix.has_expressions = true;
+        ix.key_count = 2;
+        ix.columns = vec![0, 1];
+        ix.options = vec![3, 0];
+        ix.key_classes = vec![String::new(), String::new()];
+        ix.key_texts = vec!["(a + 1)".to_owned(), String::new()];
+        let raw = RawCatalog {
+            tables: vec![table(1, "t")],
+            columns: vec![col(1, 1, "a", "integer")],
+            indexes: vec![ix],
+            ..RawCatalog::default()
+        };
+        let pulled = assemble(&raw);
+        assert!(pulled.limitations.is_empty(), "{:?}", pulled.warnings);
+        let read = &only(&pulled).indexes["t_ix"];
+        assert_eq!(
+            read.columns[0].key,
+            pbps_model::IndexKey::Expression("(a + 1)".into())
+        );
+        assert!(read.columns[0].descending);
+        assert_eq!(
+            read.columns[1].key,
+            pbps_model::IndexKey::Column("a".into())
+        );
+        // Negative: an expression is not a column, whatever its text.
+        assert_eq!(read.columns[0].key.column(), None);
+        assert_eq!(read.column_keys(), None);
     }
 
     /// A collation that is not the column's own is left out on its own

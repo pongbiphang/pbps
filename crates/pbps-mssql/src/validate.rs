@@ -754,7 +754,21 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
         if let Err(e) = ident::quote(n) {
             errs.push(e);
         }
-        let keys: Vec<String> = idx.columns.iter().map(|c| c.name.clone()).collect();
+        // An expression key is PostgreSQL's (DEC-1169.2): SQL Server indexes a
+        // computed column instead, which this model does not hold.
+        for key in &idx.columns {
+            if let Some(expression) = key.key.expression() {
+                errs.push(invalid(format!(
+                    "index `{n}` has the expression key `{expression}`, and SQL Server indexes \
+                     only columns"
+                )));
+            }
+        }
+        let keys: Vec<String> = idx
+            .columns
+            .iter()
+            .filter_map(|c| c.key.column().map(str::to_owned))
+            .collect();
         errs.extend(key_columns(&format!("index `{n}`"), &keys, table));
         if keys.len() > MAX_INDEX_KEY_COLUMNS {
             errs.push(invalid(format!(
@@ -792,7 +806,7 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
                 errs.push(invalid(format!(
                     "index `{n}` indexes `{}` with `{class}`, and SQL Server has no operator \
                      classes (if `{class}` was meant as a direction, it is `asc` or `desc`)",
-                    key.name
+                    key.key.text()
                 )));
             }
         }
@@ -901,7 +915,7 @@ mod tests {
             .insert("a".into(), Column::new("int".parse().unwrap()));
         let index = |method: IndexMethod, opclass: Option<&str>| Index {
             columns: vec![IndexColumn {
-                name: "a".into(),
+                key: pbps_model::IndexKey::Column("a".into()),
                 descending: false,
                 opclass: opclass.map(str::to_owned),
             }],
@@ -921,6 +935,15 @@ mod tests {
         assert!(messages(index(IndexMethod::Btree, None)).is_empty());
         let gin = messages(index(IndexMethod::Gin, None));
         assert!(gin.iter().any(|m| m.contains("`gin` method")), "{gin:?}");
+        let mut expression = index(IndexMethod::Btree, None);
+        expression.columns[0].key = pbps_model::IndexKey::Expression("a + 1".into());
+        let expression = messages(expression);
+        assert!(
+            expression
+                .iter()
+                .any(|m| m.contains("indexes only columns")),
+            "{expression:?}"
+        );
         let class = messages(index(IndexMethod::Btree, Some("dsc")));
         assert!(
             class
@@ -939,7 +962,7 @@ mod tests {
         let (name, mut t) = base_table();
         let index = |include: Vec<String>, filter: Option<&str>| Index {
             columns: vec![IndexColumn {
-                name: "id".into(),
+                key: pbps_model::IndexKey::Column("id".into()),
                 descending: false,
                 opclass: None,
             }],
@@ -1556,7 +1579,7 @@ mod tests {
             "ix_email".into(),
             Index {
                 columns: vec![IndexColumn {
-                    name: "email".into(),
+                    key: pbps_model::IndexKey::Column("email".into()),
                     descending: false,
                     opclass: None,
                 }],
@@ -1884,7 +1907,7 @@ mod tests {
             "same".into(),
             Index {
                 columns: vec![IndexColumn {
-                    name: "id".into(),
+                    key: pbps_model::IndexKey::Column("id".into()),
                     descending: false,
                     opclass: None,
                 }],

@@ -198,8 +198,9 @@ impl Reconstruction {
                         // before any module, which can then name it through
                         // an OID-alias constant and be refused by the
                         // capture for that constant rather than fail to
-                        // compile (#1042). A predicate can call a module.
-                        let phase = if spec.filter.is_some() {
+                        // compile (#1042). A predicate or an expression key
+                        // can call a module (DEC-1169.2).
+                        let phase = if spec.holds_expression() {
                             Phase::Expressions
                         } else {
                             Phase::Keys

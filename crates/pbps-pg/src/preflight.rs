@@ -3169,7 +3169,16 @@ fn build(
             // The key columns only. `INCLUDE` is payload the engine carries in
             // the leaf and never compares, so counting it would group rows the
             // index will still collide.
-            let columns: Vec<String> = index.columns.iter().map(|c| c.name.clone()).collect();
+            // An expression over the planned rows is the engine's to evaluate
+            // and no probe here can: unchecked, not counted as something it is
+            // not (DEC-1169.2).
+            let Some(columns) = index.column_keys() else {
+                return Ok(skip(
+                    change,
+                    "a unique index over an expression cannot be counted before apply",
+                    unchecked,
+                ));
+            };
             let applies = match &index.filter {
                 Some(predicate) => Applies::Where(predicate),
                 None => Applies::AllRows,
@@ -3599,7 +3608,7 @@ mod tests {
                 name: "ix".into(),
                 index: Box::new(pbps_model::Index {
                     columns: vec![pbps_model::IndexColumn {
-                        name: "v".into(),
+                        key: pbps_model::IndexKey::Column("v".into()),
                         descending: false,
                         opclass: None,
                     }],
@@ -3741,7 +3750,7 @@ mod tests {
                     name: "ix".into(),
                     index: Box::new(pbps_model::Index {
                         columns: vec![pbps_model::IndexColumn {
-                            name: "v".into(),
+                            key: pbps_model::IndexKey::Column("v".into()),
                             descending: false,
                             opclass: None,
                         }],

@@ -1225,7 +1225,7 @@ mod tests {
                     n.into(),
                     Index {
                         columns: vec![IndexColumn {
-                            name: "id".into(),
+                            key: pbps_model::IndexKey::Column("id".into()),
                             descending: false,
                             opclass: None,
                         }],
@@ -1328,7 +1328,7 @@ mod tests {
                     n.into(),
                     Index {
                         columns: vec![IndexColumn {
-                            name: "id".into(),
+                            key: pbps_model::IndexKey::Column("id".into()),
                             descending: false,
                             opclass: None,
                         }],
@@ -1421,7 +1421,7 @@ mod tests {
                         index_name.into(),
                         Index {
                             columns: vec![IndexColumn {
-                                name: "id".into(),
+                                key: pbps_model::IndexKey::Column("id".into()),
                                 descending: false,
                                 opclass: None,
                             }],
@@ -1470,7 +1470,7 @@ mod tests {
         use pbps_model::{Column, Identity, Index, IndexColumn, PrimaryKey, Schema, Table};
         let index = |col: &str| Index {
             columns: vec![IndexColumn {
-                name: col.into(),
+                key: pbps_model::IndexKey::Column(col.into()),
                 descending: false,
                 opclass: None,
             }],
@@ -2317,7 +2317,7 @@ mod tests {
                 "ix".into(),
                 pbps_model::Index {
                     columns: vec![pbps_model::IndexColumn {
-                        name: "a".into(),
+                        key: pbps_model::IndexKey::Column("a".into()),
                         descending: false,
                         opclass: None,
                     }],
@@ -2357,7 +2357,7 @@ mod tests {
             "json_key".into(),
             pbps_model::Index {
                 columns: vec![pbps_model::IndexColumn {
-                    name: "j".into(),
+                    key: pbps_model::IndexKey::Column("j".into()),
                     descending: false,
                     opclass: None,
                 }],
@@ -2514,7 +2514,7 @@ mod tests {
                     columns: keys
                         .into_iter()
                         .map(|name| pbps_model::IndexColumn {
-                            name: name.into(),
+                            key: pbps_model::IndexKey::Column(name.into()),
                             descending: false,
                             opclass: None,
                         })
@@ -2590,7 +2590,7 @@ mod tests {
                                 columns: keys
                                     .into_iter()
                                     .map(|name| pbps_model::IndexColumn {
-                                        name,
+                                        key: pbps_model::IndexKey::Column(name),
                                         descending: false,
                                         opclass: None,
                                     })
@@ -2655,7 +2655,7 @@ mod tests {
             "ix".into(),
             pbps_model::Index {
                 columns: vec![pbps_model::IndexColumn {
-                    name: "a".into(),
+                    key: pbps_model::IndexKey::Column("a".into()),
                     descending: false,
                     opclass: None,
                 }],
@@ -2706,7 +2706,7 @@ mod tests {
                 "ix".into(),
                 pbps_model::Index {
                     columns: vec![pbps_model::IndexColumn {
-                        name: "a".into(),
+                        key: pbps_model::IndexKey::Column("a".into()),
                         descending: false,
                         opclass: None,
                     }],
@@ -2756,7 +2756,7 @@ mod tests {
                 "ix".into(),
                 pbps_model::Index {
                     columns: vec![pbps_model::IndexColumn {
-                        name: "a".into(),
+                        key: pbps_model::IndexKey::Column("a".into()),
                         descending: false,
                         opclass: None,
                     }],
@@ -3151,7 +3151,7 @@ mod tests {
             "same".into(),
             Index {
                 columns: vec![IndexColumn {
-                    name: "id".into(),
+                    key: pbps_model::IndexKey::Column("id".into()),
                     descending: false,
                     opclass: None,
                 }],

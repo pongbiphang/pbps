@@ -1163,7 +1163,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             index.include.push(i.column.clone());
         } else {
             index.columns.push(IndexColumn {
-                name: i.column.clone(),
+                key: pbps_model::IndexKey::Column(i.column.clone()),
                 descending: i.is_descending,
                 opclass: None,
             });

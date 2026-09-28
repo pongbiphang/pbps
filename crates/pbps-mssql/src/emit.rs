@@ -1615,9 +1615,17 @@ fn create_index(
         .columns
         .iter()
         .map(|c| {
+            // Refused by validation; an error here rather than a key built
+            // from text that was never a column (DEC-1169.2).
+            let Some(column) = c.key.column() else {
+                return Err(DialectError::Invalid {
+                    dialect: DIALECT,
+                    message: "SQL Server indexes only columns, not expressions".to_owned(),
+                });
+            };
             Ok(format!(
                 "{} {}",
-                quote(&c.name)?,
+                quote(column)?,
                 if c.descending { "DESC" } else { "ASC" }
             ))
         })
@@ -2011,7 +2019,7 @@ mod tests {
                 n.into(),
                 Index {
                     columns: vec![IndexColumn {
-                        name: "code".into(),
+                        key: pbps_model::IndexKey::Column("code".into()),
                         descending: false,
                         opclass: None,
                     }],
@@ -2123,7 +2131,7 @@ mod tests {
         };
         let index = Index {
             columns: vec![IndexColumn {
-                name: "id".into(),
+                key: pbps_model::IndexKey::Column("id".into()),
                 descending: false,
                 opclass: None,
             }],
@@ -2931,7 +2939,7 @@ mod tests {
             name: "ix_t_a".into(),
             index: Box::new(Index {
                 columns: vec![IndexColumn {
-                    name: "a".into(),
+                    key: pbps_model::IndexKey::Column("a".into()),
                     descending: false,
                     opclass: None,
                 }],
@@ -2958,12 +2966,12 @@ mod tests {
             index: Box::new(Index {
                 columns: vec![
                     IndexColumn {
-                        name: "a".into(),
+                        key: pbps_model::IndexKey::Column("a".into()),
                         descending: false,
                         opclass: None,
                     },
                     IndexColumn {
-                        name: "b".into(),
+                        key: pbps_model::IndexKey::Column("b".into()),
                         descending: true,
                         opclass: None,
                     },
@@ -3108,7 +3116,7 @@ mod tests {
             name: "ix_order_line_order".into(),
             index: Box::new(Index {
                 columns: vec![IndexColumn {
-                    name: "order_id".into(),
+                    key: pbps_model::IndexKey::Column("order_id".into()),
                     descending: false,
                     opclass: None,
                 }],
@@ -3234,7 +3242,7 @@ mod tests {
             "ix_new".into(),
             Index {
                 columns: vec![IndexColumn {
-                    name: "order_id".into(),
+                    key: pbps_model::IndexKey::Column("order_id".into()),
                     descending: false,
                     opclass: None,
                 }],

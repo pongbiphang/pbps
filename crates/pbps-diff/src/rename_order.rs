@@ -156,7 +156,7 @@ pub(crate) fn order(
                 t.indexes
                     .get(name)
                     .filter(|index| index.unique && index.filter.is_none())
-                    .map(|index| index.columns.iter().map(|c| c.name.clone()).collect())
+                    .and_then(|index| index.column_keys())
             } else {
                 None
             };

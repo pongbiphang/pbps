@@ -198,9 +198,9 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
             .iter()
             .map(|c| {
                 if c.descending {
-                    format!("{} desc", code(&c.name))
+                    format!("{} desc", code(c.key.text()))
                 } else {
-                    code(&c.name)
+                    code(c.key.text())
                 }
             })
             .collect();
