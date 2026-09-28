@@ -112,6 +112,7 @@ class SelectorEffects(ast.NodeVisitor):
     def __init__(self, proven_assignment=None):
         self.proven_assignment = proven_assignment
         self.writes = set()
+        self.deletes = set()
         self.mutations = set()
         self.global_writes = set()
         self.global_mutations = set()
@@ -123,6 +124,8 @@ class SelectorEffects(ast.NodeVisitor):
     def visit_Name(self, node):
         if isinstance(node.ctx, (ast.Store, ast.Del)):
             self.writes.add(node.id)
+            if isinstance(node.ctx, ast.Del):
+                self.deletes.add(node.id)
         elif isinstance(node.ctx, ast.Load):
             self.loads.add(node.id)
 
@@ -204,16 +207,17 @@ class SelectorEffects(ast.NodeVisitor):
             writes = (body.writes & (globals_ | {"*"})) | body.global_writes
             self.writes.update(writes)
             self.global_writes.update(writes)
+            # A possible deletion exposes the module binding even to later
+            # reads inside this same compound statement.
+            locals_.difference_update(body.deletes)
             # A module list retained by a class can be mutated through that alias.
             escaped = ((body.loads | body.mutations) - locals_) | body.global_mutations
             escaped.update((body.loads | body.mutations) & globals_)
             self.mutations.update(escaped)
             self.global_mutations.update(escaped)
-            if isinstance(statement, ast.Delete):
-                locals_.difference_update(body.writes)
-            elif isinstance(statement, (ast.Assign, ast.AnnAssign, ast.AugAssign,
-                                        ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
-                                        ast.Import, ast.ImportFrom)):
+            if isinstance(statement, (ast.Assign, ast.AnnAssign, ast.AugAssign,
+                                      ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                                      ast.Import, ast.ImportFrom)):
                 locals_.update(body.writes - globals_ - body.global_writes)
 
     def visit_alias(self, node):
@@ -222,6 +226,8 @@ class SelectorEffects(ast.NodeVisitor):
     def visit_ExceptHandler(self, node):
         if node.name:
             self.writes.add(node.name)
+            # Python clears the exception target when its handler exits.
+            self.deletes.add(node.name)
         self.generic_visit(node)
 
     def visit_MatchAs(self, node):

@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from textwrap import indent
 import unittest
 from unittest.mock import patch
 
@@ -217,6 +218,59 @@ class Ownership(unittest.TestCase):
         for control in controls:
             with self.subTest(control=control):
                 source = 'TESTS = ["owned"]\n' + control + '\n'
+                actual = subprocess.run([sys.executable, "-c", source + 'print(TESTS)'],
+                                        check=True, capture_output=True, text=True, timeout=10)
+                self.assertEqual(actual.stdout, "['owned']\n")
+                (self.root / "runner.py").write_text(source, encoding="utf-8")
+                self.assertEqual(self.check(), 1)
+
+    def test_deleted_class_shadows_cannot_hide_module_selector_escapes(self):
+        escape = 'ALIAS = TESTS\nALIAS.clear()'
+        bodies = [
+            'del TESTS\n' + escape,
+            'if True:\n    del TESTS\n' + escape,
+            'for _ in [0]:\n    del TESTS\n' + escape,
+            'try:\n    del TESTS\nfinally:\n    pass\n' + escape,
+            'try:\n    pass\nfinally:\n    del TESTS\n' + escape,
+            'from contextlib import nullcontext\nwith nullcontext():\n    del TESTS\n' + escape,
+            'if True:\n    del TESTS\n' + indent(escape, '    '),
+            'try:\n    raise ValueError("fixture")\nexcept ValueError as TESTS:\n    pass\n' + escape,
+            'try:\n    raise ValueError("fixture")\nexcept ValueError as TESTS:\n    pass\nfinally:\n'
+            + indent(escape, '    '),
+        ]
+        self.inventory["owners"]["live"]["selection"] = {
+            "kind": "data", "file": "runner.py", "expression": "TESTS"}
+        for body in bodies:
+            with self.subTest(body=body):
+                local = 'TESTS = ["local"]\n' + body
+                source = 'TESTS = ["owned"]\nclass Local:\n' + indent(local, '    ') + '\n'
+                # Keep observation out of the audited source: print itself
+                # would otherwise supply a mutable escape and mask the bug.
+                actual = subprocess.run([sys.executable, "-c", source + 'print(TESTS)'],
+                                        check=True, capture_output=True, text=True, timeout=10)
+                self.assertEqual(actual.stdout, "[]\n")
+                (self.root / "runner.py").write_text(source, encoding="utf-8")
+                with self.assertRaises(audit.InventoryError):
+                    self.check()
+
+    def test_other_scope_and_item_deletions_preserve_class_local_shadows(self):
+        bodies = [
+            '',
+            'def unused():\n    del TESTS',
+            'def unused():\n    try: raise ValueError("fixture")\n    except ValueError as TESTS: pass',
+            'class Nested:\n    TESTS = []\n    if True: del TESTS',
+            'class Nested:\n    TESTS = []\n    try: raise ValueError("fixture")\n    except ValueError as TESTS: pass',
+            'del TESTS[0]',
+            'del TESTS[:]',
+            'class Nested:\n    TESTS = []\ndel Nested.TESTS',
+            'del TESTS\nTESTS = []',
+        ]
+        self.inventory["owners"]["live"]["selection"] = {
+            "kind": "data", "file": "runner.py", "expression": "TESTS"}
+        for body in bodies:
+            with self.subTest(body=body):
+                local = 'TESTS = ["local"]\n' + body + '\nALIAS = TESTS\nALIAS.clear()'
+                source = 'TESTS = ["owned"]\nclass Local:\n' + indent(local, '    ') + '\n'
                 actual = subprocess.run([sys.executable, "-c", source + 'print(TESTS)'],
                                         check=True, capture_output=True, text=True, timeout=10)
                 self.assertEqual(actual.stdout, "['owned']\n")
