@@ -322,7 +322,7 @@ async fn the_owned_container_resolves_the_overload_pair_on_its_qualified_connect
     cleanup_observation(&before, &refused_recovery);
     target.check().await.unwrap();
     let before = containers();
-    let mut candidate = candidate(&mut target, &socket, image).await;
+    let mut candidate = self::candidate(&mut target, &socket, image).await;
     let mut run = candidate
         .open_scratch(&recipe)
         .await
