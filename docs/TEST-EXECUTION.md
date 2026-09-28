@@ -72,6 +72,14 @@ Function-local bodies are not interpreted as module assignments; this
 bounded extraction does not execute helper calls or prove arbitrary runtime
 control flow.
 
+Visible `globals()`, `locals()`, `vars()` and unknown dynamic execution can
+retain the module namespace: later literal assignments cannot restore evidence
+after that exposure. A direct module-level `vars(SimpleNamespace())` call is
+recognized as unrelated only with an untouched `types` import and builtin
+`vars`; imported aliases are supported. The constructor must receive no
+arguments. Other reflective object forms remain conservatively unsupported;
+this check does not import fixtures or resolve arbitrary Python runtime state.
+
 The inventory is a scheduling contract, not runtime coverage or proof that every
 branch was visited. Fixture success assertions and exact-case execution checks
 remain necessary. In particular, a listed case's early return can still need an

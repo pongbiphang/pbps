@@ -113,8 +113,10 @@ def static_value(node, values):
 
 class SelectorEffects(ast.NodeVisitor):
     """Visible writes/escapes outside function-local bodies invalidate evidence."""
-    def __init__(self, proven_assignment=None):
+    def __init__(self, proven_assignment=None, harmless_reflection=None):
         self.proven_assignment = proven_assignment
+        self.harmless_reflection = harmless_reflection
+        self.namespace_exposed = False
         self.writes = set()
         self.deletes = set()
         self.mutations = set()
@@ -158,9 +160,13 @@ class SelectorEffects(ast.NodeVisitor):
     visit_Attribute = visit_Subscript
 
     def visit_Call(self, node):
+        if node is self.harmless_reflection:
+            # The recognized call inspects a fresh empty object, not a module.
+            return
         if isinstance(node.func, ast.Name) and node.func.id in ("exec", "eval", "globals", "locals", "vars"):
-            # Reflective namespace access cannot retain any proven bindings.
+            # An escaped namespace can also change bindings created later.
             self.writes.add("*")
+            self.namespace_exposed = True
         # Unknown callees may mutate mutable arguments or method receivers.
         if isinstance(node.func, ast.Attribute):
             self.references(node.func.value)
@@ -208,6 +214,7 @@ class SelectorEffects(ast.NodeVisitor):
         for statement in node.body:
             body = SelectorEffects()
             body.visit(statement)
+            self.namespace_exposed |= body.namespace_exposed
             writes = (body.writes & (globals_ | {"*"})) | body.global_writes
             self.writes.update(writes)
             self.global_writes.update(writes)
@@ -261,8 +268,68 @@ def mutable_ids(value):
     return set()
 
 
+class NamespaceImports:
+    """Recognize only direct module-level inspection of a fresh empty object."""
+    def __init__(self):
+        self.constructors = set()
+        self.modules = set()
+        self.types_pristine = True
+        self.builtin_modules = set()
+        self.vars_builtin = True
+
+    def harmless_call(self, statement):
+        if not self.vars_builtin or not isinstance(statement, (ast.Assign, ast.Expr)):
+            return None
+        call = statement.value
+        if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                and call.func.id == "vars" and len(call.args) == 1 and not call.keywords):
+            return None
+        instance = call.args[0]
+        if not isinstance(instance, ast.Call) or instance.args or instance.keywords:
+            return None
+        constructor = instance.func
+        direct = isinstance(constructor, ast.Name) and constructor.id in self.constructors
+        qualified = (isinstance(constructor, ast.Attribute) and constructor.attr == "SimpleNamespace"
+                     and isinstance(constructor.value, ast.Name) and constructor.value.id in self.modules)
+        return call if direct or qualified else None
+
+    def advance(self, statement, effects):
+        # Rebinding, an attribute write or an opaque escape loses provenance.
+        touched = effects.writes | effects.mutations
+        if self.builtin_modules & effects.mutations:
+            self.vars_builtin = False
+        self.builtin_modules.difference_update(touched)
+        if self.modules & effects.mutations:
+            # Imports share a cached module: another alias or reimport cannot
+            # restore the original constructor after a possible module edit.
+            self.types_pristine = False
+            self.modules.clear()
+        if "*" in touched:
+            self.builtin_modules.clear()
+            self.constructors.clear()
+            self.modules.clear()
+            self.types_pristine = False
+            self.vars_builtin = False
+        else:
+            self.constructors.difference_update(touched)
+            self.modules.difference_update(touched)
+            if "vars" in effects.writes:
+                self.vars_builtin = False
+        if (self.types_pristine and isinstance(statement, ast.ImportFrom)
+                and statement.module == "types" and not statement.level):
+            self.constructors.update(alias.asname or alias.name for alias in statement.names
+                                     if alias.name == "SimpleNamespace")
+        if isinstance(statement, ast.Import):
+            self.builtin_modules.update(alias.asname or alias.name for alias in statement.names
+                                        if alias.name == "builtins")
+        if self.types_pristine and isinstance(statement, ast.Import):
+            self.modules.update(alias.asname or alias.name for alias in statement.names if alias.name == "types")
+
+
 def python_values(tree):
     values = {}
+    imports = NamespaceImports()
+    namespace_exposed = False
     for node in tree.body:
         replacement = None
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
@@ -270,13 +337,16 @@ def python_values(tree):
                 replacement = (node.targets[0].id, static_value(node.value, values))
             except (InventoryError, TypeError):
                 pass
-        effects = SelectorEffects(node if replacement is not None else None)
+        harmless = imports.harmless_call(node)
+        effects = SelectorEffects(node if replacement is not None or harmless is not None else None, harmless)
         effects.visit(node)
+        imports.advance(node, effects)
+        namespace_exposed |= effects.namespace_exposed
         mutated = set().union(*(mutable_ids(values[name]) for name in effects.mutations if name in values))
         for name in list(values):
             if name in effects.writes or mutable_ids(values[name]) & mutated or "*" in effects.writes:
                 del values[name]
-        if replacement is not None:
+        if replacement is not None and not namespace_exposed:
             values[replacement[0]] = replacement[1]
     return values
 
