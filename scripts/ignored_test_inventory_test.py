@@ -478,6 +478,95 @@ class Ownership(unittest.TestCase):
         with self.assertRaisesRegex(audit.InventoryError, "missing parent test"):
             self.check()
 
+    def test_class_construction_keywords_cannot_escape_mutable_selectors(self):
+        setup = ('def clear(value):\n    (value[0] if isinstance(value, tuple) else value).clear()\n'
+                 'class Meta(type):\n'
+                 '    def __new__(meta, name, bases, namespace, tests):\n'
+                 '        clear(tests)\n        return super().__new__(meta, name, bases, namespace)\n'
+                 'class Base:\n    def __init_subclass__(cls, tests): clear(tests)\n'
+                 'TESTS = ["owned"]\nKEY = (TESTS,)\n')
+        headers = ['metaclass=Meta, tests=TESTS', 'metaclass=Meta, **{"tests": TESTS}',
+                   'metaclass=Meta, tests=(TESTS,)', 'metaclass=Meta, tests=KEY',
+                   'Base, tests=TESTS', 'Base, **{"tests": TESTS}']
+        self.inventory["owners"]["live"]["selection"] = {
+            "kind": "data", "file": "runner.py", "expression": "TESTS"}
+        for header in headers:
+            with self.subTest(header=header):
+                source = setup + f'class Holder({header}): pass\n'
+                actual = subprocess.run([sys.executable, '-c', source + 'print(TESTS)'],
+                                        check=True, capture_output=True, text=True, timeout=10)
+                self.assertEqual(actual.stdout, '[]\n')
+                (self.root / 'runner.py').write_text(source, encoding='utf-8')
+                with self.assertRaises(audit.InventoryError):
+                    self.check()
+
+    def test_subscription_protocols_cannot_mutate_selector_keys(self):
+        setup = ('def clear(key):\n'
+                 '    if isinstance(key, slice):\n'
+                 '        key = next(part for part in (key.start, key.stop, key.step) if part is not None)\n'
+                 '    if isinstance(key, tuple): key = key[0]\n    key.clear()\n'
+                 'class Indexer:\n'
+                 '    def __getitem__(self, key): clear(key)\n'
+                 '    def __setitem__(self, key, value): clear(key)\n'
+                 '    def __delitem__(self, key): clear(key)\n'
+                 'INDEXER = Indexer()\nTESTS = ["owned"]\nKEY = (TESTS,)\n')
+        self.inventory["owners"]["live"]["selection"] = {
+            "kind": "data", "file": "runner.py", "expression": "TESTS"}
+        for key in ['TESTS', '(TESTS,)', 'KEY', 'TESTS:', ':TESTS', '::TESTS']:
+            for operation in [f'INDEXER[{key}]', f'INDEXER[{key}] = 0', f'del INDEXER[{key}]']:
+                with self.subTest(operation=operation):
+                    # A standalone read and scalar write RHS avoid the existing
+                    # unsupported-assignment guard masking the key escape.
+                    source = setup + operation + '\n'
+                    actual = subprocess.run([sys.executable, '-c', source + 'print(TESTS)'],
+                                            check=True, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(actual.stdout, '[]\n')
+                    (self.root / 'runner.py').write_text(source, encoding='utf-8')
+                    with self.assertRaises(audit.InventoryError):
+                        self.check()
+
+    def test_immutable_class_keywords_preserve_selector_evidence(self):
+        setup = ('class Meta(type):\n'
+                 '    def __new__(meta, name, bases, namespace, tests):\n'
+                 '        return super().__new__(meta, name, bases, namespace)\n'
+                 'class Base:\n    def __init_subclass__(cls, tests): pass\n'
+                 'LABEL = "owned"\nKEY = (LABEL,)\nTESTS = [LABEL]\n')
+        headers = ['metaclass=Meta, tests=LABEL', 'metaclass=Meta, **{"tests": LABEL}',
+                   'metaclass=Meta, tests=KEY', 'Base, tests=LABEL', 'Base, tests=KEY']
+        self.inventory["owners"]["live"]["selection"] = {
+            "kind": "data", "file": "runner.py", "expression": "TESTS"}
+        for header in headers:
+            with self.subTest(header=header):
+                source = setup + f'class Holder({header}): pass\n'
+                actual = subprocess.run([sys.executable, '-c', source + 'print(TESTS)'],
+                                        check=True, capture_output=True, text=True, timeout=10)
+                self.assertEqual(actual.stdout, "['owned']\n")
+                (self.root / 'runner.py').write_text(source, encoding='utf-8')
+                self.assertEqual(self.check(), 1)
+
+    def test_scalar_indices_and_ordinary_attributes_preserve_selectors(self):
+        setup = ('class Indexer:\n'
+                 '    def __getitem__(self, key): pass\n'
+                 '    def __setitem__(self, key, value): pass\n'
+                 '    def __delitem__(self, key): pass\n'
+                 'INDEXER = Indexer()\nKEY = (0,)\nTESTS = ["owned"]\n')
+        controls = ['TESTS[0]', 'TESTS[:]', 'TESTS[::1]',
+                    'INDEXER.value = 1\nINDEXER.value\ndel INDEXER.value',
+                    'BOX = [0]\nBOX[0] = 1\ndel BOX[0]']
+        for key in ['0', 'KEY', ':1']:
+            controls.extend([f'INDEXER[{key}]', f'INDEXER[{key}] = 0', f'del INDEXER[{key}]'])
+        self.inventory["owners"]["live"]["selection"] = {
+            "kind": "data", "file": "runner.py", "expression": "TESTS"}
+        for control in controls:
+            with self.subTest(control=control):
+                source = setup + control + '\n'
+                actual = subprocess.run([sys.executable, '-c', source + 'print(TESTS)'],
+                                        check=True, capture_output=True, text=True, timeout=10)
+                self.assertEqual(actual.stdout, "['owned']\n")
+                (self.root / 'runner.py').write_text(source, encoding='utf-8')
+                self.assertEqual(self.check(), 1)
+
+
 
 class CargoSelectors(unittest.TestCase):
     def test_ambiguous_or_unsupported_cargo_arguments_supply_no_owner(self):

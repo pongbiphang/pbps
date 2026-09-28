@@ -58,7 +58,9 @@ an execution owner.
 Module-level selector data is kept only while its supported literal assignment
 remains valid. Unsupported writes, deletion and conditional rebinding discard
 that name; visible mutation or escape of a mutable selector also discards its
-shared aliases, including aliases inside supported containers. Literal tuples
+shared aliases, including aliases inside supported containers. Class-construction
+keywords and subscription keys (reads, writes and deletions, including slice
+components) are arguments to potentially mutating Python protocols. Literal tuples
 retain their immutability and Python concatenation semantics; a tuple can still
 expose mutable children. Data selectors accept lists or tuples of names. Unsupported
 assignment RHS values also count as escapes inside compound statements,

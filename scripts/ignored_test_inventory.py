@@ -152,12 +152,15 @@ class SelectorEffects(ast.NodeVisitor):
         self.references(node.value)
         self.generic_visit(node)
 
-    def visit_Subscript(self, node):
+    def visit_Attribute(self, node):
         if isinstance(node.ctx, (ast.Store, ast.Del)):
             self.references(node.value)
         self.generic_visit(node)
 
-    visit_Attribute = visit_Subscript
+    def visit_Subscript(self, node):
+        # All three subscription protocols receive the key as an argument.
+        self.references(node.slice)
+        self.visit_Attribute(node)
 
     def visit_Call(self, node):
         if node is self.harmless_reflection:
@@ -202,6 +205,9 @@ class SelectorEffects(ast.NodeVisitor):
         self.writes.add(node.name)
         for expression in [*node.decorator_list, *node.bases, *node.keywords]:
             self.visit(expression)
+        for keyword in node.keywords:
+            # Metaclass and subclass hooks can retain or mutate keyword values.
+            self.references(keyword.value)
         # Class assignments are local unless explicitly declared global.
         def declared_globals(statement):
             if isinstance(statement, ast.Global):
