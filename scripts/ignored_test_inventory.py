@@ -141,15 +141,105 @@ class PruneInactive(ast.NodeTransformer):
         return ast.Constant(value="unexecuted lambda")
 
 
+def script_condition(node):
+    """Evaluate the bounded guards used by scripts launched as __main__."""
+    if isinstance(node, ast.Constant):
+        return bool(node.value)
+    if isinstance(node, ast.Name) and node.id == "__name__":
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        value = script_condition(node.operand)
+        return None if value is None else not value
+    if isinstance(node, ast.Compare) and len(node.ops) == 1:
+        if isinstance(node.ops[0], (ast.Eq, ast.NotEq)):
+            operands = [node.left, node.comparators[0]]
+            if not all(isinstance(value, ast.Constant) or
+                       isinstance(value, ast.Name) and value.id == "__name__" for value in operands):
+                return None
+            # Selector data normalizes tuples to lists; guard equality must not.
+            left, right = [value.value if isinstance(value, ast.Constant) else "__main__"
+                           for value in operands]
+            return left == right if isinstance(node.ops[0], ast.Eq) else left != right
+    return None
+
+
+class ScriptNameBindings(ast.NodeVisitor):
+    """A direct rebinding makes the interpreter's entry name unsafe to assume."""
+    def visit_Name(self, node):
+        require(node.id != "__name__" or not isinstance(node.ctx, (ast.Store, ast.Del)),
+                "module entry name is rebound; audit the script entry explicitly")
+
+    def visit_FunctionDef(self, node):
+        require(node.name != "__name__", "module entry name is rebound")
+        # Defaults/decorators execute at definition time, unlike local bodies.
+        for expression in [*node.decorator_list, node.args]:
+            self.visit(expression)
+        if node.returns is not None:
+            self.visit(node.returns)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_Lambda(self, node):
+        self.visit(node.args)
+
+    def visit_ClassDef(self, node):
+        require(node.name != "__name__", "module entry name is rebound")
+        for expression in [*node.decorator_list, *node.bases, *node.keywords]:
+            self.visit(expression)
+
+    def visit_ExceptHandler(self, node):
+        require(node.name != "__name__", "module entry name is rebound")
+        self.generic_visit(node)
+
+    def visit_MatchAs(self, node):
+        require(node.name != "__name__", "module entry name is rebound")
+        self.generic_visit(node)
+
+    visit_MatchStar = visit_MatchAs
+
+    def visit_MatchMapping(self, node):
+        require(node.rest != "__name__", "module entry name is rebound")
+        self.generic_visit(node)
+
+    def visit_alias(self, node):
+        require((node.asname or node.name.split(".")[0]) != "__name__",
+                "module entry name is rebound")
+
+
+class PruneModuleEntry(PruneInactive):
+    def visit_If(self, node):
+        condition = script_condition(node.test)
+        if condition is None:
+            # Neither branch is evidence when its entry condition is unknown.
+            return None
+        selected = node.body if condition else node.orelse
+        return self.visit(ast.Module(body=selected, type_ignores=[])).body
+
+    def visit_unsupported_control(self, node):
+        # These forms need a separate scheduling adapter, not an execution guess.
+        return None
+
+    visit_While = visit_unsupported_control
+    visit_For = visit_unsupported_control
+    visit_AsyncFor = visit_unsupported_control
+    visit_Try = visit_unsupported_control
+    visit_TryStar = visit_unsupported_control
+    visit_With = visit_unsupported_control
+    visit_AsyncWith = visit_unsupported_control
+    visit_Match = visit_unsupported_control
+
+
 def python_scope(source, scope):
     tree = ast.parse(source)
     if scope == "<module>":
-        body = [n for n in tree.body if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+        ScriptNameBindings().visit(tree)
+        body = tree.body
     else:
         functions = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == scope]
         require(len(functions) == 1, f"missing or ambiguous Python function: {scope}")
         body = [n for n in functions[0].body if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
-    active = PruneInactive().visit(ast.Module(body=body, type_ignores=[]))
+    pruner = PruneModuleEntry() if scope == "<module>" else PruneInactive()
+    active = pruner.visit(ast.Module(body=body, type_ignores=[]))
     return ast.unparse(ast.fix_missing_locations(active))
 
 
