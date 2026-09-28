@@ -43,6 +43,16 @@ updating the checker and its negative tests. Comments, stringified calls,
 missing calls, disabled CI steps and mismatched runner platforms cannot supply
 an execution owner.
 
+Module-level selector data is kept only while its supported literal assignment
+remains valid. Unsupported writes, deletion and conditional rebinding discard
+that name; visible mutation or escape of a mutable selector also discards its
+shared aliases, including aliases inside supported containers. Literal
+replacement, string prefixes and the existing list comprehensions remain
+supported. Unknown calls and containers are not evaluated to guess their
+effects. Function-local bodies are not interpreted as module assignments; this
+bounded extraction does not execute helper calls or prove arbitrary runtime
+control flow.
+
 The inventory is a scheduling contract, not runtime coverage or proof that every
 branch was visited. Fixture success assertions and exact-case execution checks
 remain necessary. In particular, a listed case's early return can still need an

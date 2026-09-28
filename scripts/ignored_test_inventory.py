@@ -107,14 +107,154 @@ def static_value(node, values):
     raise InventoryError("selector is not supported literal data: " + ast.dump(node))
 
 
+class SelectorEffects(ast.NodeVisitor):
+    """Visible writes/escapes outside function-local bodies invalidate evidence."""
+    def __init__(self):
+        self.writes = set()
+        self.mutations = set()
+        self.global_writes = set()
+        self.global_mutations = set()
+        self.loads = set()
+
+    def references(self, node):
+        self.mutations.update(n.id for n in ast.walk(node) if isinstance(n, ast.Name))
+
+    def visit_Name(self, node):
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            self.writes.add(node.id)
+        elif isinstance(node.ctx, ast.Load):
+            self.loads.add(node.id)
+
+    def visit_AugAssign(self, node):
+        # A list += changes its aliases too; rebinding a name normally does not.
+        self.references(node.target)
+        self.generic_visit(node)
+
+    def visit_Subscript(self, node):
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            self.references(node.value)
+        self.generic_visit(node)
+
+    visit_Attribute = visit_Subscript
+
+    def visit_Call(self, node):
+        if isinstance(node.func, ast.Name) and node.func.id in ("exec", "eval", "globals", "locals", "vars"):
+            # Reflective namespace access cannot retain any proven bindings.
+            self.writes.add("*")
+        # Unknown callees may mutate mutable arguments or method receivers.
+        if isinstance(node.func, ast.Attribute):
+            self.references(node.func.value)
+        for argument in [*node.args, *(k.value for k in node.keywords)]:
+            self.references(argument)
+        self.generic_visit(node)
+
+    def visit_AnnAssign(self, node):
+        if node.value is not None:
+            self.visit(node.target)
+            self.visit(node.value)
+        self.references(node.annotation)
+        self.visit(node.annotation)
+
+    def visit_FunctionDef(self, node):
+        self.writes.add(node.name)
+        # Defining a helper does not run its body; defaults can retain aliases.
+        for expression in [*node.decorator_list, node.args]:
+            self.references(expression)
+            self.visit(expression)
+        if node.returns is not None:
+            self.references(node.returns)
+            self.visit(node.returns)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_Lambda(self, node):
+        self.references(node.args)
+        self.visit(node.args)
+
+    def visit_ClassDef(self, node):
+        self.writes.add(node.name)
+        for expression in [*node.decorator_list, *node.bases, *node.keywords]:
+            self.visit(expression)
+        # Class assignments are local unless explicitly declared global.
+        def declared_globals(statement):
+            if isinstance(statement, ast.Global):
+                return set(statement.names)
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                return set()
+            return set().union(*(declared_globals(child) for child in ast.iter_child_nodes(statement)))
+        globals_ = set().union(*(declared_globals(statement) for statement in node.body))
+        locals_ = set()
+        for statement in node.body:
+            body = SelectorEffects()
+            body.visit(statement)
+            writes = (body.writes & (globals_ | {"*"})) | body.global_writes
+            self.writes.update(writes)
+            self.global_writes.update(writes)
+            # A module list retained by a class can be mutated through that alias.
+            escaped = ((body.loads | body.mutations) - locals_) | body.global_mutations
+            escaped.update((body.loads | body.mutations) & globals_)
+            self.mutations.update(escaped)
+            self.global_mutations.update(escaped)
+            if isinstance(statement, ast.Delete):
+                locals_.difference_update(body.writes)
+            elif isinstance(statement, (ast.Assign, ast.AnnAssign, ast.AugAssign,
+                                        ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                                        ast.Import, ast.ImportFrom)):
+                locals_.update(body.writes - globals_ - body.global_writes)
+
+    def visit_alias(self, node):
+        self.writes.add(node.asname or node.name.split(".")[0])
+
+    def visit_ExceptHandler(self, node):
+        if node.name:
+            self.writes.add(node.name)
+        self.generic_visit(node)
+
+    def visit_MatchAs(self, node):
+        if node.name:
+            self.writes.add(node.name)
+        self.generic_visit(node)
+
+    visit_MatchStar = visit_MatchAs
+
+    def visit_MatchMapping(self, node):
+        if node.rest:
+            self.writes.add(node.rest)
+        self.generic_visit(node)
+
+    def visit_comprehension(self, node):
+        # Comprehension targets are local, but walrus writes in expressions are not.
+        self.visit(node.iter)
+        for condition in node.ifs:
+            self.visit(condition)
+
+
+def mutable_ids(value):
+    if isinstance(value, list):
+        return {id(value)}.union(*(mutable_ids(item) for item in value))
+    return set()
+
+
 def python_values(tree):
     values = {}
     for node in tree.body:
+        replacement = None
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             try:
-                values[node.targets[0].id] = static_value(node.value, values)
+                replacement = (node.targets[0].id, static_value(node.value, values))
             except (InventoryError, TypeError):
                 pass
+        effects = SelectorEffects()
+        effects.visit(node)
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and replacement is None and node.value is not None:
+            # Unsupported containers/expressions can hide a mutable alias.
+            effects.references(node.value)
+        mutated = set().union(*(mutable_ids(values[name]) for name in effects.mutations if name in values))
+        for name in list(values):
+            if name in effects.writes or mutable_ids(values[name]) & mutated or "*" in effects.writes:
+                del values[name]
+        if replacement is not None:
+            values[replacement[0]] = replacement[1]
     return values
 
 
