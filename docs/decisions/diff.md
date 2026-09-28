@@ -959,7 +959,9 @@ UTF-8 collation. Which code page a collation uses is not known offline. The
 probes convert under the target collation instead of `DATABASE_DEFAULT`, and
 count a rebuilt key's duplicates under the collation it will have. A Unicode
 column's collation change takes no class of its own; the keys rebuilt around
-it carry theirs. A foreign key's two sides must declare the same collation
-(1757). A name the server lacks is refused before the first statement (448).
+it carry theirs. A foreign key's two sides must have the same collation
+(1757). Offline, only two named collations that differ can be refused: an
+absent one facing a named one is valid exactly when the named one is the
+target's default, so `plan --db` asks again once it knows it. A name the server lacks is refused before the first statement (448).
 The operational estimate reports a collation change as unmeasured.
 PostgreSQL refuses the field.

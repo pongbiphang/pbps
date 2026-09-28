@@ -2177,6 +2177,31 @@ fn a_column_collation_round_trips_and_changes_through_the_cli() {
              THROW 50000, 'note was not moved', 1;
          IF (SELECT COUNT(*) FROM dbo.t) <> 2 THROW 50000, 'rows lost', 1;",
     );
+
+    // A foreign key from a column with no collation into the case-sensitive
+    // `code`: valid offline, since only the target knows its default, and
+    // refused by the connected plan once it does (1757), before anything
+    // runs. Declared under the same collation, it plans (#1247 review).
+    let child = |collation: &str| {
+        std::fs::write(
+            d.dir.join("schema/dbo.c.yml"),
+            format!(
+                "table: dbo.c\ncolumns:\n  code:\n    type: varchar(10)\n{collation}\
+                 foreign_keys:\n  fk_c_t:\n    columns: [code]\n    references: dbo.t(code)\n"
+            ),
+        )
+        .unwrap();
+    };
+    child("");
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let o = d.run(&["plan", "--db", source.connection()]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(stderr(&o).contains("fk_c_t"), "{}", stderr(&o));
+    child("    collation: Latin1_General_CS_AS\n");
+    ok(&d.run(&["plan"]));
+    d.commit();
+    ok(&d.run(&["plan", "--db", source.connection()]));
 }
 
 /// A table's clustered layout goes the whole way through the CLI (#1178):

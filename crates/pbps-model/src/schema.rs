@@ -88,10 +88,15 @@ impl Schema {
     /// Foreign keys whose two sides are declared under different collations
     /// (#1175). Measured on SQL Server 17.0, the engine refuses one (1757,
     /// "is not of same collation as referencing column"), so a plan with it
-    /// fails at apply. Both sides as declared: an absent collation on one side
-    /// and a named one on the other are refused too, since whether the named
-    /// one is the target database's default is not known here.
-    pub fn foreign_key_collation_problems(&self) -> Vec<String> {
+    /// fails at apply.
+    ///
+    /// `default_known` says whether this schema's absent collations have
+    /// been resolved against a target ([`Schema::without_collation`]). Until
+    /// they have, an absent collation facing a named one is not a problem: it
+    /// is valid exactly when the named one is the target's default, which is
+    /// not known offline — refusing it there refused a valid plan (#1247
+    /// review). A connected plan asks again once the default is known.
+    pub fn foreign_key_collation_problems(&self, default_known: bool) -> Vec<String> {
         let mut problems = Vec::new();
         for (name, table) in &self.tables {
             for (fk_name, fk) in &table.foreign_keys {
@@ -104,7 +109,9 @@ impl Schema {
                     else {
                         continue;
                     };
-                    if l.collation != r.collation {
+                    let undecided =
+                        !default_known && (l.collation.is_none() != r.collation.is_none());
+                    if l.collation != r.collation && !undecided {
                         let say = |c: &Option<Collation>| {
                             c.as_ref().map_or_else(
                                 || "the database default".to_owned(),
@@ -832,17 +839,33 @@ mod tests {
         let mut s = Schema::default();
         s.tables.insert(TableName::new("dbo", "customer"), parent);
         s.tables.insert(TableName::new("dbo", "child"), child);
-        let problems = s.foreign_key_collation_problems();
+        let set_child = |s: &mut Schema, collation: &str| {
+            s.tables
+                .get_mut(&TableName::new("dbo", "child"))
+                .unwrap()
+                .columns
+                .get_mut("email")
+                .unwrap()
+                .collation = Some(Collation::new(collation));
+        };
+        // Absent facing named: undecidable offline, so not refused there; a
+        // problem once the target's default is known and is not the named
+        // one (the schema then has the default taken out already).
+        assert!(s.foreign_key_collation_problems(false).is_empty());
+        let problems = s.foreign_key_collation_problems(true);
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("fk_child_email"), "{problems:?}");
-        s.tables
-            .get_mut(&TableName::new("dbo", "child"))
-            .unwrap()
-            .columns
-            .get_mut("email")
-            .unwrap()
-            .collation = Some(Collation::new("latin1_general_cs_as"));
-        assert!(s.foreign_key_collation_problems().is_empty());
+        // Named on the target's default: normalized away, and valid.
+        assert!(
+            s.without_collation("Latin1_General_CS_AS")
+                .foreign_key_collation_problems(true)
+                .is_empty()
+        );
+        // Two named collations that differ: refused even offline.
+        set_child(&mut s, "Latin1_General_CI_AS");
+        assert_eq!(s.foreign_key_collation_problems(false).len(), 1);
+        set_child(&mut s, "latin1_general_cs_as");
+        assert!(s.foreign_key_collation_problems(true).is_empty());
     }
 
     /// Column order affects CREATE TABLE output, so it has to be preserved.

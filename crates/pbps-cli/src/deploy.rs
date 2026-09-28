@@ -4820,6 +4820,16 @@ pub fn cmd_plan_db(
             None => loaded.schema.clone(),
         };
         crate::engine::refuse_unknown_collations(&mut conn, &declared).await?;
+        // And now that the default is known, an absent collation facing a
+        // named one on a foreign key is decidable (#1247 review).
+        let mismatched =
+            declared.foreign_key_collation_problems(managed.database_collation.is_some());
+        if !mismatched.is_empty() {
+            bail!(
+                "the declarations have a foreign key the engine refuses (1757):\n  {}",
+                mismatched.join("\n  ")
+            );
+        }
         // A declared name standing on an object introspection cannot express is
         // not something to plan around. It is absent from the scoped schema, so
         // the diff would emit an ungated `CreateModule` and `CREATE OR ALTER`
