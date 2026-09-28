@@ -656,7 +656,8 @@ pub struct NameOccupant {
 
 /// The [`NameOccupant`]s at `names`, and every object whose parent is one of
 /// `parents` (its constraints, defaults and triggers), compared under the
-/// database's collation, read in the caller's transaction. An object found
+/// catalog collation that names them (see [`object_names_alike`]), read in the
+/// caller's transaction. An object found
 /// only as a child has its own name as `wanted`.
 pub async fn object_name_occupants(
     conn: &mut Conn,
@@ -692,8 +693,8 @@ pub async fn object_name_occupants(
            FROM sys.objects o
            JOIN sys.schemas s ON s.schema_id = o.schema_id
            LEFT JOIN (VALUES {}) AS w(i, schema_name, object_name)
-             ON s.name = w.schema_name COLLATE DATABASE_DEFAULT
-            AND o.name = w.object_name COLLATE DATABASE_DEFAULT
+             ON s.name = w.schema_name COLLATE CATALOG_DEFAULT
+            AND o.name = w.object_name COLLATE CATALOG_DEFAULT
            LEFT JOIN sys.objects p ON p.object_id = o.parent_object_id
            LEFT JOIN sys.schemas ps ON ps.schema_id = p.schema_id
            LEFT JOIN sys.default_constraints dc ON dc.object_id = o.object_id
@@ -701,8 +702,8 @@ pub async fn object_name_occupants(
              ON c.object_id = dc.parent_object_id AND c.column_id = dc.parent_column_id
           WHERE w.i IS NOT NULL
              OR EXISTS (SELECT 1 FROM (VALUES {}) AS q(i, schema_name, table_name)
-                         WHERE q.schema_name = ps.name COLLATE DATABASE_DEFAULT
-                           AND q.table_name = p.name COLLATE DATABASE_DEFAULT)
+                         WHERE q.schema_name = ps.name COLLATE CATALOG_DEFAULT
+                           AND q.table_name = p.name COLLATE CATALOG_DEFAULT)
           ORDER BY s.name, o.name;",
         values(names),
         values(parents)
@@ -776,8 +777,13 @@ pub async fn tables_reusing_a_column_name(
 }
 
 /// Among `names`, the pairs of schema-scoped objects the database reads as one
-/// `sys.objects` name: the same schema and the same name under its collation,
-/// such as `dbo.Ck_Name` and `dbo.ck_name` on a case-insensitive database.
+/// `sys.objects` name: the same schema and the same name under its catalog
+/// collation, such as `dbo.Ck_Name` and `dbo.ck_name` on a case-insensitive
+/// database. `CATALOG_DEFAULT`, not `DATABASE_DEFAULT`: a partially contained
+/// database names its objects under a fixed catalog collation of its own.
+/// Measured on 17.0: with an accent-insensitive database collation, `cafe` and
+/// `café` are two constraints there and one anywhere else, and the two
+/// collations agree on a database that is not contained (review of #1240).
 /// Each pair comes once, as `(earlier, later)` in the order given. The same
 /// question as [`names_alike`], with the schema taking part (#1215). A fold done
 /// in Rust would refuse a valid plan on a case-sensitive database, so it is
@@ -806,8 +812,8 @@ pub async fn object_names_alike(
            FROM (VALUES {values}) AS a(i, schema_name, object_name)
            JOIN (VALUES {values}) AS b(i, schema_name, object_name)
              ON a.i < b.i
-            AND a.schema_name = b.schema_name COLLATE DATABASE_DEFAULT
-            AND a.object_name = b.object_name COLLATE DATABASE_DEFAULT
+            AND a.schema_name = b.schema_name COLLATE CATALOG_DEFAULT
+            AND a.object_name = b.object_name COLLATE CATALOG_DEFAULT
           ORDER BY a.i, b.i;"
     );
     let mut out = Vec::new();

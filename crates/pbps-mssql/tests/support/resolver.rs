@@ -135,6 +135,55 @@ mod contained611 {
         let recipe = DatabaseRecipe::from_sql_server_catalog(&catalog).unwrap();
         assert_eq!(recipe.sql_server.as_ref().unwrap().containment, "PARTIAL");
 
+        // #1215, review of #1240: object names are compared under the catalog
+        // collation. With an accent-insensitive database collation, `cafe`
+        // and `café` are two `sys.objects` names in a partially contained
+        // database, whose catalog collation is fixed and accent-sensitive, and
+        // one in an ordinary database. The option is on here, so this test,
+        // the only one allowed to set it, asks both.
+        for (containment, distinct) in [("PARTIAL", true), ("NONE", false)] {
+            let probe = format!("pbps_catalog1215_{}_{pid}", containment.to_lowercase());
+            crate::create_database(
+                &mut admin,
+                &format!(
+                    "CREATE DATABASE [{probe}] CONTAINMENT = {containment} \
+                     COLLATE Latin1_General_100_CI_AI;"
+                ),
+            )
+            .await
+            .unwrap();
+            let mut conn = connect_live(&format!("{};Database={probe}", conn_str()))
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE dbo.t (id int); ALTER TABLE dbo.t ADD CONSTRAINT [café] CHECK (id > 0);")
+                .await
+                .unwrap();
+            let names: Vec<pbps_model::TableName> = ["dbo.cafe", "dbo.café"]
+                .iter()
+                .map(|n| n.parse().unwrap())
+                .collect();
+            let alike = pbps_mssql::catalog::object_names_alike(&mut conn, &names)
+                .await
+                .unwrap();
+            let occupants = pbps_mssql::catalog::object_name_occupants(&mut conn, &names[..1], &[])
+                .await
+                .unwrap();
+            drop(conn);
+            admin
+                .execute(&format!(
+                    "ALTER DATABASE [{probe}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; \
+                     DROP DATABASE [{probe}];"
+                ))
+                .await
+                .unwrap();
+            assert_eq!(alike.is_empty(), distinct, "{containment}: {alike:?}");
+            assert_eq!(
+                occupants.is_empty(),
+                distinct,
+                "{containment}: {occupants:?}"
+            );
+        }
+
         // Off: refused by name, before any statement could fail halfway. The
         // engine will not turn the option off while a contained database
         // exists (12818), so the target goes first; its recipe is what is kept.
