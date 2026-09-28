@@ -1758,6 +1758,13 @@ pub trait Dialect {
         RetypeDependents::default()
     }
 
+    /// Dependencies that cannot remain standing while a column's collation
+    /// changes (#1175). None by default: an engine without column
+    /// collations in the model refuses the change before it gets here.
+    fn recollate_dependents(&self) -> RetypeDependents {
+        RetypeDependents::default()
+    }
+
     /// Expands aliases and fills in omitted default arguments, so that two
     /// semantically identical spellings become the same value.
     ///
@@ -1808,7 +1815,24 @@ pub trait Dialect {
         {
             risks.insert(risk);
         }
+        if let Change::AlterColumnType {
+            to,
+            from_collation,
+            to_collation,
+            ..
+        } = change
+            && from_collation != to_collation
+            && let Some(risk) = self.collation_change_risk(to)
+        {
+            risks.insert(risk);
+        }
         risks
+    }
+
+    /// The risk of moving a column of type `to` to another collation
+    /// (#1175), beyond what its type change carries. `None` by default.
+    fn collation_change_risk(&self, _to: &ColumnType) -> Option<RiskClass> {
+        None
     }
 
     /// The canonical form of an unquoted identifier in this dialect.

@@ -25,7 +25,8 @@ use std::borrow::Cow;
 
 use pbps_dialect::{Dialect, DialectError, Lexicon, Statement, TransactionFraming, TypeChangeRisk};
 use pbps_model::{
-    Change, ChangeSet, ColumnType, Module, ModuleId, Role, Schema, Strategy, Table, TableName,
+    Change, ChangeSet, ColumnType, Module, ModuleId, RiskClass, Role, Schema, Strategy, Table,
+    TableName,
 };
 
 pub mod catalog;
@@ -97,6 +98,34 @@ impl Dialect for Mssql {
         to: &ColumnType,
     ) -> pbps_dialect::RetypeDependents {
         types::retype_dependents(from, to)
+    }
+
+    /// Every dependent a type change can have (#1175). Measured on 17.0, an
+    /// `ALTER COLUMN ... COLLATE` is refused (5074 with 4922 behind it) by an
+    /// index over the column, as a key or an INCLUDE column or in a filter's
+    /// predicate, by a PRIMARY KEY or UNIQUE constraint on it, by a foreign
+    /// key on either side, and by a CHECK naming it; a DEFAULT does not
+    /// block it.
+    fn recollate_dependents(&self) -> pbps_dialect::RetypeDependents {
+        pbps_dialect::RetypeDependents {
+            keys_and_indexes: true,
+            checks: true,
+            filtered_indexes: true,
+            foreign_keys: true,
+        }
+    }
+
+    /// A non-Unicode column stores bytes in its collation's code page, so a
+    /// collation change can change them without an error: measured on 17.0,
+    /// `varchar(5)` holding `ééééé` kept `éé` under a UTF-8 collation, and
+    /// `中文é` became `??é` going back to `Latin1_General_CI_AS`. Which code
+    /// page a collation uses is not known offline, so every such change is
+    /// `narrowing`. A Unicode column stores the same characters under any
+    /// collation; what changes there is comparison, and the keys that depend
+    /// on it are rebuilt as their own gated changes.
+    fn collation_change_risk(&self, to: &ColumnType) -> Option<RiskClass> {
+        let to = types::normalize(to).ok()?;
+        matches!(to.base.as_str(), "char" | "varchar" | "text").then_some(RiskClass::Narrowing)
     }
 
     fn type_change_risk(&self, from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
@@ -226,6 +255,36 @@ impl Dialect for Mssql {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A collation change on a non-Unicode column can change its bytes, so
+    /// it is `narrowing`; on a Unicode column it changes comparison only, and
+    /// takes no class of its own (#1175).
+    #[test]
+    fn only_a_non_unicode_collation_change_is_narrowing() {
+        let change = |ty: &str| Change::AlterColumnType {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: "dbo.t.c".parse().unwrap(),
+            from: ty.parse().unwrap(),
+            to: ty.parse().unwrap(),
+            from_nullable: true,
+            to_nullable: true,
+            from_collation: None,
+            to_collation: Some(pbps_model::Collation::new(
+                "Latin1_General_100_CI_AS_SC_UTF8",
+            )),
+        };
+        for ty in ["varchar(10)", "char(3)", "text"] {
+            assert!(
+                Mssql
+                    .change_risks(&change(ty))
+                    .contains(&RiskClass::Narrowing),
+                "{ty}"
+            );
+        }
+        for ty in ["nvarchar(10)", "nchar(3)", "ntext"] {
+            assert!(Mssql.change_risks(&change(ty)).is_empty(), "{ty}");
+        }
+    }
 
     /// #878: the pull filters the two ledger tables out of `dbo`, so a
     /// declaration of one must be refused rather than read back as absent and

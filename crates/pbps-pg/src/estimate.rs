@@ -898,6 +898,8 @@ mod tests {
                     to: ty("bigint"),
                     from_nullable: true,
                     to_nullable: true,
+                    from_collation: None,
+                    to_collation: None,
                 }),
                 PlannedChange::new(Change::RenameColumn {
                     uid: "c_bbbbbb".parse().expect("a uid"),
@@ -915,6 +917,8 @@ mod tests {
                     to: ty("bigint"),
                     from_nullable: true,
                     to_nullable: true,
+                    from_collation: None,
+                    to_collation: None,
                 }),
             ],
         };
@@ -952,6 +956,8 @@ mod tests {
                 to: ty("bigint"),
                 from_nullable: true,
                 to_nullable: true,
+                from_collation: None,
+                to_collation: None,
             })
         };
         let cs = ChangeSet {
@@ -963,6 +969,7 @@ mod tests {
                     column: cref("app.customer.required"),
                     ty: ty("integer"),
                     to_nullable: false,
+                    collation: None,
                 }),
                 PlannedChange::new(Change::RenameColumn {
                     uid: "c_aaaaaa".parse().unwrap(),
@@ -1194,6 +1201,7 @@ mod tests {
                 column: cref("app.t.v"),
                 ty: ty("integer"),
                 to_nullable: false,
+                collation: None,
             },
             Strategy::default(),
         )
@@ -1213,6 +1221,8 @@ mod tests {
                 to: ty("varchar(20)"),
                 from_nullable: true,
                 to_nullable: true,
+                from_collation: None,
+                to_collation: None,
             },
             Strategy::default(),
         )
@@ -1235,6 +1245,8 @@ mod tests {
                     to: ty("varchar(20)"),
                     from_nullable,
                     to_nullable,
+                    from_collation: None,
+                    to_collation: None,
                 },
                 Strategy::default(),
             )
@@ -1262,6 +1274,7 @@ mod tests {
                 column: tname(table).column("v"),
                 ty: ty("integer"),
                 to_nullable: false,
+                collation: None,
             })
         };
         let drop = |table, name: &str| {

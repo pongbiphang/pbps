@@ -332,11 +332,7 @@ pub struct SpellingQuery {
 /// read time (71). Integer and bit cells are parsed by the loader and
 /// spelled by the model; only text-kind columns carry a spelling to ask
 /// about.
-pub fn spelling_queries(
-    name: &TableName,
-    table: &Table,
-    at: &Catalogued,
-) -> Result<Vec<SpellingQuery>, RowsError> {
+pub fn spelling_queries(name: &TableName, table: &Table) -> Result<Vec<SpellingQuery>, RowsError> {
     let Some(data) = &table.data else {
         return Ok(Vec::new());
     };
@@ -355,17 +351,15 @@ pub fn spelling_queries(
         })?;
         Ok((ty.base.clone(), ty.to_string()))
     };
-    // The catalog is asked under the names it has now, not the ones this plan
-    // is about to give it: the collation read below happens before the rename
-    // statement runs (DECISIONS 148).
-    let qualified_name =
-        crate::emit::qualified(at.table.as_ref().unwrap_or(name)).map_err(|e| {
-            RowsError::Unreadable {
-                table: name.clone(),
-                why: e.to_string(),
-            }
-        })?;
-    let key_name = at.key_column.clone().unwrap_or_else(|| key.clone());
+    // The key's collation, as a clause: validated here, where an error can
+    // be returned, rather than defaulted inside the closure below.
+    let key_collation = match table.columns.get(&key).and_then(|c| c.collation.as_ref()) {
+        Some(c) => crate::emit::collate_clause(Some(c)).map_err(|e| RowsError::Unreadable {
+            table: name.clone(),
+            why: e.to_string(),
+        })?,
+        None => " COLLATE DATABASE_DEFAULT".to_owned(),
+    };
     let query = |column: Option<String>,
                  base: &str,
                  ty: String,
@@ -397,26 +391,15 @@ pub fn spelling_queries(
             // case-insensitive key column, `a` and `A` are one row and this
             // reported no collision — two inserts that fail on the primary
             // key; the other way round, two distinct keys were refused as
-            // one. The column's own collation is asked for here.
+            // one. So the keys are grouped under the key column's collation.
             //
-            // A collation is a name, not a value, so it cannot be bound and
-            // the statement has to be built around it. Only names of
-            // letters, digits and `_` are concatenated — every real
-            // collation name is one — and a table that does not exist yet
-            // has none, which is right: the emitter writes no `COLLATE`, so
-            // its column will be created with the database's default.
-            format!(
-                "DECLARE @coll sysname = (SELECT c.collation_name FROM sys.columns c\n  \
-                   WHERE c.object_id = OBJECT_ID({}) AND c.name = {}\n    \
-                     AND c.collation_name NOT LIKE N'%[^A-Za-z0-9_]%');\n\
-                 DECLARE @sql nvarchar(max) = {}\n  \
-                   + COALESCE(N' COLLATE ' + @coll, N'') + {};\n\
-                 EXEC sp_executesql @sql;",
-                literal(&qualified_name),
-                literal(&key_name),
-                literal(&grouped),
-                literal(tail),
-            )
+            // The declared one, not the catalog's: since #1175 the column
+            // has, once the plan has run, exactly the collation it declares —
+            // the database default where it names none — whether the plan
+            // creates the table, changes the column's collation, or leaves
+            // it alone. The catalog's answer was the collation before the
+            // plan, and for a table the plan creates, none at all.
+            format!("{grouped}{key_collation}{tail}")
         });
         SpellingQuery {
             column,
@@ -1243,6 +1226,43 @@ mod tests {
         TableName::new("dbo", "status")
     }
 
+    /// Two row keys are one when the key column's collation says so, and
+    /// that is the collation the column *declares*: what it has once the plan
+    /// has run, whether the plan creates it, changes it or leaves it (#1175).
+    #[test]
+    fn row_keys_collide_under_the_key_columns_declared_collation() {
+        let mut t = table(Some(vec!["code"]), &[("code", "varchar(10)", None)]);
+        t.data = Some(pbps_model::TableData {
+            mode: pbps_model::DataMode::Exact,
+            rows: [
+                (RowKey::from("a"), pbps_model::Row::default()),
+                (RowKey::from("A"), pbps_model::Row::default()),
+            ]
+            .into_iter()
+            .collect(),
+        });
+        let collisions = |t: &Table| {
+            spelling_queries(&name(), t).unwrap()[0]
+                .collisions
+                .clone()
+                .unwrap()
+        };
+        let plain = collisions(&t);
+        assert!(
+            plain.contains("GROUP BY TRY_CONVERT(varchar(10), v.s) COLLATE DATABASE_DEFAULT"),
+            "{plain}"
+        );
+        t.columns.get_mut("code").unwrap().collation =
+            Some(pbps_model::Collation::new("Latin1_General_CI_AS"));
+        let declared = collisions(&t);
+        assert!(
+            declared.contains("COLLATE Latin1_General_CI_AS\nHAVING"),
+            "{declared}"
+        );
+        // Negative: nothing is looked up at run time any more.
+        assert!(!declared.contains("sys.columns"), "{declared}");
+    }
+
     #[test]
     fn the_query_reads_the_key_first_then_every_other_column() {
         let t = table(
@@ -1423,7 +1443,7 @@ mod tests {
                 .into_iter()
                 .collect(),
         });
-        let qs = spelling_queries(&name(), &t, &Catalogued::default()).unwrap();
+        let qs = spelling_queries(&name(), &t).unwrap();
         let columns: Vec<Option<&str>> = qs.iter().map(|q| q.column.as_deref()).collect();
         assert_eq!(columns, [None, Some("pct"), Some("since")], "{qs:#?}");
         assert_eq!(qs[0].ty, "varchar(10)");
@@ -1458,11 +1478,7 @@ mod tests {
         );
         // No block, nothing to ask.
         t.data = None;
-        assert!(
-            spelling_queries(&name(), &t, &Catalogued::default())
-                .unwrap()
-                .is_empty()
-        );
+        assert!(spelling_queries(&name(), &t).unwrap().is_empty());
     }
 
     #[test]

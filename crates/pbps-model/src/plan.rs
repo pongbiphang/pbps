@@ -126,7 +126,14 @@ use crate::schema::Schema;
 ///
 /// Bumped to 12 for required analysis provenance and sealed resolver evidence.
 /// Omitting analysis must never downgrade a resolved plan to an ordinary one.
-pub const CURRENT_VERSION: u32 = 12;
+///
+/// Bumped to 13 for column collations (#1175): `Column::collation` in a
+/// created table's or added column's payload, and the collation fields of
+/// `AlterColumnType` and `AlterColumnNullability`. A version 12 plan read by
+/// this build would restate every `ALTER COLUMN` without a collation, which
+/// this build's emitter reads as the database default — moving a collated
+/// column to it, the silent reset the fields exist to prevent.
+pub const CURRENT_VERSION: u32 = 13;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.

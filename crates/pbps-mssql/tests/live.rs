@@ -1023,6 +1023,20 @@ impl TestDb {
         TestDb { name, conn }
     }
 
+    /// The same, with a default collation of the test's choosing (#1175).
+    async fn create_collated(tag: &str, collation: &str) -> TestDb {
+        let name = format!("pbps_test_{tag}_{}", std::process::id());
+        let mut conn = connect_live(&conn_str()).await.expect("connect");
+        create_database(
+            &mut conn,
+            &format!("CREATE DATABASE [{name}] COLLATE {collation};"),
+        )
+        .await
+        .expect("create database");
+        conn.execute(&format!("USE [{name}];")).await.expect("use");
+        TestDb { name, conn }
+    }
+
     async fn drop(mut self) {
         // Failure to clean up must not obscure the test's own verdict; the
         // container is throwaway anyway.
@@ -1489,17 +1503,21 @@ async fn pull_warns_about_what_it_cannot_express() {
         "{:?}",
         pulled.warnings
     );
-    assert!(
-        legacy.columns.contains_key("code"),
-        "a non-default collation is unmodelled, not the column itself"
+    // Since #1175 a column pulled off a real server with an explicit COLLATE
+    // is declared with it, rather than reported as #94 had it.
+    assert_eq!(
+        legacy.columns["code"]
+            .collation
+            .as_ref()
+            .map(|c| c.as_str()),
+        Some("Latin1_General_BIN2")
     );
     assert!(
-        pulled
+        !pulled
             .warnings
             .iter()
-            .any(|w| w.contains("code") && w.contains("Latin1_General_BIN2")),
-        "a column pulled off a real server with an explicit COLLATE must be \
-         reported, the way issue #94 asked for: {:?}",
+            .any(|w| w.contains("Latin1_General_BIN2")),
+        "{:?}",
         pulled.warnings
     );
 }
@@ -2073,6 +2091,291 @@ async fn a_layout_on_partitioned_rows_is_left_out_and_named() {
     }
     // Negative: unpartitioned, the same key is declared as a heap's.
     assert_eq!(t("plain").clustered, Some(Clustered::Heap));
+}
+
+/// Runs every probe of a plan and returns (description, count) pairs.
+async fn probe_counts(conn: &mut Conn, cs: &pbps_model::ChangeSet) -> Vec<(String, i32)> {
+    let mut counts = Vec::new();
+    for probe in Mssql.preflight(cs).probes {
+        let rows = conn
+            .query(&probe.sql)
+            .await
+            .unwrap_or_else(|e| panic!("the engine rejected a probe:\n{}\n{e}", probe.sql));
+        counts.push((probe.description, rows[0].try_get_at(0).unwrap().unwrap()));
+    }
+    counts
+}
+
+/// A column collated away from its database's default is declared with its
+/// collation and rebuilt with it on a database whose default is another one,
+/// keeping what `=` means there; a column under the default follows the new
+/// database's (#1175, the acceptance's round trip).
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_collated_column_round_trips_onto_a_database_with_another_default() {
+    let mut source = TestDb::create_collated("coll_src", "Latin1_General_CI_AS").await;
+    source
+        .conn
+        .execute(
+            "CREATE TABLE dbo.t (
+                 code varchar(10) COLLATE Latin1_General_CS_AS NOT NULL CONSTRAINT pk_t PRIMARY KEY,
+                 note varchar(10) NULL,
+                 u nvarchar(10) COLLATE Latin1_General_BIN2 NULL
+             );",
+        )
+        .await
+        .expect("create");
+    let pulled = pbps_mssql::catalog::introspect(&mut source.conn)
+        .await
+        .expect("introspect");
+    source.drop().await;
+    assert!(pulled.limitations.is_empty(), "{:?}", pulled.limitations);
+    let t = &pulled.schema.tables[&TableName::new("dbo", "t")];
+    let collation = |c: &str| {
+        t.columns[c]
+            .collation
+            .as_ref()
+            .map(|c| c.as_str().to_owned())
+    };
+    assert_eq!(collation("code").as_deref(), Some("Latin1_General_CS_AS"));
+    assert_eq!(collation("u").as_deref(), Some("Latin1_General_BIN2"));
+    assert_eq!(collation("note"), None);
+
+    let ids = mint_ids(&pulled.schema, &IdsFile::default(), &[]);
+    let bootstrap = plan(
+        &Schema::default(),
+        &IdsFile::default(),
+        &pulled.schema,
+        &ids,
+    );
+    let mut target = TestDb::create_collated("coll_dst", "Latin1_General_100_CS_AS_SC_UTF8").await;
+    try_apply(&mut target.conn, &bootstrap)
+        .await
+        .unwrap_or_else(|e| panic!("bootstrap refused: {e}"));
+    let again = pbps_mssql::catalog::introspect(&mut target.conn)
+        .await
+        .expect("introspect the rebuild");
+    target
+        .conn
+        .execute("INSERT dbo.t (code, note) VALUES ('ABC', 'x');")
+        .await
+        .expect("insert");
+    let matched = target
+        .conn
+        .query("SELECT COUNT(*) AS n FROM dbo.t WHERE code = 'abc';")
+        .await
+        .expect("compare");
+    let physical = target
+        .conn
+        .query(
+            "SELECT name, collation_name FROM sys.columns
+              WHERE object_id = OBJECT_ID('dbo.t') ORDER BY column_id;",
+        )
+        .await
+        .expect("catalog");
+    target.drop().await;
+    assert_eq!(again.schema, pulled.schema);
+    // Still case-sensitive: the declaration kept the source's semantics.
+    assert_eq!(matched[0].try_get::<i32>("n").unwrap(), Some(0));
+    let physical: Vec<(String, String)> = physical
+        .iter()
+        .map(|r| {
+            (
+                r.try_get::<&str>("name").unwrap().unwrap().to_owned(),
+                r.try_get::<&str>("collation_name")
+                    .unwrap()
+                    .unwrap()
+                    .to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        physical,
+        [
+            ("code".to_owned(), "Latin1_General_CS_AS".to_owned()),
+            (
+                "note".to_owned(),
+                "Latin1_General_100_CS_AS_SC_UTF8".to_owned()
+            ),
+            ("u".to_owned(), "Latin1_General_BIN2".to_owned()),
+        ]
+    );
+}
+
+/// A collation change on a populated key column, with a foreign key into
+/// it: the key, the foreign key and the check come down and go back up
+/// around the `ALTER`, every row stays, and nothing is left to plan. A
+/// nullability change on a collated column keeps its collation, where an
+/// `ALTER COLUMN` without `COLLATE` resets it (#1175).
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_collation_change_rebuilds_its_dependents_and_keeps_the_rows() {
+    let mut db = TestDb::create_collated("coll_change", "Latin1_General_CI_AS").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.p (
+                 code varchar(10) NOT NULL CONSTRAINT pk_p PRIMARY KEY,
+                 label nvarchar(20) COLLATE Latin1_General_CS_AS NULL,
+                 CONSTRAINT ck_p CHECK (code <> '')
+             );
+             CREATE TABLE dbo.c (
+                 id int NOT NULL CONSTRAINT pk_c PRIMARY KEY,
+                 p_code varchar(10) NULL CONSTRAINT fk_c_p REFERENCES dbo.p (code)
+             );
+             INSERT dbo.p VALUES ('abc', N'A'), ('XYZ', N'B');
+             INSERT dbo.c VALUES (1, 'abc'), (2, 'XYZ');",
+        )
+        .await
+        .expect("create populated tables");
+    let start = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    let ids = mint_ids(&start.schema, &IdsFile::default(), &[]);
+    let mut declared = start.schema.clone();
+    let cs = Some(pbps_model::Collation::new("Latin1_General_CS_AS"));
+    for (table, column) in [("p", "code"), ("c", "p_code")] {
+        declared
+            .tables
+            .get_mut(&TableName::new("dbo", table))
+            .unwrap()
+            .columns
+            .get_mut(column)
+            .unwrap()
+            .collation = cs.clone();
+    }
+    // And a nullability change on a column that keeps its collation.
+    declared
+        .tables
+        .get_mut(&TableName::new("dbo", "p"))
+        .unwrap()
+        .columns
+        .get_mut("label")
+        .unwrap()
+        .nullable = false;
+    let step = plan(&start.schema, &ids, &declared, &ids);
+    let kinds: Vec<String> = step
+        .changes
+        .iter()
+        .map(|p| {
+            format!("{:?}", p.change)
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    for kind in [
+        "DropForeignKey",
+        "SetPrimaryKey",
+        "DropCheck",
+        "AlterColumnType",
+    ] {
+        assert!(kinds.iter().any(|k| k == kind), "{kind}: {kinds:?}");
+    }
+    let counts = probe_counts(&mut db.conn, &step).await;
+    assert!(counts.iter().all(|(_, n)| *n == 0), "{counts:?}");
+    try_apply(&mut db.conn, &step)
+        .await
+        .unwrap_or_else(|e| panic!("the collation change was refused: {e}"));
+    let after = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect after");
+    let rows = db
+        .conn
+        .query("SELECT (SELECT COUNT(*) FROM dbo.p) AS p, (SELECT COUNT(*) FROM dbo.c) AS c")
+        .await
+        .unwrap();
+    let orphan = db.conn.execute("INSERT dbo.c VALUES (3, 'ABC');").await;
+    db.drop().await;
+    assert_eq!(after.schema, declared);
+    assert!(
+        plan(&after.schema, &ids, &declared, &ids)
+            .changes
+            .is_empty()
+    );
+    assert_eq!(rows[0].try_get::<i32>("p").unwrap(), Some(2));
+    assert_eq!(rows[0].try_get::<i32>("c").unwrap(), Some(2));
+    // Case-sensitive now: `ABC` is not the parent `abc`, and the foreign key
+    // that was rebuilt refuses it.
+    assert!(
+        orphan.is_err(),
+        "fk_c_p no longer enforced, or still case-blind"
+    );
+}
+
+/// Before a collation change runs, its probes count what it would lose or
+/// collide: a non-Unicode column's characters its new code page cannot hold,
+/// and keys the new collation calls equal (#1175).
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_collation_change_is_counted_before_it_can_lose_or_collide() {
+    let mut db = TestDb::create_collated("coll_probe", "Latin1_General_CI_AS").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.w (id int NOT NULL CONSTRAINT pk_w PRIMARY KEY, v varchar(5) NULL);
+             INSERT dbo.w VALUES (1, 'ééééé'), (2, 'abc');
+             CREATE TABLE dbo.k (code varchar(10) COLLATE Latin1_General_CS_AS NOT NULL
+                                  CONSTRAINT uq_k UNIQUE);
+             INSERT dbo.k VALUES ('abc'), ('ABC'), ('x');",
+        )
+        .await
+        .expect("create");
+    let start = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    let ids = mint_ids(&start.schema, &IdsFile::default(), &[]);
+    let mut declared = start.schema.clone();
+    declared
+        .tables
+        .get_mut(&TableName::new("dbo", "w"))
+        .unwrap()
+        .columns
+        .get_mut("v")
+        .unwrap()
+        .collation = Some(pbps_model::Collation::new(
+        "Latin1_General_100_CI_AS_SC_UTF8",
+    ));
+    declared
+        .tables
+        .get_mut(&TableName::new("dbo", "k"))
+        .unwrap()
+        .columns
+        .get_mut("code")
+        .unwrap()
+        .collation = None;
+    let step = plan(&start.schema, &ids, &declared, &ids);
+    let counts = probe_counts(&mut db.conn, &step).await;
+    let refused = try_apply(&mut db.conn, &step).await;
+    db.drop().await;
+    let by = |needle: &str| {
+        counts
+            .iter()
+            .find(|(d, _)| d.contains(needle))
+            .unwrap_or_else(|| panic!("no probe mentioning `{needle}` in {counts:?}"))
+            .1
+    };
+    assert_eq!(by("dbo.w.v"), 1, "{counts:?}");
+    assert_eq!(by("uq_k"), 2, "{counts:?}");
+    // And the engine agrees: the rebuilt unique constraint is refused.
+    assert!(refused.is_err());
+}
+
+/// A collation the server lacks is named before any statement runs, and a
+/// known one in another case is not (#1175).
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn an_unknown_collation_is_named_before_it_is_used() {
+    let mut conn = connect_live(&conn_str()).await.expect("connect");
+    let unknown = pbps_mssql::catalog::unknown_collations(
+        &mut conn,
+        &[
+            "latin1_general_cs_as".to_owned(),
+            "No_Such_Collation".to_owned(),
+        ],
+    )
+    .await
+    .expect("ask");
+    assert_eq!(unknown, ["No_Such_Collation"]);
 }
 
 /// A key the plan adds as the clustered index spells `CLUSTERED`, so a
@@ -4099,6 +4402,7 @@ async fn preflight_probes_count_what_the_engine_would_refuse() {
                 column: "dbo.customer.email".parse().unwrap(),
                 ty: ty("nvarchar(255)"),
                 to_nullable: false,
+                collation: None,
             }),
             PlannedChange::new(Change::AddCheck {
                 table: TableName::new("dbo", "customer"),
@@ -4183,6 +4487,8 @@ async fn narrowing_to_sysname_probes_the_alias_real_capacity() {
             to: ty("sysname"),
             from_nullable: true,
             to_nullable: true,
+            from_collation: None,
+            to_collation: None,
         })],
     };
 
@@ -4298,6 +4604,8 @@ async fn narrowing_a_varbinary_source_to_sysname_is_not_falsely_blocked() {
             to: ty("sysname"),
             from_nullable: true,
             to_nullable: true,
+            from_collation: None,
+            to_collation: None,
         })],
     };
     for probe in Mssql.preflight(&cs).probes {
@@ -4351,6 +4659,8 @@ async fn unicode_capacity_verdict(
             to: ty(to),
             from_nullable: true,
             to_nullable: true,
+            from_collation: None,
+            to_collation: None,
         })],
     };
     let preflight = Mssql.preflight(&changes);
@@ -4609,6 +4919,8 @@ async fn unicode_to_varchar_probes_character_loss() {
             to: ty(to),
             from_nullable: true,
             to_nullable: true,
+            from_collation: None,
+            to_collation: None,
         })],
     };
     async fn counts(conn: &mut Conn, plan: &ChangeSet) -> std::collections::BTreeMap<String, i32> {
@@ -5077,6 +5389,8 @@ async fn a_filtered_predicate_reads_a_retyped_column_through_the_type_it_has_now
                     to: ColumnType::new("varchar", vec![pbps_model::TypeArg::Int(2)]),
                     from_nullable: true,
                     to_nullable: true,
+                    from_collation: None,
+                    to_collation: None,
                 }),
                 PlannedChange::new(Change::AddIndex {
                     table: TableName::new("dbo", "customer"),
@@ -9553,50 +9867,39 @@ async fn a_child_row_that_arrives_after_the_probe_is_not_cascaded_away() {
     db.drop().await;
 }
 
+/// The key collisions the engine finds in one declaration's rows.
+async fn conflicts(conn: &mut Conn, schema: Schema) -> Vec<String> {
+    pbps_mssql::catalog::misspelt(conn, &schema, &Default::default())
+        .await
+        .expect("ask the engine")
+        .conflicts
+        .iter()
+        .map(|c| format!("{c:?}"))
+        .collect()
+}
+
 /// Whether two declared keys are one row is the *key column's* question.
 /// The collision query compares `VALUES` literals, which carry the database's
 /// default collation, so a column collated differently was answered about a
 /// collation that is not its own — in one direction refusing two valid keys,
 /// in the other letting two spellings of one row through to a pair of inserts
 /// the primary key refuses (DECISIONS 131).
+///
+/// Since #1175 the answer is the column's *declared* collation: what the
+/// column has once the plan has run, whatever it is called or has now. So
+/// the rename case DECISIONS 148 read the catalog for, and a table the plan
+/// creates, are answered the same way as a standing one.
 #[tokio::test]
 #[ignore = "needs a SQL Server; see scripts/live-tests.sh"]
 async fn key_collisions_are_judged_by_the_key_column_s_own_collation() {
     use pbps_model::{DataMode, Row, RowKey, TableData, Value};
 
-    let mut db = TestDb::create("keycollation").await;
-    // A case-sensitive database, so the column's collation and the
-    // database's disagree in both directions below.
-    db.conn
-        .execute(&format!(
-            "USE master; ALTER DATABASE [{0}] COLLATE Latin1_General_CS_AS; USE [{0}];",
-            db.name
-        ))
-        .await
-        .expect("a case-sensitive database");
-    for sql in [
-        // Case-insensitive column in a case-sensitive database: `a` and `A`
-        // are one row here, and the old query said they were two.
-        "CREATE TABLE dbo.ci (\n\
-             code varchar(10) COLLATE Latin1_General_CI_AS NOT NULL CONSTRAINT pk_ci PRIMARY KEY,\n\
-             label nvarchar(50) NOT NULL\n\
-         );",
-        // And one that takes the database's own collation: two rows.
-        "CREATE TABLE dbo.cs (\n\
-             code varchar(10) NOT NULL CONSTRAINT pk_cs PRIMARY KEY,\n\
-             label nvarchar(50) NOT NULL\n\
-         );",
-    ] {
-        db.conn
-            .execute(sql)
-            .await
-            .unwrap_or_else(|e| panic!("{sql}\n{e}"));
-    }
-
-    let declared_with = |name: &TableName| {
+    let mut db = TestDb::create_collated("keycollation", "Latin1_General_CS_AS").await;
+    let declared_with = |name: &TableName, collation: Option<&str>| {
         let mut t = Table::default();
-        t.columns
-            .insert("code".to_owned(), Column::new(ty("varchar(10)")).not_null());
+        let mut code = Column::new(ty("varchar(10)")).not_null();
+        code.collation = collation.map(pbps_model::Collation::new);
+        t.columns.insert("code".to_owned(), code);
         t.columns.insert(
             "label".to_owned(),
             Column::new(ty("nvarchar(50)")).not_null(),
@@ -9624,123 +9927,47 @@ async fn key_collisions_are_judged_by_the_key_column_s_own_collation() {
         schema
     };
 
-    let ci = TableName::new("dbo", "ci");
-    let conflicts =
-        pbps_mssql::catalog::misspelt(&mut db.conn, &declared_with(&ci), &Default::default())
-            .await
-            .expect("ask the engine")
-            .conflicts;
-    assert_eq!(
-        conflicts.len(),
-        1,
-        "`a` and `A` are one row to a case-insensitive column: {conflicts:?}"
-    );
-    assert_eq!(conflicts[0].table, ci);
-
-    let cs = TableName::new("dbo", "cs");
-    let conflicts =
-        pbps_mssql::catalog::misspelt(&mut db.conn, &declared_with(&cs), &Default::default())
-            .await
-            .expect("ask the engine")
-            .conflicts;
-    assert!(
-        conflicts.is_empty(),
-        "a case-sensitive column holds both: {conflicts:?}"
-    );
-
-    // A table this plan has yet to create has no collation to read, and its
-    // column will be made with the database's — which is this database's
-    // case-sensitive default, so the two keys stand.
-    let conflicts = pbps_mssql::catalog::misspelt(
+    // A case-insensitive key in a case-sensitive database: one row. Whether
+    // the table stands, is created by the plan, or is renamed by it.
+    for name in ["ci", "not_yet", "ci_renamed"] {
+        let found = conflicts(
+            &mut db.conn,
+            declared_with(&TableName::new("dbo", name), Some("Latin1_General_CI_AS")),
+        )
+        .await;
+        assert_eq!(found.len(), 1, "{name}: `a` and `A` are one row: {found:?}");
+    }
+    // A key under the database's own collation: two rows.
+    let found = conflicts(
         &mut db.conn,
-        &declared_with(&TableName::new("dbo", "not_yet")),
-        &Default::default(),
+        declared_with(&TableName::new("dbo", "cs"), None),
     )
-    .await
-    .expect("ask the engine")
-    .conflicts;
+    .await;
     assert!(
-        conflicts.is_empty(),
-        "a table with no column yet answers under the database's collation: {conflicts:?}"
+        found.is_empty(),
+        "a case-sensitive column holds both: {found:?}"
     );
+    db.drop().await;
 
     // And the other direction, where the old query refused two valid keys:
     // a case-sensitive column in a database whose default is not.
-    let mut ci_db = TestDb::create("keycollation_ci").await;
-    ci_db
-        .conn
-        .execute(
-            "CREATE TABLE dbo.cs (\n\
-                 code varchar(10) COLLATE Latin1_General_CS_AS NOT NULL\n\
-                     CONSTRAINT pk_cs2 PRIMARY KEY,\n\
-                 label nvarchar(50) NOT NULL\n\
-             );",
-        )
-        .await
-        .expect("a case-sensitive column");
-    let conflicts =
-        pbps_mssql::catalog::misspelt(&mut ci_db.conn, &declared_with(&cs), &Default::default())
-            .await
-            .expect("ask the engine")
-            .conflicts;
-    assert!(
-        conflicts.is_empty(),
-        "the column holds `a` and `A` apart, whatever the database does: {conflicts:?}"
-    );
+    let mut ci_db = TestDb::create_collated("keycollation_ci", "Latin1_General_CI_AS").await;
+    let found = conflicts(
+        &mut ci_db.conn,
+        declared_with(&TableName::new("dbo", "cs"), Some("Latin1_General_CS_AS")),
+    )
+    .await;
+    let under_default = conflicts(
+        &mut ci_db.conn,
+        declared_with(&TableName::new("dbo", "cs"), None),
+    )
+    .await;
     ci_db.drop().await;
-
-    // And under the names the catalog has *now*: the checks run before the
-    // plan does, so a table or key column this revision renames is still
-    // spelt the old way. Asked under the declared names there is no such
-    // table, the collation read finds nothing, and the comparison falls back
-    // to this case-sensitive database's default — letting through two
-    // spellings that the case-insensitive column will refuse as one
-    // (DECISIONS 148).
-    let renamed = TableName::new("dbo", "ci_renamed");
-    let at: pbps_mssql::rows::CatalogNames = [(
-        renamed.clone(),
-        pbps_mssql::rows::Catalogued {
-            table: Some(ci.clone()),
-            key_column: Some("code".to_owned()),
-            key_collation: None,
-        },
-    )]
-    .into_iter()
-    .collect();
-    let mut declared_renamed = declared_with(&renamed);
-    let t = declared_renamed
-        .tables
-        .get_mut(&renamed)
-        .expect("the declared table");
-    let held = t.columns.shift_remove("code").expect("the key column");
-    t.columns.insert("key_code".to_owned(), held);
-    t.primary_key = Some(PrimaryKey {
-        name: None,
-        columns: vec!["key_code".to_owned()],
-    });
-
-    let conflicts = pbps_mssql::catalog::misspelt(&mut db.conn, &declared_renamed, &at)
-        .await
-        .expect("ask the engine")
-        .conflicts;
-    assert_eq!(
-        conflicts.len(),
-        1,
-        "the collation is the renamed column's own, read under the name the catalog still has: \
-         {conflicts:?}"
-    );
-    let missed =
-        pbps_mssql::catalog::misspelt(&mut db.conn, &declared_renamed, &Default::default())
-            .await
-            .expect("ask the engine")
-            .conflicts;
     assert!(
-        missed.is_empty(),
-        "and under the declared names there is no column to read a collation from, so the \
-         database's own answers instead — the miss this mapping exists to close: {missed:?}"
+        found.is_empty(),
+        "the column holds `a` and `A` apart: {found:?}"
     );
-
-    db.drop().await;
+    assert_eq!(under_default.len(), 1, "{under_default:?}");
 }
 
 /// The engine reporting a successful write is not the same as the row being
@@ -12080,6 +12307,8 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
                 to: ty("varchar(10)"),
                 from_nullable: true,
                 to_nullable: true,
+                from_collation: None,
+                to_collation: None,
             }),
             PlannedChange::new(Change::UpdateRow {
                 table: TableName::new("dbo", "customer"),
@@ -14138,6 +14367,8 @@ async fn an_undeclared_key_on_a_retyped_column_is_named_before_the_widening() {
         to: ty(wider),
         from_nullable: false,
         to_nullable: false,
+        from_collation: None,
+        to_collation: None,
     };
     for (family, spelling, wider) in [
         ("varchar", "varchar(10)", "varchar(20)"),
@@ -14264,6 +14495,8 @@ async fn an_undeclared_key_on_a_retyped_column_is_named_before_the_widening() {
             to: ty("varchar(20)"),
             from_nullable: false,
             to_nullable: false,
+            from_collation: None,
+            to_collation: None,
         },
     ]);
     let reports = pbps_mssql::impact::key_drop_blockers(&mut conn, &renamed)

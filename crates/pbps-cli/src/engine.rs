@@ -448,6 +448,36 @@ pub async fn introspect(conn: &mut Conn, read: Read) -> Result<Pulled, DbError> 
     }
 }
 
+/// Refuses a declared column collation the target does not have (#1175), by
+/// name and before any statement runs. PostgreSQL declares none: `validate`
+/// refuses the field there.
+pub async fn refuse_unknown_collations(conn: &mut Conn, schema: &Schema) -> anyhow::Result<()> {
+    let names: Vec<String> = schema
+        .tables
+        .values()
+        .flat_map(|t| t.columns.values())
+        .filter_map(|c| c.collation.as_ref().map(|c| c.as_str().to_owned()))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let unknown = match conn.driver() {
+        Driver::Mssql => pbps_mssql::catalog::unknown_collations(conn, &names).await?,
+        Driver::Postgres => Vec::new(),
+    };
+    if !unknown.is_empty() {
+        anyhow::bail!(
+            "this server has no collation named {}; a `COLLATE` naming it would be refused \
+             mid-apply",
+            unknown
+                .iter()
+                .map(|n| format!("`{n}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
+}
+
 pub async fn read_rows(
     conn: &mut Conn,
     schema: &Schema,
@@ -2325,6 +2355,8 @@ mod tests {
                         to: "bigint".parse().unwrap(),
                         from_nullable: true,
                         to_nullable: true,
+                        from_collation: None,
+                        to_collation: None,
                     },
                 )],
             };

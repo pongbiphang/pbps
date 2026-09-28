@@ -594,6 +594,42 @@ pub async fn principals_holding(
 /// Compare captured table names under the catalog collation that names them,
 /// part by part (DECISIONS 119, 142). Only values from the caller's read are
 /// compared: a second catalog lookup could miss a name that read already saw.
+/// The declared collation names this server does not have (#1175).
+///
+/// Asked of `sys.fn_helpcollations()`, which lists every collation the
+/// engine accepts; a name it lacks is refused by the `CREATE` or `ALTER` that
+/// names it (448, "Invalid collation"), after every statement ahead of it has
+/// run. The comparison is case-insensitive under a binary collation of the
+/// uppercased names, the way the engine resolves a collation name — measured,
+/// `latin1_general_ci_as` names `Latin1_General_CI_AS`.
+pub async fn unknown_collations(conn: &mut Conn, names: &[String]) -> Result<Vec<String>, DbError> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let values = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| format!("({i}, {})", crate::ident::literal(n)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT w.i FROM (VALUES {values}) AS w(i, name)
+          WHERE NOT EXISTS (
+                SELECT 1 FROM sys.fn_helpcollations() h
+                 WHERE UPPER(h.name) COLLATE Latin1_General_BIN2
+                     = UPPER(w.name) COLLATE Latin1_General_BIN2)
+          ORDER BY w.i;"
+    );
+    let mut unknown = Vec::new();
+    for row in conn.query(&sql).await? {
+        let i: i32 = get(&row, "i")?;
+        if let Some(name) = usize::try_from(i).ok().and_then(|i| names.get(i)) {
+            unknown.push(name.clone());
+        }
+    }
+    Ok(unknown)
+}
+
 pub async fn matching_table_names(
     conn: &mut Conn,
     wanted: &[TableName],
@@ -1170,16 +1206,18 @@ pub use pbps_db::catalog::Spellings;
 /// every pair of keys it reads as one, over every table that declares rows
 /// (DECISIONS 101, 106). Asked of the engine, not of the table: a table this
 /// plan creates can be asked too.
+///
+/// `_at` is the names the catalog has now, which the PostgreSQL side needs.
+/// This one needs none since #1175: the only question it asked the catalog was
+/// a key column's collation, and the declaration now says what it will be.
 pub async fn misspelt(
     conn: &mut Conn,
     schema: &Schema,
-    at: &crate::rows::CatalogNames,
+    _at: &crate::rows::CatalogNames,
 ) -> Result<Spellings, crate::rows::RowsError> {
     let mut out = Spellings::default();
-    let as_declared = crate::rows::Catalogued::default();
     for (name, table) in &schema.tables {
-        let at = at.get(name).unwrap_or(&as_declared);
-        for q in crate::rows::spelling_queries(name, table, at)? {
+        for q in crate::rows::spelling_queries(name, table)? {
             let read = |source| crate::rows::RowsError::Read {
                 table: name.clone(),
                 source: Box::new(source),

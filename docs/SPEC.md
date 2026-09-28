@@ -214,6 +214,12 @@ indexes:
   (`INT` / `int` / `integer` are one type).
 - **`deprecated` needs only a reason**; the date comes from git and is not written
   by hand.
+- **`collation` on a SQL Server column names an explicit collation**; absent
+  means the collation of the database the column is created in. A plan
+  against a database compares a declared collation equal to that database's
+  default as absent, and `pull` writes one only where a column's collation
+  differs from its database's default. PostgreSQL refuses the key
+  (DEC-1175.1).
 - **`clustered` says which index holds a SQL Server table's rows**, only where
   that is not the default: `clustered: heap` for a primary key with no
   clustered index, or `clustered: {unique: uq_x}` / `clustered: {index: ix_x}`

@@ -215,6 +215,20 @@ impl OwnDatabase {
         }
     }
 
+    /// The same, with a default collation of the test's choosing (#1175).
+    fn collated(server: &str, slug: &str, collation: &str) -> Self {
+        let name = format!("pbps_cli_{slug}_{}", std::process::id());
+        on_server(
+            server,
+            &format!("CREATE DATABASE [{name}] COLLATE {collation};"),
+        );
+        Self {
+            server: server.to_owned(),
+            connection: with_key(server, "Database", &name),
+            name,
+        }
+    }
+
     /// What to pass to `--db`.
     fn connection(&self) -> &str {
         &self.connection
@@ -2050,6 +2064,119 @@ fn a_synonym_at_an_added_checks_name_refuses_the_plan() {
         "constraint",
     ]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+}
+
+/// A column collation goes the whole way through the CLI (#1175). `pull`
+/// declares a column collated away from its database's default, `bootstrap`
+/// rebuilds it onto a database with another default, and a second `pull`
+/// writes the same files. A declaration naming the target's own default
+/// plans nothing; a collation change is a gated plan that applies and
+/// leaves nothing to plan; and a collation the server lacks is refused by
+/// name before any statement runs.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_column_collation_round_trips_and_changes_through_the_cli() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let source = OwnDatabase::collated(&server, "coll1175_src", "Latin1_General_CI_AS");
+    let target = OwnDatabase::collated(&server, "coll1175_dst", "Latin1_General_100_CS_AS_SC_UTF8");
+    on_server(
+        source.connection(),
+        "CREATE TABLE dbo.t (
+             code varchar(10) COLLATE Latin1_General_CS_AS NOT NULL CONSTRAINT pk_t PRIMARY KEY,
+             note varchar(20) NULL
+         );
+         INSERT dbo.t VALUES ('abc', 'x'), ('ABC', 'y');",
+    );
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let file = |d: &Demo| std::fs::read_to_string(d.dir.join("schema/dbo.t.yml")).unwrap();
+
+    let d = Demo::new("coll1175");
+    ok(&d.run(&["pull", "--db", source.connection()]));
+    assert!(
+        file(&d).contains("    collation: Latin1_General_CS_AS\n"),
+        "{}",
+        file(&d)
+    );
+    assert_eq!(file(&d).matches("collation").count(), 1, "{}", file(&d));
+    d.commit();
+    ok(&d.run(&["bootstrap", "--db", target.connection()]));
+    let again = Demo::new("coll1175-again");
+    ok(&again.run(&["pull", "--db", target.connection()]));
+    assert_eq!(file(&again), file(&d));
+
+    // Adopt the source. Naming its default on `note` changes nothing there.
+    ok(&d.run(&["baseline", "--db", source.connection(), "--reason", "adopt"]));
+    let path = d.dir.join("schema/dbo.t.yml");
+    let pulled = file(&d);
+    let set_note = |collation: &str| {
+        let text = pulled.replacen(
+            "  note:\n    type: varchar(20)\n",
+            &format!("  note:\n    type: varchar(20)\n    collation: {collation}\n"),
+            1,
+        );
+        assert_ne!(text, pulled, "{pulled}");
+        std::fs::write(&path, text).unwrap();
+    };
+    set_note("latin1_general_ci_as");
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let o = d.run(&["plan", "--db", source.connection()]);
+    ok(&o);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+
+    // A name the server does not have is refused before anything runs.
+    set_note("No_Such_Collation");
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let o = d.run(&["plan", "--db", source.connection()]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(stderr(&o).contains("`No_Such_Collation`"), "{}", stderr(&o));
+
+    // A real change: `note` becomes case-sensitive. Gated as the narrowing a
+    // non-Unicode column's collation change is, applied, and done.
+    set_note("Latin1_General_CS_AS");
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    ok(&d.run(&[
+        "plan",
+        "--db",
+        source.connection(),
+        "--out",
+        plan.to_str().unwrap(),
+    ]));
+    let checksum = plan_checksum(&plan);
+    let apply = |allow: &[&str]| {
+        let mut args = vec![
+            "apply",
+            "--db",
+            source.connection(),
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+        ];
+        args.extend_from_slice(allow);
+        d.run(&args)
+    };
+    let refused = apply(&[]);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        stderr(&refused).contains("narrowing"),
+        "{}",
+        stderr(&refused)
+    );
+    ok(&apply(&["--allow", "narrowing"]));
+    let o = d.run(&["plan", "--db", source.connection()]);
+    ok(&o);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+    on_server(
+        source.connection(),
+        "IF (SELECT collation_name FROM sys.columns
+              WHERE object_id = OBJECT_ID('dbo.t') AND name = 'note') <> 'Latin1_General_CS_AS'
+             THROW 50000, 'note was not moved', 1;
+         IF (SELECT COUNT(*) FROM dbo.t) <> 2 THROW 50000, 'rows lost', 1;",
+    );
 }
 
 /// A table's clustered layout goes the whole way through the CLI (#1178):

@@ -37,6 +37,10 @@ use crate::db::{self, Target};
 /// catalog holds and introspection cannot reproduce is inside the managed set
 /// by name and outside the scoped schema in fact.
 pub struct Managed {
+    /// The connected database's default collation, where the engine has
+    /// column collations (#1175): the declarations are compared with a
+    /// collation equal to it taken out ([`Schema::without_collation`]).
+    pub database_collation: Option<String>,
     pub scoped: pbps_diff::Scoped,
     /// Catalog facts inside the managed set that the projection could not
     /// express: an unsupported feature on a managed table, or a module the set
@@ -1152,6 +1156,7 @@ async fn managed_state_full(
         .await
         .context("cannot read the declared rows back")?;
     Ok(Managed {
+        database_collation: pulled.database_collation.clone(),
         scoped,
         limitations,
         unrevocable: pulled.unrevocable.clone(),
@@ -2177,6 +2182,7 @@ fn column_as_declared(
         && declared.nullable == now.nullable
         && declared.identity == now.identity
         && declared.default.is_some() == now.default.is_some()
+        && declared.collation == now.collation
 }
 
 /// Whether an index read back is the one declared. Structure only: the
@@ -2268,6 +2274,9 @@ fn differing(
     }
     if was.deprecated != now.deprecated {
         out.push((Some(ColumnField::Deprecated), "deprecation"));
+    }
+    if was.collation != now.collation {
+        out.push((Some(ColumnField::Collation), "collation"));
     }
     // `None` is "no change of this model moves this", so nothing can excuse
     // it: an identity or a description that differs across an apply is
@@ -3510,6 +3519,7 @@ fn refuse_unplanned_movement(
                 ColumnPromise::Type(to) => (same_type(dialect, to, &now.ty), "type"),
                 ColumnPromise::Nullable(to) => (now.nullable == to, "nullability"),
                 ColumnPromise::Default(has) => (now.default.is_some() == has, "default"),
+                ColumnPromise::Collation(c) => (now.collation.as_ref() == c, "collation"),
             };
             if !kept {
                 moved.push(format!(
@@ -4375,6 +4385,10 @@ pub fn cmd_bootstrap(
 
     db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
+        // A collation the server lacks is refused here, by name, rather than
+        // by the `CREATE TABLE` that names it after the ones before it ran
+        // (#1175).
+        crate::engine::refuse_unknown_collations(&mut conn, &loaded.schema).await?;
         crate::engine::permission_support(&mut conn, &cs).await?;
         crate::engine::lock(&mut conn, &operator).await?;
         let mut transaction_attempted = false;
@@ -4796,6 +4810,16 @@ pub fn cmd_plan_db(
         // reconnect to catch it. The same argument as the line above, about
         // the other half of what a projection can fail to hold.
         refuse_managed_limitations(&managed.limitations)?;
+        // The declarations as this database reads them back: a collation
+        // equal to its default is a column with none (#1175). Compared as
+        // written, an unchanged column was altered to the collation it
+        // already has on every plan, and a created one read back without
+        // it failed the apply's own postcondition.
+        let declared = match &managed.database_collation {
+            Some(default) => loaded.schema.without_collation(default),
+            None => loaded.schema.clone(),
+        };
+        crate::engine::refuse_unknown_collations(&mut conn, &declared).await?;
         // A declared name standing on an object introspection cannot express is
         // not something to plan around. It is absent from the scoped schema, so
         // the diff would emit an ungated `CreateModule` and `CREATE OR ALTER`
@@ -4922,7 +4946,7 @@ pub fn cmd_plan_db(
                 ids: &recorded_ids,
             },
             pbps_diff::Side {
-                schema: &loaded.schema,
+                schema: &declared,
                 ids: &resolved.ids,
             },
             dialect.as_ref(),
@@ -4971,7 +4995,7 @@ pub fn cmd_plan_db(
                         ids: &recorded_ids,
                     },
                     pbps_diff::Side {
-                        schema: &loaded.schema,
+                        schema: &declared,
                         ids: &resolved.ids,
                     },
                     dialect.as_ref(),
@@ -8985,6 +9009,7 @@ mod tests {
                     "on a schema",
                 ),
             ],
+            database_collation: None,
         };
 
         let kept = unexpressible_permissions(&pulled, &ids, &modules);
@@ -9247,6 +9272,8 @@ mod tests {
             to: "bigint".parse().unwrap(),
             from_nullable: true,
             to_nullable: true,
+            from_collation: None,
+            to_collation: None,
         }]);
         refuse(&planned, &before, &retyped).expect("the plan's own change");
 
@@ -10123,6 +10150,8 @@ mod tests {
                     to: "nvarchar(100)".parse().unwrap(),
                     from_nullable: true,
                     to_nullable: true,
+                    from_collation: None,
+                    to_collation: None,
                 },
             )],
         };
@@ -10647,6 +10676,7 @@ mod tests {
                     column: "dbo.t.note".parse().unwrap(),
                     ty: "nvarchar(50)".parse().unwrap(),
                     to_nullable: false,
+                    collation: None,
                 },
             )],
         };
@@ -11766,6 +11796,8 @@ mod tests {
                     to: "nvarchar(100)".parse().unwrap(),
                     from_nullable: true,
                     to_nullable: true,
+                    from_collation: None,
+                    to_collation: None,
                 },
             )],
         };
@@ -11819,6 +11851,8 @@ mod tests {
                     to: "nvarchar(100)".parse().unwrap(),
                     from_nullable: true,
                     to_nullable: false,
+                    from_collation: None,
+                    to_collation: None,
                 },
             )],
         };
@@ -11886,6 +11920,7 @@ mod tests {
                     column: "dbo.t.note".parse().unwrap(),
                     ty: "int".parse().unwrap(),
                     to_nullable: false,
+                    collation: None,
                 },
             )],
         };
@@ -12727,6 +12762,8 @@ mod tests {
                 to: ColumnType::from_str("varchar(10)").unwrap(),
                 from_nullable: false,
                 to_nullable: false,
+                from_collation: None,
+                to_collation: None,
             })
         };
         let cs = ChangeSet {
@@ -12813,6 +12850,8 @@ mod tests {
                 to: ColumnType::from_str("varchar(10)").unwrap(),
                 from_nullable: false,
                 to_nullable: false,
+                from_collation: None,
+                to_collation: None,
             })],
         };
         let found = key_type_changes_over_aliases(&cs, &declared, &rows, &final_ids, &live_ids);
@@ -13059,6 +13098,7 @@ mod tests {
             owners: Default::default(),
             session_role: String::new(),
             unrevocable: Vec::new(),
+            database_collation: None,
         }
     }
 
@@ -13346,6 +13386,8 @@ mod tests {
             to: "bigint".parse().unwrap(),
             from_nullable: false,
             to_nullable: false,
+            from_collation: None,
+            to_collation: None,
         });
         refuse_unplanned_movement(
             &pbps_mssql::Mssql,
@@ -13384,6 +13426,7 @@ mod tests {
             column: dbo_t.column("kept"),
             ty: "int".parse().unwrap(),
             to_nullable: true,
+            collation: None,
         });
         let e = refuse_unplanned_movement(
             &pbps_mssql::Mssql,
@@ -13545,6 +13588,8 @@ mod tests {
                     to: "bigint".parse().unwrap(),
                     from_nullable: false,
                     to_nullable: false,
+                    from_collation: None,
+                    to_collation: None,
                 }),
             ],
         };
@@ -13567,6 +13612,74 @@ mod tests {
         )
         .expect_err("the nullability is nobody's plan");
         assert!(format!("{e:#}").contains("nullability"), "{e:#}");
+    }
+
+    /// A column's collation is held to what the plan leaves it (#1175): an
+    /// `ALTER COLUMN` promises the collation it restates, and one read back
+    /// under another — the silent reset an omitted `COLLATE` makes — is not
+    /// the plan's result; nor is a collation another session changed on a
+    /// column the plan does not touch.
+    #[test]
+    fn a_columns_collation_is_held_to_what_the_plan_leaves_it() {
+        use pbps_model::Collation;
+        let dbo_t: TableName = "dbo.t".parse().unwrap();
+        let schema = |nullable: bool, collation: Option<&str>| {
+            let mut c = pbps_model::Column::new("varchar(10)".parse().unwrap());
+            c.nullable = nullable;
+            c.collation = collation.map(Collation::new);
+            let mut t = pbps_model::Table::default();
+            t.columns.insert("c".to_owned(), c);
+            t.columns.insert(
+                "n".to_owned(),
+                pbps_model::Column::new("int".parse().unwrap()),
+            );
+            Schema {
+                tables: [(dbo_t.clone(), t)].into(),
+                ..Default::default()
+            }
+        };
+        let tightening = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::AlterColumnNullability {
+                    uid: "c_aaaaaa".parse().unwrap(),
+                    column: dbo_t.column("c"),
+                    ty: "varchar(10)".parse().unwrap(),
+                    to_nullable: false,
+                    collation: Some(Collation::new("Latin1_General_CS_AS")),
+                },
+            )],
+        };
+        let check = |plan: &pbps_model::ChangeSet, after: &Schema| {
+            refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                plan,
+                &schema(true, Some("Latin1_General_CS_AS")),
+                after,
+                "prod",
+                Settled::Whole,
+            )
+        };
+        check(&tightening, &schema(false, Some("Latin1_General_CS_AS")))
+            .expect("tightened, collation kept");
+        let e = check(&tightening, &schema(false, None))
+            .expect_err("the collation was reset to the default");
+        assert!(format!("{e:#}").contains("collation"), "{e:#}");
+        // Negative: a plan that touches another column is not excused for
+        // this one's collation.
+        let elsewhere = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::AlterColumnNullability {
+                    uid: "c_bbbbbb".parse().unwrap(),
+                    column: dbo_t.column("n"),
+                    ty: "int".parse().unwrap(),
+                    to_nullable: true,
+                    collation: None,
+                },
+            )],
+        };
+        let e = check(&elsewhere, &schema(true, Some("Latin1_General_CI_AS")))
+            .expect_err("another session changed the collation");
+        assert!(format!("{e:#}").contains("collation"), "{e:#}");
     }
 
     /// A part this plan adds is held to the definition it adds it with, not

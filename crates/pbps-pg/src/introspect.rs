@@ -2038,6 +2038,7 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
         identity,
         description: None,
         deprecated: None,
+        collation: None,
     }
 }
 

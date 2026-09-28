@@ -1034,6 +1034,8 @@ async fn temporal_modifiers_keep_the_engine_bounds_and_do_not_shorten_the_calend
             to: to.clone(),
             from_nullable: true,
             to_nullable: true,
+            from_collation: None,
+            to_collation: None,
         };
         let changes = pbps_model::ChangeSet {
             changes: vec![pbps_model::PlannedChange::new(change)],
@@ -3675,6 +3677,8 @@ async fn a_type_change_that_would_need_a_using_clause_is_refused_by_name() {
                 to: ty("integer"),
                 from_nullable: false,
                 to_nullable: false,
+                from_collation: None,
+                to_collation: None,
             },
             Strategy::default(),
         )
@@ -3692,6 +3696,8 @@ async fn a_type_change_that_would_need_a_using_clause_is_refused_by_name() {
                 to: ty("varchar(20)"),
                 from_nullable: false,
                 to_nullable: true,
+                from_collation: None,
+                to_collation: None,
             },
             Strategy::default(),
         )
@@ -4862,6 +4868,8 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
                 to: ty("timestamptz"),
                 from_nullable: true,
                 to_nullable: true,
+                from_collation: None,
+                to_collation: None,
             },
             Strategy::default(),
         )
@@ -4910,6 +4918,8 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
                     to: ty("time"),
                     from_nullable: true,
                     to_nullable: true,
+                    from_collation: None,
+                    to_collation: None,
                 },
                 Strategy::default(),
             )
@@ -4929,6 +4939,8 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
                 to: ty("timetz"),
                 from_nullable: true,
                 to_nullable: true,
+                from_collation: None,
+                to_collation: None,
             },
             Strategy::default(),
         )
@@ -5103,6 +5115,8 @@ async fn a_conversion_to_text_renders_under_the_framings_settings_and_not_the_op
         to: ty("text"),
         from_nullable: true,
         to_nullable: true,
+        from_collation: None,
+        to_collation: None,
     };
 
     let framing = pg.transaction_framing();
@@ -15988,6 +16002,8 @@ fn narrowing_projection_change(column: &str, from: &str, to: &str) -> pbps_model
         to: ty(to),
         from_nullable: true,
         to_nullable: true,
+        from_collation: None,
+        to_collation: None,
     }
 }
 
@@ -20071,6 +20087,8 @@ async fn planned_key_collation_guards_use_renamed_added_created_and_retyped_colu
                     to: ty("varchar(20)"),
                     from_nullable: true,
                     to_nullable: true,
+                    from_collation: None,
+                    to_collation: None,
                 }),
                 _ => unreachable!(),
             }
@@ -22188,6 +22206,7 @@ async fn preflight_probes_count_the_rows_this_engine_would_refuse() {
             column: table.column("email"),
             ty: ty("text"),
             to_nullable: false,
+            collation: None,
         },
         Change::AddCheck {
             table: table.clone(),
@@ -22222,6 +22241,8 @@ async fn preflight_probes_count_the_rows_this_engine_would_refuse() {
             to: ty("varchar(5)"),
             from_nullable: true,
             to_nullable: true,
+            from_collation: None,
+            to_collation: None,
         },
     ];
     let cs = ChangeSet {
@@ -22522,6 +22543,8 @@ async fn integer_narrowing_conversion_probes_match_both_engine_boundaries() {
                 to: ty(to),
                 from_nullable: true,
                 to_nullable: true,
+                from_collation: None,
+                to_collation: None,
             })],
         };
         for (value, rejected) in [(min - 1, true), (min, false), (max, false), (max + 1, true)] {
@@ -22611,6 +22634,8 @@ async fn a_value_a_cast_would_truncate_is_one_the_alter_refuses() {
         to: ty(to),
         from_nullable: true,
         to_nullable: true,
+        from_collation: None,
+        to_collation: None,
     };
     let cs = ChangeSet {
         changes: vec![PlannedChange::new(narrow("varchar(4)"))],
@@ -23803,6 +23828,8 @@ async fn the_estimate_says_what_the_engine_does_about_rebuilding_the_table() {
             to: ty(dst),
             from_nullable: true,
             to_nullable: true,
+            from_collation: None,
+            to_collation: None,
         };
         let ours = one_estimate(&change, Strategy::default())
             .expect("every column change has an estimate")
@@ -23874,6 +23901,8 @@ async fn the_estimate_says_what_the_engine_does_about_rebuilding_the_table() {
         to: ty("timestamptz"),
         from_nullable: true,
         to_nullable: true,
+        from_collation: None,
+        to_collation: None,
     };
     assert!(
         matches!(
@@ -24072,6 +24101,8 @@ async fn a_temporal_precision_change_is_estimated_as_the_engine_rebuilds_it() {
             to: ty(dst),
             from_nullable: true,
             to_nullable: true,
+            from_collation: None,
+            to_collation: None,
         };
         let ours = one_estimate(&change, Strategy::default())
             .expect("every column change has an estimate")
@@ -24123,6 +24154,8 @@ async fn a_temporal_precision_change_is_estimated_as_the_engine_rebuilds_it() {
             to: ty(to),
             from_nullable: false,
             to_nullable: false,
+            from_collation: None,
+            to_collation: None,
         };
         let mut ours = one_estimate(&change, Strategy::default()).expect("an estimate");
         pbps_pg::estimate::against(&mut conn, &mut ours)
@@ -24178,6 +24211,7 @@ async fn a_change_that_rebuilds_nothing_may_still_read_every_row() {
         column: column.column("v"),
         ty: ty("integer"),
         to_nullable: false,
+        collation: None,
     };
     let widen = Change::AlterColumnType {
         uid: "c_bbbbbb".parse().expect("a uid"),
@@ -24186,6 +24220,8 @@ async fn a_change_that_rebuilds_nothing_may_still_read_every_row() {
         to: ty("varchar(20)"),
         from_nullable: true,
         to_nullable: true,
+        from_collation: None,
+        to_collation: None,
     };
 
     let folded = Change::AlterColumnType {
@@ -24195,6 +24231,8 @@ async fn a_change_that_rebuilds_nothing_may_still_read_every_row() {
         to: ty("varchar(20)"),
         from_nullable: true,
         to_nullable: false,
+        from_collation: None,
+        to_collation: None,
     };
 
     for (change, expected_reads, sql) in [
@@ -24306,6 +24344,7 @@ async fn a_check_the_engine_may_prove_the_column_from_takes_the_scan_back_to_unk
             column: table.column(column),
             ty: ty("integer"),
             to_nullable,
+            collation: None,
         };
         let mut ours =
             one_estimate(&tighten("v", false), Strategy::default()).expect("an estimate");
@@ -24394,6 +24433,8 @@ async fn nullability_folded_into_widening_keeps_unparsed_check_uncertainty() {
         to: ty("varchar(20)"),
         from_nullable: true,
         to_nullable: false,
+        from_collation: None,
+        to_collation: None,
     };
     let mut ours = one_estimate(&change, Strategy::default()).unwrap();
     against(&mut db, &mut ours).await.unwrap();
@@ -24637,6 +24678,8 @@ async fn the_lock_each_statement_takes_is_the_one_the_estimate_names() {
                 to: ty("bigint"),
                 from_nullable: false,
                 to_nullable: false,
+                from_collation: None,
+                to_collation: None,
             },
             format!("ALTER TABLE {s}.t ALTER COLUMN v TYPE bigint"),
         ),
@@ -24766,6 +24809,8 @@ async fn a_shape_the_measurements_never_covered_is_not_answered_from_them() {
         to: ty("bigint"),
         from_nullable: true,
         to_nullable: true,
+        from_collation: None,
+        to_collation: None,
     };
 
     // The static answer is the same for all of them, and the table decides
@@ -24861,6 +24906,8 @@ async fn index_expressions_and_predicates_keep_unmeasured_costs_unknown() {
                 to: ty("bigint"),
                 from_nullable: true,
                 to_nullable: true,
+                from_collation: None,
+                to_collation: None,
             };
             let mut estimate = one_estimate(&change, Strategy::default()).unwrap();
             assert_eq!(estimate.rewrite, Rewrite::Yes);
@@ -25093,6 +25140,8 @@ async fn a_length_probe_is_measured_in_the_session_the_statement_will_run_in() {
             to: ty(to),
             from_nullable: false,
             to_nullable: false,
+            from_collation: None,
+            to_collation: None,
         })
     };
     let cs = ChangeSet {
@@ -25199,12 +25248,15 @@ async fn estimate_provenance_follows_renamed_columns_for_indexes_and_checks() {
                 to: ty("bigint"),
                 from_nullable: true,
                 to_nullable: true,
+                from_collation: None,
+                to_collation: None,
             }),
             PlannedChange::new(Change::AlterColumnNullability {
                 uid: "c_bbbbbb".parse().unwrap(),
                 column: new.column("required"),
                 ty: ty("integer"),
                 to_nullable: false,
+                collation: None,
             }),
             PlannedChange::new(Change::AlterColumnType {
                 uid: "c_cccccc".parse().unwrap(),
@@ -25213,6 +25265,8 @@ async fn estimate_provenance_follows_renamed_columns_for_indexes_and_checks() {
                 to: ty("bigint"),
                 from_nullable: true,
                 to_nullable: true,
+                from_collation: None,
+                to_collation: None,
             }),
         ],
     };
@@ -25404,6 +25458,8 @@ async fn an_estimate_for_a_renamed_table_is_measured_against_the_one_that_exists
                 to: ty("bigint"),
                 from_nullable: true,
                 to_nullable: true,
+                from_collation: None,
+                to_collation: None,
             }),
         ],
     };
@@ -25471,6 +25527,8 @@ async fn a_check_probe_over_values_a_conversion_replaces_would_refuse_a_valid_pl
         to: ty("numeric(10,0)"),
         from_nullable: true,
         to_nullable: true,
+        from_collation: None,
+        to_collation: None,
     };
 
     // The probe this plan would have produced, had the skip not been there.
@@ -25574,6 +25632,8 @@ async fn a_date_the_engine_carries_across_is_not_counted_out_of_range() {
                 to: ty("timestamp without time zone"),
                 from_nullable: true,
                 to_nullable: true,
+                from_collation: None,
+                to_collation: None,
             })],
         };
         let measured = counts(&mut conn, &cs).await;
@@ -25665,6 +25725,8 @@ async fn a_float_on_the_boundary_is_judged_as_the_engine_judges_it() {
                 to: ty(to),
                 from_nullable: true,
                 to_nullable: true,
+                from_collation: None,
+                to_collation: None,
             })],
         };
         let measured = counts(&mut conn, &cs).await;
@@ -25941,6 +26003,8 @@ async fn a_length_probe_agrees_with_the_engine_for_every_rendering_the_pins_deci
                     to: ty(&to),
                     from_nullable: true,
                     to_nullable: true,
+                    from_collation: None,
+                    to_collation: None,
                 })],
             };
             let measured = counts(&mut conn, &cs).await;

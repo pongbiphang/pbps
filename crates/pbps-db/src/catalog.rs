@@ -22,6 +22,12 @@ use crate::DbError;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Pulled {
     pub schema: Schema,
+    /// The connected database's default collation, where the engine's model
+    /// has column collations (#1175). A column under it is read back with no
+    /// collation, so a declaration naming it has to be compared as naming
+    /// none — see [`Schema::without_collation`](pbps_model::Schema).
+    /// `None` on an engine whose columns declare no collation.
+    pub database_collation: Option<String>,
     /// Source context to show when adopting declarations through pull or init.
     /// These reminders are not catalog defects or managed-object limitations,
     /// so routine connected reads must not present them as warnings.

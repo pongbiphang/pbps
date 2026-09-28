@@ -123,6 +123,11 @@ struct AsStored {
     /// row already in it will hold in one. See [`Added`]: not `alias.[name]`,
     /// because the column is not there when the probe runs.
     added: BTreeMap<ColumnRef, Added>,
+    /// Columns whose collation this plan changes, and the one each will have
+    /// (`None` being the database default). A key over one is rebuilt after
+    /// the change, and its values collide or not under the new collation, not
+    /// the one the probe would otherwise group them by (#1175).
+    recollated: BTreeMap<ColumnRef, Option<pbps_model::Collation>>,
     /// The foreign keys this plan takes away before the deletes run: a
     /// `DropForeignKey`, and every key into the table a `DropTable` removes.
     /// Both sort before `DeleteRow` (`order_key`), so counting a child
@@ -305,8 +310,18 @@ impl AsStored {
                     };
                     this.added.insert(table.column(name), added);
                 }
-                Change::AlterColumnType { column, to, .. } => {
+                Change::AlterColumnType {
+                    column,
+                    to,
+                    from_collation,
+                    to_collation,
+                    ..
+                } => {
                     this.types.insert(column.clone(), to.clone());
+                    if from_collation != to_collation {
+                        this.recollated
+                            .insert(column.clone(), to_collation.clone());
+                    }
                 }
                 // Both run before the deletes, so a child counted through
                 // either would refuse a delete that will be valid by then.
@@ -547,6 +562,7 @@ fn build(
             to,
             from_nullable,
             to_nullable,
+            to_collation,
             ..
         } => {
             let Some(stored) = names.column(column) else {
@@ -581,6 +597,7 @@ fn build(
                     &stored,
                     from,
                     to,
+                    to_collation.as_ref(),
                     probes_capacity,
                 )?);
             }
@@ -663,7 +680,7 @@ fn build(
             };
             Ok(vec![duplicate_probe(
                 &format!("(\n{rows}\n) AS r"),
-                &keys(constraint.columns.len()),
+                &collated_keys(names, table, &constraint.columns)?,
                 &format!("rows that would collide under the new unique constraint {name}"),
             )?])
         }
@@ -697,7 +714,7 @@ fn build(
             }
             out.push(duplicate_probe(
                 &from,
-                &keys(pk.columns.len()),
+                &collated_keys(names, table, &pk.columns)?,
                 "rows that would collide under the new primary key",
             )?);
             Ok(out)
@@ -730,7 +747,7 @@ fn build(
             };
             Ok(vec![duplicate_probe(
                 &format!("(\n{rows}\n) AS r"),
-                &keys(columns.len()),
+                &collated_keys(names, table, &columns)?,
                 &format!("rows that would collide under the new unique index {name}"),
             )?])
         }
@@ -1819,6 +1836,29 @@ fn keys(n: usize) -> Vec<String> {
     (0..n).map(|i| format!("r.k{i}")).collect()
 }
 
+/// [`keys`], each grouped under the collation its column will have when the
+/// key is rebuilt, where this plan changes it (#1175). Measured on 17.0,
+/// `GROUP BY c COLLATE Latin1_General_CI_AS` puts `abc` and `ABC` in one group
+/// and `COLLATE Latin1_General_CS_AS` in two — so the count is the rows the
+/// rebuilt key will refuse (1505), not the ones the current collation does.
+fn collated_keys(
+    names: &AsStored,
+    table: &TableName,
+    columns: &[String],
+) -> Result<Vec<String>, DialectError> {
+    columns
+        .iter()
+        .zip(keys(columns.len()))
+        .map(|(column, key)| {
+            Ok(match names.recollated.get(&table.column(column)) {
+                Some(Some(to)) => format!("{key}{}", crate::emit::collate_clause(Some(to))?),
+                Some(None) => format!("{key} COLLATE DATABASE_DEFAULT"),
+                None => key,
+            })
+        })
+        .collect()
+}
+
 /// The table and columns as the database currently names them, or `None` when
 /// the table does not exist yet.
 fn stored_columns(
@@ -1911,6 +1951,7 @@ fn conversion_probe(
     stored: &ColumnRef,
     from: &ColumnType,
     to: &ColumnType,
+    to_collation: Option<&pbps_model::Collation>,
     probes_capacity: bool,
 ) -> Result<Vec<Probe>, DialectError> {
     let table = qualified(&stored.table)?;
@@ -1921,10 +1962,19 @@ fn conversion_probe(
         from.base.as_str(),
         "char" | "varchar" | "text" | "nchar" | "nvarchar" | "ntext" | "sysname"
     ) && matches!(to.base.as_str(), "char" | "varchar" | "text");
+    // The code page the `ALTER` converts into is the column's collation
+    // once it has run: the database default where it declares none, and
+    // otherwise the one it names — which the statement restates whether or
+    // not it changes (#1175). Measured on 17.0, `c COLLATE <UTF-8>` over a
+    // `varchar(5)` holding `ééééé` reads `éé`, what the `ALTER` then stores.
+    let target = match to_collation {
+        Some(c) => crate::emit::collate_clause(Some(c))?,
+        None => " COLLATE DATABASE_DEFAULT".to_owned(),
+    };
     let target_input = match from.base.as_str() {
-        "text" => format!("CONVERT(varchar(max), {col}) COLLATE DATABASE_DEFAULT"),
-        "ntext" => format!("CONVERT(nvarchar(max), {col}) COLLATE DATABASE_DEFAULT"),
-        _ => format!("{col} COLLATE DATABASE_DEFAULT"),
+        "text" => format!("CONVERT(varchar(max), {col}){target}"),
+        "ntext" => format!("CONVERT(nvarchar(max), {col}){target}"),
+        _ => format!("{col}{target}"),
     };
     let character_loss_probe = || {
         Probe::new(
@@ -2078,6 +2128,7 @@ mod tests {
             column: cref("dbo.customer.email"),
             ty: ty("nvarchar(255)"),
             to_nullable: false,
+            collation: None,
         });
         assert_eq!(
             sql,
@@ -2246,6 +2297,7 @@ mod tests {
                 column: cref("dbo.customer.email"),
                 ty: ty("nvarchar(255)"),
                 to_nullable: true,
+                collation: None,
             })
             .is_empty()
         );
@@ -2263,11 +2315,102 @@ mod tests {
             to: ty("nvarchar(50)"),
             from_nullable: true,
             to_nullable: false,
+            from_collation: None,
+            to_collation: None,
         });
         assert_eq!(sql.len(), 2, "{sql:?}");
         assert!(sql[0].contains("IS NULL"), "{sql:?}");
         assert!(
             sql[1].contains("DATALENGTH(RTRIM(TRY_CONVERT(nvarchar(max), [email]))) > 100"),
+            "{sql:?}"
+        );
+    }
+
+    /// A non-Unicode column moved to another collation can change its bytes
+    /// without an error, so its rows are converted under the *target*
+    /// collation and compared (measured on 17.0: `ééééé` in `varchar(5)`
+    /// reads `éé` under a UTF-8 collation). A Unicode column keeps its
+    /// characters, and is asked nothing (#1175).
+    #[test]
+    fn a_collation_change_is_probed_under_the_collation_it_moves_to() {
+        let alter = |ty_: &str, to: Option<&str>| Change::AlterColumnType {
+            uid: uid("c_aaaaaa"),
+            column: cref("dbo.customer.email"),
+            from: ty(ty_),
+            to: ty(ty_),
+            from_nullable: true,
+            to_nullable: true,
+            from_collation: None,
+            to_collation: to.map(pbps_model::Collation::new),
+        };
+        let sql = sql_of(&alter(
+            "varchar(5)",
+            Some("Latin1_General_100_CI_AS_SC_UTF8"),
+        ));
+        assert!(
+            sql.iter()
+                .any(|q| q.contains("[email] COLLATE Latin1_General_100_CI_AS_SC_UTF8")),
+            "{sql:?}"
+        );
+        assert!(
+            !sql.iter().any(|q| q.contains("DATABASE_DEFAULT")),
+            "{sql:?}"
+        );
+        // Back to the default: that is what the probe converts into.
+        let mut back = alter("varchar(5)", None);
+        if let Change::AlterColumnType { from_collation, .. } = &mut back {
+            *from_collation = Some(pbps_model::Collation::new("Latin1_General_BIN2"));
+        }
+        let sql = sql_of(&back);
+        assert!(
+            sql.iter().any(|q| q.contains("COLLATE DATABASE_DEFAULT")),
+            "{sql:?}"
+        );
+        // Negative: a Unicode column's characters survive any collation.
+        assert!(sql_of(&alter("nvarchar(5)", Some("Latin1_General_CS_AS"))).is_empty());
+    }
+
+    /// A unique key rebuilt over a column whose collation this plan changes
+    /// is counted for duplicates under the collation it will have: `abc` and
+    /// `ABC` are one key under a case-insensitive one (#1175).
+    #[test]
+    fn a_rebuilt_key_is_counted_under_its_columns_new_collation() {
+        let changes = ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::AlterColumnType {
+                    uid: uid("c_aaaaaa"),
+                    column: cref("dbo.customer.email"),
+                    from: ty("nvarchar(255)"),
+                    to: ty("nvarchar(255)"),
+                    from_nullable: false,
+                    to_nullable: false,
+                    from_collation: Some(pbps_model::Collation::new("Latin1_General_CS_AS")),
+                    to_collation: Some(pbps_model::Collation::new("Latin1_General_CI_AS")),
+                }),
+                PlannedChange::new(Change::AddUnique {
+                    table: tname("dbo.customer"),
+                    name: "uq_email".into(),
+                    constraint: UniqueConstraint {
+                        columns: vec!["email".into()],
+                    },
+                    clustered: false,
+                }),
+            ],
+        };
+        let sql: Vec<String> = probes(&changes).into_iter().map(|p| p.sql).collect();
+        assert!(
+            sql.iter()
+                .any(|q| q.contains("GROUP BY r.k0 COLLATE Latin1_General_CI_AS")),
+            "{sql:?}"
+        );
+        // Negative: without the collation change the key is grouped as it
+        // stands.
+        let unchanged = ChangeSet {
+            changes: vec![changes.changes[1].clone()],
+        };
+        let sql: Vec<String> = probes(&unchanged).into_iter().map(|p| p.sql).collect();
+        assert!(
+            sql.iter().any(|q| q.contains("GROUP BY r.k0 HAVING")),
             "{sql:?}"
         );
     }
@@ -2283,6 +2426,8 @@ mod tests {
             to: ty("nvarchar(50)"),
             from_nullable: true,
             to_nullable: true,
+            from_collation: None,
+            to_collation: None,
         });
         assert_eq!(sql.len(), 1);
         assert!(
@@ -2311,6 +2456,8 @@ mod tests {
             to: ty("sysname"),
             from_nullable: true,
             to_nullable: true,
+            from_collation: None,
+            to_collation: None,
         });
         assert_eq!(sql.len(), 1, "{sql:?}");
         assert!(
@@ -2338,6 +2485,8 @@ mod tests {
                 to: ty("sysname"),
                 from_nullable: true,
                 to_nullable: true,
+                from_collation: None,
+                to_collation: None,
             })
             .is_empty()
         );
@@ -2355,6 +2504,8 @@ mod tests {
             to: ty("sysname"),
             from_nullable: true,
             to_nullable: true,
+            from_collation: None,
+            to_collation: None,
         });
         assert_eq!(sql.len(), 1, "{sql:?}");
         assert!(
@@ -2387,6 +2538,8 @@ mod tests {
                 to: target,
                 from_nullable: true,
                 to_nullable: true,
+                from_collation: None,
+                to_collation: None,
             });
             assert_eq!(sql.len(), 2, "{from} -> {to}: {sql:?}");
             let expected_len = match from {
@@ -2427,6 +2580,8 @@ mod tests {
                 to: target,
                 from_nullable: true,
                 to_nullable: true,
+                from_collation: None,
+                to_collation: None,
             });
             assert_eq!(sql.len(), 1, "{from} -> {to}: {sql:?}");
             assert!(!sql[0].contains("LEN("), "{sql:?}");
@@ -2451,6 +2606,8 @@ mod tests {
                 to: ty(to),
                 from_nullable: true,
                 to_nullable: true,
+                from_collation: None,
+                to_collation: None,
             });
             assert_eq!(sql.len(), 1, "varchar(20) -> {to}: {sql:?}");
             assert!(!sql[0].contains("LEN("), "{sql:?}");
@@ -2473,6 +2630,8 @@ mod tests {
                 to: ty(to),
                 from_nullable: true,
                 to_nullable: true,
+                from_collation: None,
+                to_collation: None,
             });
             assert_eq!(sql.len(), 1, "{from} -> {to}: {sql:?}");
             assert!(
@@ -2491,6 +2650,8 @@ mod tests {
             to: ty("int"),
             from_nullable: true,
             to_nullable: true,
+            from_collation: None,
+            to_collation: None,
         });
         assert_eq!(sql.len(), 1);
         assert!(
@@ -2529,6 +2690,8 @@ mod tests {
                     to: ty(to),
                     from_nullable: false,
                     to_nullable: false,
+                    from_collation: None,
+                    to_collation: None,
                 })
                 .is_empty(),
                 "`{from}` -> `{to}` was probed"
@@ -2541,6 +2704,8 @@ mod tests {
             to: ty("varbinary(8)"),
             from_nullable: false,
             to_nullable: false,
+            from_collation: None,
+            to_collation: None,
         });
         assert_eq!(sql.len(), 1, "{sql:?}");
         assert!(sql[0].contains("DATALENGTH([v]) > 8"), "{sql:?}");
@@ -2558,6 +2723,8 @@ mod tests {
                 to: ty("bigint"),
                 from_nullable: true,
                 to_nullable: true,
+                from_collation: None,
+                to_collation: None,
             })
             .is_empty()
         );
@@ -2836,6 +3003,8 @@ mod tests {
                 to: ty("varchar(10)"),
                 from_nullable: true,
                 to_nullable: true,
+                from_collation: None,
+                to_collation: None,
             },
             Change::UpdateRow {
                 table: tname("dbo.customer"),
@@ -3187,6 +3356,8 @@ mod tests {
             to: ty("varchar(2)"),
             from_nullable: true,
             to_nullable: true,
+            from_collation: None,
+            to_collation: None,
         };
         assert_eq!(
             probed(vec![
@@ -3208,6 +3379,8 @@ mod tests {
                     to: ty("varchar(2)"),
                     from_nullable: true,
                     to_nullable: true,
+                    from_collation: None,
+                    to_collation: None,
                 },
                 index(&["email"], true, Some("[flag] = '01'")),
             ]),
@@ -4161,6 +4334,7 @@ mod tests {
                 column: cref("dbo.customer.email"),
                 ty: ty("nvarchar(255)"),
                 to_nullable: false,
+                collation: None,
             },
             Change::AddCheck {
                 table: tname("dbo.customer"),
@@ -4206,6 +4380,7 @@ mod tests {
                 column: cref("dbo.customer.contact_email"),
                 ty: ty("nvarchar(255)"),
                 to_nullable: false,
+                collation: None,
             },
         ]);
         let p = probes(&cs);

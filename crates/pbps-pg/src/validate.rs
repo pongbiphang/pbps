@@ -46,6 +46,17 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
     // one-time operation", after which new and updated rows go wherever
     // there is room — so there is no statement a plan could emit to honour
     // it (#1178).
+    // The same for a column collation (#1175): the model holds SQL Server's,
+    // and this reader still leaves a collated column out rather than
+    // declaring it, so a declaration here has nothing it could round-trip to.
+    for (name, column) in &table.columns {
+        if let Some(collation) = &column.collation {
+            found.push(invalid(format!(
+                "column `{name}` names collation `{collation}`; column collations are modelled \
+                 for SQL Server only, so remove the line"
+            )));
+        }
+    }
     if table.clustered.is_some() {
         found.push(invalid(
             "`clustered` is a SQL Server table layout: PostgreSQL has no clustered index \

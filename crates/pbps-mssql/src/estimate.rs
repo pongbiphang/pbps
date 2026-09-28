@@ -113,6 +113,13 @@ enum Work {
         to: ColumnType,
         from_nullable: bool,
         to_nullable: bool,
+        /// The column's collation changes too (#1175). Unmeasured: a change
+        /// of code page rewrites every row (22,316 log records for 20,000
+        /// rows from 1252 to UTF-8) where the
+        /// same type under one code page is metadata — the #1175 feasibility
+        /// review's measurement — and which code page a collation uses is not
+        /// known here.
+        recollated: bool,
     },
     /// Building the table's clustered index. Measured on 17.0 with 20,000
     /// rows: the base table and every nonclustered index got new partition
@@ -277,6 +284,7 @@ pub fn planned_estimates(changes: &ChangeSet) -> Vec<(usize, Estimate)> {
         })
         .collect::<Vec<_>>();
     let mut retyped = BTreeSet::new();
+    let mut recollated = BTreeMap::new();
     let mut out: Vec<(usize, Estimate)> = changes
         .changes
         .iter()
@@ -290,12 +298,18 @@ pub fn planned_estimates(changes: &ChangeSet) -> Vec<(usize, Estimate)> {
                     to,
                     from_nullable,
                     to_nullable,
-                } => (uid, column, from, to, *from_nullable, *to_nullable),
+                    from_collation,
+                    to_collation,
+                } => {
+                    recollated.insert(index, from_collation != to_collation);
+                    (uid, column, from, to, *from_nullable, *to_nullable)
+                }
                 Change::AlterColumnNullability {
                     uid,
                     column,
                     ty,
                     to_nullable,
+                    ..
                 } => (uid, column, ty, ty, !*to_nullable, *to_nullable),
                 Change::CreateTable { .. }
                 | Change::DropTable { .. }
@@ -367,6 +381,7 @@ pub fn planned_estimates(changes: &ChangeSet) -> Vec<(usize, Estimate)> {
                         to: to.clone(),
                         from_nullable,
                         to_nullable,
+                        recollated: recollated.get(&index).copied().unwrap_or(false),
                     },
                     online: p.strategy.online,
                 },
@@ -445,6 +460,14 @@ pub async fn against(conn: &mut Conn, estimate: &mut Estimate) -> Result<(), DbE
     let compression = row.try_get::<u8>("compression")?;
     let why = if estimate.online {
         Some("ONLINE ALTER COLUMN has not been measured")
+    } else if matches!(
+        estimate.work,
+        Work::Column {
+            recollated: true,
+            ..
+        }
+    ) {
+        Some("a collation change has not been measured; a change of code page rewrites every row")
     } else if row.try_get::<i32>("major")? != Some(17) {
         Some(
             "this SQL Server version has not been measured; the catalogue matrix covers version 17",
@@ -478,6 +501,7 @@ pub async fn against(conn: &mut Conn, estimate: &mut Estimate) -> Result<(), DbE
             to,
             from_nullable,
             to_nullable,
+            ..
         } = &estimate.work
         else {
             unreachable!("a layout estimate returned above");

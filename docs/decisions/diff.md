@@ -923,3 +923,43 @@ Pinned by `a_partially_contained_target_needs_a_server_that_allows_contained_dat
 (`crates/pbps-mssql/tests/support/resolver.rs`). It is the only test allowed
 to switch `contained database authentication`. It asks all six functions about
 `cafe` and `café` on a `PARTIAL` and a `NONE` database.
+
+<a id="dec-1175-1"></a>
+
+**DEC-1175.1. A column declares an explicit collation or none, and none is
+the default of whichever database the column is created in.** `collation:`
+names one; absent is the database default. The catalog cannot tell an
+inherited default from the same name spelled out (DECISIONS 443), so the
+reader declares a collation only where it differs from the connected
+database's default. A connected plan compares the declarations with a
+collation equal to the live default taken out (`Schema::without_collation`).
+Compared as written, an unchanged column was altered to the collation it
+already has on every plan, and a created one read back without it failed the
+apply's postcondition. An offline preview cannot do that, and shows such a
+column as a change; the connected plan is the one that is applied. The
+baseline checksum pins the default implicitly: if it changes after the plan,
+every character column's read-back changes with it. A name is compared
+without ASCII case (`Collation`), as the engine resolves it.
+
+The emitter spells `COLLATE` on every statement that writes a column
+definition, `ALTER COLUMN` included, whether or not the collation changes.
+Measured on 17.0, an `ALTER COLUMN` without it moved a `Latin1_General_CS_AS`
+column to the database default with no error. So `AlterColumnType` and
+`AlterColumnNullability` carry the collation, and the apply guard holds the
+read-back to it. A collation change is an `AlterColumnType` with the type
+restated. It is the same statement, and it is blocked by the same dependents:
+measured, an index (key, INCLUDE or filter), a PRIMARY KEY or UNIQUE, a
+foreign key on either side and a CHECK each refuse it (5074); a DEFAULT does
+not. The dialect's `recollate_dependents` makes the differ take all of those
+down and put them back, with a key's foreign keys.
+
+A non-Unicode column's collation change is `narrowing`. Its bytes are in the
+collation's code page, and measured, `ééééé` in `varchar(5)` kept `éé` under a
+UTF-8 collation. Which code page a collation uses is not known offline. The
+probes convert under the target collation instead of `DATABASE_DEFAULT`, and
+count a rebuilt key's duplicates under the collation it will have. A Unicode
+column's collation change takes no class of its own; the keys rebuilt around
+it carry theirs. A foreign key's two sides must declare the same collation
+(1757). A name the server lacks is refused before the first statement (448).
+The operational estimate reports a collation change as unmeasured.
+PostgreSQL refuses the field.

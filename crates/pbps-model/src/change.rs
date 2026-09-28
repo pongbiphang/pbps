@@ -22,7 +22,7 @@ use crate::module::{Module, ModuleId, ModuleKind, ObjectName, RoutineId};
 use crate::name::{ColumnRef, TableName};
 use crate::role::{GrantTarget, Permission};
 use crate::schema::{
-    CheckConstraint, Column, ForeignKey, Index, PrimaryKey, Table, UniqueConstraint,
+    CheckConstraint, Collation, Column, ForeignKey, Index, PrimaryKey, Table, UniqueConstraint,
 };
 use crate::strategy::Strategy;
 use crate::types::ColumnType;
@@ -234,6 +234,19 @@ pub enum Change {
         /// from the change alone.
         from_nullable: bool,
         to_nullable: bool,
+        /// Explicit collation before and after (#1175), `None` being the
+        /// database default. Carried for the reason the nullability is: SQL
+        /// Server's `ALTER COLUMN` restates the whole definition and reads an
+        /// omitted `COLLATE` as the database default — measured on 17.0, a
+        /// column `COLLATE Latin1_General_CI_AS` altered to `varchar(20)`
+        /// came back under the database's collation. A collation change on
+        /// a column whose type stays is this change too, with `from == to`:
+        /// the statement is the same `ALTER COLUMN`, and so are the
+        /// dependents it has to take down and put back.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_collation: Option<Collation>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_collation: Option<Collation>,
     },
     AlterColumnNullability {
         uid: Uid,
@@ -245,6 +258,10 @@ pub enum Change {
         ty: ColumnType,
         /// Whether the column is nullable after the change.
         to_nullable: bool,
+        /// The column's explicit collation, unchanged, restated for the
+        /// reason [`Change::AlterColumnType`] carries it (#1175).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        collation: Option<Collation>,
     },
     AlterColumnDefault {
         uid: Uid,
@@ -692,6 +709,8 @@ pub enum ColumnField {
     Type,
     Nullable,
     Default,
+    /// The explicit collation (#1175).
+    Collation,
     /// Named for exhaustiveness rather than because a comparison turns on it:
     /// deprecation emits no statement and no catalog reads it back.
     Deprecated,
@@ -811,6 +830,9 @@ pub enum ColumnPromise<'a> {
     Nullable(bool),
     /// Whether the column has a default at all.
     Default(bool),
+    /// The explicit collation the column has after the change, `None` being
+    /// the database default (#1175).
+    Collation(Option<&'a Collation>),
 }
 
 impl ColumnPromise<'_> {
@@ -830,6 +852,7 @@ impl ColumnPromise<'_> {
             ColumnPromise::Type(_) => ColumnField::Type,
             ColumnPromise::Nullable(_) => ColumnField::Nullable,
             ColumnPromise::Default(_) => ColumnField::Default,
+            ColumnPromise::Collation(_) => ColumnField::Collation,
         }
     }
 }
@@ -1252,11 +1275,16 @@ impl Change {
                 column,
                 from_nullable,
                 to_nullable,
+                from_collation,
+                to_collation,
                 ..
             } => {
                 let mut out = vec![(column.clone(), ColumnField::Type)];
                 if from_nullable != to_nullable {
                     out.push((column.clone(), ColumnField::Nullable));
+                }
+                if from_collation != to_collation {
+                    out.push((column.clone(), ColumnField::Collation));
                 }
                 out
             }
@@ -1539,20 +1567,31 @@ impl Change {
             } => vec![(table.column(name), ColumnPromise::Whole(column))],
             // Both: `ALTER COLUMN` restates the nullability with the type
             // (§12), so the statement promises it whether or not it moves.
+            // And the collation: the statement restates it too, and one it
+            // leaves out moves the column to the database default (#1175).
             Change::AlterColumnType {
                 column,
                 to,
                 to_nullable,
+                to_collation,
                 ..
             } => vec![
                 (column.clone(), ColumnPromise::Type(to)),
                 (column.clone(), ColumnPromise::Nullable(*to_nullable)),
+                (
+                    column.clone(),
+                    ColumnPromise::Collation(to_collation.as_ref()),
+                ),
             ],
             Change::AlterColumnNullability {
                 column,
                 to_nullable,
+                collation,
                 ..
-            } => vec![(column.clone(), ColumnPromise::Nullable(*to_nullable))],
+            } => vec![
+                (column.clone(), ColumnPromise::Nullable(*to_nullable)),
+                (column.clone(), ColumnPromise::Collation(collation.as_ref())),
+            ],
             Change::AlterColumnDefault { column, to, .. } => {
                 vec![(column.clone(), ColumnPromise::Default(to.is_some()))]
             }
@@ -2285,6 +2324,7 @@ mod tests {
             column: col("dbo.customer.email"),
             ty: ty("nvarchar(255)"),
             to_nullable,
+            collation: None,
         };
         let (tighten, loosen) = (make(false), make(true));
         assert!(tighten.intrinsic_risks().contains(&RiskClass::NotNull));
@@ -2302,6 +2342,8 @@ mod tests {
             to: ty("int"),
             from_nullable: true,
             to_nullable: true,
+            from_collation: None,
+            to_collation: None,
         };
         assert!(
             c.intrinsic_risks().is_empty(),
@@ -2324,6 +2366,8 @@ mod tests {
             to: ty("nvarchar(100)"),
             from_nullable,
             to_nullable,
+            from_collation: None,
+            to_collation: None,
         };
         assert!(
             make(true, false)
@@ -2552,12 +2596,15 @@ mod tests {
                 to: ty("bigint"),
                 from_nullable: false,
                 to_nullable: true,
+                from_collation: None,
+                to_collation: None,
             },
             Change::AlterColumnNullability {
                 uid: uid("c_p3n8vd"),
                 column: column.clone(),
                 ty: ty("int"),
                 to_nullable: true,
+                collation: None,
             },
             Change::AlterColumnDefault {
                 uid: uid("c_p3n8vd"),

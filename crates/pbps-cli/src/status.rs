@@ -1033,6 +1033,7 @@ mod tests {
             owners: Default::default(),
             session_role: String::new(),
             unrevocable: Vec::new(),
+            database_collation: None,
         };
         let scoped = pbps_diff::scope(
             &pulled.schema,

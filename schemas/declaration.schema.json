@@ -165,6 +165,14 @@
           "maxItems": 2,
           "default": null
         },
+        "collation": {
+          "description": "An explicit collation, on SQL Server (`Latin1_General_CS_AS`). Absent\nmeans the collation of the database the column is created in.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "description": {
           "type": [
             "string",

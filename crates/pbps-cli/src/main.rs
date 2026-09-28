@@ -1664,6 +1664,12 @@ pub(crate) fn declaration_problems(
     for problem in pbps_dialect::check_constraint_names(schema, dialect) {
         out.push(("schema.name-collision", problem));
     }
+    // And a fifth: a foreign key between two columns of different collations,
+    // which SQL Server refuses (1757) and only the whole schema can see
+    // (#1175).
+    for problem in schema.foreign_key_collation_problems() {
+        out.push(("dialect.rejected", problem));
+    }
     // Roles (ADR-0005): a grant on an object nobody declares is the
     // foreign-key-target rule applied to permissions.
     for problem in pbps_model::role::check(schema) {

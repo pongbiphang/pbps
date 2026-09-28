@@ -257,6 +257,7 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
                     .map(|[seed, increment]| Identity { seed, increment }),
                 description: c.description,
                 deprecated: c.deprecated,
+                collation: c.collation.map(pbps_model::Collation::new),
             },
         );
     }

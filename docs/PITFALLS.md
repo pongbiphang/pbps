@@ -2501,3 +2501,21 @@ matches the default today. The explicit `PRIMARY KEY CLUSTERED` fails loudly
 (DEC-1178.1). A default that is the same everywhere — a UNIQUE constraint is
 nonclustered whatever else is on the table — needs no spelling.
 
+## A statement that restates the whole column resets what it leaves out
+
+SQL Server's `ALTER COLUMN` takes the column's full definition. An omitted
+`NULL`/`NOT NULL` reads as `NULL`, which is why every type change here
+carries the nullability. An omitted `COLLATE` reads as the database's default
+collation. Measured on 17.0, `ALTER COLUMN c varchar(20) NOT NULL` on a
+`Latin1_General_CS_AS` column put it under the database default, with no
+error. Before #1175 the emitter had no collation to restate, so any retype or
+nullability change on such a column changed its comparison semantics too.
+
+**The shape:** a statement that restates a definition resets every part of it
+the caller did not spell. Adding a property to the model means adding it to
+every such statement, not only to the one that changes that property.
+
+**The rule.** When the model gains a column property, sweep every statement
+that writes a column definition — create, add, and each alter — and restate it
+there (DEC-1175.1).
+
