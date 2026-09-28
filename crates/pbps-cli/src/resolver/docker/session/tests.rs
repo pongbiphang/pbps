@@ -8,6 +8,7 @@ async fn an_unqualified_daemon_cannot_start_a_private_candidate() {
     let api = fixture.client().await;
     let image = CandidateImage {
         environment_keys: Some(vec![]),
+        postgres_layout: Some(crate::resolver::docker::profile::engine::PostgresLayout::Root),
         acquisition: None,
         identity: super::super::ImageIdentity {
             image_id: format!("sha256:{}", "e".repeat(64)),

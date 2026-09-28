@@ -530,3 +530,6 @@ mod kernel_tests;
 
 #[cfg(test)]
 mod native_factory_tests;
+
+#[cfg(test)]
+mod pg_recipe_tests;

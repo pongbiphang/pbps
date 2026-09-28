@@ -37,6 +37,7 @@ impl Drop for Fixture {
 fn candidate() -> CandidateImage {
     CandidateImage {
         environment_keys: Some(vec![]),
+        postgres_layout: Some(crate::resolver::docker::profile::engine::PostgresLayout::Root),
         acquisition: None,
         identity: ImageIdentity {
             image_id: format!("sha256:{}", "e".repeat(64)),
