@@ -207,8 +207,9 @@ impl LockInfo {
 /// The widest `locked_by` either engine's lock table holds, in characters.
 pub const LOCKED_BY_CHARS: usize = 256;
 
-/// The widest `operator` either engine's ledger holds: `varchar(128)` on
-/// PostgreSQL, `NVARCHAR(128)` on SQL Server (#1205).
+/// The width of SQL Server's ledger `operator` column, `NVARCHAR(128)`, in
+/// the UTF-16 code units it counts (#1205). PostgreSQL's `varchar(128)`
+/// counts characters and is bounded in its own unit by `pbps-pg`.
 pub const OPERATOR_CHARS: usize = 128;
 
 /// `text` cut to at most `width` UTF-16 code units, on a character boundary.

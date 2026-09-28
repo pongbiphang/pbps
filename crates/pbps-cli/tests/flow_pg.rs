@@ -7003,7 +7003,8 @@ fn the_cli_ledger_preserves_history_and_distinguishes_absent_empty_and_unreadabl
 /// #1205: the operator (git `user.name`) went into the ledger's
 /// `varchar(128)` unbounded, so a long one was refused at the ledger write —
 /// on `apply`, after the statements had run. It is recorded, cut to the
-/// column on a character boundary.
+/// column in this engine's unit, characters: 100 emoji fit whole here, where
+/// SQL Server's UTF-16 count would have kept 64.
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn an_operator_wider_than_the_ledger_column_is_recorded_cut_to_it() {
@@ -7012,11 +7013,17 @@ fn an_operator_wider_than_the_ledger_column_is_recorded_cut_to_it() {
     let d = bootstrapped_demo(connection, "operator-width", ONE_COLUMN);
     for (name, recorded) in [
         ("a".repeat(300), "a".repeat(128)),
-        ("\u{1F600}".repeat(100), "\u{1F600}".repeat(64)),
+        ("\u{1F600}".repeat(100), "\u{1F600}".repeat(100)),
+        ("\u{1F600}".repeat(200), "\u{1F600}".repeat(128)),
     ] {
         d.git(&["config", "user.name", &name]);
         succeeds(d.run(&["baseline", "--db", connection, "--reason", "wide operator"]));
         assert_eq!(latest_snapshot(connection).operator, recorded);
+        // The column projection and `state_json` agree on what was recorded.
+        let listed = json_output(succeeds(
+            d.run(&["state", "list", "--db", connection, "--format", "json"]),
+        ));
+        assert_eq!(listed["data"]["entries"][0]["operator"], recorded.as_str());
     }
 }
 

@@ -1743,9 +1743,7 @@ fn write_ids(project: &Project, ids: &IdsFile) -> anyhow::Result<()> {
 
 fn context(root: &std::path::Path) -> Context {
     Context {
-        // Whole: a tombstone goes into the identity file, which has no column
-        // to fit, and cutting it there would weaken the git audit record.
-        operator: operator_name(root),
+        operator: operator(root),
         today: today(),
     }
 }
@@ -3166,17 +3164,12 @@ pub(crate) fn validate_saved_plan(
 
 /// The operator. An audit asks "who did this", and git's configuration is the
 /// closest thing to the truth available.
-/// Who is running this command, as the ledger and the lock record it:
-/// [`operator_name`], bounded to the ledger's `operator` column in that
-/// column's own measure (`pbps_db::clip_utf16`). Unbounded, a long or
-/// emoji-heavy `user.name` was refused by both engines at the ledger write,
-/// which on `apply` comes after the statements have run (#1205).
+/// Who is running this command: git's `user.name`, else `$USER`, whole.
+///
+/// Not bounded here: a tombstone carries it into the identity file, which has
+/// no column to fit, and each engine's ledger cuts it to its own column in its
+/// own unit when it records (#1205).
 fn operator(root: &std::path::Path) -> String {
-    pbps_db::clip_utf16(&operator_name(root), pbps_db::OPERATOR_CHARS)
-}
-
-/// Who is running this command, whole: git's `user.name`, else `$USER`.
-fn operator_name(root: &std::path::Path) -> String {
     std::process::Command::new("git")
         .arg("-C")
         .arg(root)
