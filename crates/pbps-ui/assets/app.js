@@ -94,7 +94,7 @@
       }
       content.append(grid);
     } else if (current === "plan") {
-      const summary = panel(data.applyable ? "Deployment plan" : "Preview plan"), stats = node("div", undefined, "stats");
+      const summary = panel(data.apply_limitation ? "Unsupported deployment plan" : data.applyable ? "Deployment plan" : "Preview plan"), stats = node("div", undefined, "stats");
       for (const [key, text] of [["change_count", "changes"], ["table_count", "tables"], ["module_count", "modules"], ["role_count", "roles"]]) {
         const stat = node("div", undefined, "stat"); stat.append(node("strong", data[key]), node("span", text)); stats.append(stat);
       }

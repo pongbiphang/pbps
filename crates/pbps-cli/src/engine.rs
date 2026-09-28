@@ -1802,6 +1802,19 @@ pub async fn check_data_write(
     }
 }
 
+/// Current execution support, separate from database provenance and evidence
+/// validation. Both apply and explain use this boundary after validating the
+/// artifact. #616 must narrow this refusal only when its transactional rechecks
+/// exist; supported resolver plans then receive ordinary approval commands too.
+pub fn resolver_apply_limitation(plan: &pbps_model::SavedPlan) -> Option<&'static str> {
+    match &plan.analysis {
+        pbps_model::resolver::PlanAnalysis::Ordinary => None,
+        pbps_model::resolver::PlanAnalysis::Resolved(_) => {
+            Some("this build cannot yet enforce resolver pre/postconditions during apply (#616)")
+        }
+    }
+}
+
 /// Artifact readers route by the engine named in the saved file, without a
 /// connection or resolver. Connected apply separately checks that engine
 /// against its actual target before accepting the artifact.

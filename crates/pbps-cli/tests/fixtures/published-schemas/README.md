@@ -41,3 +41,5 @@ DECISIONS 465).
   before it runs, apart from its executable `probes` (issue #478).
 - `17/` adds a table's `clustered:` layout selector: `heap`, or the UNIQUE
   constraint or index that is the clustered one (issue #1178).
+- `18/` documents explain's current-build apply capability and adds its optional
+  `apply_limitation`; unsupported artifacts carry an empty `approve_with`.

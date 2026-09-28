@@ -128,7 +128,8 @@ use crate::schema::Schema;
 /// Omitting analysis must never downgrade a resolved plan to an ordinary one.
 pub const CURRENT_VERSION: u32 = 12;
 
-/// Where a plan came from, and therefore whether it may be applied.
+/// Where a plan came from. Database provenance permits apply in principle;
+/// the executing build must also support its mode and analysis contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanOrigin {
@@ -142,6 +143,8 @@ pub enum PlanOrigin {
 }
 
 impl PlanOrigin {
+    /// Whether the provenance permits apply, independent of a build's support
+    /// for the recorded analysis. A resolved artifact still needs guarded apply.
     pub const fn is_applyable(self) -> bool {
         matches!(self, PlanOrigin::Database | PlanOrigin::ResolvedDatabase)
     }
