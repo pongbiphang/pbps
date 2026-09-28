@@ -561,8 +561,9 @@ pub(crate) fn object_reads(cs: &pbps_model::ChangeSet) -> (Vec<TableName>, Vec<T
 
 /// Every name the walk may hold that the collation question has to see
 /// (#1215): the names the plan reads (`object_reads`), the names the catalog
-/// found, each renamed table's new name, and the destination of each
-/// occupant a cross-schema `RenameTable` carries. The walk moves a carried constraint into the new schema under
+/// found, each renamed table's new name, each module it creates (a rebuilt
+/// one too), and the destination of each occupant a cross-schema
+/// `RenameTable` carries. The walk moves a carried constraint into the new schema under
 /// its own name, so `archive.Ck_Name` arrives there without ever being read,
 /// and a later `archive.ck_name` must still meet it (review of #1240).
 // The complement is every change that moves no table between schemas.
@@ -576,9 +577,13 @@ pub(crate) fn alike_candidates(
     let mut out: Vec<TableName> = names.to_vec();
     out.extend(occupants.iter().map(|o| o.name.clone()));
     for p in &cs.changes {
-        // A renamed table's new name, which the plan uses without reading.
-        if let Change::RenameTable { to, .. } = &p.change {
-            out.push(to.clone());
+        // A renamed table's new name, which the plan uses without reading,
+        // and every module the plan creates, a rebuilt one included, which
+        // `created_object_names` leaves out of the read (review of #1240).
+        match &p.change {
+            Change::RenameTable { to, .. } => out.push(to.clone()),
+            Change::CreateModule { id, .. } => out.push(module_object(id)),
+            _ => {}
         }
         if let Change::RenameTable { from, to, .. } = &p.change
             && from.schema != to.schema
@@ -7886,6 +7891,27 @@ mod tests {
         assert!(e.contains("this plan puts user table `dbo.Ck_Name`"), "{e}");
         refuse_occupied_objects_under(&into_ck, &[], &[], "prod")
             .expect("two names where the database reads them as two");
+        // A rebuilt module is a name the plan creates too, though the read
+        // leaves it out: it is asked about all the same.
+        let rebuilt_view = ModuleId::Named(TableName::new("dbo", "Ck_Name"));
+        let rebuild_view = plan(vec![
+            PlannedChange::new(Change::DropModule {
+                id: rebuilt_view.clone(),
+                kind: pbps_model::ModuleKind::View,
+            }),
+            PlannedChange::new(Change::CreateModule {
+                id: rebuilt_view,
+                module: Box::new(pbps_model::Module {
+                    kind: pbps_model::ModuleKind::View,
+                    description: None,
+                    definition: "CREATE VIEW dbo.Ck_Name AS SELECT 1 AS x".into(),
+                }),
+            }),
+        ]);
+        assert!(
+            alike_candidates(&rebuild_view, &[], &[]).contains(&TableName::new("dbo", "Ck_Name")),
+            "a rebuilt module is a candidate"
+        );
         // And the walk meets it there under the database's answer.
         let archive_other = TableName::new("archive", "other");
         let mut carried_then_added = transfer_old.clone();
