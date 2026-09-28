@@ -1,5 +1,6 @@
 //! Expected closing prerequisites, derived only from approved typed changes.
 
+use super::ownership::{at_endpoint, transition_at_endpoint};
 use super::{InputManifest, ManifestError, ObjectIdentity, ObjectOwnership, Surface};
 use crate::{Change, ChangeSet, GrantTarget, ModuleId};
 use std::collections::{BTreeMap, BTreeSet};
@@ -72,18 +73,26 @@ impl InputManifest {
                     // Ownership permits aggregation, not unrelated mutations.
                     // The same typed scope that requires a record below must
                     // also authorize replacing it (SPEC 9.3.2).
-                    let affected = changes.changes.iter().any(|step| {
+                    let affected = changes.changes.iter().enumerate().any(|(index, step)| {
                         touches(&step.change, &transition.surface)
+                            && ownership.permits(&transition_at_endpoint(
+                                &transition.surface,
+                                changes,
+                                index,
+                                before,
+                            ))
                             && changed_owners(&step.change).is_some_and(
                                 |(candidates, opening, closing)| {
                                     (if before { opening } else { closing })
-                                        && candidates
-                                            .iter()
-                                            .any(|owner| owner.contains(ownership, changes))
+                                        && candidates.iter().any(|owner| {
+                                            owner
+                                                .at_endpoint(changes, index, before)
+                                                .contains(ownership)
+                                        })
                                 },
                             )
                     });
-                    if !ownership.permits(&transition.surface, changes) || !affected {
+                    if !affected {
                         return Err(ManifestError::Invalid);
                     }
                 }
@@ -103,7 +112,7 @@ impl InputManifest {
         // catalog mutation must account for its independently captured owner
         // and its affected records. Containment alone is not a mutation: a
         // table grant preserves columns/defaults/checks/indexes (SPEC 9.3.2).
-        for step in &changes.changes {
+        for (index, step) in changes.changes.iter().enumerate() {
             if let Some((candidates, opening, closing)) = changed_owners(&step.change) {
                 let complete = candidates.iter().any(|owner| {
                     [
@@ -115,10 +124,11 @@ impl InputManifest {
                         if !required {
                             return true;
                         }
+                        let owner = owner.at_endpoint(changes, index, before);
                         let records: Vec<_> = manifest
                             .prerequisites()
                             .iter()
-                            .filter(|p| owner.contains(&p.ownership, changes))
+                            .filter(|p| owner.contains(&p.ownership))
                             .collect();
                         // A grant or constraint may follow an approved CREATE,
                         // or precede a DROP. The typed plan must prove why the
@@ -128,7 +138,7 @@ impl InputManifest {
                         }
                         records
                             .iter()
-                            .any(|p| p.ownership.matches_surface(owner.surface(), changes))
+                            .any(|p| p.ownership.matches_surface(owner.surface()))
                             && records.iter().all(|p| inventory.contains(&p.object))
                     })
                 });
@@ -228,10 +238,18 @@ impl OwnerScope {
         }
     }
 
-    fn contains(&self, ownership: &ObjectOwnership, changes: &ChangeSet) -> bool {
+    fn at_endpoint(&self, changes: &ChangeSet, step: usize, before: bool) -> Self {
+        let surface = at_endpoint(self.surface(), changes, step, before);
         match self {
-            Self::Exact(surface) => ownership.matches_surface(surface, changes),
-            Self::WithChildren(surface) => ownership.permits(surface, changes),
+            Self::Exact(_) => Self::Exact(surface),
+            Self::WithChildren(_) => Self::WithChildren(surface),
+        }
+    }
+
+    fn contains(&self, ownership: &ObjectOwnership) -> bool {
+        match self {
+            Self::Exact(surface) => ownership.matches_surface(surface),
+            Self::WithChildren(surface) => ownership.permits(surface),
         }
     }
 }
@@ -360,7 +378,7 @@ fn changed_owners(change: &Change) -> Option<(Vec<OwnerScope>, bool, bool)> {
 #[allow(clippy::wildcard_enum_match_arm)]
 fn planned_absence(owner: &Surface, changes: &ChangeSet, before: bool) -> bool {
     let ownership = super::ObjectOwnership::Surface(owner.clone());
-    changes.changes.iter().any(|step| {
+    changes.changes.iter().enumerate().any(|(index, step)| {
         let boundary = match &step.change {
             Change::CreateTable { name, .. } if before => Surface::Table(name.clone()),
             Change::DropTable { name, .. } if !before => Surface::Table(name.clone()),
@@ -393,7 +411,7 @@ fn planned_absence(owner: &Surface, changes: &ChangeSet, before: bool) -> bool {
             }
             _ => return false,
         };
-        ownership.permits(&boundary, changes)
+        ownership.permits(&at_endpoint(&boundary, changes, index, before))
     })
 }
 

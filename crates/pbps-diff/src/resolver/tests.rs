@@ -616,3 +616,61 @@ fn splitting_table_creation_preserves_the_declared_index_layout() {
         assert!(ordered.proof.validate(&changed).is_err());
     }
 }
+
+#[test]
+fn new_table_indexes_are_offline_while_existing_table_indexes_keep_the_requested_strategy() {
+    use pbps_model::{Hints, IdsFile, Index, IndexColumn, Schema, Strategy};
+    for existing in [false, true] {
+        for online in [false, true] {
+            let base = if existing {
+                tables()
+            } else {
+                Schema::default()
+            };
+            let before_ids = ids(&base, &IdsFile::default());
+            let mut desired = tables();
+            let mut hints = Hints::default();
+            for (name, table) in &mut desired.tables {
+                table.indexes.insert(
+                    "ix".into(),
+                    Index {
+                        columns: vec![IndexColumn {
+                            name: "id".into(),
+                            descending: false,
+                        }],
+                        include: vec![],
+                        unique: false,
+                        filter: None,
+                    },
+                );
+                hints.strategies.insert(name.clone(), Strategy { online });
+            }
+            let after_ids = ids(&desired, &before_ids);
+            let ordered = plan(
+                crate::Side {
+                    schema: &base,
+                    ids: &before_ids,
+                },
+                crate::Side {
+                    schema: &desired,
+                    ids: &after_ids,
+                },
+                &hints,
+                &[],
+                &pbps_dialect::MinimalDialect,
+            )
+            .unwrap();
+            let indexes: Vec<_> = ordered
+                .changes
+                .changes
+                .iter()
+                .filter(|p| matches!(p.change, Change::AddIndex { .. }))
+                .collect();
+            assert_eq!(indexes.len(), 2);
+            for index in indexes {
+                assert_eq!(index.strategy.online, existing && online);
+            }
+            ordered.proof.validate(&ordered.changes).unwrap();
+        }
+    }
+}

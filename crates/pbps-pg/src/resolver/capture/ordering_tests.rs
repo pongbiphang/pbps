@@ -238,6 +238,7 @@ async fn exercise(target_connection: String, scratch_connection: String, worker:
         .await
         .unwrap();
     target.execute("CREATE SCHEMA app").await.unwrap();
+    new_table_online_indexes_are_transactional(&mut target).await;
     scratch.execute("CREATE SCHEMA app; CREATE TABLE app.t(id integer NOT NULL); CREATE FUNCTION app.f() RETURNS integer LANGUAGE SQL IMMUTABLE RETURN (SELECT count(*)::integer FROM app.t); CREATE FUNCTION app.a() RETURNS integer LANGUAGE SQL IMMUTABLE RETURN app.f(); ALTER TABLE app.t ALTER COLUMN id SET DEFAULT app.f(); ALTER TABLE app.t ADD CONSTRAINT positive CHECK(id >= app.f()); CREATE INDEX ix ON app.t(id) WHERE id >= app.f()").await.unwrap();
     let scope = CaptureScope {
         retained: BTreeSet::new(),
@@ -516,4 +517,67 @@ async fn exercise(target_connection: String, scratch_connection: String, worker:
             .unwrap(),
         Some(9)
     );
+}
+
+// A declaration may request online work for an existing table. Ordinary table
+// creation ignores that request because its indexes belong to an empty table;
+// resolver extraction must preserve the same executable transaction boundary.
+async fn new_table_online_indexes_are_transactional(target: &mut Conn) {
+    let empty = Schema::default();
+    let before_ids = IdsFile::default();
+    let name: pbps_model::TableName = "app.online_new".parse().unwrap();
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("n".into(), Column::new("integer".parse().unwrap()));
+    table.indexes.insert(
+        "online_new_ix".into(),
+        pbps_model::Index {
+            columns: vec![pbps_model::IndexColumn {
+                name: "n".into(),
+                descending: false,
+            }],
+            include: vec![],
+            unique: false,
+            filter: None,
+        },
+    );
+    let mut desired = Schema::default();
+    desired.tables.insert(name.clone(), table);
+    let after_ids = ids(&desired, &before_ids);
+    let mut hints = Hints::default();
+    hints
+        .strategies
+        .insert(name, pbps_model::Strategy { online: true });
+    let before = pbps_diff::Side {
+        schema: &empty,
+        ids: &before_ids,
+    };
+    let after = pbps_diff::Side {
+        schema: &desired,
+        ids: &after_ids,
+    };
+    let dialect = crate::Postgres::default();
+    let ordinary = pbps_diff::diff(before, after, &dialect, &hints).unwrap();
+    target.execute("BEGIN").await.unwrap();
+    execute(target, &ordinary).await.unwrap();
+    target.execute("ROLLBACK").await.unwrap();
+    let ordered = pbps_diff::resolver::plan(before, after, &hints, &[], &dialect).unwrap();
+    let restored: ChangeSet =
+        serde_json::from_str(&serde_json::to_string(&ordered.changes).unwrap()).unwrap();
+    ordered.proof.validate(&restored).unwrap();
+    target.execute("BEGIN").await.unwrap();
+    execute(target, &restored)
+        .await
+        .expect("a new table's extracted online-declared index must execute transactionally");
+    for step in &restored.changes {
+        assert!(
+            dialect
+                .emit(&step.change, step.strategy)
+                .unwrap()
+                .iter()
+                .all(|s| s.transactional)
+        );
+    }
+    target.execute("ROLLBACK").await.unwrap();
 }

@@ -657,3 +657,6 @@ mod transition_scope_tests;
 
 #[cfg(test)]
 mod owner_mutation_scope_tests;
+
+#[cfg(test)]
+mod chained_rename_tests;

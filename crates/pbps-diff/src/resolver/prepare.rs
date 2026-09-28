@@ -247,6 +247,14 @@ pub(super) fn changes(
         };
         for change in expanded {
             let mut p = planned.clone();
+            if matches!(planned.change, Change::CreateTable { .. })
+                && matches!(change, Change::AddIndex { .. })
+            {
+                // Ordinary CREATE TABLE builds indexes on its new empty table
+                // without online/concurrent DDL. Splitting must keep that
+                // transactional behavior (SPEC 9.3.2).
+                p.strategy = Default::default();
+            }
             p.risks = dialect.change_risks(&change);
             p.change = change;
             changes.push(p);

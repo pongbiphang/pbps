@@ -214,7 +214,10 @@ A projected closing manifest permits approved catalog/grant changes while
 preserving untouched external inputs. Each transitioned record must carry an
 independently captured typed owner on its opening/closing prerequisite. An
 inventory cannot confer ownership merely by listing an object. Aggregate table
-and column owners and explicitly approved rename endpoints remain valid.
+and column owners and explicitly approved rename endpoints remain valid. Rename
+owners resolve from the typed statement position to each snapshot separately,
+following the recorded UID through intermediate names. A closing name reused
+by another UID is never replayed as an opening name.
 Every catalog mutation inventory must include the changed owner and all of its
 affected qualified records in each applicable manifest. Table constraint/ACL
 changes and column nullability changes affect the owner itself, including its
@@ -240,3 +243,8 @@ resolved apply before DDL until those checks exist. #617 owns private-source
 handling, #618 artifact/report integration, and #619/#620 the independently
 qualified SQL Server adapter. No protected verifier table or legacy-reader
 confidentiality proof is reintroduced.
+
+Indexes extracted from a newly created empty table use the ordinary creation
+strategy. A table-level online hint cannot turn that extraction into concurrent
+DDL and invalidate the resolver plan's transactional boundary. Index changes
+on existing tables retain their requested strategy.

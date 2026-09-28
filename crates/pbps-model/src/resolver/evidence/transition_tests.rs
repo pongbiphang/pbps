@@ -587,7 +587,7 @@ fn adding_a_column_requires_more_than_its_default_transition() {
     );
 }
 
-fn rename_endpoints(column: bool) -> (ChangeSet, ResolverEvidence) {
+pub(super) fn rename_endpoints(column: bool) -> (ChangeSet, ResolverEvidence) {
     let table: TableName = "app.v".parse().unwrap();
     let (drop, surface) = dropped_surfaces().pop().unwrap();
     let (_, mut evidence) = drop_fixture(drop, surface);
