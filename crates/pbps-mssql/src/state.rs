@@ -103,15 +103,6 @@ END;";
 /// `NVARCHAR(4)` refused two emoji plus one ASCII letter with Msg 2628.
 pub const REASON_UTF16_UNITS: usize = 1000;
 
-/// Cuts a reason down to what the ledger column can hold.
-///
-/// Counts `char::len_utf16`, because a Rust `char` above U+FFFF occupies two
-/// units and a count of characters could hand the column twice its width. The
-/// cut never splits a character, so what remains is valid text. Used on the
-/// best-effort audit paths, where a failed attempt that cannot be recorded is
-/// the opposite of what the row exists for; a user-supplied `--reason` is not
-/// truncated and fails loudly instead, since an audit text silently shortened
-/// is a different kind of loss.
 /// The snapshot with its operator cut to the `NVARCHAR(128)` column in that
 /// column's measure, UTF-16 code units, and never inside a surrogate pair,
 /// which the engine refuses as invalid UTF-16; cloned only when it has to be
@@ -126,6 +117,15 @@ fn bounded_operator(snapshot: &StateSnapshot) -> std::borrow::Cow<'_, StateSnaps
     std::borrow::Cow::Owned(bounded)
 }
 
+/// Cuts a reason down to what the ledger column can hold.
+///
+/// Counts `char::len_utf16`, because a Rust `char` above U+FFFF occupies two
+/// units and a count of characters could hand the column twice its width. The
+/// cut never splits a character, so what remains is valid text. Used on the
+/// best-effort audit paths, where a failed attempt that cannot be recorded is
+/// the opposite of what the row exists for; a user-supplied `--reason` is not
+/// truncated and fails loudly instead, since an audit text silently shortened
+/// is a different kind of loss.
 pub fn truncate_reason(text: &str) -> String {
     let mut units = 0;
     text.chars()
