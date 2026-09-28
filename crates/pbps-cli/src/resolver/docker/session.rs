@@ -21,6 +21,7 @@ struct State {
     workload: CandidateRun,
     native: Option<NativeRun>,
     target: Option<TargetWitness>,
+    layout: engine::Layout,
 }
 
 struct NativeRun {
@@ -33,12 +34,14 @@ impl NativeRun {
     fn capture(state: &State, driver: Driver) -> Result<Self, Error> {
         let workload = ExecutionLease::capture(
             state.workload.native_pid()?,
-            engine::workload_limits(driver),
+            engine::workload_limits_for(state.layout),
         )
         .map_err(|_| Error::RuntimeChanged)?;
-        let control =
-            ExecutionLease::capture(state.control.native_pid()?, engine::control_limits(driver))
-                .map_err(|_| Error::RuntimeChanged)?;
+        let control = ExecutionLease::capture(
+            state.control.native_pid()?,
+            engine::control_limits_for(state.layout),
+        )
+        .map_err(|_| Error::RuntimeChanged)?;
         let channel = PrivateChannelLease::capture(
             state.workload.native_pid()?,
             state.control.native_pid()?,
@@ -149,6 +152,21 @@ impl CandidateSession {
         password: String,
         workload: CandidateRun,
     ) -> Result<Self, StartFailure> {
+        let layout = match image.layout(driver) {
+            Ok(layout) => layout,
+            Err(cause) => {
+                let name = workload.resource_name().to_owned();
+                let recovery_names = if workload.close().await.is_err() {
+                    vec![name]
+                } else {
+                    Vec::new()
+                };
+                return Err(StartFailure {
+                    cause,
+                    recovery_names,
+                });
+            }
+        };
         let result = Self::connect_control(
             control_api,
             attach_api,
@@ -168,6 +186,7 @@ impl CandidateSession {
                     workload,
                     native: None,
                     target: None,
+                    layout,
                 }),
             }),
             Err(mut error) => {

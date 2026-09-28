@@ -34,8 +34,15 @@ lease are checked throughout ordinary API traffic and attach streams. Passing
 a protected PID file or plausible Docker replies through a proxy cannot qualify
 its socket. Missing or unreadable socket diagnostics refuse admission.
 
-The initial fixed layouts are the tested PostgreSQL 18 and Linux SQL Server
-images used by the fixture scripts. The selected image must be explicitly
+The fixed layouts include PostgreSQL 16 and 18 and Linux SQL Server images
+used by the fixture scripts. A PostgreSQL image declaring only
+`/var/lib/postgresql/data` selects the fixed PG16 bootstrap and a bounded
+tmpfs at that exact path. One declaring only `/var/lib/postgresql`, or no
+volumes, selects the existing PG18 bootstrap and bounded parent tmpfs.
+Malformed or additional volume declarations refuse the PostgreSQL launch.
+This image metadata chooses a provisioning recipe; the native observer still
+checks the effective mount and running executable, and engine qualification
+still compares actual build content. The selected image must be explicitly
 trusted. Missing images obey `never`/`if_missing`; registry credentials stay
 with Docker's configured credential helpers. Acquisition records Docker's
 immutable content ID, registry digests and platform separately. It never treats
