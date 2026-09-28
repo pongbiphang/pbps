@@ -569,14 +569,57 @@ indexes:
 
     #[test]
     fn malformed_index_direction_is_rejected() {
-        let e = errors(
-            "table: dbo.t\ncolumns:\n  a: {type: int}\nindexes:\n  ix:\n    columns: [a sideways]\n",
-        );
+        // A third part has to be a direction, and a class a plain identifier;
+        // a second part that is neither a direction nor an identifier is
+        // neither (DEC-1169.1).
+        for columns in ["[a jsonb_path_ops sideways]", "[\"a b-c\"]", "[a b c d]"] {
+            let e = errors(&format!(
+                "table: dbo.t\ncolumns:\n  a: {{type: int}}\nindexes:\n  ix:\n    columns: {columns}\n"
+            ));
+            assert!(
+                render(&e).contains("invalid index column"),
+                "{columns}: {}",
+                render(&e)
+            );
+        }
+    }
+
+    /// A method and an operator class load, and the writer puts them back in
+    /// the order they were read: PostgreSQL's own, class before direction
+    /// (DEC-1169.1). Absent, each is the default a declaration has always meant.
+    #[test]
+    fn an_index_method_and_operator_class_round_trip() {
+        let text = "table: app.doc\ncolumns:\n  body: {type: jsonb}\n  tags: {type: jsonb}\n  n: {type: int}\n\
+                    indexes:\n  ix_body:\n    method: gin\n    columns: [body, tags jsonb_path_ops]\n\
+                    \x20 ix_n:\n    columns: [n desc]\n";
+        let t = load(text);
+        let gin = &t.table.indexes["ix_body"];
+        assert_eq!(gin.method, pbps_model::IndexMethod::Gin);
+        assert_eq!(gin.columns[0].opclass, None);
+        assert_eq!(gin.columns[1].opclass.as_deref(), Some("jsonb_path_ops"));
+        assert!(!gin.columns[1].descending);
+        // Negative: no method is the B-tree, and no class is the default one.
+        let plain = &t.table.indexes["ix_n"];
+        assert_eq!(plain.method, pbps_model::IndexMethod::Btree);
+        assert_eq!(plain.columns[0].opclass, None);
+        assert!(plain.columns[0].descending);
+
+        let written = crate::render(&t.name, &t.table, &[], None);
+        assert!(written.contains("    method: gin\n"), "{written}");
         assert!(
-            render(&e).contains("invalid index column"),
-            "{}",
-            render(&e)
+            written.contains("columns: [body, tags jsonb_path_ops]"),
+            "{written}"
         );
+        assert_eq!(written.matches("method:").count(), 1, "{written}");
+        assert_eq!(load(&written).table, t.table);
+
+        // All three parts, class then direction.
+        let both = load(
+            "table: app.t\ncolumns:\n  a: {type: text}\nindexes:\n  ix:\n    columns: [a text_pattern_ops desc]\n",
+        );
+        let key = &both.table.indexes["ix"].columns[0];
+        assert_eq!(key.opclass.as_deref(), Some("text_pattern_ops"));
+        assert!(key.descending);
     }
 
     /// Report every problem at once, rather than fix-one-run-again.

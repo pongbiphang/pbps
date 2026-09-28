@@ -325,6 +325,7 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
                     include: ix.include,
                     unique: ix.unique,
                     filter: ix.filter,
+                    method: ix.method,
                 },
             );
         }
@@ -483,7 +484,12 @@ fn parse_reference(
     Ok((table, columns))
 }
 
-/// `created_at` or `created_at desc`.
+/// `created_at`, `created_at desc`, `body jsonb_path_ops`, or all three
+/// parts: PostgreSQL's own order, the operator class before the direction.
+///
+/// A second part that is a direction is the direction; anything else there is
+/// an operator class, which has to be a plain identifier. Whether the dialect
+/// accepts that class for that column is its validator's question (DEC-1169.1).
 fn parse_index_column(src: &SourceFile, v: &Spanned<String>) -> Result<IndexColumn, LoadError> {
     let parts: Vec<&str> = v.value.split_whitespace().collect();
     let bad = |msg: &str| {
@@ -493,21 +499,45 @@ fn parse_index_column(src: &SourceFile, v: &Spanned<String>) -> Result<IndexColu
             format!("invalid index column: {msg}"),
             msg,
         )
-        .with_help("the format is `column` or `column desc`")
+        .with_help("the format is `column`, then an optional operator class, then an optional `asc` or `desc`")
+    };
+    let direction = |d: &str| {
+        if d.eq_ignore_ascii_case("desc") {
+            Some(true)
+        } else if d.eq_ignore_ascii_case("asc") {
+            Some(false)
+        } else {
+            None
+        }
+    };
+    let opclass = |o: &str| {
+        let mut chars = o.chars();
+        let identifier = chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if identifier {
+            Ok(o.to_owned())
+        } else {
+            Err(bad(&format!("`{o}` is not an operator class name")))
+        }
+    };
+    let column = |name: &str, opclass: Option<String>, descending: bool| IndexColumn {
+        name: name.to_owned(),
+        descending,
+        opclass,
     };
 
     match parts.as_slice() {
-        [name] => Ok(IndexColumn {
-            name: (*name).to_owned(),
-            descending: false,
-        }),
-        [name, dir] if dir.eq_ignore_ascii_case("asc") || dir.eq_ignore_ascii_case("desc") => {
-            Ok(IndexColumn {
-                name: (*name).to_owned(),
-                descending: dir.eq_ignore_ascii_case("desc"),
-            })
-        }
-        [_, dir] => Err(bad(&format!("`{dir}` is not asc or desc"))),
+        [name] => Ok(column(name, None, false)),
+        [name, second] => match direction(second) {
+            Some(descending) => Ok(column(name, None, descending)),
+            None => Ok(column(name, Some(opclass(second)?), false)),
+        },
+        [name, class, dir] => match direction(dir) {
+            Some(descending) => Ok(column(name, Some(opclass(class)?), descending)),
+            None => Err(bad(&format!("`{dir}` is not asc or desc"))),
+        },
         _ => Err(bad("wrong number of parts")),
     }
 }

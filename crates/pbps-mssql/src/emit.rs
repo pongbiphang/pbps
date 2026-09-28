@@ -2013,10 +2013,12 @@ mod tests {
                     columns: vec![IndexColumn {
                         name: "code".into(),
                         descending: false,
+                        opclass: None,
                     }],
                     include: vec![],
                     unique: false,
                     filter: None,
+                    method: Default::default(),
                 },
             );
         }
@@ -2123,10 +2125,12 @@ mod tests {
             columns: vec![IndexColumn {
                 name: "id".into(),
                 descending: false,
+                opclass: None,
             }],
             include: vec![],
             unique: false,
             filter: None,
+            method: Default::default(),
         };
         for build in [
             Change::SetPrimaryKey {
@@ -2929,10 +2933,12 @@ mod tests {
                 columns: vec![IndexColumn {
                     name: "a".into(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: Vec::new(),
                 unique: false,
                 filter: Some("a IS NOT NULL -- only the live ones".into()),
+                method: Default::default(),
             }),
             clustered: false,
         });
@@ -2954,15 +2960,18 @@ mod tests {
                     IndexColumn {
                         name: "a".into(),
                         descending: false,
+                        opclass: None,
                     },
                     IndexColumn {
                         name: "b".into(),
                         descending: true,
+                        opclass: None,
                     },
                 ],
                 include: vec!["c".into()],
                 unique: true,
                 filter: Some("a IS NOT NULL".into()),
+                method: Default::default(),
             }),
             clustered: false,
         });
@@ -3101,10 +3110,12 @@ mod tests {
                 columns: vec![IndexColumn {
                     name: "order_id".into(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: Vec::new(),
                 unique: false,
                 filter: None,
+                method: Default::default(),
             }),
             clustered: false,
         }
@@ -3225,10 +3236,12 @@ mod tests {
                 columns: vec![IndexColumn {
                     name: "order_id".into(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: Vec::new(),
                 unique: false,
                 filter: None,
+                method: Default::default(),
             },
         );
         let sql = online_sql_of(&Change::CreateTable {

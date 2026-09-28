@@ -4513,7 +4513,9 @@ fn validate_json_carries_the_id_the_file_and_the_line() {
     let d = Demo::new("vjson");
     // A semantic error rather than a dialect one: only the loader has a span,
     // because the dialect is span-free by design (constraint 1 in CLAUDE.md).
-    d.table("table: dbo.t\ncolumns:\n  id: {type: bigint}\nindexes:\n  ix:\n    columns: [id sideways]\n");
+    // A second word alone now loads as an operator class (DEC-1169.1), so the
+    // malformed key needs a third word that is not a direction.
+    d.table("table: dbo.t\ncolumns:\n  id: {type: bigint}\nindexes:\n  ix:\n    columns: [id some_class sideways]\n");
 
     let o = d.run(&["validate", "--format", "json"]);
     assert_eq!(code(&o), FINDING, "{}", stderr(&o));

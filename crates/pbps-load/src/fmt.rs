@@ -150,13 +150,19 @@ pub fn render(
                 .columns
                 .iter()
                 .map(|c| {
-                    if c.descending {
-                        format!("{} desc", c.name)
-                    } else {
-                        c.name.clone()
+                    let mut spelled = c.name.clone();
+                    if let Some(class) = &c.opclass {
+                        spelled = format!("{spelled} {class}");
                     }
+                    if c.descending {
+                        spelled.push_str(" desc");
+                    }
+                    spelled
                 })
                 .collect();
+            if !ix.method.is_btree() {
+                let _ = writeln!(s, "    method: {}", ix.method.as_str());
+            }
             let _ = writeln!(s, "    columns: {}", seq(&cols));
             if !ix.include.is_empty() {
                 let _ = writeln!(s, "    include: {}", seq(&ix.include));

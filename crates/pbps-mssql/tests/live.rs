@@ -1207,15 +1207,18 @@ fn rich_schema() -> Schema {
                 IndexColumn {
                     name: "region_id".into(),
                     descending: false,
+                    opclass: None,
                 },
                 IndexColumn {
                     name: "created_at".into(),
                     descending: true,
+                    opclass: None,
                 },
             ],
             include: vec!["status".into()],
             unique: false,
             filter: Some("[region_id] IS NOT NULL".into()),
+            method: Default::default(),
         },
     );
 
@@ -1389,10 +1392,12 @@ async fn applying_a_planned_migration_converges_on_the_target() {
                 columns: vec![IndexColumn {
                     name: "loyalty".into(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: vec![],
                 unique: false,
                 filter: None,
+                method: Default::default(),
             },
         );
     }
@@ -5857,10 +5862,12 @@ async fn a_unique_index_is_probed_and_a_filtered_one_only_over_the_rows_it_keeps
             columns: vec![IndexColumn {
                 name: "email".into(),
                 descending: false,
+                opclass: None,
             }],
             include: Vec::new(),
             unique,
             filter: filter.map(str::to_owned),
+            method: Default::default(),
         }),
         clustered: false,
     };
@@ -6005,10 +6012,12 @@ async fn a_filtered_predicate_reads_a_retyped_column_through_the_type_it_has_now
                         columns: vec![IndexColumn {
                             name: "email".into(),
                             descending: false,
+                            opclass: None,
                         }],
                         include: Vec::new(),
                         unique: true,
                         filter: Some("flag = '01'".into()),
+                        method: Default::default(),
                     }),
                     clustered: false,
                 }),
@@ -13569,10 +13578,12 @@ async fn an_expression_ending_in_a_line_comment_still_applies() {
             columns: vec![IndexColumn {
                 name: "status".into(),
                 descending: false,
+                opclass: None,
             }],
             include: Vec::new(),
             unique: false,
             filter: Some("[status] IS NOT NULL -- only the set ones".into()),
+            method: Default::default(),
         },
     );
     let mut declared = Schema::default();
@@ -14666,10 +14677,12 @@ async fn constraint_name_validation_preserves_legal_index_sharing() {
             columns: vec![IndexColumn {
                 name: "id".into(),
                 descending: false,
+                opclass: None,
             }],
             include: vec![],
             unique: false,
             filter: None,
+            method: Default::default(),
         },
     );
     assert!(Mssql.validate_table(&name, &table).is_empty());

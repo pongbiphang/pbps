@@ -9,10 +9,12 @@ fn index(unique: bool, filtered: bool) -> Change {
             columns: vec![IndexColumn {
                 name: "id".into(),
                 descending: false,
+                opclass: None,
             }],
             include: vec![],
             unique,
             filter: filtered.then(|| "id IS NOT NULL".into()),
+            method: Default::default(),
         }),
         clustered: false,
     }

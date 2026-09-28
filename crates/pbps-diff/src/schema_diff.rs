@@ -2842,10 +2842,12 @@ mod tests {
                 columns: vec![IndexColumn {
                     name: "v".into(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: Vec::new(),
                 unique: false,
                 filter: None,
+                method: Default::default(),
             },
         );
         t.clustered = layout;
@@ -3560,10 +3562,12 @@ mod tests {
                     columns: vec![pbps_model::IndexColumn {
                         name: "n".to_owned(),
                         descending: false,
+                        opclass: None,
                     }],
                     include: Vec::new(),
                     unique: false,
                     filter: Some("n > 0".to_owned()),
+                    method: Default::default(),
                 },
             );
             t
@@ -6121,10 +6125,12 @@ mod tests {
             columns: vec![IndexColumn {
                 name: c.into(),
                 descending: false,
+                opclass: None,
             }],
             include: vec![],
             unique: false,
             filter: None,
+            method: Default::default(),
         };
         let mut base_t = table(&[("a", Column::new(ty("int"))), ("b", Column::new(ty("int")))]);
         base_t.indexes.insert("ix_t".into(), ix("a"));
@@ -6189,10 +6195,12 @@ mod tests {
                         columns: vec![pbps_model::IndexColumn {
                             name: "id".into(),
                             descending: false,
+                            opclass: None,
                         }],
                         include: vec![],
                         unique: true,
                         filter: None,
+                        method: Default::default(),
                     },
                 );
             } else {
@@ -6293,10 +6301,12 @@ mod tests {
                     columns: vec![pbps_model::IndexColumn {
                         name: "id".into(),
                         descending: false,
+                        opclass: None,
                     }],
                     include: vec![],
                     unique,
                     filter: filter.map(str::to_owned),
+                    method: Default::default(),
                 },
             );
             let mut child = sku_table();
@@ -6464,10 +6474,12 @@ mod tests {
                 columns: vec![IndexColumn {
                     name: "sku".into(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: vec![],
                 unique: true,
                 filter: None,
+                method: Default::default(),
             },
         );
         let mut order_line = sku_table();
@@ -6608,10 +6620,12 @@ mod tests {
                 columns: vec![IndexColumn {
                     name: "old".into(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: vec!["note".into()],
                 unique: false,
                 filter: None,
+                method: Default::default(),
             },
         );
         base_t.unique.insert("uq_t_old".into(), unique(&["old"]));
@@ -6627,10 +6641,12 @@ mod tests {
                 columns: vec![IndexColumn {
                     name: "new".into(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: vec!["note".into()],
                 unique: false,
                 filter: None,
+                method: Default::default(),
             },
         );
         want_t.unique.insert("uq_t_old".into(), unique(&["new"]));
@@ -6810,10 +6826,12 @@ mod tests {
             columns: vec![IndexColumn {
                 name: column.into(),
                 descending: false,
+                opclass: None,
             }],
             include: vec![],
             unique: false,
             filter: Some(format!("[{column}] IS NOT NULL")),
+            method: Default::default(),
         };
         let mut base_t = table(&[
             ("id", Column::new(ty("int"))),
@@ -6982,10 +7000,12 @@ mod tests {
                 columns: vec![IndexColumn {
                     name: "n".into(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: vec![],
                 unique: false,
                 filter: None,
+                method: Default::default(),
             },
         );
         let base = two_tables(("app.old", old_t.clone()), ("app.other", other_base));
@@ -7079,10 +7099,12 @@ mod tests {
                 columns: vec![IndexColumn {
                     name: "id".into(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: vec![],
                 unique: false,
                 filter: None,
+                method: Default::default(),
             },
         );
         let bare = table(&[("id", Column::new(ty("int")))]);
@@ -7488,10 +7510,12 @@ mod tests {
                 columns: vec![IndexColumn {
                     name: "id".into(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: vec![],
                 unique: false,
                 filter: None,
+                method: Default::default(),
             },
         );
         let base = schema_of("app.old", old_t);
@@ -7535,10 +7559,12 @@ mod tests {
                 columns: vec![IndexColumn {
                     name: "n".into(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: vec![],
                 unique: false,
                 filter: None,
+                method: Default::default(),
             },
         );
         let base = two_tables(("s1.old", old_t.clone()), ("s2.sibling", sibling_base));
@@ -7576,10 +7602,12 @@ mod tests {
                 columns: vec![IndexColumn {
                     name: "id".into(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: vec![],
                 unique: false,
                 filter: Some("id > 0".into()),
+                method: Default::default(),
             },
         );
         let base = schema_of("s1.old", old_t);
@@ -7795,10 +7823,12 @@ mod tests {
                 columns: vec![IndexColumn {
                     name: "doomed".into(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: vec![],
                 unique: false,
                 filter: None,
+                method: Default::default(),
             },
         );
         let want_t = table(&[("new", Column::new(ty("int")))]);

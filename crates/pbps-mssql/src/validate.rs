@@ -779,6 +779,23 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
                 "index `{n}` has an empty filter expression"
             )));
         }
+        // PostgreSQL's words (DEC-1169.1): SQL Server builds every index this model
+        // holds as a B-tree, and has no operator classes to choose among.
+        if !idx.method.is_btree() {
+            errs.push(invalid(format!(
+                "index `{n}` uses the `{}` method, which SQL Server does not have",
+                idx.method.as_str()
+            )));
+        }
+        for key in &idx.columns {
+            if let Some(class) = &key.opclass {
+                errs.push(invalid(format!(
+                    "index `{n}` indexes `{}` with `{class}`, and SQL Server has no operator \
+                     classes (if `{class}` was meant as a direction, it is `asc` or `desc`)",
+                    key.name
+                )));
+            }
+        }
         // The engine's rules for the clustered index, which is the table's
         // rows rather than a copy of some of them — so every column is in it
         // already and it covers every row. Measured on 17.0: `INCLUDE` is
@@ -832,8 +849,8 @@ fn key_columns(what: &str, columns: &[String], table: &Table) -> Vec<DialectErro
 mod tests {
     use super::*;
     use pbps_model::{
-        CheckConstraint, Column, ColumnType, ForeignKey, Identity, Index, IndexColumn, PrimaryKey,
-        UniqueConstraint,
+        CheckConstraint, Column, ColumnType, ForeignKey, Identity, Index, IndexColumn, IndexMethod,
+        PrimaryKey, UniqueConstraint,
     };
 
     fn ty(s: &str) -> ColumnType {
@@ -874,6 +891,45 @@ mod tests {
         assert_eq!(messages(&table(&name, &t)), "");
     }
 
+    /// A GIN method or an operator class is PostgreSQL's, and is refused on
+    /// SQL Server by name; an index with neither is unchanged (DEC-1169.1).
+    #[test]
+    fn an_index_method_or_operator_class_is_refused_on_sql_server() {
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("a".into(), Column::new("int".parse().unwrap()));
+        let index = |method: IndexMethod, opclass: Option<&str>| Index {
+            columns: vec![IndexColumn {
+                name: "a".into(),
+                descending: false,
+                opclass: opclass.map(str::to_owned),
+            }],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method,
+        };
+        let messages = |ix: Index| {
+            let mut t = table.clone();
+            t.indexes.insert("ix".into(), ix);
+            super::table(&"dbo.t".parse().unwrap(), &t)
+                .into_iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(messages(index(IndexMethod::Btree, None)).is_empty());
+        let gin = messages(index(IndexMethod::Gin, None));
+        assert!(gin.iter().any(|m| m.contains("`gin` method")), "{gin:?}");
+        let class = messages(index(IndexMethod::Btree, Some("dsc")));
+        assert!(
+            class
+                .iter()
+                .any(|m| m.contains("no operator classes") && m.contains("`asc` or `desc`")),
+            "{class:?}"
+        );
+    }
+
     /// The clustered index holds every row and every column, so SQL Server
     /// refuses a filter and INCLUDE on it (#1178); and the selector must name
     /// something this table declares.
@@ -885,10 +941,12 @@ mod tests {
             columns: vec![IndexColumn {
                 name: "id".into(),
                 descending: false,
+                opclass: None,
             }],
             include,
             unique: false,
             filter: filter.map(Into::into),
+            method: Default::default(),
         };
         t.clustered = Some(Clustered::Index("cx".into()));
         t.indexes.insert("cx".into(), index(Vec::new(), None));
@@ -1500,10 +1558,12 @@ mod tests {
                 columns: vec![IndexColumn {
                     name: "email".into(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: vec!["email".into()],
                 unique: false,
                 filter: None,
+                method: Default::default(),
             },
         );
         let msg = messages(&table(&name, &t));
@@ -1826,10 +1886,12 @@ mod tests {
                 columns: vec![IndexColumn {
                     name: "id".into(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: vec![],
                 unique: false,
                 filter: None,
+                method: Default::default(),
             },
         );
         assert!(

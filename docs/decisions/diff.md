@@ -971,3 +971,43 @@ absent one facing a named one is valid exactly when the named one is the
 target's default, so `plan --db` asks again once it knows it. A name the server lacks is refused before the first statement (448).
 The operational estimate reports a collation change as unmeasured.
 PostgreSQL refuses the field.
+
+<a id="dec-1169-1"></a>
+
+**DEC-1169.1. An index names its access method and, per key, a non-default
+operator class. The first slice holds GIN over `jsonb` only.** `method:` is
+`btree`, which is the default and is written only when it differs, or `gin`.
+A key is `column [opclass] [asc|desc]`, in PostgreSQL's own order. An absent
+class is the method's default for the column's type. Absent-means-default
+keeps every index declared, recorded or planned before this reading as the
+index it always was.
+
+PostgreSQL accepts GIN over `jsonb` columns under `jsonb_ops` (spelled by
+leaving the class out) or `jsonb_path_ops`, and a B-tree only under default
+classes. Spelling `jsonb_ops` is refused, as is `unique`, `include` or `desc`
+on GIN. Measured on 18.6, the engine refuses the last three itself. Anything
+else is refused before apply, because the reader would report it as a
+limitation after apply. SQL Server builds every index as a B-tree and has no
+classes, so it refuses `method: gin` and any class. `method: btree` is only
+the default spelled out, and `fmt` writes it back out of the file.
+
+The reader takes each key's class from the catalog as `schema.name`, or empty
+for the resolved default. It accepts only `pg_catalog.jsonb_path_ops`. A class
+of that name in another schema is another class, and is left out and named.
+The emitter writes the class qualified (`"pg_catalog"."jsonb_path_ops"`) so
+that the `search_path` cannot stand another in its place. A collation that is
+not the column's own is still left out and named on its own account.
+
+An index this slice now reads was never in a recorded state, because
+`plan --db`, `baseline` and apply's closing read refuse a managed set that
+carries a limitation. A declaration pulled before this slice lacks the index,
+so a plan from it proposes a `DropIndex`. That drop is Destructive and waits
+at the risk gate. The remedy is to pull again.
+
+State version 10 carries the two fields and still reads 6 to 9, where their
+absence is true of every recorded index. Plan version 14 turns 13 away. The
+declaration schema is published as set 20.
+
+Pinned by `a_gin_index_over_jsonb_round_trips_and_changes_as_a_typed_plan`
+(`crates/pbps-pg/tests/live.rs`), which reads hand-written DDL, rebuilds it,
+replaces and drops an index, and refuses to take a B-tree for the GIN index.

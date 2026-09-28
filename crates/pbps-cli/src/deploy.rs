@@ -2215,12 +2215,15 @@ fn column_as_declared(
 
 /// Whether an index read back is the one declared. Structure only: the
 /// filter's text is the engine's to rewrite, and whether there is one at all
-/// decides which rows the index covers, and is not (DECISIONS 185).
+/// decides which rows the index covers, and is not (DECISIONS 185). The
+/// access method is read back exactly, and a GIN index rebuilt as a B-tree
+/// answers other queries (DEC-1169.1).
 fn index_as_declared(declared: &pbps_model::Index, now: &pbps_model::Index) -> bool {
     declared.columns == now.columns
         && declared.include == now.include
         && declared.unique == now.unique
         && declared.filter.is_some() == now.filter.is_some()
+        && declared.method == now.method
 }
 
 /// Whether a primary key read back is the one declared. The name only where
@@ -10175,10 +10178,12 @@ mod tests {
                         columns: vec![pbps_model::IndexColumn {
                             name: "note".to_owned(),
                             descending: false,
+                            opclass: None,
                         }],
                         include: Vec::new(),
                         unique: false,
                         filter: None,
+                        method: Default::default(),
                     },
                 );
             }
@@ -10293,10 +10298,12 @@ mod tests {
                         columns: vec![pbps_model::IndexColumn {
                             name: "note".to_owned(),
                             descending: false,
+                            opclass: None,
                         }],
                         include: Vec::new(),
                         unique: false,
                         filter: None,
+                        method: Default::default(),
                     }),
                     clustered: false,
                 },
@@ -10795,10 +10802,12 @@ mod tests {
             columns: vec![IndexColumn {
                 name: column.into(),
                 descending: false,
+                opclass: None,
             }],
             include: vec![],
             unique,
             filter: filter.map(Into::into),
+            method: Default::default(),
         };
         let planned_index = index("id", false, Some("id > 0"));
         let changes = pbps_model::ChangeSet {
@@ -10872,10 +10881,12 @@ mod tests {
             columns: vec![IndexColumn {
                 name: "id".into(),
                 descending: false,
+                opclass: None,
             }],
             include: vec![],
             unique: false,
             filter: None,
+            method: Default::default(),
         };
         t.indexes.insert("ix".into(), ix.clone());
         let schema = |layout: Option<Clustered>| {
@@ -11182,10 +11193,12 @@ mod tests {
                 columns: vec![IndexColumn {
                     name: "id".into(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: vec![],
                 unique: false,
                 filter: None,
+                method: Default::default(),
             },
         );
         let changes = pbps_model::ChangeSet {
@@ -11417,10 +11430,12 @@ mod tests {
                 columns: vec![pbps_model::IndexColumn {
                     name: "id".to_owned(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: Vec::new(),
                 unique: false,
                 filter: None,
+                method: Default::default(),
             },
         );
         let e = refuse_unplanned_movement(
@@ -11527,10 +11542,12 @@ mod tests {
                     columns: vec![pbps_model::IndexColumn {
                         name: "id".to_owned(),
                         descending: false,
+                        opclass: None,
                     }],
                     include: Vec::new(),
                     unique: false,
                     filter: filter.map(str::to_owned),
+                    method: Default::default(),
                 },
             );
             t
@@ -12014,10 +12031,12 @@ mod tests {
             columns: vec![pbps_model::IndexColumn {
                 name: "note".to_owned(),
                 descending: false,
+                opclass: None,
             }],
             include: Vec::new(),
             unique,
             filter: None,
+            method: Default::default(),
         };
         let schema_with = |unique: bool| {
             let mut t = pbps_model::Table::default();
@@ -12091,10 +12110,12 @@ mod tests {
                                 columns: vec![IndexColumn {
                                     name: "id".into(),
                                     descending: false,
+                                    opclass: None,
                                 }],
                                 include: vec![],
                                 unique: false,
                                 filter: None,
+                                method: Default::default(),
                             },
                         );
                         Change::DropIndex {
@@ -13740,10 +13761,12 @@ mod tests {
             columns: vec![pbps_model::IndexColumn {
                 name: on.to_owned(),
                 descending: false,
+                opclass: None,
             }],
             include: Vec::new(),
             unique,
             filter: None,
+            method: Default::default(),
         };
         let unique = |on: &str| pbps_model::UniqueConstraint {
             columns: vec![on.to_owned()],
@@ -13817,6 +13840,17 @@ mod tests {
                 t.clustered = Some(pbps_model::Clustered::Index("ix".into()));
             }),
             "the index came back clustered",
+        );
+        // So is the method (DEC-1169.1): the planned B-tree read back as a
+        // GIN index over the same key is another index.
+        refused(
+            &adding_index,
+            &with(&|t| {
+                let mut gin = index("id", false);
+                gin.method = pbps_model::IndexMethod::Gin;
+                t.indexes.insert("ix".to_owned(), gin);
+            }),
+            "the index came back under another method",
         );
         let adding_clustered = plan(pbps_model::Change::AddIndex {
             table: dbo_t.clone(),

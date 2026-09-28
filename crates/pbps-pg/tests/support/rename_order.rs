@@ -42,10 +42,12 @@ fn fixture(case: &str) -> (Schema, Schema, Vec<Intent>) {
                     columns: vec![IndexColumn {
                         name: "id".into(),
                         descending: false,
+                        opclass: None,
                     }],
                     include: vec![],
                     unique: false,
                     filter: Some("id > 0".into()),
+                    method: Default::default(),
                 },
             );
         }

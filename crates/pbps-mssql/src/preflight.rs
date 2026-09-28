@@ -3527,11 +3527,13 @@ mod tests {
                     .map(|c| pbps_model::IndexColumn {
                         name: (*c).to_owned(),
                         descending: false,
+                        opclass: None,
                     })
                     .collect(),
                 include: vec!["note".into()],
                 unique,
                 filter: filter.map(str::to_owned),
+                method: Default::default(),
             }),
             clustered: false,
         }

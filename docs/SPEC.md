@@ -227,6 +227,12 @@ indexes:
   primary key, or a heap for a table without one — the engine's own default.
   One selector per table, so two clustered indexes cannot be written;
   PostgreSQL refuses the key (DEC-1178.1).
+- **An index key is `column [opclass] [asc|desc]`**, in PostgreSQL's order, and
+  `method:` names the access method only where it is not the default `btree`.
+  An absent class is the method's default for the column's type. The first
+  slice holds `method: gin` over `jsonb` columns, with the class left out or
+  `jsonb_path_ops`. SQL Server has only the default method and no classes, so
+  it refuses `method: gin` and any class (DEC-1169.1).
 - **Comments belong in `description` fields only.** The tool owns the file format
   and `pbps fmt` rewrites files canonically, so ordinary YAML comments are lost.
   `description` doubles as the source for data-catalogue integration.

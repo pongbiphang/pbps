@@ -573,9 +573,15 @@ fn constraints_query() -> String {
 /// guard is its "ambiguous operator class" case.
 ///
 /// A domain is unwrapped to its base type first, for the same reason the engine
-/// does it. And the comparison is `IS DISTINCT FROM`, so a default this query
-/// cannot resolve reports the index rather than passing it as ordinary — not
-/// being able to tell is not the same as there being nothing to tell.
+/// does it. And a key's class is reported unless it `IS NOT DISTINCT FROM` the
+/// resolved default, so a default this query cannot resolve reports the class
+/// rather than passing it as the default — not being able to tell is not the
+/// same as there being nothing to tell.
+///
+/// `key_classes` holds one entry per key, `''` for the default and
+/// `schema.name` otherwise, so the reader can accept exactly the classes the
+/// model holds and name every other one (DEC-1169.1). A collation that is not the
+/// column's own is its own flag: no class makes up for it.
 ///
 /// `indkey` and `indoption` are `int2vector`s, which no driver here reads.
 /// Rendered as text they are space-separated, so they arrive as a list this
@@ -594,35 +600,44 @@ fn indexes_query() -> String {
             pg_catalog.pg_get_expr(i.indpred, i.indrelid) AS filter,
             i.indexprs IS NOT NULL AS has_expressions,
             am.amname AS method,
+            (SELECT COALESCE(pg_catalog.json_agg(
+                      CASE WHEN i.indclass[k.n - 1] IS NOT DISTINCT FROM COALESCE(
+                             (SELECT oc.oid FROM pg_catalog.pg_opclass oc
+                               WHERE oc.opcmethod = ic.relam AND oc.opcdefault
+                                 AND oc.opcintype = col.coltype),
+                             (SELECT CASE WHEN count(*) = 1 THEN min(oc.oid) END
+                                FROM pg_catalog.pg_opclass oc
+                                JOIN pg_catalog.pg_type tt ON tt.oid = oc.opcintype
+                                JOIN pg_catalog.pg_type st ON st.oid = col.coltype
+                               WHERE oc.opcmethod = ic.relam AND oc.opcdefault
+                                 AND tt.typispreferred AND tt.typcategory = st.typcategory
+                                 AND EXISTS (SELECT 1 FROM pg_catalog.pg_cast ct
+                                              WHERE ct.castsource = col.coltype
+                                                AND ct.casttarget = oc.opcintype
+                                                AND ct.castmethod = 'b'
+                                                AND ct.castcontext = 'i')))
+                           THEN ''
+                           ELSE ocn.nspname || '.' || occ.opcname END
+                      ORDER BY k.n), '[]'::pg_catalog.json)
+               FROM pg_catalog.generate_series(1, i.indnkeyatts) AS k(n)
+               JOIN pg_catalog.pg_opclass occ ON occ.oid = i.indclass[k.n - 1]
+               JOIN pg_catalog.pg_namespace ocn ON ocn.oid = occ.opcnamespace
+               LEFT JOIN LATERAL (
+                 SELECT COALESCE(
+                   (SELECT t.typbasetype FROM pg_catalog.pg_type t
+                     WHERE t.oid = a.atttypid AND t.typtype = 'd' AND t.typbasetype <> 0),
+                   a.atttypid) AS coltype
+                   FROM pg_catalog.pg_attribute a
+                  WHERE a.attrelid = i.indrelid AND a.attnum = i.indkey[k.n - 1]) AS col ON true
+            ) AS key_classes,
             EXISTS (
               SELECT 1
                 FROM pg_catalog.generate_series(1, i.indnkeyatts) AS k(n)
-                CROSS JOIN LATERAL (
-                  SELECT COALESCE(
-                    (SELECT t.typbasetype FROM pg_catalog.pg_type t
-                      WHERE t.oid = a.atttypid AND t.typtype = 'd' AND t.typbasetype <> 0),
-                    a.atttypid) AS coltype,
-                    a.attcollation AS colcollation
-                    FROM pg_catalog.pg_attribute a
-                   WHERE a.attrelid = i.indrelid AND a.attnum = i.indkey[k.n - 1]) AS col
-               WHERE i.indclass[k.n - 1] IS DISTINCT FROM COALESCE(
-                       (SELECT oc.oid FROM pg_catalog.pg_opclass oc
-                         WHERE oc.opcmethod = ic.relam AND oc.opcdefault
-                           AND oc.opcintype = col.coltype),
-                       (SELECT CASE WHEN count(*) = 1 THEN min(oc.oid) END
-                          FROM pg_catalog.pg_opclass oc
-                          JOIN pg_catalog.pg_type tt ON tt.oid = oc.opcintype
-                          JOIN pg_catalog.pg_type st ON st.oid = col.coltype
-                         WHERE oc.opcmethod = ic.relam AND oc.opcdefault
-                           AND tt.typispreferred AND tt.typcategory = st.typcategory
-                           AND EXISTS (SELECT 1 FROM pg_catalog.pg_cast ct
-                                        WHERE ct.castsource = col.coltype
-                                          AND ct.casttarget = oc.opcintype
-                                          AND ct.castmethod = 'b'
-                                          AND ct.castcontext = 'i')))
-                  OR (i.indcollation[k.n - 1] <> 0
-                      AND i.indcollation[k.n - 1] <> col.colcollation)
-            ) AS nondefault_column_options
+                JOIN pg_catalog.pg_attribute a
+                  ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k.n - 1]
+               WHERE i.indcollation[k.n - 1] <> 0
+                 AND i.indcollation[k.n - 1] <> a.attcollation
+            ) AS nondefault_collation
        FROM pg_catalog.pg_index i
        JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
        JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
@@ -1043,7 +1058,8 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             filter: optional_text(row, "filter")?,
             has_expressions: flag(row, "has_expressions")?,
             method: text(row, "method")?,
-            nondefault_column_options: flag(row, "nondefault_column_options")?,
+            key_classes: strings(row, "key_classes")?,
+            nondefault_collation: flag(row, "nondefault_collation")?,
         });
     }
     for row in batch.get("modules").ok_or_else(|| missing("modules"))? {
@@ -2004,6 +2020,20 @@ fn small(row: &impl CatalogFields, column: &str) -> Result<i32, DbError> {
 
 fn flag(row: &impl CatalogFields, column: &str) -> Result<bool, DbError> {
     row.boolean(column)?.ok_or_else(|| missing(column))
+}
+
+/// A JSON array of strings. The query coalesces an empty aggregate to `[]`, so
+/// a `NULL` here is a column this reader has lost track of, not an empty list,
+/// and is an error like any other shape it does not expect.
+fn strings(row: &serde_json::Value, column: &str) -> Result<Vec<String>, DbError> {
+    let bad = || DbError::BadRow(format!("catalog column `{column}` is not a list of text"));
+    row.get(column)
+        .ok_or_else(|| missing(column))?
+        .as_array()
+        .ok_or_else(bad)?
+        .iter()
+        .map(|v| v.as_str().map(str::to_owned).ok_or_else(bad))
+        .collect()
 }
 
 /// The catalog a grant row came from, and that catalog's kind letter.

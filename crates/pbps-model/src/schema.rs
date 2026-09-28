@@ -596,6 +596,51 @@ pub struct Index {
     /// The filtered-index predicate, kept verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
+
+    /// The access method. Absent is the B-tree every engine builds by
+    /// default, so an index declared before methods existed reads as the
+    /// index it always was (DEC-1169.1).
+    #[serde(default, skip_serializing_if = "IndexMethod::is_btree")]
+    pub method: IndexMethod,
+}
+
+/// How an index is built. A closed list: a method this model does not name is
+/// left out of a pull and reported, never stood in for by one it does.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexMethod {
+    /// The default B-tree.
+    #[default]
+    Btree,
+    /// PostgreSQL's generalized inverted index, over `jsonb` in this model.
+    Gin,
+}
+
+impl IndexMethod {
+    pub fn is_btree(&self) -> bool {
+        *self == IndexMethod::Btree
+    }
+
+    /// The spelling a declaration and PostgreSQL's `pg_am.amname` share.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IndexMethod::Btree => "btree",
+            IndexMethod::Gin => "gin",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -604,6 +649,11 @@ pub struct IndexColumn {
     pub name: String,
     #[serde(default)]
     pub descending: bool,
+    /// The operator class this key is indexed with, where it is not the
+    /// method's default for the column's type; absent is that default. Which
+    /// names are accepted is the dialect's question (DEC-1169.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opclass: Option<String>,
 }
 
 #[cfg(test)]

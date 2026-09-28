@@ -1012,10 +1012,12 @@ mod tests {
                 columns: vec![pbps_model::IndexColumn {
                     name: "id".into(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: Vec::new(),
                 unique: filter.is_none(),
                 filter: filter.map(Into::into),
+                method: Default::default(),
             }),
             clustered: false,
         }
@@ -1169,10 +1171,12 @@ mod tests {
                     columns: vec![pbps_model::IndexColumn {
                         name: "id".into(),
                         descending: false,
+                        opclass: None,
                     }],
                     include: Vec::new(),
                     unique: filter.is_none(),
                     filter: filter.map(Into::into),
+                    method: Default::default(),
                 },
             );
         }

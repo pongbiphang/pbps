@@ -54,6 +54,10 @@ use crate::schema::Schema;
 /// Bumped to 9 when a column gained its collation (#1175). Versions 6 to 8
 /// stay readable, for the reason 8 kept them: see `OLDEST_READABLE_VERSION`.
 ///
+/// Bumped to 10 when an index gained its method and each key its operator
+/// class (DEC-1169.1). Versions 6 to 9 stay readable: see
+/// `OLDEST_READABLE_VERSION`.
+///
 /// Readers refuse a version they do not understand rather than reading it
 /// partially.
 ///
@@ -72,7 +76,7 @@ use crate::schema::Schema;
 /// order, which can drop a schema-bound dependency before its dependent.
 /// Refused, with the remedy `check_version` already names: re-record it with
 /// `pbps baseline --reason ...`.
-pub const CURRENT_VERSION: u32 = 9;
+pub const CURRENT_VERSION: u32 = 10;
 
 /// The oldest snapshot version this build reads as its own.
 ///
@@ -99,6 +103,11 @@ pub const CURRENT_VERSION: u32 = 9;
 /// reader recorded was under it or reported as a limitation (DECISIONS 443),
 /// which no recorder accepts on a managed table. A state from before that
 /// report, with a collated column recorded plain, reads back as drift.
+///
+/// Still 6 at version 10, whose index `method` and key `opclass` an older
+/// state lacks (DEC-1169.1): absent is the B-tree under default classes, which is
+/// every index an older reader recorded. It reported every other one as a
+/// limitation, and no recorder accepts one of those on a managed table.
 pub const OLDEST_READABLE_VERSION: u32 = 6;
 
 /// How this state came about.
@@ -501,7 +510,7 @@ mod tests {
         // the whole story rather than a sample of it; 6 is readable because
         // the field 7 added is one it truly lacks.
         assert_eq!(OLDEST_READABLE_VERSION, 6);
-        assert_eq!(CURRENT_VERSION, 9);
+        assert_eq!(CURRENT_VERSION, 10);
     }
 
     fn schema_with(ty: &str) -> Schema {

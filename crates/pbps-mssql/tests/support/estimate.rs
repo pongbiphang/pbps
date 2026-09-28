@@ -349,10 +349,12 @@ async fn a_clustered_index_change_is_a_rewrite_only_where_the_catalog_says_so() 
         columns: vec![pbps_model::IndexColumn {
             name: column.into(),
             descending: false,
+            opclass: None,
         }],
         include: Vec::new(),
         unique: false,
         filter: None,
+        method: Default::default(),
     };
     let cs = ChangeSet {
         changes: vec![

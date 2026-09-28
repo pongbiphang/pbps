@@ -62,8 +62,8 @@ use std::str::FromStr;
 
 use pbps_model::{
     CheckConstraint, Column, ColumnRef, ColumnType, ForeignKey, Identity, Index, IndexColumn,
-    Module, ModuleId, ModuleKind, ObjectName, PrimaryKey, ReferentialAction, RoutineArg, RoutineId,
-    Table, TableName, UniqueConstraint,
+    IndexMethod, Module, ModuleId, ModuleKind, ObjectName, PrimaryKey, ReferentialAction,
+    RoutineArg, RoutineId, Table, TableName, UniqueConstraint,
 };
 
 use crate::types;
@@ -255,11 +255,15 @@ pub struct RawIndex {
     pub has_expressions: bool,
     /// `amname`: `btree`, `hash`, `gin`, …
     pub method: String,
-    /// Whether any key column uses an operator class that is not its type's
-    /// default, or a collation that is not the column's own — `text_pattern_ops`
-    /// and `COLLATE "C"`. Computed in the query, because what "default" means
-    /// is a catalog lookup rather than a fact about the row.
-    pub nondefault_column_options: bool,
+    /// Each key's operator class: `""` where it is the default for the key's
+    /// type under this method, `schema.name` otherwise — `pg_catalog.
+    /// text_pattern_ops`, `pg_catalog.jsonb_path_ops`. Computed in the query,
+    /// because what "default" means is a catalog lookup rather than a fact
+    /// about the row.
+    pub key_classes: Vec<String>,
+    /// Whether any key column is indexed under a collation that is not the
+    /// column's own — `COLLATE "C"`.
+    pub nondefault_collation: bool,
 }
 
 /// Everything one pull read, before any of it is interpreted.
@@ -2515,18 +2519,22 @@ fn unknown_match(pulled: &mut Pulled, parts: &Parts, name: &str, kind: char) {
 /// Returns whether the index reached the pull, which is what tells a foreign
 /// key whether the uniqueness it is enforced against is there.
 fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pulled) -> bool {
-    if raw.method != "btree" {
-        note(
-            pulled,
-            &parts.name,
-            format!(
-                "index `{}` on `{}` uses the `{}` method, and this model holds only the default \
-                 one. It is left out of the pull, so a plan cannot see it.",
-                raw.name, parts.name, raw.method
-            ),
-        );
-        return false;
-    }
+    let method = match raw.method.as_str() {
+        "btree" => IndexMethod::Btree,
+        "gin" => IndexMethod::Gin,
+        other => {
+            note(
+                pulled,
+                &parts.name,
+                format!(
+                    "index `{}` on `{}` uses the `{other}` method, and this model holds only \
+                     `btree` and `gin`. It is left out of the pull, so a plan cannot see it.",
+                    raw.name, parts.name
+                ),
+            );
+            return false;
+        }
+    };
     if raw.has_expressions || raw.columns.contains(&0) {
         note(
             pulled,
@@ -2557,16 +2565,15 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
         );
         return false;
     }
-    if raw.nondefault_column_options {
+    if raw.nondefault_collation {
         note(
             pulled,
             &parts.name,
             format!(
-                "index `{}` on `{}` orders a column by an operator class or a collation that is \
-                 not its type's own — `text_pattern_ops` and `COLLATE \"C\"` are the two that \
-                 come up — and `IndexColumn` holds only the name and the direction. Read back it \
-                 is an ordinary index, which answers different queries and compares different \
-                 values equal, so it is left out.",
+                "index `{}` on `{}` orders a column by a collation that is not the column's own \
+                 — `COLLATE \"C\"` is the one that comes up — and `IndexColumn` has no field \
+                 for it. Read back it is an ordinary index, which compares different values \
+                 equal, so it is left out.",
                 raw.name, parts.name
             ),
         );
@@ -2636,7 +2643,14 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
                 ),
             );
         }
-        columns.push(IndexColumn { name, descending });
+        let Some(opclass) = key_class(raw, parts, table, method, position, &name, pulled) else {
+            return false;
+        };
+        columns.push(IndexColumn {
+            name,
+            descending,
+            opclass,
+        });
     }
 
     table.indexes.insert(
@@ -2647,9 +2661,96 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
             unique: raw.unique,
             // Verbatim: see this module's own documentation.
             filter: raw.filter.clone(),
+            method,
         },
     );
     true
+}
+
+/// A key's operator class as the model holds it, or `None` after naming why
+/// the index is left out (DEC-1169.1).
+///
+/// A B-tree holds only each type's default class: `text_pattern_ops` answers
+/// different queries, and read back as an ordinary index it would compare
+/// clean against one it is not. GIN holds `jsonb` keys under `jsonb_ops`, the
+/// default and so no class at all, or `jsonb_path_ops`, and only the engine's
+/// own: a class of that name in another schema is another class.
+fn key_class(
+    raw: &RawIndex,
+    parts: &Parts,
+    table: &Table,
+    method: IndexMethod,
+    position: usize,
+    column: &str,
+    pulled: &mut Pulled,
+) -> Option<Option<String>> {
+    // An empty entry is the default class; a missing one is a key the query
+    // did not describe, which is not the same thing.
+    let Some(class) = raw.key_classes.get(position) else {
+        note(
+            pulled,
+            &parts.name,
+            format!(
+                "index `{}` on `{}`: the catalog did not say which operator class orders \
+                 `{column}`, so the index is left out rather than read as the default.",
+                raw.name, parts.name
+            ),
+        );
+        return None;
+    };
+    let left_out = |pulled: &mut Pulled, why: String| {
+        note(
+            pulled,
+            &parts.name,
+            format!(
+                "index `{}` on `{}` {why}. Read back without it, it would be an ordinary index \
+                 that answers different queries, so it is left out.",
+                raw.name, parts.name
+            ),
+        );
+    };
+    match method {
+        IndexMethod::Btree if class.is_empty() => Some(None),
+        IndexMethod::Btree => {
+            left_out(
+                pulled,
+                format!(
+                    "orders `{column}` by operator class `{class}`, and this model holds only a \
+                     B-tree key's default class"
+                ),
+            );
+            None
+        }
+        IndexMethod::Gin => {
+            let jsonb = table
+                .columns
+                .get(column)
+                .is_some_and(|c| crate::types::normalize(&c.ty).is_ok_and(|t| t.base == "jsonb"));
+            if !jsonb {
+                left_out(
+                    pulled,
+                    format!(
+                        "is a GIN index over `{column}`, and this model holds GIN only over `jsonb`"
+                    ),
+                );
+                return None;
+            }
+            match class.as_str() {
+                "" => Some(None),
+                "pg_catalog.jsonb_path_ops" => Some(Some("jsonb_path_ops".to_owned())),
+                other => {
+                    left_out(
+                        pulled,
+                        format!(
+                            "indexes `{column}` with operator class `{other}`, and this model holds \
+                             GIN over `jsonb` only with `jsonb_ops` or `pg_catalog.jsonb_path_ops`"
+                        ),
+                    );
+                    None
+                }
+            }
+        }
+    }
 }
 
 /// An attnum with no live column behind it.
@@ -4074,7 +4175,8 @@ mod tests {
             filter: None,
             has_expressions: false,
             method: "btree".to_owned(),
-            nondefault_column_options: false,
+            key_classes: vec![String::new()],
+            nondefault_collation: false,
         }
     }
 
@@ -4286,6 +4388,9 @@ mod tests {
         ix.key_count = 2;
         ix.columns = vec![3, 1, 2];
         ix.options = vec![1, 0, 0];
+        // One class per key column, as the query reports them; none for the
+        // `INCLUDE` payload, which has no order.
+        ix.key_classes = vec![String::new(), String::new()];
         ix.filter = Some("(c IS NOT NULL)".to_owned());
         let raw = RawCatalog {
             tables: vec![table(1, "t")],
@@ -4344,8 +4449,12 @@ mod tests {
         for (name, mutate) in [
             (
                 "method",
-                (|ix: &mut RawIndex| ix.method = "gin".to_owned()) as fn(&mut RawIndex),
+                (|ix: &mut RawIndex| ix.method = "hash".to_owned()) as fn(&mut RawIndex),
             ),
+            // GIN is held only over `jsonb`, and this key is an integer.
+            ("gin off jsonb", |ix: &mut RawIndex| {
+                ix.method = "gin".to_owned()
+            }),
             ("expression", |ix: &mut RawIndex| ix.has_expressions = true),
             ("expression column", |ix: &mut RawIndex| {
                 ix.columns = vec![0];
@@ -4852,7 +4961,7 @@ mod tests {
     #[test]
     fn an_index_ordered_by_something_other_than_its_columns_own_is_left_out() {
         let mut ix = index(50, 1, "t_ix");
-        ix.nondefault_column_options = true;
+        ix.key_classes = vec!["pg_catalog.text_pattern_ops".to_owned()];
         let raw = RawCatalog {
             tables: vec![table(1, "t")],
             columns: vec![col(1, 1, "a", "text")],
@@ -4863,6 +4972,84 @@ mod tests {
         let pulled = assemble(&raw);
         assert!(only(&pulled).indexes.is_empty());
         assert!(pulled.warnings[0].contains("operator class"));
+    }
+
+    /// A collation that is not the column's own is left out on its own
+    /// account, whatever the class (DEC-1169.1).
+    #[test]
+    fn an_index_under_another_collation_is_left_out() {
+        let mut ix = index(50, 1, "t_ix");
+        ix.nondefault_collation = true;
+        let raw = RawCatalog {
+            tables: vec![table(1, "t")],
+            columns: vec![col(1, 1, "a", "text")],
+            indexes: vec![ix],
+            ..RawCatalog::default()
+        };
+        let pulled = assemble(&raw);
+        assert!(only(&pulled).indexes.is_empty());
+        assert!(
+            pulled.warnings[0].contains("collation"),
+            "{:?}",
+            pulled.warnings
+        );
+    }
+
+    /// GIN over `jsonb` is read back with its method and, where it is not the
+    /// default, its class; every other class, a same-named class outside
+    /// `pg_catalog`, and a key the catalog did not describe are named and
+    /// left out rather than read as the default (DEC-1169.1).
+    #[test]
+    fn a_gin_index_over_jsonb_is_read_back_with_its_class() {
+        let gin = |classes: &[&str]| {
+            let mut ix = index(50, 1, "t_ix");
+            ix.method = "gin".to_owned();
+            ix.key_count = classes.len();
+            ix.columns = (1..=classes.len() as i32).collect();
+            ix.options = vec![0; classes.len()];
+            ix.key_classes = classes.iter().map(|c| (*c).to_owned()).collect();
+            let raw = RawCatalog {
+                tables: vec![table(1, "t")],
+                columns: vec![col(1, 1, "body", "jsonb"), col(1, 2, "tags", "jsonb")],
+                indexes: vec![ix],
+                ..RawCatalog::default()
+            };
+            assemble(&raw)
+        };
+        let pulled = gin(&["", "pg_catalog.jsonb_path_ops"]);
+        assert!(pulled.limitations.is_empty(), "{:?}", pulled.warnings);
+        let ix = &only(&pulled).indexes["t_ix"];
+        assert_eq!(ix.method, IndexMethod::Gin);
+        assert_eq!(ix.columns[0].opclass, None);
+        assert_eq!(ix.columns[1].opclass.as_deref(), Some("jsonb_path_ops"));
+
+        for (classes, expected) in [
+            (&["pg_catalog.jsonb_hash_ops"][..], "jsonb_hash_ops"),
+            (&["public.jsonb_path_ops"][..], "public.jsonb_path_ops"),
+            (&[][..], "did not say"),
+        ] {
+            let pulled = gin(if classes.is_empty() { &[""] } else { classes });
+            let pulled = if classes.is_empty() {
+                // One key described by none.
+                let mut ix = index(50, 1, "t_ix");
+                ix.method = "gin".to_owned();
+                ix.key_classes = Vec::new();
+                assemble(&RawCatalog {
+                    tables: vec![table(1, "t")],
+                    columns: vec![col(1, 1, "body", "jsonb")],
+                    indexes: vec![ix],
+                    ..RawCatalog::default()
+                })
+            } else {
+                pulled
+            };
+            assert!(only(&pulled).indexes.is_empty(), "{expected}");
+            assert!(
+                pulled.warnings.iter().any(|w| w.contains(expected)),
+                "{expected}: {:?}",
+                pulled.warnings
+            );
+        }
     }
 
     /// A key constraint's `INCLUDE` payload lives on its backing index and
