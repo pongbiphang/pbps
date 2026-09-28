@@ -9,14 +9,32 @@ pub(crate) fn decode(raw: &str, path: &Path) -> anyhow::Result<SavedPlan> {
     match serde_json::from_str(raw) {
         Ok(plan) => Ok(plan),
         Err(error) => {
-            // An older shape may lack required fields, and a newer one may
-            // carry unknown variants. Read only its version for a refusal,
-            // never to fill in missing current evidence (DEC-614.1). Keep the
-            // successful decode path intact so apply still reports identified
-            // artifacts through its existing checksum/attempt-hook boundary.
+            // Versions 1 through 12 share this envelope. Require it before
+            // calling a failed decode an unsupported plan: an ids file also
+            // has a version. Leave change payloads opaque so a future enum
+            // variant cannot hide a future plan's version. This only selects
+            // a refusal; it never fills in missing current evidence (DEC-614.1).
+            // Direct decoding above retains apply's checksum/attempt boundary.
+            #[allow(dead_code)]
             #[derive(serde::Deserialize)]
             struct Header {
                 version: u32,
+                origin: String,
+                dialect: String,
+                created_at: String,
+                baseline: Baseline,
+                changes: Changes,
+            }
+            #[allow(dead_code)]
+            #[derive(serde::Deserialize)]
+            struct Baseline {
+                description: String,
+                checksum: String,
+            }
+            #[allow(dead_code)]
+            #[derive(serde::Deserialize)]
+            struct Changes {
+                changes: Vec<serde::de::IgnoredAny>,
             }
             if let Ok(header) = serde_json::from_str::<Header>(raw) {
                 require_current(header.version, path)?;
