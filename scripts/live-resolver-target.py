@@ -98,7 +98,9 @@ def fixture(args, binary, root, owned):
     image = fixture_image(engine, args.pg_major)
     name = "pbps-native-target-" + uuid.uuid4().hex
     if engine == "pg":
-        environment = ["-e", f"POSTGRES_PASSWORD={PASSWORD}"]
+        # The owned resolver launches with C.UTF-8; keep target session-wide
+        # locale settings comparable while preserving actual engine checks.
+        environment = ["-e", f"POSTGRES_PASSWORD={PASSWORD}", "-e", "LANG=C.UTF-8"]
         boot = ("chown postgres:postgres /tmp/peer.key; chmod 600 /tmp/peer.key; "
                 "exec docker-entrypoint.sh postgres -c listen_addresses=127.0.0.1 "
                 "-c ssl=on -c ssl_cert_file=/tmp/peer.pem -c ssl_key_file=/tmp/peer.key")
