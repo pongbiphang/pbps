@@ -35,7 +35,13 @@ helper never gains an owner merely because it appears in a library binary.
 
 Witnesses are deliberately bounded checks on the current runner forms, not a
 Python, shell or Rust interpreter. Python uses its AST and literal selector
-data; fixture modules are never imported or executed. Rust witnesses use a
+data; fixture modules are never imported or executed. Module entry witnesses
+accept direct calls, literal truth values, and selected branches of equality /
+inequality guards between constants and `__name__` for a script launched as
+`__main__`. Unsupported conditional
+module bodies supply no witness, and direct rebinding of `__name__` is refused.
+Function witnesses retain runtime branches: this check does not prove every
+runtime precondition or general Python control flow. Rust witnesses use a
 comment/string-aware lexer inside an unambiguous named function. They do not
 interpret Rust cfgs: the compiler's test list decides whether the parent and
 child exist. Unsupported or ambiguous witness forms must be audited before

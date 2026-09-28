@@ -5,6 +5,7 @@ import copy
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -205,6 +206,88 @@ class SourceWitnesses(unittest.TestCase):
                 self.assertFalse(audit.contains(audit.python_tokens(text), witness))
         text = audit.python_scope('def main():\n    if True:\n        run(binary, "--ignored", "--exact", TEST)\n', 'main')
         self.assertTrue(audit.contains(audit.python_tokens(text), witness))
+
+    def test_unreachable_script_guards_cannot_supply_an_execution_witness(self):
+        witness = audit.python_tokens("main()")
+        for source in ('if __name__ == "__never__": main()',
+                       'if __name__ != "__main__": main()',
+                       'if "__main__" != __name__: main()',
+                       'if not __name__: main()',
+                       'if True:\n    if __name__ == "imported": main()',
+                       'if __name__ == "__main__": pass\nelse: main()'):
+            with self.subTest(source=source):
+                tokens = audit.python_tokens(audit.python_scope(source, "<module>"))
+                self.assertFalse(audit.contains(tokens, witness))
+
+    def test_real_script_entry_and_selected_else_branches_remain_witnesses(self):
+        witness = audit.python_tokens("main()")
+        for source in ('main()', 'if __name__ == "__main__": main()',
+                       'if "__main__" == __name__: main()',
+                       'if __name__ != "imported": raise SystemExit(main())',
+                       'if __name__ == "imported": pass\nelse: main()',
+                       'if False: pass\nelif __name__ == "__main__": main()'):
+            with self.subTest(source=source):
+                tokens = audit.python_tokens(audit.python_scope(source, "<module>"))
+                self.assertTrue(audit.contains(tokens, witness))
+
+    def test_unknown_module_conditions_and_control_forms_supply_no_witness(self):
+        witness = audit.python_tokens("main()")
+        for source in ('if enabled: main()', 'if discover(): main()',
+                       'if enabled: pass\nelse: main()',
+                       'while __name__ == "imported": main()',
+                       'for item in unknown: main()',
+                       'try: pass\nexcept Exception: main()',
+                       'with context(): main()',
+                       'match __name__:\n    case "imported": main()'):
+            with self.subTest(source=source):
+                tokens = audit.python_tokens(audit.python_scope(source, "<module>"))
+                self.assertFalse(audit.contains(tokens, witness))
+
+    def test_module_guards_do_not_remove_function_runtime_branches_or_direct_calls(self):
+        witness = audit.python_tokens("main()")
+        source = 'if os.geteuid() != 0: parser.error("needs root")\nmain()'
+        self.assertTrue(audit.contains(audit.python_tokens(audit.python_scope(source, "<module>")), witness))
+        source = 'def fixture(args):\n    if args.native_host: main()'
+        self.assertTrue(audit.contains(audit.python_tokens(audit.python_scope(source, "fixture")), witness))
+
+    def test_a_rebound_module_name_is_not_assumed_to_be_the_script_entry(self):
+        for binding in ('__name__ = "imported"', 'del __name__',
+                        'import sys as __name__', 'from sys import version as __name__',
+                        'def __name__(): pass', 'class __name__: pass',
+                        'if enabled: __name__ = "imported"',
+                        'try: pass\nexcept Exception as __name__: pass',
+                        'match "imported":\n    case __name__: pass',
+                        'def helper(value=(__name__ := "imported")): pass'):
+            with self.subTest(binding=binding):
+                with self.assertRaisesRegex(audit.InventoryError, "module entry name is rebound"):
+                    audit.python_scope(binding + '\nif __name__ == "__main__": main()', "<module>")
+        for definition in ('def unused():\n    __name__ = "local"',
+                           'unused = lambda: (__name__ := "local")'):
+            source = definition + '\nif __name__ == "__main__": main()'
+            self.assertTrue(audit.contains(audit.python_tokens(audit.python_scope(source, "<module>")),
+                                           audit.python_tokens("main()")))
+
+    def test_module_witness_agrees_with_a_real_script_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / "runner.py"
+            witness = {"file": "runner.py", "language": "python", "scope": "<module>",
+                       "requires": ["main()"]}
+            for guard, runs in [('__name__ == "__main__"', True),
+                                ('__name__ == "__never__"', False),
+                                ('__name__ != "__main__"', False),
+                                ('(1,) == [1]', False), ('[1] == (1,)', False)]:
+                with self.subTest(guard=guard):
+                    script.write_text('def main(): print("selected")\nif ' + guard + ': main()\n',
+                                      encoding="utf-8")
+                    actual = subprocess.run([sys.executable, str(script)], check=True,
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(actual.stdout, "selected\n" if runs else "")
+                    if runs:
+                        audit.check_witness(root, witness)
+                    else:
+                        with self.assertRaisesRegex(audit.InventoryError, "removed invocation"):
+                            audit.check_witness(root, witness)
 
     def test_python_selector_data_supports_literals_prefixes_and_comprehensions(self):
         tree = audit.ast.parse('PREFIX = "module::"\nTESTS = [PREFIX + n for n in ["one", "two"]] + ["three"]')
