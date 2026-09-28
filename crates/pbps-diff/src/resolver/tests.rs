@@ -570,10 +570,12 @@ fn splitting_table_creation_preserves_the_declared_index_layout() {
                     columns: vec![IndexColumn {
                         name: "id".into(),
                         descending: false,
+                        opclass: None,
                     }],
                     include: vec![],
                     unique: false,
                     filter: None,
+                    method: Default::default(),
                 },
             );
             table.clustered = clustered.then(|| Clustered::Index("ix".into()));
@@ -637,10 +639,12 @@ fn new_table_indexes_are_offline_while_existing_table_indexes_keep_the_requested
                         columns: vec![IndexColumn {
                             name: "id".into(),
                             descending: false,
+                            opclass: None,
                         }],
                         include: vec![],
                         unique: false,
                         filter: None,
+                        method: Default::default(),
                     },
                 );
                 hints.strategies.insert(name.clone(), Strategy { online });

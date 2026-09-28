@@ -1637,6 +1637,7 @@
         "a_foreign_keys_width_is_the_servers_answer_and_it_answers_before_looking_for_a_key",
         "a_fully_migrated_ledger_answers_the_timeline_without_reading_state_json",
         "a_generated_fallback_is_the_one_the_engine_uses_and_order_decides_it",
+        "a_gin_index_over_jsonb_round_trips_and_changes_as_a_typed_plan",
         "a_grant_in_the_public_schema_reaches_the_table_with_no_schema_grant",
         "a_grant_on_something_the_declarations_cannot_name_is_reported_not_lost",
         "a_grant_on_what_the_pull_cannot_carry_is_reported_rather_than_recorded",

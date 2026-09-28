@@ -750,6 +750,7 @@ mod tests {
                 include: Vec::new(),
                 unique: false,
                 filter: None,
+                method: Default::default(),
             },
         );
         let mut with_index = pbps_model::Schema::default();

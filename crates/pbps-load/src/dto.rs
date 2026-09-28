@@ -476,7 +476,9 @@ pub struct ForeignKeyDto {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct IndexDto {
-    /// Each entry is `column` or `column desc`.
+    /// Each entry is `column`, optionally followed by an operator class
+    /// (PostgreSQL), then optionally by `asc` or `desc`: `column`,
+    /// `column desc`, `body jsonb_path_ops`.
     #[schemars(with = "Vec<String>")]
     pub columns: Vec<Spanned<String>>,
 
@@ -490,6 +492,11 @@ pub struct IndexDto {
     /// keyword, hence the rename.
     #[serde(rename = "where", default)]
     pub filter: Option<String>,
+
+    /// The access method: `btree` (the default, and what an absent key
+    /// means) or `gin` (PostgreSQL, over `jsonb` columns).
+    #[serde(default)]
+    pub method: pbps_model::IndexMethod,
 }
 
 // The doc comment below becomes the schema's own `description`, which an editor

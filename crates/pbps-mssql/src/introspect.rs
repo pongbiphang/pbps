@@ -1157,6 +1157,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     .filter
                     .as_deref()
                     .map(|f| strip_stored_parens(f).to_owned()),
+                method: Default::default(),
             });
         if i.is_included {
             index.include.push(i.column.clone());
@@ -1164,6 +1165,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             index.columns.push(IndexColumn {
                 name: i.column.clone(),
                 descending: i.is_descending,
+                opclass: None,
             });
         }
     }

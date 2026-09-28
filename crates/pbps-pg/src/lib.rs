@@ -1227,10 +1227,12 @@ mod tests {
                         columns: vec![IndexColumn {
                             name: "id".into(),
                             descending: false,
+                            opclass: None,
                         }],
                         include: Vec::new(),
                         unique: false,
                         filter: None,
+                        method: Default::default(),
                     },
                 );
             }
@@ -1328,10 +1330,12 @@ mod tests {
                         columns: vec![IndexColumn {
                             name: "id".into(),
                             descending: false,
+                            opclass: None,
                         }],
                         include: Vec::new(),
                         unique: false,
                         filter: None,
+                        method: Default::default(),
                     },
                 );
             }
@@ -1419,10 +1423,12 @@ mod tests {
                             columns: vec![IndexColumn {
                                 name: "id".into(),
                                 descending: false,
+                                opclass: None,
                             }],
                             include: Vec::new(),
                             unique: false,
                             filter: None,
+                            method: Default::default(),
                         },
                     );
                 }
@@ -1466,10 +1472,12 @@ mod tests {
             columns: vec![IndexColumn {
                 name: col.into(),
                 descending: false,
+                opclass: None,
             }],
             include: Vec::new(),
             unique: false,
             filter: None,
+            method: Default::default(),
         };
         let table = |pk_name: Option<&str>, identity: bool, index_name: Option<&str>| {
             let mut t = Table::default();
@@ -2311,10 +2319,12 @@ mod tests {
                     columns: vec![pbps_model::IndexColumn {
                         name: "a".into(),
                         descending: false,
+                        opclass: None,
                     }],
                     include: vec![],
                     unique: false,
                     filter: Some(expression.into()),
+                    method: Default::default(),
                 },
             );
             let errors = structural_errors(&table);
@@ -2349,10 +2359,12 @@ mod tests {
                 columns: vec![pbps_model::IndexColumn {
                     name: "j".into(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: vec![],
                 unique: false,
                 filter: None,
+                method: Default::default(),
             },
         );
         let errors = structural_errors(&table);
@@ -2504,11 +2516,13 @@ mod tests {
                         .map(|name| pbps_model::IndexColumn {
                             name: name.into(),
                             descending: false,
+                            opclass: None,
                         })
                         .collect(),
                     include: include.into_iter().map(String::from).collect(),
                     unique: false,
                     filter: None,
+                    method: Default::default(),
                 },
             );
             let errors = structural_errors(&table);
@@ -2578,11 +2592,13 @@ mod tests {
                                     .map(|name| pbps_model::IndexColumn {
                                         name,
                                         descending: false,
+                                        opclass: None,
                                     })
                                     .collect(),
                                 include,
                                 unique: false,
                                 filter: None,
+                                method: Default::default(),
                             },
                         );
                     }
@@ -2641,10 +2657,12 @@ mod tests {
                 columns: vec![pbps_model::IndexColumn {
                     name: "a".into(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: vec![],
                 unique: false,
                 filter: Some(" \t".into()),
+                method: Default::default(),
             },
         );
         let errors = structural_errors(&table);
@@ -2690,10 +2708,12 @@ mod tests {
                     columns: vec![pbps_model::IndexColumn {
                         name: "a".into(),
                         descending: false,
+                        opclass: None,
                     }],
                     include: vec![],
                     unique: false,
                     filter: Some(expression.into()),
+                    method: Default::default(),
                 },
             );
             let errors = structural_errors(&table);
@@ -2738,10 +2758,12 @@ mod tests {
                     columns: vec![pbps_model::IndexColumn {
                         name: "a".into(),
                         descending: false,
+                        opclass: None,
                     }],
                     include: vec![],
                     unique: false,
                     filter: Some(expression.into()),
+                    method: Default::default(),
                 },
             );
             assert!(
@@ -3131,10 +3153,12 @@ mod tests {
                 columns: vec![IndexColumn {
                     name: "id".into(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: vec![],
                 unique: false,
                 filter: None,
+                method: Default::default(),
             },
         );
         assert!(

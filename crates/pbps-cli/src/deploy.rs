@@ -10175,10 +10175,12 @@ mod tests {
                         columns: vec![pbps_model::IndexColumn {
                             name: "note".to_owned(),
                             descending: false,
+                            opclass: None,
                         }],
                         include: Vec::new(),
                         unique: false,
                         filter: None,
+                        method: Default::default(),
                     },
                 );
             }
@@ -10293,10 +10295,12 @@ mod tests {
                         columns: vec![pbps_model::IndexColumn {
                             name: "note".to_owned(),
                             descending: false,
+                            opclass: None,
                         }],
                         include: Vec::new(),
                         unique: false,
                         filter: None,
+                        method: Default::default(),
                     }),
                     clustered: false,
                 },
@@ -10795,10 +10799,12 @@ mod tests {
             columns: vec![IndexColumn {
                 name: column.into(),
                 descending: false,
+                opclass: None,
             }],
             include: vec![],
             unique,
             filter: filter.map(Into::into),
+            method: Default::default(),
         };
         let planned_index = index("id", false, Some("id > 0"));
         let changes = pbps_model::ChangeSet {
@@ -10872,10 +10878,12 @@ mod tests {
             columns: vec![IndexColumn {
                 name: "id".into(),
                 descending: false,
+                opclass: None,
             }],
             include: vec![],
             unique: false,
             filter: None,
+            method: Default::default(),
         };
         t.indexes.insert("ix".into(), ix.clone());
         let schema = |layout: Option<Clustered>| {
@@ -11182,10 +11190,12 @@ mod tests {
                 columns: vec![IndexColumn {
                     name: "id".into(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: vec![],
                 unique: false,
                 filter: None,
+                method: Default::default(),
             },
         );
         let changes = pbps_model::ChangeSet {
@@ -11417,10 +11427,12 @@ mod tests {
                 columns: vec![pbps_model::IndexColumn {
                     name: "id".to_owned(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: Vec::new(),
                 unique: false,
                 filter: None,
+                method: Default::default(),
             },
         );
         let e = refuse_unplanned_movement(
@@ -11527,10 +11539,12 @@ mod tests {
                     columns: vec![pbps_model::IndexColumn {
                         name: "id".to_owned(),
                         descending: false,
+                        opclass: None,
                     }],
                     include: Vec::new(),
                     unique: false,
                     filter: filter.map(str::to_owned),
+                    method: Default::default(),
                 },
             );
             t
@@ -12014,10 +12028,12 @@ mod tests {
             columns: vec![pbps_model::IndexColumn {
                 name: "note".to_owned(),
                 descending: false,
+                opclass: None,
             }],
             include: Vec::new(),
             unique,
             filter: None,
+            method: Default::default(),
         };
         let schema_with = |unique: bool| {
             let mut t = pbps_model::Table::default();
@@ -12091,10 +12107,12 @@ mod tests {
                                 columns: vec![IndexColumn {
                                     name: "id".into(),
                                     descending: false,
+                                    opclass: None,
                                 }],
                                 include: vec![],
                                 unique: false,
                                 filter: None,
+                                method: Default::default(),
                             },
                         );
                         Change::DropIndex {
@@ -13740,10 +13758,12 @@ mod tests {
             columns: vec![pbps_model::IndexColumn {
                 name: on.to_owned(),
                 descending: false,
+                opclass: None,
             }],
             include: Vec::new(),
             unique,
             filter: None,
+            method: Default::default(),
         };
         let unique = |on: &str| pbps_model::UniqueConstraint {
             columns: vec![on.to_owned()],

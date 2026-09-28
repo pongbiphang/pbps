@@ -19,7 +19,10 @@
 use std::collections::BTreeSet;
 
 use pbps_dialect::{DialectError, Expression};
-use pbps_model::{GrantTarget, ModuleId, ModuleKind, ObjectName, Permission, Role, Schema, Table};
+use pbps_model::{
+    GrantTarget, Index, IndexMethod, ModuleId, ModuleKind, ObjectName, Permission, Role, Schema,
+    Table,
+};
 
 use crate::quote;
 use crate::types::DIALECT;
@@ -145,6 +148,79 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
             .is_some_and(|f| crate::LEXICON.expression_in(f) == Expression::Absent)
         {
             found.push(invalid(format!("{what} has an empty filter expression")));
+        }
+        found.extend(index_method(&what, index, table));
+    }
+    found
+}
+
+/// The access methods and operator classes this model holds (#1169): the
+/// B-tree under each type's default class, and GIN over `jsonb` under
+/// `jsonb_ops`, its default, or `jsonb_path_ops`. Anything else would be
+/// created as declared but read back as a limitation, so it is refused here
+/// rather than applied and then refused.
+fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
+    let mut found = Vec::new();
+    match index.method {
+        IndexMethod::Btree => {
+            for key in &index.columns {
+                if let Some(class) = &key.opclass {
+                    found.push(invalid(format!(
+                        "{what} indexes `{}` with operator class `{class}`; a B-tree index here \
+                         takes only its type's default class, so leave the class out \
+                         (or, if `{class}` was meant as a direction, it is `asc` or `desc`)",
+                        key.name
+                    )));
+                }
+            }
+        }
+        // Measured on 18.6: `gin` refuses `UNIQUE` ("access method \"gin\"
+        // does not support unique indexes"), `INCLUDE` and `ASC`/`DESC`, and an
+        // `int` column has no default GIN class at all.
+        IndexMethod::Gin => {
+            if index.unique {
+                found.push(invalid(format!(
+                    "{what} is a GIN index, which cannot be unique"
+                )));
+            }
+            if !index.include.is_empty() {
+                found.push(invalid(format!(
+                    "{what} is a GIN index, which cannot include payload columns"
+                )));
+            }
+            for key in &index.columns {
+                if key.descending {
+                    found.push(invalid(format!(
+                        "{what} orders `{}` descending, and a GIN index has no order",
+                        key.name
+                    )));
+                }
+                let jsonb = table.columns.get(&key.name).is_some_and(|c| {
+                    crate::types::normalize(&c.ty).is_ok_and(|t| t.base == "jsonb")
+                });
+                // A missing column is already named by `key_columns`.
+                if table.columns.contains_key(&key.name) && !jsonb {
+                    found.push(invalid(format!(
+                        "{what} is a GIN index over `{}`, and this model holds GIN only over \
+                         `jsonb` columns",
+                        key.name
+                    )));
+                }
+                match key.opclass.as_deref() {
+                    None | Some("jsonb_path_ops") => {}
+                    Some("jsonb_ops") => found.push(invalid(format!(
+                        "{what} names `jsonb_ops` for `{}`, which is GIN's default for `jsonb`; \
+                         leave the class out",
+                        key.name
+                    ))),
+                    Some(class) => found.push(invalid(format!(
+                        "{what} indexes `{}` with operator class `{class}`; a GIN index over \
+                         `jsonb` here takes `jsonb_path_ops` or, by leaving it out, the default \
+                         `jsonb_ops`",
+                        key.name
+                    ))),
+                }
+            }
         }
     }
     found
@@ -659,6 +735,97 @@ mod tests {
 
     fn role_errors(name: &str, role: &Role) -> Vec<DialectError> {
         super::role(name, role, &declarations())
+    }
+
+    /// A table with a `jsonb` and an `integer` column, and one index over the
+    /// keys given, each `(column, opclass, descending)`.
+    fn indexed(method: IndexMethod, keys: &[(&str, Option<&str>, bool)]) -> Table {
+        let mut table = Table::default();
+        table.columns.insert(
+            "body".into(),
+            pbps_model::Column::new("jsonb".parse().unwrap()),
+        );
+        table.columns.insert(
+            "n".into(),
+            pbps_model::Column::new("integer".parse().unwrap()),
+        );
+        table.indexes.insert(
+            "ix".into(),
+            Index {
+                columns: keys
+                    .iter()
+                    .map(|(name, class, descending)| pbps_model::IndexColumn {
+                        name: (*name).into(),
+                        descending: *descending,
+                        opclass: class.map(str::to_owned),
+                    })
+                    .collect(),
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method,
+            },
+        );
+        table
+    }
+
+    fn structure(table: &Table) -> Vec<String> {
+        table_structure(table)
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect()
+    }
+
+    /// GIN over `jsonb` is accepted with its default class or
+    /// `jsonb_path_ops`, filtered or not; everything the engine refuses for
+    /// GIN, or this model would read back as a limitation, is refused before
+    /// it is applied (#1169).
+    #[test]
+    fn a_gin_index_is_held_to_jsonb_and_to_what_the_engine_accepts() {
+        use IndexMethod::Gin;
+        assert!(structure(&indexed(Gin, &[("body", None, false)])).is_empty());
+        assert!(structure(&indexed(Gin, &[("body", Some("jsonb_path_ops"), false)])).is_empty());
+        let mut filtered = indexed(Gin, &[("body", None, false)]);
+        filtered.indexes.get_mut("ix").unwrap().filter = Some("n > 0".into());
+        assert!(structure(&filtered).is_empty());
+
+        let refused = |table: Table, expected: &str| {
+            let found = structure(&table);
+            assert!(
+                found.iter().any(|m| m.contains(expected)),
+                "expected `{expected}` in {found:?}"
+            );
+        };
+        refused(indexed(Gin, &[("n", None, false)]), "only over `jsonb`");
+        refused(indexed(Gin, &[("body", None, true)]), "has no order");
+        refused(
+            indexed(Gin, &[("body", Some("jsonb_ops"), false)]),
+            "leave the class out",
+        );
+        refused(
+            indexed(Gin, &[("body", Some("gin_trgm_ops"), false)]),
+            "takes `jsonb_path_ops`",
+        );
+        let mut unique = indexed(Gin, &[("body", None, false)]);
+        unique.indexes.get_mut("ix").unwrap().unique = true;
+        refused(unique, "cannot be unique");
+        let mut include = indexed(Gin, &[("body", None, false)]);
+        include.indexes.get_mut("ix").unwrap().include = vec!["n".into()];
+        refused(include, "cannot include");
+    }
+
+    /// A B-tree takes no operator class here, and a class that looks like a
+    /// misspelt direction says so (#1169); without one it is unchanged.
+    #[test]
+    fn a_btree_index_takes_no_operator_class() {
+        assert!(structure(&indexed(IndexMethod::Btree, &[("n", None, true)])).is_empty());
+        let found = structure(&indexed(IndexMethod::Btree, &[("n", Some("dsc"), false)]));
+        assert!(
+            found
+                .iter()
+                .any(|m| m.contains("operator class `dsc`") && m.contains("`asc` or `desc`")),
+            "{found:?}"
+        );
     }
 
     /// The declaration this file exists to accept. Every rule below refuses

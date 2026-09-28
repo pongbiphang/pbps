@@ -26,10 +26,12 @@ fn declared(body: &str) -> Schema {
             columns: vec![pbps_model::IndexColumn {
                 name: "id".into(),
                 descending: false,
+                opclass: None,
             }],
             include: vec![],
             unique: false,
             filter: Some("id >= app.f()".into()),
+            method: Default::default(),
         },
     );
     schema.tables.insert("app.t".parse().unwrap(), table);
@@ -537,10 +539,12 @@ async fn new_table_online_indexes_are_transactional(target: &mut Conn) {
             columns: vec![pbps_model::IndexColumn {
                 name: "n".into(),
                 descending: false,
+                opclass: None,
             }],
             include: vec![],
             unique: false,
             filter: None,
+            method: Default::default(),
         },
     );
     let mut desired = Schema::default();

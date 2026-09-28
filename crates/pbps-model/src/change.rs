@@ -2525,10 +2525,12 @@ mod tests {
                 columns: vec![crate::schema::IndexColumn {
                     name: "email".into(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: Vec::new(),
                 unique,
                 filter: None,
+                method: Default::default(),
             }),
             clustered: false,
         };

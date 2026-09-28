@@ -3549,10 +3549,12 @@ mod tests {
                 columns: vec![IndexColumn {
                     name: "n".to_owned(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: Vec::new(),
                 unique: false,
                 filter: None,
+                method: Default::default(),
             },
         );
         table

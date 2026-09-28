@@ -133,7 +133,11 @@ use crate::schema::Schema;
 /// this build would restate every `ALTER COLUMN` without a collation, which
 /// this build's emitter reads as the database default — moving a collated
 /// column to it, the silent reset the fields exist to prevent.
-pub const CURRENT_VERSION: u32 = 13;
+///
+/// Bumped to 14 for index methods and operator classes (#1169): `method` and
+/// each key's `opclass` in an `AddIndex` or created table's payload. An older
+/// build would refuse such a plan on an unknown field; the version says why.
+pub const CURRENT_VERSION: u32 = 14;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -592,7 +596,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 13);
+        assert_eq!(CURRENT_VERSION, 14);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads

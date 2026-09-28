@@ -410,10 +410,12 @@ mod tests {
                 columns: vec![IndexColumn {
                     name: "n".to_owned(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: Vec::new(),
                 unique: false,
                 filter: Some("n > 0".to_owned()),
+                method: Default::default(),
             },
         );
         table.indexes.insert(
@@ -422,10 +424,12 @@ mod tests {
                 columns: vec![IndexColumn {
                     name: "m".to_owned(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: Vec::new(),
                 unique: false,
                 filter: None,
+                method: Default::default(),
             },
         );
         table

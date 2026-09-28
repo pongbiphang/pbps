@@ -339,10 +339,12 @@ fn removing_a_predicate_can_retain_the_plain_index_catalog_record() {
             columns: vec![crate::IndexColumn {
                 name: "n".into(),
                 descending: false,
+                opclass: None,
             }],
             include: vec![],
             unique: false,
             filter: None,
+            method: Default::default(),
         }),
     }));
     evidence.transitions[0].after = evidence.transitions[0].before.clone();

@@ -829,21 +829,30 @@ fn create_index(
     index: &Index,
     strategy: Strategy,
 ) -> Result<String, DialectError> {
+    // A GIN key has no order: measured on 18.6, `ASC`/`DESC` on one is
+    // "access method \"gin\" does not support ASC/DESC options" (#1169).
+    let ordered = index.method.is_btree();
     let keys = index
         .columns
         .iter()
         .map(|c| {
-            Ok(format!(
-                "{} {}",
-                quote(&c.name)?,
-                if c.descending { "DESC" } else { "ASC" }
-            ))
+            let mut key = quote(&c.name)?;
+            // Qualified, so a class of the same name earlier on the
+            // `search_path` cannot stand in for the one declared: every class
+            // this model accepts is the engine's own.
+            if let Some(class) = &c.opclass {
+                key = format!("{key} {}.{}", quote("pg_catalog")?, quote(class)?);
+            }
+            if ordered {
+                key = format!("{key} {}", if c.descending { "DESC" } else { "ASC" });
+            }
+            Ok(key)
         })
         .collect::<Result<Vec<_>, DialectError>>()?
         .join(", ");
 
     let mut s = format!(
-        "CREATE {}INDEX {}{} ON {} ({keys})",
+        "CREATE {}INDEX {}{} ON {}{} ({keys})",
         if index.unique { "UNIQUE " } else { "" },
         if built_concurrently(index, strategy) {
             "CONCURRENTLY "
@@ -851,7 +860,12 @@ fn create_index(
             ""
         },
         quote(name)?,
-        qualified(table)?
+        qualified(table)?,
+        if ordered {
+            String::new()
+        } else {
+            format!(" USING {}", index.method.as_str())
+        }
     );
     if !index.include.is_empty() {
         s.push_str(&format!(" INCLUDE ({})", column_list(&index.include)?));
@@ -3456,10 +3470,12 @@ mod tests {
             columns: vec![IndexColumn {
                 name: "id".into(),
                 descending: false,
+                opclass: None,
             }],
             include: vec![],
             unique: false,
             filter: None,
+            method: Default::default(),
         };
         let unique = pbps_model::UniqueConstraint {
             columns: vec!["id".into()],
@@ -5202,6 +5218,39 @@ mod tests {
         assert_eq!(block.matches("$pbps1$").count(), 2, "{block}");
     }
 
+    /// A GIN index is built `USING gin`, with no direction on its keys, which
+    /// the method refuses, and with a non-default class qualified so the
+    /// `search_path` cannot swap it for another (#1169).
+    #[test]
+    fn a_gin_index_names_its_method_and_qualifies_its_class() {
+        let key = |name: &str, opclass: Option<&str>| IndexColumn {
+            name: name.into(),
+            descending: false,
+            opclass: opclass.map(str::to_owned),
+        };
+        let change = Change::AddIndex {
+            table: name("app", "doc"),
+            name: "ix_body".into(),
+            index: Box::new(Index {
+                columns: vec![key("body", None), key("tags", Some("jsonb_path_ops"))],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: pbps_model::IndexMethod::Gin,
+            }),
+            clustered: false,
+        };
+        let sql = sql_of(&Postgres::new(), &change).remove(0);
+        assert!(
+            sql.contains(
+                "CREATE INDEX \"ix_body\" ON \"app\".\"doc\" USING gin \
+                 (\"body\", \"tags\" \"pg_catalog\".\"jsonb_path_ops\");"
+            ),
+            "{sql}"
+        );
+        assert!(!sql.contains("ASC") && !sql.contains("DESC"), "{sql}");
+    }
+
     /// An index without a filter and without the hint is the ordinary case, and
     /// it is scoped like everything else; the concurrent one is the only
     /// statement here that is not, because it cannot be.
@@ -5211,10 +5260,12 @@ mod tests {
             columns: vec![IndexColumn {
                 name: "n".into(),
                 descending: true,
+                opclass: None,
             }],
             include: vec!["m".into()],
             unique: true,
             filter: None,
+            method: Default::default(),
         };
         let change = Change::AddIndex {
             table: name("app", "t"),
@@ -5333,10 +5384,12 @@ mod tests {
                     columns: vec![IndexColumn {
                         name: "n".into(),
                         descending: false,
+                        opclass: None,
                     }],
                     include: vec![],
                     unique: false,
                     filter: Some("n > 0 -- why".into()),
+                    method: Default::default(),
                 }),
                 clustered: false,
             },

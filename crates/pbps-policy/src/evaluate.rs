@@ -476,6 +476,7 @@ mod tests {
                 include: vec![],
                 unique: false,
                 filter: None,
+                method: Default::default(),
             },
         );
         s.tables.insert("dbo.customer".parse().unwrap(), t);

@@ -838,10 +838,12 @@ mod tests {
                     columns: vec![pbps_model::IndexColumn {
                         name: "v".into(),
                         descending: false,
+                        opclass: None,
                     }],
                     include: Vec::new(),
                     unique: false,
                     filter: None,
+                    method: Default::default(),
                 }),
                 clustered: false,
             });
@@ -1023,10 +1025,12 @@ mod tests {
                     columns: vec![pbps_model::IndexColumn {
                         name: "v".into(),
                         descending: false,
+                        opclass: None,
                     }],
                     include: vec![],
                     unique: false,
                     filter: None,
+                    method: Default::default(),
                 }),
                 clustered: false,
             })
@@ -1434,10 +1438,12 @@ mod tests {
                 columns: vec![pbps_model::IndexColumn {
                     name: "v".into(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: Vec::new(),
                 unique: false,
                 filter: filter.map(str::to_owned),
+                method: Default::default(),
             }),
             clustered: false,
         };

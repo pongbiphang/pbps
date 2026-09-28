@@ -128,10 +128,12 @@ mod tests {
                 columns: vec![IndexColumn {
                     name: "tag".into(),
                     descending: false,
+                    opclass: None,
                 }],
                 include: vec!["note".into()],
                 unique: false,
                 filter: Some("[tag] IS NOT NULL".into()),
+                method: Default::default(),
             },
         );
         table.foreign_keys.insert(

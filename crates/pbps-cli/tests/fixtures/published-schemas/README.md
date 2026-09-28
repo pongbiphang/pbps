@@ -44,3 +44,4 @@ DECISIONS 465).
 - `18/` documents explain's current-build apply capability and adds its optional
   `apply_limitation`; unsupported artifacts carry an empty `approve_with`.
 - `19/` adds a column's `collation:` (issue #1175).
+- `20/` adds an index's `method:` and a key's operator class (issue #1169).

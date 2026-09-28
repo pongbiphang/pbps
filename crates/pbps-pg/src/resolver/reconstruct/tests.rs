@@ -22,10 +22,12 @@ fn table() -> Table {
             columns: vec![IndexColumn {
                 name: "c".into(),
                 descending: false,
+                opclass: None,
             }],
             include: Vec::new(),
             unique: false,
             filter: Some("c > app.f(1)".into()),
+            method: Default::default(),
         },
     );
     table.indexes.insert(
@@ -34,10 +36,12 @@ fn table() -> Table {
             columns: vec![IndexColumn {
                 name: "c".into(),
                 descending: false,
+                opclass: None,
             }],
             include: Vec::new(),
             unique: false,
             filter: None,
+            method: Default::default(),
         },
     );
     table.foreign_keys.insert(
