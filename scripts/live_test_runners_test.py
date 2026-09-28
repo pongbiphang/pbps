@@ -62,6 +62,7 @@ class LiveExecution(unittest.TestCase):
             for name in (
                 "resolver::docker::tests::direct_native_daemon_is_accepted_but_a_root_owned_proxy_is_not",
                 native.TARGET_TEST, native.FACTORY_TEST, native.RECIPE_TEST,
+                native.ANALYSIS_TEST, native.INVALIDATION_TEST, native.CANCELLATION_TEST,
             )
         ])
         for call in run.call_args_list:
