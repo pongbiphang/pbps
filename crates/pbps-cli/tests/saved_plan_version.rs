@@ -133,6 +133,7 @@ fn ordinary_current_artifacts_keep_their_checksum_and_approval_gate() {
         PlanBaseline {
             description: "fixture".into(),
             checksum: "00".repeat(32),
+            database_collation: None,
         },
         ChangeSet::default(),
         IdsFile::default(),
