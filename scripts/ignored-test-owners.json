@@ -1323,6 +1323,7 @@
         "a_failed_retype_restores_the_default_it_temporarily_removed",
         "a_failed_statement_rolls_the_whole_plan_back",
         "a_filtered_predicate_reads_a_retyped_column_through_the_type_it_has_now",
+        "a_foreign_key_between_recollated_columns_is_probed_under_their_new_collation",
         "a_foreign_key_into_a_left_out_unique_index_is_left_out_too",
         "a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target",
         "a_fully_migrated_ledger_answers_the_timeline_without_reading_state_json",

@@ -790,9 +790,35 @@ fn build(
             let not_null: Vec<String> = (0..constraint.columns.len())
                 .map(|i| format!("r.k{i} IS NOT NULL"))
                 .collect();
-            let join: Vec<String> = (0..constraint.columns.len())
-                .map(|i| format!("q.k{i} = r.k{i}"))
-                .collect();
+            // Compared under the collation both sides will have, where this
+            // plan changes either (#1175): the rebuilt key is checked by the
+            // engine under the columns' new collation, which both sides share
+            // once the plan has run (1757). Compared bare, two sides the plan
+            // brings to one collation from two others were a collation
+            // conflict, and a key moving from case-insensitive to sensitive
+            // matched a child `a` to a parent `A` the rebuilt key refuses.
+            let join: Vec<String> = constraint
+                .columns
+                .iter()
+                .zip(&constraint.references_columns)
+                .enumerate()
+                .map(|(i, (child, parent))| {
+                    let moved = names
+                        .recollated
+                        .get(&table.column(child))
+                        .or_else(|| {
+                            names
+                                .recollated
+                                .get(&constraint.references_table.column(parent))
+                        });
+                    let collate = match moved {
+                        Some(Some(to)) => crate::emit::collate_clause(Some(to))?,
+                        Some(None) => " COLLATE DATABASE_DEFAULT".to_owned(),
+                        None => String::new(),
+                    };
+                    Ok(format!("q.k{i}{collate} = r.k{i}{collate}"))
+                })
+                .collect::<Result<_, DialectError>>()?;
 
             Ok(vec![Probe::new(
                 format!("rows with no matching parent for the new foreign key {name}"),
@@ -2368,6 +2394,59 @@ mod tests {
         );
         // Negative: a Unicode column's characters survive any collation.
         assert!(sql_of(&alter("nvarchar(5)", Some("Latin1_General_CS_AS"))).is_empty());
+    }
+
+    /// A foreign key added over columns whose collation this plan changes is
+    /// probed with both sides under the collation they will share (#1247
+    /// review): compared bare, two sides moving from two collations to one
+    /// were a collation conflict, and a case-insensitive pair made
+    /// case-sensitive matched `a` to `A` where the rebuilt key does not.
+    #[test]
+    fn a_foreign_key_is_probed_under_its_columns_new_collation() {
+        let recollate = |column: &str| {
+            PlannedChange::new(Change::AlterColumnType {
+                uid: uid("c_aaaaaa"),
+                column: cref(column),
+                from: ty("varchar(10)"),
+                to: ty("varchar(10)"),
+                from_nullable: true,
+                to_nullable: true,
+                from_collation: None,
+                to_collation: Some(pbps_model::Collation::new("Latin1_General_CS_AS")),
+            })
+        };
+        let fk = PlannedChange::new(Change::AddForeignKey {
+            table: tname("dbo.child"),
+            name: "fk_child_parent".into(),
+            constraint: Box::new(ForeignKey {
+                columns: vec!["code".into()],
+                references_table: tname("dbo.parent"),
+                references_columns: vec!["code".into()],
+                on_delete: ReferentialAction::NoAction,
+                on_update: ReferentialAction::NoAction,
+            }),
+        });
+        let sql = |changes: Vec<PlannedChange>| -> Vec<String> {
+            probes(&ChangeSet { changes })
+                .into_iter()
+                .map(|p| p.sql)
+                .collect()
+        };
+        for moved in ["dbo.child.code", "dbo.parent.code"] {
+            let got = sql(vec![recollate(moved), fk.clone()]);
+            assert!(
+                got.iter().any(|q| q.contains(
+                    "q.k0 COLLATE Latin1_General_CS_AS = r.k0 COLLATE Latin1_General_CS_AS"
+                )),
+                "{moved}: {got:?}"
+            );
+        }
+        // Negative: nothing recollated, nothing spelled.
+        let got = sql(vec![fk]);
+        assert!(
+            got.iter().any(|q| q.contains("WHERE q.k0 = r.k0")),
+            "{got:?}"
+        );
     }
 
     /// A unique key rebuilt over a column whose collation this plan changes

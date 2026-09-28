@@ -2360,6 +2360,65 @@ async fn a_collation_change_is_counted_before_it_can_lose_or_collide() {
     assert!(refused.is_err());
 }
 
+/// A foreign key added between a parent and a child the plan brings to one
+/// collation is probed under it (#1247 review). Compared bare, the two old
+/// collations were a collation conflict and the probe failed; under the
+/// target, a child `a` has no parent `A`, as the engine then agrees.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_foreign_key_between_recollated_columns_is_probed_under_their_new_collation() {
+    let mut db = TestDb::create_collated("coll_fk", "Latin1_General_CI_AS").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.p (code varchar(10) COLLATE Latin1_General_CS_AS NOT NULL
+                                  CONSTRAINT pk_p PRIMARY KEY);
+             CREATE TABLE dbo.c (id int NOT NULL CONSTRAINT pk_c PRIMARY KEY, code varchar(10) NULL);
+             INSERT dbo.p VALUES ('A');
+             INSERT dbo.c VALUES (1, 'A'), (2, 'a');",
+        )
+        .await
+        .expect("create");
+    let start = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect");
+    let ids = mint_ids(&start.schema, &IdsFile::default(), &[]);
+    let mut declared = start.schema.clone();
+    let child = declared
+        .tables
+        .get_mut(&TableName::new("dbo", "c"))
+        .unwrap();
+    child.columns.get_mut("code").unwrap().collation =
+        Some(pbps_model::Collation::new("Latin1_General_CS_AS"));
+    child.foreign_keys.insert(
+        "fk_c_p".into(),
+        ForeignKey {
+            columns: vec!["code".into()],
+            references_table: TableName::new("dbo", "p"),
+            references_columns: vec!["code".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    let step = plan(&start.schema, &ids, &declared, &ids);
+    let counts = probe_counts(&mut db.conn, &step).await;
+    let refused = try_apply(&mut db.conn, &step).await;
+    db.conn.execute("DELETE dbo.c WHERE id = 2;").await.unwrap();
+    let clean = probe_counts(&mut db.conn, &step).await;
+    let applied = try_apply(&mut db.conn, &step).await;
+    db.drop().await;
+    let orphans = |counts: &[(String, i32)]| {
+        counts
+            .iter()
+            .find(|(d, _)| d.contains("fk_c_p"))
+            .unwrap_or_else(|| panic!("no probe for fk_c_p in {counts:?}"))
+            .1
+    };
+    assert_eq!(orphans(&counts), 1, "{counts:?}");
+    assert!(refused.is_err(), "the engine refuses the orphan too");
+    assert_eq!(orphans(&clean), 0, "{clean:?}");
+    applied.unwrap_or_else(|e| panic!("the valid plan was refused: {e}"));
+}
+
 /// A collation the server lacks is named before any statement runs, and a
 /// known one in another case is not (#1175).
 #[tokio::test]
