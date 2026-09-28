@@ -289,6 +289,17 @@ fn check_decimal(ty: &ColumnType, p: i64, s: i64) -> Result<(), DialectError> {
     Ok(())
 }
 
+/// Whether an expression of this normalized base type takes a `COLLATE`.
+/// Measured on 17.0: these seven do, and anything else is refused (447,
+/// "Expression type decimal is invalid for COLLATE clause") — on a column
+/// declaration and on an expression alike (#1175).
+pub(crate) fn takes_collation(base: &str) -> bool {
+    matches!(
+        base,
+        "char" | "varchar" | "text" | "nchar" | "nvarchar" | "ntext" | "sysname"
+    )
+}
+
 /// Whether a type may hold a `NOT NULL` IDENTITY.
 pub fn can_be_identity(ty: &ColumnType) -> bool {
     let Ok(t) = normalize(ty) else {

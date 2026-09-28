@@ -1664,6 +1664,15 @@ pub(crate) fn declaration_problems(
     for problem in pbps_dialect::check_constraint_names(schema, dialect) {
         out.push(("schema.name-collision", problem));
     }
+    // And a fifth: a foreign key between two columns of different collations,
+    // which SQL Server refuses (1757) and only the whole schema can see
+    // (#1175).
+    // Offline, only two named collations that differ: an absent one is
+    // the target's default, and whether that matches a named one is asked
+    // again once `plan --db` knows it.
+    for problem in schema.foreign_key_collation_problems(false) {
+        out.push(("dialect.rejected", problem));
+    }
     // Roles (ADR-0005): a grant on an object nobody declares is the
     // foreign-key-target rule applied to permissions.
     for problem in pbps_model::role::check(schema) {
@@ -2731,6 +2740,7 @@ fn cmd_plan(
             pbps_model::PlanBaseline {
                 description: base.description.clone(),
                 checksum: pbps_model::state_checksum(&base.schema, &base.ids),
+                database_collation: None,
             },
             cs.clone(),
             res.ids.clone(),
@@ -3300,6 +3310,50 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
 
+    /// Offline, a foreign key between a column with no collation and one
+    /// naming a collation is not refused: it is valid exactly when the named
+    /// one is the target's default, which only `plan --db` knows (#1247
+    /// review). Two named collations that differ are refused (1757).
+    #[test]
+    fn a_foreign_key_collation_is_refused_offline_only_when_both_sides_name_one() {
+        let load = |child_collation: &str| {
+            let parent = pbps_load::load_table_str(
+                std::path::Path::new("p.yml"),
+                "table: dbo.p\ncolumns:\n  code:\n    type: varchar(10)\n    nullable: false\n    collation: Latin1_General_CI_AS\nprimary_key: [code]\n",
+            )
+            .unwrap();
+            let child = pbps_load::load_table_str(
+                std::path::Path::new("c.yml"),
+                &format!(
+                    "table: dbo.c\ncolumns:\n  code:\n    type: varchar(10)\n{child_collation}foreign_keys:\n  fk_c_p:\n    columns: [code]\n    references: dbo.p(code)\n"
+                ),
+            )
+            .unwrap();
+            let mut schema = pbps_model::Schema::default();
+            schema.tables.insert(parent.name, parent.table);
+            schema.tables.insert(child.name, child.table);
+            pbps_load::Loaded {
+                schema,
+                intents: Vec::new(),
+                hints: Default::default(),
+            }
+        };
+        let dialect = pbps_mssql::Mssql;
+        let fk = |l: &pbps_load::Loaded| {
+            declaration_problems(l, &dialect)
+                .into_iter()
+                .filter(|(_, m)| m.contains("fk_c_p"))
+                .count()
+        };
+        assert_eq!(
+            fk(&load("")),
+            0,
+            "absent facing named is the connected plan's question"
+        );
+        assert_eq!(fk(&load("    collation: Latin1_General_CS_AS\n")), 1);
+        assert_eq!(fk(&load("    collation: latin1_general_ci_as\n")), 0);
+    }
+
     /// #1203: a printed resume fills `--allow "<approved-risk-classes>"`
     /// with nothing for a plan that has no gated class, so an empty value
     /// parses and approves none; an unknown class is still refused.
@@ -3653,6 +3707,7 @@ mod tests {
                     PlanBaseline {
                         description: "test".into(),
                         checksum: "a".repeat(64),
+                        database_collation: None,
                     },
                     ChangeSet {
                         changes: vec![planned],

@@ -458,6 +458,7 @@ mod tests {
             PlanBaseline {
                 description: "fixture".into(),
                 checksum: "00".repeat(32),
+                database_collation: None,
             },
             changes,
             IdsFile::default(),

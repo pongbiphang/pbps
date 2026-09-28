@@ -61,6 +61,76 @@ impl Schema {
     pub fn get(&self, name: &TableName) -> Option<&Table> {
         self.tables.get(name)
     }
+
+    /// This schema with every column collation equal to `default` taken out
+    /// (#1175).
+    ///
+    /// The catalog reads a column under its database's default collation as
+    /// having none — an inherited default and the same name spelled out are
+    /// identical there (DECISIONS 443) — so a declaration that names the
+    /// target's default is compared as one that names nothing, or every
+    /// connected plan would alter the column to what it already is. Only
+    /// where the target's default is known: offline, the declaration stays as
+    /// written and an emitted `COLLATE` says exactly what it means.
+    pub fn without_collation(&self, default: &str) -> Schema {
+        let default = Collation::new(default);
+        let mut out = self.clone();
+        for table in out.tables.values_mut() {
+            for column in table.columns.values_mut() {
+                if column.collation.as_ref() == Some(&default) {
+                    column.collation = None;
+                }
+            }
+        }
+        out
+    }
+
+    /// Foreign keys whose two sides are declared under different collations
+    /// (#1175). Measured on SQL Server 17.0, the engine refuses one (1757,
+    /// "is not of same collation as referencing column"), so a plan with it
+    /// fails at apply.
+    ///
+    /// `default_known` says whether this schema's absent collations have
+    /// been resolved against a target ([`Schema::without_collation`]). Until
+    /// they have, an absent collation facing a named one is not a problem: it
+    /// is valid exactly when the named one is the target's default, which is
+    /// not known offline — refusing it there refused a valid plan (#1247
+    /// review). A connected plan asks again once the default is known.
+    pub fn foreign_key_collation_problems(&self, default_known: bool) -> Vec<String> {
+        let mut problems = Vec::new();
+        for (name, table) in &self.tables {
+            for (fk_name, fk) in &table.foreign_keys {
+                let Some(parent) = self.tables.get(&fk.references_table) else {
+                    continue;
+                };
+                for (local, referenced) in fk.columns.iter().zip(&fk.references_columns) {
+                    let (Some(l), Some(r)) =
+                        (table.columns.get(local), parent.columns.get(referenced))
+                    else {
+                        continue;
+                    };
+                    let undecided =
+                        !default_known && (l.collation.is_none() != r.collation.is_none());
+                    if l.collation != r.collation && !undecided {
+                        let say = |c: &Option<Collation>| {
+                            c.as_ref().map_or_else(
+                                || "the database default".to_owned(),
+                                |c| format!("`{c}`"),
+                            )
+                        };
+                        problems.push(format!(
+                            "{name}: foreign key `{fk_name}` joins `{local}` ({}) to {}.`{referenced}` \
+                             ({}); both sides of a foreign key must declare the same collation",
+                            say(&l.collation),
+                            fk.references_table,
+                            say(&r.collation)
+                        ));
+                    }
+                }
+            }
+        }
+        problems
+    }
 }
 
 impl Table {
@@ -279,6 +349,15 @@ pub struct Column {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<Identity>,
 
+    /// An explicit collation (#1175). `None` is the database's default
+    /// collation — whichever database the column is created in — which is
+    /// what a column declared without one gets, and what the reader reports
+    /// for a column whose collation is the connected database's own default:
+    /// the catalog cannot tell an inherited default from the same name spelled
+    /// out (DECISIONS 443).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collation: Option<Collation>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
@@ -299,6 +378,7 @@ impl Column {
             nullable: true,
             default: None,
             identity: None,
+            collation: None,
             description: None,
             deprecated: None,
         }
@@ -371,6 +451,65 @@ fn has_explicit_null_semantics(expression: &str, continues_ident: fn(char) -> bo
                 || word.eq_ignore_ascii_case("try_convert")
                 || word.eq_ignore_ascii_case("try_parse")
         })
+}
+
+/// A collation's name, compared the way the engine compares it (#1175).
+///
+/// SQL Server takes a collation name in any case — `latin1_general_ci_as`
+/// names `Latin1_General_CI_AS`, measured on 17.0 — and reads it back in its
+/// own spelling. Kept as written, and compared without ASCII case, so a
+/// declaration spelled one way and a read-back spelled the other are the one
+/// schema they are (constraint 1) instead of a change planned forever.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct Collation(String);
+
+impl Collation {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn key(&self) -> impl Iterator<Item = u8> + '_ {
+        self.0.bytes().map(|b| b.to_ascii_lowercase())
+    }
+}
+
+impl PartialEq for Collation {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq_ignore_ascii_case(&other.0)
+    }
+}
+
+impl Eq for Collation {}
+
+impl PartialOrd for Collation {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Collation {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key().cmp(other.key())
+    }
+}
+
+impl std::hash::Hash for Collation {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        for b in self.key() {
+            state.write_u8(b);
+        }
+    }
+}
+
+impl std::fmt::Display for Collation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -641,6 +780,92 @@ mod tests {
         let json = serde_json::to_string(&heap).unwrap();
         assert!(json.contains(r#""clustered":"heap""#), "{json}");
         assert_eq!(serde_json::from_str::<Table>(&json).unwrap(), heap);
+    }
+
+    /// A collation name compares the way the engine resolves one, without
+    /// case, and a declaration naming the target's default compares as one
+    /// naming none (#1175).
+    #[test]
+    fn collations_compare_without_case_and_the_default_drops_out() {
+        assert_eq!(
+            Collation::new("Latin1_General_CS_AS"),
+            Collation::new("latin1_general_cs_as")
+        );
+        assert_ne!(
+            Collation::new("Latin1_General_CS_AS"),
+            Collation::new("Latin1_General_CI_AS")
+        );
+        let mut s = Schema::default();
+        let mut t = sample();
+        t.columns.get_mut("email").unwrap().collation =
+            Some(Collation::new("latin1_general_ci_as"));
+        t.columns.get_mut("customer_id").unwrap().collation =
+            Some(Collation::new("Latin1_General_BIN2"));
+        s.tables.insert(TableName::new("dbo", "customer"), t);
+        let normal = s.without_collation("Latin1_General_CI_AS");
+        let t = &normal.tables[&TableName::new("dbo", "customer")];
+        assert_eq!(t.columns["email"].collation, None);
+        // Negative: another collation stays.
+        assert!(t.columns["customer_id"].collation.is_some());
+    }
+
+    /// A foreign key between two collations is refused (1757 on SQL Server),
+    /// and so is a named collation facing an absent one (#1175).
+    #[test]
+    fn a_foreign_key_across_collations_is_a_problem() {
+        let mut parent = sample();
+        parent.columns.get_mut("email").unwrap().collation =
+            Some(Collation::new("Latin1_General_CS_AS"));
+        parent.unique.insert(
+            "uq_email".into(),
+            UniqueConstraint {
+                columns: vec!["email".into()],
+            },
+        );
+        let mut child = Table::default();
+        child
+            .columns
+            .insert("email".into(), Column::new(ty("nvarchar(255)")));
+        child.foreign_keys.insert(
+            "fk_child_email".into(),
+            ForeignKey {
+                columns: vec!["email".into()],
+                references_table: TableName::new("dbo", "customer"),
+                references_columns: vec!["email".into()],
+                on_delete: ReferentialAction::NoAction,
+                on_update: ReferentialAction::NoAction,
+            },
+        );
+        let mut s = Schema::default();
+        s.tables.insert(TableName::new("dbo", "customer"), parent);
+        s.tables.insert(TableName::new("dbo", "child"), child);
+        let set_child = |s: &mut Schema, collation: &str| {
+            s.tables
+                .get_mut(&TableName::new("dbo", "child"))
+                .unwrap()
+                .columns
+                .get_mut("email")
+                .unwrap()
+                .collation = Some(Collation::new(collation));
+        };
+        // Absent facing named: undecidable offline, so not refused there; a
+        // problem once the target's default is known and is not the named
+        // one (the schema then has the default taken out already).
+        assert!(s.foreign_key_collation_problems(false).is_empty());
+        let problems = s.foreign_key_collation_problems(true);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("fk_child_email"), "{problems:?}");
+        // Named on the target's default: normalized away, and valid.
+        assert!(
+            s.without_collation("Latin1_General_CS_AS")
+                .foreign_key_collation_problems(true)
+                .is_empty()
+        );
+        // Two named collations that differ: refused even offline.
+        set_child(&mut s, "Latin1_General_CI_AS");
+        assert_eq!(s.foreign_key_collation_problems(false).len(), 1);
+        set_child(&mut s, "latin1_general_cs_as");
+        assert!(s.foreign_key_collation_problems(true).is_empty());
     }
 
     /// Column order affects CREATE TABLE output, so it has to be preserved.

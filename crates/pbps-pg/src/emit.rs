@@ -726,6 +726,9 @@ fn null_clause(nullable: bool) -> &'static str {
 
 /// One line of a `CREATE TABLE` column list, or the body of an `ALTER TABLE ADD`.
 fn column_definition(name: &str, column: &Column) -> Result<String, DialectError> {
+    if let Some(collation) = &column.collation {
+        return Err(no_column_collation(name, collation));
+    }
     let mut s = format!("{} {}", quote(name)?, types::normalize(&column.ty)?);
     if let Some(id) = column.identity {
         // `GENERATED ALWAYS`, never `BY DEFAULT`: the model holds a seed and an
@@ -2061,6 +2064,22 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
 
         Change::AlterColumnType {
             column,
+            to_collation: Some(collation),
+            ..
+        }
+        | Change::AlterColumnType {
+            column,
+            from_collation: Some(collation),
+            ..
+        }
+        | Change::AlterColumnNullability {
+            column,
+            collation: Some(collation),
+            ..
+        } => Err(no_column_collation(&column.to_string(), collation)),
+
+        Change::AlterColumnType {
+            column,
             from,
             to,
             from_nullable,
@@ -2609,6 +2628,16 @@ fn change_is_clustered(change: &Change) -> bool {
 }
 
 /// The refusal for a SQL Server table layout reaching this emitter (#1178).
+/// The refusal for a column collation reaching this emitter (#1175): the
+/// model's collation is SQL Server's, `validate` refuses it here, and a
+/// statement without it would build the column under another collation.
+fn no_column_collation(column: &str, collation: &pbps_model::Collation) -> DialectError {
+    invalid(format!(
+        "column `{column}` names collation `{collation}`; column collations are modelled for \
+         SQL Server only"
+    ))
+}
+
 fn no_clustered_layout(table: &TableName) -> DialectError {
     invalid(format!(
         "`{table}`: a clustered or nonclustered layout is SQL Server's; PostgreSQL has no \
@@ -3366,6 +3395,50 @@ mod tests {
 
     fn permissions(list: &[Permission]) -> BTreeSet<Permission> {
         list.iter().copied().collect()
+    }
+
+    /// A column collation reaches this emitter only past `validate`; every
+    /// change carrying one is refused rather than emitted without it (#1175).
+    #[test]
+    fn a_change_carrying_a_column_collation_is_refused_here() {
+        let pg = Postgres::new();
+        let collation = Some(pbps_model::Collation::new("C"));
+        let column = ColumnRef {
+            table: name("app", "t"),
+            name: "c".into(),
+        };
+        let mut c = Column::new(ty("text"));
+        c.collation = collation.clone();
+        for change in [
+            Change::AlterColumnType {
+                uid: Uid::generate(UidKind::Column),
+                column: column.clone(),
+                from: ty("text"),
+                to: ty("text"),
+                from_nullable: true,
+                to_nullable: true,
+                from_collation: None,
+                to_collation: collation.clone(),
+            },
+            Change::AlterColumnNullability {
+                uid: Uid::generate(UidKind::Column),
+                column: column.clone(),
+                ty: ty("text"),
+                to_nullable: false,
+                collation: collation.clone(),
+            },
+            Change::AddColumn {
+                uid: Uid::generate(UidKind::Column),
+                table: name("app", "t"),
+                name: "c".into(),
+                column: Box::new(c.clone()),
+            },
+        ] {
+            let e = pg
+                .emit(&change, Strategy::default())
+                .expect_err("a SQL Server collation");
+            assert!(e.to_string().contains("SQL Server only"), "{e}");
+        }
     }
 
     /// A layout only SQL Server has reaches this emitter only by a path that
@@ -4693,6 +4766,8 @@ mod tests {
             to: ty(to),
             from_nullable: false,
             to_nullable: false,
+            from_collation: None,
+            to_collation: None,
         }
     }
 

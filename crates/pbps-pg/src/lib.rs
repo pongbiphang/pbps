@@ -2593,6 +2593,18 @@ mod tests {
         }
     }
 
+    /// A column collation is SQL Server's in the model; this engine refuses
+    /// the key rather than create the column under another one (#1175).
+    #[test]
+    fn a_column_collation_is_refused_on_this_engine() {
+        let mut table = structural_table();
+        assert!(structural_errors(&table).is_empty());
+        table.columns.get_mut("a").unwrap().collation = Some(pbps_model::Collation::new("C"));
+        let errors = structural_errors(&table);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("SQL Server only"), "{errors:?}");
+    }
+
     /// `clustered` is SQL Server's table layout; this engine has no clustered
     /// index to create, so the line is refused whatever it names — even a
     /// well-formed selector (#1178).

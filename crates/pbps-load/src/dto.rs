@@ -403,6 +403,11 @@ pub struct ColumnDto {
     #[serde(default)]
     pub identity: Option<[i64; 2]>,
 
+    /// An explicit collation, on SQL Server (`Latin1_General_CS_AS`). Absent
+    /// means the collation of the database the column is created in.
+    #[serde(default)]
+    pub collation: Option<String>,
+
     #[serde(default)]
     pub description: Option<String>,
 

@@ -321,13 +321,19 @@ async fn rehearse_in(
     let engine = scoped
         .schema
         .with_observed_rows(&rows, &declared_data, declared)?;
+    // As `plan --db` compares it: a collation equal to this database's
+    // default reads back as none (#1175).
+    let declared_here = match &built.database_collation {
+        Some(default) => declared.without_collation(default),
+        None => declared.clone(),
+    };
     let remaining = pbps_diff::diff(
         pbps_diff::Side {
             schema: &engine,
             ids: &observed,
         },
         pbps_diff::Side {
-            schema: declared,
+            schema: &declared_here,
             ids: declared_ids,
         },
         dialect,

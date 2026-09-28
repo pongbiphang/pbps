@@ -215,6 +215,20 @@ impl OwnDatabase {
         }
     }
 
+    /// The same, with a default collation of the test's choosing (#1175).
+    fn collated(server: &str, slug: &str, collation: &str) -> Self {
+        let name = format!("pbps_cli_{slug}_{}", std::process::id());
+        on_server(
+            server,
+            &format!("CREATE DATABASE [{name}] COLLATE {collation};"),
+        );
+        Self {
+            server: server.to_owned(),
+            connection: with_key(server, "Database", &name),
+            name,
+        }
+    }
+
     /// What to pass to `--db`.
     fn connection(&self) -> &str {
         &self.connection
@@ -2052,6 +2066,304 @@ fn a_synonym_at_an_added_checks_name_refuses_the_plan() {
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
 }
 
+/// A column collation goes the whole way through the CLI (#1175). `pull`
+/// declares a column collated away from its database's default, `bootstrap`
+/// rebuilds it onto a database with another default, and a second `pull`
+/// writes the same files. A declaration naming the target's own default
+/// plans nothing; a collation change is a gated plan that applies and
+/// leaves nothing to plan; and a collation the server lacks is refused by
+/// name before any statement runs.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_column_collation_round_trips_and_changes_through_the_cli() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let source = OwnDatabase::collated(&server, "coll1175_src", "Latin1_General_CI_AS");
+    let target = OwnDatabase::collated(&server, "coll1175_dst", "Latin1_General_100_CS_AS_SC_UTF8");
+    on_server(
+        source.connection(),
+        "CREATE TABLE dbo.t (
+             code varchar(10) COLLATE Latin1_General_CS_AS NOT NULL CONSTRAINT pk_t PRIMARY KEY,
+             note varchar(20) NULL
+         );
+         INSERT dbo.t VALUES ('abc', 'x'), ('ABC', 'y');",
+    );
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let file = |d: &Demo| std::fs::read_to_string(d.dir.join("schema/dbo.t.yml")).unwrap();
+
+    let d = Demo::new("coll1175");
+    ok(&d.run(&["pull", "--db", source.connection()]));
+    assert!(
+        file(&d).contains("    collation: Latin1_General_CS_AS\n"),
+        "{}",
+        file(&d)
+    );
+    assert_eq!(file(&d).matches("collation").count(), 1, "{}", file(&d));
+    d.commit();
+    ok(&d.run(&["bootstrap", "--db", target.connection()]));
+    let again = Demo::new("coll1175-again");
+    ok(&again.run(&["pull", "--db", target.connection()]));
+    assert_eq!(file(&again), file(&d));
+
+    // Adopt the source. Naming its default on `note` changes nothing there.
+    ok(&d.run(&["baseline", "--db", source.connection(), "--reason", "adopt"]));
+    let path = d.dir.join("schema/dbo.t.yml");
+    let pulled = file(&d);
+    let set_note = |collation: &str| {
+        let text = pulled.replacen(
+            "  note:\n    type: varchar(20)\n",
+            &format!("  note:\n    type: varchar(20)\n    collation: {collation}\n"),
+            1,
+        );
+        assert_ne!(text, pulled, "{pulled}");
+        std::fs::write(&path, text).unwrap();
+    };
+    set_note("latin1_general_ci_as");
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let o = d.run(&["plan", "--db", source.connection()]);
+    ok(&o);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+
+    // A name the server does not have is refused before anything runs.
+    set_note("No_Such_Collation");
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let o = d.run(&["plan", "--db", source.connection()]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(stderr(&o).contains("`No_Such_Collation`"), "{}", stderr(&o));
+
+    // A real change: `note` becomes case-sensitive. Gated as the narrowing a
+    // non-Unicode column's collation change is, applied, and done.
+    set_note("Latin1_General_CS_AS");
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    ok(&d.run(&[
+        "plan",
+        "--db",
+        source.connection(),
+        "--out",
+        plan.to_str().unwrap(),
+    ]));
+    let checksum = plan_checksum(&plan);
+    let apply = |allow: &[&str]| {
+        let mut args = vec![
+            "apply",
+            "--db",
+            source.connection(),
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+        ];
+        args.extend_from_slice(allow);
+        d.run(&args)
+    };
+    let refused = apply(&[]);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        stderr(&refused).contains("narrowing"),
+        "{}",
+        stderr(&refused)
+    );
+    ok(&apply(&["--allow", "narrowing"]));
+    let o = d.run(&["plan", "--db", source.connection()]);
+    ok(&o);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+    on_server(
+        source.connection(),
+        "IF (SELECT collation_name FROM sys.columns
+              WHERE object_id = OBJECT_ID('dbo.t') AND name = 'note') <> 'Latin1_General_CS_AS'
+             THROW 50000, 'note was not moved', 1;
+         IF (SELECT COUNT(*) FROM dbo.t) <> 2 THROW 50000, 'rows lost', 1;",
+    );
+
+    // A foreign key from a column with no collation into the case-sensitive
+    // `code`: valid offline, since only the target knows its default, and
+    // refused by the connected plan once it does (1757), before anything
+    // runs. Declared under the same collation, it plans (#1247 review).
+    let child = |collation: &str| {
+        std::fs::write(
+            d.dir.join("schema/dbo.c.yml"),
+            format!(
+                "table: dbo.c\ncolumns:\n  code:\n    type: varchar(10)\n{collation}\
+                 foreign_keys:\n  fk_c_t:\n    columns: [code]\n    references: dbo.t(code)\n"
+            ),
+        )
+        .unwrap();
+    };
+    child("");
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let o = d.run(&["plan", "--db", source.connection()]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(stderr(&o).contains("fk_c_t"), "{}", stderr(&o));
+    child("    collation: Latin1_General_CS_AS\n");
+    ok(&d.run(&["plan"]));
+    d.commit();
+    ok(&d.run(&["plan", "--db", source.connection()]));
+
+    // A column added with no collation takes the default in force when it
+    // runs, and no managed column sits under the default here to move the
+    // checksum. So the plan pins the default, and an apply after it changed
+    // is refused before the first statement (#1247 review); put back, the
+    // same plan applies.
+    let with_extra = file(&d).replacen(
+        "\nprimary_key:",
+        "\n  extra:\n    type: varchar(5)\n\nprimary_key:",
+        1,
+    );
+    assert_ne!(with_extra, file(&d));
+    std::fs::write(&path, with_extra).unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan-extra.json");
+    ok(&d.run(&[
+        "plan",
+        "--db",
+        source.connection(),
+        "--out",
+        plan.to_str().unwrap(),
+    ]));
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+    assert_eq!(
+        saved["baseline"]["database_collation"], "Latin1_General_CI_AS",
+        "{saved}"
+    );
+    let checksum = plan_checksum(&plan);
+    // Measured: the ledger's own CHECK on `__pbps_lock` depends on the
+    // database collation, so the engine refuses to change it (5075) until
+    // that check is gone — which is what someone changing it has to do.
+    let recollate_database = |collation: &str| {
+        on_server(
+            &server,
+            &format!(
+                "USE [{0}]; ALTER TABLE dbo.__pbps_lock DROP CONSTRAINT ck___pbps_lock_single;
+                 USE master;
+                 ALTER DATABASE [{0}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+                 ALTER DATABASE [{0}] COLLATE {collation};
+                 ALTER DATABASE [{0}] SET MULTI_USER;
+                 USE [{0}];
+                 ALTER TABLE dbo.__pbps_lock ADD CONSTRAINT ck___pbps_lock_single CHECK (id = 1);",
+                source.name()
+            ),
+        );
+    };
+    let apply_extra = || {
+        d.run(&[
+            "apply",
+            "--db",
+            source.connection(),
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+            "--allow",
+            "constraint",
+        ])
+    };
+    recollate_database("Latin1_General_BIN2");
+    let refused = apply_extra();
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        stderr(&refused).contains("default collation `Latin1_General_BIN2` now"),
+        "{}",
+        stderr(&refused)
+    );
+    recollate_database("Latin1_General_CI_AS");
+    ok(&apply_extra());
+}
+
+/// A staged run resumed after the database's default collation changed is
+/// refused before its remaining statements, as a fresh apply is: the plan
+/// pinned the default, and a statement still to run that leaves a column with
+/// no collation would take the new one (#1247 review). Pinned to the default
+/// the database has, the same resume runs.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_staged_resume_rechecks_the_pinned_default_collation() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::collated(&server, "coll1175_resume", "Latin1_General_CI_AS");
+    let connection = own.connection().to_owned();
+    let d = Demo::new("coll1175-resume");
+    d.table("table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n");
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    ok(&d.run(&["plan"]));
+    d.commit();
+    ok(&d.run(&["bootstrap", "--db", &connection]));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let resume = |pinned: &str, view: &str| {
+        let latest = rt.block_on(async {
+            let mut conn = connect_live(&connection).await.unwrap();
+            pbps_mssql::state::latest(&mut conn).await.unwrap().unwrap()
+        });
+        let plan = pbps_model::SavedPlan::new(
+            pbps_model::PlanOrigin::Database,
+            "mssql",
+            "2026-09-28T00:00:00Z",
+            pbps_model::PlanBaseline {
+                description: "paused".into(),
+                checksum: pbps_model::state_checksum(&latest.snapshot.schema, &latest.snapshot.ids),
+                database_collation: Some(pinned.to_owned()),
+            },
+            pbps_model::ChangeSet {
+                changes: vec![pbps_model::PlannedChange::new(
+                    pbps_model::Change::CreateModule {
+                        id: format!("dbo.{view}").parse().unwrap(),
+                        module: Box::new(pbps_model::Module {
+                            kind: pbps_model::ModuleKind::View,
+                            description: None,
+                            definition: "SELECT 1 AS id".into(),
+                        }),
+                    },
+                )],
+            },
+            latest.snapshot.ids.clone(),
+        )
+        .staged();
+        let path = d.dir.join(format!("{view}.json"));
+        std::fs::write(&path, serde_json::to_string_pretty(&plan).unwrap()).unwrap();
+        let checksum = plan.checksum();
+        rt.block_on(async {
+            let mut conn = connect_live(&connection).await.unwrap();
+            let mut checkpoint = latest.snapshot.clone();
+            checkpoint.kind = pbps_model::StateKind::Staged;
+            checkpoint.plan_checksum = Some(checksum.clone());
+            checkpoint.staged = Some(pbps_model::StagedProgress {
+                completed: 0,
+                total: 1,
+                last_statement: String::new(),
+            });
+            pbps_mssql::state::record(&mut conn, &checkpoint)
+                .await
+                .unwrap();
+        });
+        d.run(&[
+            "apply",
+            "--db",
+            &connection,
+            "--plan",
+            path.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+            "--staged",
+            "--resume",
+        ])
+    };
+    let refused = resume("Latin1_General_BIN2", "v_refused");
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        stderr(&refused).contains("computed against `Latin1_General_BIN2`"),
+        "{}",
+        stderr(&refused)
+    );
+    ok(&resume("Latin1_General_CI_AS", "v_resumed"));
+}
+
 /// A table's clustered layout goes the whole way through the CLI (#1178):
 /// `pull` declares it, `bootstrap` rebuilds it in an empty database, and a
 /// second `pull` from there writes the same files. Moving it on an adopted,
@@ -3144,6 +3456,7 @@ fn apply_refuses_a_plan_that_relabels_a_rebuilt_routine_as_a_fresh_one() {
         pbps_model::PlanBaseline {
             description: "test as queried".into(),
             checksum: "0".repeat(64),
+            database_collation: None,
         },
         pbps_model::ChangeSet {
             changes: vec![
@@ -3210,6 +3523,7 @@ fn apply_refuses_a_plan_that_builds_a_routine_and_settles_nothing_about_public()
         pbps_model::PlanBaseline {
             description: "test as queried".into(),
             checksum: "0".repeat(64),
+            database_collation: None,
         },
         pbps_model::ChangeSet {
             changes: vec![pbps_model::PlannedChange {
@@ -3266,6 +3580,7 @@ fn apply_refuses_a_plan_whose_risks_were_removed() {
         pbps_model::PlanBaseline {
             description: "test as queried".into(),
             checksum: "0".repeat(64),
+            database_collation: None,
         },
         pbps_model::ChangeSet {
             changes: vec![pbps_model::PlannedChange {
@@ -3698,6 +4013,7 @@ fn staged_cardinality_plan(dialect: &str, count: usize, staged: bool) -> pbps_mo
         PlanBaseline {
             description: "cardinality fixture".into(),
             checksum: "0".repeat(64),
+            database_collation: None,
         },
         ChangeSet { changes },
         ids,
@@ -12716,6 +13032,7 @@ fn a_failed_resume_does_not_relabel_the_interrupted_plan() {
         pbps_model::PlanBaseline {
             description: "interrupted checkpoint".into(),
             checksum: pbps_model::state_checksum(&checkpoint.schema, &checkpoint.ids),
+            database_collation: None,
         },
         pbps_model::ChangeSet {
             changes: vec![pbps_model::PlannedChange::new(

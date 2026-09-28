@@ -126,7 +126,14 @@ use crate::schema::Schema;
 ///
 /// Bumped to 12 for required analysis provenance and sealed resolver evidence.
 /// Omitting analysis must never downgrade a resolved plan to an ordinary one.
-pub const CURRENT_VERSION: u32 = 12;
+///
+/// Bumped to 13 for column collations (#1175): `Column::collation` in a
+/// created table's or added column's payload, and the collation fields of
+/// `AlterColumnType` and `AlterColumnNullability`. A version 12 plan read by
+/// this build would restate every `ALTER COLUMN` without a collation, which
+/// this build's emitter reads as the database default — moving a collated
+/// column to it, the silent reset the fields exist to prevent.
+pub const CURRENT_VERSION: u32 = 13;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -198,6 +205,16 @@ pub struct PlanBaseline {
     /// [`state_checksum`] of the baseline. `apply` recomputes it from the live
     /// database; a mismatch is drift and stops the apply.
     pub checksum: String,
+
+    /// The target database's default collation when the plan was computed,
+    /// where the engine has column collations (#1175). A column the plan
+    /// creates or alters with no collation takes whatever the default is when
+    /// the statement runs, and the read-back reads that as no collation
+    /// again, so a default changed since planning is invisible to the
+    /// checksum above whenever no managed character column sits under it.
+    /// `apply` refuses before the first statement unless it is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_collation: Option<String>,
 }
 
 /// A plan as written to disk by `pbps plan --out`.
@@ -517,6 +534,7 @@ mod tests {
             PlanBaseline {
                 description: "prod as queried".into(),
                 checksum: state_checksum(&schema_with("nvarchar(255)"), &IdsFile::default()),
+                database_collation: None,
             },
             cs,
             ids_with("t_a1b2c3"),
@@ -574,7 +592,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 12);
+        assert_eq!(CURRENT_VERSION, 13);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads
@@ -589,6 +607,7 @@ mod tests {
             PlanBaseline {
                 description: "d".into(),
                 checksum: "c".into(),
+                database_collation: None,
             },
             ChangeSet::default(),
             IdsFile::default(),

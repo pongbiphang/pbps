@@ -610,6 +610,7 @@ mod tests {
             column: table().column("name"),
             ty: "int".parse().unwrap(),
             to_nullable: false,
+            collation: None,
         });
         // A widening type change that also tightens: `Narrowing` is not among
         // its risks, and it is still a contraction.
@@ -620,6 +621,8 @@ mod tests {
             to: "bigint".parse().unwrap(),
             from_nullable: true,
             to_nullable: false,
+            from_collation: None,
+            to_collation: None,
         });
         assert!(
             !widen_and_tighten.risks.contains(&RiskClass::Narrowing),
@@ -643,6 +646,7 @@ mod tests {
             column: table().column("name"),
             ty: "int".parse().unwrap(),
             to_nullable: true,
+            collation: None,
         });
         assert!(plan(&cs(vec![add.clone(), loosen]), &Policies::default(), &ctx()).is_empty());
 
@@ -678,6 +682,8 @@ mod tests {
             to: "int".parse().unwrap(),
             from_nullable: true,
             to_nullable: true,
+            from_collation: None,
+            to_collation: None,
         })
         .with_risk(RiskClass::Narrowing);
         let grant = PlannedChange::new(Change::Grant {

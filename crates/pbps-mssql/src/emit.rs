@@ -20,8 +20,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::{Created, DialectError, Statement};
 use pbps_model::{
-    Cell, Change, Column, ColumnType, ForeignKey, GrantTarget, Index, Module, ModuleId, ModuleKind,
-    Permission, PrimaryKey, ReferentialAction, Row, RowKey, Strategy, Table, TableName,
+    Cell, Change, Collation, Column, ColumnType, ForeignKey, GrantTarget, Index, Module, ModuleId,
+    ModuleKind, Permission, PrimaryKey, ReferentialAction, Row, RowKey, Strategy, Table, TableName,
     UniqueConstraint, Value,
 };
 
@@ -519,14 +519,16 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             column,
             to,
             to_nullable,
+            to_collation,
             ..
         } => {
             let normalized = types::normalize(to)?;
             let alter = format!(
-                "ALTER TABLE {} ALTER COLUMN {} {} {}{};",
+                "ALTER TABLE {} ALTER COLUMN {} {}{} {}{};",
                 qualified(&column.table)?,
                 quote(&column.name)?,
                 normalized,
+                collate_clause(to_collation.as_ref())?,
                 null_clause(*to_nullable),
                 online(strategy)
             );
@@ -544,6 +546,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             column,
             ty,
             to_nullable,
+            collation,
             ..
         } => {
             // `CREATE TABLE` accepts nullable timestamp / rowversion, but the
@@ -560,10 +563,11 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             }
             let normalized = types::normalize(ty)?;
             one(format!(
-                "ALTER TABLE {} ALTER COLUMN {} {} {}{};",
+                "ALTER TABLE {} ALTER COLUMN {} {}{} {}{};",
                 qualified(&column.table)?,
                 quote(&column.name)?,
                 normalized,
+                collate_clause(collation.as_ref())?,
                 null_clause(*to_nullable),
                 online(strategy)
             ))
@@ -1047,7 +1051,7 @@ fn recorded_cell(
             // `geography` (DECISIONS 471): there is no expression that puts
             // the recorded text back through that type, so there is nothing
             // to compare the converted column with.
-            let Some(expected) = ty.as_stored(&recorded) else {
+            let Some(expected) = ty.as_stored(&recorded, &quoted) else {
                 return Ok(None);
             };
             Some(format!(
@@ -1120,10 +1124,18 @@ impl<'a> Held<'a> {
     /// `TRY_CONVERT` so that a recorded value the new type cannot hold reads
     /// as "not what the plan recorded" rather than raising Msg 245 from
     /// inside the write.
-    fn converted(self, value: &str) -> String {
+    ///
+    /// The `ALTER` converted under the column's collation, which `value` does
+    /// not carry: `stored` is the column, to lend it
+    /// ([`crate::rows::in_column_collation`]).
+    fn converted(self, value: &str, stored: &str) -> String {
         match self.retyped() {
             false => value.to_owned(),
-            true => format!("TRY_CONVERT({}, {value})", self.now()),
+            true => {
+                let now = self.now();
+                let value = crate::rows::in_column_collation(stored, value, &now.base);
+                format!("TRY_CONVERT({now}, {value})")
+            }
         }
     }
 
@@ -1145,13 +1157,13 @@ impl<'a> Held<'a> {
     /// `geography` ([`crate::rows::from_text`], which measures why for each).
     /// A column this plan leaves alone never converts anything, so it is
     /// always held, whatever its type.
-    fn as_stored(self, recorded: &str) -> Option<String> {
+    fn as_stored(self, recorded: &str, stored: &str) -> Option<String> {
         if !self.retyped() {
             return Some(recorded.to_owned());
         }
         let now = self.now();
         Some(crate::rows::read_expr(
-            &self.converted(&crate::rows::from_text(recorded, &self.read())?),
+            &self.converted(&crate::rows::from_text(recorded, &self.read())?, stored),
             &now.base,
         ))
     }
@@ -1251,7 +1263,10 @@ fn defaulted_cell(
     // The default converted to the type the column had when the row was
     // written, and then — where this plan retypes it — the way the `ALTER`
     // converted the column itself.
-    let at_default = ty.converted(&format!("CONVERT({read}, {default})"));
+    // Both under the column's collation, which a literal default does not
+    // carry (#1247 review).
+    let lent = crate::rows::in_column_collation(&quoted, &default, &now.base);
+    let at_default = ty.converted(&format!("CONVERT({read}, {lent})"), &quoted);
     // A default of `NULL` references nothing and compares to nothing; both
     // halves are spelled so the one predicate covers it.
     Ok(Some(format!(
@@ -1459,7 +1474,12 @@ fn column_definition(
     name: &str,
     column: &Column,
 ) -> Result<String, DialectError> {
-    let mut s = format!("{} {}", quote(name)?, types::normalize(&column.ty)?);
+    let mut s = format!(
+        "{} {}{}",
+        quote(name)?,
+        types::normalize(&column.ty)?,
+        collate_clause(column.collation.as_ref())?
+    );
     if let Some(id) = column.identity {
         s.push_str(&format!(" IDENTITY({},{})", id.seed, id.increment));
     }
@@ -1485,6 +1505,33 @@ fn column_definition(
 /// `CLUSTERED`, the same statement is refused (1902) instead, so a plan that
 /// meets a clustered index it did not expect stops rather than recording a key
 /// laid out otherwise than declared (#1178).
+/// ` COLLATE <name>` for an explicit collation, and nothing for the database
+/// default (#1175).
+///
+/// Spelled on every statement that writes a column definition, including an
+/// `ALTER COLUMN` whose collation does not change: the statement restates the
+/// whole column, and an omitted `COLLATE` there moves the column to the
+/// database default without a word (measured on 17.0). The name is a bare
+/// word in code position, so it is held to the characters every SQL Server
+/// collation name is made of rather than quoted — the engine takes no quoted
+/// collation name.
+pub(crate) fn collate_clause(collation: Option<&Collation>) -> Result<String, DialectError> {
+    let Some(collation) = collation else {
+        return Ok(String::new());
+    };
+    let name = collation.as_str();
+    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return Err(DialectError::Invalid {
+            dialect: DIALECT,
+            message: format!(
+                "collation `{name}` is not a SQL Server collation name: those are letters, \
+                 digits and `_`"
+            ),
+        });
+    }
+    Ok(format!(" COLLATE {name}"))
+}
+
 fn primary_key_clause(pk: &PrimaryKey, clustered: bool) -> Result<String, DialectError> {
     let cols = column_list(&pk.columns)?;
     let layout = if clustered {
@@ -2125,6 +2172,73 @@ mod tests {
         }
     }
 
+    /// A collation is written where the column is defined and restated on
+    /// every `ALTER COLUMN`, whose omitted `COLLATE` resets the column to the
+    /// database default (measured on 17.0; #1175). None writes nothing.
+    #[test]
+    fn a_collation_is_written_and_restated_on_every_alter() {
+        use pbps_model::Collation;
+        let cs = Some(Collation::new("Latin1_General_CS_AS"));
+        let mut c = Column::new(ty("varchar(10)")).not_null();
+        c.collation = cs.clone();
+        let mut t = Table::default();
+        t.columns.insert("code".into(), c.clone());
+        let created = sql_of(&Change::CreateTable {
+            uid: uid("t_k7x2mq"),
+            name: tname("dbo.t"),
+            table: Box::new(t),
+        });
+        assert!(
+            created[0].contains("[code] varchar(10) COLLATE Latin1_General_CS_AS NOT NULL"),
+            "{}",
+            created[0]
+        );
+        let retyped = sql_of(&Change::AlterColumnType {
+            uid: uid("c_k7x2mq"),
+            column: cref("dbo.t.code"),
+            from: ty("varchar(10)"),
+            to: ty("varchar(20)"),
+            from_nullable: false,
+            to_nullable: false,
+            from_collation: cs.clone(),
+            to_collation: cs.clone(),
+        });
+        assert!(
+            retyped[0]
+                .contains("ALTER COLUMN [code] varchar(20) COLLATE Latin1_General_CS_AS NOT NULL"),
+            "{}",
+            retyped[0]
+        );
+        let relaxed = sql_of(&Change::AlterColumnNullability {
+            uid: uid("c_k7x2mq"),
+            column: cref("dbo.t.code"),
+            ty: ty("varchar(10)"),
+            to_nullable: true,
+            collation: cs,
+        });
+        assert_eq!(
+            relaxed,
+            [
+                "ALTER TABLE [dbo].[t] ALTER COLUMN [code] varchar(10) COLLATE Latin1_General_CS_AS NULL;"
+            ]
+        );
+        // The default collation writes nothing: the column follows the
+        // database it is created in.
+        let plain = sql_of(&Change::AlterColumnNullability {
+            uid: uid("c_k7x2mq"),
+            column: cref("dbo.t.code"),
+            ty: ty("varchar(10)"),
+            to_nullable: true,
+            collation: None,
+        });
+        assert_eq!(
+            plain,
+            ["ALTER TABLE [dbo].[t] ALTER COLUMN [code] varchar(10) NULL;"]
+        );
+        // Negative: a name that is not one is refused, never interpolated.
+        assert!(collate_clause(Some(&Collation::new("x; DROP TABLE t"))).is_err());
+    }
+
     /// Nullability is never implicit: an omitted clause means NULL to the
     /// server, so every column definition must say which it is.
     #[test]
@@ -2192,6 +2306,8 @@ mod tests {
             to: ty("bigint"),
             from_nullable: false,
             to_nullable: false,
+            from_collation: None,
+            to_collation: None,
         });
         assert_eq!(sql.len(), 1);
         assert!(sql[0].contains("ALTER TABLE [dbo].[t] ALTER COLUMN [amount] bigint NOT NULL;"));
@@ -2204,6 +2320,7 @@ mod tests {
             column: cref("dbo.t.email"),
             ty: ty("nvarchar(255)"),
             to_nullable: false,
+            collation: None,
         });
         assert_eq!(
             sql,
@@ -2219,6 +2336,7 @@ mod tests {
                 column: cref("dbo.t.version"),
                 ty: ty(spelling),
                 to_nullable: true,
+                collation: None,
             };
             let msg = emit(&change, Strategy::default()).unwrap_err().to_string();
             assert!(msg.contains("`dbo.t.version`"), "{spelling}: {msg}");
@@ -2235,6 +2353,7 @@ mod tests {
                 column: cref("dbo.t.version"),
                 ty: ty("varbinary(8)"),
                 to_nullable: false,
+                collation: None,
             }),
             ["ALTER TABLE [dbo].[t] ALTER COLUMN [version] varbinary(8) NOT NULL;"]
         );
@@ -3008,6 +3127,7 @@ mod tests {
                 column: cref("dbo.order_line.note"),
                 ty: ty("nvarchar(100)"),
                 to_nullable: false,
+                collation: None,
             }),
             [
                 "ALTER TABLE [dbo].[order_line] ALTER COLUMN [note] nvarchar(100) NOT NULL WITH (ONLINE = ON);"

@@ -26,6 +26,10 @@ the UNIQUE constraint or index that holds the rows; absent is a clustered
 primary key), and `pull` reads it (#1178, DEC-1178.1). PostgreSQL refuses the
 field. Columnstore, XML, spatial and hash indexes stay limitations.
 
+A SQL Server column may name its collation (`collation:`); `pull` declares one
+that differs from the database's default, and a collation change is a planned
+`ALTER COLUMN` that rebuilds the keys around it (#1175, DEC-1175.1).
+
 Offline: `plan` (`--check` / `--since` / `--base` / `--out` / `--sql` / `--dev`),
 `validate` (`--since`), `fmt` (`--check`), `rename`, `rename-table`, `rename-role`, `drop`,
 `drop-table`, `drop-role`,

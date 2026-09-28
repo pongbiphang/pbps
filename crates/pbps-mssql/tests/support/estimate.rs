@@ -12,6 +12,8 @@ fn retype(table: &str, column: &str, from: &str, to: &str) -> PlannedChange {
         to: to.parse().unwrap(),
         from_nullable: true,
         to_nullable: true,
+        from_collation: None,
+        to_collation: None,
     })
 }
 

@@ -2501,3 +2501,41 @@ matches the default today. The explicit `PRIMARY KEY CLUSTERED` fails loudly
 (DEC-1178.1). A default that is the same everywhere — a UNIQUE constraint is
 nonclustered whatever else is on the table — needs no spelling.
 
+## A statement that restates the whole column resets what it leaves out
+
+SQL Server's `ALTER COLUMN` takes the column's full definition. An omitted
+`NULL`/`NOT NULL` reads as `NULL`, which is why every type change here
+carries the nullability. An omitted `COLLATE` reads as the database's default
+collation. Measured on 17.0, `ALTER COLUMN c varchar(20) NOT NULL` on a
+`Latin1_General_CS_AS` column put it under the database default, with no
+error. Before #1175 the emitter had no collation to restate, so any retype or
+nullability change on such a column changed its comparison semantics too.
+
+**The shape:** a statement that restates a definition resets every part of it
+the caller did not spell. Adding a property to the model means adding it to
+every such statement, not only to the one that changes that property.
+
+**The rule.** When the model gains a column property, sweep every statement
+that writes a column definition — create, add, and each alter — and restate it
+there (DEC-1175.1).
+
+## A conversion reads its input under the input's collation
+
+Converting into `char`, `varchar` or `text` uses the code page of the
+*input's* collation. A literal's collation is the database default. Measured
+on 17.0, on a `SQL_Latin1_General_CP1_CI_AS` database,
+`TRY_CONVERT(varchar(10), N'中')` is `?`. Assigning the same `N'中'` to a
+UTF-8 column stores `中`. Collating the result afterwards is too late, since
+the character is already gone. #1247 review found five places where a literal
+was converted to stand in for a cell: spelling probes, projected key values,
+planned defaults, the default-cell read-back, and the row guards. Each read a valid UTF-8 value
+as `?`, then refused the plan or reported drift nobody made.
+
+**The shape:** an expression that models an assignment must model it under
+the collation of the column being assigned. A bare literal models it under
+the database default.
+
+**The rule.** Put the column's collation on the *input* before a conversion
+into a code-page type. Where the column is in scope, it lends its own
+collation (`rows::in_column_collation`). Where it does not exist yet, use the
+declared one, `COLLATE` on the input.

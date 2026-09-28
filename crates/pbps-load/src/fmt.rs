@@ -69,6 +69,9 @@ pub fn render(
         if let Some(id) = &c.identity {
             let _ = writeln!(s, "    identity: [{}, {}]", id.seed, id.increment);
         }
+        if let Some(collation) = &c.collation {
+            let _ = writeln!(s, "    collation: {}", scalar(collation.as_str()));
+        }
         if let Some(d) = &c.description {
             let _ = writeln!(s, "    description: {}", scalar(d));
         }
@@ -725,6 +728,27 @@ indexes:
         let t = crate::load_table_str(Path::new("t.yml"), base).unwrap();
         assert_eq!(t.table.clustered, None);
         assert!(!render(&t.name, &t.table, &t.intents, None).contains("clustered"));
+    }
+
+    /// An explicit collation reads back as written and renders again; absent
+    /// renders nothing (#1175).
+    #[test]
+    fn a_column_collation_round_trips_and_its_absence_writes_nothing() {
+        let yaml = "table: dbo.t\ncolumns:\n  code:\n    type: varchar(10)\n    collation: Latin1_General_CS_AS\n  note: {type: varchar(10)}\n";
+        round_trip(yaml);
+        let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
+        assert_eq!(
+            t.table.columns["code"].collation,
+            Some(pbps_model::Collation::new("latin1_general_cs_as")),
+            "compared without case"
+        );
+        assert_eq!(t.table.columns["note"].collation, None);
+        let out = render(&t.name, &t.table, &t.intents, None);
+        assert!(
+            out.contains("    collation: Latin1_General_CS_AS\n"),
+            "{out}"
+        );
+        assert_eq!(out.matches("collation").count(), 1, "{out}");
     }
 
     /// A kind the selector does not have is a load error, not a default

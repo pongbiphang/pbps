@@ -486,6 +486,23 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
                 continue;
             }
         }
+        // Measured on 17.0: `COLLATE` is taken on these seven and refused on
+        // anything else (447, "Expression type xml is invalid for COLLATE
+        // clause"), and an unknown name is 448 (#1175).
+        if let Some(collation) = &col.collation {
+            let character =
+                types::normalize(&col.ty).is_ok_and(|t| types::takes_collation(&t.base));
+            if !character {
+                errs.push(invalid(format!(
+                    "column `{col_name}` is `{}`, which takes no collation; only character \
+                     types do",
+                    col.ty
+                )));
+            }
+            if let Err(e) = crate::emit::collate_clause(Some(collation)) {
+                errs.push(e);
+            }
+        }
         if let Some(identity) = col.identity {
             identity_columns.push(col_name.clone());
             if !types::can_be_identity(&col.ty) {
@@ -887,6 +904,22 @@ mod tests {
         assert_eq!(messages(&table(&name, &t)), "");
         t.clustered = Some(Clustered::Index("cx_missing".into()));
         assert!(messages(&table(&name, &t)).contains("does not declare"));
+    }
+
+    /// A collation only on the seven character types the engine takes one on
+    /// (447 otherwise), and only as a collation name (#1175).
+    #[test]
+    fn a_collation_is_refused_off_character_types_and_as_a_bad_name() {
+        use pbps_model::Collation;
+        let (name, mut t) = base_table();
+        t.columns.get_mut("email").unwrap().collation =
+            Some(Collation::new("Latin1_General_CS_AS"));
+        assert_eq!(messages(&table(&name, &t)), "");
+        t.columns.get_mut("id").unwrap().collation = Some(Collation::new("Latin1_General_CS_AS"));
+        assert!(messages(&table(&name, &t)).contains("takes no collation"));
+        t.columns.get_mut("id").unwrap().collation = None;
+        t.columns.get_mut("email").unwrap().collation = Some(Collation::new("Latin1 General"));
+        assert!(messages(&table(&name, &t)).contains("not a SQL Server collation name"));
     }
 
     #[test]

@@ -865,36 +865,22 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         };
 
         // The baseline is the *source* database's own default, not "any
-        // explicit COLLATE" or "every collated column" (DECISIONS 443). A
-        // collation matching it — whether inherited or spelled out
-        // explicitly — round-trips for free *onto a database whose own
-        // default is the same*: the emitter writes no `COLLATE`, so the
-        // column is created under whatever default the target has.
-        // The onboarding notice names that source default (DECISIONS 491); nothing
-        // compares it with the target's. Anything differing from the source default
-        // is a difference the declaration cannot hold regardless of target;
-        // reported here rather than dropped, the way a clustered index is
-        // (`index_type_name` above), so an operator can find it instead of a
-        // bootstrap changing what `=` and a unique constraint on the column
-        // mean without a word (issue #94).
-        if let Some(collation) = c.collation.as_deref()
-            && collation != raw.database_collation
-        {
-            push_limitation(
-                &mut warnings,
-                &mut limitations,
-                names.get(&c.object_id),
-                format!(
-                    "{table_name}.{}: column collation `{collation}` is not the database's \
-                     default (`{}`); collations are not modelled yet, so the declaration omits \
-                     it and a bootstrap would create the column under the database default \
-                     instead",
-                    c.name, raw.database_collation
-                ),
-            );
-        }
+        // explicit COLLATE" or "every collated column" (DECISIONS 443). The
+        // catalog cannot tell a collation inherited from the default from the
+        // same name spelled out, so a column under the default is declared
+        // without one, and follows the default of whichever database it is
+        // created in; the onboarding notice below names the source's. Any
+        // other collation is declared, so a bootstrap onto a database with
+        // another default keeps what `=`, a unique key and an index seek mean
+        // on the column (#1175, which replaces the limitation #94 added).
+        let collation = c
+            .collation
+            .as_deref()
+            .filter(|collation| *collation != raw.database_collation)
+            .map(pbps_model::Collation::new);
 
         let mut column = Column::new(ty);
+        column.collation = collation;
         column.nullable = c.is_nullable;
         column.identity = c
             .identity
@@ -1704,6 +1690,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     }
 
     Pulled {
+        database_collation: Some(raw.database_collation.clone()),
         schema,
         onboarding_notices,
         warnings,
@@ -1849,18 +1836,18 @@ mod tests {
         assert_eq!(strip_stored_parens("plain"), "plain");
     }
 
-    /// A column `COLLATE`d away from the database's default is not modelled —
-    /// the emitter has nowhere to write it — so it is kept in the
-    /// declarations under its plain type, with a limitation naming the column
-    /// and both collations, matching the SPEC's rule that an unmodelled fact
-    /// is reported rather than silently dropped (issue #94).
+    /// A column `COLLATE`d away from the database's default is declared with
+    /// that collation (#1175); #94 reported it as a limitation when the model
+    /// had nowhere to hold it. A column under the default declares none.
     #[test]
-    fn a_column_collation_that_differs_from_the_database_default_is_a_limitation() {
+    fn a_column_collation_that_differs_from_the_database_default_is_declared() {
         let mut column = raw_column(10, "code", "varchar");
         column.collation = Some("Latin1_General_BIN2".into());
+        let mut plain = raw_column(10, "note", "varchar");
+        plain.collation = Some("Latin1_General_CI_AS".into());
         let raw = RawCatalog {
             tables: vec![raw_table(10, "dbo", "customer")],
-            columns: vec![column],
+            columns: vec![column, plain],
             database_collation: "Latin1_General_CI_AS".into(),
             ..Default::default()
         };
@@ -1868,29 +1855,18 @@ mod tests {
         let pulled = assemble(&raw);
 
         let table = &pulled.schema.tables[&TableName::new("dbo", "customer")];
-        assert!(
-            table.columns.contains_key("code"),
-            "only the collation is unmodelled; the column itself stays declared"
+        assert_eq!(
+            table.columns["code"].collation,
+            Some(pbps_model::Collation::new("Latin1_General_BIN2"))
         );
-        assert_eq!(pulled.limitations.len(), 1, "{:?}", pulled.limitations);
-        assert_eq!(pulled.warnings.len(), 1, "{:?}", pulled.warnings);
-        assert_eq!(pulled.warnings[0], pulled.limitations[0].detail);
+        // Negative: the default is not spelled, so the column follows the
+        // default of the database it is created in.
+        assert_eq!(table.columns["note"].collation, None);
+        assert!(pulled.limitations.is_empty(), "{:?}", pulled.limitations);
+        assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
         assert!(
             pulled.onboarding_notices[0]
                 .contains("source database default collation `Latin1_General_CI_AS`")
-        );
-        assert_eq!(
-            pulled.limitations[0].target.object_name(),
-            TableName::new("dbo", "customer")
-        );
-        assert!(
-            pulled.limitations[0].detail.contains("customer.code")
-                && pulled.limitations[0].detail.contains("Latin1_General_BIN2")
-                && pulled.limitations[0]
-                    .detail
-                    .contains("Latin1_General_CI_AS"),
-            "{:?}",
-            pulled.limitations
         );
     }
 

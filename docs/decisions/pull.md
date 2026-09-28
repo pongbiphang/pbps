@@ -581,3 +581,19 @@ it could carry, and a refusal would only send them to rerun without the flag.
 What stays a refusal is a name the database does not have. That is a mistake on
 the command line, not a fact about the catalog. The dialect check that follows
 the row read stays too: by then it can only fail on the rows themselves.
+
+<a id="dec-1175-2"></a>
+
+**DEC-1175.2. `pull` declares a column's collation where it differs from the
+database's default, instead of reporting it (supersedes the limitation of
+DECISIONS 443).** The model holds a column collation now (DEC-1175.1), so the
+column #94 made a limitation is declared with its collation, and a bootstrap
+onto a database with another default keeps what `=`, a unique key and an
+index seek mean on it. DECISIONS 443's baseline stands: the source database's
+default is what "no collation" means on the way in. DECISIONS 491's
+onboarding notice stands too, since a column under the source default follows
+the target's default after a bootstrap. The key-collision check groups
+declared row keys under the key column's declared collation, not the one the
+catalog had before the plan. That is the collation the column has once the
+plan has run, including for a table the plan creates or renames (replacing
+DECISIONS 148's catalog read for this question).

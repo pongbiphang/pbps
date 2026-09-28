@@ -773,11 +773,15 @@ fn diff_columns(
 
         let norm = |t: &ColumnType| dialect.normalize_type(t).unwrap_or_else(|_| t.clone());
         let (from_ty, to_ty) = (norm(&base_col.ty), norm(&col.ty));
-        let retyped = from_ty != to_ty;
+        // A collation change is the same `ALTER COLUMN` as a type change, and
+        // takes down the same dependents (#1175), so it is carried by the
+        // same change with the type restated.
+        let recollated = base_col.collation != col.collation;
+        let retyped = from_ty != to_ty || recollated;
         // A type change subsumes a nullability change rather than sitting beside
         // one: `ALTER COLUMN` restates the whole definition, so two changes would
         // mean two statements where the second undoes half of the first.
-        if from_ty != to_ty {
+        if retyped {
             changes.push(Change::AlterColumnType {
                 uid: uid.clone(),
                 column: declared_ref.clone(),
@@ -785,6 +789,8 @@ fn diff_columns(
                 to: to_ty,
                 from_nullable: base_col.nullable,
                 to_nullable: col.nullable,
+                from_collation: base_col.collation.clone(),
+                to_collation: col.collation.clone(),
             });
         } else if base_col.nullable != col.nullable {
             changes.push(Change::AlterColumnNullability {
@@ -792,6 +798,7 @@ fn diff_columns(
                 column: declared_ref.clone(),
                 ty: to_ty,
                 to_nullable: col.nullable,
+                collation: col.collation.clone(),
             });
         }
         if base_col.default != col.default {
@@ -1090,8 +1097,23 @@ fn recreate_retyped_dependents(
         .iter()
         .filter_map(|change| match change {
             Change::AlterColumnType {
-                column, from, to, ..
-            } => Some((column.clone(), dialect.retype_dependents(from, to))),
+                column,
+                from,
+                to,
+                from_collation,
+                to_collation,
+                ..
+            } => {
+                let mut dependents = dialect.retype_dependents(from, to);
+                if from_collation != to_collation {
+                    let also = dialect.recollate_dependents();
+                    dependents.keys_and_indexes |= also.keys_and_indexes;
+                    dependents.checks |= also.checks;
+                    dependents.filtered_indexes |= also.filtered_indexes;
+                    dependents.foreign_keys |= also.foreign_keys;
+                }
+                Some((column.clone(), dependents))
+            }
             Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
@@ -2632,6 +2654,168 @@ mod tests {
             &Hints::default(),
         )
         .unwrap()
+    }
+
+    /// A dialect whose collation changes take every dependent down, as SQL
+    /// Server's do (#1175); everything else is `MinimalDialect`'s.
+    struct Recollates;
+
+    impl Dialect for Recollates {
+        fn name(&self) -> &'static str {
+            "recollates"
+        }
+        fn recollate_dependents(&self) -> pbps_dialect::RetypeDependents {
+            pbps_dialect::RetypeDependents {
+                keys_and_indexes: true,
+                checks: true,
+                filtered_indexes: true,
+                foreign_keys: true,
+            }
+        }
+        fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
+            MinimalDialect.quote_ident(ident)
+        }
+        fn emit(
+            &self,
+            change: &Change,
+            strategy: pbps_model::Strategy,
+        ) -> Result<Vec<pbps_dialect::Statement>, pbps_dialect::DialectError> {
+            MinimalDialect.emit(change, strategy)
+        }
+        fn normalize_type(
+            &self,
+            ty: &pbps_model::ColumnType,
+        ) -> Result<pbps_model::ColumnType, pbps_dialect::DialectError> {
+            MinimalDialect.normalize_type(ty)
+        }
+        fn type_change_risk(
+            &self,
+            from: &pbps_model::ColumnType,
+            to: &pbps_model::ColumnType,
+        ) -> pbps_dialect::TypeChangeRisk {
+            MinimalDialect.type_change_risk(from, to)
+        }
+        fn fold_ident<'a>(&self, ident: &'a str) -> std::borrow::Cow<'a, str> {
+            MinimalDialect.fold_ident(ident)
+        }
+        fn lexicon(&self) -> pbps_dialect::Lexicon {
+            MinimalDialect.lexicon()
+        }
+        fn validate_table(
+            &self,
+            name: &pbps_model::TableName,
+            table: &Table,
+        ) -> Vec<pbps_dialect::DialectError> {
+            MinimalDialect.validate_table(name, table)
+        }
+        fn transaction_framing(&self) -> pbps_dialect::TransactionFraming {
+            MinimalDialect.transaction_framing()
+        }
+        fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
+            MinimalDialect.probe_framing()
+        }
+    }
+
+    /// A collation change is the `ALTER COLUMN` a type change is, with both
+    /// collations carried and the type restated, and it takes down and puts
+    /// back every key, index and check the dialect says blocks it (#1175).
+    #[test]
+    fn a_collation_change_is_a_column_alter_that_rebuilds_its_dependents() {
+        use pbps_model::Collation;
+        let keyed = |collation: Option<&str>| {
+            let mut code = Column::new(ty("varchar(10)")).not_null();
+            code.collation = collation.map(Collation::new);
+            let mut t = table(&[("id", Column::new(ty("int")).not_null()), ("code", code)]);
+            t.primary_key = Some(PrimaryKey {
+                name: Some("pk_t".into()),
+                columns: vec!["id".into()],
+            });
+            t.unique.insert(
+                "uq_code".into(),
+                UniqueConstraint {
+                    columns: vec!["code".into()],
+                },
+            );
+            t.checks.insert(
+                "ck_code".into(),
+                CheckConstraint {
+                    expression: "code <> ''".into(),
+                },
+            );
+            schema_of("dbo.t", t)
+        };
+        let (base, declared) = (keyed(None), keyed(Some("Latin1_General_CS_AS")));
+        let cs = run_with(&Recollates, &base, &declared, &[]);
+        let alter = cs
+            .changes
+            .iter()
+            .find_map(|p| match &p.change {
+                Change::AlterColumnType {
+                    from,
+                    to,
+                    from_collation,
+                    to_collation,
+                    ..
+                } => Some((
+                    from.clone(),
+                    to.clone(),
+                    from_collation.clone(),
+                    to_collation.clone(),
+                )),
+                _ => None,
+            })
+            .expect("an ALTER COLUMN");
+        assert_eq!(alter.0, alter.1, "the type is restated, not changed");
+        assert_eq!(
+            (alter.2, alter.3),
+            (None, Some(Collation::new("latin1_general_cs_as")))
+        );
+        let k = kinds(&cs);
+        for kind in ["DropUnique", "AddUnique", "DropCheck", "AddCheck"] {
+            assert!(k.contains(&kind.to_owned()), "{kind}: {k:?}");
+        }
+        // The key on `id` names no recollated column and stays.
+        assert!(!k.contains(&"SetPrimaryKey".to_owned()), "{k:?}");
+        // Negative: a dialect that needs nothing rebuilt gets the alter alone.
+        assert_eq!(kinds(&run(&base, &declared, &[])), ["AlterColumnType"]);
+        // And an unchanged collation, spelled in another case, is no change.
+        assert!(
+            run_with(
+                &Recollates,
+                &declared,
+                &keyed(Some("LATIN1_general_cs_as")),
+                &[]
+            )
+            .changes
+            .is_empty()
+        );
+    }
+
+    /// A nullability change restates the column's collation, which an
+    /// `ALTER COLUMN` without it would reset to the database default (#1175).
+    #[test]
+    fn a_nullability_change_restates_the_collation() {
+        use pbps_model::Collation;
+        let with = |nullable: bool| {
+            let mut c = Column::new(ty("varchar(10)"));
+            c.nullable = nullable;
+            c.collation = Some(Collation::new("Latin1_General_CS_AS"));
+            schema_of("dbo.t", table(&[("c", c)]))
+        };
+        let cs = run(&with(true), &with(false), &[]);
+        assert!(
+            matches!(
+                &cs.changes[..],
+                [PlannedChange {
+                    change: Change::AlterColumnNullability {
+                        collation: Some(_),
+                        ..
+                    },
+                    ..
+                }]
+            ),
+            "{cs:?}"
+        );
     }
 
     /// A table with a key, a UNIQUE constraint and an index, clustered on
@@ -5524,6 +5708,7 @@ mod tests {
                     },
                     ty: ty("int"),
                     to_nullable: true,
+                    collation: None,
                 }),
             ],
             "the key has to go first: {:#?}",

@@ -882,6 +882,7 @@ mod tests {
             pbps_model::PlanBaseline {
                 description: "fixture".into(),
                 checksum: "00".repeat(32),
+                database_collation: None,
             },
             pbps_model::ChangeSet::default(),
             pbps_model::IdsFile::default(),

@@ -301,6 +301,7 @@ async fn exercise(target_connection: String, scratch_connection: String, worker:
         pbps_model::PlanBaseline {
             description: "empty fixture".into(),
             checksum: "00".repeat(32),
+            database_collation: None,
         },
         ordered.changes.clone(),
         wanted_ids.clone(),
