@@ -205,6 +205,9 @@ class SelectorEffects(ast.NodeVisitor):
         self.writes.add(node.name)
         for expression in [*node.decorator_list, *node.bases, *node.keywords]:
             self.visit(expression)
+        for base in node.bases:
+            # Callable metaclasses can accept and mutate non-type bases.
+            self.references(base)
         for keyword in node.keywords:
             # Metaclass and subclass hooks can retain or mutate keyword values.
             self.references(keyword.value)
