@@ -155,6 +155,16 @@ class Ownership(unittest.TestCase):
         with self.assertRaisesRegex(audit.InventoryError, "no longer selects"):
             self.check()
 
+    def test_a_runner_with_mutated_selector_data_has_no_execution_owner(self):
+        script = self.root / "runner.py"
+        self.inventory["owners"]["live"]["selection"] = {
+            "kind": "data", "file": "runner.py", "expression": "TESTS"}
+        script.write_text('TESTS = ["owned"]\nALIAS = TESTS\nALIAS.clear()\n')
+        with self.assertRaisesRegex(audit.InventoryError, "not supported literal data"):
+            self.check()
+        script.write_text('TESTS = ["removed"]\nTESTS = ["owned"]\n')
+        self.assertEqual(self.check(), 1)
+
     def test_duplicate_and_cyclic_owners_are_refused(self):
         self.inventory["groups"].append(copy.deepcopy(self.inventory["groups"][0]))
         with self.assertRaisesRegex(audit.InventoryError, "duplicate case"):
@@ -380,6 +390,99 @@ fn parent<'a>(x: &'a str) { let c = '}'; { real(x); } }
             self.assertEqual(listings[0], {'renamed::nested_case'})
             self.assertEqual(listings[1], {'renamed::nested_case', 'conditional::platform_case', 'conditional_ignore'})
 
+    def test_unsupported_selector_writes_cannot_retain_a_previous_literal(self):
+        writes = (
+            'TESTS = dynamic_cases()', 'TESTS += dynamic_cases()', 'del TESTS',
+            'TESTS: list = dynamic_cases()', 'TESTS, other = dynamic_cases()',
+            '[other, TESTS] = dynamic_cases()', 'TESTS = other = dynamic_cases()',
+            'if condition:\n    TESTS = dynamic_cases()',
+            'for TESTS in dynamic_cases():\n    pass',
+            'with context() as TESTS:\n    pass', 'other = (TESTS := dynamic_cases())',
+            'import unknown as TESTS', 'from unknown import TESTS', 'from unknown import *',
+            'def TESTS():\n    pass', 'class TESTS:\n    pass',
+            'try:\n    run()\nexcept Exception as TESTS:\n    pass',
+            'match value:\n    case {"key": TESTS}:\n        pass',
+        )
+        for write in writes:
+            with self.subTest(write=write):
+                values = audit.python_values(audit.ast.parse('TESTS = ["owned"]\n' + write))
+                self.assertNotIn("TESTS", values)
+
+    def test_visible_mutation_invalidates_every_shared_selector_alias(self):
+        mutations = (
+            'ALIAS.clear()', 'ALIAS[0] = "changed"', 'del ALIAS[:]',
+            'ALIAS += ["changed"]', 'mutate(ALIAS)', 'mutate(tests=ALIAS)',
+            'BOX = [ALIAS]\nBOX[0].clear()',
+            'BOX = {"tests": ALIAS}\nBOX["tests"].clear()',
+            'def helper(tests=ALIAS):\n    tests.clear()',
+            'def helper() -> ALIAS:\n    pass',
+            'annotation: ALIAS',
+            'class Holder:\n    cases = ALIAS\nHolder.cases.clear()',
+            'class Outer:\n    TESTS = []\n    class Inner:\n        cases = ALIAS',
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                values = audit.python_values(audit.ast.parse(
+                    'TESTS = ["owned"]\nALIAS = TESTS\n' + mutation))
+                self.assertNotIn("TESTS", values)
+
+    def test_literal_replacement_does_not_mutate_old_aliases_or_copies(self):
+        values = audit.python_values(audit.ast.parse(
+            'TESTS = ["owned"]\nALIAS = TESTS\nCOPY = TESTS + []\n'
+            'TESTS = ["fresh"]\nALIAS.clear()'))
+        self.assertEqual(values["TESTS"], ["fresh"])
+        self.assertEqual(values["COPY"], ["owned"])
+        self.assertNotIn("ALIAS", values)
+        values = audit.python_values(audit.ast.parse(
+            'PREFIX = "module::"\nALIAS = PREFIX\nPREFIX = dynamic_prefix()\n'
+            'TESTS = [ALIAS + n for n in ["one", "two"]]'))
+        self.assertEqual(values["TESTS"], ["module::one", "module::two"])
+
+    def test_local_bindings_and_annotations_do_not_replace_module_selectors(self):
+        source = ('TESTS = ["owned"]\nTESTS: list\n'
+                  'def helper(TESTS=None):\n    TESTS = []\n'
+                  'class Holder:\n    TESTS = []\n    TESTS.clear()\n'
+                  'OTHER = [TESTS for TESTS in ["local"]]\n')
+        self.assertEqual(audit.python_values(audit.ast.parse(source))["TESTS"], ["owned"])
+        values = audit.python_values(audit.ast.parse(
+            'TESTS = ["owned"]\nclass Holder:\n    global TESTS\n    TESTS = []'))
+        self.assertNotIn("TESTS", values)
+
+    def test_executed_class_global_writes_invalidate_module_selector_data(self):
+        for body in (
+            'class Holder:\n    if True:\n        global TESTS\n        TESTS = []',
+            'class Outer:\n    class Inner:\n        global TESTS\n        TESTS = []',
+        ):
+            with self.subTest(body=body):
+                source = 'TESTS = ["owned"]\n' + body
+                actual = subprocess.run([sys.executable, '-c', source + '\nprint(TESTS)'],
+                                        capture_output=True, text=True, check=True, timeout=10)
+                self.assertEqual(actual.stdout, '[]\n')
+                self.assertNotIn("TESTS", audit.python_values(audit.ast.parse(source)))
+
+    def test_stale_selector_refusal_agrees_with_real_python_execution(self):
+        variants = (
+            'TESTS = dynamic_cases()', 'del TESTS', 'TESTS: list = []',
+            'TESTS, other = [], None', 'TESTS = other = []',
+            'ALIAS = TESTS\nALIAS.clear()', 'TESTS[:] = []',
+            'if bool("yes"):\n    TESTS = []',
+            'BOX = {"tests": TESTS}\nBOX["tests"].clear()',
+            'other = (TESTS := [])',
+            'def helper() -> TESTS:\n    pass\nhelper.__annotations__["return"].clear()',
+            'annotation: TESTS\n__annotations__["annotation"].clear()',
+            'globals()["TESTS"] = []', 'exec("TESTS = []")',
+            'namespace = locals()\nnamespace["TESTS"] = []',
+        )
+        for variant in variants:
+            with self.subTest(variant=variant):
+                source = 'def dynamic_cases():\n    return []\nTESTS = ["owned"]\n' + variant
+                actual = subprocess.run(
+                    [sys.executable, '-c', source + '\nimport json\nprint(json.dumps(globals().get("TESTS", [])))'],
+                    capture_output=True, text=True, check=True, timeout=10)
+                self.assertEqual(json.loads(actual.stdout), [])
+                with self.assertRaises(audit.InventoryError):
+                    audit.static_value(audit.ast.parse('TESTS', mode='eval').body,
+                                       audit.python_values(audit.ast.parse(source)))
 
 if __name__ == '__main__':
     unittest.main()
