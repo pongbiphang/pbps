@@ -1537,6 +1537,8 @@ impl ScratchRun {
         // land there instead (finding on #688). Open an admin session to the
         // scratch database for it; the run login cannot, being unprivileged.
         self.admin_session().await?;
+        #[cfg(test)]
+        container_tests::pause("container-qualify-admin-owned").await;
         let reconstruction = self.inner.admin_connection().ok_or(Error::Cancelled)?;
         let outcome = scope::prepare(
             reconstruction,
@@ -1941,6 +1943,8 @@ impl ScratchRun {
             engine::paths(extras, &sealed.target.catalog.visibility)
         };
         self.admin_session().await?;
+        #[cfg(test)]
+        container_tests::pause("container-capture-admin-owned").await;
         let admin = self.inner.admin_connection().ok_or(Error::Cancelled)?;
         let captured = engine::capture_desired(admin, &base, &desired, &paths).await;
         self.retire_admin();
@@ -2379,3 +2383,6 @@ mod tests;
 #[cfg(test)]
 #[path = "server/live_tests.rs"]
 mod live_tests;
+
+#[cfg(test)]
+pub(crate) mod container_tests;

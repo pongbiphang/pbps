@@ -553,6 +553,8 @@ impl ContainerControl {
             self.retire(scratch);
         }
         self.retire_admin();
+        #[cfg(test)]
+        crate::resolver::server::container_tests::pause("container-close-owned").await;
         // End every scratch/admin transport before DROP DATABASE. Record the
         // entire batch first, so cancellation while confirming one removal
         // cannot lose the names of the others.
@@ -738,6 +740,8 @@ impl CandidateSession {
         if !self.analysis_in_flight {
             return Err(failed(Error::Consumed, Vec::new()));
         }
+        #[cfg(test)]
+        crate::resolver::server::container_tests::pause("container-discard-owned").await;
         if let Some(state) = self.state.as_ref()
             && let Some(pending) = self.pending.as_mut()
         {
@@ -826,6 +830,8 @@ impl CandidateSession {
                 self.pending.as_ref().expect("names").names(),
             ));
         }
+        #[cfg(test)]
+        crate::resolver::server::container_tests::pause("container-create-owned").await;
         let pending = self.pending.as_mut().expect("names");
         let owner = generated_owner();
         pending.relay_name = Some(format!("pbps-resolver-{owner}"));
