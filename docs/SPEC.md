@@ -1828,7 +1828,7 @@ It answers, from the file alone:
 
 | Question | From |
 |---|---|
-| Is this applyable at all? | `origin` — a preview says so in its own terms (7.3) |
+| Is this applyable at all? | `origin` and this build's execution support — a preview says so in its own terms (7.3); a database-derived artifact with unsupported apply reports that limitation |
 | What does it change? | the typed ChangeSet, grouped by table |
 | Why does it need approval? | each risk class present, **with what can go wrong**, and the changes that carry it |
 | How will it run? | `mode`: one transaction all-or-nothing, or staged (ADR-0003) |
@@ -1836,8 +1836,13 @@ It answers, from the file alone:
 | What exactly do I type? | the `apply` command, with the target, `--checksum`, `--allow` and `--staged` filled in — or, for a preview, the `plan --db` that would produce an applyable artifact, since `apply` refuses a preview whatever it is given |
 | What am I approving? | the plan checksum `apply` will recompute and require to match the explicit `--checksum` supplied by the deployment gate |
 
-A resolver plan's fingerprints are keyed (§9.3.2), so its checksum and approval
-command are shown as any plan's.
+A resolver plan's fingerprints are keyed (§9.3.2), so its checksum is shown as
+any plan's. Its approval command is offered only when this build implements its
+guarded apply path. Otherwise `explain` describes the execution limitation,
+without relabeling the database-derived artifact as a preview or recommending
+the preview's replanning remedy. JSON reports `applyable: false`, an
+`apply_limitation`, and an empty `approve_with`; ordinary database approval and
+offline preview remedies keep their existing meaning.
 
 A target is **optional**: `--db` / `--env` adds the one question no file can
 answer — whether that environment is mid-deployment on a staged checkpoint. It

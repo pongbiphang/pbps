@@ -105,6 +105,8 @@ pub struct Baseline {
 #[serde(deny_unknown_fields)]
 pub struct Explanation {
     pub applyable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apply_limitation: Option<String>,
     pub dialect: String,
     pub created_at: String,
     pub git_sha: Option<String>,

@@ -5489,13 +5489,8 @@ fn apply_identified(
         );
     }
     crate::validate_saved_plan(plan, dialect)?;
-    // #614 defines the artifact contract; #616 supplies coherent transactional
-    // rechecks. Until those exist, never apply evidence as an ordinary plan.
-    if matches!(
-        plan.analysis,
-        pbps_model::resolver::PlanAnalysis::Resolved(_)
-    ) {
-        bail!("this build cannot yet enforce resolver pre/postconditions during apply (#616)");
+    if let Some(limitation) = crate::engine::resolver_apply_limitation(plan) {
+        bail!(limitation);
     }
 
     // The mode lives in the file because that is what the gate approved; the
