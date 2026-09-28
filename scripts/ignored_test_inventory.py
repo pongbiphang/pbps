@@ -617,7 +617,7 @@ def cargo_selection(command):
 def selects(selection, key, name):
     if not selection: return False
     target, ignored, exact, filters, skips = selection
-    return (target == key and ignored and not any(s in name for s in skips)
+    return (target == key and ignored and not any(name == s if exact else s in name for s in skips)
             and (not filters or any(name == f if exact else f in name for f in filters)))
 
 

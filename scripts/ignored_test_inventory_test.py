@@ -253,6 +253,25 @@ class CargoSelectors(unittest.TestCase):
                 (["--profile", "live-test", "owned"], ["--ignored"], {"owned"}),
                 (["--profile=live-test", "owned"], ["--ignored"], {"owned"}),
             ]
+            # Compare skip behavior with libtest for either position of the
+            # positive filter; exact mode applies to exclusions as well.
+            for before, filters in [(["owned"], []), ([], ["owned"])]:
+                for mode, skips, expected in [
+                    ([], ["own"], set()),
+                    (["--exact"], ["own"], {"owned"}),
+                    (["--exact"], ["owned"], set()),
+                    ([], ["missing"], {"owned"}),
+                    (["--exact"], ["own", "other"], {"owned"}),
+                    (["--exact"], ["missing", "owned"], set()),
+                    ([], [""], set()),
+                    (["--exact"], [""], {"owned"}),
+                ]:
+                    skip_args = [arg for skip in skips for arg in ("--skip", skip)]
+                    cases.append((before, ["--ignored", *filters, *mode, *skip_args], expected))
+            cases.extend([
+                (["owned"], ["--ignored", "other", "--exact", "--skip", "own", "--skip", "other"], {"owned"}),
+                (["owned"], ["--ignored", "other", "--skip", "own", "--skip", "other"], set()),
+            ])
             for before, after, expected in cases:
                 with self.subTest(before=before, after=after):
                     command = ["cargo", "test", "--offline", "-p", "demo", "--lib",
