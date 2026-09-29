@@ -320,6 +320,131 @@ def mutable_ids(value):
     return set()
 
 
+class NamespaceExposure(ast.NodeVisitor):
+    """Potential builtin aliases, independent of pristine object-inspection proof."""
+    reflective = frozenset({"globals", "locals", "vars", "exec", "eval"})
+
+    def __init__(self, module=None):
+        self.bindings = {}
+        self.module = self.bindings if module is None else module
+        self.globals = set()
+        self.exposed = False
+        self.harmless = None
+        self.conditional = False
+
+    def value(self, node):
+        if isinstance(node, ast.Name):
+            fallback = self.module.get(node.id, {node.id} if node.id in self.reflective else set())
+            return fallback if node.id in self.globals else self.bindings.get(node.id, fallback)
+        if (isinstance(node, ast.Attribute) and node.attr in self.reflective
+            and "builtins" in self.value(node.value)):
+            return {node.attr}
+        return set()
+
+    def bind(self, name, value):
+        value = set(value)
+        if self.conditional:
+            value |= self.value(ast.Name(id=name, ctx=ast.Load()))
+        if name in self.globals:
+            self.module[name] = value
+        else:
+            self.bindings[name] = value
+
+    def visit(self, node):
+        # Unknown control flow cannot prove a previous reflective alias gone.
+        # Retain either binding; direct statements still distinguish shadows.
+        conditional = self.conditional
+        if isinstance(node, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.Try,
+                             ast.TryStar, ast.Match)):
+            self.conditional = True
+        try:
+            return super().visit(node)
+        finally:
+            self.conditional = conditional
+
+    def visit_Call(self, node):
+        if node is self.harmless:
+            return
+        if self.value(node.func) & self.reflective:
+            self.exposed = True
+        self.generic_visit(node)
+
+    def visit_Assign(self, node):
+        value = self.value(node.value)
+        self.visit(node.value)
+        for target in node.targets:
+            self.visit(target)
+            if isinstance(target, ast.Name):
+                self.bind(target.id, value)
+
+    def visit_NamedExpr(self, node):
+        value = self.value(node.value)
+        self.visit(node.value)
+        if isinstance(node.target, ast.Name):
+            self.bind(node.target.id, value)
+
+    def visit_AnnAssign(self, node):
+        if node.value is not None:
+            value = self.value(node.value)
+            self.visit(node.value)
+            self.visit(node.target)
+            if isinstance(node.target, ast.Name):
+                self.bind(node.target.id, value)
+        self.visit(node.annotation)
+
+    def visit_Import(self, node):
+        # Apply each import in order: a repeated spelling has one final binding.
+        for alias in node.names:
+            self.bind(alias.asname or alias.name.split('.')[0],
+                      {'builtins'} if alias.name == 'builtins' else set())
+
+    def visit_ImportFrom(self, node):
+        for alias in node.names:
+            if alias.name == '*':
+                continue
+            self.bind(alias.asname or alias.name,
+                      {alias.name} if not node.level and node.module == 'builtins'
+                      and alias.name in self.reflective else set())
+
+    def visit_Delete(self, node):
+        for target in node.targets:
+            self.visit(target)
+            if isinstance(target, ast.Name) and not self.conditional:
+                self.bindings.pop(target.id, None)
+                if target.id in self.globals:
+                    self.module.pop(target.id, None)
+
+    def visit_FunctionDef(self, node):
+        for expression in [*node.decorator_list, node.args]:
+            self.visit(expression)
+        if node.returns is not None:
+            self.visit(node.returns)
+        self.bind(node.name, set())
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_Lambda(self, node):
+        self.visit(node.args)
+
+    def visit_ClassDef(self, node):
+        for expression in [*node.decorator_list, *node.bases, *node.keywords]:
+            self.visit(expression)
+        # A nested class does not close over an enclosing class's locals.
+        body = NamespaceExposure(self.module)
+        body.conditional = self.conditional
+        def globals_in(statement):
+            if isinstance(statement, ast.Global):
+                return set(statement.names)
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                return set()
+            return set().union(*(globals_in(child) for child in ast.iter_child_nodes(statement)))
+        body.globals = set().union(*(globals_in(statement) for statement in node.body))
+        for statement in node.body:
+            body.visit(statement)
+        self.exposed |= body.exposed
+        self.bind(node.name, set())
+
+
 class NamespaceImports:
     """Recognize only direct module-level inspection of a fresh empty object."""
     def __init__(self, values):
@@ -632,6 +757,7 @@ def python_values(tree):
     values = {}
     imports = NamespaceImports(values)
     class_proof = ClassExecutionProof()
+    namespace_aliases = NamespaceExposure()
     namespace_exposed = False
     for node in tree.body:
         replacement = None
@@ -641,13 +767,18 @@ def python_values(tree):
             except (InventoryError, TypeError):
                 pass
         harmless = imports.harmless_call(node)
+        namespace_aliases.harmless = harmless
+        namespace_aliases.exposed = False
+        namespace_aliases.visit(node)
         literal_class = node if isinstance(node, ast.ClassDef) and class_proof.safe(node, imports, values) else None
         effects = SelectorEffects(node if replacement is not None or harmless is not None else None,
                                   harmless, literal_class, values)
         effects.visit(node)
+        if namespace_aliases.exposed:
+            effects.writes.add("*")
         class_proof.advance(node, effects)
         imports.advance(node, effects)
-        namespace_exposed |= effects.namespace_exposed
+        namespace_exposed |= effects.namespace_exposed or namespace_aliases.exposed
         mutated = effects.exposed_ids.union(*(mutable_ids(values[name]) for name in effects.mutations if name in values))
         for name in list(values):
             if name in effects.writes or mutable_ids(values[name]) & mutated or "*" in effects.writes:

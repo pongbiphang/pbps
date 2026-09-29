@@ -99,7 +99,15 @@ control flow.
 
 Visible `globals()`, `locals()`, `vars()` and unknown dynamic execution can
 retain the module namespace: later literal assignments cannot restore evidence
-after that exposure. A direct module-level `vars(SimpleNamespace())` call is
+after that exposure. This includes calls through direct `builtins` module
+imports, imported reflective callables and plain-name alias assignments.
+Bindings are followed in statement order: direct shadows replace aliases,
+class-local bindings do not replace module bindings, and uncalled function
+bodies do not expose namespaces. Unknown conditional writes retain possible
+reflective aliases conservatively. Potential namespace access is tracked
+separately from the stricter pristine-binding proof for safe object inspection;
+passing an imported module to an opaque helper cannot make a later reflective
+call harmless. A direct module-level `vars(SimpleNamespace())` call is
 recognized as unrelated only with an untouched `types` import and builtin
 `vars`; imported aliases follow their final left-to-right binding. The
 constructor must receive no arguments, and the call must be an expression or
