@@ -102,6 +102,47 @@ fn relation_identity(table: &pbps_model::TableName) -> ObjectIdentity {
     }
 }
 
+// Target metadata inserted into a scratch capture has already been named in
+// the opening catalog. Keep that provenance until sealing: an opening role
+// must not be mistaken for the scratch server's native role of the same name,
+// or mapped a second time as though it were a run-local role.
+const TARGET_ROLE: &str = "resolver-target-authid";
+const SCRATCH_ROLE: &str = "resolver-scratch-authid";
+
+fn target_identity(object: &ObjectIdentity) -> ObjectIdentity {
+    let mut result = object.clone();
+    result.signature = object.signature.iter().map(target_identity).collect();
+    if result.class == "pg_authid" {
+        result.class = TARGET_ROLE.into();
+    }
+    result
+}
+
+fn target_value(value: &Value) -> Result<Value, pbps_model::resolver::ManifestError> {
+    use pbps_model::resolver::ManifestError;
+    if let Value::Object(map) = value {
+        if map.get("class").and_then(Value::as_str) == Some("pg_authid")
+            || map.get("class").and_then(Value::as_str) == Some(TARGET_ROLE)
+        {
+            let identity: ObjectIdentity =
+                serde_json::from_value(value.clone()).map_err(|_| ManifestError::Invalid)?;
+            return serde_json::to_value(target_identity(&identity))
+                .map_err(|_| ManifestError::Invalid);
+        }
+        return Ok(Value::Object(
+            map.iter()
+                .map(|(name, member)| Ok((name.clone(), target_value(member)?)))
+                .collect::<Result<_, ManifestError>>()?,
+        ));
+    }
+    if let Value::Array(items) = value {
+        return Ok(Value::Array(
+            items.iter().map(target_value).collect::<Result<_, _>>()?,
+        ));
+    }
+    Ok(value.clone())
+}
+
 /// An ALTER TABLE/COLUMN RENAME preserves only typed owner/ACL metadata.
 /// The recorded change and its UID-backed transition locate the opening
 /// subject; a reused spelling cannot serve as a substitute source.
@@ -281,7 +322,9 @@ impl CompiledCapture {
                                 .properties
                                 .get(*field)
                                 .ok_or(ManifestError::Incomplete)?;
-                            after.properties.insert((*field).into(), value.clone());
+                            after
+                                .properties
+                                .insert((*field).into(), target_value(value)?);
                         }
                         preserved_dependencies.insert(object.clone());
                         dependency_mappings.push((
@@ -314,19 +357,20 @@ impl CompiledCapture {
                             namespace,
                             kind,
                         )?;
+                        let target_acl = target_value(&acl)?;
                         let after = self
                             .captured
                             .inputs
                             .get_mut(raw)
                             .ok_or(ManifestError::Incomplete)?;
-                        after.properties.insert(acl_field.into(), acl.clone());
+                        after.properties.insert(acl_field.into(), target_acl);
                         after.properties.insert(
                             owner_field.into(),
-                            serde_json::to_value(ObjectIdentity {
+                            serde_json::to_value(target_identity(&ObjectIdentity {
                                 class: "pg_authid".into(),
                                 name: vec![effective_creator.into()],
                                 signature: Vec::new(),
-                            })
+                            }))
                             .map_err(|_| ManifestError::Invalid)?,
                         );
                         created_dependencies.insert(object.clone());
@@ -386,6 +430,9 @@ impl CompiledCapture {
                 }
                 let mut final_id = id.clone();
                 final_id.signature[0] = destination.clone();
+                for role in final_id.signature.iter_mut().skip(1) {
+                    *role = target_identity(role);
+                }
                 self.captured.inputs.insert(final_id.clone(), input.clone());
                 self.ownership
                     .insert(final_id, ObjectOwnership::Surface(surface.clone()));
@@ -410,7 +457,7 @@ impl CompiledCapture {
             let id = ObjectIdentity {
                 class: "pg_shdepend".into(),
                 name: vec!["a".into()],
-                signature: vec![subject, role],
+                signature: vec![subject, target_identity(&role)],
             };
             self.captured.inputs.insert(
                 id.clone(),
@@ -467,13 +514,19 @@ fn normalize_identity(
         .iter()
         .map(|id| normalize_identity(id, roles))
         .collect::<Result<_, _>>()?;
-    if let Some(roles) = roles {
-        if object.class == "pg_authid" {
+    if object.class == TARGET_ROLE {
+        result.class = "pg_authid".into();
+    } else if object.class == "pg_authid" {
+        if let Some(roles) = roles {
             let [name] = object.name.as_slice() else {
                 return Err(ManifestError::Invalid);
             };
             if let Some(logical) = roles.logical_of(name) {
                 result.name = vec![logical];
+            } else {
+                // The scratch server's own role is a separate observed
+                // prerequisite, even if its spelling equals a target role.
+                result.class = SCRATCH_ROLE.into();
             }
         }
     }
@@ -505,7 +558,9 @@ fn normalize_value(
     roles: Option<&crate::resolver::authorization::RoleMap>,
 ) -> Result<Value, pbps_model::resolver::ManifestError> {
     if let Value::Object(map) = value {
-        if map.get("class").and_then(Value::as_str) == Some("pg_authid") {
+        if map.get("class").and_then(Value::as_str) == Some("pg_authid")
+            || map.get("class").and_then(Value::as_str) == Some(TARGET_ROLE)
+        {
             let identity: ObjectIdentity = serde_json::from_value(value.clone())
                 .map_err(|_| pbps_model::resolver::ManifestError::Invalid)?;
             return serde_json::to_value(normalize_identity(&identity, roles)?)
