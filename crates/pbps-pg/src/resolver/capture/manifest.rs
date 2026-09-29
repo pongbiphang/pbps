@@ -355,9 +355,10 @@ impl CompiledCapture {
                 }
             }
         }
-        // Dependency rows are addressed by their owned subject. For in-place
-        // replacement the target's owner/ACL rows survive exactly; scratch's
-        // new-object dependencies would falsely report its transient owner.
+        // Dependency rows are addressed by their owned subject. A typed
+        // rename keeps the target's owner/ACL edges, but their catalog address
+        // must use the final subject. Scratch's rows would report its transient
+        // owner instead.
         let old_dependencies = self
             .captured
             .inputs
@@ -378,23 +379,16 @@ impl CompiledCapture {
             self.captured.inputs.remove(&id);
             self.ownership.remove(&id);
         }
-        for transition in transitions {
-            if !inplace.contains(&transition.surface) {
-                continue;
-            }
+        for (source, destination, surface) in dependency_mappings {
             for (id, input) in &opening.inputs {
-                if id.class == "pg_shdepend"
-                    && id
-                        .signature
-                        .first()
-                        .is_some_and(|subject| transition.before.contains(subject))
-                {
-                    self.captured.inputs.insert(id.clone(), input.clone());
-                    self.ownership.insert(
-                        id.clone(),
-                        ObjectOwnership::Surface(transition.surface.clone()),
-                    );
+                if id.class != "pg_shdepend" || id.signature.first() != Some(&source) {
+                    continue;
                 }
+                let mut final_id = id.clone();
+                final_id.signature[0] = destination.clone();
+                self.captured.inputs.insert(final_id.clone(), input.clone());
+                self.ownership
+                    .insert(final_id, ObjectOwnership::Surface(surface.clone()));
             }
         }
         for (subject, role, surface) in dependencies_to_copy {

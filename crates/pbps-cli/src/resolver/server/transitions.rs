@@ -145,6 +145,20 @@ fn declared(schema: &Schema, surface: &Surface) -> bool {
     }
 }
 
+fn specializes(child: &Surface, parent: &Surface) -> bool {
+    match (parent, child) {
+        (Surface::Table(table), Surface::Column(column) | Surface::Default(column)) => {
+            table == &column.table
+        }
+        (
+            Surface::Table(table),
+            Surface::Check { table: owner, .. } | Surface::Index { table: owner, .. },
+        ) => table == owner,
+        (Surface::Column(column), Surface::Default(owner)) => column == owner,
+        _ => false,
+    }
+}
+
 /// Source coordinates are selected by change kind. CREATE and ADD already
 /// name the final object; RENAME's `to` is final and its recorded UID locates
 /// the opening spelling. DROP records an explicit opening endpoint so a
@@ -250,7 +264,7 @@ pub(super) fn derive(
             entry.dropped_before = dropped;
         }
     }
-    Ok(affected
+    let mut transitions: Vec<ObjectTransition> = affected
         .into_iter()
         .map(|(surface, intent)| {
             let prior = intent
@@ -271,5 +285,26 @@ pub(super) fn derive(
                 after,
             }
         })
-        .collect())
+        .collect();
+    // Parent renames cover their complete child inventory, while a separately
+    // changed child has its own exact typed owner. Give each catalog address
+    // to that child once; projection still checks that every parent and child
+    // mutation has a covering transition and that the union is complete.
+    for parent in 0..transitions.len() {
+        let mut child_before = BTreeSet::new();
+        let mut child_after = BTreeSet::new();
+        for (index, child) in transitions.iter().enumerate() {
+            if index != parent && specializes(&child.surface, &transitions[parent].surface) {
+                child_before.extend(child.before.iter().cloned());
+                child_after.extend(child.after.iter().cloned());
+            }
+        }
+        transitions[parent]
+            .before
+            .retain(|object| !child_before.contains(object));
+        transitions[parent]
+            .after
+            .retain(|object| !child_after.contains(object));
+    }
+    Ok(transitions)
 }
