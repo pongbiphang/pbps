@@ -12,6 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Default)]
 struct Affected {
     children: bool,
+    opening: bool,
+    closing: bool,
     /// A DROP can coexist with a CREATE of the same spelling under a new UID.
     /// Its opening endpoint is the dropped UID, never the desired one's.
     dropped_before: Option<Surface>,
@@ -172,72 +174,116 @@ pub(super) fn derive(
 ) -> Result<Vec<ObjectTransition>, Error> {
     let mut affected: BTreeMap<Surface, Affected> = BTreeMap::new();
     for step in &changes.changes {
-        let (surface, children, dropped) = match &step.change {
-            Change::CreateTable { name, .. } => (Surface::Table(name.clone()), true, None),
+        let (surface, children, opening, closing, dropped) = match &step.change {
+            Change::CreateTable { name, .. } => {
+                (Surface::Table(name.clone()), true, false, true, None)
+            }
             Change::DropTable { name, .. } => (
                 Surface::Table(name.clone()),
                 true,
+                true,
+                false,
                 Some(Surface::Table(name.clone())),
             ),
-            Change::RenameTable { to, .. } => (Surface::Table(to.clone()), true, None),
+            Change::RenameTable { to, .. } => (Surface::Table(to.clone()), true, true, true, None),
             Change::AddColumn { table, name, .. } => {
-                (Surface::Column(table.column(name)), true, None)
+                (Surface::Column(table.column(name)), true, false, true, None)
             }
             Change::DropColumn { column, .. } => (
                 Surface::Column(column.clone()),
                 true,
+                true,
+                false,
                 Some(Surface::Column(column.clone())),
             ),
             Change::RenameColumn { table, to, .. } => {
-                (Surface::Column(table.column(to)), true, None)
+                (Surface::Column(table.column(to)), true, true, true, None)
             }
             Change::AlterColumnType { uid, column, .. } => (
                 Surface::Column(final_column(uid, column, desired)),
+                true,
+                true,
                 true,
                 None,
             ),
             Change::AlterColumnNullability { uid, column, .. } => (
                 Surface::Column(final_column(uid, column, desired)),
                 false,
+                true,
+                true,
                 None,
             ),
-            Change::AlterColumnDefault { uid, column, .. } => (
-                Surface::Default(final_column(uid, column, desired)),
-                false,
-                None,
-            ),
+            Change::AlterColumnDefault {
+                column, from, to, ..
+            } => {
+                let surface = Surface::Default(column.clone());
+                (
+                    surface.clone(),
+                    false,
+                    from.is_some(),
+                    to.is_some(),
+                    (from.is_some() && to.is_none()).then_some(surface),
+                )
+            }
             Change::SetPrimaryKey { table, .. }
             | Change::AddUnique { table, .. }
             | Change::DropUnique { table, .. }
             | Change::AddForeignKey { table, .. }
-            | Change::DropForeignKey { table, .. } => (Surface::Table(table.clone()), false, None),
-            Change::AddCheck { table, name, .. } | Change::DropCheck { table, name } => (
+            | Change::DropForeignKey { table, .. } => {
+                (Surface::Table(table.clone()), false, true, true, None)
+            }
+            Change::AddCheck { table, name, .. } => (
                 Surface::Check {
                     table: table.clone(),
                     name: name.clone(),
                 },
                 false,
+                false,
+                true,
                 None,
             ),
-            Change::AddIndex { table, name, .. } | Change::DropIndex { table, name } => (
+            Change::DropCheck { table, name } => {
+                let surface = Surface::Check {
+                    table: table.clone(),
+                    name: name.clone(),
+                };
+                (surface.clone(), false, true, false, Some(surface))
+            }
+            Change::AddIndex { table, name, .. } => (
                 Surface::Index {
                     table: table.clone(),
                     name: name.clone(),
                 },
                 false,
+                false,
+                true,
                 None,
             ),
-            Change::CreateModule { id, .. } | Change::AlterModule { id, .. } => {
-                (Surface::Module(id.clone()), false, None)
+            Change::DropIndex { table, name } => {
+                let surface = Surface::Index {
+                    table: table.clone(),
+                    name: name.clone(),
+                };
+                (surface.clone(), false, true, false, Some(surface))
+            }
+            Change::CreateModule { id, .. } => {
+                (Surface::Module(id.clone()), false, false, true, None)
+            }
+            Change::AlterModule { id, .. } => {
+                (Surface::Module(id.clone()), false, true, true, None)
             }
             Change::DropModule { id, .. } => (
                 Surface::Module(id.clone()),
+                false,
+                true,
                 false,
                 Some(Surface::Module(id.clone())),
             ),
             Change::PublicExecution { routine, .. } => (
                 Surface::Module(ModuleId::Routine(routine.clone())),
                 false,
+                true,
+                true,
                 None,
             ),
             Change::Grant { target, .. } | Change::Revoke { target, .. } => (
@@ -247,6 +293,8 @@ pub(super) fn derive(
                     GrantTarget::Object(name) => object_grant(name, opening, compiled)?,
                 },
                 false,
+                true,
+                true,
                 None,
             ),
             Change::InsertRow { .. }
@@ -260,6 +308,8 @@ pub(super) fn derive(
         };
         let entry = affected.entry(surface).or_default();
         entry.children |= children;
+        entry.opening |= opening;
+        entry.closing |= closing;
         if dropped.is_some() {
             entry.dropped_before = dropped;
         }
@@ -270,11 +320,15 @@ pub(super) fn derive(
             let prior = intent
                 .dropped_before
                 .or_else(|| opening_endpoint(&surface, base, desired));
-            let before = prior
-                .filter(|prior| declared(base.schema, prior))
-                .map(|prior| inventory(opening, &prior, intent.children))
-                .unwrap_or_default();
-            let after = if declared(desired.schema, &surface) {
+            let before = if intent.opening {
+                prior
+                    .filter(|prior| declared(base.schema, prior))
+                    .map(|prior| inventory(opening, &prior, intent.children))
+                    .unwrap_or_default()
+            } else {
+                BTreeSet::new()
+            };
+            let after = if intent.closing && declared(desired.schema, &surface) {
                 inventory(compiled, &surface, intent.children)
             } else {
                 BTreeSet::new()
@@ -293,9 +347,21 @@ pub(super) fn derive(
     for parent in 0..transitions.len() {
         let mut child_before = BTreeSet::new();
         let mut child_after = BTreeSet::new();
+        let parent_opening = opening_endpoint(&transitions[parent].surface, base, desired)
+            .unwrap_or_else(|| transitions[parent].surface.clone());
         for (index, child) in transitions.iter().enumerate() {
-            if index != parent && specializes(&child.surface, &transitions[parent].surface) {
+            if index == parent {
+                continue;
+            }
+            // A teardown keeps its opening spelling while the parent rename
+            // is labelled by the final UID. Coalesce each endpoint in its own
+            // coordinates, so one owned child is never claimed twice.
+            let child_opening = opening_endpoint(&child.surface, base, desired)
+                .unwrap_or_else(|| child.surface.clone());
+            if specializes(&child_opening, &parent_opening) {
                 child_before.extend(child.before.iter().cloned());
+            }
+            if specializes(&child.surface, &transitions[parent].surface) {
                 child_after.extend(child.after.iter().cloned());
             }
         }
