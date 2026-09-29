@@ -214,16 +214,27 @@ pub(super) fn derive(
                 None,
             ),
             Change::AlterColumnDefault {
-                column, from, to, ..
+                uid,
+                column,
+                from,
+                to,
             } => {
                 let surface = Surface::Default(column.clone());
-                (
-                    surface.clone(),
-                    false,
-                    from.is_some(),
-                    to.is_some(),
-                    (from.is_some() && to.is_none()).then_some(surface),
-                )
+                // A teardown may carry an old address while an ordinary
+                // removal carries the final one. The recorded UID identifies
+                // the same opening default in either case.
+                let prior = if from.is_some() {
+                    Some(Surface::Default(
+                        base.ids.columns.get(uid).cloned().ok_or_else(|| {
+                            Error::Binding(
+                                "a default change lacks its recorded opening column UID".into(),
+                            )
+                        })?,
+                    ))
+                } else {
+                    None
+                };
+                (surface, false, from.is_some(), to.is_some(), prior)
             }
             Change::SetPrimaryKey { table, .. }
             | Change::AddUnique { table, .. }
