@@ -17,13 +17,15 @@ use crate::resolver::docker::{
     CandidateImage, ContainerControl, ContainerSession, LocalApi, forwarder::Forwarder,
 };
 use crate::resolver::native::{
-    FORWARDER_PRIVILEGES, MqueueLease, NativeTarget, ProcessLease, TargetWitness, guarded_tasks,
+    CapturedTargetInputs, FORWARDER_PRIVILEGES, MqueueLease, NativeTarget, ProcessLease,
+    TargetWitness, guarded_tasks,
 };
 use crate::resolver::scope::{self, PlannedGrant};
 use pbps_db::Driver;
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
 use pbps_db::resolver::environment::{
-    AuthorizationFingerprint, EnvironmentFacts, FactStatus, RuleVersion, ScopeReport, Verdict,
+    AuthorizationFingerprint, CatalogFacts, EnvironmentFacts, FactStatus, RuleVersion, ScopeReport,
+    Verdict,
 };
 use pbps_db::resolver::{InstanceObservation, ScratchNames};
 use pbps_db::transport::{StreamConn, StreamLogin};
@@ -35,8 +37,11 @@ use std::time::Instant;
 
 pub(crate) mod engine;
 pub(crate) mod exclusivity;
+mod producer;
 pub(crate) mod profile;
+mod resolution;
 mod runtime;
+mod transitions;
 
 use exclusivity::TcpPair;
 use profile::ServerProfile;
@@ -1382,6 +1387,12 @@ struct QualifiedScope {
     /// The target's facts as sealed at `qualify`, visibility expected after
     /// the plan's grants: what every later check re-reads the target against.
     target: EnvironmentFacts,
+    /// Unprojected opening facts from exactly the same target read. The
+    /// closing catalog condition projects the final approved grants onto a
+    /// clone, never substitutes a later capture.
+    opening_catalog: CatalogFacts,
+    scratch_facts: EnvironmentFacts,
+    authorization_context: scope::Authorization,
     /// The digest of the target's authorization as read, before the plan's
     /// grants are projected onto it. The projected digest above cannot see a
     /// target that performed one of those very grants in the meantime — the
@@ -1410,10 +1421,25 @@ pub struct ResolvedAnalysis {
     pub compiled: InputManifest,
 }
 
+/// Complete same-capture qualified plan. It contains only ordered typed
+/// changes and keyed evidence; no raw target or scratch capture escapes.
+pub struct ResolvedPlan {
+    pub changes: pbps_model::ChangeSet,
+    pub evidence: pbps_model::resolver::ResolverEvidence,
+}
+
 struct AnalysisOutcome {
     assessment: pbps_db::resolver::capture::Assessment,
     opening: Option<InputManifest>,
     compiled: Option<InputManifest>,
+    producer: Option<ProducerOutcome>,
+}
+
+struct ProducerOutcome {
+    compiled: engine::CompiledCapture,
+    opening_capture: CapturedTargetInputs,
+    opening_build: String,
+    surfaces: Vec<pbps_model::resolver::SurfaceResolution>,
 }
 
 impl ScratchRun {
@@ -1618,6 +1644,7 @@ impl ScratchRun {
             self.scratch = Some(reopened);
         }
         let target_authorization = target_auth.digest();
+        let opening_catalog = target_facts.catalog.clone();
         // The expected visibility is what the deployer would see on each path
         // *after* the plan's preceding grants — so a planned USAGE grant that
         // intentionally reveals or hides a schema is compared against its
@@ -1703,6 +1730,9 @@ impl ScratchRun {
             report,
             authorization,
             target: target_facts,
+            opening_catalog,
+            scratch_facts,
+            authorization_context: target_auth,
             target_authorization,
             scratch_authorization,
             map,
@@ -1902,7 +1932,7 @@ impl ScratchRun {
         target: &mut NativeTarget,
         request: &BindingRequest<'_>,
     ) -> Result<pbps_db::resolver::capture::Assessment, Error> {
-        self.resolve_with_key(target, request, None)
+        self.resolve_with_key(target, request, None, None)
             .await
             .map(|outcome| outcome.assessment)
     }
@@ -1916,7 +1946,9 @@ impl ScratchRun {
         request: &BindingRequest<'_>,
         key: &EnvironmentFingerprintKey,
     ) -> Result<ResolvedAnalysis, Error> {
-        let outcome = self.resolve_with_key(target, request, Some(key)).await?;
+        let outcome = self
+            .resolve_with_key(target, request, Some(key), None)
+            .await?;
         Ok(ResolvedAnalysis {
             assessment: outcome.assessment,
             opening: outcome.opening.expect("keyed resolve has opening manifest"),
@@ -1931,11 +1963,12 @@ impl ScratchRun {
         target: &mut NativeTarget,
         request: &BindingRequest<'_>,
         key: Option<&EnvironmentFingerprintKey>,
+        planning: Option<(pbps_diff::Side<'_>, pbps_diff::Side<'_>)>,
     ) -> Result<AnalysisOutcome, Error> {
         self.begin_operation()?;
         let mut entered_runtime = false;
         let outcome = self
-            .resolve_inner(target, request, key, &mut entered_runtime)
+            .resolve_inner(target, request, key, planning, &mut entered_runtime)
             .await;
         self.operation_in_flight = false;
         let must_retire = entered_runtime || self.inner.refusal().is_some();
@@ -1950,6 +1983,7 @@ impl ScratchRun {
         target: &mut NativeTarget,
         request: &BindingRequest<'_>,
         key: Option<&EnvironmentFingerprintKey>,
+        planning: Option<(pbps_diff::Side<'_>, pbps_diff::Side<'_>)>,
         entered_runtime: &mut bool,
     ) -> Result<AnalysisOutcome, Error> {
         // A held session, or a refusal already recorded, ends the run before
@@ -1981,7 +2015,7 @@ impl ScratchRun {
         self.check_inner(target).await?;
         self.compiled = true;
         let outcome = self
-            .resolve_checked(target, request, &extras, &mut reconstruction, key)
+            .resolve_checked(target, request, &extras, &mut reconstruction, key, planning)
             .await;
         if let Err(cause) = &outcome {
             self.inner.refuse(cause.clone());
@@ -1999,6 +2033,7 @@ impl ScratchRun {
         extras: &[String],
         reconstruction: &mut engine::Reconstruction,
         key: Option<&EnvironmentFingerprintKey>,
+        planning: Option<(pbps_diff::Side<'_>, pbps_diff::Side<'_>)>,
     ) -> Result<AnalysisOutcome, Error> {
         // In flight across the compilation: dropped part-way, the scratch
         // session is mid-transaction, and the next check must end the run.
@@ -2029,29 +2064,93 @@ impl ScratchRun {
         container_tests::pause("container-capture-admin-owned").await;
         let admin = self.inner.admin_connection().ok_or(Error::Cancelled)?;
         let principals = self.scope.as_ref().ok_or(Error::Cancelled)?.map.clone();
-        let captured = match key {
-            Some(key) => {
+        let namespaces = {
+            let sealed = self.scope.as_ref().ok_or(Error::Cancelled)?;
+            sealed
+                .schemas
+                .iter()
+                .chain(&sealed.write_path_extras)
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        };
+        let captured: Result<
+            (
+                Option<engine::CompiledCapture>,
+                Option<engine::CapturedInputs>,
+                engine::CaptureScope,
+                Option<InputManifest>,
+            ),
+            String,
+        > = match (key, planning) {
+            (Some(key), Some((_, wanted))) => engine::capture_desired_for_plan(
+                admin,
+                &base,
+                &desired,
+                &paths,
+                key,
+                &principals,
+                wanted,
+                reconstruction,
+                &namespaces,
+            )
+            .await
+            .map(|(captured, scope)| (Some(captured), None, scope, None)),
+            (Some(key), None) => {
                 engine::capture_desired_sealed(admin, &base, &desired, &paths, key, &principals)
                     .await
-                    .map(|(captured, scope, manifest)| (captured, scope, Some(manifest)))
+                    .map(|(captured, scope, manifest)| {
+                        (None, Some(captured), scope, Some(manifest))
+                    })
             }
-            None => engine::capture_desired(admin, &base, &desired, &paths)
+            (None, None) => engine::capture_desired(admin, &base, &desired, &paths)
                 .await
-                .map(|(captured, scope)| (captured, scope, None)),
+                .map(|(captured, scope)| (None, Some(captured), scope, None)),
+            (None, Some(_)) => Err("qualified planning requires the environment key".into()),
         };
         self.retire_admin();
-        let (compiled, scope, compiled_manifest) = captured.map_err(Error::Binding)?;
+        let (compiled_qualified, compiled, scope, compiled_manifest) =
+            captured.map_err(Error::Binding)?;
         self.check_inner(target).await?;
         let signatures = dropped.iter().filter_map(|(_, s)| s.clone()).collect();
-        let (current, opening_manifest) = match key {
-            Some(key) => target
+        let (current, opening_manifest, opening_build) = match (key, planning) {
+            (Some(key), Some((recorded, _))) => {
+                let routines = recorded
+                    .schema
+                    .modules
+                    .keys()
+                    .filter_map(|id| {
+                        reconstruction
+                            .created(id)
+                            .map(|object| (id.clone(), object.clone()))
+                    })
+                    .collect();
+                let dropped_roots = dropped
+                    .iter()
+                    .filter_map(|(id, signature)| {
+                        signature.clone().map(|signature| (id.clone(), signature))
+                    })
+                    .collect();
+                let ownership = engine::RecordedOwnership {
+                    schema: recorded.schema,
+                    ids: recorded.ids,
+                    routines: &routines,
+                    dropped: &dropped_roots,
+                    namespaces: &namespaces,
+                };
+                target
+                    .capture_postgres_qualified(&scope, &signatures, key, &ownership)
+                    .await
+                    .map(|(captured, manifest, build)| (captured, Some(manifest), Some(build)))
+            }
+            (Some(key), None) => target
                 .capture_postgres_sealed(&scope, &signatures, key)
                 .await
-                .map(|(captured, manifest)| (captured, Some(manifest))),
-            None => target
+                .map(|(captured, manifest)| (captured, Some(manifest), None)),
+            (None, None) => target
                 .capture_postgres(&scope, &signatures)
                 .await
-                .map(|captured| (captured, None)),
+                .map(|captured| (captured, None, None)),
+            (None, Some(_)) => unreachable!("planned branch requires the key"),
         }
         .map_err(|error| Error::Binding(error.to_string()))?;
         self.check_inner(target).await?;
@@ -2065,10 +2164,45 @@ impl ScratchRun {
                 })
                 .collect(),
         );
+        let assessment = match &compiled_qualified {
+            Some(compiled) => compiled.assess(current.catalog(), &base, &paths, reconstruction),
+            None => engine::assess(
+                current.catalog(),
+                compiled.as_ref().expect("ordinary capture"),
+                &base,
+                &paths,
+                reconstruction,
+            ),
+        };
+        let producer = if let Some(compiled) = compiled_qualified {
+            let opening = opening_manifest
+                .as_ref()
+                .expect("qualified opening manifest");
+            let records = compiled
+                .planning_records()
+                .map_err(|error| Error::Binding(error.to_string()))?;
+            let (base_side, desired_side) = planning.expect("qualified planning sides");
+            let surfaces = resolution::from_records(
+                base_side.schema,
+                desired_side.schema,
+                &resolution::records(opening),
+                &records,
+                &assessment,
+            )?;
+            Some(ProducerOutcome {
+                compiled,
+                opening_capture: current,
+                opening_build: opening_build.expect("qualified build"),
+                surfaces,
+            })
+        } else {
+            None
+        };
         Ok(AnalysisOutcome {
-            assessment: engine::assess(current.catalog(), &compiled, &base, &paths, reconstruction),
+            assessment,
             opening: opening_manifest,
             compiled: compiled_manifest,
+            producer,
         })
     }
 

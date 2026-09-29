@@ -7,6 +7,7 @@ use pbps_db::resolver::capture::{CaptureDifference, InputChange, ObjectIdentity}
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+#[derive(Clone)]
 pub(super) struct Input {
     pub(super) properties: BTreeMap<String, Value>,
     pub(super) bindings: Vec<Binding>,
@@ -72,6 +73,365 @@ pub struct CapturedInputs {
     pub(super) limitations: BTreeSet<ObjectIdentity>,
     /// What each requested dropped signature named in this snapshot.
     dropped: BTreeMap<super::DroppedSignature, Option<ObjectIdentity>>,
+}
+
+/// Logical planning facts only. Private properties never leave the fixed-key
+/// capture that produced them.
+#[derive(Clone)]
+pub struct BindingRecord {
+    pub object: ObjectIdentity,
+    pub ownership: pbps_model::resolver::ObjectOwnership,
+    pub bindings: Vec<pbps_model::resolver::Binding>,
+}
+
+/// An in-progress producer, with its environment key selected before the
+/// coherent read. It exposes no raw capture getter, callback or rekey setter.
+/// The only outward observations are verdicts and logical binding identities.
+pub struct CompiledCapture {
+    captured: CapturedInputs,
+    key: pbps_db::fingerprint::EnvironmentFingerprintKey,
+    roles: crate::resolver::authorization::RoleMap,
+    ownership: BTreeMap<ObjectIdentity, pbps_model::resolver::ObjectOwnership>,
+}
+
+fn relation_identity(table: &pbps_model::TableName) -> ObjectIdentity {
+    ObjectIdentity {
+        class: "pg_class".into(),
+        name: vec![table.schema.clone(), table.name.clone()],
+        signature: Vec::new(),
+    }
+}
+
+/// An ALTER TABLE/COLUMN RENAME preserves only typed owner/ACL metadata.
+/// The recorded change and its UID-backed transition locate the opening
+/// subject; a reused spelling cannot serve as a substitute source.
+fn rename_source(
+    object: &ObjectIdentity,
+    transition: &pbps_model::resolver::ObjectTransition,
+    changes: &pbps_model::ChangeSet,
+) -> Option<ObjectIdentity> {
+    use pbps_model::Change;
+    use pbps_model::resolver::Surface;
+    let final_table = match &transition.surface {
+        Surface::Table(table) => table,
+        Surface::Column(column) => &column.table,
+        _ => return None,
+    };
+    let prior_table = changes
+        .changes
+        .iter()
+        .find_map(|step| match &step.change {
+            Change::RenameTable { from, to, .. } if to == final_table => Some(from),
+            _ => None,
+        })
+        .unwrap_or(final_table);
+    let before_relation = relation_identity(prior_table);
+    let before_column = |name: &str| {
+        let prior = changes
+            .changes
+            .iter()
+            .find_map(|step| match &step.change {
+                Change::RenameColumn {
+                    table, from, to, ..
+                } if table == final_table && to == name => Some(from.as_str()),
+                _ => None,
+            })
+            .unwrap_or(name);
+        ObjectIdentity {
+            class: "pg_attribute".into(),
+            name: vec![prior.into()],
+            signature: vec![before_relation.clone()],
+        }
+    };
+    let source = match object.class.as_str() {
+        "pg_class" if object.name == [final_table.schema.clone(), final_table.name.clone()] => {
+            before_relation
+        }
+        "pg_attribute" => before_column(object.name.first()?),
+        _ => return None,
+    };
+    transition.before.contains(&source).then_some(source)
+}
+
+impl CompiledCapture {
+    pub(super) fn new(
+        captured: CapturedInputs,
+        key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+        roles: &crate::resolver::authorization::RoleMap,
+        ownership: BTreeMap<ObjectIdentity, pbps_model::resolver::ObjectOwnership>,
+    ) -> Self {
+        Self {
+            captured,
+            key: key.clone(),
+            roles: roles.clone(),
+            ownership,
+        }
+    }
+
+    pub fn assess(
+        &self,
+        target: &CapturedInputs,
+        base: &super::Managed,
+        paths: &super::Paths,
+        reconstruction: &crate::resolver::reconstruct::Reconstruction,
+    ) -> pbps_db::resolver::capture::Assessment {
+        super::assess(target, &self.captured, base, paths, reconstruction)
+    }
+
+    /// Consume the fixed-key producer once the exact final typed sequence is
+    /// known. Typed table/column renames retain measured opening metadata;
+    /// rebuilt and newly created objects receive the opening target's
+    /// effective creation defaults. No caller supplies a property mapping.
+    pub fn seal_for_plan(
+        mut self,
+        opening: &CapturedInputs,
+        changes: &pbps_model::ChangeSet,
+        transitions: &[pbps_model::resolver::ObjectTransition],
+        effective_creator: &str,
+    ) -> Result<pbps_model::resolver::InputManifest, pbps_model::resolver::ManifestError> {
+        use pbps_model::Change;
+        use pbps_model::resolver::{ManifestError, ObjectOwnership, Surface};
+        let inplace: BTreeSet<Surface> = changes
+            .changes
+            .iter()
+            .filter_map(|step| match &step.change {
+                Change::RenameTable { to, .. } => Some(Surface::Table(to.clone())),
+                Change::RenameColumn { table, to, .. } => Some(Surface::Column(table.column(to))),
+                _ => None,
+            })
+            .collect();
+        let lookup: BTreeMap<_, _> = self
+            .captured
+            .inputs
+            .keys()
+            .map(|raw| Ok((normalize_identity(raw, Some(&self.roles))?, raw.clone())))
+            .collect::<Result<_, ManifestError>>()?;
+        let mut preserved_dependencies = BTreeSet::new();
+        let mut created_dependencies = BTreeSet::new();
+        let mut dependency_mappings = Vec::new();
+        let mut dependencies_to_copy = Vec::new();
+        for transition in transitions {
+            let preserved = inplace.contains(&transition.surface);
+            let created = transition.before.is_empty()
+                || changes.changes.iter().any(|step| matches!(
+                    &step.change,
+                    Change::CreateModule { id, .. } if transition.surface == Surface::Module(id.clone())
+                ));
+            for object in &transition.after {
+                if object.class == "pg_shdepend" {
+                    continue;
+                }
+                let Some(raw) = lookup.get(object) else {
+                    return Err(ManifestError::Incomplete);
+                };
+                let owner = self.ownership.get(raw).ok_or(ManifestError::Incomplete)?;
+                if !matches!(owner, ObjectOwnership::Surface(_)) {
+                    continue;
+                }
+                if preserved {
+                    let source = rename_source(object, transition, changes);
+                    let before = source
+                        .as_ref()
+                        .and_then(|source| opening.inputs.get(source));
+                    let fields: &[&str] = match object.class.as_str() {
+                        "pg_class" => &["relowner", "relacl"],
+                        "pg_proc" => &["proowner", "proacl"],
+                        "pg_attribute" if source.is_some() => &["attacl"],
+                        "pg_type" => &["typowner"],
+                        _ => &[],
+                    };
+                    if !fields.is_empty() {
+                        let source = source.ok_or(ManifestError::Incomplete)?;
+                        let before = before.ok_or(ManifestError::Incomplete)?;
+                        let after = self
+                            .captured
+                            .inputs
+                            .get_mut(raw)
+                            .ok_or(ManifestError::Incomplete)?;
+                        for field in fields {
+                            let value = before
+                                .properties
+                                .get(*field)
+                                .ok_or(ManifestError::Incomplete)?;
+                            after.properties.insert((*field).into(), value.clone());
+                        }
+                        preserved_dependencies.insert(object.clone());
+                        dependency_mappings.push((
+                            source,
+                            object.clone(),
+                            transition.surface.clone(),
+                        ));
+                    }
+                } else if created {
+                    let kind = match object.class.as_str() {
+                        "pg_proc" => Some(("f", "proacl", "proowner")),
+                        "pg_class" => match self
+                            .captured
+                            .inputs
+                            .get(raw)
+                            .and_then(|input| input.properties.get("relkind"))
+                            .and_then(Value::as_str)
+                        {
+                            Some("r" | "p" | "v") => Some(("r", "relacl", "relowner")),
+                            Some("S") => Some(("S", "relacl", "relowner")),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some((kind, acl_field, owner_field)) = kind {
+                        let namespace = object.name.first().ok_or(ManifestError::Invalid)?;
+                        let acl = super::creation_acl::creation_acl(
+                            opening,
+                            effective_creator,
+                            namespace,
+                            kind,
+                        )?;
+                        let after = self
+                            .captured
+                            .inputs
+                            .get_mut(raw)
+                            .ok_or(ManifestError::Incomplete)?;
+                        after.properties.insert(acl_field.into(), acl.clone());
+                        after.properties.insert(
+                            owner_field.into(),
+                            serde_json::to_value(ObjectIdentity {
+                                class: "pg_authid".into(),
+                                name: vec![effective_creator.into()],
+                                signature: Vec::new(),
+                            })
+                            .map_err(|_| ManifestError::Invalid)?,
+                        );
+                        created_dependencies.insert(object.clone());
+                        if let Value::Array(entries) = acl {
+                            for entry in entries {
+                                for principal in ["grantor", "grantee"] {
+                                    let role: ObjectIdentity = serde_json::from_value(
+                                        entry
+                                            .get(principal)
+                                            .cloned()
+                                            .ok_or(ManifestError::Invalid)?,
+                                    )
+                                    .map_err(|_| ManifestError::Invalid)?;
+                                    if role.class == "pg_authid" && role.name != [effective_creator]
+                                    {
+                                        dependencies_to_copy.push((
+                                            object.clone(),
+                                            role,
+                                            transition.surface.clone(),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Dependency rows are addressed by their owned subject. For in-place
+        // replacement the target's owner/ACL rows survive exactly; scratch's
+        // new-object dependencies would falsely report its transient owner.
+        let old_dependencies = self
+            .captured
+            .inputs
+            .keys()
+            .filter(|id| id.class == "pg_shdepend")
+            .filter(|id| {
+                id.signature
+                    .first()
+                    .and_then(|subject| normalize_identity(subject, Some(&self.roles)).ok())
+                    .is_some_and(|subject| {
+                        preserved_dependencies.contains(&subject)
+                            || created_dependencies.contains(&subject) && id.name == ["a"]
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for id in old_dependencies {
+            self.captured.inputs.remove(&id);
+            self.ownership.remove(&id);
+        }
+        for transition in transitions {
+            if !inplace.contains(&transition.surface) {
+                continue;
+            }
+            for (id, input) in &opening.inputs {
+                if id.class == "pg_shdepend"
+                    && id
+                        .signature
+                        .first()
+                        .is_some_and(|subject| transition.before.contains(subject))
+                {
+                    self.captured.inputs.insert(id.clone(), input.clone());
+                    self.ownership.insert(
+                        id.clone(),
+                        ObjectOwnership::Surface(transition.surface.clone()),
+                    );
+                }
+            }
+        }
+        for (subject, role, surface) in dependencies_to_copy {
+            // A pinned role has no shared dependency. The opening default ACL
+            // itself proves whether this role is dependency-recorded; never
+            // infer that from a spelling or from the scratch role map.
+            let recorded = opening.inputs.keys().any(|id| {
+                id.class == "pg_shdepend"
+                    && id.name == ["a"]
+                    && id.signature.get(1) == Some(&role)
+                    && id
+                        .signature
+                        .first()
+                        .is_some_and(|owner| owner.class == "pg_default_acl")
+            });
+            if !recorded {
+                continue;
+            }
+            let id = ObjectIdentity {
+                class: "pg_shdepend".into(),
+                name: vec!["a".into()],
+                signature: vec![subject, role],
+            };
+            self.captured.inputs.insert(
+                id.clone(),
+                Input {
+                    properties: BTreeMap::new(),
+                    bindings: Vec::new(),
+                },
+            );
+            self.ownership.insert(id, ObjectOwnership::Surface(surface));
+        }
+        self.captured
+            .seal_with_roles(&self.key, Some(&self.roles), Some(&self.ownership))
+    }
+
+    pub fn planning_records(
+        &self,
+    ) -> Result<Vec<BindingRecord>, pbps_model::resolver::ManifestError> {
+        self.captured
+            .inputs
+            .iter()
+            .map(|(object, input)| {
+                Ok(BindingRecord {
+                    object: normalize_identity(object, Some(&self.roles))?,
+                    ownership: self
+                        .ownership
+                        .get(object)
+                        .cloned()
+                        .unwrap_or(pbps_model::resolver::ObjectOwnership::Unqualified),
+                    bindings: input
+                        .bindings
+                        .iter()
+                        .map(|binding| {
+                            Ok(pbps_model::resolver::Binding {
+                                node: binding.node.clone(),
+                                path: binding.path.clone(),
+                                target: normalize_identity(&binding.target, Some(&self.roles))?,
+                            })
+                        })
+                        .collect::<Result<_, pbps_model::resolver::ManifestError>>()?,
+                })
+            })
+            .collect()
+    }
 }
 
 fn normalize_identity(
@@ -164,7 +524,7 @@ impl CapturedInputs {
         &self,
         key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
     ) -> Result<pbps_model::resolver::InputManifest, pbps_model::resolver::ManifestError> {
-        self.seal_with_roles(key, None)
+        self.seal_with_roles(key, None, None)
     }
 
     /// The mapped variant is used only during the scratch read owned by the
@@ -174,6 +534,7 @@ impl CapturedInputs {
         &self,
         key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
         roles: Option<&crate::resolver::authorization::RoleMap>,
+        ownership: Option<&BTreeMap<ObjectIdentity, pbps_model::resolver::ObjectOwnership>>,
     ) -> Result<pbps_model::resolver::InputManifest, pbps_model::resolver::ManifestError> {
         use pbps_model::resolver::{
             Binding, CandidateSet, InputManifest, ManifestError, Membership, Prerequisite,
@@ -235,7 +596,10 @@ impl CapturedInputs {
                     object: normalized(object)?,
                     // An ordinary read still proves no ownership. The qualified
                     // producer assigns it only from the recorded managed UID.
-                    ownership: pbps_model::resolver::ObjectOwnership::Unqualified,
+                    ownership: ownership
+                        .and_then(|owners| owners.get(object))
+                        .cloned()
+                        .unwrap_or(pbps_model::resolver::ObjectOwnership::Unqualified),
                     canonicalization: self.rule.into(),
                     properties: digest(
                         "properties",

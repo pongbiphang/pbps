@@ -31,7 +31,9 @@ pub(in crate::resolver::native) use pbps_pg::resolver::capture::{
 // the engine's held-lock state (DECISIONS 417). Source-free refusals and
 // comparison reports use pbps-db's shared answer types. No catalog can mint
 // the separate native source capability (DEC-974.1).
-pub(super) use pbps_pg::resolver::capture::{CaptureScope, CapturedInputs, DroppedSignature};
+pub(super) use pbps_pg::resolver::capture::{
+    CaptureScope, CapturedInputs, DroppedSignature, RecordedOwnership,
+};
 
 pub(super) async fn capture_with_runtime_inputs(
     connection: &mut PeerVerifiedConn,
@@ -59,6 +61,26 @@ pub(super) async fn capture_sealed(
         Driver::Postgres => {
             pbps_pg::resolver::capture::capture_identifying_sealed(connection, scope, dropped, key)
                 .await
+        }
+        Driver::Mssql => Err(CaptureError::Unsupported {
+            engine: "SQL Server",
+        }),
+    }
+}
+
+pub(super) async fn capture_qualified(
+    connection: &mut PeerVerifiedConn,
+    scope: &CaptureScope,
+    dropped: &std::collections::BTreeSet<DroppedSignature>,
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+    recorded: &RecordedOwnership<'_>,
+) -> Result<(CapturedInputs, pbps_model::resolver::InputManifest), CaptureError> {
+    match connection.driver() {
+        Driver::Postgres => {
+            pbps_pg::resolver::capture::capture_identifying_qualified(
+                connection, scope, dropped, key, None, recorded,
+            )
+            .await
         }
         Driver::Mssql => Err(CaptureError::Unsupported {
             engine: "SQL Server",

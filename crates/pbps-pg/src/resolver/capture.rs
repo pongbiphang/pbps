@@ -79,8 +79,11 @@ pub struct DroppedSignature {
 
 pub use pbps_db::resolver::capture::{CaptureError, Uncovered};
 
+mod creation_acl;
 mod manifest;
-pub use manifest::CapturedInputs;
+mod ownership;
+pub use manifest::{BindingRecord, CapturedInputs, CompiledCapture};
+pub use ownership::RecordedOwnership;
 
 mod assess;
 pub use assess::{Managed, Paths, assess, managed_scope, scope};
@@ -143,9 +146,43 @@ pub async fn capture_identifying_sealed_with_roles(
 ) -> Result<(CapturedInputs, pbps_model::resolver::InputManifest), CaptureError> {
     let captured = capture_identifying(connection, scope, dropped).await?;
     let manifest = captured
-        .seal_with_roles(key, Some(roles))
+        .seal_with_roles(key, Some(roles), None)
         .map_err(|_| CaptureError::Incomplete)?;
     Ok((captured, manifest))
+}
+
+/// Qualify recorded ownership while the final coherent read still holds its
+/// private relkind/prokind/dependency facts. The key and Schema/IdsFile are
+/// fixed at this producer entry; the returned capture has no rekey method.
+pub async fn capture_identifying_qualified(
+    connection: &mut impl pbps_db::transport::QueryConnection,
+    scope: &CaptureScope,
+    dropped: &BTreeSet<DroppedSignature>,
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+    roles: Option<&crate::resolver::authorization::RoleMap>,
+    recorded: &RecordedOwnership<'_>,
+) -> Result<(CapturedInputs, pbps_model::resolver::InputManifest), CaptureError> {
+    let captured = capture_identifying(connection, scope, dropped).await?;
+    let ownership = ownership::classify(&captured, recorded).map_err(CaptureError::Coverage)?;
+    let manifest = captured
+        .seal_with_roles(key, roles, Some(&ownership))
+        .map_err(|_| CaptureError::Incomplete)?;
+    Ok((captured, manifest))
+}
+
+/// Fix the key, role map and recorded identity roots at the authorized
+/// scratch read. The private result exposes no raw or rekey operation.
+pub async fn capture_identifying_for_plan(
+    connection: &mut impl pbps_db::transport::QueryConnection,
+    scope: &CaptureScope,
+    dropped: &BTreeSet<DroppedSignature>,
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+    roles: &crate::resolver::authorization::RoleMap,
+    recorded: &RecordedOwnership<'_>,
+) -> Result<CompiledCapture, CaptureError> {
+    let captured = capture_identifying(connection, scope, dropped).await?;
+    let ownership = ownership::classify(&captured, recorded).map_err(CaptureError::Coverage)?;
+    Ok(CompiledCapture::new(captured, key, roles, ownership))
 }
 
 /// Read and seal on behalf of the holder of catalog-read authority. A

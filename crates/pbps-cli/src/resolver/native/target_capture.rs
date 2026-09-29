@@ -3,7 +3,7 @@
 //! the returned fresh read is enclosed by the native build observations.
 
 use super::{BoundTarget, NativeTarget, correlate, engine, executables};
-use engine::{CaptureScope, CapturedInputs};
+use engine::{CaptureScope, CapturedInputs, RecordedOwnership};
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
 use pbps_db::resolver::{
     InstanceObservation,
@@ -95,6 +95,34 @@ fn qualified<'a>(
     engine.role == ExecutableRole::Engine && readable(engine) && libraries.into_iter().all(readable)
 }
 
+/// Versioned target-only native observation. Canonical roles, content,
+/// provenance, multiplicity and disk-divergence are retained; run-local paths,
+/// PIDs, mapping addresses and connection IDs are excluded. A future apply
+/// reader can call this after its own native lease and catalog hints read.
+fn build_fingerprint(
+    key: &EnvironmentFingerprintKey,
+    observed: &executables::CapturedExecutables,
+) -> Result<String, CaptureFailure> {
+    let engine = observed.engine().clone();
+    // These are process-namespace loader paths, not inspector host prefixes or
+    // PIDs. Retaining a mapped file's path distinguishes a code swap between
+    // two loaded libraries; opaque required names are keyed separately below.
+    let mut libraries = observed.libraries().cloned().collect::<Vec<_>>();
+    libraries.sort_by_cached_key(|library| {
+        serde_json::to_vec(library).expect("qualified executable serializes")
+    });
+    let associations = observed
+        .required_associations(key)
+        .map_err(|_| CaptureFailure::Executables)?;
+    let bytes = serde_json::to_vec(&(engine, libraries, associations))
+        .map_err(|_| CaptureFailure::Executables)?;
+    Ok(crate::resolver::sealing::hex(key.fingerprint(
+        "pbps/pg-native-build/v1",
+        "qualified-executables",
+        &bytes,
+    )))
+}
+
 impl NativeTarget {
     /// `dropped` are the dropped routines' signatures to identify in the
     /// capture's own snapshot, which both reads below carry (#1148).
@@ -103,9 +131,9 @@ impl NativeTarget {
         scope: &CaptureScope,
         dropped: &std::collections::BTreeSet<engine::DroppedSignature>,
     ) -> Result<CapturedTargetInputs, CaptureFailure> {
-        self.capture_postgres_inner(scope, dropped, None)
+        self.capture_postgres_inner(scope, dropped, None, None)
             .await
-            .map(|(captured, _)| captured)
+            .map(|(captured, _, _)| captured)
     }
 
     /// The key is chosen before the fresh catalog read. Neither the returned
@@ -116,12 +144,32 @@ impl NativeTarget {
         dropped: &std::collections::BTreeSet<engine::DroppedSignature>,
         key: &EnvironmentFingerprintKey,
     ) -> Result<(CapturedTargetInputs, InputManifest), CaptureFailure> {
-        let (captured, manifest) = self
-            .capture_postgres_inner(scope, dropped, Some(key))
+        let (captured, manifest, _) = self
+            .capture_postgres_inner(scope, dropped, Some(key), None)
             .await?;
         Ok((
             captured,
             manifest.expect("sealed capture returns a manifest"),
+        ))
+    }
+
+    /// This is the evidence producer's controlled fresh read. Recorded
+    /// identities enter before catalog kind facts are erased by sealing;
+    /// native build content is pinned inside the same executable bracket.
+    pub async fn capture_postgres_qualified(
+        &mut self,
+        scope: &CaptureScope,
+        dropped: &std::collections::BTreeSet<engine::DroppedSignature>,
+        key: &EnvironmentFingerprintKey,
+        recorded: &RecordedOwnership<'_>,
+    ) -> Result<(CapturedTargetInputs, InputManifest, String), CaptureFailure> {
+        let (captured, manifest, build) = self
+            .capture_postgres_inner(scope, dropped, Some(key), Some(recorded))
+            .await?;
+        Ok((
+            captured,
+            manifest.expect("qualified capture returns a manifest"),
+            build.expect("qualified capture returns a build fingerprint"),
         ))
     }
 
@@ -130,7 +178,8 @@ impl NativeTarget {
         scope: &CaptureScope,
         dropped: &std::collections::BTreeSet<engine::DroppedSignature>,
         key: Option<&EnvironmentFingerprintKey>,
-    ) -> Result<(CapturedTargetInputs, Option<InputManifest>), CaptureFailure> {
+        recorded: Option<&RecordedOwnership<'_>>,
+    ) -> Result<(CapturedTargetInputs, Option<InputManifest>, Option<String>), CaptureFailure> {
         // Ownership moves before the first await. Cancellation, even during
         // an owned SQL transaction, drops the connection and every weak lease.
         let mut bound = self.current.take().ok_or(CaptureFailure::Binding)?;
@@ -148,8 +197,21 @@ impl NativeTarget {
         check(&mut bound).await?;
         let (catalog, manifest) = match key {
             Some(key) => {
-                let (catalog, manifest) =
-                    engine::capture_sealed(&mut bound.connection, scope, dropped, key).await?;
+                let (catalog, manifest) = match recorded {
+                    Some(recorded) => {
+                        engine::capture_qualified(
+                            &mut bound.connection,
+                            scope,
+                            dropped,
+                            key,
+                            recorded,
+                        )
+                        .await?
+                    }
+                    None => {
+                        engine::capture_sealed(&mut bound.connection, scope, dropped, key).await?
+                    }
+                };
                 (catalog, Some(manifest))
             }
             None => (
@@ -170,13 +232,18 @@ impl NativeTarget {
             return Err(CaptureFailure::Changed);
         }
         check(&mut bound).await?;
+        let build = if let (Some(key), Some(_)) = (key, recorded) {
+            Some(build_fingerprint(key, &after)?)
+        } else {
+            None
+        };
         let captured = CapturedTargetInputs {
             catalog,
             executables: after,
             instance: bound.identity.clone(),
         };
         self.current = Some(bound);
-        Ok((captured, manifest))
+        Ok((captured, manifest, build))
     }
 
     pub async fn recapture_postgres(
