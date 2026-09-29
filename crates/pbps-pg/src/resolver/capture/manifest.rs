@@ -92,14 +92,30 @@ fn normalize_identity(
             };
             if let Some(logical) = roles.logical_of(name) {
                 result.name = vec![logical];
-            } else if name.starts_with("pbps_role_") {
-                // A run-local name without a recorded mapping is unreadable,
-                // not an unrelated stable principal.
-                return Err(ManifestError::Incomplete);
             }
         }
     }
     Ok(result)
+}
+
+/// Only the ACL arrays qualified by the catalog layout are sets. Their
+/// source order is by raw role spelling, which changes under the run-local
+/// map; other property arrays may encode meaningful SQL order.
+fn acl_field(class: &str, name: &str) -> bool {
+    matches!(
+        (class, name),
+        ("pg_attribute", "attacl")
+            | ("pg_class", "relacl")
+            | ("pg_database", "datacl")
+            | ("pg_default_acl", "defaclacl")
+            | ("pg_init_privs", "privileges")
+            | ("pg_language", "lanacl")
+            | ("pg_namespace", "nspacl")
+            | ("pg_parameter_acl", "paracl")
+            | ("pg_proc", "proacl")
+            | ("pg_tablespace", "spcacl")
+            | ("pg_type", "typacl")
+    )
 }
 
 fn normalize_value(
@@ -205,7 +221,15 @@ impl CapturedInputs {
                 let properties: BTreeMap<String, Value> = input
                     .properties
                     .iter()
-                    .map(|(name, value)| Ok((name.clone(), normalize_value(value, roles)?)))
+                    .map(|(name, value)| {
+                        let mut normalized = normalize_value(value, roles)?;
+                        if acl_field(&object.class, name) {
+                            if let Value::Array(entries) = &mut normalized {
+                                entries.sort_by_cached_key(Value::to_string);
+                            }
+                        }
+                        Ok((name.clone(), normalized))
+                    })
                     .collect::<Result<_, ManifestError>>()?;
                 Ok(Prerequisite {
                     object: normalized(object)?,
