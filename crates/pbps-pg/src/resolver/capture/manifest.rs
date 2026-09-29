@@ -1,7 +1,7 @@
 //! Private complete input records and versioned cryptographic comparison.
 //! No external verifier, source, or derived checksum is an ordinary report.
 
-use super::{CaptureScope, Uncovered, bindings::Binding, properties, read, scope};
+use super::{CaptureScope, Uncovered, bindings::Binding, logical, properties, read, scope};
 use pbps_db::fingerprint::FingerprintKey;
 use pbps_db::resolver::capture::{CaptureDifference, InputChange, ObjectIdentity};
 use serde_json::Value;
@@ -69,6 +69,9 @@ pub struct CapturedInputs {
     major: u32,
     scope: CaptureScope,
     pub(super) inputs: BTreeMap<ObjectIdentity, Input>,
+    /// Raw attribute numbers prove physical children before the ordinal is
+    /// erased from durable catalog properties. Never seal these positions.
+    pub(super) attribute_numbers: BTreeMap<ObjectIdentity, i32>,
     pub(super) candidates: BTreeMap<super::CandidateSet, BTreeSet<ObjectIdentity>>,
     pub(super) limitations: BTreeSet<ObjectIdentity>,
     /// What each requested dropped signature named in this snapshot.
@@ -932,6 +935,7 @@ pub(super) fn finish(
     scope: CaptureScope,
 ) -> Result<CapturedInputs, Uncovered> {
     let mut inputs = BTreeMap::new();
+    let mut attribute_numbers = BTreeMap::new();
     for (object, locator) in prepared.members {
         let row = &read.catalog.rows[locator.class][locator.index];
         // Rows in the two passes need not have the same iteration order.
@@ -946,6 +950,22 @@ pub(super) fn finish(
                     Uncovered::object(&object, "selected object is missing from rendered input")
                 })?
         };
+        if object.class == "column" {
+            if locator.class != "pg_attribute" {
+                return Err(Uncovered::object(
+                    &object,
+                    "column provenance has the wrong catalog kind",
+                ));
+            }
+            let number = logical::signed(row, "attnum")
+                .map_err(|_| Uncovered::object(&object, "column number is unreadable"))?;
+            if number == 0 || attribute_numbers.insert(object.clone(), number).is_some() {
+                return Err(Uncovered::object(
+                    &object,
+                    "column number is not unique or valid",
+                ));
+            }
+        }
         let properties = properties::normalize(&read.catalog, locator.class, row, read.major)
             .map_err(|_| Uncovered::object(&object, "incomplete canonical properties"))?;
         let bindings = prepared
@@ -982,6 +1002,7 @@ pub(super) fn finish(
         major: read.major,
         scope,
         inputs,
+        attribute_numbers,
         candidates: prepared.candidates,
         limitations: prepared.limitations,
         dropped: read.dropped,
