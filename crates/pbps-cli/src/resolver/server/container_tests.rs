@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::Notify;
+use tokio::time::{Duration, Instant};
 
 const SCHEMA: &str = "pbps_bind1273";
 
@@ -166,6 +167,40 @@ async fn candidate(target: &mut NativeTarget, socket: &Path, image: &str) -> Can
     CandidateSession::start(api, acquired, target)
         .await
         .expect("the pinned native container qualifies before analysis")
+}
+
+async fn candidate_with_start_window(
+    target: &mut NativeTarget,
+    socket: &Path,
+    image: &str,
+) -> (CandidateSession, Instant, Instant) {
+    let mut api = LocalApi::connect_native(socket).await.unwrap();
+    let acquired = api
+        .acquire(&ResolverProfile::Docker {
+            image: image.into(),
+            pull: PullPolicy::Never,
+        })
+        .await
+        .unwrap();
+    // Bracket the public startup call, not an implementation deadline getter.
+    let before_start = Instant::now();
+    let candidate = CandidateSession::start(api, acquired, target)
+        .await
+        .expect("the pinned native container qualifies before analysis");
+    let after_start = Instant::now();
+    (candidate, before_start, after_start)
+}
+
+tokio::task_local! {
+    static DEADLINE_NOW: Instant;
+}
+
+/// Only the analysis deadline comparison reads this injected instant. Docker
+/// supervision, root guards, timeouts and both engines keep their real clocks.
+pub(crate) fn deadline_now() -> Instant {
+    DEADLINE_NOW
+        .try_with(|now| *now)
+        .unwrap_or_else(|_| Instant::now())
 }
 
 fn declared(modules: &[(&str, ModuleKind, &str)]) -> Schema {
@@ -365,6 +400,93 @@ async fn the_owned_container_resolves_the_overload_pair_on_its_qualified_connect
         .query("DROP SCHEMA pbps_bind1273 CASCADE")
         .await
         .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires the owned native Docker daemon and a pinned PostgreSQL TLS target"]
+async fn delayed_container_analysis_expires_at_its_first_owner_bound() {
+    let (socket, image, version) = fixture();
+    actual_target_version(version).await;
+    let before = containers();
+    let mut target = target().await;
+    let (mut candidate, before_start, after_start) =
+        candidate_with_start_window(&mut target, &socket, image).await;
+    let (workload_id, _) = workload(&created_since(&before));
+    let recipe = target.database_recipe().await.unwrap();
+
+    // Hold the already-started candidate briefly on the real scheduler.
+    // Scratch opening therefore occurs strictly after the first owner's
+    // startup window, without waiting for the 600-second production bound.
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let mut run = candidate
+        .open_scratch(&recipe)
+        .await
+        .expect("a held but live candidate can still open scratch");
+
+    // This instant precedes any possible first-owner deadline: startup began
+    // only after before_start. Real engine and channel checks still execute.
+    let before_bound = before_start + Duration::from_secs(599);
+    let positive = DEADLINE_NOW
+        .scope(before_bound, async {
+            run.check(&mut target).await?;
+            run.qualify(&mut target, &ScopeRequest::default()).await
+        })
+        .await;
+
+    // Startup completed by after_start, so every honest first-owner bound
+    // has expired here. A new 600-second budget minted after the real hold
+    // and scratch opening remains live, making this a behavioral distinction
+    // rather than a field comparison. Only analysis comparisons see the
+    // injected instant; the native runtime and scheduler keep real time.
+    let (at_bound, still_running, terminal) = if positive.is_ok() {
+        let result = DEADLINE_NOW
+            .scope(
+                after_start + Duration::from_secs(600),
+                run.check(&mut target),
+            )
+            .await;
+        let still_running = inspect(&workload_id)["State"]["Running"].as_bool() == Some(true);
+        let terminal = if matches!(&result, Err(Error::Deadline)) {
+            let checked = DEADLINE_NOW.scope(before_bound, run.check(&mut target)).await;
+            let qualified = DEADLINE_NOW
+                .scope(
+                    before_bound,
+                    run.qualify(&mut target, &ScopeRequest::default()),
+                )
+                .await;
+            matches!(checked, Err(Error::Deadline))
+                && matches!(qualified, Err(Error::Deadline))
+        } else {
+            false
+        };
+        (Some(result), still_running, terminal)
+    } else {
+        (None, false, false)
+    };
+
+    let closed = run.close().await;
+    if closed.is_ok() {
+        run.close().await.expect("completed cleanup is idempotent");
+    }
+    let recovery = closed
+        .as_ref()
+        .err()
+        .map(|failure| failure.recovery_names.clone())
+        .unwrap_or_default();
+    cleanup_observation(&before, &recovery);
+    closed.expect("deadline refusal removes every transferred resource");
+    target.check().await.expect("the target is still usable");
+
+    assert_eq!(positive.unwrap(), Verdict::Verified);
+    assert!(
+        still_running,
+        "the real owned workload must still be live at the injected analysis bound"
+    );
+    assert!(
+        matches!(&at_bound, Some(Err(Error::Deadline))),
+        "the first-owner deadline must refuse before a fresh scratch budget: {at_bound:?}"
+    );
+    assert!(terminal, "deadline refusal cannot regain a qualified scope");
 }
 
 fn established_pg_channels(root: u32) -> usize {

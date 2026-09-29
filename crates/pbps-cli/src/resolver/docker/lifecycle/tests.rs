@@ -268,6 +268,29 @@ async fn dropping_a_started_run_stops_and_removes_its_owned_resource() {
 }
 
 #[tokio::test]
+async fn first_owner_deadline_precedes_a_delayed_create_reply() {
+    let fixture = Fixture::new(Observations {
+        delay_create: true,
+        ..Default::default()
+    });
+    let before_start = Instant::now();
+    let run = CandidateRun::start(fixture.api().await, candidate(), Driver::Postgres)
+        .await
+        .unwrap();
+    let after_start = Instant::now();
+    assert!(
+        after_start - before_start >= Duration::from_millis(200),
+        "the mock Docker reply must actually be delayed"
+    );
+    assert!(run.deadline() >= before_start + Duration::from_secs(LIFETIME_SECS));
+    assert!(
+        run.deadline() < after_start + Duration::from_secs(LIFETIME_SECS) - Duration::from_millis(100),
+        "creation delay cannot extend the first owner's deadline"
+    );
+    run.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn cancelled_creation_is_cleaned_without_starting_the_engine() {
     let fixture = Fixture::new(Observations {
         delay_create: true,
