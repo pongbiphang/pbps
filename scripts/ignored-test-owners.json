@@ -1232,7 +1232,8 @@
       ],
       "cases": [
         "a_server_refusal_already_carries_the_servers_own_sentence",
-        "a_session_is_named_for_this_process_unless_the_string_names_it"
+        "a_session_is_named_for_this_process_unless_the_string_names_it",
+        "a_slow_server_statement_does_not_gain_a_driver_deadline"
       ]
     },
     {
@@ -1272,6 +1273,7 @@
         "darwin"
       ],
       "cases": [
+        "ado_options_cannot_disable_peer_verification",
         "invalid_trust_cannot_yield_a_verified_connection",
         "verified_round_trips_reject_wrong_peers_and_corrupted_replies"
       ]
