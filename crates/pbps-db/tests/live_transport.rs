@@ -96,6 +96,24 @@ async fn verified_round_trips_reject_wrong_peers_and_corrupted_replies() {
         );
     }
     if driver() == Driver::Mssql {
+        // #861: omitting Encrypt already meant Required in tiberius-ng 0.13.1.
+        // The upstream driver must still verify the chain and host name on
+        // ordinary connections, without asking the caller to add the key.
+        let no_encrypt = |host: &str| address(host, port()).replace(";Encrypt=true", "");
+        let mut ordinary = pbps_db::Conn::connect(Driver::Mssql, &no_encrypt("localhost"))
+            .await
+            .expect("omitted Encrypt must use verified TLS");
+        let rows = ordinary
+            .query("SELECT CAST(611 AS INT) AS value")
+            .await
+            .unwrap();
+        assert_eq!(rows[0].try_get::<i32>("value").unwrap(), Some(611));
+        assert!(
+            pbps_db::Conn::connect(Driver::Mssql, &no_encrypt("127.0.0.1"))
+                .await
+                .is_err(),
+            "omitted Encrypt accepted a certificate for the wrong host"
+        );
         let ca = std::env::var("PBPS_TEST_TLS_CA").unwrap();
         let mut custom = PeerVerifiedConn::connect(
             driver(),
@@ -178,6 +196,56 @@ async fn invalid_trust_cannot_yield_a_verified_connection() {
         PeerVerifiedConn::connect(driver(), &address("localhost", port()))
             .await
             .is_err()
+    );
+}
+
+/// #861: the policy and the driver use different ADO.NET parsers. Password
+/// markers and duplicate keys must not become certificate-bypass options
+/// after the policy accepts them. An untrusted root must fail at TLS before
+/// SQL login; a conservatively refused string is also safe.
+#[tokio::test]
+#[ignore = "needs disposable SQL Server TLS engine and untrusted CA; scripts/live-transport.py"]
+async fn ado_options_cannot_disable_peer_verification() {
+    assert_eq!(driver(), Driver::Mssql);
+    let with_password = |password: &str| {
+        format!(
+            "Server=localhost,{};User Id=sa;Password={password};Encrypt=true",
+            port()
+        )
+    };
+    let cases = [
+        with_password("{marker;TrustServerCertificate=true}"),
+        with_password("\"marker;TrustServerCertificate=true\""),
+        with_password("'marker;TrustServerCertificate=true'"),
+        format!(
+            "Server=localhost,{};User Id=sa;Password=marker;TrustServerCertificate=true;TRUSTSERVERCERTIFICATE=false;Encrypt=false;ENCRYPT=true",
+            port()
+        ),
+    ];
+    let mut tls_checks = 0;
+    for connection_string in cases {
+        let result = PeerVerifiedConn::connect(Driver::Mssql, &connection_string).await;
+        match result {
+            Err(pbps_db::DbError::Refused(_)) | Err(pbps_db::DbError::BadConnectionString(_)) => {}
+            Err(pbps_db::DbError::Driver { message, code }) => {
+                tls_checks += 1;
+                assert!(
+                    code.is_none(),
+                    "{connection_string}: reached SQL Server: {message}"
+                );
+                let lower = message.to_ascii_lowercase();
+                assert!(
+                    lower.contains("cert") || lower.contains("tls"),
+                    "{connection_string}: did not fail TLS verification: {message}"
+                );
+            }
+            Err(other) => panic!("{connection_string}: unexpected failure: {other}"),
+            Ok(_) => panic!("{connection_string}: bypassed TLS verification"),
+        }
+    }
+    assert!(
+        tls_checks > 0,
+        "no accepted ADO.NET option case reached TLS verification"
     );
 }
 

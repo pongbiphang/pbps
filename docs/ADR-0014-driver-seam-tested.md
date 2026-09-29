@@ -214,19 +214,16 @@ never answered:   Some("ConnectTimeout")
 
 ## What this says about the two open decisions
 
-- **Open question 10, which is now the return trip.** The move *to*
-  `tiberius-ng` has been taken — `9fe1289` switched the `package` and emptied
-  `deny.toml`'s `ignore` list — and what open question 10 holds today is the
-  move **back** to upstream `tiberius`, gated on a release newer than 0.12.3
-  whose `rustls` feature resolves `rustls >= 0.23`, with `cargo deny check`
-  passing on an empty `ignore` and the §11.5 live suite green.
+- **Open question 10 is resolved by the return to `tiberius` 0.13.0.**
+  The earlier move *to* `tiberius-ng` — `9fe1289` switched the `package` and
+  emptied `deny.toml`'s `ignore` list — was a waypoint. The upstream release
+  resolves `rustls 0.23`, passes `cargo deny check` with an empty advisory
+  ignore list, and passes the §11.5 live suites. The driver API remains behind
+  the same seam. Its new command timeout needed an explicit choice (DEC-861.1).
 
-  This spike bounds that return, and bounds it generously. Going back is the
-  same driver API, the same error type and no connection future; the spike
-  changed a *different* driver, hit two seam points, and still took an
-  afternoon. So the standing cost of being wrong about a driver is smaller than
-  the one thing anybody has actually measured — which is what ADR-0007 built the
-  seam to make true, and it is worth having a number rather than a hope.
+  This spike bounded the return generously. A different driver hit two seam
+  points and still took an afternoon. That measured cost is the reason the
+  driver boundary remains one file per driver.
 - **ADBC is unaffected.** It was refused on source availability and
   distribution, not on the seam, and nothing here touches that.
 

@@ -904,3 +904,22 @@ here.
      The test and CI configurations name `sslmode=disable` for their
      TLS-less throwaway servers. `connect_verified` (the resolver's peer
      hop) is unchanged: it still refuses anything but an explicit `require`.
+
+<a id="dec-861-1"></a>
+
+**DEC-861.1. Keep SQL Server command waits unbounded when returning to
+`tiberius` 0.13.0.** That release adds a 30-second per-response command timeout.
+A long index build, table rewrite or deployment lock wait previously remained
+with the server until it answered; silently imposing a new 30-second deadline
+would turn a valid approved plan into an error while its statement might still
+be running. Both direct and preverified-stream connections therefore set
+`command_timeout(None)`. A live `WAITFOR` response beyond the new default pins
+the choice. The separate TCP connect bound and the driver's 15-second prelogin,
+TLS and login handshake bound remain in force.
+
+The same migration keeps `rustls` with aws-lc-rs. `tiberius` falls back to
+aws-lc-rs when no process provider was installed; this workspace installs none
+and resolves no `ring`. PostgreSQL constructs its client with aws-lc-rs directly
+(228). An omitted SQL Server `Encrypt` key already meant `Required` in the
+preceding `tiberius-ng` release, so the upstream switch does not weaken or
+change that default. The peer-verified path still sets `Required` explicitly.

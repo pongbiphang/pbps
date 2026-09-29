@@ -137,6 +137,8 @@ def main():
                 print(f"TLS trust variant: {trust}", flush=True)
                 env["SSL_CERT_FILE"] = str(root / trust)
                 run_case(cargo, "invalid_trust_cannot_yield_a_verified_connection", env)
+                if args.engine == "mssql" and trust == "untrusted.pem":
+                    run_case(cargo, "ado_options_cannot_disable_peer_verification", env)
         finally:
             # Do not silently ignore failed cleanup: no shared container is
             # named, and a failed removal leaves this fixture's resources live.

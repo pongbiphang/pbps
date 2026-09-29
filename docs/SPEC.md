@@ -2166,7 +2166,7 @@ database is work with clearly drawn boundaries.
 
 | Purpose | Crate | Notes |
 |---|---|---|
-| SQL Server | `tiberius-ng` (the `tiberius` library API) | Pure Rust; **no driver to install** — one static binary, decisive for air-gapped environments. Adopted after the original package's pinned TLS stack accumulated findings no upgrade could reach; see open question 10 |
+| SQL Server | `tiberius` 0.13.0 | Rust-native with rustls and aws-lc-rs; **no database driver to install** — one static binary for air-gapped environments. See open question 10 |
 | PostgreSQL | `tokio-postgres` plus `tokio-postgres-rustls` | Pure Rust driver with rustls TLS; no PostgreSQL client library to install (ADR-0014) |
 | Async | `tokio` plus `tokio-util` (tiberius compat) | |
 | CLI | `clap` (derive) | |
@@ -2187,7 +2187,7 @@ layer — ODBC, ADBC — is a separate question with its own answer; see
 
 A single static binary. Windows runners use `x86_64-pc-windows-msvc`; Linux
 runners use `x86_64-unknown-linux-musl` for a fully static file. The same binary
-includes both SQL Server (`tiberius-ng`) and PostgreSQL (`tokio-postgres`)
+includes both SQL Server (`tiberius`) and PostgreSQL (`tokio-postgres`)
 support with rustls TLS. Neither engine requires an installed ODBC driver or
 database client library on the target host; the distribution goal remains
 "copy one file and run it" on an air-gapped host.
@@ -2412,9 +2412,10 @@ engine already supported.
    ADR-0009 and ADR-0010).
 
 10. **The driver supply chain** — a recorded risk that has already come due.
-    `tiberius` was chosen for the property in 11.3 (pure Rust, nothing to
-    install) and has had no release since 2024-07-19. It pins `tokio-rustls
-    0.24`, which resolves `rustls 0.21` and with it `rustls-webpki 0.101.7`.
+    `tiberius` was chosen for the property in 11.3 (no database client library
+    to install). At the time of this assessment, its latest release was from
+    2024-07-19 and pinned `tokio-rustls 0.24`, which resolved `rustls 0.21`
+    and with it `rustls-webpki 0.101.7`.
 
     On 2026-09-01 the first `cargo-deny` run against that tree reported **three
     vulnerabilities, none of them reachable by `cargo update`**:
@@ -2431,8 +2432,8 @@ engine already supported.
     already isolates the driver — after the seam was tightened it is named in
     exactly one file, and rows and parameters cross the boundary as this
     project's own types, so a replacement touches `pbps-db` and nothing else.
-    And a drop-in continuation exists: `tiberius-ng` keeps the library name, so
-    only the dependency line changes, and a trial swap on 2026-09-01 resolved
+    A drop-in continuation existed: `tiberius-ng` kept the library name, so
+    only the dependency line changed, and a trial swap on 2026-09-01 resolved
     all four findings (`rustls 0.23`, `rustls-webpki 0.103`) and passed the
     whole offline suite.
 
@@ -2448,22 +2449,15 @@ engine already supported.
     four advisory exceptions from `deny.toml`; the live suite remains the
     acceptance test for future driver upgrades.
 
-    **The original crate is community-owned again, and the intent is to return
-    to it — but not yet.** Checked on 2026-09-04: the repository has moved from
-    `prisma/tiberius` to `tiberius-rs/tiberius`, is not archived, and received
-    commits on 2026-09-02 (CI, clippy, docker fixes). What has *not* happened is
-    a release: crates.io still serves 0.12.3 from 2024-07-19, and `main` still
-    carries `version = "0.12.3"` with `tokio-rustls 0.24` — the exact pin that
-    produces RUSTSEC-2026-0098, -0099, -0104 and -0134. Moving back today, by
-    version or by git revision, would restore all four exceptions to
-    `deny.toml` and replace a maintained driver with an unreleased one. The
-    move back is one dependency line plus the `deny.toml` re-check, in that
-    order, and it is taken when **all** of the following hold: a `tiberius`
-    release on crates.io newer than 0.12.3; its `rustls` feature resolving
-    `rustls >= 0.23` (so `cargo deny check advisories` passes with `ignore`
-    still empty); and the full live suite of 11.5 green on it. Until then
-    `tiberius-ng` stays, and this paragraph is the reminder that it is a
-    waypoint rather than the destination.
+    **The original crate is community-owned again and the workspace has
+    returned to it.** `tiberius` 0.13.0 on crates.io meets the release condition:
+    its `rustls` feature resolves `tokio-rustls 0.26` and `rustls 0.23`, with
+    `cargo deny check` passing while the advisory ignore list remains empty.
+    The driver chooses a process-installed crypto provider when there is one,
+    otherwise aws-lc-rs; this workspace installs no process default and does
+    not resolve `ring`. PostgreSQL constructs its rustls client with aws-lc-rs
+    explicitly (DECISIONS 228). The live suites of 11.5 qualify the return;
+    changing the pinned driver release requires those checks again.
 
 11. **Whether a universal connection layer belongs here** — settled; see
     [ADR-0007](ADR-0007-connection-strategy.md). ODBC and ADBC arrive sounding

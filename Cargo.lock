@@ -724,6 +724,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd417de3d1d015fc3bfd2b1ea46dfc7bab72ef86f1cc7cc9c78e728b34a6d1fd"
 
 [[package]]
+name = "futures-timer"
+version = "3.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af43fadb8a98512d547e37b4e92e0ced13e205c061b87b4623eff01d918d6968"
+
+[[package]]
 name = "futures-util"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1360,7 +1366,7 @@ dependencies = [
  "sha2 0.11.0",
  "socket2",
  "thiserror",
- "tiberius-ng",
+ "tiberius",
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",
@@ -1431,7 +1437,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
- "tiberius-ng",
+ "tiberius",
  "tokio",
 ]
 
@@ -1809,6 +1815,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "secrecy"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
+dependencies = [
+ "zeroize",
+]
+
+[[package]]
 name = "security-framework"
 version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2116,10 +2131,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "tiberius-ng"
-version = "0.13.1"
+name = "tiberius"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ab253018afea08e630df81d678998e061b9b38d2acbe87f5466f792ae62070f"
+checksum = "e07324791de2bdaed058af4aa433a0b5ec5c0beac407a9797419c19805df2415"
 dependencies = [
  "async-trait",
  "asynchronous-codec",
@@ -2128,6 +2143,7 @@ dependencies = [
  "connection-string",
  "encoding_rs",
  "enumflags2",
+ "futures-timer",
  "futures-util",
  "libc",
  "num-traits",
@@ -2135,8 +2151,11 @@ dependencies = [
  "pin-project-lite",
  "pretty-hex",
  "rustls-native-certs",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "secrecy",
  "thiserror",
- "tiberius-ng-macros",
+ "tiberius-macros",
  "tokio-rustls",
  "tokio-util",
  "tracing",
@@ -2145,10 +2164,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "tiberius-ng-macros"
+name = "tiberius-macros"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df46152ea543b73fb69ab53907326889c9e5724f91c6b3c67fc993d6534bc455"
+checksum = "907fed5ea55695d902cc3359fffa4a35021dfa9b95ab4eb9c8376d42ffb9eec8"
 dependencies = [
  "proc-macro2",
  "quote",

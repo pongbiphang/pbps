@@ -48,17 +48,15 @@ base64 = "0.22"
 
 serde      = { version = "1", features = ["derive"] }
 
-# Both database drivers are pure Rust: no ODBC or database client library to
-# install on air-gapped hosts (SPEC §11.3). Async work is confined to connected
+# Both database drivers are Rust-native: no ODBC or database client library
+# to install on air-gapped hosts (SPEC §11.3). Async work is confined to connected
 # operations; the model, differ and SQL emitters stay synchronous.
 #
-# `tiberius-ng` is a waypoint, not the destination (SPEC open question 10).
-# The original crate is community-maintained again at tiberius-rs/tiberius, but
-# as of 2026-09-04 has no release past 0.12.3, which pins `tokio-rustls 0.24`
-# and with it four open rustls advisories. Switch `package` back to `tiberius`
-# only for a release whose `rustls` feature resolves `rustls >= 0.23`, and run
-# `cargo deny check` and the live suite before keeping it.
-tiberius   = { package = "tiberius-ng", version = "0.13", default-features = false, features = ["rustls", "tds73"] }
+# The original tiberius 0.13.0 release resolves rustls 0.23 and
+# tokio-rustls 0.26. Its rustls client uses aws-lc-rs unless a process-wide
+# provider was installed; this workspace installs none (SPEC open question 10).
+# Pin the driver release so its TLS behavior changes only with an audited update.
+tiberius   = { version = "=0.13.0", default-features = false, features = ["rustls", "tds73"] }
 # `time` is for the connect timeout: a firewall that drops rather than
 # refuses would otherwise leave a pipeline waiting out the OS retry.
 tokio      = { version = "1", features = ["net", "rt", "time", "process"] }
@@ -80,7 +78,7 @@ rustix = { version = "1", features = ["net", "fs"] }
 # so it is made explicitly against the one `rustls` already in this tree.
 tokio-postgres = { version = "0.7", default-features = false }
 # `aws-lc-rs`, not `ring`, and the reason is measured rather than preferred:
-# `tiberius-ng` resolves `rustls` with its default provider, so asking for
+# `tiberius` resolves `rustls` with aws-lc-rs, so asking for
 # `ring` here compiled **both** into the binary. rustls then cannot determine a
 # process-level provider and panics the moment a `ClientConfig::builder()` runs
 # — which the PostgreSQL live suite hit on its first connection, and which no
