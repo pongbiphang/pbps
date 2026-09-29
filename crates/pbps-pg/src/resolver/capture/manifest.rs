@@ -419,29 +419,77 @@ impl CompiledCapture {
                 name: vec![final_column.name.clone()],
                 signature: vec![relation_identity(&final_column.table)],
             };
-            if !opening.inputs.contains_key(&old_column)
-                || !self.captured.inputs.contains_key(&new_column)
-            {
+            let old_not_null = opening
+                .inputs
+                .get(&old_column)
+                .and_then(|input| input.properties.get("attnotnull"))
+                .and_then(Value::as_bool)
+                .ok_or(ManifestError::Incomplete)?;
+            let new_not_null = self
+                .captured
+                .inputs
+                .get(&new_column)
+                .and_then(|input| input.properties.get("attnotnull"))
+                .and_then(Value::as_bool)
+                .ok_or(ManifestError::Incomplete)?;
+            let mut nullable_after = None;
+            for step in &changes.changes {
+                let to_nullable = match &step.change {
+                    Change::AlterColumnType {
+                        uid: changed,
+                        column,
+                        from_nullable,
+                        to_nullable,
+                        ..
+                    } if changed == uid => {
+                        if column != final_column
+                            || *from_nullable != !old_not_null
+                            || *to_nullable != !new_not_null
+                        {
+                            return Err(ManifestError::Incomplete);
+                        }
+                        Some(*to_nullable)
+                    }
+                    Change::AlterColumnNullability {
+                        uid: changed,
+                        column,
+                        to_nullable,
+                        ..
+                    } if changed == uid => {
+                        if column != final_column || *to_nullable != !new_not_null {
+                            return Err(ManifestError::Incomplete);
+                        }
+                        Some(*to_nullable)
+                    }
+                    _ => None,
+                };
+                if let Some(to_nullable) = to_nullable {
+                    if nullable_after.replace(to_nullable).is_some() {
+                        return Err(ManifestError::Invalid);
+                    }
+                }
+            }
+            if nullable_after.is_none() && old_not_null != new_not_null {
                 return Err(ManifestError::Incomplete);
             }
             let old_child = not_null_child(opening, &old_column)?;
             let new_child = not_null_child(&self.captured, &new_column)?;
-            let redefined = changes.changes.iter().any(|step| match &step.change {
-                Change::AlterColumnType { uid: changed, .. }
-                | Change::AlterColumnNullability { uid: changed, .. } => changed == uid,
-                _ => false,
-            });
-            if redefined {
-                // Retention across a type/nullability rewrite is not proved
-                // by the rename measurement. Neither a removed nor a newly
-                // made child may silently borrow the opening identity.
-                if old_child.is_some() || new_child.is_some() {
-                    return Err(ManifestError::Incomplete);
-                }
-                continue;
-            }
             let (old_child, new_child) = match (old_child, new_child) {
-                (Some(old_child), Some(new_child)) => (old_child, new_child),
+                (Some(old_child), Some(new_child)) if old_not_null && new_not_null => {
+                    // A type rewrite recreates the physical PG18 row but
+                    // retains its old name. Keep scratch structural properties.
+                    (old_child, new_child)
+                }
+                (Some(_), None)
+                    if old_not_null && !new_not_null && nullable_after == Some(true) =>
+                {
+                    continue;
+                }
+                (None, Some(_))
+                    if !old_not_null && new_not_null && nullable_after == Some(false) =>
+                {
+                    continue;
+                }
                 // PostgreSQL 16 has no separate NOT NULL constraint record.
                 (None, None) => continue,
                 _ => return Err(ManifestError::Incomplete),
