@@ -137,7 +137,9 @@ pub(super) fn classify(
                     "declared column lacks its recorded UID",
                 ));
             }
-            let column_id = identity("pg_attribute", vec![column.clone()], vec![table_id.clone()]);
+            // The captured pg_attribute row has a logical `column` address;
+            // its raw catalog class is not the address used by pg_attrdef.
+            let column_id = identity("column", vec![column.clone()], vec![table_id.clone()]);
             if capture.inputs.contains_key(&column_id) {
                 if !owned.contains_key(&table_id) {
                     return Err(Uncovered::object(
@@ -332,7 +334,7 @@ pub(super) fn classify(
                 // to the exact column. Other automatic edges, including
                 // ordinary indexes and triggers, never convey ownership.
                 made.class == "pg_constraint"
-                    && maker.class == "pg_attribute"
+                    && maker.class == "column"
                     && matches!(owner, Surface::Column(_))
                     && property(capture, made, "contype")? == Some("n")
                     && made.signature.get(1) == maker.signature.first()
@@ -348,13 +350,13 @@ pub(super) fn classify(
                             && made.name[0] == "_RETURN"
                             && made.signature.first() == Some(maker)
                     }
-                    ("pg_class", "pg_attribute", Surface::Column(_)) => {
+                    ("pg_class", "column", Surface::Column(_)) => {
                         property(capture, made, "relkind")? == Some("S")
                     }
                     ("pg_class", "pg_constraint", Surface::Table(_)) => {
                         matches!(property(capture, made, "relkind")?, Some("i" | "I"))
                     }
-                    ("pg_attrdef", "pg_attribute", Surface::Column(_)) => true,
+                    ("pg_attrdef", "column", Surface::Column(_)) => true,
                     _ => false,
                 }
             };
