@@ -341,6 +341,20 @@ fn relocated_set(
     Ok(result)
 }
 
+/// A one-shot fixed-key seal refusal. The public boundary conveys only a
+/// safe category, never a captured property, chosen mapping or verifier.
+#[derive(Debug, thiserror::Error)]
+pub enum SealError {
+    #[error(transparent)]
+    Manifest(#[from] pbps_model::resolver::ManifestError),
+    #[error("a rebuilt routine's opening ACL is missing or unreadable")]
+    OpeningAcl,
+    #[error(
+        "a rebuilt routine carries WITH GRANT OPTION, which the declarations cannot restore; revoke the grant option and plan again"
+    )]
+    GrantOption,
+}
+
 impl CompiledCapture {
     pub(super) fn new(
         captured: CapturedInputs,
@@ -612,11 +626,110 @@ impl CompiledCapture {
         super::assess(target, &self.captured, base, paths, reconstruction)
     }
 
+    /// A replacement cannot restore an opening routine ACL grant option:
+    /// `Grant` expresses the privilege but carries no grant-option bit. The
+    /// ordinary connected rebuild guard refuses the same shape (DEC-95,
+    /// DEC-447). Check only final typed replacements, using their qualified
+    /// opening transition and the retained capture that produced the verdict.
+    /// The caller can only observe this check by consuming the seal below.
+    fn admit_rebuilt_routine_grant_options(
+        &self,
+        opening: &CapturedInputs,
+        changes: &pbps_model::ChangeSet,
+        transitions: &[pbps_model::resolver::ObjectTransition],
+    ) -> Result<(), SealError> {
+        use pbps_model::resolver::Surface;
+        use pbps_model::{Change, ModuleId};
+        if opening.major != self.captured.major {
+            return Err(SealError::OpeningAcl);
+        }
+        let dropped: BTreeSet<_> = changes
+            .changes
+            .iter()
+            .filter_map(|step| match &step.change {
+                Change::DropModule { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let rebuilt: BTreeSet<_> = changes
+            .changes
+            .iter()
+            .filter_map(|step| match &step.change {
+                Change::AlterModule { id, .. } => Some(id.clone()),
+                Change::CreateModule { id, .. } if dropped.contains(id) => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        for id in rebuilt {
+            let ModuleId::Routine(_) = id else {
+                continue;
+            };
+            let mut matching = transitions
+                .iter()
+                .filter(|transition| transition.surface == Surface::Module(id.clone()));
+            let transition = matching.next().ok_or(SealError::OpeningAcl)?;
+            if matching.next().is_some() {
+                return Err(SealError::OpeningAcl);
+            }
+            let mut roots = transition
+                .before
+                .iter()
+                .filter(|object| object.class == "pg_proc");
+            let root = roots.next().ok_or(SealError::OpeningAcl)?;
+            if roots.next().is_some() {
+                return Err(SealError::OpeningAcl);
+            }
+            let acl = opening
+                .inputs
+                .get(root)
+                .and_then(|input| input.properties.get("proacl"))
+                .ok_or(SealError::OpeningAcl)?;
+            match acl {
+                Value::Null => {}
+                Value::Array(entries) => {
+                    for entry in entries {
+                        match entry.get("grant_option").and_then(Value::as_bool) {
+                            Some(true) => return Err(SealError::GrantOption),
+                            Some(false) => {}
+                            None => return Err(SealError::OpeningAcl),
+                        }
+                    }
+                }
+                _ => return Err(SealError::OpeningAcl),
+            }
+        }
+        Ok(())
+    }
+
+    /// Consume the fixed-key producer once. This admission guard and the
+    /// compiled seal observe the same opening capture and exact final plan;
+    /// no separately callable capture probe escapes the producer.
+    pub fn seal_for_plan(
+        self,
+        opening: &CapturedInputs,
+        changes: &pbps_model::ChangeSet,
+        transitions: &[pbps_model::resolver::ObjectTransition],
+        base_ids: &pbps_model::IdsFile,
+        desired_ids: &pbps_model::IdsFile,
+        effective_creator: &str,
+    ) -> Result<pbps_model::resolver::InputManifest, SealError> {
+        self.admit_rebuilt_routine_grant_options(opening, changes, transitions)?;
+        self.seal_for_plan_inner(
+            opening,
+            changes,
+            transitions,
+            base_ids,
+            desired_ids,
+            effective_creator,
+        )
+        .map_err(SealError::from)
+    }
+
     /// Consume the fixed-key producer once the exact final typed sequence is
     /// known. Typed table/column renames retain measured opening metadata;
     /// rebuilt and newly created objects receive the opening target's
     /// effective creation defaults. No caller supplies a property mapping.
-    pub fn seal_for_plan(
+    fn seal_for_plan_inner(
         mut self,
         opening: &CapturedInputs,
         changes: &pbps_model::ChangeSet,

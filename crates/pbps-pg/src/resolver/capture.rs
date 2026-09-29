@@ -82,7 +82,7 @@ pub use pbps_db::resolver::capture::{CaptureError, Uncovered};
 mod creation_acl;
 mod manifest;
 mod ownership;
-pub use manifest::{BindingRecord, CapturedInputs, CompiledCapture};
+pub use manifest::{BindingRecord, CapturedInputs, CompiledCapture, SealError};
 pub use ownership::RecordedOwnership;
 
 mod assess;
