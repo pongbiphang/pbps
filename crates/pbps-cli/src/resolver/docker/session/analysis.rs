@@ -328,7 +328,11 @@ impl ContainerControl {
     }
 
     async fn check_inner(&mut self, scratch: Option<&ContainerSession>) -> Result<(), Error> {
-        if Instant::now() >= self.census.deadline {
+        #[cfg(test)]
+        let now = server::container_tests::deadline_now();
+        #[cfg(not(test))]
+        let now = Instant::now();
+        if now >= self.census.deadline {
             return Err(Error::Deadline);
         }
         let state = self.state.as_mut().ok_or(Error::Consumed)?;
