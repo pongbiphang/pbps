@@ -95,6 +95,31 @@ fn qualified<'a>(
     engine.role == ExecutableRole::Engine && readable(engine) && libraries.into_iter().all(readable)
 }
 
+/// Pure final encoding of already qualified native facts. The required
+/// association is independently keyed while the loader names are still held
+/// by the native producer; this helper has no source or lease authority.
+fn fingerprint_qualified_build(
+    key: &EnvironmentFingerprintKey,
+    engine: &ExecutableIdentity,
+    libraries: &[ExecutableIdentity],
+    required_associations: &str,
+) -> Result<String, CaptureFailure> {
+    // These are process-namespace loader paths, not inspector host prefixes or
+    // PIDs. Retaining a mapped file's path distinguishes a code swap between
+    // two loaded libraries; opaque required names are keyed separately.
+    let mut libraries = libraries.to_vec();
+    libraries.sort_by_cached_key(|library| {
+        serde_json::to_vec(library).expect("qualified executable serializes")
+    });
+    let bytes = serde_json::to_vec(&(engine, libraries, required_associations))
+        .map_err(|_| CaptureFailure::Executables)?;
+    Ok(crate::resolver::sealing::hex(key.fingerprint(
+        "pbps/pg-native-build/v1",
+        "qualified-executables",
+        &bytes,
+    )))
+}
+
 /// Versioned target-only native observation. Canonical roles, content,
 /// provenance, multiplicity and disk-divergence are retained; run-local paths,
 /// PIDs, mapping addresses and connection IDs are excluded. A future apply
@@ -103,24 +128,11 @@ fn build_fingerprint(
     key: &EnvironmentFingerprintKey,
     observed: &executables::CapturedExecutables,
 ) -> Result<String, CaptureFailure> {
-    let engine = observed.engine().clone();
-    // These are process-namespace loader paths, not inspector host prefixes or
-    // PIDs. Retaining a mapped file's path distinguishes a code swap between
-    // two loaded libraries; opaque required names are keyed separately below.
-    let mut libraries = observed.libraries().cloned().collect::<Vec<_>>();
-    libraries.sort_by_cached_key(|library| {
-        serde_json::to_vec(library).expect("qualified executable serializes")
-    });
     let associations = observed
         .required_associations(key)
         .map_err(|_| CaptureFailure::Executables)?;
-    let bytes = serde_json::to_vec(&(engine, libraries, associations))
-        .map_err(|_| CaptureFailure::Executables)?;
-    Ok(crate::resolver::sealing::hex(key.fingerprint(
-        "pbps/pg-native-build/v1",
-        "qualified-executables",
-        &bytes,
-    )))
+    let libraries = observed.libraries().cloned().collect::<Vec<_>>();
+    fingerprint_qualified_build(key, observed.engine(), &libraries, &associations)
 }
 
 impl NativeTarget {
