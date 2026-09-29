@@ -227,6 +227,8 @@ impl ScratchRun {
                 producer.opening_capture.catalog(),
                 &changes,
                 &transitions,
+                base.ids,
+                desired.ids,
                 creator,
             )
             .map_err(|error| Error::Binding(format!("final compiled catalog manifest: {error}")))?;

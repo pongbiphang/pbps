@@ -224,6 +224,120 @@ fn rename_source(
     transition.before.contains(&source).then_some(source)
 }
 
+// PostgreSQL 18 retains a NOT NULL constraint's name across an in-place
+// table/column rename. The automatic dependency identifies the exact column
+// that made it; the generated spelling is never evidence of that ownership.
+fn not_null_child(
+    captured: &CapturedInputs,
+    column: &ObjectIdentity,
+) -> Result<Option<ObjectIdentity>, pbps_model::resolver::ManifestError> {
+    use pbps_model::resolver::ManifestError;
+    let [relation] = column.signature.as_slice() else {
+        return Err(ManifestError::Invalid);
+    };
+    let mut found = None;
+    for (constraint, input) in captured.inputs.iter().filter(|(id, input)| {
+        id.class == "pg_constraint"
+            && input.properties.get("contype").and_then(Value::as_str) == Some("n")
+            && id.signature.get(1) == Some(relation)
+    }) {
+        let keys: Vec<ObjectIdentity> = serde_json::from_value(
+            input
+                .properties
+                .get("conkey")
+                .cloned()
+                .ok_or(ManifestError::Incomplete)?,
+        )
+        .map_err(|_| ManifestError::Invalid)?;
+        if keys != [column.clone()] {
+            continue;
+        }
+        if constraint.name.len() != 1
+            || constraint.signature.len() != 3
+            || input.properties.get("conname").and_then(Value::as_str)
+                != constraint.name.first().map(String::as_str)
+        {
+            return Err(ManifestError::Invalid);
+        }
+        let edge = ObjectIdentity {
+            class: "pg_depend".into(),
+            name: vec!["a".into()],
+            signature: vec![constraint.clone(), column.clone()],
+        };
+        if !captured.inputs.contains_key(&edge) {
+            return Err(ManifestError::Incomplete);
+        }
+        if found.replace(constraint.clone()).is_some() {
+            return Err(ManifestError::Invalid);
+        }
+    }
+    Ok(found)
+}
+
+fn relocated_identity(
+    object: &ObjectIdentity,
+    names: &BTreeMap<ObjectIdentity, ObjectIdentity>,
+) -> ObjectIdentity {
+    if let Some(replaced) = names.get(object) {
+        return replaced.clone();
+    }
+    let mut result = object.clone();
+    result.signature = object
+        .signature
+        .iter()
+        .map(|part| relocated_identity(part, names))
+        .collect();
+    result
+}
+
+// Catalog properties encode references as complete logical identities, while
+// scalar strings and SQL definitions are not reference addresses.
+fn relocated_value(
+    value: &Value,
+    names: &BTreeMap<ObjectIdentity, ObjectIdentity>,
+) -> Result<Value, pbps_model::resolver::ManifestError> {
+    use pbps_model::resolver::ManifestError;
+    match value {
+        Value::Object(members)
+            if members.contains_key("class")
+                && members.contains_key("name")
+                && members.contains_key("signature") =>
+        {
+            let object: ObjectIdentity =
+                serde_json::from_value(value.clone()).map_err(|_| ManifestError::Invalid)?;
+            serde_json::to_value(relocated_identity(&object, names))
+                .map_err(|_| ManifestError::Invalid)
+        }
+        Value::Object(members) => Ok(Value::Object(
+            members
+                .iter()
+                .map(|(field, member)| Ok((field.clone(), relocated_value(member, names)?)))
+                .collect::<Result<_, ManifestError>>()?,
+        )),
+        Value::Array(members) => Ok(Value::Array(
+            members
+                .iter()
+                .map(|member| relocated_value(member, names))
+                .collect::<Result<_, _>>()?,
+        )),
+        _ => Ok(value.clone()),
+    }
+}
+
+fn relocated_set(
+    objects: &BTreeSet<ObjectIdentity>,
+    names: &BTreeMap<ObjectIdentity, ObjectIdentity>,
+) -> Result<BTreeSet<ObjectIdentity>, pbps_model::resolver::ManifestError> {
+    let result: BTreeSet<_> = objects
+        .iter()
+        .map(|object| relocated_identity(object, names))
+        .collect();
+    if result.len() != objects.len() {
+        return Err(pbps_model::resolver::ManifestError::Invalid);
+    }
+    Ok(result)
+}
+
 impl CompiledCapture {
     pub(super) fn new(
         captured: CapturedInputs,
@@ -237,6 +351,188 @@ impl CompiledCapture {
             roles: roles.clone(),
             ownership,
         }
+    }
+
+    // This consuming capability already holds the fixed key and both fresh
+    // captures. Only recorded UIDs and typed in-place renames may relocate a
+    // retained child; the caller cannot supply an identity mapping.
+    fn retain_renamed_not_null(
+        &mut self,
+        opening: &CapturedInputs,
+        changes: &pbps_model::ChangeSet,
+        transitions: &[pbps_model::resolver::ObjectTransition],
+        base_ids: &pbps_model::IdsFile,
+        desired_ids: &pbps_model::IdsFile,
+    ) -> Result<(), pbps_model::resolver::ManifestError> {
+        use pbps_model::Change;
+        use pbps_model::resolver::{ManifestError, ObjectOwnership, Surface};
+        base_ids.validate().map_err(|_| ManifestError::Invalid)?;
+        desired_ids.validate().map_err(|_| ManifestError::Invalid)?;
+        if opening.major != self.captured.major {
+            return Err(ManifestError::Incomplete);
+        }
+        let mut names = BTreeMap::new();
+        let mut retained = BTreeMap::new();
+        for (uid, old) in &base_ids.columns {
+            let Some(final_column) = desired_ids.columns.get(uid) else {
+                continue;
+            };
+            if old == final_column {
+                continue;
+            }
+            let table_uid = base_ids
+                .table_uid(&old.table)
+                .ok_or(ManifestError::Invalid)?;
+            if desired_ids.table_uid(&final_column.table) != Some(table_uid) {
+                return Err(ManifestError::Invalid);
+            }
+            if old.table != final_column.table
+                && !changes.changes.iter().any(|step| {
+                    matches!(
+                        &step.change,
+                        Change::RenameTable { uid: moved, from, to, .. }
+                            if moved == table_uid && from == &old.table && to == &final_column.table
+                    )
+                })
+            {
+                return Err(ManifestError::Invalid);
+            }
+            if old.name != final_column.name
+                && !changes.changes.iter().any(|step| {
+                    matches!(
+                        &step.change,
+                        Change::RenameColumn { uid: moved, table, from, to, .. }
+                            if moved == uid && table == &final_column.table
+                                && from == &old.name && to == &final_column.name
+                    )
+                })
+            {
+                return Err(ManifestError::Invalid);
+            }
+            let old_column = ObjectIdentity {
+                class: "column".into(),
+                name: vec![old.name.clone()],
+                signature: vec![relation_identity(&old.table)],
+            };
+            let new_column = ObjectIdentity {
+                class: "column".into(),
+                name: vec![final_column.name.clone()],
+                signature: vec![relation_identity(&final_column.table)],
+            };
+            if !opening.inputs.contains_key(&old_column)
+                || !self.captured.inputs.contains_key(&new_column)
+            {
+                return Err(ManifestError::Incomplete);
+            }
+            let old_child = not_null_child(opening, &old_column)?;
+            let new_child = not_null_child(&self.captured, &new_column)?;
+            let redefined = changes.changes.iter().any(|step| match &step.change {
+                Change::AlterColumnType { uid: changed, .. }
+                | Change::AlterColumnNullability { uid: changed, .. } => changed == uid,
+                _ => false,
+            });
+            if redefined {
+                // Retention across a type/nullability rewrite is not proved
+                // by the rename measurement. Neither a removed nor a newly
+                // made child may silently borrow the opening identity.
+                if old_child.is_some() || new_child.is_some() {
+                    return Err(ManifestError::Incomplete);
+                }
+                continue;
+            }
+            let (old_child, new_child) = match (old_child, new_child) {
+                (Some(old_child), Some(new_child)) => (old_child, new_child),
+                // PostgreSQL 16 has no separate NOT NULL constraint record.
+                (None, None) => continue,
+                _ => return Err(ManifestError::Incomplete),
+            };
+            if !transitions.iter().any(|t| t.before.contains(&old_child))
+                || !transitions.iter().any(|t| t.after.contains(&new_child))
+                || self.ownership.get(&new_child)
+                    != Some(&ObjectOwnership::Surface(Surface::Column(
+                        final_column.clone(),
+                    )))
+            {
+                return Err(ManifestError::Incomplete);
+            }
+            let mut projected = new_child.clone();
+            projected.name.clone_from(&old_child.name);
+            if names.insert(new_child.clone(), projected).is_some()
+                || retained
+                    .insert(new_child, old_child.name[0].clone())
+                    .is_some()
+            {
+                return Err(ManifestError::Invalid);
+            }
+        }
+        if names.is_empty() {
+            return Ok(());
+        }
+        let destinations: BTreeSet<_> = names.values().collect();
+        if destinations.len() != names.len()
+            || names
+                .iter()
+                .any(|(from, to)| from != to && self.captured.inputs.contains_key(to))
+        {
+            return Err(ManifestError::Invalid);
+        }
+        for (object, name) in retained {
+            let input = self
+                .captured
+                .inputs
+                .get_mut(&object)
+                .ok_or(ManifestError::Incomplete)?;
+            input
+                .properties
+                .insert("conname".into(), Value::String(name));
+        }
+        let mut inputs = BTreeMap::new();
+        for (object, mut input) in std::mem::take(&mut self.captured.inputs) {
+            for value in input.properties.values_mut() {
+                *value = relocated_value(value, &names)?;
+            }
+            for binding in &mut input.bindings {
+                binding.target = relocated_identity(&binding.target, &names);
+            }
+            if inputs
+                .insert(relocated_identity(&object, &names), input)
+                .is_some()
+            {
+                return Err(ManifestError::Invalid);
+            }
+        }
+        self.captured.inputs = inputs;
+        let mut ownership = BTreeMap::new();
+        for (object, owner) in std::mem::take(&mut self.ownership) {
+            if ownership
+                .insert(relocated_identity(&object, &names), owner)
+                .is_some()
+            {
+                return Err(ManifestError::Invalid);
+            }
+        }
+        self.ownership = ownership;
+        let mut numbers = BTreeMap::new();
+        for (object, number) in std::mem::take(&mut self.captured.attribute_numbers) {
+            if numbers
+                .insert(relocated_identity(&object, &names), number)
+                .is_some()
+            {
+                return Err(ManifestError::Invalid);
+            }
+        }
+        self.captured.attribute_numbers = numbers;
+        for members in self.captured.candidates.values_mut() {
+            *members = relocated_set(members, &names)?;
+        }
+        self.captured.scope.retained = relocated_set(&self.captured.scope.retained, &names)?;
+        self.captured.limitations = relocated_set(&self.captured.limitations, &names)?;
+        for found in self.captured.dropped.values_mut() {
+            if let Some(object) = found {
+                *object = relocated_identity(object, &names);
+            }
+        }
+        Ok(())
     }
 
     pub fn assess(
@@ -258,6 +554,8 @@ impl CompiledCapture {
         opening: &CapturedInputs,
         changes: &pbps_model::ChangeSet,
         transitions: &[pbps_model::resolver::ObjectTransition],
+        base_ids: &pbps_model::IdsFile,
+        desired_ids: &pbps_model::IdsFile,
         effective_creator: &str,
     ) -> Result<pbps_model::resolver::InputManifest, pbps_model::resolver::ManifestError> {
         use pbps_model::Change;
@@ -471,6 +769,7 @@ impl CompiledCapture {
             );
             self.ownership.insert(id, ObjectOwnership::Surface(surface));
         }
+        self.retain_renamed_not_null(opening, changes, transitions, base_ids, desired_ids)?;
         self.captured
             .seal_with_roles(&self.key, Some(&self.roles), Some(&self.ownership))
     }
