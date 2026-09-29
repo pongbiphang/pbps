@@ -474,6 +474,21 @@ impl CompiledCapture {
             }
             let old_child = not_null_child(opening, &old_column)?;
             let new_child = not_null_child(&self.captured, &new_column)?;
+            // A missing PG18 child is not evidence of a nullable column: the
+            // captured attnotnull value and exact automatic edge must agree
+            // on each side before any retained-name projection is allowed.
+            match opening.major {
+                18 if old_child.is_some() != old_not_null
+                    || new_child.is_some() != new_not_null =>
+                {
+                    return Err(ManifestError::Incomplete);
+                }
+                16 if old_child.is_some() || new_child.is_some() => {
+                    return Err(ManifestError::Incomplete);
+                }
+                16 | 18 => {}
+                _ => return Err(ManifestError::Invalid),
+            }
             let (old_child, new_child) = match (old_child, new_child) {
                 (Some(old_child), Some(new_child)) if old_not_null && new_not_null => {
                     // A type rewrite recreates the physical PG18 row but
@@ -490,7 +505,8 @@ impl CompiledCapture {
                 {
                     continue;
                 }
-                // PostgreSQL 16 has no separate NOT NULL constraint record.
+                // PostgreSQL 16 has no separate child; PG18 nullable columns
+                // likewise have none on either side.
                 (None, None) => continue,
                 _ => return Err(ManifestError::Incomplete),
             };
