@@ -61,7 +61,13 @@ that name; visible mutation or escape of a mutable selector also discards its
 shared aliases, including aliases inside supported containers. Class-construction
 positional bases and keywords, along with subscription keys (reads, writes and
 deletions, including slice components), are arguments to potentially mutating
-Python protocols. Literal tuples
+Python protocols. For a direct module class without decorators, fully proven
+literal bases expose only the mutable objects actually passed: starred native
+containers pass their elements, and native indexing/slicing with literal integer
+bounds preserves immutable reads and independent copies. Shared mutable children
+still escape. Unknown base expressions and nested classes retain conservative
+reference tracking; this proof does not extend the selector assignment grammar.
+Literal tuples
 retain their immutability and Python concatenation semantics; a tuple can still
 expose mutable children. Data selectors accept lists or tuples of names. Unsupported
 assignment RHS values also count as escapes inside compound statements,

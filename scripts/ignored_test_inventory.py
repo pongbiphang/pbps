@@ -88,32 +88,57 @@ def discover(root):
     return targets
 
 
-def static_value(node, values):
+def static_value(node, values, *, subscripts=False):
     """Only literal selector data; never import or execute a fixture."""
+    def read(child, bindings=values):
+        return static_value(child, bindings, subscripts=subscripts)
+
     if isinstance(node, ast.Constant):
         return node.value
     if isinstance(node, ast.Name) and node.id in values:
         return values[node.id]
     if isinstance(node, (ast.List, ast.Tuple)):
-        items = [static_value(x, values) for x in node.elts]
+        items = [read(x) for x in node.elts]
         return tuple(items) if isinstance(node, ast.Tuple) else items
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
         try:
-            return static_value(node.left, values) + static_value(node.right, values)
+            return read(node.left) + read(node.right)
         except TypeError as error:
             raise InventoryError("incompatible literal selector operands") from error
     if isinstance(node, ast.ListComp) and len(node.generators) == 1:
         loop = node.generators[0]
         require(isinstance(loop.target, ast.Name) and not loop.ifs and not loop.is_async,
                 "unsupported selector comprehension")
-        return [static_value(node.elt, dict(values, **{loop.target.id: value}))
-                for value in static_value(loop.iter, values)]
+        return [read(node.elt, dict(values, **{loop.target.id: value}))
+                for value in read(loop.iter)]
+    if subscripts and isinstance(node, ast.Subscript):
+        container = read(node.value)
+        require(type(container) in (list, tuple, str), "unsupported literal subscription")
+        def index(part):
+            if part is None:
+                return None
+            # Literal signed integer bounds cannot dispatch a user __index__.
+            try:
+                value = ast.literal_eval(part)
+            except (ValueError, TypeError):
+                raise InventoryError("unsupported literal index") from None
+            require(type(value) is int, "unsupported literal index")
+            return value
+        key = (slice(index(node.slice.lower), index(node.slice.upper), index(node.slice.step))
+               if isinstance(node.slice, ast.Slice) else index(node.slice))
+        try:
+            return container[key]
+        except (IndexError, ValueError):
+            raise InventoryError("invalid literal subscription") from None
     raise InventoryError("selector is not supported literal data: " + ast.dump(node))
 
 
 class SelectorEffects(ast.NodeVisitor):
     """Visible writes/escapes outside function-local bodies invalidate evidence."""
-    def __init__(self, proven_assignment=None, harmless_reflection=None):
+    def __init__(self, proven_assignment=None, harmless_reflection=None, literal_class=None, values=None):
+        self.literal_class = literal_class
+        self.values = values
+        self.exposed_ids = set()
         self.proven_assignment = proven_assignment
         self.harmless_reflection = harmless_reflection
         self.namespace_exposed = False
@@ -205,9 +230,27 @@ class SelectorEffects(ast.NodeVisitor):
         self.writes.add(node.name)
         for expression in [*node.decorator_list, *node.bases, *node.keywords]:
             self.visit(expression)
-        for base in node.bases:
-            # Callable metaclasses can accept and mutate non-type bases.
-            self.references(base)
+        # Only a direct module class has these exact bindings. Decorator/base
+        # callbacks or class-local rebinding make a literal result unsafe to use.
+        exposed = None
+        if node is self.literal_class and not node.decorator_list:
+            try:
+                exposed = set()
+                for base in node.bases:
+                    value = static_value(base.value if isinstance(base, ast.Starred) else base,
+                                         self.values, subscripts=True)
+                    if isinstance(base, ast.Starred):
+                        require(type(value) in (list, tuple, str), "unsupported literal base iterable")
+                        exposed.update(identity for item in value for identity in mutable_ids(item))
+                    else:
+                        exposed.update(mutable_ids(value))
+            except (InventoryError, TypeError):
+                exposed = None
+        if exposed is None:
+            for base in node.bases:
+                self.references(base)
+        else:
+            self.exposed_ids.update(exposed)
         for keyword in node.keywords:
             # Metaclass and subclass hooks can retain or mutate keyword values.
             self.references(keyword.value)
@@ -433,11 +476,12 @@ def python_values(tree):
             except (InventoryError, TypeError):
                 pass
         harmless = imports.harmless_call(node)
-        effects = SelectorEffects(node if replacement is not None or harmless is not None else None, harmless)
+        effects = SelectorEffects(node if replacement is not None or harmless is not None else None, harmless,
+                                  node if isinstance(node, ast.ClassDef) else None, values)
         effects.visit(node)
         imports.advance(node, effects)
         namespace_exposed |= effects.namespace_exposed
-        mutated = set().union(*(mutable_ids(values[name]) for name in effects.mutations if name in values))
+        mutated = effects.exposed_ids.union(*(mutable_ids(values[name]) for name in effects.mutations if name in values))
         for name in list(values):
             if name in effects.writes or mutable_ids(values[name]) & mutated or "*" in effects.writes:
                 del values[name]

@@ -822,6 +822,87 @@ class Ownership(unittest.TestCase):
                 self.assertEqual(self.check(), 1)
 
 
+    def test_literal_base_elements_and_copies_preserve_selector_ownership(self):
+        setup = ('def clear(value):\n'
+                 '    if isinstance(value, list): value.clear()\n'
+                 '    elif isinstance(value, tuple):\n'
+                 '        for child in value: clear(child)\n'
+                 'def construct(name, bases, namespace):\n'
+                 '    for base in bases: clear(base)\n'
+                 '    return type(name, (), namespace)\n')
+        bases = ['*TESTS', '*ALIAS', 'TESTS[0]', 'ALIAS[-1]', 'TESTS[0][0:]',
+                 'TESTS[:]', 'ALIAS[::-1]', '*TESTS[:]', '(TESTS[0],)',
+                 '[ALIAS[0]]', '*[TESTS[0]]', '*[name for name in TESTS]',
+                 'TESTS[:1] + TESTS[:0]', 'WRAPPED[0][0]', '*WRAPPED[0]']
+        self.inventory['owners']['live']['selection'] = {
+            'kind': 'data', 'file': 'runner.py', 'expression': 'TESTS'}
+        for declaration in ('["owned"]', '("owned",)'):
+            for base in bases:
+                with self.subTest(declaration=declaration, base=base):
+                    source = (setup + f'TESTS = {declaration}\nALIAS = TESTS\nWRAPPED = (TESTS,)\n'
+                              + f'class Holder({base}, metaclass=construct): pass\n')
+                    actual = subprocess.run([sys.executable, '-c', source + 'print(list(TESTS))'],
+                                            check=True, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(actual.stdout, "['owned']\n")
+                    (self.root / 'runner.py').write_text(source, encoding='utf-8')
+                    self.assertEqual(self.check(), 1)
+
+    def test_computed_bases_expose_shared_mutable_children(self):
+        setup = ('def clear(value):\n'
+                 '    if isinstance(value, (list, tuple)):\n'
+                 '        for child in list(value): clear(child)\n'
+                 '        if isinstance(value, list): value.clear()\n'
+                 'def construct(name, bases, namespace):\n'
+                 '    for base in bases: clear(base)\n'
+                 '    return type(name, (), namespace)\n'
+                 'TESTS = ["owned"]\nALIAS = TESTS\nWRAPPED = (ALIAS,)\n'
+                 'NESTED = [WRAPPED]\n')
+        bases = ['WRAPPED[0]', '*WRAPPED', '*WRAPPED[:]', 'NESTED[0][0]',
+                 '*NESTED[0]', 'NESTED[:]', '([WRAPPED[0]],)',
+                 '[WRAPPED[0] for unused in [0]]', '"safe", WRAPPED[0]']
+        self.inventory['owners']['live']['selection'] = {
+            'kind': 'data', 'file': 'runner.py', 'expression': 'TESTS'}
+        for base in bases:
+            with self.subTest(base=base):
+                source = setup + f'class Holder({base}, metaclass=construct): pass\n'
+                actual = subprocess.run([sys.executable, '-c', source + 'print(TESTS)'],
+                                        check=True, capture_output=True, text=True, timeout=10)
+                self.assertEqual(actual.stdout, '[]\n')
+                (self.root / 'runner.py').write_text(source, encoding='utf-8')
+                with self.assertRaises(audit.InventoryError):
+                    self.check()
+
+    def test_unproven_base_execution_keeps_conservative_selector_effects(self):
+        setup = ('def construct(name, bases, namespace):\n'
+                 '    for base in bases:\n'
+                 '        if isinstance(base, list): base.clear()\n'
+                 '    return type(name, (), namespace)\n'
+                 'def opaque(value): return (value,)\n'
+                 'TESTS = ["owned"]\n')
+        suffixes = [
+            'def decorate():\n    TESTS.append(TESTS)\n    return lambda cls: cls\n'
+            '@decorate()\nclass Holder(*TESTS, metaclass=construct): pass\n',
+            'def expand():\n    TESTS.append(TESTS)\n    return "safe"\n'
+            'class Holder(expand(), *TESTS, metaclass=construct): pass\n',
+            'class Holder(*opaque(TESTS), metaclass=construct): pass\n',
+            'class Holder(opaque(TESTS)[0], metaclass=construct): pass\n',
+            'class Outer:\n    ALIAS = TESTS\n    class Holder(ALIAS, metaclass=construct): pass\n',
+            'class Outer:\n    TESTS = (TESTS,)\n    class Holder(*TESTS, metaclass=construct): pass\n',
+            'class Iterable:\n    def __iter__(self):\n        yield TESTS\n'
+            'class Holder(*Iterable(), TESTS, metaclass=construct): pass\n',
+        ]
+        self.inventory['owners']['live']['selection'] = {
+            'kind': 'data', 'file': 'runner.py', 'expression': 'TESTS'}
+        for suffix in suffixes:
+            with self.subTest(suffix=suffix):
+                source = setup + suffix
+                actual = subprocess.run([sys.executable, '-c', source + 'print(TESTS)'],
+                                        check=True, capture_output=True, text=True, timeout=10)
+                self.assertEqual(actual.stdout, '[]\n')
+                (self.root / 'runner.py').write_text(source, encoding='utf-8')
+                with self.assertRaises(audit.InventoryError):
+                    self.check()
+
     def test_callable_metaclasses_cannot_mutate_positional_selector_bases(self):
         setup = ('def clear(value):\n'
                  '    if isinstance(value, tuple) or (value and isinstance(value[0], (list, tuple))):\n'
