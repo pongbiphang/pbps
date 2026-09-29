@@ -310,14 +310,22 @@ pub(super) fn classify(
     for (id, module) in &recorded.schema.modules {
         match (id, module.kind) {
             (ModuleId::Named(name), ModuleKind::View) => {
+                let root = relation(name);
+                let surface = Surface::Module(id.clone());
                 direct(
                     capture,
                     &mut owned,
-                    relation(name),
+                    root.clone(),
                     "relkind",
                     &["v"],
-                    Surface::Module(id.clone()),
+                    surface.clone(),
                 )?;
+                if owned.get(&root) == Some(&surface) {
+                    // DROP/CREATE replaces the view's positive physical
+                    // attributes too, including a column's old ACL. References
+                    // and negative system attributes gain no mutation authority.
+                    physical_attributes(capture, &mut owned, &root, &surface, false)?;
+                }
             }
             (ModuleId::Routine(_), ModuleKind::Procedure | ModuleKind::Function) => {
                 // A target DROP lookup is resolved in this snapshot. A
