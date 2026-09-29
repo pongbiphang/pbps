@@ -223,10 +223,16 @@ pub(super) async fn unprotected_backend_cannot_inherit_frontend_tls(
     let key = std::env::var("PBPS_NATIVE_PROXY_KEY").expect("owned fixture TLS key");
     let certificate = rustls::pki_types::CertificateDer::from_pem_file(certificate).unwrap();
     let key = rustls::pki_types::PrivateKeyDer::from_pem_file(key).unwrap();
-    let config = rustls::ServerConfig::builder()
+    let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![certificate], key)
         .unwrap();
+    if driver == Driver::Mssql {
+        // TDS frames TLS only during prelogin. A TLS 1.3 session ticket sent
+        // after the handshake would retain that framing after the client has
+        // switched to raw TLS records, corrupting its next read.
+        config.send_tls13_tickets = 0;
+    }
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let address = match driver {
