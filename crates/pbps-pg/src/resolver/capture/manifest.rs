@@ -140,7 +140,7 @@ fn rename_source(
             })
             .unwrap_or(name);
         ObjectIdentity {
-            class: "pg_attribute".into(),
+            class: "column".into(),
             name: vec![prior.into()],
             signature: vec![before_relation.clone()],
         }
@@ -157,7 +157,7 @@ fn rename_source(
         "pg_class" if object.name == [final_table.schema.clone(), final_table.name.clone()] => {
             before_relation
         }
-        "pg_attribute" => before_column(object.name.first()?),
+        "column" => before_column(object.name.first()?),
         "pg_type" => {
             // PostgreSQL renames a relation's row and array types with the
             // table. Match the qualified type references, never a guessed
@@ -264,7 +264,7 @@ impl CompiledCapture {
                     let fields: &[&str] = match object.class.as_str() {
                         "pg_class" => &["relowner", "relacl"],
                         "pg_proc" => &["proowner", "proacl"],
-                        "pg_attribute" if source.is_some() => &["attacl"],
+                        "column" if source.is_some() => &["attacl"],
                         "pg_type" => &["typowner"],
                         _ => &[],
                     };
@@ -486,7 +486,7 @@ fn normalize_identity(
 fn acl_field(class: &str, name: &str) -> bool {
     matches!(
         (class, name),
-        ("pg_attribute", "attacl")
+        ("column", "attacl")
             | ("pg_class", "relacl")
             | ("pg_database", "datacl")
             | ("pg_default_acl", "defaclacl")
