@@ -680,6 +680,21 @@ fn diff_partial_rebuilding(
     // The class, and a rank inside it, so a change can sit between two
     // classes without a new ordinal shifting every one below it — the cost
     // `order_key`'s own doc names.
+    // The base's generated columns, whose drops go first in their class: an
+    // input column cannot be dropped while a generated column still reads it
+    // (DEC-1168.1).
+    let generated_in_base: BTreeSet<(TableName, String)> = base
+        .schema
+        .tables
+        .iter()
+        .flat_map(|(name, table)| {
+            table
+                .columns
+                .iter()
+                .filter(|(_, c)| c.generated.is_some())
+                .map(move |(column, _)| (name.clone(), column.clone()))
+        })
+        .collect();
     let sort_class = |c: &Change| -> (u8, usize) {
         if frees_a_renamed_column(c) {
             // Between the constraint and index drops of class 2 — a column a
@@ -698,8 +713,24 @@ fn diff_partial_rebuilding(
             // occupied target and never reaches this sort, which is the
             // property `a_single_revision_cannot_rename_into_an_occupied_baseline_name`
             // holds.
-            (2, 2)
-        } else if let Change::RenameColumn { table, from, .. } = c {
+            return (2, 2);
+        }
+        // A generated column is dropped before, and added after, the ordinary
+        // columns of its class. Measured, the engine refuses to drop a column
+        // a generated column reads, and refuses a generation expression over a
+        // column that is not there yet; a generated column never reads another
+        // (DEC-1168.1), so one layer each way is the whole order.
+        if let Change::DropColumn { column, .. } = c
+            && generated_in_base.contains(&(column.table.clone(), column.name.clone()))
+        {
+            return (order_key(c), 0);
+        }
+        if let Change::AddColumn { column, .. } = c
+            && column.generated.is_some()
+        {
+            return (order_key(c), 2);
+        }
+        if let Change::RenameColumn { table, from, .. } = c {
             let depth = chain_depth
                 .get(&(table.clone(), from.clone()))
                 .copied()
@@ -8159,6 +8190,74 @@ mod tests {
 
     /// The expressible half of the same comparison survives. `diff` accumulates
     /// every change it can phrase and only then checks for errors, so returning
+    /// A generated column is added after, and dropped before, the ordinary
+    /// columns of the same plan: the engine refuses an expression over a
+    /// column not added yet, and refuses to drop a column a generated column
+    /// still reads (DEC-1168.1). Each half names its columns so that name
+    /// order alone would get it wrong.
+    #[test]
+    fn a_generated_column_is_added_after_and_dropped_before_its_inputs() {
+        let generated_over = |input: &str| {
+            let mut c = Column::new(ty("int"));
+            c.generated = Some(pbps_model::Generated {
+                expression: format!("{input} * 2"),
+                stored: true,
+            });
+            c
+        };
+        let bare = schema_of("app.t", table(&[("id", Column::new(ty("int")))]));
+        let with = |generated: &str, input: &str| {
+            schema_of(
+                "app.t",
+                table(&[
+                    ("id", Column::new(ty("int"))),
+                    (input, Column::new(ty("int"))),
+                    (generated, generated_over(input)),
+                ]),
+            )
+        };
+        let order = |from: &Schema, to: &Schema, intents: &[pbps_model::Intent]| {
+            let from_ids = crate::resolve(from, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let to_ids = crate::resolve(to, &from_ids, intents, &ctx()).unwrap().ids;
+            diff_partial(
+                Side {
+                    schema: from,
+                    ids: &from_ids,
+                },
+                Side {
+                    schema: to,
+                    ids: &to_ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .changes
+            .changes
+            .iter()
+            .filter_map(|p| {
+                if let Change::AddColumn { name, .. } = &p.change {
+                    Some(format!("+{name}"))
+                } else if let Change::DropColumn { column, .. } = &p.change {
+                    Some(format!("-{}", column.name))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+        };
+        // `a0` sorts before `b` by name, and is added after it.
+        assert_eq!(order(&bare, &with("a0", "b"), &[]), ["+b", "+a0"]);
+        // `zz` sorts after `a` by name, and is dropped before it.
+        let t: TableName = "app.t".parse().unwrap();
+        let drops = ["a", "zz"].map(|c| pbps_model::Intent::DropColumn {
+            column: t.column(c),
+            reason: "gone".into(),
+        });
+        assert_eq!(order(&with("zz", "a"), &bare, &drops), ["-zz", "-a"]);
+    }
+
     /// A generated column's expression changes in place, as one typed change
     /// that carries both texts; a column that becomes or stops being
     /// generated, or changes kind, has no in-place form and is refused by name
