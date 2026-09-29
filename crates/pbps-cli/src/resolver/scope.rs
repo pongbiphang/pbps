@@ -244,6 +244,48 @@ pub(crate) fn compare(
     }
 }
 
+/// The ordered schema-grant sequence whose projection the qualified scope
+/// used. Compare it with the final pure planner changes before persisting
+/// either authorization or target visibility.
+pub(crate) fn planned_schema_grants(
+    changes: &pbps_model::ChangeSet,
+) -> Result<Vec<PlannedGrant>, String> {
+    use pbps_model::{Change, GrantTarget};
+    let mut planned = Vec::new();
+    for p in &changes.changes {
+        if matches!(
+            p.change,
+            Change::CreateRole { .. } | Change::RenameRole { .. } | Change::DropRole { .. }
+        ) {
+            return Err(
+                "persistent PostgreSQL authorization cannot project cluster role identity changes"
+                    .into(),
+            );
+        }
+        if let Change::Grant {
+            role,
+            target: GrantTarget::Schema(schema),
+            permissions,
+        }
+        | Change::Revoke {
+            role,
+            target: GrantTarget::Schema(schema),
+            permissions,
+        } = &p.change
+        {
+            for permission in permissions {
+                planned.push(PlannedGrant {
+                    principal: role.clone(),
+                    schema: schema.clone(),
+                    privilege: permission.as_str().to_ascii_uppercase().replace('-', " "),
+                    revoke: matches!(p.change, Change::Revoke { .. }),
+                });
+            }
+        }
+    }
+    Ok(planned)
+}
+
 impl Authorization {
     /// The name of the versioned authorization rule the context was read
     /// under.
@@ -289,36 +331,8 @@ impl Authorization {
         key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
         changes: &pbps_model::ChangeSet,
     ) -> Result<pbps_model::resolver::AuthorizationCondition, String> {
-        use pbps_model::{Change, GrantTarget};
-        let mut planned = Vec::new();
-        for p in &changes.changes {
-            if matches!(
-                p.change,
-                Change::CreateRole { .. } | Change::RenameRole { .. } | Change::DropRole { .. }
-            ) {
-                return Err("persistent PostgreSQL authorization cannot project cluster role identity changes".into());
-            }
-            if let Change::Grant {
-                role,
-                target: GrantTarget::Schema(schema),
-                permissions,
-            }
-            | Change::Revoke {
-                role,
-                target: GrantTarget::Schema(schema),
-                permissions,
-            } = &p.change
-            {
-                for permission in permissions {
-                    planned.push(PlannedGrant {
-                        principal: role.clone(),
-                        schema: schema.clone(),
-                        privilege: permission.as_str().to_ascii_uppercase().replace('-', " "),
-                        revoke: matches!(p.change, Change::Revoke { .. }),
-                    });
-                }
-            }
-        }
+        use pbps_model::Change;
+        let planned = planned_schema_grants(changes)?;
         if !self.unpredictable(&planned).is_empty() {
             return Err("the adapter cannot derive the approved authorization transition".into());
         }

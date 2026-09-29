@@ -35,6 +35,76 @@ pub fn environment_key(
     .map_err(|e| KeyRequired(e.to_string()))
 }
 
+/// The target-only closing checker (#616) uses this exact encoding for
+/// both phases. The phase selects which observed facts to compare, not a
+/// different HMAC domain that would make equal facts compare unequal.
+#[cfg(target_os = "linux")]
+pub(crate) fn target_catalog_fingerprint(
+    key: &EnvironmentFingerprintKey,
+    facts: &pbps_db::resolver::environment::CatalogFacts,
+) -> Result<String, &'static str> {
+    let mut canonical = facts.clone();
+    // SQL readers order these inventories, but sorting here makes the
+    // persisted encoding independent of row delivery order. Duplicates are
+    // unknown coverage, not an excuse to silently discard an observation.
+    canonical.extensions.sort_by(|a, b| a.name.cmp(&b.name));
+    if canonical
+        .extensions
+        .windows(2)
+        .any(|w| w[0].name == w[1].name)
+        || canonical
+            .extensions
+            .iter()
+            .any(|e| e.name.is_empty() || e.version.is_empty())
+    {
+        return Err("the target extension inventory is incomplete");
+    }
+    for extension in &mut canonical.extensions {
+        extension.requires.sort();
+        extension.libraries.sort();
+        if extension.requires.windows(2).any(|w| w[0] == w[1])
+            || extension.libraries.windows(2).any(|w| w[0] == w[1])
+        {
+            return Err("the target extension inventory is ambiguous");
+        }
+    }
+    canonical.collations.sort_by(|a, b| a.key.cmp(&b.key));
+    if canonical
+        .collations
+        .windows(2)
+        .any(|w| w[0].key == w[1].key)
+        || canonical.collations.iter().any(|c| c.key.is_empty())
+    {
+        return Err("the target collation inventory is incomplete");
+    }
+    for versions in canonical.available_extensions.values_mut() {
+        versions.sort();
+        if versions.windows(2).any(|w| w[0] == w[1]) {
+            return Err("the target available-extension inventory is ambiguous");
+        }
+    }
+    if canonical.visibility.values().any(|observed| {
+        observed
+            .value()
+            .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+            .is_none()
+    }) {
+        return Err("the target effective visibility is unreadable");
+    }
+    let bytes =
+        serde_json::to_vec(&canonical).map_err(|_| "the target catalog facts cannot be encoded")?;
+    Ok(hex(key.fingerprint(
+        "pbps/pg-target-catalog/v1",
+        "catalog-facts",
+        &bytes,
+    )))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn hex(bytes: [u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Recognizing a saved profile version is independent of the reader's host:
 /// offline explanation of a Linux artifact must work on Windows too. This
 /// validates the recorded contract, not the runtime's present-day condition.

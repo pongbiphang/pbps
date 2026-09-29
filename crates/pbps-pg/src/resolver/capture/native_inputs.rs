@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 /// ```
 #[derive(PartialEq, Eq)]
 pub struct RuntimeResolution {
+    requirements: Vec<String>,
     candidates: Vec<Vec<String>>,
 }
 
@@ -90,6 +91,7 @@ impl RuntimeInputs {
             .map(|prefix| prefix.join("lib"))
             .unwrap_or_else(|| PathBuf::from("/lib"));
         RuntimeResolution {
+            requirements: self.libraries.clone(),
             candidates: self
                 .libraries
                 .iter()
@@ -102,6 +104,46 @@ impl RuntimeInputs {
 }
 
 impl RuntimeResolution {
+    /// Key the loader's ordered logical requirement -> selected candidate ->
+    /// measured content association without releasing a source-bearing name.
+    /// Only the fresh-read native producer holds this resolution and its key;
+    /// an ordinary captured result cannot request a second seal.
+    pub fn seal_required_associations(
+        &self,
+        key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+        selected: &[(usize, pbps_db::resolver::environment::ExecutableIdentity)],
+    ) -> Result<String, Uncovered> {
+        if selected.len() != self.requirements.len() {
+            return Err(Uncovered::class(
+                "native-library",
+                "required executable inventory is incomplete",
+            ));
+        }
+        let mut facts = Vec::with_capacity(selected.len());
+        for (index, (candidate, identity)) in selected.iter().enumerate() {
+            if self.candidates[index].get(*candidate).is_none() {
+                return Err(Uncovered::class(
+                    "native-library",
+                    "selected executable candidate is invalid",
+                ));
+            }
+            let mut identity = identity.clone();
+            identity.path.clear();
+            facts.push((&self.requirements[index], candidate, identity));
+        }
+        let bytes = serde_json::to_vec(&facts).map_err(|_| {
+            Uncovered::class(
+                "native-library",
+                "required executable inventory cannot be encoded",
+            )
+        })?;
+        Ok(key
+            .fingerprint("pbps/pg-native-required/v1", "requirement-content", &bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
+    }
+
     pub fn len(&self) -> usize {
         self.candidates.len()
     }
