@@ -479,6 +479,21 @@ impl CompiledCapture {
             .inputs
             .iter()
             .map(|(object, input)| {
+                let mut bindings: Vec<pbps_model::resolver::Binding> = input
+                    .bindings
+                    .iter()
+                    .map(|binding| {
+                        Ok(pbps_model::resolver::Binding {
+                            node: binding.node.clone(),
+                            path: binding.path.clone(),
+                            target: normalize_identity(&binding.target, Some(&self.roles))?,
+                        })
+                    })
+                    .collect::<Result<_, pbps_model::resolver::ManifestError>>()?;
+                // The raw capture orders paths first; the sealed manifest
+                // orders model Bindings after role normalization. Resolution
+                // must carry that same order into BoundSurface.
+                bindings.sort();
                 Ok(BindingRecord {
                     object: normalize_identity(object, Some(&self.roles))?,
                     ownership: self
@@ -486,17 +501,7 @@ impl CompiledCapture {
                         .get(object)
                         .cloned()
                         .unwrap_or(pbps_model::resolver::ObjectOwnership::Unqualified),
-                    bindings: input
-                        .bindings
-                        .iter()
-                        .map(|binding| {
-                            Ok(pbps_model::resolver::Binding {
-                                node: binding.node.clone(),
-                                path: binding.path.clone(),
-                                target: normalize_identity(&binding.target, Some(&self.roles))?,
-                            })
-                        })
-                        .collect::<Result<_, pbps_model::resolver::ManifestError>>()?,
+                    bindings,
                 })
             })
             .collect()
