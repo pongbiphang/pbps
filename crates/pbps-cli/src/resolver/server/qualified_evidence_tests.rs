@@ -3281,3 +3281,187 @@ async fn a_new_routine_created_as_an_ordinary_deployer_keeps_its_owner_edge() {
     drop(admin);
     setup(&[]).await;
 }
+
+/// A verified scope belongs to the same preliminary plan and both live
+/// connections. Reusing precisely that request must still seal evidence.
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn a_prequalified_matching_scope_seals_the_same_ordinary_plan() {
+    setup(cases::TARGET_SETUP).await;
+    let inputs = Inputs::overload();
+    let key = ProjectKey::new(true);
+    let ordinary = pbps_diff::diff(
+        inputs.base(),
+        inputs.desired(),
+        &pbps_pg::Postgres::with_write_path_extras(vec![]),
+        &inputs.hints,
+    )
+    .unwrap();
+    assert!(scope::planned_schema_grants(&ordinary).unwrap().is_empty());
+    let mut owned = Some(ObservedContainers::begin());
+    let mut target = target().await;
+    let mut run = open(Profile::Container, &mut target).await;
+    let qualified = run
+        .qualify(
+            &mut target,
+            &ScopeRequest {
+                schemas: vec![cases::SCHEMA.into()],
+                write_path_extras: Vec::new(),
+                planned: Vec::new(),
+            },
+        )
+        .await;
+    if !matches!(&qualified, Ok(Verdict::Verified)) {
+        close(&mut run, &mut owned).await;
+        setup(&[]).await;
+        panic!("the ordinary preliminary request must truly verify: {qualified:?}");
+    }
+    let before = run.scope_connections();
+    let result = run
+        .plan_resolved(
+            &mut target,
+            &inputs.binding(),
+            inputs.base(),
+            inputs.desired(),
+            &inputs.hints,
+            &[],
+            &key.project,
+            Some(ENVIRONMENT),
+        )
+        .await;
+    let after = run.scope_connections();
+    let compiled = run.compiled;
+    close(&mut run, &mut owned).await;
+    setup(&[]).await;
+    assert!(before.is_some());
+    assert_eq!(after, before);
+    assert!(compiled, "the matching plan reached the one-shot compiler");
+    let resolved = result.expect("the same qualified request seals its ordinary plan");
+    resolved.evidence.validate(&resolved.changes).unwrap();
+}
+
+/// The two extras name the same schemas, but their search order selects the
+/// unqualified routine. A prior qualification must not authorize a reorder.
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn a_prequalified_scope_rejects_reordered_write_path_extras_before_compilation() {
+    setup(cases::EXTRA_LOOKUP_TARGET_SETUP).await;
+    let qualified_extras = vec!["pbps_evidence1274_extra".into(), "public".into()];
+    let requested_extras = vec!["public".into(), "pbps_evidence1274_extra".into()];
+    let inputs = Inputs::from_pair_with_extras(cases::extra_lookup_pair(), &requested_extras);
+    let key = ProjectKey::new(true);
+    let ordinary = pbps_diff::diff(
+        inputs.base(),
+        inputs.desired(),
+        &pbps_pg::Postgres::with_write_path_extras(requested_extras.clone()),
+        &inputs.hints,
+    )
+    .unwrap();
+    assert!(scope::planned_schema_grants(&ordinary).unwrap().is_empty());
+    let mut owned = Some(ObservedContainers::begin());
+    let mut target = target().await;
+    let mut run = open(Profile::Container, &mut target).await;
+    let qualified = run
+        .qualify(
+            &mut target,
+            &ScopeRequest {
+                schemas: vec![cases::SCHEMA.into(), "pbps_evidence1274_extra".into()],
+                write_path_extras: qualified_extras,
+                planned: Vec::new(),
+            },
+        )
+        .await;
+    if !matches!(&qualified, Ok(Verdict::Verified)) {
+        close(&mut run, &mut owned).await;
+        setup(&[]).await;
+        panic!("the original ordered extra scope must truly verify: {qualified:?}");
+    }
+    let before = run.scope_connections();
+    let result = run
+        .plan_resolved(
+            &mut target,
+            &inputs.binding(),
+            inputs.base(),
+            inputs.desired(),
+            &inputs.hints,
+            &requested_extras,
+            &key.project,
+            Some(ENVIRONMENT),
+        )
+        .await;
+    let after = run.scope_connections();
+    let compiled = run.compiled;
+    close(&mut run, &mut owned).await;
+    setup(&[]).await;
+    assert!(before.is_some());
+    assert_eq!(after, before, "an early refusal cannot rebind the scope");
+    assert!(!compiled, "a reordered write path cannot start compilation");
+    assert!(matches!(result, Err(Error::Scope(ref reason))
+        if reason == "the existing verified scope does not match the planning request"));
+}
+
+/// The opening qualification may project a planned schema grant, but the
+/// ordinary overload plan performs none. That old scope cannot seal it.
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn a_prequalified_scope_rejects_changed_preliminary_grants_before_compilation() {
+    setup(cases::TARGET_SETUP).await;
+    let inputs = Inputs::overload();
+    let key = ProjectKey::new(true);
+    let ordinary = pbps_diff::diff(
+        inputs.base(),
+        inputs.desired(),
+        &pbps_pg::Postgres::with_write_path_extras(vec![]),
+        &inputs.hints,
+    )
+    .unwrap();
+    assert!(scope::planned_schema_grants(&ordinary).unwrap().is_empty());
+    let mut owned = Some(ObservedContainers::begin());
+    let mut target = target().await;
+    let mut run = open(Profile::Container, &mut target).await;
+    let qualified = run
+        .qualify(
+            &mut target,
+            &ScopeRequest {
+                schemas: vec![cases::SCHEMA.into()],
+                write_path_extras: Vec::new(),
+                planned: vec![PlannedGrant {
+                    principal: "PUBLIC".into(),
+                    schema: cases::SCHEMA.into(),
+                    privilege: "USAGE".into(),
+                    revoke: false,
+                }],
+            },
+        )
+        .await;
+    if !matches!(&qualified, Ok(Verdict::Verified)) {
+        close(&mut run, &mut owned).await;
+        setup(&[]).await;
+        panic!("the planned PUBLIC USAGE scope must truly verify: {qualified:?}");
+    }
+    let before = run.scope_connections();
+    let result = run
+        .plan_resolved(
+            &mut target,
+            &inputs.binding(),
+            inputs.base(),
+            inputs.desired(),
+            &inputs.hints,
+            &[],
+            &key.project,
+            Some(ENVIRONMENT),
+        )
+        .await;
+    let after = run.scope_connections();
+    let compiled = run.compiled;
+    close(&mut run, &mut owned).await;
+    setup(&[]).await;
+    assert!(before.is_some());
+    assert_eq!(after, before, "an early refusal cannot rebind the scope");
+    assert!(
+        !compiled,
+        "a changed grant sequence cannot start compilation"
+    );
+    assert!(matches!(result, Err(Error::Scope(ref reason))
+        if reason == "the existing verified scope does not match the planning request"));
+}
