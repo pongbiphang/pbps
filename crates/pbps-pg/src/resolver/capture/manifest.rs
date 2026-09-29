@@ -644,8 +644,15 @@ impl CompiledCapture {
             .collect::<Result<_, ManifestError>>()?;
         let mut preserved_dependencies = BTreeSet::new();
         let mut created_dependencies = BTreeSet::new();
+        let mut created_owned_subjects = BTreeSet::new();
         let mut dependency_mappings = Vec::new();
         let mut dependencies_to_copy = Vec::new();
+        let mut created_owner_edges = Vec::new();
+        let creator = ObjectIdentity {
+            class: "pg_authid".into(),
+            name: vec![effective_creator.into()],
+            signature: Vec::new(),
+        };
         for transition in transitions {
             let preserved = inplace.contains(&transition.surface);
             let created = transition.before.is_empty()
@@ -663,6 +670,9 @@ impl CompiledCapture {
                 let owner = self.ownership.get(raw).ok_or(ManifestError::Incomplete)?;
                 if !matches!(owner, ObjectOwnership::Surface(_)) {
                     continue;
+                }
+                if created && !preserved {
+                    created_owned_subjects.insert(object.clone());
                 }
                 if preserved {
                     let source =
@@ -751,14 +761,27 @@ impl CompiledCapture {
                         after.properties.insert(acl_field.into(), target_acl);
                         after.properties.insert(
                             owner_field.into(),
-                            serde_json::to_value(target_identity(&ObjectIdentity {
-                                class: "pg_authid".into(),
-                                name: vec![effective_creator.into()],
-                                signature: Vec::new(),
-                            }))
-                            .map_err(|_| ManifestError::Invalid)?,
+                            serde_json::to_value(target_identity(&creator))
+                                .map_err(|_| ManifestError::Invalid)?,
                         );
                         created_dependencies.insert(object.clone());
+                        // A class without an owner edge on scratch has no
+                        // edge to project. For classes that do, the scratch
+                        // role must resolve to this plan's effective creator.
+                        let mut observed = self.captured.inputs.keys().filter(|id| {
+                            id.class == "pg_shdepend"
+                                && id.name == ["o"]
+                                && id.signature.first() == Some(raw)
+                        });
+                        if let Some(edge) = observed.next() {
+                            let role = edge.signature.get(1).ok_or(ManifestError::Invalid)?;
+                            if observed.next().is_some()
+                                || normalize_identity(role, Some(&self.roles))? != creator
+                            {
+                                return Err(ManifestError::Invalid);
+                            }
+                            created_owner_edges.push((object.clone(), transition.surface.clone()));
+                        }
                         if let Value::Array(entries) = acl {
                             for entry in entries {
                                 for principal in ["grantor", "grantee"] {
@@ -799,7 +822,8 @@ impl CompiledCapture {
                     .and_then(|subject| normalize_identity(subject, Some(&self.roles)).ok())
                     .is_some_and(|subject| {
                         preserved_dependencies.contains(&subject)
-                            || created_dependencies.contains(&subject) && id.name == ["a"]
+                            || created_dependencies.contains(&subject)
+                                && (id.name == ["a"] || id.name == ["o"])
                     })
             })
             .cloned()
@@ -807,6 +831,35 @@ impl CompiledCapture {
         for id in old_dependencies {
             self.captured.inputs.remove(&id);
             self.ownership.remove(&id);
+        }
+        // Auto-created children may have owner edges even though their
+        // metadata needs no explicit owner rewrite above. The opening
+        // target role's pin class decides whether each observed scratch edge
+        // survives the same DDL on target.
+        let scratch_owner_edges = self
+            .captured
+            .inputs
+            .keys()
+            .filter(|id| id.class == "pg_shdepend" && id.name == ["o"])
+            .cloned()
+            .collect::<Vec<_>>();
+        for id in scratch_owner_edges {
+            let [subject, role] = id.signature.as_slice() else {
+                return Err(ManifestError::Invalid);
+            };
+            let subject = normalize_identity(subject, Some(&self.roles))?;
+            if !created_owned_subjects.contains(&subject) {
+                continue;
+            }
+            let role = normalize_identity(role, Some(&self.roles))?;
+            let pinned = opening
+                .role_pinned
+                .get(&role)
+                .ok_or(ManifestError::Incomplete)?;
+            if *pinned {
+                self.captured.inputs.remove(&id);
+                self.ownership.remove(&id);
+            }
         }
         for (source, destination, surface) in dependency_mappings {
             for (id, input) in &opening.inputs {
@@ -821,6 +874,33 @@ impl CompiledCapture {
                 self.captured.inputs.insert(final_id.clone(), input.clone());
                 self.ownership
                     .insert(final_id, ObjectOwnership::Surface(surface.clone()));
+            }
+        }
+        if !created_owner_edges.is_empty() {
+            // Scratch's owner is a run-local ordinary role. Re-addressing its
+            // edge to a pinned target owner invents a dependency; dropping it
+            // for an ordinary target owner loses a real one. Classify the
+            // effective creator from the same opening pg_roles inventory.
+            let pinned = opening
+                .role_pinned
+                .get(&creator)
+                .ok_or(ManifestError::Incomplete)?;
+            if !*pinned {
+                for (subject, surface) in created_owner_edges {
+                    let id = ObjectIdentity {
+                        class: "pg_shdepend".into(),
+                        name: vec!["o".into()],
+                        signature: vec![subject, target_identity(&creator)],
+                    };
+                    self.captured.inputs.insert(
+                        id.clone(),
+                        Input {
+                            properties: BTreeMap::new(),
+                            bindings: Vec::new(),
+                        },
+                    );
+                    self.ownership.insert(id, ObjectOwnership::Surface(surface));
+                }
             }
         }
         for (subject, role, surface) in dependencies_to_copy {
