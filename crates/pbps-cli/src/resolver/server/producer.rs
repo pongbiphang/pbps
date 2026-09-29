@@ -229,7 +229,7 @@ impl ScratchRun {
                 &transitions,
                 creator,
             )
-            .map_err(|error| Error::Binding(error.to_string()))?;
+            .map_err(|error| Error::Binding(format!("final compiled catalog manifest: {error}")))?;
         // Typed preservation can replace the scratch owner's shared-dependency
         // addresses. Re-inventory the final sealed records before projecting;
         // the model must see exactly those closing addresses.
@@ -280,7 +280,7 @@ impl ScratchRun {
             transitions,
             ordered.proof,
         )
-        .map_err(|error| Error::Binding(error.to_string()))?;
+        .map_err(|error| Error::Binding(format!("closing evidence projection: {error}")))?;
         Ok(ResolvedPlan { changes, evidence })
     }
 }
