@@ -272,7 +272,7 @@ pub(super) fn classify(
                 // scratch-created identity is never authority for a target
                 // overload with the same declared signature.
                 let root = if let Some(signature) = recorded.dropped.get(id) {
-                    capture.dropped.get(signature).and_then(Option::as_ref)
+                    capture.dropped().get(signature).and_then(Option::as_ref)
                 } else {
                     recorded.routines.get(id)
                 };

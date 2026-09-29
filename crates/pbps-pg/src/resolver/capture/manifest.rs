@@ -507,6 +507,10 @@ fn normalize_value(
 }
 
 impl CapturedInputs {
+    pub(super) fn major(&self) -> u32 {
+        self.major
+    }
+
     /// Persistable catalog facts, keyed by the target environment. This is
     /// still catalog evidence only: it does not confer runtime qualification.
     /// No property value, including an external definition's literals, crosses
