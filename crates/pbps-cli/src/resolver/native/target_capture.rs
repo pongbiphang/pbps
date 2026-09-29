@@ -4,11 +4,13 @@
 
 use super::{BoundTarget, NativeTarget, correlate, engine, executables};
 use engine::{CaptureScope, CapturedInputs};
+use pbps_db::fingerprint::EnvironmentFingerprintKey;
 use pbps_db::resolver::{
     InstanceObservation,
     capture::{CaptureDifference, CaptureError, InputChange},
     environment::{ExecutableIdentity, ExecutableRole, Provenance},
 };
+use pbps_model::resolver::InputManifest;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureFailure {
@@ -101,6 +103,34 @@ impl NativeTarget {
         scope: &CaptureScope,
         dropped: &std::collections::BTreeSet<engine::DroppedSignature>,
     ) -> Result<CapturedTargetInputs, CaptureFailure> {
+        self.capture_postgres_inner(scope, dropped, None)
+            .await
+            .map(|(captured, _)| captured)
+    }
+
+    /// The key is chosen before the fresh catalog read. Neither the returned
+    /// native capture nor the keyed manifest can be sealed under another key.
+    pub async fn capture_postgres_sealed(
+        &mut self,
+        scope: &CaptureScope,
+        dropped: &std::collections::BTreeSet<engine::DroppedSignature>,
+        key: &EnvironmentFingerprintKey,
+    ) -> Result<(CapturedTargetInputs, InputManifest), CaptureFailure> {
+        let (captured, manifest) = self
+            .capture_postgres_inner(scope, dropped, Some(key))
+            .await?;
+        Ok((
+            captured,
+            manifest.expect("sealed capture returns a manifest"),
+        ))
+    }
+
+    async fn capture_postgres_inner(
+        &mut self,
+        scope: &CaptureScope,
+        dropped: &std::collections::BTreeSet<engine::DroppedSignature>,
+        key: Option<&EnvironmentFingerprintKey>,
+    ) -> Result<(CapturedTargetInputs, Option<InputManifest>), CaptureFailure> {
         // Ownership moves before the first await. Cancellation, even during
         // an owned SQL transaction, drops the connection and every weak lease.
         let mut bound = self.current.take().ok_or(CaptureFailure::Binding)?;
@@ -116,7 +146,17 @@ impl NativeTarget {
             return Err(CaptureFailure::Executables);
         }
         check(&mut bound).await?;
-        let catalog = engine::capture(&mut bound.connection, scope, dropped).await?;
+        let (catalog, manifest) = match key {
+            Some(key) => {
+                let (catalog, manifest) =
+                    engine::capture_sealed(&mut bound.connection, scope, dropped, key).await?;
+                (catalog, Some(manifest))
+            }
+            None => (
+                engine::capture(&mut bound.connection, scope, dropped).await?,
+                None,
+            ),
+        };
         if !hints.compare(&catalog).is_empty() {
             return Err(CaptureFailure::Changed);
         }
@@ -136,7 +176,7 @@ impl NativeTarget {
             instance: bound.identity.clone(),
         };
         self.current = Some(bound);
-        Ok(captured)
+        Ok((captured, manifest))
     }
 
     pub async fn recapture_postgres(

@@ -446,7 +446,7 @@ impl RoleMap {
 
     /// The logical role a run-local name stands for, for comparing a
     /// reconstructed context back against the target.
-    fn logical_of(&self, run_local: &str) -> Option<String> {
+    pub(crate) fn logical_of(&self, run_local: &str) -> Option<String> {
         if run_local == "PUBLIC" {
             return Some("PUBLIC".to_owned());
         }

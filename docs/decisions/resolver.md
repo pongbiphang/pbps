@@ -1164,3 +1164,18 @@ new name as a known contract, never an unknown name or an admission substitute.
 The fixed fixture selects pinned PG16/PG18 recipes explicitly, defaults to 18,
 and retains the ordinary SQL Server recipe. This does not admit a Podman-native
 daemon, arbitrary layouts, publish the held producer or enable resolved apply.
+
+<a id="dec-1274-1"></a>
+
+**DEC-1274.1. Seal the resolved producer's exact observations under its selected environment key.**
+The key is fixed before the authorized fresh target and scratch reads. The
+producer keeps the captures that justified the binding verdict, seals them
+inside those read boundaries, and returns no capability to rekey a retained
+capture. Managed ownership is proved per catalog record from recorded UIDs
+and kind-specific dependency rules; a reference or automatic dependency alone
+never authorizes a transition. The resolved evidence format is version 2: its
+opening target-environment fingerprint covers complete raw `CatalogFacts`, and
+its closing fingerprint covers the approved grant projection of that same
+observation. Both use the same versioned canonical input and HMAC component,
+so a target-only recheck can compare each phase directly. The final ordered
+grant changes must match the projection request or production refuses.

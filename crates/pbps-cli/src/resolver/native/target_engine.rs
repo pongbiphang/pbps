@@ -49,6 +49,23 @@ pub(super) async fn capture_with_runtime_inputs(
     }
 }
 
+pub(super) async fn capture_sealed(
+    connection: &mut PeerVerifiedConn,
+    scope: &CaptureScope,
+    dropped: &std::collections::BTreeSet<DroppedSignature>,
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+) -> Result<(CapturedInputs, pbps_model::resolver::InputManifest), CaptureError> {
+    match connection.driver() {
+        Driver::Postgres => {
+            pbps_pg::resolver::capture::capture_identifying_sealed(connection, scope, dropped, key)
+                .await
+        }
+        Driver::Mssql => Err(CaptureError::Unsupported {
+            engine: "SQL Server",
+        }),
+    }
+}
+
 pub(super) async fn capture(
     connection: &mut PeerVerifiedConn,
     scope: &CaptureScope,
