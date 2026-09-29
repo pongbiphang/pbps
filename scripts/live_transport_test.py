@@ -89,10 +89,14 @@ class FixtureOwnership(unittest.TestCase):
     def test_every_trust_variant_uses_the_guard_and_every_exit_removes_the_fixture(self):
         verified = "verified_round_trips_reject_wrong_peers_and_corrupted_replies"
         invalid = "invalid_trust_cannot_yield_a_verified_connection"
-        expected = [(verified, "ca.pem"), (invalid, "untrusted.pem"),
-                    (invalid, "invalid.pem"), (invalid, "missing.pem")]
         for engine in ("pg", "mssql"):
-            for fail_at in (None, 0, 1, 2, 3):
+            expected = [(verified, "ca.pem"), (invalid, "untrusted.pem")]
+            if engine == "mssql":
+                expected.append(("ado_options_cannot_disable_peer_verification",
+                                 "untrusted.pem"))
+            expected.extend([(invalid, "invalid.pem"),
+                             (invalid, "missing.pem")])
+            for fail_at in (None, *range(len(expected))):
                 with self.subTest(engine=engine, fail_at=fail_at):
                     calls = []
 

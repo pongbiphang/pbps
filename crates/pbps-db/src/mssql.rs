@@ -12,10 +12,11 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 use crate::{DbError, Param};
 
-/// Use the driver's parser for escaping, case and duplicate-key precedence.
-/// Splitting on semicolons would mistake password contents for policy. The
-/// driver has no public trust/encryption getters, so only these two effective
-/// keys are checked here; Config still validates every option it supports.
+/// Read effective policy keys without splitting on password semicolons.
+/// `connection-string` and tiberius 0.13 use separate ADO.NET parsers, so
+/// accepted and refused quoted/duplicate forms are pinned below and in the
+/// live TLS fixture (issue #861). The driver has no public trust/encryption
+/// getters; Config still validates every option it supports.
 fn verified_options(connection_string: &str) -> Result<(), DbError> {
     let options: connection_string::AdoNetString = connection_string
         .parse()
@@ -108,7 +109,12 @@ impl Conn {
         Self::connect_config(config).await
     }
 
-    async fn connect_config(config: Config) -> Result<Self, DbError> {
+    async fn connect_config(mut config: Config) -> Result<Self, DbError> {
+        // A 30-second per-response timeout was added in tiberius 0.13. Long
+        // DDL and lock waits were unbounded before this driver switch. Keep
+        // that deployment behavior explicit; the TCP and handshake bounds
+        // remain independent of statement execution (DEC-861.1).
+        config.command_timeout(None);
         let addr = config.get_addr().to_owned();
         // A firewall that drops rather than refuses leaves the OS retrying for
         // over two minutes. Waiting that long for a pipeline to say "I could
@@ -122,7 +128,7 @@ impl Conn {
         //
         // `CONNECT_TIMEOUT` unconditionally: an ADO.NET connection string has
         // no `connect_timeout` of its own to honour or refuse (issue #113;
-        // `tiberius-ng`'s `Config::from_ado_string` parses no such key), and
+        // `tiberius` 0.13.0's `Config::from_ado_string` parses no such key), and
         // `false` for the same reason — no `load_balance_hosts` equivalent
         // either, so resolution order is never reshuffled here.
         let tcp = crate::open_socket(&addr, crate::CONNECT_TIMEOUT, false).await?;
@@ -156,6 +162,9 @@ impl Conn {
         config.authentication(tiberius::AuthMethod::sql_server(login.user, login.password));
         config.encryption(tiberius::EncryptionLevel::NotSupported);
         config.application_name(crate::session_application_name());
+        // This path also executes deployment work; the new driver default
+        // must not impose a deadline on a long statement here either.
+        config.command_timeout(None);
         let client = Client::connect(config, stream.compat_write()).await?;
         Ok(Self {
             client,
@@ -284,17 +293,55 @@ impl Row {
 mod transport_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn a_stalled_handshake_is_reported_as_a_driver_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        });
+        let mut config = Config::from_ado_string(&format!(
+            "Server=127.0.0.1,{port};User Id=synthetic;Password=marker;Encrypt=true"
+        ))
+        .unwrap();
+        config.handshake_timeout(Some(std::time::Duration::from_millis(100)));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            Conn::connect_config(config),
+        )
+        .await
+        .expect("the driver handshake must terminate within its bound");
+        server.abort();
+        match result {
+            Err(DbError::Driver { message, .. }) => {
+                assert!(message.contains("connection handshake"), "{message}");
+                assert!(
+                    message.contains("did not complete within 100ms"),
+                    "{message}"
+                );
+            }
+            Err(other) => panic!("expected a driver timeout, got: {other}"),
+            Ok(_) => panic!("a stalled handshake must not connect"),
+        }
+    }
+
     #[test]
     fn effective_trust_options_follow_driver_escaping_and_duplicate_precedence() {
         for input in [
             "Server=localhost;Password={marker;TrustServerCertificate=true};Encrypt=YES",
             "Encrypt=false;Encrypt=true;TrustServerCertificate=true;TrustServerCertificate=no",
+            "Encrypt=NO;ENCRYPT=yes;TrustServerCertificate=yes;TRUSTSERVERCERTIFICATE=NO",
+            "Server=localhost;Password={marker;TrustServerCertificate=true};TrustServerCertificate=false;Encrypt=true",
+            "Password=\"marker;TrustServerCertificate=true\";Encrypt=true",
+            "Password='marker;TrustServerCertificate=true';Encrypt=true",
             "ENCRYPT={ true };TRUSTSERVERCERTIFICATE={ false }",
             "Server=localhost",
         ] {
             verified_options(input).unwrap();
             Config::from_ado_string(input).unwrap();
         }
+        // Last effective key wins on both parsers, including mixed case.
         for input in [
             "Encrypt=true;Encrypt=no",
             "TrustServerCertificate=false;TRUSTSERVERCERTIFICATE=YES",
@@ -302,7 +349,7 @@ mod transport_tests {
             "TrustServerCertificate=maybe",
             "Password={unterminated",
         ] {
-            assert!(verified_options(input).is_err());
+            assert!(verified_options(input).is_err(), "{input}");
         }
     }
 }

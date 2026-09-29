@@ -7,9 +7,11 @@ bugs behind the scar tissue are in [PITFALLS.md](PITFALLS.md).
 ## Phase
 
 **Phases 0-5 complete** (0, 1, 2, 3, 3.1, 3.5, 4 and 5), with SQL Server
-and PostgreSQL supported through the CLI. The test and clippy bar is in
-AGENTS.md's "Taking an issue"; counts change too often to record here. The
-copy-pastable pipelines SPEC 14.1 lists as P1 are in [CI.md](CI.md).
+and PostgreSQL supported through the CLI. SQL Server uses `tiberius` 0.13.0
+with rustls and aws-lc-rs; PostgreSQL's rustls configuration selects the same
+provider. The test and clippy bar is in AGENTS.md's "Taking an issue"; counts
+change too often to record here. The copy-pastable pipelines SPEC 14.1 lists
+as P1 are in [CI.md](CI.md).
 
 First-run: `init` (`--env` / `--from` / `--url-env`), with staged validation
 and pbps.yml installed last so a failed onboarding run leaves no partial project.
@@ -236,18 +238,6 @@ tagged release, reset `plan::CURRENT_VERSION`, `state::CURRENT_VERSION` and
 back-compatibility with the pre-release numbering** (DECISIONS 145). Until
 then, bump freely: a plan file lives for the length of one deployment window,
 and there is nothing in the field to invalidate.
-
-### Return the driver to `tiberius` once it ships a release
-
-(SPEC open question 10.) The driver is `tiberius-ng`, adopted because
-`tiberius` 0.12.3 pins a `rustls` stack with four open advisories and had no
-release since 2024. The original crate has since moved to the community-owned
-`tiberius-rs/tiberius` repository and is active again (commits on 2026-09-02),
-so the plan is to go back — after a crates.io release newer than 0.12.3 whose
-`rustls` feature resolves `rustls >= 0.23`. As of 2026-09-04 there is no such
-release and `main` still pins `tokio-rustls 0.24`, so moving back now would
-reinstate every advisory exception. The move is one line in the workspace
-`Cargo.toml`, then `cargo deny check`, then the live suite.
 
 ### No universal connection layer
 

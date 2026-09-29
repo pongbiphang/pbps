@@ -41,6 +41,22 @@ async fn a_server_refusal_already_carries_the_servers_own_sentence() {
     assert_eq!(error.server_error_code().as_deref(), Some("208"));
 }
 
+/// #861: the 0.13 driver added a 30-second command deadline. Deployment
+/// statements previously had none, so a server response past that default
+/// must remain usable through the ordinary connection path.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_slow_server_statement_does_not_gain_a_driver_deadline() {
+    let mut conn = Conn::connect(Driver::Mssql, &conn_str())
+        .await
+        .expect("connect to the live server");
+    let rows = conn
+        .query("WAITFOR DELAY '00:00:31'; SELECT CAST(861 AS INT) AS value")
+        .await
+        .expect("a 31-second response must not time out");
+    assert_eq!(rows[0].try_get::<i32>("value").unwrap(), Some(861));
+}
+
 fn conn_str() -> String {
     std::env::var("PBPS_TEST_DB").expect(
         "PBPS_TEST_DB is not set; these tests need a live SQL Server (see scripts/live-tests.sh)",
