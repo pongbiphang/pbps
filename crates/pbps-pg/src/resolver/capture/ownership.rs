@@ -94,6 +94,48 @@ fn direct(
     Ok(())
 }
 
+/// Only physical attributes of an independently owned relation inherit its
+/// typed surface. A referenced column on some other relation grants nothing.
+fn physical_attributes(
+    capture: &CapturedInputs,
+    owned: &mut BTreeMap<ObjectIdentity, Surface>,
+    parent: &ObjectIdentity,
+    surface: &Surface,
+    system: bool,
+) -> Result<(), Uncovered> {
+    for child in capture
+        .inputs
+        .keys()
+        .filter(|id| id.class == "column" && id.signature.first() == Some(parent))
+    {
+        let fail = || Uncovered::object(child, "physical attribute provenance is unreadable");
+        let number = *capture.attribute_numbers.get(child).ok_or_else(|| fail())?;
+        let input = capture.inputs.get(child).ok_or_else(|| fail())?;
+        let relation: ObjectIdentity = serde_json::from_value(
+            input
+                .properties
+                .get("attrelid")
+                .cloned()
+                .ok_or_else(|| fail())?,
+        )
+        .map_err(|_| fail())?;
+        if number == 0
+            || child.signature.len() != 1
+            || child.name.len() != 1
+            || relation != *parent
+            || input.properties.get("attname").and_then(Value::as_str)
+                != child.name.first().map(String::as_str)
+            || input.properties.get("attisdropped") != Some(&Value::Bool(false))
+        {
+            return Err(fail());
+        }
+        if (number < 0) == system {
+            assign(owned, child.clone(), surface.clone())?;
+        }
+    }
+    Ok(())
+}
+
 /// Classify exact roots before raw kind/provenance properties are erased by
 /// sealing. Absence stays absence; a present root of the wrong kind refuses.
 /// Missing or corrupt recorded UID authority also refuses, rather than
@@ -121,14 +163,18 @@ pub(super) fn classify(
             ));
         }
         let table_id = relation(name);
+        let table_owner = Surface::Table(name.clone());
         direct(
             capture,
             &mut owned,
             table_id.clone(),
             "relkind",
             &["r", "p"],
-            Surface::Table(name.clone()),
+            table_owner.clone(),
         )?;
+        if owned.get(&table_id) == Some(&table_owner) {
+            physical_attributes(capture, &mut owned, &table_id, &table_owner, true)?;
+        }
         for (column, declaration) in &table.columns {
             let reference = name.column(column);
             if recorded.ids.column_uid(&reference).is_none() {
@@ -207,17 +253,21 @@ pub(super) fn classify(
                     ));
                 }
             }
+            let index_owner = Surface::Index {
+                table: name.clone(),
+                name: index.clone(),
+            };
             direct(
                 capture,
                 &mut owned,
-                object,
+                object.clone(),
                 "relkind",
                 &["i", "I"],
-                Surface::Index {
-                    table: name.clone(),
-                    name: index.clone(),
-                },
+                index_owner.clone(),
             )?;
+            if owned.get(&object) == Some(&index_owner) {
+                physical_attributes(capture, &mut owned, &object, &index_owner, false)?;
+            }
         }
         // A key constraint is independently declared. Its automatic table
         // edge does not qualify any other constraint or ordinary index.
