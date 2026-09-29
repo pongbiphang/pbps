@@ -69,6 +69,9 @@ pub struct CapturedInputs {
     major: u32,
     scope: CaptureScope,
     pub(super) inputs: BTreeMap<ObjectIdentity, Input>,
+    /// Same-snapshot pg_roles OIDs classify shared-dependency pinning on
+    /// qualified PG16/18. Physical numbers never enter sealed properties.
+    role_pinned: BTreeMap<ObjectIdentity, bool>,
     /// Raw attribute numbers prove physical children before the ordinal is
     /// erased from durable catalog properties. Never seal these positions.
     pub(super) attribute_numbers: BTreeMap<ObjectIdentity, i32>,
@@ -716,12 +719,29 @@ impl CompiledCapture {
                     };
                     if let Some((kind, acl_field, owner_field)) = kind {
                         let namespace = object.name.first().ok_or(ManifestError::Invalid)?;
-                        let acl = super::creation_acl::creation_acl(
-                            opening,
-                            effective_creator,
-                            namespace,
-                            kind,
-                        )?;
+                        let acl = if kind == "f" {
+                            let Surface::Module(pbps_model::ModuleId::Routine(routine)) =
+                                &transition.surface
+                            else {
+                                return Err(ManifestError::Incomplete);
+                            };
+                            super::creation_acl::routine_acl_after_plan(
+                                opening,
+                                &self.captured,
+                                raw,
+                                effective_creator,
+                                namespace,
+                                routine,
+                                changes,
+                            )?
+                        } else {
+                            super::creation_acl::creation_acl(
+                                opening,
+                                effective_creator,
+                                namespace,
+                                kind,
+                            )?
+                        };
                         let target_acl = target_value(&acl)?;
                         let after = self
                             .captured
@@ -804,19 +824,14 @@ impl CompiledCapture {
             }
         }
         for (subject, role, surface) in dependencies_to_copy {
-            // A pinned role has no shared dependency. The opening default ACL
-            // itself proves whether this role is dependency-recorded; never
-            // infer that from a spelling or from the scratch role map.
-            let recorded = opening.inputs.keys().any(|id| {
-                id.class == "pg_shdepend"
-                    && id.name == ["a"]
-                    && id.signature.get(1) == Some(&role)
-                    && id
-                        .signature
-                        .first()
-                        .is_some_and(|owner| owner.class == "pg_default_acl")
-            });
-            if !recorded {
+            // PostgreSQL records an ACL edge for each unpinned role. A final
+            // GRANT may name a role absent from every opening default ACL,
+            // so absence of an earlier edge cannot classify that role.
+            let pinned = opening
+                .role_pinned
+                .get(&role)
+                .ok_or(ManifestError::Incomplete)?;
+            if *pinned {
                 continue;
             }
             let id = ObjectIdentity {
@@ -1297,6 +1312,34 @@ pub(super) fn finish(
     prepared: scope::Prepared,
     scope: CaptureScope,
 ) -> Result<CapturedInputs, Uncovered> {
+    if !matches!(read.major, 16 | 18) {
+        return Err(Uncovered::class(
+            "pg_roles",
+            "unsupported role pinning rule",
+        ));
+    }
+    let mut role_pinned = BTreeMap::new();
+    for row in read
+        .catalog
+        .rows
+        .get("pg_roles")
+        .ok_or_else(|| Uncovered::class("pg_roles", "role inventory is missing"))?
+    {
+        let role = read
+            .catalog
+            .identity("pg_roles", row)
+            .map_err(|_| Uncovered::class("pg_roles", "role identity is unreadable"))?;
+        let oid = logical::number(row, "oid")
+            .map_err(|_| Uncovered::object(&role, "role OID is unreadable"))?;
+        // PG16/18 IsPinnedObject uses FirstUnpinnedObjectId (12000), with
+        // no pg_authid exception. A spelling or absent edge proves neither.
+        if oid == 0 || role_pinned.insert(role.clone(), oid < 12_000).is_some() {
+            return Err(Uncovered::object(
+                &role,
+                "role OID is invalid or duplicated",
+            ));
+        }
+    }
     let mut inputs = BTreeMap::new();
     let mut attribute_numbers = BTreeMap::new();
     for (object, locator) in prepared.members {
@@ -1365,6 +1408,7 @@ pub(super) fn finish(
         major: read.major,
         scope,
         inputs,
+        role_pinned,
         attribute_numbers,
         candidates: prepared.candidates,
         limitations: prepared.limitations,
