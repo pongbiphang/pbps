@@ -69,11 +69,19 @@ class LiveExecution(unittest.TestCase):
                 native.SQL_RECOVERY_CLOSE_TEST,
                 native.SQL_RECOVERY_DISCARD_TEST,
                 native.SQL_RECOVERY_CANCEL_TEST,
+                *native.PRODUCER_TESTS,
             )
         ])
         for call in run.call_args_list:
             for key, value in env.items():
                 self.assertEqual(call.kwargs["env"][key], value)
+
+    def test_focused_pg_producer_selector_keeps_existing_native_cases_out(self):
+        completed = subprocess.CompletedProcess([], 0, "test result: ok. 1 passed\n")
+        with patch.object(native, "run", return_value=completed) as run:
+            with contextlib.redirect_stdout(io.StringIO()):
+                native.native_tests("/owned/tests", {"PBPS_NATIVE_DRIVER": "pg"}, producer_only=True)
+        self.assertEqual([call.args[3] for call in run.call_args_list], native.PRODUCER_TESTS)
 
     def test_sql_server_native_runner_keeps_its_original_three_cases(self):
         completed = subprocess.CompletedProcess([], 0, "test result: ok. 1 passed\n")

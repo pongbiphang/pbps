@@ -1,0 +1,3283 @@
+//! Connected #1274 producer oracles on native PostgreSQL fixtures.
+//!
+//! The target is seeded separately. The producer owns a fresh ScratchRun and
+//! receives the ordinary empty-to-desired bootstrap; no test prepares its
+//! scratch schema by hand. Connected cases require the pinned native container
+//! or supplied-server fixture; UID transition regressions are pure.
+
+use super::qualified_evidence_cases as cases;
+use super::*;
+use crate::resolver::docker::CandidateSession;
+use pbps_config::resolver::{PullPolicy, ResolverProfile};
+use pbps_db::fingerprint::FingerprintKey;
+use pbps_db::transport::PeerVerifiedConn;
+use pbps_model::resolver::{ObjectOwnership, Surface};
+use pbps_model::{Change, ChangeSet, Hints, IdsFile, PlanBaseline, PlanOrigin, SavedPlan, Schema};
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+const ENVIRONMENT: &str = "fixture";
+
+#[derive(Clone, Copy)]
+enum Profile {
+    Container,
+    Supplied,
+}
+
+struct ProjectKey {
+    root: PathBuf,
+    project: pbps_config::Project,
+}
+
+impl ProjectKey {
+    fn new(with_key: bool) -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "pbps-1274-evidence-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        if with_key {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(root.join("key"))
+                .unwrap();
+            writeln!(file, "{}", FingerprintKey::generate()).unwrap();
+        }
+        let config = format!(
+            "dialect: postgres\nenvironments:\n  {ENVIRONMENT}:\n    url_env: PBPS_1274_UNUSED\n{}",
+            if with_key {
+                "    fingerprint_key_file: key\n"
+            } else {
+                ""
+            }
+        );
+        let path = root.join("pbps.yml");
+        std::fs::write(&path, &config).unwrap();
+        let parsed = pbps_config::Config::parse(&config, &path).unwrap();
+        let project = pbps_config::Project {
+            root: root.clone(),
+            config: parsed,
+        };
+        Self { root, project }
+    }
+}
+
+impl Drop for ProjectKey {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.root).unwrap();
+    }
+}
+
+fn ids(schema: &Schema, previous: &IdsFile) -> IdsFile {
+    pbps_diff::resolve(
+        schema,
+        previous,
+        &[],
+        &pbps_diff::Context {
+            operator: "1274-test".into(),
+            today: "2026-09-29".into(),
+        },
+    )
+    .unwrap()
+    .ids
+}
+
+struct Inputs {
+    base: Schema,
+    desired: Schema,
+    base_ids: IdsFile,
+    desired_ids: IdsFile,
+    bootstrap: Vec<Change>,
+    hints: Hints,
+}
+
+impl Inputs {
+    fn overload() -> Self {
+        Self::from_pair(cases::pair_with_cross_kind_surfaces())
+    }
+
+    fn from_pair((base, desired): (Schema, Schema)) -> Self {
+        Self::from_pair_with_extras((base, desired), &[])
+    }
+
+    fn from_pair_with_extras((base, desired): (Schema, Schema), extras: &[String]) -> Self {
+        let base_ids = ids(&base, &IdsFile::default());
+        let desired_ids = ids(&desired, &base_ids);
+        Self::with_ids_and_extras(base, desired, base_ids, desired_ids, extras)
+    }
+
+    fn with_ids(base: Schema, desired: Schema, base_ids: IdsFile, desired_ids: IdsFile) -> Self {
+        Self::with_ids_and_extras(base, desired, base_ids, desired_ids, &[])
+    }
+
+    fn with_ids_and_extras(
+        base: Schema,
+        desired: Schema,
+        base_ids: IdsFile,
+        desired_ids: IdsFile,
+        extras: &[String],
+    ) -> Self {
+        let empty = Schema::default();
+        let dialect = pbps_pg::Postgres::with_write_path_extras(extras.to_vec());
+        let bootstrap = pbps_diff::diff(
+            pbps_diff::Side {
+                schema: &empty,
+                ids: &IdsFile::default(),
+            },
+            pbps_diff::Side {
+                schema: &desired,
+                ids: &desired_ids,
+            },
+            &dialect,
+            &Hints::default(),
+        )
+        .unwrap()
+        .changes
+        .into_iter()
+        .map(|planned| planned.change)
+        .collect();
+        Self {
+            base,
+            desired,
+            base_ids,
+            desired_ids,
+            bootstrap,
+            hints: Hints::default(),
+        }
+    }
+
+    fn binding(&self) -> BindingRequest<'_> {
+        BindingRequest {
+            bootstrap: &self.bootstrap,
+            desired: &self.desired,
+            base: &self.base,
+        }
+    }
+
+    fn base(&self) -> pbps_diff::Side<'_> {
+        pbps_diff::Side {
+            schema: &self.base,
+            ids: &self.base_ids,
+        }
+    }
+
+    fn desired(&self) -> pbps_diff::Side<'_> {
+        pbps_diff::Side {
+            schema: &self.desired,
+            ids: &self.desired_ids,
+        }
+    }
+}
+
+fn docker(args: &[&str]) -> String {
+    let binary = std::env::var("PBPS_NATIVE_DOCKER").unwrap();
+    assert!(Path::new(&binary).is_absolute());
+    let socket = std::env::var("PBPS_RESOLVER_TEST_SOCKET").unwrap();
+    let output = Command::new(binary)
+        .arg("--host")
+        .arg(format!("unix://{socket}"))
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "fixture Docker observation {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn containers() -> BTreeMap<String, String> {
+    docker(&[
+        "ps",
+        "-a",
+        "--no-trunc",
+        "--filter",
+        "name=pbps-resolver-",
+        "--format",
+        "{{json .}}",
+    ])
+    .lines()
+    .map(|row| {
+        let row: Value = serde_json::from_str(row).unwrap();
+        (
+            row["ID"].as_str().unwrap().to_owned(),
+            row["Names"].as_str().unwrap().to_owned(),
+        )
+    })
+    .collect()
+}
+
+/// This is an environmental observation, not an ownership claim. The
+/// product's returned names are the only authority for a surviving resource.
+/// In particular, a concurrently created pbps-resolver container is never
+/// removed merely because it appeared after this snapshot.
+struct ObservedContainers(BTreeMap<String, String>);
+
+impl ObservedContainers {
+    fn begin() -> Self {
+        Self(containers())
+    }
+
+    fn finish(&self, recovery_names: &[String]) {
+        let newly_seen: BTreeMap<_, _> = containers()
+            .into_iter()
+            .filter(|(id, _)| !self.0.contains_key(id))
+            .collect();
+        let mut unowned = Vec::new();
+        for (id, name) in &newly_seen {
+            let inspected: Value =
+                serde_json::from_str::<Value>(&docker(&["inspect", "--type", "container", id]))
+                    .unwrap()[0]
+                    .clone();
+            assert_eq!(inspected["Id"].as_str(), Some(id.as_str()));
+            assert_eq!(
+                inspected["Name"].as_str(),
+                Some(format!("/{name}").as_str())
+            );
+            if !recovery_names.contains(name) {
+                unowned.push((id.clone(), name.clone()));
+            }
+        }
+        assert!(
+            unowned.is_empty(),
+            "newly seen containers have no exact run-owned recovery name; no container was deleted: {unowned:?}"
+        );
+        eprintln!("#1274 named surviving containers (left untouched): {newly_seen:?}");
+    }
+}
+
+async fn setup(statements: &[&str]) {
+    let mut peer = PeerVerifiedConn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    peer.query(cases::RESET).await.unwrap();
+    peer.query(cases::EXTRA_RESET).await.unwrap();
+    for sql in statements {
+        peer.query(sql).await.unwrap();
+    }
+}
+
+async fn table_column_grants(table: &str, column: &str) -> (String, String, String) {
+    // Both inputs are fixed names from this disposable test fixture.
+    assert!(matches!(table, "t" | "u"));
+    assert!(matches!(column, "id" | "n"));
+    let mut peer = PeerVerifiedConn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    let rows = peer
+        .query(&format!(
+            "SELECT pg_catalog.pg_get_userbyid(c.relowner)::text AS owner, \
+             c.relacl::text AS table_acl, a.attacl::text AS column_acl \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid \
+             WHERE n.nspname = 'pbps_evidence1274' AND c.relname = '{table}' \
+               AND a.attname = '{column}'"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let owner = rows[0]
+        .try_get::<&str>("owner")
+        .unwrap()
+        .unwrap()
+        .to_owned();
+    let table_acl = rows[0]
+        .try_get::<&str>("table_acl")
+        .unwrap()
+        .unwrap()
+        .to_owned();
+    let column_acl = rows[0]
+        .try_get::<&str>("column_acl")
+        .unwrap()
+        .unwrap()
+        .to_owned();
+    assert!(table_acl.contains("pg_monitor"));
+    assert!(column_acl.contains("pg_monitor"));
+    (owner, table_acl, column_acl)
+}
+
+/// An ordinary table owner has a shared edge; a pinned owner and a table-owned
+/// index do not. Keep this catalog oracle beside the complete sealed inventory.
+async fn catalog_owner_dependency(subject: &str) -> (String, i64, i64) {
+    let (class, source) = match subject {
+        "routine-a" => (
+            "pg_proc",
+            "SELECT oid, proowner AS owner FROM pg_catalog.pg_proc \
+             WHERE oid = 'pbps_evidence1274.a()'::regprocedure",
+        ),
+        "table-t" => (
+            "pg_class",
+            "SELECT oid, relowner AS owner FROM pg_catalog.pg_class \
+             WHERE oid = 'pbps_evidence1274.t'::regclass",
+        ),
+        "table-u" => (
+            "pg_class",
+            "SELECT oid, relowner AS owner FROM pg_catalog.pg_class \
+             WHERE oid = 'pbps_evidence1274.u'::regclass",
+        ),
+        "index-ix" => (
+            "pg_class",
+            "SELECT oid, relowner AS owner FROM pg_catalog.pg_class \
+             WHERE oid = 'pbps_evidence1274.ix'::regclass AND relkind = 'i'",
+        ),
+        _ => panic!("unsupported exact fixture subject {subject}"),
+    };
+    let mut peer = PeerVerifiedConn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    let rows = peer
+        .query(&format!(
+            "SELECT pg_catalog.pg_get_userbyid(s.owner)::text AS owner, \
+                    count(d.objid) AS owner_edges, \
+                    count(d.objid) FILTER (WHERE d.refclassid = 'pg_catalog.pg_authid'::regclass \
+                        AND d.refobjid = s.owner) AS matching_owner_edges \
+               FROM ({source}) s \
+               LEFT JOIN pg_catalog.pg_shdepend d \
+                 ON d.dbid = (SELECT oid FROM pg_catalog.pg_database \
+                               WHERE datname = current_database()) \
+                AND d.classid = 'pg_catalog.{class}'::regclass \
+                AND d.objid = s.oid AND d.objsubid = 0 AND d.deptype = 'o' \
+              GROUP BY s.owner"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "the exact fixture subject exists");
+    let row = &rows[0];
+    (
+        row.try_get::<&str>("owner").unwrap().unwrap().to_owned(),
+        row.try_get::<i64>("owner_edges").unwrap().unwrap(),
+        row.try_get::<i64>("matching_owner_edges").unwrap().unwrap(),
+    )
+}
+
+/// Query the engine's ACL rows, not its textual ACL spelling. `NULL` and an
+/// explicit owner-only ACL are different closing properties even when they
+/// grant the same owner permission.
+async fn routine_execution_acl(
+    routine: &str,
+    reader: &str,
+) -> (bool, Option<bool>, i64, i64, i64, i64, i64) {
+    assert!(matches!(routine, "a" | "f"));
+    assert!(matches!(reader, "pg_monitor" | "pbps_native_alt"));
+    let mut peer = PeerVerifiedConn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    let rows = peer
+        .query(&format!(
+            "SELECT p.proacl IS NULL AS acl_null, \
+                    p.proacl = pg_catalog.acldefault('f'::\"char\", p.proowner) AS builtin_acl, \
+                    (SELECT count(*) FROM pg_catalog.aclexplode(p.proacl) a \
+                      WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE') AS public_execute, \
+                    (SELECT count(*) FROM pg_catalog.aclexplode(p.proacl) a \
+                      WHERE a.grantee = p.proowner AND a.grantor = p.proowner \
+                        AND a.privilege_type = 'EXECUTE') AS owner_execute, \
+                    (SELECT count(*) FROM pg_catalog.aclexplode(p.proacl) a \
+                      WHERE a.grantee = '{reader}'::regrole AND a.grantor = p.proowner \
+                        AND a.privilege_type = 'EXECUTE' AND NOT a.is_grantable) AS reader_execute, \
+                    (SELECT count(*) FROM pg_catalog.aclexplode(p.proacl) a \
+                      WHERE a.grantee = '{reader}'::regrole AND a.grantor = p.proowner \
+                        AND a.privilege_type = 'EXECUTE' AND a.is_grantable) AS reader_option, \
+                    (SELECT count(*) FROM pg_catalog.pg_shdepend d \
+                      WHERE d.classid = 'pg_catalog.pg_proc'::regclass AND d.objid = p.oid \
+                        AND d.deptype = 'a' AND d.refobjid = '{reader}'::regrole) AS reader_edge \
+               FROM pg_catalog.pg_proc p \
+              WHERE p.oid = 'pbps_evidence1274.{routine}()'::regprocedure",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "the declared routine has one catalog row");
+    let row = &rows[0];
+    (
+        row.try_get::<bool>("acl_null").unwrap().unwrap(),
+        row.try_get::<bool>("builtin_acl").unwrap(),
+        row.try_get::<i64>("public_execute").unwrap().unwrap(),
+        row.try_get::<i64>("owner_execute").unwrap().unwrap(),
+        row.try_get::<i64>("reader_execute").unwrap().unwrap(),
+        row.try_get::<i64>("reader_edge").unwrap().unwrap(),
+        row.try_get::<i64>("reader_option").unwrap().unwrap(),
+    )
+}
+
+async fn target() -> NativeTarget {
+    let peer = PeerVerifiedConn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    NativeTarget::establish(
+        peer,
+        std::env::var("PBPS_NATIVE_SERVICE_PID")
+            .unwrap()
+            .parse()
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+async fn open(profile: Profile, target: &mut NativeTarget) -> ScratchRun {
+    let recipe = target.database_recipe().await.unwrap();
+    match profile {
+        Profile::Container => {
+            assert_eq!(
+                std::env::var("PBPS_NATIVE_FACTORY_FIXTURE").as_deref(),
+                Ok("1")
+            );
+            assert_eq!(std::env::var("PBPS_NATIVE_DRIVER").as_deref(), Ok("pg"));
+            let image = std::env::var("PBPS_RESOLVER_TEST_IMAGE").unwrap();
+            let socket = PathBuf::from(std::env::var("PBPS_RESOLVER_TEST_SOCKET").unwrap());
+            let mut api = LocalApi::connect_native(&socket).await.unwrap();
+            let acquired = api
+                .acquire(&ResolverProfile::Docker {
+                    image,
+                    pull: PullPolicy::Never,
+                })
+                .await
+                .unwrap();
+            let mut candidate = CandidateSession::start(api, acquired, target)
+                .await
+                .unwrap();
+            candidate.open_scratch(&recipe).await.unwrap()
+        }
+        Profile::Supplied => {
+            assert_eq!(std::env::var("PBPS_SERVER_FIXTURE").as_deref(), Ok("1"));
+            assert_eq!(std::env::var("PBPS_SERVER_DRIVER").as_deref(), Ok("pg"));
+            let configured = std::env::var("PBPS_SERVER_ENDPOINT").unwrap();
+            let mut refusals = Vec::new();
+            for _ in 0..60 {
+                let endpoint = ScratchEndpoint::parse(&configured).unwrap();
+                let refused = match DedicatedServer::admit(endpoint, target).await {
+                    Ok(mut server) => match server.open_scratch(&recipe).await {
+                        Ok(run) => return run,
+                        Err(refused) => {
+                            server.discard().await.unwrap();
+                            refused
+                        }
+                    },
+                    Err(refused) => refused,
+                };
+                match refused {
+                    ServerFailure {
+                        cause:
+                            cause @ (Error::Exclusivity(_) | Error::Containment(Premise::Occupants)),
+                        recovery_names,
+                    } if recovery_names.is_empty() => refusals.push(cause),
+                    other => panic!("the supplied native fixture must open: {other}"),
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            panic!("the supplied native fixture did not become exclusive: {refusals:?}");
+        }
+    }
+}
+
+async fn close(run: &mut ScratchRun, owned: &mut Option<ObservedContainers>) {
+    let closed = run.close().await;
+    let recovery = closed
+        .as_ref()
+        .err()
+        .map(|failure| failure.recovery_names.clone())
+        .unwrap_or_default();
+    if let Some(owned) = owned {
+        owned.finish(&recovery);
+    }
+    closed.expect("a completed producer run removes its owned resources");
+}
+
+fn view<'a>(
+    evidence: &'a pbps_model::resolver::ResolverEvidence,
+    name: &str,
+) -> &'a pbps_model::resolver::SurfaceResolution {
+    let wanted = Surface::Module(format!("{}.{}", cases::SCHEMA, name).parse().unwrap());
+    evidence
+        .surfaces()
+        .iter()
+        .find(|surface| surface.surface == wanted)
+        .expect("the declared view has a connected binding surface")
+}
+
+async fn positive(profile: Profile) {
+    setup(cases::TARGET_SETUP).await;
+    let mut owned = matches!(profile, Profile::Container).then(ObservedContainers::begin);
+    let mut target = target().await;
+    let mut run = open(profile, &mut target).await;
+    let inputs = Inputs::overload();
+    let key = ProjectKey::new(true);
+    let result = run
+        .plan_resolved(
+            &mut target,
+            &inputs.binding(),
+            inputs.base(),
+            inputs.desired(),
+            &inputs.hints,
+            &[],
+            &key.project,
+            Some(ENVIRONMENT),
+        )
+        .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            close(&mut run, &mut owned).await;
+            panic!("the qualified fresh producer refused its compatible fixture: {error}");
+        }
+    };
+    // The producer result is owned data. Release the run before any assertion
+    // can panic, so an oracle failure cannot strand its exact owned container.
+    close(&mut run, &mut owned).await;
+    target.check().await.unwrap();
+    setup(&[]).await;
+    result.evidence.validate(&result.changes).unwrap();
+
+    let affected = view(&result.evidence, "v");
+    let control = view(&result.evidence, "control");
+    assert_ne!(
+        affected.current.as_ref().unwrap().bindings,
+        affected.desired.as_ref().unwrap().bindings,
+        "the integer overload changes the unqualified call"
+    );
+    assert_eq!(
+        control.current.as_ref().unwrap().bindings,
+        control.desired.as_ref().unwrap().bindings,
+        "the explicit numeric call remains on the old overload"
+    );
+
+    let affected_id: pbps_model::ModuleId = format!("{}.v", cases::SCHEMA).parse().unwrap();
+    let control_id: pbps_model::ModuleId = format!("{}.control", cases::SCHEMA).parse().unwrap();
+    let ordinary = pbps_diff::diff(
+        inputs.base(),
+        inputs.desired(),
+        &pbps_pg::Postgres::with_write_path_extras(vec![]),
+        &inputs.hints,
+    )
+    .unwrap();
+    let ordinary_control: Vec<_> = ordinary
+        .changes
+        .iter()
+        .filter(|step| {
+            matches!(
+                &step.change,
+                Change::DropModule { id, .. }
+                    | Change::CreateModule { id, .. }
+                    | Change::AlterModule { id, .. }
+                    if id == &control_id
+            )
+        })
+        .collect();
+    assert_eq!(ordinary_control.len(), 1);
+    assert!(matches!(
+        &ordinary_control[0].change,
+        Change::AlterModule { id, .. } if id == &control_id
+    ));
+    let changes = &result.changes.changes;
+    assert!(
+        changes.iter().any(|step| {
+            matches!(&step.change, Change::DropModule { id, .. } if id == &affected_id)
+        }) && changes.iter().any(|step| {
+            matches!(&step.change, Change::CreateModule { id, .. } if id == &affected_id)
+        }),
+        "the changed target binding must rebuild the affected view in the final typed sequence"
+    );
+    // ADR-0013 conservatively rebuilds lexical callers of an arriving
+    // overload, even when the connected binding proves this call unchanged.
+    // The resolved plan must carry exactly that ordinary rebuild, not an
+    // additional control-view rebuild from its binding evidence.
+    let final_control: Vec<_> = changes
+        .iter()
+        .filter(|step| {
+            matches!(
+                &step.change,
+                Change::DropModule { id, .. }
+                    | Change::CreateModule { id, .. }
+                    | Change::AlterModule { id, .. }
+                    if id == &control_id
+            )
+        })
+        .collect();
+    assert_eq!(final_control.len(), 2);
+    assert!(matches!(
+        &final_control[0].change,
+        Change::DropModule { id, .. } if id == &control_id
+    ));
+    assert!(matches!(
+        &final_control[1].change,
+        Change::CreateModule { id, .. } if id == &control_id
+    ));
+
+    let table: pbps_model::TableName = format!("{}.t", cases::SCHEMA).parse().unwrap();
+    let default = result
+        .evidence
+        .before()
+        .prerequisites()
+        .iter()
+        .find(|record| {
+            record.object.class == "pg_attrdef"
+                && record.object.signature.first().is_some_and(|column| {
+                    column.class == "column"
+                        && column.name == ["c"]
+                        && column
+                            .signature
+                            .first()
+                            .is_some_and(|relation| relation.name == [cases::SCHEMA, "t"])
+                })
+        })
+        .expect("the real target contains the declared ordinary default");
+    assert_eq!(
+        default.ownership,
+        ObjectOwnership::Surface(Surface::Default(table.column("c"))),
+        "a default is owned by the recorded default, not its column"
+    );
+    let unmanaged = result
+        .evidence
+        .before()
+        .prerequisites()
+        .iter()
+        .find(|record| {
+            record.object.class == "pg_class"
+                && record.object.name == [cases::SCHEMA, "unmanaged_ix"]
+        })
+        .expect("unmanaged_ix must actually be captured before nonownership is claimed");
+    assert_eq!(unmanaged.ownership, ObjectOwnership::Unqualified);
+    assert!(
+        result.changes.changes.iter().any(|change| {
+            matches!(
+                &change.change,
+                Change::CreateModule { id, .. }
+                    if id.to_string() == format!("{}.f(integer)", cases::SCHEMA)
+            )
+        }),
+        "the final typed sequence creates the arriving overload"
+    );
+    let artifact = SavedPlan::new(
+        PlanOrigin::Database,
+        "postgres",
+        "1274 native fixture",
+        PlanBaseline {
+            description: "independent target".into(),
+            checksum: "00".repeat(32),
+            database_collation: None,
+        },
+        result.changes,
+        inputs.desired_ids.clone(),
+    )
+    .with_resolution(result.evidence)
+    .unwrap();
+    let restored: SavedPlan =
+        serde_json::from_str(&serde_json::to_string(&artifact).unwrap()).unwrap();
+    restored.validate_analysis().unwrap();
+    assert_eq!(restored.checksum(), artifact.checksum());
+}
+
+async fn refusal(
+    profile: Profile,
+    statements: &[&str],
+    expected: &str,
+    index_parent: Option<&str>,
+) {
+    setup(statements).await;
+    if let Some(parent) = index_parent {
+        let mut peer = PeerVerifiedConn::connect(
+            Driver::Postgres,
+            &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+        )
+        .await
+        .unwrap();
+        let rows = peer
+            .query(
+                "SELECT tbl.relname::text AS parent FROM pg_catalog.pg_index i \
+                 JOIN pg_catalog.pg_class idx ON idx.oid = i.indexrelid \
+                 JOIN pg_catalog.pg_class tbl ON tbl.oid = i.indrelid \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = idx.relnamespace \
+                 WHERE n.nspname = 'pbps_evidence1274' AND idx.relname = 'ix'",
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].try_get::<&str>("parent").unwrap(), Some(parent));
+    }
+    let mut owned = matches!(profile, Profile::Container).then(ObservedContainers::begin);
+    let mut target = target().await;
+    let mut run = open(profile, &mut target).await;
+    let inputs = Inputs::overload();
+    let key = ProjectKey::new(true);
+    let outcome = run
+        .plan_resolved(
+            &mut target,
+            &inputs.binding(),
+            inputs.base(),
+            inputs.desired(),
+            &inputs.hints,
+            &[],
+            &key.project,
+            Some(ENVIRONMENT),
+        )
+        .await;
+    let message = match outcome {
+        Ok(_) => "the producer wrongly published a seal".to_owned(),
+        Err(error) => error.to_string(),
+    };
+    close(&mut run, &mut owned).await;
+    assert!(
+        message.contains(expected),
+        "expected the owned catalog mismatch ({expected}); got {message}"
+    );
+    // A refused fresh capture may consume its native target binding. Prove
+    // the disposable engine remains usable through a new owned connection.
+    drop(target);
+    let mut fresh = self::target().await;
+    fresh.check().await.unwrap();
+    setup(&[]).await;
+}
+
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn the_container_producer_seals_the_overload_and_default_from_one_fresh_read() {
+    positive(Profile::Container).await;
+}
+
+#[tokio::test]
+#[ignore = "requires native supplied PostgreSQL and dedicated-server fixtures"]
+async fn the_supplied_producer_seals_the_overload_and_default_from_one_fresh_read() {
+    positive(Profile::Supplied).await;
+}
+
+/// The view's real catalog binding proves the undeclared relation is a read
+/// prerequisite. Its system columns and index attributes remain unqualified;
+/// only exact recorded table/index roots may own their physical children.
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target"]
+async fn only_recorded_table_and_index_roots_own_their_catalog_columns() {
+    use pbps_db::fingerprint::EnvironmentFingerprintKey;
+    use pbps_model::resolver::ObjectIdentity;
+    use pbps_pg::resolver::capture::{
+        CandidateClass, CandidateSet, CaptureScope, RecordedOwnership,
+        capture_identifying_qualified,
+    };
+
+    setup(cases::COLUMN_OWNERSHIP_TARGET_SETUP).await;
+    let schema = cases::column_ownership_schema();
+    let recorded_ids = ids(&schema, &IdsFile::default());
+    let routines = BTreeMap::new();
+    let dropped = BTreeMap::new();
+    let namespaces = BTreeSet::from([cases::SCHEMA.to_owned()]);
+    let recorded = RecordedOwnership {
+        schema: &schema,
+        ids: &recorded_ids,
+        routines: &routines,
+        dropped: &dropped,
+        namespaces: &namespaces,
+    };
+    let scope = CaptureScope {
+        retained: BTreeSet::new(),
+        candidates: BTreeSet::from([CandidateSet {
+            class: CandidateClass::Relation,
+            namespace: Some(cases::SCHEMA.to_owned()),
+            name: None,
+        }]),
+    };
+    let key = ProjectKey::new(true);
+    let selected = EnvironmentFingerprintKey::from_file(&key.root.join("key")).unwrap();
+    let no_drops = BTreeSet::new();
+    let mut peer = PeerVerifiedConn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    let captured =
+        capture_identifying_qualified(&mut peer, &scope, &no_drops, &selected, None, &recorded)
+            .await;
+    drop(peer);
+    setup(&[]).await;
+    let (_, manifest) = captured.expect("the fixed-key fresh catalog read must qualify");
+    let relation = |name: &str| ObjectIdentity {
+        class: "pg_class".into(),
+        name: vec![cases::SCHEMA.into(), name.into()],
+        signature: Vec::new(),
+    };
+    let attribute = |parent: &str, name: &str| ObjectIdentity {
+        class: "column".into(),
+        name: vec![name.into()],
+        signature: vec![relation(parent)],
+    };
+    assert!(
+        manifest.prerequisites().iter().any(|row| {
+            row.object.class == "pg_rewrite"
+                && row.object.signature.first() == Some(&relation("ref"))
+                && row
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.target == relation("foreign_t"))
+        }),
+        "the managed view must actually read the undeclared table"
+    );
+    let table: pbps_model::TableName = format!("{}.t", cases::SCHEMA).parse().unwrap();
+    for (name, expected) in [
+        ("t", ObjectOwnership::Surface(Surface::Table(table.clone()))),
+        (
+            "ix",
+            ObjectOwnership::Surface(Surface::Index {
+                table: table.clone(),
+                name: "ix".into(),
+            }),
+        ),
+        ("unmanaged_ix", ObjectOwnership::Unqualified),
+        ("foreign_t", ObjectOwnership::Unqualified),
+        ("foreign_ix", ObjectOwnership::Unqualified),
+    ] {
+        let object = relation(name);
+        let observed = manifest
+            .prerequisites()
+            .iter()
+            .find(|row| row.object == object)
+            .unwrap_or_else(|| panic!("the fresh capture omitted {object:?}"));
+        assert_eq!(
+            observed.ownership, expected,
+            "recorded root authority for {object:?}"
+        );
+    }
+    for (parent, name, expected) in [
+        (
+            "t",
+            "cmax",
+            ObjectOwnership::Surface(Surface::Table(table.clone())),
+        ),
+        (
+            "t",
+            "c",
+            ObjectOwnership::Surface(Surface::Column(table.column("c"))),
+        ),
+        (
+            "ix",
+            "c",
+            ObjectOwnership::Surface(Surface::Index {
+                table: table.clone(),
+                name: "ix".into(),
+            }),
+        ),
+        ("unmanaged_ix", "c", ObjectOwnership::Unqualified),
+        ("foreign_t", "cmax", ObjectOwnership::Unqualified),
+        ("foreign_t", "c", ObjectOwnership::Unqualified),
+        ("foreign_ix", "c", ObjectOwnership::Unqualified),
+    ] {
+        let object = attribute(parent, name);
+        let observed = manifest
+            .prerequisites()
+            .iter()
+            .find(|row| row.object == object)
+            .unwrap_or_else(|| panic!("the fresh capture omitted {object:?}"));
+        assert_eq!(
+            observed.ownership, expected,
+            "a shared column spelling or reference cannot confer ownership on {object:?}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn a_same_named_view_cannot_own_the_declared_table_uid() {
+    refusal(
+        Profile::Container,
+        cases::WRONG_KIND_TARGET_SETUP,
+        "different catalog kind",
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn a_same_named_index_on_another_table_cannot_own_the_declared_index() {
+    refusal(
+        Profile::Container,
+        cases::WRONG_TABLE_INDEX_TARGET_SETUP,
+        "different table",
+        Some("other"),
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn the_connected_producer_refuses_a_missing_environment_key_before_sealing() {
+    setup(cases::TARGET_SETUP).await;
+    let mut owned = Some(ObservedContainers::begin());
+    let mut target = target().await;
+    let mut run = open(Profile::Container, &mut target).await;
+    let inputs = Inputs::overload();
+    let key = ProjectKey::new(false);
+    let outcome = run
+        .plan_resolved(
+            &mut target,
+            &inputs.binding(),
+            inputs.base(),
+            inputs.desired(),
+            &inputs.hints,
+            &[],
+            &key.project,
+            Some(ENVIRONMENT),
+        )
+        .await;
+    let message = match outcome {
+        Ok(_) => "the producer wrongly published a keyless seal".to_owned(),
+        Err(error) => error.to_string(),
+    };
+    close(&mut run, &mut owned).await;
+    assert!(message.contains("pbps key generate"), "{message}");
+    drop(target);
+    let mut fresh = self::target().await;
+    fresh.check().await.unwrap();
+    setup(&[]).await;
+}
+
+fn catalog_scope(
+    read: &pbps_model::resolver::ReadScope,
+) -> pbps_pg::resolver::capture::CaptureScope {
+    use pbps_pg::resolver::capture::{CandidateClass, CandidateSet, CaptureScope};
+    let candidates = read
+        .candidates
+        .iter()
+        .map(|set| CandidateSet {
+            class: match set.class.as_str() {
+                "pg_class" => CandidateClass::Relation,
+                "pg_proc" => CandidateClass::Routine,
+                "pg_type" => CandidateClass::Type,
+                "pg_operator" => CandidateClass::Operator,
+                "pg_collation" => CandidateClass::Collation,
+                "pg_opclass" => CandidateClass::OperatorClass,
+                "pg_opfamily" => CandidateClass::OperatorFamily,
+                "pg_cast" => CandidateClass::Cast,
+                "pg_extension" => CandidateClass::Extension,
+                other => panic!("unrecognized qualified candidate class: {other}"),
+            },
+            namespace: set.namespace.clone(),
+            name: set.name.clone(),
+        })
+        .collect();
+    CaptureScope {
+        retained: read.retained.clone(),
+        candidates,
+    }
+}
+
+// Apply uses Conn::execute, whose PostgreSQL driver sends the emitter's SQL
+// as a batch. PeerVerifiedConn::query prepares one statement and cannot run
+// the multi-command DDL emitted for some typed steps.
+async fn execute_plan(conn: &mut pbps_db::Conn, changes: &ChangeSet) {
+    execute_plan_with_extras(conn, changes, &[]).await;
+}
+
+async fn execute_plan_with_extras(
+    conn: &mut pbps_db::Conn,
+    changes: &ChangeSet,
+    extras: &[String],
+) {
+    use pbps_dialect::Dialect;
+    let dialect = pbps_pg::Postgres::with_write_path_extras(extras.to_vec());
+    conn.execute("BEGIN").await.unwrap();
+    for step in &changes.changes {
+        for statement in dialect.emit(&step.change, step.strategy).unwrap() {
+            conn.execute(&statement.sql).await.unwrap();
+        }
+    }
+    conn.execute("COMMIT").await.unwrap();
+}
+
+/// PostgreSQL's typed AlterModule is expanded to DROP+CREATE, so a replaced
+/// view receives creation defaults rather than retaining its old relation and
+/// column ACL. Compare projected closing facts to a real post-DDL capture.
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn a_rebuilt_view_projects_creation_defaults_instead_of_old_target_grants() {
+    use pbps_db::fingerprint::EnvironmentFingerprintKey;
+    use pbps_db::resolver::capture::ObjectIdentity;
+
+    setup(cases::REBUILT_VIEW_TARGET_SETUP).await;
+    let mut observer = PeerVerifiedConn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    let original = observer
+        .query(
+            "SELECT c.relacl::text AS relation_acl, a.attacl::text AS column_acl \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attname = 'x' \
+             WHERE n.nspname = 'pbps_evidence1274' AND c.relname = 'v'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(original.len(), 1);
+    assert!(
+        original[0]
+            .try_get::<&str>("relation_acl")
+            .unwrap()
+            .unwrap()
+            .contains("pg_monitor")
+    );
+    assert!(
+        original[0]
+            .try_get::<&str>("column_acl")
+            .unwrap()
+            .unwrap()
+            .contains("pg_monitor")
+    );
+    drop(observer);
+    let mut owned = Some(ObservedContainers::begin());
+    let mut target = target().await;
+    let mut run = open(Profile::Container, &mut target).await;
+    let inputs = Inputs::from_pair(cases::rebuilt_view_pair());
+    let key = ProjectKey::new(true);
+    let result = run
+        .plan_resolved(
+            &mut target,
+            &inputs.binding(),
+            inputs.base(),
+            inputs.desired(),
+            &inputs.hints,
+            &[],
+            &key.project,
+            Some(ENVIRONMENT),
+        )
+        .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            close(&mut run, &mut owned).await;
+            panic!("the view rebuild and its creation defaults must qualify: {error}");
+        }
+    };
+    result.evidence.validate(&result.changes).unwrap();
+    let view_id: pbps_model::ModuleId = "pbps_evidence1274.v".parse().unwrap();
+    let dropped = result
+        .changes
+        .changes
+        .iter()
+        .position(|step| matches!(&step.change, Change::DropModule { id, .. } if id == &view_id))
+        .expect("the final typed plan drops the old view");
+    let created = result
+        .changes
+        .changes
+        .iter()
+        .position(|step| matches!(&step.change, Change::CreateModule { id, .. } if id == &view_id))
+        .expect("the final typed plan creates the replacement view");
+    assert!(dropped < created);
+
+    let closing = result.evidence.after().clone();
+    close(&mut run, &mut owned).await;
+    let mut peer = pbps_db::Conn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    execute_plan(&mut peer, &result.changes).await;
+    let rows = peer
+        .query("SELECT x FROM pbps_evidence1274.v")
+        .await
+        .unwrap();
+    assert_eq!(rows[0].try_get::<i32>("x").unwrap(), Some(2));
+    let acl = peer
+        .query(
+            "SELECT c.relacl::text AS relation_acl, a.attacl::text AS column_acl \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attname = 'x' \
+             WHERE n.nspname = 'pbps_evidence1274' AND c.relname = 'v'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(acl.len(), 1);
+    assert_eq!(acl[0].try_get::<&str>("relation_acl").unwrap(), None);
+    assert_eq!(acl[0].try_get::<&str>("column_acl").unwrap(), None);
+    drop(peer);
+
+    let selected = EnvironmentFingerprintKey::from_file(&key.root.join("key")).unwrap();
+    let (_, actual) = target
+        .capture_postgres_sealed(
+            &catalog_scope(closing.scope()),
+            &Default::default(),
+            &selected,
+        )
+        .await
+        .unwrap();
+    let view = ObjectIdentity {
+        class: "pg_class".into(),
+        name: vec![cases::SCHEMA.into(), "v".into()],
+        signature: Vec::new(),
+    };
+    let column = ObjectIdentity {
+        class: "column".into(),
+        name: vec!["x".into()],
+        signature: vec![view.clone()],
+    };
+    let view_owner = ObjectOwnership::Surface(Surface::Module(view_id.clone()));
+    for manifest in [result.evidence.before(), &closing] {
+        for object in [&view, &column] {
+            let record = manifest
+                .prerequisites()
+                .iter()
+                .find(|record| &record.object == object)
+                .expect("the rebuilt view and its column remain in the exact inventory");
+            assert_eq!(
+                record.ownership, view_owner,
+                "the managed view owns its user column at both transition endpoints"
+            );
+        }
+    }
+    let encoded = serde_json::to_value(&result.evidence).unwrap();
+    let transitions: Vec<pbps_model::resolver::ObjectTransition> =
+        serde_json::from_value(encoded["transitions"].clone()).unwrap();
+    let transition = transitions
+        .iter()
+        .find(|transition| transition.surface == Surface::Module(view_id.clone()))
+        .expect("the typed rebuild has a view transition");
+    assert!(
+        transition.before.contains(&view)
+            && transition.after.contains(&view)
+            && transition.before.contains(&column)
+            && transition.after.contains(&column),
+        "the rebuilt view transition must replace both the relation and its user column"
+    );
+    for object in [view, column] {
+        let expected = closing
+            .prerequisites()
+            .iter()
+            .find(|record| record.object == object)
+            .expect("projected closing evidence retains the target view and column");
+        let observed = actual
+            .prerequisites()
+            .iter()
+            .find(|record| record.object == expected.object)
+            .expect("the fresh post-DDL target capture contains the same catalog object");
+        assert_eq!(
+            expected.properties, observed.properties,
+            "the final projected {} properties must match actual rebuild defaults",
+            object.class
+        );
+        assert_eq!(expected.bindings, observed.bindings);
+    }
+    target.check().await.unwrap();
+    setup(&[]).await;
+}
+
+/// #614 first phase: a bare table must exist before f() can read it, while
+/// its default, CHECK and index predicate must wait until f() exists. The
+/// ordinary bootstrap is handed directly to the shared ScratchRun.
+async fn empty_cross_kind_case(profile: Profile) {
+    use pbps_db::fingerprint::EnvironmentFingerprintKey;
+
+    setup(&["CREATE SCHEMA pbps_evidence1274"]).await;
+    let mut owned = matches!(profile, Profile::Container).then(ObservedContainers::begin);
+    let mut target = target().await;
+    let mut run = open(profile, &mut target).await;
+    let inputs = Inputs::from_pair(cases::empty_cross_kind_pair());
+    let key = ProjectKey::new(true);
+    let result = run
+        .plan_resolved(
+            &mut target,
+            &inputs.binding(),
+            inputs.base(),
+            inputs.desired(),
+            &inputs.hints,
+            &[],
+            &key.project,
+            Some(ENVIRONMENT),
+        )
+        .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            close(&mut run, &mut owned).await;
+            panic!("the empty target's ordinary bootstrap must reconstruct: {error}");
+        }
+    };
+    result.evidence.validate(&result.changes).unwrap();
+    let place = |predicate: fn(&Change) -> bool| {
+        result
+            .changes
+            .changes
+            .iter()
+            .position(|step| predicate(&step.change))
+            .expect("the final typed sequence includes every #614 creation phase")
+    };
+    let table = place(
+        |change| matches!(change, Change::CreateTable { name, .. } if name.to_string() == "pbps_evidence1274.t"),
+    );
+    let routine = place(
+        |change| matches!(change, Change::CreateModule { id, .. } if id.to_string() == "pbps_evidence1274.f()"),
+    );
+    let default = place(|change| matches!(change, Change::AlterColumnDefault { .. }));
+    let check = place(|change| matches!(change, Change::AddCheck { .. }));
+    let index = place(|change| matches!(change, Change::AddIndex { .. }));
+    assert!(table < routine, "f() reads the new table");
+    assert!(
+        [default, check, index].into_iter().all(|at| routine < at),
+        "all creation-time expressions call f()"
+    );
+    let actual_surfaces: std::collections::BTreeSet<_> = result
+        .evidence
+        .surfaces()
+        .iter()
+        .map(|row| row.surface.clone())
+        .collect();
+    let t: pbps_model::TableName = "pbps_evidence1274.t".parse().unwrap();
+    for surface in [
+        Surface::Default(t.column("id")),
+        Surface::Check {
+            table: t.clone(),
+            name: "positive".into(),
+        },
+        Surface::Index {
+            table: t,
+            name: "ix".into(),
+        },
+        Surface::Module("pbps_evidence1274.f()".parse().unwrap()),
+        Surface::Module("pbps_evidence1274.a()".parse().unwrap()),
+    ] {
+        assert!(
+            actual_surfaces.contains(&surface),
+            "the connected producer omits a #614 binding surface: {surface:?}"
+        );
+    }
+    let closing = result.evidence.after().clone();
+    close(&mut run, &mut owned).await;
+
+    let mut peer = pbps_db::Conn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    execute_plan(&mut peer, &result.changes).await;
+    let selected = EnvironmentFingerprintKey::from_file(&key.root.join("key")).unwrap();
+    let (_, observed) = target
+        .capture_postgres_sealed(
+            &catalog_scope(closing.scope()),
+            &Default::default(),
+            &selected,
+        )
+        .await
+        .unwrap();
+    for class in [
+        "pg_class",
+        "pg_proc",
+        "pg_attrdef",
+        "pg_constraint",
+        "pg_index",
+    ] {
+        assert!(
+            closing
+                .prerequisites()
+                .iter()
+                .any(|record| record.object.class == class),
+            "the projected closing manifest omits a #614 catalog class: {class}"
+        );
+    }
+    for expected in closing.prerequisites() {
+        let actual = observed
+            .prerequisites()
+            .iter()
+            .find(|row| row.object == expected.object)
+            .expect("every projected prerequisite exists after actual DDL");
+        assert_eq!(
+            expected.properties, actual.properties,
+            "the projected catalog properties must match actual new-object defaults"
+        );
+        assert_eq!(expected.bindings, actual.bindings);
+    }
+    // The empty #614 phase proves ordered creation and the fresh closing
+    // catalog. On PG16/18, after COMMIT the partial-index predicate recursively
+    // invokes table-reading f() even for SELECT f() or an explicit INSERT.
+    // The replacement phase below exercises DML after f() becomes constant.
+    drop(peer);
+    target.check().await.unwrap();
+    setup(&[]).await;
+}
+
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn an_empty_target_producer_orders_table_routines_and_expressions_before_sealing() {
+    empty_cross_kind_case(Profile::Container).await;
+}
+
+#[tokio::test]
+#[ignore = "requires native supplied PostgreSQL and dedicated-server fixtures"]
+async fn the_supplied_empty_target_producer_orders_table_routines_and_expressions_before_sealing() {
+    empty_cross_kind_case(Profile::Supplied).await;
+}
+
+/// #614's same-name replacement must tear down the dependent expressions
+/// before dropping f(), then recreate them after the new f() is present.
+async fn replacement_case(profile: Profile) {
+    setup(cases::REPLACEMENT_TARGET_SETUP).await;
+    let mut owned = matches!(profile, Profile::Container).then(ObservedContainers::begin);
+    let mut target = target().await;
+    let mut run = open(profile, &mut target).await;
+    let inputs = Inputs::from_pair(cases::replacement_pair());
+    let key = ProjectKey::new(true);
+    let result = run
+        .plan_resolved(
+            &mut target,
+            &inputs.binding(),
+            inputs.base(),
+            inputs.desired(),
+            &inputs.hints,
+            &[],
+            &key.project,
+            Some(ENVIRONMENT),
+        )
+        .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            close(&mut run, &mut owned).await;
+            panic!("the same-name routine replacement must be sealable: {error}");
+        }
+    };
+    result.evidence.validate(&result.changes).unwrap();
+    let changes = &result.changes.changes;
+    let dropped_f = changes
+        .iter()
+        .position(|step| {
+            matches!(&step.change, Change::DropModule { id, .. } if id.to_string() == "pbps_evidence1274.f()")
+        })
+        .expect("old f() must be dropped");
+    assert!(
+        changes[..dropped_f]
+            .iter()
+            .any(|step| matches!(step.change, Change::DropCheck { .. }))
+            && changes[..dropped_f]
+                .iter()
+                .any(|step| matches!(step.change, Change::DropIndex { .. }))
+            && changes[..dropped_f].iter().any(|step| {
+                matches!(&step.change, Change::AlterColumnDefault { to: None, .. })
+            })
+            && changes[..dropped_f].iter().any(|step| {
+                matches!(&step.change, Change::DropModule { id, .. } if id.to_string() == "pbps_evidence1274.a()")
+            }),
+        "CHECK, index, default and dependent routine must release old f() first"
+    );
+    let created_f = changes
+        .iter()
+        .position(|step| {
+            matches!(&step.change, Change::CreateModule { id, .. } if id.to_string() == "pbps_evidence1274.f()")
+        })
+        .expect("new f() must be created");
+    assert!(dropped_f < created_f);
+    assert!(
+        changes[created_f + 1..]
+            .iter()
+            .any(|step| { matches!(&step.change, Change::AlterColumnDefault { to: Some(_), .. }) }),
+        "the default must be restored after new f()"
+    );
+    close(&mut run, &mut owned).await;
+    let mut peer = pbps_db::Conn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    execute_plan(&mut peer, &result.changes).await;
+    peer.query("INSERT INTO pbps_evidence1274.t DEFAULT VALUES")
+        .await
+        .unwrap();
+    let rows = peer
+        .query("SELECT id, pbps_evidence1274.a() AS a FROM pbps_evidence1274.t")
+        .await
+        .unwrap();
+    assert_eq!(rows[0].try_get::<i32>("id").unwrap(), Some(8));
+    assert_eq!(rows[0].try_get::<i32>("a").unwrap(), Some(8));
+    drop(peer);
+    target.check().await.unwrap();
+    setup(&[]).await;
+}
+
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn a_replaced_routine_rebuilds_cross_kind_dependents_in_the_final_plan() {
+    replacement_case(Profile::Container).await;
+}
+
+#[tokio::test]
+#[ignore = "requires native supplied PostgreSQL and dedicated-server fixtures"]
+async fn the_supplied_replaced_routine_rebuilds_cross_kind_dependents_in_the_final_plan() {
+    replacement_case(Profile::Supplied).await;
+}
+
+/// #614 records a table and column UID move before planning. The target still
+/// holds the old spelling; a name-only reconstruction cannot authorize it.
+async fn recorded_rename_case(profile: Profile, keep_public: bool, ordinary_table_owner: bool) {
+    setup(cases::RENAME_TARGET_SETUP).await;
+    if ordinary_table_owner {
+        assert!(matches!(profile, Profile::Container));
+        let mut peer = PeerVerifiedConn::connect(
+            Driver::Postgres,
+            &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+        )
+        .await
+        .unwrap();
+        peer.query("ALTER TABLE pbps_evidence1274.t OWNER TO pbps_native_alt")
+            .await
+            .unwrap();
+        // The rebuilt predicate is checked as the table owner after PUBLIC is revoked.
+        peer.query("GRANT EXECUTE ON ROUTINE pbps_evidence1274.f() TO pbps_native_alt")
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog_owner_dependency("table-t").await,
+            ("pbps_native_alt".into(), 1, 1),
+            "the recorded table starts with its ordinary owner's exact edge"
+        );
+        assert_eq!(
+            catalog_owner_dependency("index-ix").await,
+            ("pbps_native_alt".into(), 0, 0),
+            "the opening index inherits the table owner without its own owner edge"
+        );
+        let f_acl = routine_execution_acl("f", "pbps_native_alt").await;
+        assert_eq!((f_acl.4, f_acl.5, f_acl.6), (1, 1, 0));
+    }
+    let opening_acl = table_column_grants("t", "id").await;
+    assert_eq!(opening_acl.0 == "pbps_native_alt", ordinary_table_owner);
+    assert!(
+        routine_execution_acl("a", "pg_monitor").await.0,
+        "a() begins with a NULL ACL"
+    );
+    let mut owned = matches!(profile, Profile::Container).then(ObservedContainers::begin);
+    let mut target = target().await;
+    let mut run = open(profile, &mut target).await;
+    let (mut base, mut desired, mut base_ids, mut desired_ids) = cases::rename_pair();
+    if ordinary_table_owner {
+        let mut role = pbps_model::Role::default();
+        role.grants.insert(
+            "pbps_evidence1274.f()"
+                .parse::<pbps_model::GrantTarget>()
+                .unwrap(),
+            BTreeSet::from([pbps_model::Permission::Execute]),
+        );
+        base.roles.insert("pbps_native_alt".into(), role.clone());
+        desired.roles.insert("pbps_native_alt".into(), role);
+        // Mint only the new role UID; keep the recorded table/column rename IDs.
+        base_ids = ids(&base, &base_ids);
+        let role_uid = base_ids.role_uid("pbps_native_alt").unwrap().clone();
+        assert!(
+            desired_ids
+                .roles
+                .insert(role_uid, "pbps_native_alt".into())
+                .is_none()
+        );
+        assert_eq!(
+            base_ids.role_uid("pbps_native_alt"),
+            desired_ids.role_uid("pbps_native_alt")
+        );
+    }
+    let old: pbps_model::TableName = "pbps_evidence1274.t".parse().unwrap();
+    let new: pbps_model::TableName = "pbps_evidence1274.u".parse().unwrap();
+    assert_eq!(base_ids.table_uid(&old), desired_ids.table_uid(&new));
+    assert_eq!(
+        base_ids.column_uid(&old.column("id")),
+        desired_ids.column_uid(&new.column("n"))
+    );
+    let mut inputs = Inputs::with_ids(base, desired, base_ids, desired_ids);
+    if keep_public {
+        inputs
+            .hints
+            .public_execute
+            .insert("pbps_evidence1274.a()".parse().unwrap());
+    }
+    let key = ProjectKey::new(true);
+    let result = run
+        .plan_resolved(
+            &mut target,
+            &inputs.binding(),
+            inputs.base(),
+            inputs.desired(),
+            &inputs.hints,
+            &[],
+            &key.project,
+            Some(ENVIRONMENT),
+        )
+        .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            close(&mut run, &mut owned).await;
+            panic!("recorded table/column rename must be sealable: {error}");
+        }
+    };
+    // The result owns its evidence and typed sequence. Release the runtime
+    // before a negative oracle can strand an exact owned container.
+    close(&mut run, &mut owned).await;
+    result.evidence.validate(&result.changes).unwrap();
+    let changes = &result.changes.changes;
+    let table_rename = changes
+        .iter()
+        .position(|step| {
+            matches!(&step.change, Change::RenameTable { uid, from, to, .. }
+                if from == &old && to == &new && Some(uid) == inputs.base_ids.table_uid(&old))
+        })
+        .expect("the final plan carries the recorded table UID rename");
+    let column_rename = changes
+        .iter()
+        .position(|step| {
+            matches!(&step.change, Change::RenameColumn { uid, from, to, .. }
+                if from == "id" && to == "n"
+                    && Some(uid) == inputs.base_ids.column_uid(&old.column("id")))
+        })
+        .expect("the final plan carries the recorded column UID rename");
+    let release = changes
+        .iter()
+        .position(|step| matches!(step.change, Change::DropCheck { .. }))
+        .expect("the old expression must be released before rename");
+    assert!(release < table_rename && table_rename < column_rename);
+    let created_a = changes
+        .iter()
+        .position(|step| {
+            matches!(&step.change, Change::CreateModule { id, .. }
+                if id.to_string() == "pbps_evidence1274.a()")
+        })
+        .expect("the dependent a() is rebuilt");
+    if ordinary_table_owner {
+        let created_f = changes
+            .iter()
+            .position(|step| {
+                matches!(&step.change, Change::CreateModule { id, .. }
+                    if id.to_string() == "pbps_evidence1274.f()")
+            })
+            .expect("the predicate routine is rebuilt");
+        let restored_f_grant = changes
+            .iter()
+            .position(|step| {
+                matches!(&step.change, Change::Grant { role, target, permissions }
+                    if role == "pbps_native_alt"
+                        && target.to_string() == "pbps_evidence1274.f()"
+                        && permissions == &BTreeSet::from([pbps_model::Permission::Execute]))
+            })
+            .expect("the final plan restores the table owner's routine EXECUTE");
+        let restored_index = changes
+            .iter()
+            .position(|step| {
+                matches!(&step.change, Change::AddIndex { table, name, .. }
+                    if table == &new && name == "ix")
+            })
+            .expect("the dependent predicate index is restored");
+        assert!(created_f < restored_f_grant && restored_f_grant < restored_index);
+    }
+    let public_a = changes
+        .iter()
+        .position(|step| {
+            matches!(&step.change, Change::PublicExecution { routine, access, .. }
+            if routine.to_string() == "pbps_evidence1274.a()"
+                && *access == if keep_public {
+                    pbps_model::PublicAccess::Kept
+                } else {
+                    pbps_model::PublicAccess::Revoked
+                })
+        })
+        .expect("the plan explicitly settles PUBLIC execution of rebuilt a()");
+    assert!(created_a < public_a, "the access decision follows CREATE");
+    let closing = result.evidence.after().clone();
+    let mut peer = pbps_db::Conn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    execute_plan(&mut peer, &result.changes).await;
+    drop(peer);
+    if ordinary_table_owner {
+        let f_acl = routine_execution_acl("f", "pbps_native_alt").await;
+        assert_eq!(
+            (f_acl.2, f_acl.4, f_acl.5, f_acl.6),
+            (0, 1, 1, 0),
+            "PUBLIC stays revoked while the table owner can execute the predicate"
+        );
+    }
+    let acl = routine_execution_acl("a", "pg_monitor").await;
+    assert!(!acl.0, "GRANT/REVOKE materializes a non-NULL routine ACL");
+    assert_eq!(
+        acl.1,
+        Some(keep_public),
+        "the final ACL reflects the opt-in"
+    );
+    assert_eq!(acl.2, i64::from(keep_public), "the PUBLIC entry is exact");
+    assert_eq!(acl.3, 1, "the effective owner keeps EXECUTE");
+    assert_eq!((acl.4, acl.5), (0, 0), "no role grant is invented");
+    assert_eq!(
+        catalog_owner_dependency("routine-a").await,
+        ("postgres".into(), 0, 0),
+        "the recreated routine's pinned owner has no shared dependency"
+    );
+    let routine_owner_edges: Vec<_> = closing
+        .prerequisites()
+        .iter()
+        .filter(|row| {
+            row.object.class == "pg_shdepend"
+                && row.object.name == ["o"]
+                && row.object.signature.first().is_some_and(|subject| {
+                    subject.class == "pg_proc" && subject.name == [cases::SCHEMA, "a"]
+                })
+        })
+        .collect();
+    assert!(
+        routine_owner_edges.is_empty(),
+        "the sealed closing routine cannot invent a pinned owner edge: {routine_owner_edges:?}"
+    );
+    if ordinary_table_owner {
+        assert_eq!(
+            catalog_owner_dependency("table-u").await,
+            ("pbps_native_alt".into(), 1, 1),
+            "the in-place rename keeps the ordinary owner's exact edge"
+        );
+        let table_owner_edges: Vec<_> = closing
+            .prerequisites()
+            .iter()
+            .filter(|row| {
+                row.object.class == "pg_shdepend"
+                    && row.object.name == ["o"]
+                    && row.object.signature.first().is_some_and(|subject| {
+                        subject.class == "pg_class" && subject.name == [cases::SCHEMA, "u"]
+                    })
+            })
+            .collect();
+        assert_eq!(table_owner_edges.len(), 1);
+        let role = &table_owner_edges[0].object.signature[1];
+        assert_eq!(role.class, "pg_authid");
+        assert_eq!(role.name, ["pbps_native_alt"]);
+        assert_eq!(
+            catalog_owner_dependency("index-ix").await,
+            ("pbps_native_alt".into(), 0, 0),
+            "the rebuilt index inherits its ordinary table owner without an owner edge"
+        );
+        let index_owner_edges: Vec<_> = closing
+            .prerequisites()
+            .iter()
+            .filter(|row| {
+                row.object.class == "pg_shdepend"
+                    && row.object.name == ["o"]
+                    && row.object.signature.first().is_some_and(|subject| {
+                        subject.class == "pg_class" && subject.name == [cases::SCHEMA, "ix"]
+                    })
+            })
+            .collect();
+        assert!(
+            index_owner_edges.is_empty(),
+            "the sealed closing index cannot invent an owner edge: {index_owner_edges:?}"
+        );
+    }
+    let selected =
+        pbps_db::fingerprint::EnvironmentFingerprintKey::from_file(&key.root.join("key")).unwrap();
+    let (_, observed) = target
+        .capture_postgres_sealed(
+            &catalog_scope(closing.scope()),
+            &Default::default(),
+            &selected,
+        )
+        .await
+        .unwrap();
+    for expected in closing.prerequisites() {
+        let actual = observed
+            .prerequisites()
+            .iter()
+            .find(|row| row.object == expected.object)
+            .unwrap_or_else(|| {
+                let same_class: Vec<_> = observed
+                    .prerequisites()
+                    .iter()
+                    .filter(|row| row.object.class == expected.object.class)
+                    .map(|row| &row.object)
+                    .collect();
+                panic!(
+                    "the UID-projected object exists under its new catalog identity: \
+                     missing {:?}; observed same-class identities: {:?}",
+                    expected.object, same_class
+                );
+            });
+        assert_eq!(
+            expected.properties, actual.properties,
+            "projected closing properties differ for {:?}",
+            expected.object
+        );
+        assert_eq!(
+            expected.bindings, actual.bindings,
+            "projected closing bindings differ for {:?}",
+            expected.object
+        );
+    }
+    assert_eq!(table_column_grants("u", "n").await, opening_acl);
+    let mut peer = PeerVerifiedConn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    peer.query("INSERT INTO pbps_evidence1274.u DEFAULT VALUES")
+        .await
+        .unwrap();
+    let rows = peer
+        .query("SELECT n, pbps_evidence1274.a() AS a FROM pbps_evidence1274.u")
+        .await
+        .unwrap();
+    assert_eq!(rows[0].try_get::<i32>("n").unwrap(), Some(9));
+    assert_eq!(rows[0].try_get::<i32>("a").unwrap(), Some(9));
+    drop(peer);
+    target.check().await.unwrap();
+    setup(&[]).await;
+}
+
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn recorded_table_and_column_uids_survive_rename_with_dependent_rebuilds() {
+    recorded_rename_case(Profile::Container, false, false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires native supplied PostgreSQL and dedicated-server fixtures"]
+async fn the_supplied_recorded_table_and_column_uids_survive_rename_with_dependent_rebuilds() {
+    recorded_rename_case(Profile::Supplied, false, false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn recorded_rename_retains_the_ordinary_table_owner_dependency() {
+    recorded_rename_case(Profile::Container, false, true).await;
+}
+
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn rebuilt_routine_with_explicit_public_execution_matches_the_post_ddl_acl() {
+    recorded_rename_case(Profile::Container, true, false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires native supplied PostgreSQL and dedicated-server fixtures"]
+async fn the_supplied_rebuilt_routine_with_explicit_public_execution_matches_the_post_ddl_acl() {
+    recorded_rename_case(Profile::Supplied, true, false).await;
+}
+
+/// A binding-induced routine rebuild must replay only the declared role
+/// grants. The fixture carries both an ordinary role (with an ACL shared
+/// dependency) and the pinned pg_monitor role (without that dependency).
+async fn rebuilt_routine_role_acl_case(grant_option: bool) {
+    use pbps_db::fingerprint::EnvironmentFingerprintKey;
+    use pbps_model::{GrantTarget, Permission, Role};
+
+    let mut statements = cases::REPLACEMENT_TARGET_SETUP.to_vec();
+    statements.push(if grant_option {
+        "GRANT EXECUTE ON ROUTINE pbps_evidence1274.a() TO pbps_native_alt WITH GRANT OPTION"
+    } else {
+        "GRANT EXECUTE ON ROUTINE pbps_evidence1274.a() TO pbps_native_alt"
+    });
+    statements.push("GRANT EXECUTE ON ROUTINE pbps_evidence1274.a() TO pg_monitor");
+    setup(&statements).await;
+    let mut peer = PeerVerifiedConn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    let roles = peer
+        .query(
+            "SELECT rolname, oid::int8 AS oid FROM pg_catalog.pg_roles \
+              WHERE rolname IN ('pbps_native_alt', 'pg_monitor') ORDER BY rolname",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        roles.len(),
+        2,
+        "the native fixture supplies both role classes"
+    );
+    for row in &roles {
+        let name = row.try_get::<&str>("rolname").unwrap().unwrap();
+        let oid = row.try_get::<i64>("oid").unwrap().unwrap();
+        assert_eq!(oid >= 12000, name == "pbps_native_alt");
+    }
+    drop(peer);
+    let mut owned = Some(ObservedContainers::begin());
+    let mut target = target().await;
+    let mut run = open(Profile::Container, &mut target).await;
+    let (mut base, mut desired) = cases::replacement_pair();
+    for name in ["pbps_native_alt", "pg_monitor"] {
+        let mut role = Role::default();
+        role.grants.insert(
+            "pbps_evidence1274.a()".parse::<GrantTarget>().unwrap(),
+            BTreeSet::from([Permission::Execute]),
+        );
+        base.roles.insert(name.into(), role.clone());
+        desired.roles.insert(name.into(), role);
+    }
+    let inputs = Inputs::from_pair((base, desired));
+    let key = ProjectKey::new(true);
+    let result = run
+        .plan_resolved(
+            &mut target,
+            &inputs.binding(),
+            inputs.base(),
+            inputs.desired(),
+            &inputs.hints,
+            &[],
+            &key.project,
+            Some(ENVIRONMENT),
+        )
+        .await;
+    close(&mut run, &mut owned).await;
+    if grant_option {
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a grant option absent from declarations must refuse sealing"),
+        };
+        assert!(
+            error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("grant option"),
+            "the refusal identifies the unrepresentable option: {error}"
+        );
+        target.check().await.unwrap();
+        setup(&[]).await;
+        return;
+    }
+    let result = result.expect("both declared routine grants can be restored");
+    result.evidence.validate(&result.changes).unwrap();
+    let created = result
+        .changes
+        .changes
+        .iter()
+        .position(|step| {
+            matches!(&step.change, Change::CreateModule { id, .. }
+            if id.to_string() == "pbps_evidence1274.a()")
+        })
+        .expect("the dependent routine is recreated");
+    for name in ["pbps_native_alt", "pg_monitor"] {
+        let grant = result
+            .changes
+            .changes
+            .iter()
+            .position(|step| {
+                matches!(&step.change, Change::Grant { role, target, permissions }
+                if role == name && target.to_string() == "pbps_evidence1274.a()"
+                    && permissions == &BTreeSet::from([Permission::Execute]))
+            })
+            .expect("the final plan restores the declared role grant");
+        assert!(created < grant, "the grant follows routine recreation");
+    }
+    let closing = result.evidence.after().clone();
+    let mut peer = pbps_db::Conn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    execute_plan(&mut peer, &result.changes).await;
+    drop(peer);
+    let ordinary = routine_execution_acl("a", "pbps_native_alt").await;
+    let pinned = routine_execution_acl("a", "pg_monitor").await;
+    assert_eq!(
+        (
+            ordinary.0, ordinary.2, ordinary.3, ordinary.4, ordinary.5, ordinary.6
+        ),
+        (false, 0, 1, 1, 1, 0)
+    );
+    assert_eq!(
+        (pinned.4, pinned.5, pinned.6),
+        (1, 0, 0),
+        "pinned grants have no ACL role edge"
+    );
+    let selected = EnvironmentFingerprintKey::from_file(&key.root.join("key")).unwrap();
+    let (_, observed) = target
+        .capture_postgres_sealed(
+            &catalog_scope(closing.scope()),
+            &Default::default(),
+            &selected,
+        )
+        .await
+        .unwrap();
+    let object = closing
+        .prerequisites()
+        .iter()
+        .find(|record| {
+            record.object.class == "pg_proc" && record.object.name == [cases::SCHEMA, "a"]
+        })
+        .expect("the projected routine is present");
+    let actual = observed
+        .prerequisites()
+        .iter()
+        .find(|record| record.object == object.object)
+        .expect("the same routine exists after DDL");
+    assert_eq!(
+        object.properties, actual.properties,
+        "final role grants affect proacl"
+    );
+    assert_eq!(object.bindings, actual.bindings);
+    // The SQL ACL oracle above cannot prove that the projected dependency
+    // inventory retained the ordinary role's distinct shared edge.
+    let acl_edge = |role: &str| pbps_db::resolver::capture::ObjectIdentity {
+        class: "pg_shdepend".into(),
+        name: vec!["a".into()],
+        signature: vec![
+            object.object.clone(),
+            pbps_db::resolver::capture::ObjectIdentity {
+                class: "pg_authid".into(),
+                name: vec![role.into()],
+                signature: Vec::new(),
+            },
+        ],
+    };
+    let ordinary_edge = acl_edge("pbps_native_alt");
+    let projected: Vec<_> = closing
+        .prerequisites()
+        .iter()
+        .filter(|row| row.object == ordinary_edge)
+        .collect();
+    let captured: Vec<_> = observed
+        .prerequisites()
+        .iter()
+        .filter(|row| row.object == ordinary_edge)
+        .collect();
+    assert_eq!(
+        projected.len(),
+        1,
+        "the projected ordinary ACL edge is exact"
+    );
+    assert_eq!(
+        captured.len(),
+        1,
+        "the fresh target has the ordinary ACL edge"
+    );
+    assert_eq!(projected[0].properties, captured[0].properties);
+    assert_eq!(projected[0].bindings, captured[0].bindings);
+    let pinned_edge = acl_edge("pg_monitor");
+    assert!(
+        closing
+            .prerequisites()
+            .iter()
+            .all(|row| row.object != pinned_edge)
+            && observed
+                .prerequisites()
+                .iter()
+                .all(|row| row.object != pinned_edge),
+        "a pinned role's grant has no shared ACL edge in either inventory"
+    );
+    target.check().await.unwrap();
+    setup(&[]).await;
+}
+
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn rebuilt_routine_replays_declared_grants_and_only_ordinary_role_acl_edges() {
+    rebuilt_routine_role_acl_case(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn unrepresentable_routine_grant_option_refuses_before_evidence() {
+    rebuilt_routine_role_acl_case(true).await;
+}
+
+/// An unrelated column arrival cannot turn an unchanged routine's opening
+/// grant option into a rebuild refusal or silently flatten that ACL in evidence.
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn an_unaffected_routine_keeps_its_grant_option_through_connected_evidence() {
+    use pbps_db::fingerprint::EnvironmentFingerprintKey;
+    use pbps_model::{GrantTarget, Permission, Role};
+
+    let mut statements = cases::REPLACEMENT_TARGET_SETUP.to_vec();
+    statements.push(
+        "GRANT EXECUTE ON ROUTINE pbps_evidence1274.a() TO pbps_native_alt WITH GRANT OPTION",
+    );
+    setup(&statements).await;
+    let opening_acl = routine_execution_acl("a", "pbps_native_alt").await;
+    assert_eq!((opening_acl.5, opening_acl.6), (1, 1));
+
+    let mut owned = Some(ObservedContainers::begin());
+    let mut target = target().await;
+    let mut run = open(Profile::Container, &mut target).await;
+    let (_, mut base) = cases::empty_cross_kind_pair();
+    let mut desired = base.clone();
+    desired
+        .tables
+        .get_mut(&"pbps_evidence1274.t".parse().unwrap())
+        .unwrap()
+        .columns
+        .insert(
+            "note".into(),
+            pbps_model::Column::new("integer".parse().unwrap()),
+        );
+    let mut role = Role::default();
+    role.grants.insert(
+        "pbps_evidence1274.a()".parse::<GrantTarget>().unwrap(),
+        BTreeSet::from([Permission::Execute]),
+    );
+    base.roles.insert("pbps_native_alt".into(), role.clone());
+    desired.roles.insert("pbps_native_alt".into(), role);
+    let inputs = Inputs::from_pair((base, desired));
+    let key = ProjectKey::new(true);
+    let result = run
+        .plan_resolved(
+            &mut target,
+            &inputs.binding(),
+            inputs.base(),
+            inputs.desired(),
+            &inputs.hints,
+            &[],
+            &key.project,
+            Some(ENVIRONMENT),
+        )
+        .await;
+    close(&mut run, &mut owned).await;
+    let result = result.expect("an untouched routine does not require ACL restoration");
+    result.evidence.validate(&result.changes).unwrap();
+    assert!(result.changes.changes.iter().any(|step| {
+        matches!(&step.change, Change::AddColumn { table, name, .. }
+            if table.to_string() == "pbps_evidence1274.t" && name == "note")
+    }));
+    assert!(!result.changes.changes.iter().any(|step| {
+        matches!(&step.change,
+            Change::DropModule { id, .. }
+            | Change::AlterModule { id, .. }
+            | Change::CreateModule { id, .. }
+            if id.to_string() == "pbps_evidence1274.a()")
+    }));
+    let before = result
+        .evidence
+        .before()
+        .prerequisites()
+        .iter()
+        .find(|row| row.object.class == "pg_proc" && row.object.name == [cases::SCHEMA, "a"])
+        .expect("the opening routine is captured");
+    let closing = result.evidence.after().clone();
+    let after = closing
+        .prerequisites()
+        .iter()
+        .find(|row| row.object == before.object)
+        .expect("the unchanged routine remains in the closing inventory");
+    assert_eq!(before.properties, after.properties);
+    assert_eq!(before.bindings, after.bindings);
+
+    let mut peer = pbps_db::Conn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    execute_plan(&mut peer, &result.changes).await;
+    drop(peer);
+    assert_eq!(
+        routine_execution_acl("a", "pbps_native_alt").await,
+        opening_acl
+    );
+    let selected = EnvironmentFingerprintKey::from_file(&key.root.join("key")).unwrap();
+    let (_, observed) = target
+        .capture_postgres_sealed(
+            &catalog_scope(closing.scope()),
+            &Default::default(),
+            &selected,
+        )
+        .await
+        .unwrap();
+    let actual = observed
+        .prerequisites()
+        .iter()
+        .find(|row| row.object == after.object)
+        .expect("the actual post-DDL routine remains in scope");
+    assert_eq!(after.properties, actual.properties);
+    assert_eq!(after.bindings, actual.bindings);
+    target.check().await.unwrap();
+    setup(&[]).await;
+}
+
+/// The new routines are created under the target creator's schema defaults,
+/// not the scratch role's defaults. PUBLIC is then revoked by the ordered plan;
+/// the ordinary role's option and shared dependency must survive that revoke.
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn newly_created_routines_project_schema_default_grants_then_public_revoke() {
+    use pbps_db::fingerprint::EnvironmentFingerprintKey;
+
+    setup(&[
+        "CREATE SCHEMA pbps_evidence1274",
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA pbps_evidence1274 GRANT EXECUTE ON FUNCTIONS TO pbps_native_alt WITH GRANT OPTION",
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA pbps_evidence1274 GRANT EXECUTE ON FUNCTIONS TO pg_monitor",
+    ])
+    .await;
+    let mut owned = Some(ObservedContainers::begin());
+    let mut target = target().await;
+    let mut run = open(Profile::Container, &mut target).await;
+    let inputs = Inputs::from_pair(cases::empty_cross_kind_pair());
+    let key = ProjectKey::new(true);
+    let result = run
+        .plan_resolved(
+            &mut target,
+            &inputs.binding(),
+            inputs.base(),
+            inputs.desired(),
+            &inputs.hints,
+            &[],
+            &key.project,
+            Some(ENVIRONMENT),
+        )
+        .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            close(&mut run, &mut owned).await;
+            panic!("the target's captured creation defaults must qualify: {error}");
+        }
+    };
+    close(&mut run, &mut owned).await;
+    result.evidence.validate(&result.changes).unwrap();
+    for name in ["f", "a"] {
+        let create = result
+            .changes
+            .changes
+            .iter()
+            .position(|step| {
+                matches!(&step.change, Change::CreateModule { id, .. }
+                if id.to_string() == format!("pbps_evidence1274.{name}()"))
+            })
+            .expect("the ordinary bootstrap creates the routine");
+        let revoke = result
+            .changes
+            .changes
+            .iter()
+            .position(|step| {
+                matches!(&step.change, Change::PublicExecution { routine, access, .. }
+                if routine.to_string() == format!("pbps_evidence1274.{name}()")
+                    && *access == pbps_model::PublicAccess::Revoked)
+            })
+            .expect("the final plan closes the created routine to PUBLIC");
+        assert!(create < revoke);
+    }
+    let closing = result.evidence.after().clone();
+    let mut peer = pbps_db::Conn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    execute_plan(&mut peer, &result.changes).await;
+    drop(peer);
+    for name in ["f", "a"] {
+        let ordinary = routine_execution_acl(name, "pbps_native_alt").await;
+        let pinned = routine_execution_acl(name, "pg_monitor").await;
+        assert_eq!(
+            (
+                ordinary.0, ordinary.2, ordinary.3, ordinary.4, ordinary.5, ordinary.6
+            ),
+            (false, 0, 1, 0, 1, 1),
+            "PUBLIC revoke retains the ordinary role's grant option and edge"
+        );
+        assert_eq!((pinned.4, pinned.5, pinned.6), (1, 0, 0));
+    }
+    let selected = EnvironmentFingerprintKey::from_file(&key.root.join("key")).unwrap();
+    let (_, observed) = target
+        .capture_postgres_sealed(
+            &catalog_scope(closing.scope()),
+            &Default::default(),
+            &selected,
+        )
+        .await
+        .unwrap();
+    for name in ["f", "a"] {
+        let expected = closing
+            .prerequisites()
+            .iter()
+            .find(|row| row.object.class == "pg_proc" && row.object.name == [cases::SCHEMA, name])
+            .expect("the final projection includes the new routine");
+        let actual = observed
+            .prerequisites()
+            .iter()
+            .find(|row| row.object == expected.object)
+            .expect("the post-DDL target contains the same routine");
+        assert_eq!(
+            expected.properties, actual.properties,
+            "creation defaults and final grants are both projected"
+        );
+        assert_eq!(expected.bindings, actual.bindings);
+    }
+    target.check().await.unwrap();
+    setup(&[]).await;
+}
+
+/// A recorded rename frees a spelling another UID may take. A check dropped
+/// from the old table belongs to its opening UID exactly once.
+#[test]
+fn reused_table_spelling_does_not_duplicate_an_opening_child_inventory() {
+    use pbps_db::resolver::capture::ObjectIdentity;
+    use pbps_model::{CheckConstraint, Column, PlannedChange, Table};
+    use pbps_pg::resolver::capture::BindingRecord;
+    use std::collections::BTreeSet;
+
+    let old: pbps_model::TableName = "app.a".parse().unwrap();
+    let renamed: pbps_model::TableName = "app.b".parse().unwrap();
+    let other: pbps_model::TableName = "app.c".parse().unwrap();
+    let mut first = Table::default();
+    first
+        .columns
+        .insert("id".into(), Column::new("integer".parse().unwrap()));
+    first.checks.insert(
+        "ck".into(),
+        CheckConstraint {
+            expression: "id > 0".into(),
+        },
+    );
+    let mut second = Table::default();
+    second
+        .columns
+        .insert("id".into(), Column::new("integer".parse().unwrap()));
+    let mut base = Schema::default();
+    base.tables.insert(old.clone(), first.clone());
+    base.tables.insert(other.clone(), second.clone());
+    let mut desired = Schema::default();
+    first.checks.clear();
+    desired.tables.insert(renamed.clone(), first);
+    desired.tables.insert(old.clone(), second);
+    let base_ids = ids(&base, &IdsFile::default());
+    let first_uid = base_ids.table_uid(&old).unwrap().clone();
+    let second_uid = base_ids.table_uid(&other).unwrap().clone();
+    let mut desired_ids = base_ids.clone();
+    desired_ids.rename_table(&old, &renamed);
+    desired_ids.rename_table(&other, &old);
+    assert_eq!(desired_ids.table_uid(&renamed), Some(&first_uid));
+    assert_eq!(desired_ids.table_uid(&old), Some(&second_uid));
+    assert_ne!(first_uid, second_uid);
+
+    let relation = |name: &pbps_model::TableName| ObjectIdentity {
+        class: "pg_class".into(),
+        name: vec![name.schema.clone(), name.name.clone()],
+        signature: vec![],
+    };
+    let old_relation = relation(&old);
+    let other_relation = relation(&other);
+    let renamed_relation = relation(&renamed);
+    let reused_relation = relation(&old);
+    let check = ObjectIdentity {
+        class: "pg_constraint".into(),
+        name: vec![old.schema.clone(), "ck".into()],
+        signature: vec![old_relation.clone()],
+    };
+    let check_surface = Surface::Check {
+        table: old.clone(),
+        name: "ck".into(),
+    };
+    let owned = |object, surface| BindingRecord {
+        object,
+        ownership: ObjectOwnership::Surface(surface),
+        bindings: vec![],
+    };
+    let opening = vec![
+        owned(old_relation.clone(), Surface::Table(old.clone())),
+        owned(other_relation.clone(), Surface::Table(other.clone())),
+        owned(check.clone(), check_surface.clone()),
+    ];
+    let compiled = vec![
+        owned(renamed_relation.clone(), Surface::Table(renamed.clone())),
+        owned(reused_relation.clone(), Surface::Table(old.clone())),
+    ];
+    let changes = ChangeSet {
+        changes: vec![
+            PlannedChange::new(Change::DropCheck {
+                table: old.clone(),
+                name: "ck".into(),
+            }),
+            PlannedChange::new(Change::RenameTable {
+                uid: first_uid,
+                from: old.clone(),
+                to: renamed.clone(),
+                defaults: vec![],
+            }),
+            PlannedChange::new(Change::RenameTable {
+                uid: second_uid,
+                from: other,
+                to: old.clone(),
+                defaults: vec![],
+            }),
+        ],
+    };
+    let transitions = super::transitions::derive(
+        &changes,
+        pbps_diff::Side {
+            schema: &base,
+            ids: &base_ids,
+        },
+        pbps_diff::Side {
+            schema: &desired,
+            ids: &desired_ids,
+        },
+        &opening,
+        &compiled,
+    )
+    .unwrap();
+    let first_table = transitions
+        .iter()
+        .find(|t| t.surface == Surface::Table(renamed.clone()))
+        .unwrap();
+    let reused_table = transitions
+        .iter()
+        .find(|t| t.surface == Surface::Table(old.clone()))
+        .unwrap();
+    let dropped_check = transitions
+        .iter()
+        .find(|t| t.surface == check_surface)
+        .unwrap();
+    assert_eq!(dropped_check.before, BTreeSet::from([check]));
+    assert_eq!(first_table.before, BTreeSet::from([old_relation]));
+    assert_eq!(reused_table.before, BTreeSet::from([other_relation]));
+    assert_eq!(first_table.after, BTreeSet::from([renamed_relation]));
+    assert_eq!(reused_table.after, BTreeSet::from([reused_relation]));
+    let claimed: Vec<_> = transitions
+        .iter()
+        .flat_map(|t| t.before.iter().cloned())
+        .collect();
+    assert_eq!(claimed.len(), claimed.iter().collect::<BTreeSet<_>>().len());
+}
+
+/// An ordinary default removal after recorded table/column renames names the
+/// final column. Its opening default belongs to the old column UID, and an
+/// unrecorded UID must refuse instead of claiming an empty inventory.
+#[test]
+fn final_coordinate_default_removal_uses_the_recorded_opening_uid() {
+    use pbps_db::resolver::capture::ObjectIdentity;
+    use pbps_model::{Column, PlannedChange, Table};
+    use pbps_pg::resolver::capture::BindingRecord;
+    use std::collections::BTreeSet;
+
+    let old: pbps_model::TableName = "app.a".parse().unwrap();
+    let renamed: pbps_model::TableName = "app.b".parse().unwrap();
+    let mut table = Table::default();
+    let mut column = Column::new("integer".parse().unwrap());
+    column.default = Some("1".into());
+    table.columns.insert("id".into(), column);
+    let mut base = Schema::default();
+    base.tables.insert(old.clone(), table.clone());
+    let mut desired = Schema::default();
+    let mut final_column = table.columns.shift_remove("id").unwrap();
+    final_column.default = None;
+    table.columns.insert("n".into(), final_column);
+    desired.tables.insert(renamed.clone(), table);
+    let base_ids = ids(&base, &IdsFile::default());
+    let table_uid = base_ids.table_uid(&old).unwrap().clone();
+    let column_uid = base_ids.column_uid(&old.column("id")).unwrap().clone();
+    let mut desired_ids = base_ids.clone();
+    desired_ids.rename_table(&old, &renamed);
+    desired_ids.columns.get_mut(&column_uid).unwrap().name = "n".into();
+    assert_eq!(
+        desired_ids.column_uid(&renamed.column("n")),
+        Some(&column_uid)
+    );
+
+    let relation = ObjectIdentity {
+        class: "pg_class".into(),
+        name: vec![old.schema.clone(), old.name.clone()],
+        signature: vec![],
+    };
+    let old_column = ObjectIdentity {
+        class: "column".into(),
+        name: vec!["id".into()],
+        signature: vec![relation],
+    };
+    let default = ObjectIdentity {
+        class: "pg_attrdef".into(),
+        name: vec!["id_default".into()],
+        signature: vec![old_column],
+    };
+    let opening = vec![BindingRecord {
+        object: default.clone(),
+        ownership: ObjectOwnership::Surface(Surface::Default(old.column("id"))),
+        bindings: vec![],
+    }];
+    let changes = ChangeSet {
+        changes: vec![
+            PlannedChange::new(Change::RenameTable {
+                uid: table_uid.clone(),
+                from: old.clone(),
+                to: renamed.clone(),
+                defaults: vec!["id".into()],
+            }),
+            PlannedChange::new(Change::RenameColumn {
+                uid: column_uid.clone(),
+                table: renamed.clone(),
+                from: "id".into(),
+                to: "n".into(),
+                table_was: Some(old.clone()),
+            }),
+            PlannedChange::new(Change::AlterColumnDefault {
+                uid: column_uid,
+                column: renamed.column("n"),
+                from: Some("1".into()),
+                to: None,
+            }),
+        ],
+    };
+    let derive = |plan: &ChangeSet| {
+        super::transitions::derive(
+            plan,
+            pbps_diff::Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            pbps_diff::Side {
+                schema: &desired,
+                ids: &desired_ids,
+            },
+            &opening,
+            &[],
+        )
+    };
+    let transitions = derive(&changes).unwrap();
+    let removal = transitions
+        .iter()
+        .find(|t| t.surface == Surface::Default(renamed.column("n")))
+        .unwrap();
+    assert_eq!(removal.before, BTreeSet::from([default]));
+    assert!(removal.after.is_empty());
+    let mut wrong_uid = changes.clone();
+    let Change::AlterColumnDefault { uid, .. } = &mut wrong_uid.changes[2].change else {
+        panic!("the final typed step removes the default");
+    };
+    *uid = table_uid;
+    assert!(derive(&wrong_uid).is_err());
+}
+
+/// The explicit ordered extra is an input to ordinary bootstrap, qualification,
+/// scratch compilation and final planning, not a value inferred from the
+/// target session's transient search_path.
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn an_explicit_extra_schema_changes_only_the_unqualified_lookup_in_the_final_plan() {
+    setup(cases::EXTRA_LOOKUP_TARGET_SETUP).await;
+    let mut owned = Some(ObservedContainers::begin());
+    let mut target = target().await;
+    let mut run = open(Profile::Container, &mut target).await;
+    let extras = vec!["pbps_evidence1274_extra".to_owned()];
+    let inputs = Inputs::from_pair_with_extras(cases::extra_lookup_pair(), &extras);
+    let key = ProjectKey::new(true);
+    let result = run
+        .plan_resolved(
+            &mut target,
+            &inputs.binding(),
+            inputs.base(),
+            inputs.desired(),
+            &inputs.hints,
+            &extras,
+            &key.project,
+            Some(ENVIRONMENT),
+        )
+        .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            close(&mut run, &mut owned).await;
+            panic!("the qualified extra-schema lookup must be sealable: {error}");
+        }
+    };
+    result.evidence.validate(&result.changes).unwrap();
+    let affected = view(&result.evidence, "v");
+    let control = view(&result.evidence, "control");
+    assert_ne!(
+        affected.current.as_ref().unwrap().bindings,
+        affected.desired.as_ref().unwrap().bindings,
+        "the earlier exact overload takes the unqualified call from the extra schema"
+    );
+    assert_eq!(
+        control.current.as_ref().unwrap().bindings,
+        control.desired.as_ref().unwrap().bindings,
+        "the explicitly extra-qualified control keeps its original binding"
+    );
+    let v: pbps_model::ModuleId = "pbps_evidence1274.v".parse().unwrap();
+    let control: pbps_model::ModuleId = "pbps_evidence1274.control".parse().unwrap();
+    assert!(
+        result
+            .changes
+            .changes
+            .iter()
+            .any(|step| { matches!(&step.change, Change::DropModule { id, .. } if id == &v) })
+    );
+    assert!(
+        result
+            .changes
+            .changes
+            .iter()
+            .any(|step| { matches!(&step.change, Change::CreateModule { id, .. } if id == &v) })
+    );
+    assert!(!result.changes.changes.iter().any(|step| {
+        matches!(&step.change, Change::DropModule { id, .. }
+            | Change::CreateModule { id, .. }
+            | Change::AlterModule { id, .. } if id == &control)
+    }));
+    close(&mut run, &mut owned).await;
+    let mut peer = pbps_db::Conn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    execute_plan_with_extras(&mut peer, &result.changes, &extras).await;
+    let rows = peer
+        .query(
+            "SELECT (SELECT x FROM pbps_evidence1274.v) AS affected, \
+                (SELECT x FROM pbps_evidence1274.control) AS control",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows[0].try_get::<i32>("affected").unwrap(), Some(30));
+    assert_eq!(rows[0].try_get::<i32>("control").unwrap(), Some(10));
+    drop(peer);
+    target.check().await.unwrap();
+    setup(&[]).await;
+}
+
+/// A rename does not make a later CREATE at the old spelling inherit the old
+/// UID. The analogous added u.id must not inherit the renamed u.n column UID.
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn recorded_renames_and_reused_old_spellings_keep_distinct_owned_inventories() {
+    use pbps_db::fingerprint::EnvironmentFingerprintKey;
+
+    setup(cases::RENAME_TARGET_SETUP).await;
+    let opening_acl = table_column_grants("t", "id").await;
+    let mut owned = Some(ObservedContainers::begin());
+    let mut target = target().await;
+    let mut run = open(Profile::Container, &mut target).await;
+    let (base, desired, base_ids, desired_ids) = cases::rename_and_reuse_pair();
+    let old: pbps_model::TableName = "pbps_evidence1274.t".parse().unwrap();
+    let new: pbps_model::TableName = "pbps_evidence1274.u".parse().unwrap();
+    assert_eq!(base_ids.table_uid(&old), desired_ids.table_uid(&new));
+    assert_ne!(base_ids.table_uid(&old), desired_ids.table_uid(&old));
+    assert_eq!(
+        base_ids.column_uid(&old.column("id")),
+        desired_ids.column_uid(&new.column("n"))
+    );
+    assert_ne!(
+        base_ids.column_uid(&old.column("id")),
+        desired_ids.column_uid(&new.column("id"))
+    );
+    assert_ne!(
+        desired_ids.column_uid(&old.column("id")),
+        desired_ids.column_uid(&new.column("id"))
+    );
+    let inputs = Inputs::with_ids(base, desired, base_ids, desired_ids);
+    let key = ProjectKey::new(true);
+    let result = run
+        .plan_resolved(
+            &mut target,
+            &inputs.binding(),
+            inputs.base(),
+            inputs.desired(),
+            &inputs.hints,
+            &[],
+            &key.project,
+            Some(ENVIRONMENT),
+        )
+        .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            close(&mut run, &mut owned).await;
+            panic!("renamed identities and their reused spellings must remain distinct: {error}");
+        }
+    };
+    result.evidence.validate(&result.changes).unwrap();
+    let changes = &result.changes.changes;
+    let rename = changes
+        .iter()
+        .position(|step| {
+            matches!(&step.change, Change::RenameTable { from, to, .. }
+            if from == &old && to == &new)
+        })
+        .expect("the recorded old table is renamed to u");
+    let create = changes
+        .iter()
+        .position(|step| {
+            matches!(&step.change, Change::CreateTable { name, .. }
+            if name == &old)
+        })
+        .expect("the old table spelling is reused by a new table");
+    assert!(
+        rename < create,
+        "the old table name must be free before its reuse"
+    );
+    assert!(changes.iter().any(
+        |step| matches!(&step.change, Change::AddColumn { table, name, .. }
+        if table == &new && name == "id")
+    ));
+
+    let before = result.evidence.before();
+    let after = result.evidence.after();
+    let opening_owner = ObjectOwnership::Surface(Surface::Table(old.clone()));
+    assert!(
+        before
+            .prerequisites()
+            .iter()
+            .any(|row| row.object.class == "pg_class"
+                && row.object.name == [cases::SCHEMA, "t"]
+                && row.ownership == opening_owner)
+    );
+    for (name, owner) in [
+        ("u", Surface::Table(new.clone())),
+        ("t", Surface::Table(old.clone())),
+    ] {
+        assert!(
+            after
+                .prerequisites()
+                .iter()
+                .any(|row| row.object.class == "pg_class"
+                    && row.object.name == [cases::SCHEMA, name]
+                    && row.ownership == ObjectOwnership::Surface(owner.clone())),
+            "closing manifest must retain separate owned table inventories for {name}"
+        );
+    }
+    for column in [new.column("n"), new.column("id"), old.column("id")] {
+        assert!(
+            after
+                .prerequisites()
+                .iter()
+                .any(|row| row.object.class == "column"
+                    && row.ownership == ObjectOwnership::Surface(Surface::Column(column.clone()))),
+            "closing manifest must own a distinct catalog column: {column:?}"
+        );
+    }
+    let closing = after.clone();
+    close(&mut run, &mut owned).await;
+    let mut peer = pbps_db::Conn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    execute_plan(&mut peer, &result.changes).await;
+    drop(peer);
+    let selected = EnvironmentFingerprintKey::from_file(&key.root.join("key")).unwrap();
+    let (_, observed) = target
+        .capture_postgres_sealed(
+            &catalog_scope(closing.scope()),
+            &Default::default(),
+            &selected,
+        )
+        .await
+        .unwrap();
+    for expected in closing.prerequisites() {
+        let actual = observed
+            .prerequisites()
+            .iter()
+            .find(|row| row.object == expected.object)
+            .expect("both renamed and newly created records exist after DDL");
+        assert_eq!(expected.properties, actual.properties);
+        assert_eq!(expected.bindings, actual.bindings);
+    }
+    assert_eq!(table_column_grants("u", "n").await, opening_acl);
+    let mut peer = PeerVerifiedConn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    peer.query("INSERT INTO pbps_evidence1274.u DEFAULT VALUES")
+        .await
+        .unwrap();
+    peer.query("INSERT INTO pbps_evidence1274.t (id) VALUES (7)")
+        .await
+        .unwrap();
+    let rows = peer
+        .query("SELECT n FROM pbps_evidence1274.u")
+        .await
+        .unwrap();
+    assert_eq!(rows[0].try_get::<i32>("n").unwrap(), Some(9));
+    let rows = peer
+        .query("SELECT id FROM pbps_evidence1274.t")
+        .await
+        .unwrap();
+    assert_eq!(rows[0].try_get::<i32>("id").unwrap(), Some(7));
+    drop(peer);
+    target.check().await.unwrap();
+    setup(&[]).await;
+}
+
+/// A persisted authorization condition must survive a second process using
+/// the same configured environment key. A different key must not reproduce
+/// either fingerprint for the same fresh target and final typed plan.
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn persisted_authorization_is_stable_across_processes_only_with_the_same_environment_key() {
+    const TEST: &str = "resolver::server::qualified_evidence_tests::persisted_authorization_is_stable_across_processes_only_with_the_same_environment_key";
+
+    async fn observe(project: &pbps_config::Project) -> Value {
+        setup(cases::TARGET_SETUP).await;
+        let mut owned = Some(ObservedContainers::begin());
+        let mut target = target().await;
+        let mut run = open(Profile::Container, &mut target).await;
+        let inputs = Inputs::overload();
+        let result = run
+            .plan_resolved(
+                &mut target,
+                &inputs.binding(),
+                inputs.base(),
+                inputs.desired(),
+                &inputs.hints,
+                &[],
+                project,
+                Some(ENVIRONMENT),
+            )
+            .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                close(&mut run, &mut owned).await;
+                panic!("fixed-key producer must qualify the same target: {error}");
+            }
+        };
+        result.evidence.validate(&result.changes).unwrap();
+        let authorization = serde_json::to_value(result.evidence.authorization()).unwrap();
+        close(&mut run, &mut owned).await;
+        target.check().await.unwrap();
+        setup(&[]).await;
+        authorization
+    }
+
+    if let Ok(kind) = std::env::var("PBPS_1274_AUTH_CHILD") {
+        let output = PathBuf::from(std::env::var("PBPS_1274_AUTH_RESULT").unwrap());
+        let authorization = match kind.as_str() {
+            "same" => {
+                let root = PathBuf::from(std::env::var("PBPS_1274_AUTH_ROOT").unwrap());
+                let path = root.join("pbps.yml");
+                let config = std::fs::read_to_string(&path).unwrap();
+                let project = pbps_config::Project {
+                    root,
+                    config: pbps_config::Config::parse(&config, &path).unwrap(),
+                };
+                observe(&project).await
+            }
+            "different" => {
+                let key = ProjectKey::new(true);
+                observe(&key.project).await
+            }
+            other => panic!("unknown child authorization observation: {other}"),
+        };
+        std::fs::write(output, serde_json::to_vec(&authorization).unwrap()).unwrap();
+        return;
+    }
+
+    let key = ProjectKey::new(true);
+    let original = observe(&key.project).await;
+    let binary = std::env::current_exe().unwrap();
+    for kind in ["same", "different"] {
+        let output = key.root.join(format!("authorization-{kind}.json"));
+        let child = Command::new(&binary)
+            .args(["--ignored", "--exact", TEST, "--nocapture"])
+            .env("PBPS_1274_AUTH_CHILD", kind)
+            .env("PBPS_1274_AUTH_RESULT", &output)
+            .env("PBPS_1274_AUTH_ROOT", &key.root)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success()
+                && String::from_utf8_lossy(&child.stdout).contains("test result: ok. 1 passed"),
+            "{kind} key child process failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let observed: Value = serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        for phase in ["before", "after"] {
+            if kind == "same" {
+                assert_eq!(observed[phase], original[phase]);
+            } else {
+                assert_ne!(observed[phase], original[phase]);
+            }
+        }
+    }
+}
+
+async fn not_null_oid(table: &str, constraint: &str) -> Option<i64> {
+    // Only fixed names from the disposable #1274 fixture reach this query.
+    assert!(matches!(table, "type_case" | "type_final"));
+    assert_eq!(constraint, "type_case_id_not_null");
+    let mut peer = PeerVerifiedConn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    let rows = peer
+        .query(&format!(
+            "SELECT c.oid::bigint AS oid FROM pg_catalog.pg_constraint c \
+             JOIN pg_catalog.pg_class t ON t.oid = c.conrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace \
+             WHERE n.nspname = 'pbps_evidence1274' \
+               AND t.relname = '{table}' AND c.conname = '{constraint}'"
+        ))
+        .await
+        .unwrap();
+    assert!(rows.len() <= 1);
+    rows.first()
+        .map(|row| row.try_get::<i64>("oid").unwrap().unwrap())
+}
+
+/// The same recorded table/column renames accompany three different typed
+/// edits. PG18 retains a NOT NULL name through a type rewrite despite a new
+/// raw constraint OID, removes it on DROP, and makes the final name on SET.
+/// PG16 has no separate constraint rows. Projected closing properties must
+/// agree with a fresh actual target capture after the emitted plan runs.
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn recorded_renames_with_type_and_nullability_edits_match_actual_child_catalog() {
+    use pbps_db::fingerprint::EnvironmentFingerprintKey;
+
+    let major: u32 = std::env::var("PBPS_NATIVE_PG_MAJOR")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(matches!(major, 16 | 18));
+    setup(cases::TYPED_RENAME_TARGET_SETUP).await;
+    let opening_oid = not_null_oid("type_case", "type_case_id_not_null").await;
+    assert_eq!(opening_oid.is_some(), major == 18);
+
+    let mut owned = Some(ObservedContainers::begin());
+    let mut target = target().await;
+    let mut run = open(Profile::Container, &mut target).await;
+    let (base, desired, base_ids, desired_ids) = cases::typed_rename_pair();
+    for stem in ["type", "drop", "add"] {
+        let old: pbps_model::TableName = format!("pbps_evidence1274.{stem}_case").parse().unwrap();
+        let new: pbps_model::TableName = format!("pbps_evidence1274.{stem}_final").parse().unwrap();
+        assert_eq!(base_ids.table_uid(&old), desired_ids.table_uid(&new));
+        assert_eq!(
+            base_ids.column_uid(&old.column("id")),
+            desired_ids.column_uid(&new.column("n"))
+        );
+    }
+    let inputs = Inputs::with_ids(base, desired, base_ids, desired_ids);
+    let key = ProjectKey::new(true);
+    let result = run
+        .plan_resolved(
+            &mut target,
+            &inputs.binding(),
+            inputs.base(),
+            inputs.desired(),
+            &inputs.hints,
+            &[],
+            &key.project,
+            Some(ENVIRONMENT),
+        )
+        .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            close(&mut run, &mut owned).await;
+            panic!("measured typed renames must produce qualified evidence: {error}");
+        }
+    };
+    close(&mut run, &mut owned).await;
+    result.evidence.validate(&result.changes).unwrap();
+
+    let changes = &result.changes.changes;
+    for stem in ["type", "drop", "add"] {
+        let old: pbps_model::TableName = format!("pbps_evidence1274.{stem}_case").parse().unwrap();
+        let new: pbps_model::TableName = format!("pbps_evidence1274.{stem}_final").parse().unwrap();
+        assert!(changes.iter().any(|step| matches!(
+            &step.change,
+            Change::RenameTable { from, to, .. } if from == &old && to == &new
+        )));
+        assert!(changes.iter().any(|step| matches!(
+            &step.change,
+            Change::RenameColumn { table, from, to, .. }
+                if table == &new && from == "id" && to == "n"
+        )));
+    }
+    let typed = "pbps_evidence1274.type_final"
+        .parse::<pbps_model::TableName>()
+        .unwrap();
+    let dropped = "pbps_evidence1274.drop_final"
+        .parse::<pbps_model::TableName>()
+        .unwrap();
+    let added = "pbps_evidence1274.add_final"
+        .parse::<pbps_model::TableName>()
+        .unwrap();
+    assert!(changes.iter().any(|step| matches!(
+        &step.change,
+        Change::AlterColumnType { column, .. } if column == &typed.column("n")
+    )));
+    for column in [dropped.column("n"), added.column("n")] {
+        assert!(changes.iter().any(|step| matches!(
+            &step.change,
+            Change::AlterColumnNullability { column: changed, .. }
+                if changed == &column
+        )));
+    }
+
+    let closing = result.evidence.after().clone();
+    // Properties are sealed HMACs. This fixture declares no other
+    // constraints, so its pg_constraint identities enumerate the NOT NULL
+    // children; the actual catalog query below also checks their contype.
+    let child_identities: BTreeSet<_> = closing
+        .prerequisites()
+        .iter()
+        .filter(|row| row.object.class == "pg_constraint")
+        .map(|row| {
+            let relation = row.object.signature.get(1).unwrap();
+            assert_eq!(relation.class, "pg_class");
+            assert_eq!(
+                relation.name.first().map(String::as_str),
+                Some(cases::SCHEMA)
+            );
+            (
+                relation.name.get(1).unwrap().clone(),
+                row.object.name.first().unwrap().clone(),
+            )
+        })
+        .collect();
+    let expected_children: BTreeSet<_> = if major == 18 {
+        [
+            ("type_final", "type_case_id_not_null"),
+            ("add_final", "add_final_n_not_null"),
+        ]
+        .into_iter()
+        .map(|(table, name)| (table.to_owned(), name.to_owned()))
+        .collect()
+    } else {
+        BTreeSet::new()
+    };
+    assert_eq!(child_identities, expected_children);
+
+    let mut peer = pbps_db::Conn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    execute_plan(&mut peer, &result.changes).await;
+    drop(peer);
+    let final_oid = not_null_oid("type_final", "type_case_id_not_null").await;
+    assert_eq!(final_oid.is_some(), major == 18);
+    if major == 18 {
+        assert_ne!(opening_oid, final_oid, "the type rewrite replaces raw OID");
+    }
+    let mut peer = PeerVerifiedConn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    let rows = peer
+        .query(
+            "SELECT t.relname::text AS table_name, c.conname::text AS constraint_name, \
+                c.contype::text AS kind \
+             FROM pg_catalog.pg_constraint c \
+             JOIN pg_catalog.pg_class t ON t.oid = c.conrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace \
+             WHERE n.nspname = 'pbps_evidence1274' \
+               AND t.relname IN ('type_final', 'drop_final', 'add_final')",
+        )
+        .await
+        .unwrap();
+    let actual_children: BTreeSet<_> = rows
+        .iter()
+        .map(|row| {
+            assert_eq!(row.try_get::<&str>("kind").unwrap(), Some("n"));
+            (
+                row.try_get::<&str>("table_name")
+                    .unwrap()
+                    .unwrap()
+                    .to_owned(),
+                row.try_get::<&str>("constraint_name")
+                    .unwrap()
+                    .unwrap()
+                    .to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(actual_children, expected_children);
+    drop(peer);
+
+    let selected = EnvironmentFingerprintKey::from_file(&key.root.join("key")).unwrap();
+    let (_, observed) = target
+        .capture_postgres_sealed(
+            &catalog_scope(closing.scope()),
+            &Default::default(),
+            &selected,
+        )
+        .await
+        .unwrap();
+    for expected in closing.prerequisites() {
+        let actual = observed
+            .prerequisites()
+            .iter()
+            .find(|row| row.object == expected.object)
+            .unwrap_or_else(|| panic!("missing actual closing identity: {:?}", expected.object));
+        assert_eq!(expected.properties, actual.properties);
+        assert_eq!(expected.bindings, actual.bindings);
+    }
+    let mut peer = PeerVerifiedConn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    let rows = peer
+        .query(
+            "SELECT t.relname::text || ':' || a.attname || ':' || \
+                pg_catalog.format_type(a.atttypid, a.atttypmod) || ':' || \
+                a.attnotnull::text AS state \
+             FROM pg_catalog.pg_attribute a \
+             JOIN pg_catalog.pg_class t ON t.oid = a.attrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace \
+             WHERE n.nspname = 'pbps_evidence1274' AND a.attnum > 0 \
+               AND t.relname IN ('type_final', 'drop_final', 'add_final')",
+        )
+        .await
+        .unwrap();
+    let actual_states: BTreeSet<_> = rows
+        .iter()
+        .map(|row| row.try_get::<&str>("state").unwrap().unwrap().to_owned())
+        .collect();
+    let expected_states: BTreeSet<_> = [
+        "type_final:n:bigint:true",
+        "drop_final:n:integer:false",
+        "add_final:n:integer:true",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    assert_eq!(actual_states, expected_states);
+    drop(peer);
+    target.check().await.unwrap();
+    setup(&[]).await;
+}
+
+/// A newly created routine follows the target connection's effective creator.
+/// A preserved ordinary table owner does not exercise this creation branch.
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn a_new_routine_created_as_an_ordinary_deployer_keeps_its_owner_edge() {
+    use pbps_db::fingerprint::EnvironmentFingerprintKey;
+    use pbps_db::resolver::capture::ObjectIdentity;
+    use pbps_model::{Module, ModuleKind};
+
+    setup(&[
+        "CREATE SCHEMA pbps_evidence1274",
+        "GRANT USAGE, CREATE ON SCHEMA pbps_evidence1274 TO pbps_native_alt",
+    ])
+    .await;
+    let mut peer = PeerVerifiedConn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    let roles = peer
+        .query("SELECT oid::int8 AS oid FROM pg_catalog.pg_roles WHERE rolname = 'pbps_native_alt'")
+        .await
+        .unwrap();
+    assert_eq!(roles.len(), 1);
+    assert!(roles[0].try_get::<i64>("oid").unwrap().unwrap() >= 12_000);
+    let settings_membership_sql = concat!(
+        "SELECT EXISTS (",
+        "SELECT 1 FROM pg_catalog.pg_auth_members m ",
+        "JOIN pg_catalog.pg_roles granted ON granted.oid = m.roleid ",
+        "JOIN pg_catalog.pg_roles member ON member.oid = m.member ",
+        "WHERE granted.rolname = 'pg_read_all_settings' ",
+        "AND member.rolname = 'pbps_native_alt') AS member"
+    );
+    let membership = peer.query(settings_membership_sql).await.unwrap();
+    assert_eq!(membership.len(), 1);
+    let had_settings_membership = membership[0].try_get::<bool>("member").unwrap().unwrap();
+    eprintln!("ordinary_creator_settings prior_membership={had_settings_membership}");
+    // The measured ordinary-role refusal had three unreadable settings:
+    // dynamic_library_path, session_preload_libraries and shared_preload_libraries.
+    // Give only this disposable target role the catalog-read privilege before
+    // admission; keep the effective deployer ordinary throughout the case.
+    if !had_settings_membership {
+        peer.query("GRANT pg_read_all_settings TO pbps_native_alt")
+            .await
+            .unwrap();
+    }
+    // Qualification and the fresh catalog read must see this same role on the
+    // bound connection; changing a separate observer would prove nothing.
+    peer.query("SET ROLE pbps_native_alt").await.unwrap();
+    let principal = peer
+        .query(
+            "SELECT current_user::text AS effective, session_user::text AS login, \
+             pg_catalog.current_setting('is_superuser') AS superuser",
+        )
+        .await
+        .unwrap();
+    assert_eq!(principal.len(), 1);
+    assert_eq!(
+        principal[0].try_get::<&str>("effective").unwrap(),
+        Some("pbps_native_alt")
+    );
+    assert_eq!(
+        principal[0].try_get::<&str>("login").unwrap(),
+        Some("postgres")
+    );
+    assert_eq!(
+        principal[0].try_get::<&str>("superuser").unwrap(),
+        Some("off")
+    );
+    let mut target = NativeTarget::establish(
+        peer,
+        std::env::var("PBPS_NATIVE_SERVICE_PID")
+            .unwrap()
+            .parse()
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let mut owned = Some(ObservedContainers::begin());
+    let mut run = open(Profile::Container, &mut target).await;
+    let base = Schema::default();
+    let mut desired = Schema::default();
+    desired.modules.insert(
+        "pbps_evidence1274.a()".parse().unwrap(),
+        Module {
+            kind: ModuleKind::Function,
+            description: None,
+            definition: "() RETURNS integer LANGUAGE SQL IMMUTABLE RETURN 1".into(),
+        },
+    );
+    let inputs = Inputs::from_pair((base, desired));
+    let key = ProjectKey::new(true);
+    let result = run
+        .plan_resolved(
+            &mut target,
+            &inputs.binding(),
+            inputs.base(),
+            inputs.desired(),
+            &inputs.hints,
+            &[],
+            &key.project,
+            Some(ENVIRONMENT),
+        )
+        .await;
+    // No assertion on the plan or catalog may strand the run's exact owners.
+    close(&mut run, &mut owned).await;
+    let result = result.expect("the ordinary effective creator can seal a new routine");
+    result.evidence.validate(&result.changes).unwrap();
+    assert!(result.changes.changes.iter().any(|step| {
+        matches!(&step.change, Change::CreateModule { id, .. }
+            if id.to_string() == "pbps_evidence1274.a()")
+    }));
+    let closing = result.evidence.after().clone();
+    let routine = ObjectIdentity {
+        class: "pg_proc".into(),
+        name: vec![cases::SCHEMA.into(), "a".into()],
+        signature: Vec::new(),
+    };
+    let owner_edge = ObjectIdentity {
+        class: "pg_shdepend".into(),
+        name: vec!["o".into()],
+        signature: vec![
+            routine.clone(),
+            ObjectIdentity {
+                class: "pg_authid".into(),
+                name: vec!["pbps_native_alt".into()],
+                signature: Vec::new(),
+            },
+        ],
+    };
+    assert_eq!(
+        closing
+            .prerequisites()
+            .iter()
+            .filter(|row| row.object == owner_edge)
+            .count(),
+        1,
+        "the projected new routine has its ordinary creator's exact owner edge"
+    );
+    let mut writer = pbps_db::Conn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    writer.execute("SET ROLE pbps_native_alt").await.unwrap();
+    let applied_as = writer
+        .query("SELECT current_user::text AS effective")
+        .await
+        .unwrap();
+    assert_eq!(
+        applied_as[0].try_get::<&str>("effective").unwrap(),
+        Some("pbps_native_alt")
+    );
+    execute_plan(&mut writer, &result.changes).await;
+    drop(writer);
+    assert_eq!(
+        catalog_owner_dependency("routine-a").await,
+        ("pbps_native_alt".into(), 1, 1),
+        "actual creation as the ordinary deployer records one owner edge"
+    );
+    let selected = EnvironmentFingerprintKey::from_file(&key.root.join("key")).unwrap();
+    let (_, observed) = target
+        .capture_postgres_sealed(
+            &catalog_scope(closing.scope()),
+            &Default::default(),
+            &selected,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        closing.prerequisites().len(),
+        observed.prerequisites().len(),
+        "the closing inventory has exactly the fresh target's members"
+    );
+    for (expected, actual) in closing.prerequisites().iter().zip(observed.prerequisites()) {
+        assert_eq!(expected.object, actual.object);
+        assert_eq!(
+            expected.properties, actual.properties,
+            "projected closing properties differ for {:?}",
+            expected.object
+        );
+        assert_eq!(
+            expected.bindings, actual.bindings,
+            "projected closing bindings differ for {:?}",
+            expected.object
+        );
+    }
+    target.check().await.unwrap();
+    let mut admin = PeerVerifiedConn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    if !had_settings_membership {
+        admin
+            .query("REVOKE pg_read_all_settings FROM pbps_native_alt")
+            .await
+            .unwrap();
+    }
+    let restored = admin.query(settings_membership_sql).await.unwrap();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(
+        restored[0].try_get::<bool>("member").unwrap(),
+        Some(had_settings_membership),
+        "the disposable role's previous settings membership is restored"
+    );
+    eprintln!("ordinary_creator_settings restored_membership={had_settings_membership}");
+    drop(admin);
+    setup(&[]).await;
+}
