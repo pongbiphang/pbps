@@ -442,6 +442,99 @@ class Ownership(unittest.TestCase):
                 with self.assertRaises(audit.InventoryError):
                     self.check()
 
+    def test_supported_literal_expressions_preserve_fresh_namespace_provenance(self):
+        statements = [
+            'PREFIX = "own"\nTESTS = [PREFIX + "ed"]',
+            'EMPTY = []\nNAMES = ["owned"]\nTESTS = EMPTY + NAMES',
+            'EMPTY = ()\nTESTS = EMPTY + ("owned",)',
+            'PREFIX = "own"\nPARTS = ["ed"]\nTESTS = [PREFIX + part for part in PARTS]',
+            'TESTS = [name for name in ("owned",)]',
+            'PREFIX = "ow" + "n"\nALIAS = PREFIX\nTESTS = [ALIAS + "ed"]',
+            'TESTS = ["own" + "ed"]\nALIAS = TESTS\nTESTS = ALIAS + []',
+            'PREFIX = "own"\nTESTS = ["owned"]\nPREFIX + "ed"',
+            'PREFIX = "own"\ndef helper(value=PREFIX + "ed"): pass\nTESTS = ["owned"]',
+            'PREFIX = "own"\nhelper = lambda value=PREFIX + "ed": None\nTESTS = ["owned"]',
+            'PREFIX = "own"\nasync def helper(value=[PREFIX + name for name in ["ed"]]): pass\nTESTS = ["owned"]',
+            'PREFIX = "own"\ndef helper() -> PREFIX + "ed": pass\nTESTS = ["owned"]',
+        ]
+        self.inventory['owners']['live']['selection'] = {
+            'kind': 'data', 'file': 'runner.py', 'expression': 'TESTS'}
+        for import_, constructor in (('from types import SimpleNamespace', 'SimpleNamespace'),
+                                     ('import types as kinds', 'kinds.SimpleNamespace')):
+            for statement in statements:
+                with self.subTest(import_=import_, statement=statement):
+                    source = (import_ + '\n' + statement + '\n'
+                              f'namespace = vars({constructor}())\nnamespace["TESTS"] = []\n')
+                    actual = subprocess.run([sys.executable, '-c', source + 'print(list(TESTS))'],
+                                            check=True, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(actual.stdout, "['owned']\n")
+                    (self.root / 'runner.py').write_text(source, encoding='utf-8')
+                    self.assertEqual(self.check(), 1)
+
+    def test_literal_proofs_do_not_restore_provenance_after_opaque_execution(self):
+        patch_type = 'types.SimpleNamespace = lambda: sys.modules["__main__"]'
+        (self.root / 'side_effect.py').write_text('import sys, types\n' + patch_type + '\n',
+                                                encoding='utf-8')
+        setups = [
+            f'def replace():\n    {patch_type}\nreplace()',
+            'import side_effect',
+            f'def names():\n    {patch_type}\n    return []\n[name for name in names()]',
+            f'class Operand:\n    def __add__(self, other):\n        {patch_type}\n        return \"\"\n'
+            'value = Operand()\nvalue + 1',
+            f'class Names:\n    def __iter__(self):\n        {patch_type}\n        return iter([])\n'
+            '[name for name in Names()]',
+        ]
+        selectors = ['TESTS = ["own" + "ed"]',
+                     'NAMES = ("owned",)\nTESTS = NAMES + ()',
+                     'PREFIX = "own"\nTESTS = [PREFIX + name for name in ["ed"]]']
+        self.inventory['owners']['live']['selection'] = {
+            'kind': 'data', 'file': 'runner.py', 'expression': 'TESTS'}
+        for setup in setups:
+            for selector in selectors:
+                with self.subTest(setup=setup, selector=selector):
+                    source = ('import sys, types\n' + setup + '\n' + selector + '\n'
+                              'namespace = vars(types.SimpleNamespace())\nnamespace["TESTS"] = []\n')
+                    actual = subprocess.run([sys.executable, '-c', source + 'print(TESTS)'],
+                                            cwd=self.root, check=True, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(actual.stdout, '[]\n')
+                    (self.root / 'runner.py').write_text(source, encoding='utf-8')
+                    with self.assertRaises(audit.InventoryError):
+                        self.check()
+
+    def test_unproven_expressions_cannot_supply_literal_provenance(self):
+        self.inventory['owners']['live']['selection'] = {
+            'kind': 'data', 'file': 'runner.py', 'expression': 'TESTS'}
+        for expression in ('sys.version + ""', '"owned".lower()', '[name for name in iter(["owned"])]'):
+            with self.subTest(expression=expression):
+                source = ('import sys\nfrom types import SimpleNamespace\n' + expression + '\n'
+                          'TESTS = ["owned"]\nvars(SimpleNamespace())\n')
+                actual = subprocess.run([sys.executable, '-c', source + 'print(TESTS)'],
+                                        check=True, capture_output=True, text=True, timeout=10)
+                self.assertEqual(actual.stdout, "['owned']\n")
+                (self.root / 'runner.py').write_text(source, encoding='utf-8')
+                # Actual purity alone is insufficient: fixture code is not
+                # executed to extend the auditor's bounded literal grammar.
+                with self.assertRaises(audit.InventoryError):
+                    self.check()
+
+    def test_proven_literal_selectors_still_lose_escaped_mutable_aliases(self):
+        self.inventory['owners']['live']['selection'] = {
+            'kind': 'data', 'file': 'runner.py', 'expression': 'TESTS'}
+        for argument in ('ALIAS', '(ALIAS,)'):
+            with self.subTest(argument=argument):
+                source = ('from types import SimpleNamespace\n'
+                          'def clear(value):\n'
+                          '    if isinstance(value, tuple): value[0].clear()\n'
+                          '    else: value.clear()\n'
+                          'TESTS = ["own" + "ed"]\nALIAS = TESTS\n'
+                          'vars(SimpleNamespace())\n' + f'clear({argument})\n')
+                actual = subprocess.run([sys.executable, '-c', source + 'print(TESTS)'],
+                                        check=True, capture_output=True, text=True, timeout=10)
+                self.assertEqual(actual.stdout, '[]\n')
+                (self.root / 'runner.py').write_text(source, encoding='utf-8')
+                with self.assertRaises(audit.InventoryError):
+                    self.check()
+
     def test_opaque_execution_cannot_preserve_fresh_namespace_provenance(self):
         patch_type = 'types.SimpleNamespace = lambda: sys.modules[__name__]'
         setups = {

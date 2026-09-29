@@ -279,7 +279,8 @@ def mutable_ids(value):
 
 class NamespaceImports:
     """Recognize only direct module-level inspection of a fresh empty object."""
-    def __init__(self):
+    def __init__(self, values):
+        self.values = values
         self.constructors = set()
         self.modules = set()
         self.types_pristine = True
@@ -290,9 +291,14 @@ class NamespaceImports:
         self.fresh_dicts = set()
 
     def inert_expression(self, node):
-        # This proves absence of callbacks, not the expression's value.
-        if isinstance(node, ast.Constant):
+        # Reuse the selector grammar: its proven native values cannot dispatch
+        # user callbacks through concatenation or supported comprehensions.
+        try:
+            static_value(node, self.values)
             return True
+        except (InventoryError, TypeError):
+            pass
+        # Definitions and fresh dictionaries can be inert without literal values.
         if isinstance(node, ast.Name):
             return node.id in self.inert_names
         if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
@@ -417,7 +423,7 @@ class NamespaceImports:
 
 def python_values(tree):
     values = {}
-    imports = NamespaceImports()
+    imports = NamespaceImports(values)
     namespace_exposed = False
     for node in tree.body:
         replacement = None
