@@ -314,32 +314,37 @@ pub(super) fn derive(
             entry.dropped_before = dropped;
         }
     }
-    let mut transitions: Vec<ObjectTransition> = affected
-        .into_iter()
-        .map(|(surface, intent)| {
-            let prior = intent
-                .dropped_before
-                .or_else(|| opening_endpoint(&surface, base, desired));
-            let before = if intent.opening {
-                prior
-                    .filter(|prior| declared(base.schema, prior))
-                    .map(|prior| inventory(opening, &prior, intent.children))
-                    .unwrap_or_default()
-            } else {
-                BTreeSet::new()
-            };
-            let after = if intent.closing && declared(desired.schema, &surface) {
-                inventory(compiled, &surface, intent.children)
-            } else {
-                BTreeSet::new()
-            };
-            ObjectTransition {
-                surface,
-                before,
-                after,
-            }
-        })
-        .collect();
+    let (mut transitions, opening_endpoints): (Vec<ObjectTransition>, Vec<Option<Surface>>) =
+        affected
+            .into_iter()
+            .map(|(surface, intent)| {
+                let prior = intent
+                    .dropped_before
+                    .or_else(|| opening_endpoint(&surface, base, desired));
+                let before = if intent.opening {
+                    prior
+                        .as_ref()
+                        .filter(|prior| declared(base.schema, prior))
+                        .map(|prior| inventory(opening, prior, intent.children))
+                        .unwrap_or_default()
+                } else {
+                    BTreeSet::new()
+                };
+                let after = if intent.closing && declared(desired.schema, &surface) {
+                    inventory(compiled, &surface, intent.children)
+                } else {
+                    BTreeSet::new()
+                };
+                (
+                    ObjectTransition {
+                        surface,
+                        before,
+                        after,
+                    },
+                    prior,
+                )
+            })
+            .unzip();
     // Parent renames cover their complete child inventory, while a separately
     // changed child has its own exact typed owner. Give each catalog address
     // to that child once; projection still checks that every parent and child
@@ -347,18 +352,18 @@ pub(super) fn derive(
     for parent in 0..transitions.len() {
         let mut child_before = BTreeSet::new();
         let mut child_after = BTreeSet::new();
-        let parent_opening = opening_endpoint(&transitions[parent].surface, base, desired)
-            .unwrap_or_else(|| transitions[parent].surface.clone());
         for (index, child) in transitions.iter().enumerate() {
             if index == parent {
                 continue;
             }
-            // A teardown keeps its opening spelling while the parent rename
-            // is labelled by the final UID. Coalesce each endpoint in its own
-            // coordinates, so one owned child is never claimed twice.
-            let child_opening = opening_endpoint(&child.surface, base, desired)
-                .unwrap_or_else(|| child.surface.clone());
-            if specializes(&child_opening, &parent_opening) {
+            // A teardown keeps its opening spelling even when another UID
+            // takes that name in the desired schema. Use the endpoint that
+            // selected its opening inventory, never resolve it again by the
+            // final spelling of the transition.
+            if let (Some(child_opening), Some(parent_opening)) =
+                (&opening_endpoints[index], &opening_endpoints[parent])
+                && specializes(child_opening, parent_opening)
+            {
                 child_before.extend(child.before.iter().cloned());
             }
             if specializes(&child.surface, &transitions[parent].surface) {
