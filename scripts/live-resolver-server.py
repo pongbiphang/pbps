@@ -71,6 +71,14 @@ TESTS = [
     # Stops the supplied server under a live run, so it is last.
     "an_unconfirmed_cleanup_reports_only_the_run_owned_names",
 ]
+# New producer cases live beside the unchanged supplied-server tests.
+PRODUCER_TESTS = [
+    "resolver::server::qualified_evidence_tests::the_supplied_producer_seals_the_overload_and_default_from_one_fresh_read",
+    "resolver::server::qualified_evidence_tests::the_supplied_empty_target_producer_orders_table_routines_and_expressions_before_sealing",
+    "resolver::server::qualified_evidence_tests::the_supplied_replaced_routine_rebuilds_cross_kind_dependents_in_the_final_plan",
+    "resolver::server::qualified_evidence_tests::the_supplied_recorded_table_and_column_uids_survive_rename_with_dependent_rebuilds",
+    "resolver::server::qualified_evidence_tests::the_supplied_rebuilt_routine_with_explicit_public_execution_matches_the_post_ddl_acl",
+]
 DOCKER_SOCKET = "/var/run/docker.sock"
 
 # The recipe an operator follows. Everything writable is a tmpfs the runtime
@@ -442,6 +450,16 @@ def fixture(args, binary, root, owned):
     selected_tests = [test for test in TESTS if engine == "pg" or test !=
                       "pg16_storage::the_supplied_storage_layout_admits_its_observed_major_and_survives_live_checks"]
     cases = [(test, empty) for test in selected_tests for empty in ([False, True] if test == uts else [False])]
+    if engine == "pg":
+        cases.extend((test, False) for test in PRODUCER_TESTS)
+    if args.producer_only:
+        cases = [(test, False) for test in PRODUCER_TESTS]
+    # The legacy cleanup case stops this same supplied engine. Keep it last
+    # so every producer can still acquire its qualified administrative view.
+    terminal_cleanup = "an_unconfirmed_cleanup_reports_only_the_run_owned_names"
+    cases = [case for case in cases if case[0] != terminal_cleanup] + [
+        case for case in cases if case[0] == terminal_cleanup
+    ]
     for test, empty in cases:
         empty_server = f"pbps-dedicated-empty-{unique}"
         if empty:
@@ -473,6 +491,8 @@ def fixture(args, binary, root, owned):
                 fixture_image(engine, pg_major), "120", **QUIET)
         command = [binary, "--ignored", "--exact",
                    f"resolver::server::live_tests::{test}", "--nocapture"]
+        if test in PRODUCER_TESTS:
+            command[3] = test
         selected = dict(os.environ, **environment)
         if empty:
             selected["PBPS_SERVER_ENDPOINT"] = endpoint(empty_server, pg_major)
@@ -514,9 +534,13 @@ def main():
     parser.add_argument("--socket", default="/var/run/docker.sock")
     parser.add_argument("--pg-major", type=int, choices=[16, 18], default=18,
                         help="the pinned PostgreSQL version and supplied layout (default: 18)")
+    parser.add_argument("--producer-only", action="store_true",
+                        help="run only the focused #1274 supplied PostgreSQL producer case")
     args = parser.parse_args()
     if args.engine != "pg" and args.pg_major != 18:
         parser.error("--pg-major 16 requires the PostgreSQL engine")
+    if args.producer_only and args.engine != "pg":
+        parser.error("--producer-only requires pg")
     global DOCKER_SOCKET
     DOCKER_SOCKET = args.socket
     if os.geteuid() != 0:

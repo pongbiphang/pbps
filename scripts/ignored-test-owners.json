@@ -145,6 +145,43 @@
         }
       ]
     },
+    "server-producer": {
+      "platform": "linux",
+      "fixture": "Root observer and supplied PostgreSQL; focused qualified evidence producer.",
+      "job": "resolver",
+      "script": "scripts/live-resolver-server.py",
+      "selection": {
+        "kind": "data",
+        "file": "scripts/live-resolver-server.py",
+        "expression": "PRODUCER_TESTS",
+        "prefix": ""
+      },
+      "witnesses": [
+        {
+          "file": "scripts/live-resolver-server.py",
+          "language": "python",
+          "scope": "<module>",
+          "requires": ["main()"]
+        },
+        {
+          "file": "scripts/live-resolver-server.py",
+          "language": "python",
+          "scope": "main",
+          "requires": ["fixture(args, binary, root, owned)"]
+        },
+        {
+          "file": "scripts/live-resolver-server.py",
+          "language": "python",
+          "scope": "fixture",
+          "requires": [
+            "cases.extend((test, False) for test in PRODUCER_TESTS)",
+            "if test in PRODUCER_TESTS:",
+            "command[3] = test",
+            "run(*command,"
+          ]
+        }
+      ]
+    },
     "target": {
       "platform": "linux",
       "fixture": "Root native Docker observer; explicitly prebuilt library test executable.",
@@ -157,7 +194,7 @@
       "selection": {
         "kind": "data",
         "file": "scripts/live-resolver-target.py",
-        "expression": "[DAEMON_TEST, TARGET_TEST, FACTORY_TEST, RECIPE_TEST, ANALYSIS_TEST, INVALIDATION_TEST, CANCELLATION_TEST, DEADLINE_TEST, ADMIN_RECOVERY_TEST, SCRATCH_RECOVERY_TEST, JANITOR_RECOVERY_TEST, SQL_RECOVERY_CLOSE_TEST, SQL_RECOVERY_DISCARD_TEST, SQL_RECOVERY_CANCEL_TEST]",
+        "expression": "NATIVE_TESTS",
         "prefix": ""
       },
       "witnesses": [
@@ -183,7 +220,7 @@
           "scope": "fixture",
           "requires": [
             "if args.native_host:",
-            "native_tests(binary, env)"
+            "native_tests(binary, env, args.producer_only)"
           ]
         },
         {
@@ -191,7 +228,7 @@
           "language": "python",
           "scope": "native_tests",
           "requires": [
-            "for test in (DAEMON_TEST, TARGET_TEST, FACTORY_TEST, RECIPE_TEST, ANALYSIS_TEST, INVALIDATION_TEST, CANCELLATION_TEST, DEADLINE_TEST, ADMIN_RECOVERY_TEST, SCRATCH_RECOVERY_TEST, JANITOR_RECOVERY_TEST, SQL_RECOVERY_CLOSE_TEST, SQL_RECOVERY_DISCARD_TEST, SQL_RECOVERY_CANCEL_TEST):",
+            "for test in PRODUCER_TESTS if producer_only else NATIVE_TESTS:",
             "run(binary, \"--ignored\", \"--exact\", test,"
           ]
         },
@@ -785,6 +822,19 @@
         "lib",
         "pbps_cli"
       ],
+      "owner": "server-producer",
+      "validate_on": "linux",
+      "ignored_on": ["linux", "win32", "darwin"],
+      "cases": [
+        "resolver::server::qualified_evidence_tests::the_supplied_producer_seals_the_overload_and_default_from_one_fresh_read",
+        "resolver::server::qualified_evidence_tests::the_supplied_empty_target_producer_orders_table_routines_and_expressions_before_sealing",
+        "resolver::server::qualified_evidence_tests::the_supplied_replaced_routine_rebuilds_cross_kind_dependents_in_the_final_plan",
+        "resolver::server::qualified_evidence_tests::the_supplied_recorded_table_and_column_uids_survive_rename_with_dependent_rebuilds",
+        "resolver::server::qualified_evidence_tests::the_supplied_rebuilt_routine_with_explicit_public_execution_matches_the_post_ddl_acl"
+      ]
+    },
+    {
+      "target": ["pbps-cli", "lib", "pbps_cli"],
       "owner": "server",
       "validate_on": "linux",
       "ignored_on": [
@@ -860,6 +910,26 @@
         "resolver::server::container_tests::relay_recovery::admin_launch_recovery_distinguishes_absence_from_uncertainty_without_losing_other_owners",
         "resolver::server::container_tests::relay_recovery::scratch_launch_recovery_distinguishes_absence_from_uncertainty_without_losing_other_owners",
         "resolver::server::container_tests::relay_recovery::janitor_launch_recovery_distinguishes_absence_from_uncertainty_without_losing_other_owners",
+        "resolver::server::qualified_evidence_tests::the_container_producer_seals_the_overload_and_default_from_one_fresh_read",
+        "resolver::server::qualified_evidence_tests::only_recorded_table_and_index_roots_own_their_catalog_columns",
+        "resolver::server::qualified_evidence_tests::a_same_named_view_cannot_own_the_declared_table_uid",
+        "resolver::server::qualified_evidence_tests::a_same_named_index_on_another_table_cannot_own_the_declared_index",
+        "resolver::server::qualified_evidence_tests::the_connected_producer_refuses_a_missing_environment_key_before_sealing",
+        "resolver::server::qualified_evidence_tests::a_rebuilt_view_projects_creation_defaults_instead_of_old_target_grants",
+        "resolver::server::qualified_evidence_tests::an_empty_target_producer_orders_table_routines_and_expressions_before_sealing",
+        "resolver::server::qualified_evidence_tests::a_replaced_routine_rebuilds_cross_kind_dependents_in_the_final_plan",
+        "resolver::server::qualified_evidence_tests::recorded_table_and_column_uids_survive_rename_with_dependent_rebuilds",
+        "resolver::server::qualified_evidence_tests::recorded_rename_retains_the_ordinary_table_owner_dependency",
+        "resolver::server::qualified_evidence_tests::rebuilt_routine_with_explicit_public_execution_matches_the_post_ddl_acl",
+        "resolver::server::qualified_evidence_tests::rebuilt_routine_replays_declared_grants_and_only_ordinary_role_acl_edges",
+        "resolver::server::qualified_evidence_tests::unrepresentable_routine_grant_option_refuses_before_evidence",
+        "resolver::server::qualified_evidence_tests::an_unaffected_routine_keeps_its_grant_option_through_connected_evidence",
+        "resolver::server::qualified_evidence_tests::newly_created_routines_project_schema_default_grants_then_public_revoke",
+        "resolver::server::qualified_evidence_tests::a_new_routine_created_as_an_ordinary_deployer_keeps_its_owner_edge",
+        "resolver::server::qualified_evidence_tests::an_explicit_extra_schema_changes_only_the_unqualified_lookup_in_the_final_plan",
+        "resolver::server::qualified_evidence_tests::recorded_renames_and_reused_old_spellings_keep_distinct_owned_inventories",
+        "resolver::server::qualified_evidence_tests::recorded_renames_with_type_and_nullability_edits_match_actual_child_catalog",
+        "resolver::server::qualified_evidence_tests::persisted_authorization_is_stable_across_processes_only_with_the_same_environment_key",
         "resolver::docker::tests::direct_native_daemon_is_accepted_but_a_root_owned_proxy_is_not",
         "resolver::native::target::tests::native_aliases_share_one_instance_and_backend_children_cannot_claim_another",
         "resolver::server::container_tests::sql_recovery::confirmed_workload_removal_finishes_only_its_existing_sql_recovery",

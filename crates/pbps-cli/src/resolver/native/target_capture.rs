@@ -321,3 +321,7 @@ mod tests {
         assert!(!qualified(&inputs.engine, inputs.libraries.iter()));
     }
 }
+
+#[cfg(test)]
+#[path = "target_capture/build_encoding_tests.rs"]
+mod build_encoding_tests;

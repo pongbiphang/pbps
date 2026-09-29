@@ -669,3 +669,6 @@ mod owner_mutation_scope_tests;
 
 #[cfg(test)]
 mod chained_rename_tests;
+
+#[cfg(test)]
+mod qualification_phase_tests;

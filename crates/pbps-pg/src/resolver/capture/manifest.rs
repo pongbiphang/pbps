@@ -1755,3 +1755,10 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, unix))]
+mod acl_order_tests;
+#[cfg(all(test, unix))]
+mod guard_tests;
+#[cfg(all(test, unix))]
+mod view_ownership_tests;

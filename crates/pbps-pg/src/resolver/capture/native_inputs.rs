@@ -366,3 +366,6 @@ mod tests {
         assert!(resolution != inputs("$libdir/other_hook", "$libdir"));
     }
 }
+
+#[cfg(test)]
+mod association_tests;

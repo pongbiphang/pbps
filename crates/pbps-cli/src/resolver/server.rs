@@ -2617,3 +2617,9 @@ mod live_tests;
 
 #[cfg(test)]
 pub(crate) mod container_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod qualified_evidence_cases;
+
+#[cfg(all(test, target_os = "linux"))]
+mod qualified_evidence_tests;
