@@ -108,6 +108,73 @@ fn relation_identity(table: &pbps_model::TableName) -> ObjectIdentity {
     }
 }
 
+/// Validate explicit index creation against the unmodified scratch capture.
+/// Table-rename projection changes the parent's owner later in the seal, so
+/// comparing an index with that mutable parent would depend on surface order.
+fn qualified_explicit_indexes(
+    captured: &CapturedInputs,
+    ownership: &BTreeMap<ObjectIdentity, pbps_model::resolver::ObjectOwnership>,
+    surfaces: &BTreeSet<pbps_model::resolver::Surface>,
+) -> Result<BTreeSet<ObjectIdentity>, pbps_model::resolver::ManifestError> {
+    use pbps_model::resolver::{ManifestError, ObjectOwnership, Surface};
+    let mut indexes = BTreeSet::new();
+    for surface in surfaces {
+        let Surface::Index { table, name } = surface else {
+            return Err(ManifestError::Invalid);
+        };
+        let index = ObjectIdentity {
+            class: "pg_class".into(),
+            name: vec![table.schema.clone(), name.clone()],
+            signature: Vec::new(),
+        };
+        if ownership.get(&index) != Some(&ObjectOwnership::Surface(surface.clone())) {
+            return Err(ManifestError::Incomplete);
+        }
+        let row = captured
+            .inputs
+            .get(&index)
+            .ok_or(ManifestError::Incomplete)?;
+        // The measured CREATE INDEX path produces ordinary indexes. A
+        // partitioned index has a different relkind and is not inferred here.
+        if row.properties.get("relkind").and_then(Value::as_str) != Some("i") {
+            return Err(ManifestError::Invalid);
+        }
+        let metadata = ObjectIdentity {
+            class: "pg_index".into(),
+            name: Vec::new(),
+            signature: vec![index.clone()],
+        };
+        let parent: ObjectIdentity = serde_json::from_value(
+            captured
+                .inputs
+                .get(&metadata)
+                .and_then(|input| input.properties.get("indrelid"))
+                .cloned()
+                .ok_or(ManifestError::Incomplete)?,
+        )
+        .map_err(|_| ManifestError::Invalid)?;
+        if parent != relation_identity(table) {
+            return Err(ManifestError::Invalid);
+        }
+        let parent_owner = captured
+            .inputs
+            .get(&parent)
+            .and_then(|input| input.properties.get("relowner"))
+            .ok_or(ManifestError::Incomplete)?;
+        if row.properties.get("relowner") != Some(parent_owner)
+            || captured.inputs.keys().any(|id| {
+                id.class == "pg_shdepend"
+                    && id.name == ["o"]
+                    && id.signature.first() == Some(&index)
+            })
+        {
+            return Err(ManifestError::Invalid);
+        }
+        indexes.insert(index);
+    }
+    Ok(indexes)
+}
+
 // Target metadata inserted into a scratch capture has already been named in
 // the opening catalog. Keep that provenance until sealing: an opening role
 // must not be mistaken for the scratch server's native role of the same name,
@@ -760,6 +827,8 @@ impl CompiledCapture {
                 _ => None,
             })
             .collect();
+        let verified_indexes =
+            qualified_explicit_indexes(&self.captured, &self.ownership, &added_indexes)?;
         let lookup: BTreeMap<_, _> = self
             .captured
             .inputs
@@ -929,54 +998,11 @@ impl CompiledCapture {
                         }
                     }
                 }
-                if let Surface::Index { table, name } = &transition.surface
+                if let Surface::Index { table, .. } = &transition.surface
                     && added_indexes.contains(&transition.surface)
-                    && object.class == "pg_class"
-                    && object.name == [table.schema.clone(), name.clone()]
+                    && verified_indexes.contains(raw)
+                    && owner == &ObjectOwnership::Surface(transition.surface.clone())
                 {
-                    let index = self
-                        .captured
-                        .inputs
-                        .get(raw)
-                        .ok_or(ManifestError::Incomplete)?;
-                    if !matches!(
-                        index.properties.get("relkind").and_then(Value::as_str),
-                        Some("i" | "I")
-                    ) {
-                        return Err(ManifestError::Invalid);
-                    }
-                    let metadata = ObjectIdentity {
-                        class: "pg_index".into(),
-                        name: Vec::new(),
-                        signature: vec![raw.clone()],
-                    };
-                    let parent: ObjectIdentity = serde_json::from_value(
-                        self.captured
-                            .inputs
-                            .get(&metadata)
-                            .and_then(|input| input.properties.get("indrelid"))
-                            .cloned()
-                            .ok_or(ManifestError::Incomplete)?,
-                    )
-                    .map_err(|_| ManifestError::Invalid)?;
-                    if parent != relation_identity(table) {
-                        return Err(ManifestError::Invalid);
-                    }
-                    let scratch_parent_owner = self
-                        .captured
-                        .inputs
-                        .get(&parent)
-                        .and_then(|input| input.properties.get("relowner"))
-                        .ok_or(ManifestError::Incomplete)?;
-                    if index.properties.get("relowner") != Some(scratch_parent_owner)
-                        || self.captured.inputs.keys().any(|id| {
-                            id.class == "pg_shdepend"
-                                && id.name == ["o"]
-                                && id.signature.first() == Some(raw)
-                        })
-                    {
-                        return Err(ManifestError::Invalid);
-                    }
                     // PostgreSQL creates an explicit index under its table's
                     // owner, even when another role issues CREATE INDEX. The
                     // recorded table UID selects the opening owner across a
