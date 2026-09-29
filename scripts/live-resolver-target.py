@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,10 @@ PASSWORD = "Pbps!NativeFixture12345"
 TARGET_TEST = "resolver::native::target::tests::native_aliases_share_one_instance_and_backend_children_cannot_claim_another"
 FACTORY_TEST = "resolver::docker::session::native_factory_tests::native_factory_qualifies_before_bootstrap_and_rejects_rebound_target_connections"
 RECIPE_TEST = "resolver::docker::session::pg_recipe_tests::the_public_factory_runs_the_pinned_engine_on_bounded_private_storage"
+ANALYSIS_TEST = "resolver::server::container_tests::the_owned_container_resolves_the_overload_pair_on_its_qualified_connections"
+INVALIDATION_TEST = "resolver::server::container_tests::a_changed_owned_runtime_or_target_ends_container_analysis_permanently"
+CANCELLATION_TEST = "resolver::server::container_tests::cancelled_container_analysis_removes_or_names_every_owned_resource"
+DEADLINE_TEST = "resolver::server::container_tests::delayed_container_analysis_expires_at_its_first_owner_bound"
 DAEMON_TEST = "resolver::docker::tests::direct_native_daemon_is_accepted_but_a_root_owned_proxy_is_not"
 QUIET = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
 DOCKER_SOCKET = "/var/run/docker.sock"
@@ -54,8 +59,8 @@ def interrupted(signum, _frame):
 def native_tests(binary, env):
     # The daemon/proxy case needs the same disposable root host as the factory;
     # the ordinary library run only compiles it and leaves it ignored.
-    for test in (DAEMON_TEST, TARGET_TEST, FACTORY_TEST, RECIPE_TEST):
-        if test == RECIPE_TEST and env.get("PBPS_NATIVE_DRIVER") != "pg":
+    for test in (DAEMON_TEST, TARGET_TEST, FACTORY_TEST, RECIPE_TEST, ANALYSIS_TEST, INVALIDATION_TEST, CANCELLATION_TEST, DEADLINE_TEST):
+        if test in (RECIPE_TEST, ANALYSIS_TEST, INVALIDATION_TEST, CANCELLATION_TEST, DEADLINE_TEST) and env.get("PBPS_NATIVE_DRIVER") != "pg":
             continue
         result = run(binary, "--ignored", "--exact", test, "--nocapture",
                      env=dict(os.environ, **env), stdout=subprocess.PIPE,
@@ -94,7 +99,9 @@ def fixture(args, binary, root, owned):
     image = fixture_image(engine, args.pg_major)
     name = "pbps-native-target-" + uuid.uuid4().hex
     if engine == "pg":
-        environment = ["-e", f"POSTGRES_PASSWORD={PASSWORD}"]
+        # The owned resolver launches with C.UTF-8; keep target session-wide
+        # locale settings comparable while preserving actual engine checks.
+        environment = ["-e", f"POSTGRES_PASSWORD={PASSWORD}", "-e", "LANG=C.UTF-8"]
         boot = ("chown postgres:postgres /tmp/peer.key; chmod 600 /tmp/peer.key; "
                 "exec docker-entrypoint.sh postgres -c listen_addresses=127.0.0.1 "
                 "-c ssl=on -c ssl_cert_file=/tmp/peer.pem -c ssl_key_file=/tmp/peer.key")
@@ -181,6 +188,7 @@ def fixture(args, binary, root, owned):
                    PBPS_RESOLVER_TEST_IMAGE=image)
         if engine == "pg":
             env["PBPS_NATIVE_PG_MAJOR"] = str(args.pg_major)
+            env["PBPS_NATIVE_DOCKER"] = str(Path(shutil.which("docker")).resolve())
         native_tests(binary, env)
         return
     reader = "pbps-native-reader-" + uuid.uuid4().hex

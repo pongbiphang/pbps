@@ -12,6 +12,9 @@ use tokio::io::AsyncWriteExt as _;
 
 pub struct CandidateSession {
     state: Option<State>,
+    pending: Option<analysis::Pending>,
+    analysis_in_flight: bool,
+    analysis_recovery: Vec<String>,
 }
 
 struct State {
@@ -22,6 +25,9 @@ struct State {
     native: Option<NativeRun>,
     target: Option<TargetWitness>,
     layout: engine::Layout,
+    password: String,
+    analysis_api: LocalApi,
+    image: CandidateImage,
 }
 
 struct NativeRun {
@@ -167,18 +173,22 @@ impl CandidateSession {
                 });
             }
         };
+        let held_image = image.clone();
         let result = Self::connect_control(
             control_api,
             attach_api,
             retry_api,
             image,
             driver,
-            password,
+            password.clone(),
             &workload,
         )
         .await;
         match result {
-            Ok((control, connection, identity)) => Ok(Self {
+            Ok((control, connection, identity, analysis_api)) => Ok(Self {
+                pending: None,
+                analysis_in_flight: false,
+                analysis_recovery: Vec::new(),
                 state: Some(State {
                     connection,
                     identity,
@@ -187,6 +197,9 @@ impl CandidateSession {
                     native: None,
                     target: None,
                     layout,
+                    password,
+                    analysis_api,
+                    image: held_image,
                 }),
             }),
             Err(mut error) => {
@@ -243,7 +256,7 @@ impl CandidateSession {
         driver: Driver,
         password: String,
         workload: &CandidateRun,
-    ) -> Result<(CandidateRun, StreamConn, InstanceObservation), StartFailure> {
+    ) -> Result<(CandidateRun, StreamConn, InstanceObservation, LocalApi), StartFailure> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
         let (mut api, mut attach_api) = (api, attach_api);
         loop {
@@ -258,7 +271,9 @@ impl CandidateSession {
             )
             .await;
             let (failure, engine_starting) = match attempt {
-                Ok(session) => return Ok(session),
+                Ok((control, connection, identity)) => {
+                    return Ok((control, connection, identity, retry_api));
+                }
                 Err(failure) => failure,
             };
             // A non-empty `recovery_names` means the attempt could not confirm
@@ -418,6 +433,9 @@ impl CandidateSession {
     }
 
     pub fn identity(&mut self) -> Result<&InstanceObservation, Error> {
+        if self.analysis_in_flight || self.pending.is_some() {
+            return Err(Error::RuntimeChanged);
+        }
         let state = self.state.as_ref().ok_or(Error::ControlLost)?;
         // The supervisor cannot clear this handle's cached state. Revalidate
         // its native leases here even when no async check preceded the read.
@@ -438,6 +456,9 @@ impl CandidateSession {
         &mut self,
         target: &mut NativeTarget,
     ) -> Result<(), Error> {
+        if self.analysis_in_flight || self.pending.is_some() {
+            return Err(Error::RuntimeChanged);
+        }
         let mut state = self.state.take().ok_or(Error::ControlLost)?;
         target.check().await.map_err(|_| Error::RuntimeChanged)?;
         let target_id = target.connection_id().map_err(|_| Error::RuntimeChanged)?;
@@ -462,6 +483,9 @@ impl CandidateSession {
     }
 
     pub async fn check(&mut self) -> Result<(), Error> {
+        if self.analysis_in_flight || self.pending.is_some() {
+            return Err(Error::RuntimeChanged);
+        }
         // Cancellation takes the connection and both ownership handles out of
         // the session. Their drops close traffic and request owned cleanup.
         let mut state = self.state.take().ok_or(Error::ControlLost)?;
@@ -471,9 +495,18 @@ impl CandidateSession {
     }
 
     pub async fn close(mut self) -> Result<(), StartFailure> {
+        if self.analysis_in_flight {
+            return self.discard().await.map_err(|failure| StartFailure {
+                cause: Error::Cleanup,
+                recovery_names: failure.recovery_names,
+            });
+        }
         let state = self.state.take().ok_or_else(|| failure(Error::Cleanup))?;
-        drop(state.connection);
         let mut recovery_names = Vec::new();
+        if let Some(mut pending) = self.pending.take() {
+            recovery_names.extend(analysis::cleanup_pending(&state, &mut pending).await);
+        }
+        drop(state.connection);
         let name = state.control.resource_name().to_owned();
         if state.control.close().await.is_err() {
             recovery_names.push(name);
@@ -533,3 +566,7 @@ mod native_factory_tests;
 
 #[cfg(test)]
 mod pg_recipe_tests;
+
+#[path = "session/analysis.rs"]
+mod analysis;
+pub(crate) use analysis::{ContainerControl, ContainerSession};

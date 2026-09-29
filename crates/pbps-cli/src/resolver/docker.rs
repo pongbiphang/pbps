@@ -30,6 +30,7 @@ pub(crate) use lifecycle::CandidateRun;
 pub use lifecycle::StartFailure;
 pub use reserved::ReservedSession;
 pub use session::CandidateSession;
+pub(crate) use session::{ContainerControl, ContainerSession};
 
 const API: &str = "/v1.47";
 const REQUEST_BUDGET: Duration = Duration::from_secs(15);

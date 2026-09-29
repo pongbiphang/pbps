@@ -11,21 +11,21 @@ use pbps_db::resolver::{
 use pbps_db::transport::StreamConn;
 use pbps_db::{DbError, Driver};
 
-pub(super) async fn identity(connection: &mut StreamConn) -> Result<InstanceObservation, DbError> {
+pub(crate) async fn identity(connection: &mut StreamConn) -> Result<InstanceObservation, DbError> {
     match connection.driver() {
         Driver::Postgres => pbps_pg::resolver::instance_identity(connection).await,
         Driver::Mssql => pbps_mssql::resolver::instance_identity(connection).await,
     }
 }
 
-pub(super) async fn own_session(connection: &mut StreamConn) -> Result<OwnSession, DbError> {
+pub(crate) async fn own_session(connection: &mut StreamConn) -> Result<OwnSession, DbError> {
     match connection.driver() {
         Driver::Postgres => pbps_pg::resolver::own_session(connection).await,
         Driver::Mssql => pbps_mssql::resolver::own_session(connection).await,
     }
 }
 
-pub(super) async fn client_sessions(
+pub(crate) async fn client_sessions(
     connection: &mut StreamConn,
 ) -> Result<SessionInventory, DbError> {
     match connection.driver() {
@@ -34,7 +34,7 @@ pub(super) async fn client_sessions(
     }
 }
 
-pub(super) async fn session_counter(
+pub(crate) async fn session_counter(
     connection: &mut StreamConn,
 ) -> Result<SessionCounter, DbError> {
     match connection.driver() {
@@ -43,7 +43,7 @@ pub(super) async fn session_counter(
     }
 }
 
-pub(super) async fn create_scratch(
+pub(crate) async fn create_scratch(
     connection: &mut StreamConn,
     names: &ScratchNames,
     recipe: &DatabaseRecipe,
@@ -54,14 +54,14 @@ pub(super) async fn create_scratch(
     }
 }
 
-pub(super) async fn drop_roles(connection: &mut StreamConn, roles: &[String]) -> Vec<String> {
+pub(crate) async fn drop_roles(connection: &mut StreamConn, roles: &[String]) -> Vec<String> {
     match connection.driver() {
         Driver::Postgres => pbps_pg::resolver::drop_roles(connection, roles).await,
         Driver::Mssql => pbps_mssql::resolver::drop_roles(connection, roles).await,
     }
 }
 
-pub(super) async fn drop_scratch(
+pub(crate) async fn drop_scratch(
     connection: &mut StreamConn,
     names: &ScratchNames,
 ) -> Result<(), DbError> {
@@ -121,7 +121,7 @@ pub(super) fn reconstruction(
 }
 
 /// Compiles the reconstruction as whatever role the session is.
-pub(super) async fn compile(
+pub(crate) async fn compile(
     reconstruction: &mut Reconstruction,
     extras: &[String],
     connection: &mut StreamConn,
@@ -140,7 +140,7 @@ pub(super) async fn compile(
 
 /// Captures scratch twice: its managed objects, and then the scope their
 /// bindings derive, which is the scope the target is captured under too.
-pub(super) async fn capture_desired(
+pub(crate) async fn capture_desired(
     connection: &mut StreamConn,
     base: &Managed,
     desired: &Managed,

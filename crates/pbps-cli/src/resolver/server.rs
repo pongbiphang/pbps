@@ -13,7 +13,9 @@
 //! managed declarations cross only in `resolve` (#613), and source handling
 //! remains a later #595 step.
 
-use crate::resolver::docker::{CandidateImage, LocalApi, forwarder::Forwarder};
+use crate::resolver::docker::{
+    CandidateImage, ContainerControl, ContainerSession, LocalApi, forwarder::Forwarder,
+};
 use crate::resolver::native::{
     FORWARDER_PRIVILEGES, MqueueLease, NativeTarget, ProcessLease, TargetWitness, guarded_tasks,
 };
@@ -29,8 +31,8 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
-mod engine;
-mod exclusivity;
+pub(crate) mod engine;
+pub(crate) mod exclusivity;
 pub(crate) mod profile;
 mod runtime;
 
@@ -572,7 +574,7 @@ impl Session {
 
 /// The kernel half of a session check, on the parts rather than a built
 /// `Session`, so `Session::open` can run it before it owns one.
-fn check_kernel_parts(
+pub(crate) fn check_kernel_parts(
     init: &ProcessLease,
     forwarder_guard: &ProcessLease,
     mqueue: &MqueueLease,
@@ -960,13 +962,14 @@ impl DedicatedServer {
         // strike a run that exists in neither place.
         let inner = self.inner.take().ok_or_else(|| failure(Error::Consumed))?;
         Ok(ScratchRun {
-            inner,
-            scratch: Some(scratch),
+            inner: RunControl::Supplied(Box::new(inner)),
+            scratch: Some(RunSession::Supplied(Box::new(scratch))),
             names,
             in_flight: false,
             removed: false,
             scope: None,
             compiled: false,
+            operation_in_flight: false,
         })
     }
 
@@ -1073,13 +1076,251 @@ impl DedicatedServer {
     }
 }
 
+/// The two admitted runtime owners. All analysis operations use ScratchRun;
+/// each arm retains its own admission, continuity and removal obligations.
+enum RunControl {
+    Supplied(Box<Inner>),
+    Container(Box<ContainerControl>),
+}
+
+enum RunSession {
+    Supplied(Box<Session>),
+    Container(Box<ContainerSession>),
+}
+
+// Existing supplied-server fixture modules inspect private run internals.
+// These adapters exist only in test builds; production calls dispatch through
+// the closed runtime enum and never infer an owner from Deref.
+#[cfg(test)]
+impl std::ops::Deref for RunControl {
+    type Target = Inner;
+    fn deref(&self) -> &Inner {
+        match self {
+            Self::Supplied(inner) => inner,
+            Self::Container(_) => panic!("supplied fixture used a container run"),
+        }
+    }
+}
+#[cfg(test)]
+impl std::ops::DerefMut for RunControl {
+    fn deref_mut(&mut self) -> &mut Inner {
+        match self {
+            Self::Supplied(inner) => inner,
+            Self::Container(_) => panic!("supplied fixture used a container run"),
+        }
+    }
+}
+#[cfg(test)]
+impl std::ops::Deref for RunSession {
+    type Target = Session;
+    fn deref(&self) -> &Session {
+        match self {
+            Self::Supplied(session) => session,
+            Self::Container(_) => panic!("supplied fixture used a container session"),
+        }
+    }
+}
+#[cfg(test)]
+impl std::ops::DerefMut for RunSession {
+    fn deref_mut(&mut self) -> &mut Session {
+        match self {
+            Self::Supplied(session) => session,
+            Self::Container(_) => panic!("supplied fixture used a container session"),
+        }
+    }
+}
+
+impl RunSession {
+    fn connection(&self) -> &StreamConn {
+        match self {
+            Self::Supplied(s) => &s.connection,
+            Self::Container(s) => &s.connection,
+        }
+    }
+    fn connection_mut(&mut self) -> &mut StreamConn {
+        match self {
+            Self::Supplied(s) => &mut s.connection,
+            Self::Container(s) => &mut s.connection,
+        }
+    }
+    fn backend(&self) -> &ProcessLease {
+        match self {
+            Self::Supplied(s) => &s.backend,
+            Self::Container(s) => s.backend(),
+        }
+    }
+}
+
+impl RunControl {
+    fn driver(&self) -> Driver {
+        match self {
+            Self::Supplied(s) => s.control.driver,
+            Self::Container(s) => s.driver(),
+        }
+    }
+    fn ensure_live(&self) -> Result<(), Error> {
+        match self {
+            Self::Supplied(s) => s.live().map(|_| ()),
+            Self::Container(s) => s.live(),
+        }
+    }
+    fn refusal(&self) -> Option<Error> {
+        match self {
+            Self::Supplied(s) => s.refusal.clone(),
+            Self::Container(s) => s.refusal(),
+        }
+    }
+    fn refuse(&mut self, cause: Error) {
+        match self {
+            Self::Supplied(s) => s.refuse(cause),
+            Self::Container(s) => s.refuse(cause),
+        }
+    }
+    fn roles_mut(&mut self) -> &mut Vec<String> {
+        match self {
+            Self::Supplied(s) => &mut s.control.roles,
+            Self::Container(s) => &mut s.roles,
+        }
+    }
+    fn admin_connection(&mut self) -> Option<&mut StreamConn> {
+        match self {
+            Self::Supplied(s) => s.control.admin.as_mut().map(|s| &mut s.connection),
+            Self::Container(s) => s.admin.as_mut().map(|s| &mut s.connection),
+        }
+    }
+    fn held_admin(&self) -> bool {
+        match self {
+            Self::Supplied(s) => s.control.admin.is_some(),
+            Self::Container(s) => s.admin.is_some(),
+        }
+    }
+    fn retire_admin(&mut self) {
+        match self {
+            Self::Supplied(s) => {
+                if let Some(admin) = s.control.admin.take() {
+                    s.control.retire(admin);
+                }
+            }
+            Self::Container(s) => s.retire_admin(),
+        }
+    }
+    fn retire(&mut self, session: RunSession) {
+        match (self, session) {
+            (Self::Supplied(s), RunSession::Supplied(session)) => s.control.retire(*session),
+            (Self::Container(s), RunSession::Container(session)) => s.retire(*session),
+            _ => unreachable!("session and runtime are sealed together"),
+        }
+    }
+    fn admin_login(&self, database: &str) -> StreamLogin {
+        match self {
+            Self::Supplied(s) => s.control.endpoint.login(database),
+            Self::Container(s) => s.admin_login(database),
+        }
+    }
+    async fn check(&mut self, extra: Option<&RunSession>) -> Result<(), Error> {
+        match (self, extra) {
+            (Self::Supplied(s), Some(RunSession::Supplied(extra))) => s.check(Some(extra)).await,
+            (Self::Supplied(s), None) => s.check(None).await,
+            (Self::Container(s), Some(RunSession::Container(extra))) => s.check(Some(extra)).await,
+            (Self::Container(s), None) => s.check(None).await,
+            _ => Err(Error::Cancelled),
+        }
+    }
+    async fn open_channel(
+        &mut self,
+        login: StreamLogin,
+        scratch: Option<&RunSession>,
+    ) -> Result<RunSession, Error> {
+        match self {
+            Self::Supplied(inner) => {
+                let analysis = inner.live()?;
+                let control_pair = &inner.control.session.as_ref().ok_or(Error::Cancelled)?.pair;
+                let mut pairs = vec![control_pair];
+                match scratch {
+                    Some(RunSession::Supplied(scratch)) => pairs.push(&scratch.pair),
+                    None => {}
+                    _ => return Err(Error::Cancelled),
+                }
+                let session =
+                    Session::open(inner.control.channel(), &analysis.runtime, login, &pairs)
+                        .await
+                        .map_err(|failure| {
+                            let cause = inner.control.retain_failure(failure);
+                            inner.refuse(cause.clone());
+                            cause
+                        })?;
+                if let Some(analysis) = inner.analysis.as_mut() {
+                    analysis.opened += 1;
+                }
+                Ok(RunSession::Supplied(Box::new(session)))
+            }
+            Self::Container(control) => {
+                let scratch = match scratch {
+                    Some(RunSession::Container(s)) => Some(s),
+                    None => None,
+                    _ => return Err(Error::Cancelled),
+                };
+                match control
+                    .open_channel(login, scratch.map(|session| &**session))
+                    .await
+                {
+                    Ok(session) => Ok(RunSession::Container(Box::new(session))),
+                    Err(failure) => {
+                        control.refuse(failure.cause.clone());
+                        Err(failure.cause)
+                    }
+                }
+            }
+        }
+    }
+    fn store_admin(&mut self, session: RunSession) {
+        match (self, session) {
+            (Self::Supplied(s), RunSession::Supplied(session)) => {
+                s.control.admin = Some(*session);
+            }
+            (Self::Container(s), RunSession::Container(session)) => {
+                s.admin = Some(*session);
+            }
+            _ => unreachable!("session and runtime are sealed together"),
+        }
+    }
+    async fn close(
+        &mut self,
+        scratch: Option<RunSession>,
+        names: &ScratchNames,
+        cause: Error,
+    ) -> ServerFailure {
+        match self {
+            Self::Supplied(inner) => {
+                match scratch {
+                    Some(RunSession::Supplied(scratch)) => inner.control.retire(*scratch),
+                    None => {}
+                    _ => unreachable!("session and runtime are sealed together"),
+                }
+                let removal = cleanup(&mut inner.control, names, cause).await;
+                report(removal, close_control(&mut inner.control).await)
+            }
+            Self::Container(control) => {
+                let scratch = match scratch {
+                    Some(RunSession::Container(s)) => Some(s),
+                    None => None,
+                    _ => unreachable!("session and runtime are sealed together"),
+                };
+                control
+                    .close(scratch.map(|session| *session), names, cause)
+                    .await
+            }
+        }
+    }
+}
+
 /// An admitted server plus this run's own scratch resources.
 pub struct ScratchRun {
-    inner: Inner,
+    inner: RunControl,
     /// The compilation capability. Dropped on the first refusal, so no later
     /// matching observation can revive the run, while everything cleanup
     /// needs stays.
-    scratch: Option<Session>,
+    scratch: Option<RunSession>,
     names: ScratchNames,
     in_flight: bool,
     removed: bool,
@@ -1090,6 +1331,8 @@ pub struct ScratchRun {
     /// holds a namespace, and a second compilation into it would build on
     /// what the first left rather than on the scope alone.
     compiled: bool,
+    /// A cancelled qualification or resolution leaves the analysis terminal.
+    operation_in_flight: bool,
 }
 
 /// What a run is asked to qualify: the schemas its plan writes to, the extras
@@ -1143,6 +1386,23 @@ struct QualifiedScope {
 }
 
 impl ScratchRun {
+    pub(crate) fn from_container(
+        control: ContainerControl,
+        scratch: ContainerSession,
+        names: ScratchNames,
+    ) -> Self {
+        Self {
+            inner: RunControl::Container(Box::new(control)),
+            scratch: Some(RunSession::Container(Box::new(scratch))),
+            names,
+            in_flight: false,
+            removed: false,
+            scope: None,
+            compiled: false,
+            operation_in_flight: false,
+        }
+    }
+
     pub fn database(&self) -> &str {
         self.names.database()
     }
@@ -1150,6 +1410,9 @@ impl ScratchRun {
     /// The verdict of the qualified scope, if `qualify` has run. `Verified`
     /// is the only value a later delivery step may build evidence on.
     pub fn verdict(&self) -> Option<Verdict> {
+        if self.operation_in_flight || self.inner.refusal().is_some() {
+            return None;
+        }
         self.scope.as_ref().map(|scope| scope.report.verdict())
     }
 
@@ -1157,6 +1420,9 @@ impl ScratchRun {
     /// later steps seal (#614) and apply rechecks against its own session
     /// (#616). Present once `qualify` has run.
     pub fn authorization_fingerprint(&self) -> Option<&AuthorizationFingerprint> {
+        if self.operation_in_flight || self.inner.refusal().is_some() {
+            return None;
+        }
         self.scope.as_ref().map(|scope| &scope.authorization)
     }
 
@@ -1168,6 +1434,9 @@ impl ScratchRun {
         pbps_db::transport::ConnectionId,
         pbps_db::transport::ConnectionId,
     )> {
+        if self.operation_in_flight || self.inner.refusal().is_some() {
+            return None;
+        }
         self.scope
             .as_ref()
             .map(|scope| (scope.target_connection, scope.scratch_connection))
@@ -1188,11 +1457,30 @@ impl ScratchRun {
         target: &mut NativeTarget,
         request: &ScopeRequest,
     ) -> Result<Verdict, Error> {
+        self.begin_operation()?;
+        let mut entered_runtime = false;
+        let outcome = self
+            .qualify_inner(target, request, &mut entered_runtime)
+            .await;
+        self.operation_in_flight = false;
+        let must_retire = entered_runtime || self.inner.refusal().is_some();
+        if let (true, Err(cause)) = (must_retire, &outcome) {
+            self.refuse_and_retire(cause.clone());
+        }
+        outcome
+    }
+
+    async fn qualify_inner(
+        &mut self,
+        target: &mut NativeTarget,
+        request: &ScopeRequest,
+        entered_runtime: &mut bool,
+    ) -> Result<Verdict, Error> {
         // A cancelled step's session, or a refusal already recorded, ends
         // the run before anything below records new cleanup state.
         self.refuse_held_admin()?;
-        self.inner.live()?;
-        let driver = self.inner.control.driver;
+        self.inner.ensure_live()?;
+        let driver = self.inner.driver();
         let read =
             |error: crate::resolver::native::EnvironmentError| Error::Scope(error.to_string());
         let db = |error: pbps_db::DbError| Error::Scope(error.to_string());
@@ -1204,6 +1492,10 @@ impl ScratchRun {
         let scope_schemas =
             scope::scope_schemas(driver, &request.schemas, &request.write_path_extras)
                 .map_err(Error::Scope)?;
+        // Input validation above has not touched either engine. Once a read
+        // starts, a failed or cancelled qualification cannot be retried on
+        // this run without risking stale scope or scratch state.
+        *entered_runtime = true;
         let (mut target_facts, target_auth) = target
             .scope_facts(
                 &request.schemas,
@@ -1237,8 +1529,8 @@ impl ScratchRun {
         // Added to, never replaced: a role an earlier attempt may have
         // created must stay among the names cleanup drops.
         for role in map.server_wide_names() {
-            if !self.inner.control.roles.contains(&role) {
-                self.inner.control.roles.push(role);
+            if !self.inner.roles_mut().contains(&role) {
+                self.inner.roles_mut().push(role);
             }
         }
         // The mapped deployer runs the plan's grants on scratch and is the
@@ -1254,9 +1546,11 @@ impl ScratchRun {
         // land there instead (finding on #688). Open an admin session to the
         // scratch database for it; the run login cannot, being unprivileged.
         self.admin_session().await?;
-        let reconstruction = self.inner.control.admin.as_mut().ok_or(Error::Cancelled)?;
+        #[cfg(test)]
+        container_tests::pause("container-qualify-admin-owned").await;
+        let reconstruction = self.inner.admin_connection().ok_or(Error::Cancelled)?;
         let outcome = scope::prepare(
-            &mut reconstruction.connection,
+            reconstruction,
             &map,
             &target_auth,
             &request.planned,
@@ -1278,36 +1572,18 @@ impl ScratchRun {
         // code (finding on #688).
         {
             let stale = self.scratch.take().ok_or(Error::Cancelled)?;
-            self.inner.control.retire(stale);
-            let reopened = {
-                let analysis = self.inner.live()?;
-                let control_pair = &self
-                    .inner
-                    .control
-                    .session
-                    .as_ref()
-                    .ok_or(Error::Cancelled)?
-                    .pair;
-                Session::open(
-                    self.inner.control.channel(),
-                    &analysis.runtime,
+            self.inner.retire(stale);
+            let reopened = self
+                .inner
+                .open_channel(
                     StreamLogin {
                         user: self.names.login().to_owned(),
                         password: self.names.password().to_owned(),
                         database: self.names.database().to_owned(),
                     },
-                    &[control_pair],
+                    None,
                 )
-                .await
-                .map_err(|failure| {
-                    let cause = self.inner.control.retain_failure(failure);
-                    self.inner.refuse(cause.clone());
-                    cause
-                })?
-            };
-            if let Some(analysis) = self.inner.analysis.as_mut() {
-                analysis.opened += 1;
-            }
+                .await?;
             self.scratch = Some(reopened);
         }
         let target_authorization = target_auth.digest();
@@ -1329,8 +1605,8 @@ impl ScratchRun {
         // backend's executables, which include any session-preloaded code.
         let (scratch_facts, auth_differences, scratch_connection, scratch_authorization) = {
             let scratch = self.scratch.as_mut().ok_or(Error::Cancelled)?;
-            let connection = scratch.connection.id();
-            scope::enter(&mut scratch.connection, driver, deployer.as_deref())
+            let connection = scratch.connection().id();
+            scope::enter(scratch.connection_mut(), driver, deployer.as_deref())
                 .await
                 .map_err(db)?;
             // Over the full scope, extras included: the expected context
@@ -1338,7 +1614,7 @@ impl ScratchRun {
             // in-scope schemas alone would report the extras absent and
             // refuse a faithful reproduction (finding on #688).
             let differences = scope::settle(
-                &mut scratch.connection,
+                scratch.connection_mut(),
                 &map,
                 &target_auth,
                 &request.planned,
@@ -1346,11 +1622,11 @@ impl ScratchRun {
             )
             .await
             .map_err(db)?;
-            let sealed = scope::seal_scratch(&mut scratch.connection, driver, &scope_schemas)
+            let sealed = scope::seal_scratch(scratch.connection_mut(), driver, &scope_schemas)
                 .await
                 .map_err(db)?;
             let catalog = scope::read_catalog(
-                &mut scratch.connection,
+                scratch.connection_mut(),
                 driver,
                 &request.schemas,
                 &request.write_path_extras,
@@ -1358,7 +1634,7 @@ impl ScratchRun {
             .await
             .map_err(db)?;
             let executables = crate::resolver::native::executables::executables(
-                &scratch.backend,
+                scratch.backend(),
                 &required,
                 &scope::library_path(driver, &catalog),
                 scope::engine_packages(driver),
@@ -1422,7 +1698,7 @@ impl ScratchRun {
         if sealed.report.verdict() != Verdict::Verified {
             return Ok(());
         }
-        let driver = self.inner.control.driver;
+        let driver = self.inner.driver();
         let db = |error: pbps_db::DbError| Error::Scope(error.to_string());
         let read =
             |error: crate::resolver::native::EnvironmentError| Error::Scope(error.to_string());
@@ -1486,16 +1762,16 @@ impl ScratchRun {
         let required = scope::required_libraries(driver, &target_facts.catalog);
         let (scratch_facts, auth_differences) = {
             let scratch = self.scratch.as_mut().ok_or(Error::Cancelled)?;
-            if scratch.connection.id() != sealed_connection {
+            if scratch.connection().id() != sealed_connection {
                 return Err(Error::Scope(
                     "the scratch session was replaced; the qualified scope cannot be reused".into(),
                 ));
             }
-            scope::enter(&mut scratch.connection, driver, deployer.as_deref())
+            scope::enter(scratch.connection_mut(), driver, deployer.as_deref())
                 .await
                 .map_err(db)?;
             let differences = scope::recheck(
-                &mut scratch.connection,
+                scratch.connection_mut(),
                 &map,
                 &target_auth,
                 &planned,
@@ -1504,11 +1780,11 @@ impl ScratchRun {
             )
             .await
             .map_err(db)?;
-            let catalog = scope::read_catalog(&mut scratch.connection, driver, &schemas, &extras)
+            let catalog = scope::read_catalog(scratch.connection_mut(), driver, &schemas, &extras)
                 .await
                 .map_err(db)?;
             let executables = crate::resolver::native::executables::executables(
-                &scratch.backend,
+                scratch.backend(),
                 &required,
                 &scope::library_path(driver, &catalog),
                 scope::engine_packages(driver),
@@ -1541,36 +1817,18 @@ impl ScratchRun {
     /// [`Self::retire_admin`].
     async fn admin_session(&mut self) -> Result<(), Error> {
         self.refuse_held_admin()?;
-        let admin_login = self.inner.control.endpoint.login(self.names.database());
-        let session = {
-            let analysis = self.inner.live()?;
-            let control_pair = &self
-                .inner
-                .control
-                .session
-                .as_ref()
-                .ok_or(Error::Cancelled)?
-                .pair;
-            let scratch_pair = &self.scratch.as_ref().ok_or(Error::Cancelled)?.pair;
-            Session::open(
-                self.inner.control.channel(),
-                &analysis.runtime,
-                admin_login,
-                &[control_pair, scratch_pair],
-            )
-            .await
-            .map_err(|failure| {
-                let cause = self.inner.control.retain_failure(failure);
-                self.inner.refuse(cause.clone());
-                cause
-            })?
-        };
-        if let Some(analysis) = self.inner.analysis.as_mut() {
-            analysis.opened += 1;
-        }
-        let _admin = self.inner.control.admin.insert(session);
+        let admin_login = self.inner.admin_login(self.names.database());
+        let session = self
+            .inner
+            .open_channel(admin_login, self.scratch.as_ref())
+            .await?;
+        self.inner.store_admin(session);
         #[cfg(test)]
-        live_tests::admission_recovery::after_admin_open(&_admin.forwarder);
+        if let RunControl::Supplied(inner) = &self.inner {
+            live_tests::admission_recovery::after_admin_open(
+                &inner.control.admin.as_ref().expect("admin").forwarder,
+            );
+        }
         #[cfg(test)]
         live_tests::admission_recovery::hold().await;
         Ok(())
@@ -1581,31 +1839,29 @@ impl ScratchRun {
     /// Retire it where cleanup finds it and end the analysis, before any
     /// other guard can answer the retry and leave it held.
     fn refuse_held_admin(&mut self) -> Result<(), Error> {
-        if let Some(admin) = self.inner.control.admin.take() {
-            self.inner.control.retire(admin);
+        if self.inner.held_admin() {
+            self.inner.retire_admin();
             self.inner.refuse(Error::Cancelled);
             return Err(Error::Cancelled);
         }
         Ok(())
     }
 
-    /// Ends the administrative session without confirming its forwarder's
-    /// removal yet; cleanup confirms it or names it.
     fn retire_admin(&mut self) {
-        if let Some(admin) = self.inner.control.admin.take() {
-            self.inner.control.retire(admin);
-        }
+        self.inner.retire_admin();
     }
 
     /// Compiles the desired declarations on this run's scratch database as
     /// the reproduced deployer, captures what they bound and what the target
     /// binds under one scope derived from scratch's bindings, and compares
     /// the two per surface (ADR-0016 decision 2; #613). Only a scope that
-    /// qualified as `Verified` may be resolved on, every step is bracketed by
-    /// a full check, and any failure ends the analysis: a namespace that
-    /// changed under the run, or a compilation that stopped part-way, cannot
-    /// supply a verdict. A run resolves once; another question needs a fresh
-    /// run and a fresh scratch database.
+    /// qualified as `Verified` may be resolved on, every runtime step is
+    /// bracketed by a full check, and any runtime failure ends the analysis:
+    /// a namespace that changed under the run, or a compilation that stopped
+    /// part-way, cannot supply a verdict. A precondition or request-preparation
+    /// error before the first runtime check leaves the run usable. A run
+    /// resolves once; another question needs a fresh run and a fresh scratch
+    /// database.
     ///
     /// Only managed declarations are transferred. A retained external object
     /// the declarations could bind is not reconstructed (#617); the surfaces
@@ -1615,10 +1871,29 @@ impl ScratchRun {
         target: &mut NativeTarget,
         request: &BindingRequest<'_>,
     ) -> Result<pbps_db::resolver::capture::Assessment, Error> {
+        self.begin_operation()?;
+        let mut entered_runtime = false;
+        let outcome = self
+            .resolve_inner(target, request, &mut entered_runtime)
+            .await;
+        self.operation_in_flight = false;
+        let must_retire = entered_runtime || self.inner.refusal().is_some();
+        if let (true, Err(cause)) = (must_retire, &outcome) {
+            self.refuse_and_retire(cause.clone());
+        }
+        outcome
+    }
+
+    async fn resolve_inner(
+        &mut self,
+        target: &mut NativeTarget,
+        request: &BindingRequest<'_>,
+        entered_runtime: &mut bool,
+    ) -> Result<pbps_db::resolver::capture::Assessment, Error> {
         // A held session, or a refusal already recorded, ends the run before
         // the scope and compiled guards below can answer in its place.
         self.refuse_held_admin()?;
-        self.inner.live()?;
+        self.inner.ensure_live()?;
         let extras = match self.scope.as_ref() {
             Some(scope) if scope.report.verdict() == Verdict::Verified => {
                 scope.write_path_extras.clone()
@@ -1635,10 +1910,13 @@ impl ScratchRun {
             ));
         }
         let mut reconstruction =
-            engine::reconstruction(self.inner.control.driver, &extras, request.bootstrap)
+            engine::reconstruction(self.inner.driver(), &extras, request.bootstrap)
                 .map_err(Error::Binding)?;
+        // The guards and request preparation above have no scratch effect.
+        // From the first runtime check onward, failures end this run.
+        *entered_runtime = true;
         // Requalifies the scope and enters the reproduced deployer.
-        self.check(target).await?;
+        self.check_inner(target).await?;
         self.compiled = true;
         let outcome = self
             .resolve_checked(target, request, &extras, &mut reconstruction)
@@ -1646,7 +1924,7 @@ impl ScratchRun {
         if let Err(cause) = &outcome {
             self.inner.refuse(cause.clone());
             if let Some(scratch) = self.scratch.take() {
-                self.inner.control.retire(scratch);
+                self.inner.retire(scratch);
             }
         }
         outcome
@@ -1670,10 +1948,10 @@ impl ScratchRun {
             .map_err(Error::Binding)?;
         let scratch = self.scratch.as_mut().ok_or(Error::Cancelled)?;
         self.in_flight = true;
-        let compiled = engine::compile(reconstruction, extras, &mut scratch.connection).await;
+        let compiled = engine::compile(reconstruction, extras, scratch.connection_mut()).await;
         self.in_flight = false;
         compiled.map_err(Error::Binding)?;
-        self.check(target).await?;
+        self.check_inner(target).await?;
         // Scratch is read through an administrative session: the capture
         // reads settings a least-privilege deployer need not see, and which
         // role reads a catalog row does not change what was bound.
@@ -1684,18 +1962,19 @@ impl ScratchRun {
             engine::paths(extras, &sealed.target.catalog.visibility)
         };
         self.admin_session().await?;
-        let admin = self.inner.control.admin.as_mut().ok_or(Error::Cancelled)?;
-        let captured =
-            engine::capture_desired(&mut admin.connection, &base, &desired, &paths).await;
+        #[cfg(test)]
+        container_tests::pause("container-capture-admin-owned").await;
+        let admin = self.inner.admin_connection().ok_or(Error::Cancelled)?;
+        let captured = engine::capture_desired(admin, &base, &desired, &paths).await;
         self.retire_admin();
         let (compiled, scope) = captured.map_err(Error::Binding)?;
-        self.check(target).await?;
+        self.check_inner(target).await?;
         let signatures = dropped.iter().filter_map(|(_, s)| s.clone()).collect();
         let current = target
             .capture_postgres(&scope, &signatures)
             .await
             .map_err(|error| Error::Binding(error.to_string()))?;
-        self.check(target).await?;
+        self.check_inner(target).await?;
         let identified = current.catalog().dropped();
         reconstruction.identified(
             dropped
@@ -1723,15 +2002,40 @@ impl ScratchRun {
     /// keeps answering with the same cause, and `close` still removes what it
     /// created. A cancelled check is the same, found by the flag it left set.
     pub async fn check(&mut self, target: &mut NativeTarget) -> Result<(), Error> {
+        if self.operation_in_flight {
+            self.refuse_and_retire(Error::Cancelled);
+            return Err(Error::Cancelled);
+        }
+        self.check_inner(target).await
+    }
+
+    fn begin_operation(&mut self) -> Result<(), Error> {
+        if self.operation_in_flight {
+            self.refuse_and_retire(Error::Cancelled);
+            return Err(Error::Cancelled);
+        }
+        self.inner.ensure_live()?;
+        self.operation_in_flight = true;
+        Ok(())
+    }
+
+    fn refuse_and_retire(&mut self, cause: Error) {
+        self.inner.refuse(cause);
+        if let Some(scratch) = self.scratch.take() {
+            self.inner.retire(scratch);
+        }
+    }
+
+    async fn check_inner(&mut self, target: &mut NativeTarget) -> Result<(), Error> {
         if self.in_flight {
             self.in_flight = false;
             if let Some(scratch) = self.scratch.take() {
-                self.inner.control.retire(scratch);
+                self.inner.retire(scratch);
             }
             self.inner.refuse(Error::Cancelled);
         }
         if self.scratch.is_none() {
-            return Err(self.inner.refusal.clone().unwrap_or(Error::Cancelled));
+            return Err(self.inner.refusal().unwrap_or(Error::Cancelled));
         }
         self.in_flight = true;
         let outcome = {
@@ -1741,7 +2045,7 @@ impl ScratchRun {
         if let Err(cause) = outcome {
             self.in_flight = false;
             if let Some(scratch) = self.scratch.take() {
-                self.inner.control.retire(scratch);
+                self.inner.retire(scratch);
             }
             return Err(cause);
         }
@@ -1756,7 +2060,7 @@ impl ScratchRun {
             self.in_flight = false;
             self.inner.refuse(cause.clone());
             if let Some(scratch) = self.scratch.take() {
-                self.inner.control.retire(scratch);
+                self.inner.retire(scratch);
             }
             return Err(cause);
         }
@@ -1774,23 +2078,12 @@ impl ScratchRun {
         if self.removed {
             return Ok(());
         }
-        // Retire the scratch session into run-owned state rather than
-        // closing it inline: its forwarder's unconfirmed name would otherwise
-        // live only in this call and be lost if `close` is retried (finding
-        // on #640). `close_control` drains it below with the control
-        // forwarder, so a later `close` still reports what is not yet gone.
-        if let Some(scratch) = self.scratch.take() {
-            self.inner.control.retire(scratch);
-        }
-        let cause = self.inner.refusal.clone().unwrap_or(Error::Cleanup);
-        let removal = cleanup(&mut self.inner.control, &self.names, cause).await;
-        // The control session and every forwarder this run opened are its own
-        // too, and a caller that keeps the run after closing it must not leave
-        // them on the server: the next admission would find an old connection
-        // as a session it did not open and refuse a valid run (finding on
-        // #640). Success is reported only once their removal is confirmed.
-        let forwarders = close_control(&mut self.inner.control).await;
-        let removal = report(removal, forwarders);
+        let cause = self.inner.refusal().unwrap_or(Error::Cleanup);
+        self.inner.refuse(Error::Consumed);
+        let removal = self
+            .inner
+            .close(self.scratch.take(), &self.names, cause)
+            .await;
         if removal.recovery_names.is_empty() {
             self.removed = true;
             return Ok(());
@@ -2043,7 +2336,7 @@ fn removal_outcome(removed: bool, cause: Error, names: &ScratchNames) -> ServerF
 /// problem and not an intrusion, and reporting it as a moved counter would
 /// send an operator looking for a session that never existed (finding on
 /// #640).
-fn signal(error: &pbps_db::DbError) -> Signal {
+pub(crate) fn signal(error: &pbps_db::DbError) -> Signal {
     // Named rather than a wildcard: a variant added later must be read here
     // before it can be filed as "the engine could not answer".
     match error {
@@ -2058,7 +2351,7 @@ fn signal(error: &pbps_db::DbError) -> Signal {
     }
 }
 
-fn correlate(
+pub(crate) fn correlate(
     process: &pbps_db::resolver::BackendProcess,
     backend_pid: u32,
     engine: &ProcessLease,
@@ -2074,7 +2367,7 @@ fn correlate(
     }
 }
 
-fn generated_names() -> Result<ScratchNames, Error> {
+pub(crate) fn generated_names() -> Result<ScratchNames, Error> {
     let suffix = || format!("{:032x}", rand::random::<u128>());
     ScratchNames::new(
         format!("pbps_scratch_{}", suffix()),
@@ -2109,3 +2402,6 @@ mod tests;
 #[cfg(test)]
 #[path = "server/live_tests.rs"]
 mod live_tests;
+
+#[cfg(test)]
+pub(crate) mod container_tests;

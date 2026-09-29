@@ -21,6 +21,10 @@ pub(crate) struct TcpPair {
 }
 
 impl TcpPair {
+    pub(crate) fn client_inode(&self) -> u64 {
+        self.client
+    }
+
     fn inodes(&self) -> [u64; 2] {
         [self.client, self.server]
     }

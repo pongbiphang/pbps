@@ -70,6 +70,8 @@ pub struct CandidateRun {
     name: String,
     id: String,
     pid: u64,
+    /// Captured before creation and shared with this run's supervisor.
+    deadline: Instant,
     commands: mpsc::Sender<Command>,
     cleaned: oneshot::Receiver<Result<(), Error>>,
 }
@@ -124,11 +126,14 @@ impl CandidateRun {
         let (ready, started) = oneshot::channel();
         let (cleanup_report, cleaned) = oneshot::channel();
         let name = owner.name.clone();
+        // Start the bound before scheduling creation, so task delay cannot
+        // give the first owner a later deadline than its analysis.
+        let deadline = Instant::now() + Duration::from_secs(lifetime_secs);
         tokio::spawn(supervise(
             api,
             owner,
             launch,
-            lifetime_secs,
+            deadline,
             receiver,
             ready,
             cleanup_report,
@@ -141,6 +146,7 @@ impl CandidateRun {
             name,
             id: running.id,
             pid: running.pid,
+            deadline,
             commands,
             cleaned,
         })
@@ -148,6 +154,10 @@ impl CandidateRun {
 
     pub fn resource_name(&self) -> &str {
         &self.name
+    }
+
+    pub(crate) fn deadline(&self) -> Instant {
+        self.deadline
     }
 
     pub fn container_id(&self) -> &str {
@@ -380,7 +390,7 @@ async fn supervise(
     mut api: LocalApi,
     mut owner: Owner,
     launch: Launch,
-    lifetime_secs: u64,
+    deadline: Instant,
     mut commands: mpsc::Receiver<Command>,
     ready: oneshot::Sender<Result<Running, StartFailure>>,
     cleaned: oneshot::Sender<Result<(), Error>>,
@@ -388,7 +398,6 @@ async fn supervise(
     if ready.is_closed() {
         return;
     }
-    let deadline = Instant::now() + Duration::from_secs(lifetime_secs);
     // The operation keeps its ownership context even if the caller cancels
     // while Docker is creating/starting it. HTTP itself has a bounded timeout.
     let start = create_start(&mut api, &mut owner, &launch, &ready).await;
