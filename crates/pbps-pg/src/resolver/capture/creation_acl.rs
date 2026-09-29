@@ -4,12 +4,13 @@
 //! state. This calculation stays inside the fixed-key producer, before its
 //! compiled facts are sealed; it is never an independent target read.
 
-use super::CapturedInputs;
+use super::{CandidateClass, CandidateSet, CapturedInputs};
 use pbps_db::resolver::capture::ObjectIdentity;
 use pbps_model::resolver::ManifestError;
+use pbps_model::{Change, ChangeSet, GrantTarget, ModuleId, Permission, PublicAccess, RoutineId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -150,7 +151,11 @@ pub(super) fn creation_acl(
     if merged.is_empty() || merged == merge(built_in) {
         return Ok(Value::Null);
     }
-    let mut entries = merged
+    Ok(explicit(merged))
+}
+
+fn explicit(acl: BTreeMap<AclKey, bool>) -> Value {
+    let mut entries = acl
         .into_iter()
         .map(|((grantor, grantee, privilege), grant_option)| {
             json!(AclEntry {
@@ -162,5 +167,123 @@ pub(super) fn creation_acl(
         })
         .collect::<Vec<_>>();
     entries.sort_by_cached_key(Value::to_string);
-    Ok(Value::Array(entries))
+    Value::Array(entries)
+}
+
+fn addresses_routine(
+    compiled: &CapturedInputs,
+    object: &ObjectIdentity,
+    target: &GrantTarget,
+    permissions: &BTreeSet<Permission>,
+    routine: &RoutineId,
+) -> Result<bool, ManifestError> {
+    match target {
+        GrantTarget::Routine(named) => Ok(named == routine),
+        GrantTarget::Object(name)
+            if name == &routine.name && permissions.contains(&Permission::Execute) =>
+        {
+            // PostgreSQL accepts bare ON ROUTINE only when this name has one
+            // overload. Use the complete qualified compiled candidate set,
+            // including unmanaged overloads, rather than guessing from the
+            // declaration or allowing its name to choose a signature.
+            let set = CandidateSet {
+                class: CandidateClass::Routine,
+                namespace: Some(name.schema.clone()),
+                name: Some(name.name.clone()),
+            };
+            let members = compiled
+                .candidates
+                .get(&set)
+                .ok_or(ManifestError::Incomplete)?;
+            if members.len() != 1 || !members.contains(object) {
+                return Err(ManifestError::Incomplete);
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Finish a newly created routine's ACL under the immutable producer key.
+/// PostgreSQL materializes even a NULL creation ACL on the first explicit
+/// GRANT/REVOKE, starting from acldefault('f', owner). This is also true
+/// when an empty global default had made creation store NULL.
+pub(super) fn routine_acl_after_plan(
+    captured: &CapturedInputs,
+    compiled: &CapturedInputs,
+    compiled_routine: &ObjectIdentity,
+    owner_name: &str,
+    namespace: &str,
+    routine: &RoutineId,
+    changes: &ChangeSet,
+) -> Result<Value, ManifestError> {
+    let owner = role(owner_name);
+    let created = creation_acl(captured, owner_name, namespace, "f")?;
+    let mut creates = changes.changes.iter().enumerate().filter_map(|(index, step)| {
+        matches!(&step.change, Change::CreateModule { id: ModuleId::Routine(r), .. } if r == routine)
+            .then_some(index)
+    });
+    let create = creates.next().ok_or(ManifestError::Incomplete)?;
+    if creates.next().is_some() {
+        return Err(ManifestError::Invalid);
+    }
+    let mut acl = if created.is_null() {
+        merge(builtin(&owner, "f", captured.major())?)
+    } else {
+        let entries: Vec<AclEntry> =
+            serde_json::from_value(created).map_err(|_| ManifestError::Invalid)?;
+        if entries.iter().any(|entry| entry.grantor != owner) {
+            return Err(ManifestError::Incomplete);
+        }
+        merge(entries)
+    };
+    let mut public_decision = false;
+    for step in changes.changes.iter().skip(create + 1) {
+        match &step.change {
+            Change::PublicExecution {
+                routine: named,
+                access,
+                ..
+            } if named == routine => {
+                if public_decision {
+                    return Err(ManifestError::Invalid);
+                }
+                public_decision = true;
+                let key = (owner.clone(), public(), "EXECUTE".into());
+                match access {
+                    PublicAccess::Kept => {
+                        acl.entry(key).or_insert(false);
+                    }
+                    PublicAccess::Revoked => {
+                        acl.remove(&key);
+                    }
+                }
+            }
+            Change::Grant {
+                role: grantee,
+                target,
+                permissions,
+            }
+            | Change::Revoke {
+                role: grantee,
+                target,
+                permissions,
+            } if addresses_routine(compiled, compiled_routine, target, permissions, routine)? => {
+                if permissions != &BTreeSet::from([Permission::Execute]) {
+                    return Err(ManifestError::Invalid);
+                }
+                let key = (owner.clone(), role(grantee), "EXECUTE".into());
+                if matches!(&step.change, Change::Grant { .. }) {
+                    acl.entry(key).or_insert(false);
+                } else {
+                    acl.remove(&key);
+                }
+            }
+            _ => {}
+        }
+    }
+    if !public_decision {
+        return Err(ManifestError::Incomplete);
+    }
+    Ok(explicit(acl))
 }
