@@ -109,6 +109,8 @@ fn rename_source(
     object: &ObjectIdentity,
     transition: &pbps_model::resolver::ObjectTransition,
     changes: &pbps_model::ChangeSet,
+    opening: &CapturedInputs,
+    compiled: &CapturedInputs,
 ) -> Option<ObjectIdentity> {
     use pbps_model::Change;
     use pbps_model::resolver::Surface;
@@ -143,11 +145,36 @@ fn rename_source(
             signature: vec![before_relation.clone()],
         }
     };
+    let reference = |capture: &CapturedInputs, owner: &ObjectIdentity, field: &str| {
+        capture
+            .inputs
+            .get(owner)?
+            .properties
+            .get(field)
+            .and_then(|value| serde_json::from_value::<ObjectIdentity>(value.clone()).ok())
+    };
     let source = match object.class.as_str() {
         "pg_class" if object.name == [final_table.schema.clone(), final_table.name.clone()] => {
             before_relation
         }
         "pg_attribute" => before_column(object.name.first()?),
+        "pg_type" => {
+            // PostgreSQL renames a relation's row and array types with the
+            // table. Match the qualified type references, never a guessed
+            // `_`-prefixed name that could belong to a different object.
+            let old_row = reference(opening, &before_relation, "reltype")?;
+            let new_row = reference(compiled, &relation_identity(final_table), "reltype")?;
+            if object == &new_row {
+                old_row
+            } else {
+                let old_array = reference(opening, &old_row, "typarray")?;
+                let new_array = reference(compiled, &new_row, "typarray")?;
+                if object != &new_array {
+                    return None;
+                }
+                old_array
+            }
+        }
         _ => return None,
     };
     transition.before.contains(&source).then_some(source)
@@ -229,7 +256,8 @@ impl CompiledCapture {
                     continue;
                 }
                 if preserved {
-                    let source = rename_source(object, transition, changes);
+                    let source =
+                        rename_source(object, transition, changes, opening, &self.captured);
                     let before = source
                         .as_ref()
                         .and_then(|source| opening.inputs.get(source));
