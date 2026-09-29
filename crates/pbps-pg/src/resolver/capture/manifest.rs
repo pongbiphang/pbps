@@ -749,6 +749,17 @@ impl CompiledCapture {
                 _ => None,
             })
             .collect();
+        let added_indexes: BTreeSet<Surface> = changes
+            .changes
+            .iter()
+            .filter_map(|step| match &step.change {
+                Change::AddIndex { table, name, .. } => Some(Surface::Index {
+                    table: table.clone(),
+                    name: name.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
         let lookup: BTreeMap<_, _> = self
             .captured
             .inputs
@@ -917,6 +928,88 @@ impl CompiledCapture {
                             }
                         }
                     }
+                }
+                if let Surface::Index { table, name } = &transition.surface
+                    && added_indexes.contains(&transition.surface)
+                    && object.class == "pg_class"
+                    && object.name == [table.schema.clone(), name.clone()]
+                {
+                    let index = self
+                        .captured
+                        .inputs
+                        .get(raw)
+                        .ok_or(ManifestError::Incomplete)?;
+                    if !matches!(
+                        index.properties.get("relkind").and_then(Value::as_str),
+                        Some("i" | "I")
+                    ) {
+                        return Err(ManifestError::Invalid);
+                    }
+                    let metadata = ObjectIdentity {
+                        class: "pg_index".into(),
+                        name: Vec::new(),
+                        signature: vec![raw.clone()],
+                    };
+                    let parent: ObjectIdentity = serde_json::from_value(
+                        self.captured
+                            .inputs
+                            .get(&metadata)
+                            .and_then(|input| input.properties.get("indrelid"))
+                            .cloned()
+                            .ok_or(ManifestError::Incomplete)?,
+                    )
+                    .map_err(|_| ManifestError::Invalid)?;
+                    if parent != relation_identity(table) {
+                        return Err(ManifestError::Invalid);
+                    }
+                    let scratch_parent_owner = self
+                        .captured
+                        .inputs
+                        .get(&parent)
+                        .and_then(|input| input.properties.get("relowner"))
+                        .ok_or(ManifestError::Incomplete)?;
+                    if index.properties.get("relowner") != Some(scratch_parent_owner)
+                        || self.captured.inputs.keys().any(|id| {
+                            id.class == "pg_shdepend"
+                                && id.name == ["o"]
+                                && id.signature.first() == Some(raw)
+                        })
+                    {
+                        return Err(ManifestError::Invalid);
+                    }
+                    // PostgreSQL creates an explicit index under its table's
+                    // owner, even when another role issues CREATE INDEX. The
+                    // recorded table UID selects the opening owner across a
+                    // rename; a newly created table has this plan's creator.
+                    let table_uid = desired_ids.table_uid(table).ok_or(ManifestError::Invalid)?;
+                    let target_owner = if let Some(prior) = base_ids.tables.get(table_uid) {
+                        let prior = relation_identity(prior);
+                        let owner: ObjectIdentity = serde_json::from_value(
+                            opening
+                                .inputs
+                                .get(&prior)
+                                .and_then(|input| input.properties.get("relowner"))
+                                .cloned()
+                                .ok_or(ManifestError::Incomplete)?,
+                        )
+                        .map_err(|_| ManifestError::Invalid)?;
+                        if owner.class != "pg_authid" || !opening.role_pinned.contains_key(&owner) {
+                            return Err(ManifestError::Invalid);
+                        }
+                        owner
+                    } else {
+                        creator.clone()
+                    };
+                    self.captured
+                        .inputs
+                        .get_mut(raw)
+                        .ok_or(ManifestError::Incomplete)?
+                        .properties
+                        .insert(
+                            "relowner".into(),
+                            serde_json::to_value(target_identity(&target_owner))
+                                .map_err(|_| ManifestError::Invalid)?,
+                        );
                 }
             }
         }
