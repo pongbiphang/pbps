@@ -1093,3 +1093,63 @@ is compared as the occupant's: its own grants arrive through the rename, the
 declared ones are granted, and the rest are revoked. A name replaced by a new
 table keeps its previous answer, grant everything and revoke nothing, because
 the new table holds no grants of its own.
+
+<a id="dec-1168-1"></a>
+
+**DEC-1168.1. A column may be a stored generated column, carried as its
+expression and its kind, and its expression changes in place on PostgreSQL
+17 and later.** `generated: {expression, stored}` is a generation kind and
+not a flag. `stored` is required, because PostgreSQL 18 reads a generation
+expression with no kind as `VIRTUAL`, and 16 and 17 read it as a syntax
+error. This model holds `stored: true` only. A virtual column computes on
+read, and a declaration of it as stored would turn it into data. The reader
+tells the two apart by `attgenerated` (`s` or `v`) rather than treating any
+generation as one, and the emitter always spells `STORED`. A generated
+column is never also a default. The engine refuses both together, and the
+reader takes the expression out of `pg_attrdef`, where defaults live,
+without also reading it back as one.
+
+Measured on 16.15, 17.11 and 18.6:
+- `SET EXPRESSION` recomputes every row, rewriting the table under `ACCESS
+  EXCLUSIVE` on 17 and 18, and is a syntax error on 16. The supported change
+  is therefore `AlterColumnExpression` on 17 and later. On 16 it is refused
+  by name through a connected check (`generation_support`), never emitted as
+  a drop and re-add that would take the column's dependents and its place.
+- A change between generated and ordinary, or between kinds, has no in-place
+  form and is refused by the differ (`GenerationChangeUnsupported`).
+- The engine refuses to retype a column a generated column reads, and drops
+  one only with `CASCADE`. The same connected check reads that dependence
+  from `pg_depend`, from the expression's `pg_attrdef` row, and refuses such
+  a retype or drop before anything runs, unless the plan also drops the
+  generated column. It does not parse the expression.
+- The engine also refuses a default beside a generation expression, a
+  reference to another generated column, a non-immutable expression, and
+  `NOT NULL` over null inputs at `ADD`. The first is refused at validation.
+  The rest are the engine's, inside the transaction.
+
+A generated column is the engine's to fill, like a non-key identity
+(`Column::engine_assigned`). It leaves `row_columns` and the row
+read-back, and a row that sets one is refused. A `NOT NULL` generated add
+is not counted as every stored row. Evaluating its expression before
+approval would run the operator's code, so the probe reports it unchecked.
+
+Its declared text is recorded, advanced and overlaid as a default's is
+(`DeclaredExpressions::generated`), and compared by presence (SPEC §7.6),
+since the engine respells `a * 3` as `(a * 3)`. A column the expression
+reads keeps its name in the declared text across a rename, as a filter
+does. The engine rewrites what it stores, and the declaration spells the new
+name. Around a function rebuild, a generated column that calls the function
+stays refused. No statement takes its expression off and puts it back:
+`DROP EXPRESSION` leaves an ordinary column, and `SET EXPRESSION` is refused
+on one.
+
+State version 12 carries the field and still reads 6 to 11. An older
+reader reported every generated column as a limitation, which no recorder
+accepts. Plan version 16 turns 15 away. The declaration schema is published
+as set 22. SQL Server refuses `generated:`: its computed columns are #1174's.
+
+Pinned by `a_stored_generated_column_round_trips_and_changes_its_expression`
+(`crates/pbps-pg/tests/live.rs`),
+`a_generated_columns_expression_changes_through_the_cli_and_its_inputs_are_held`
+and `a_generated_columns_expression_change_is_refused_by_name_before_postgres_17`
+(`crates/pbps-cli/tests/flow_pg.rs`).

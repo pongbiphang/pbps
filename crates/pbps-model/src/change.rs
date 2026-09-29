@@ -269,6 +269,16 @@ pub enum Change {
         from: Option<String>,
         to: Option<String>,
     },
+    /// A generated column's expression, changed in place (DEC-1168.1).
+    /// PostgreSQL 17 and later recompute every row under the new expression
+    /// (`SET EXPRESSION`); older servers have no in-place form, and a plan
+    /// that needs one is refused before it runs.
+    AlterColumnExpression {
+        uid: Uid,
+        column: ColumnRef,
+        from: String,
+        to: String,
+    },
     /// Deprecation flag changed. Produces no structural change; may optionally be
     /// written to an extended property.
     SetColumnDeprecated {
@@ -709,6 +719,8 @@ pub enum ColumnField {
     Type,
     Nullable,
     Default,
+    /// The generation expression (DEC-1168.1).
+    Generated,
     /// The explicit collation (#1175).
     Collation,
     /// Named for exhaustiveness rather than because a comparison turns on it:
@@ -830,6 +842,8 @@ pub enum ColumnPromise<'a> {
     Nullable(bool),
     /// Whether the column has a default at all.
     Default(bool),
+    /// Whether the column is generated at all (DEC-1168.1).
+    Generated(bool),
     /// The explicit collation the column has after the change, `None` being
     /// the database default (#1175).
     Collation(Option<&'a Collation>),
@@ -852,6 +866,7 @@ impl ColumnPromise<'_> {
             ColumnPromise::Type(_) => ColumnField::Type,
             ColumnPromise::Nullable(_) => ColumnField::Nullable,
             ColumnPromise::Default(_) => ColumnField::Default,
+            ColumnPromise::Generated(_) => ColumnField::Generated,
             ColumnPromise::Collation(_) => ColumnField::Collation,
         }
     }
@@ -991,6 +1006,7 @@ impl Change {
             | Change::AlterColumnType { column, .. }
             | Change::AlterColumnNullability { column, .. }
             | Change::AlterColumnDefault { column, .. }
+            | Change::AlterColumnExpression { column, .. }
             | Change::SetColumnDeprecated { column, .. } => &column.table,
             Change::CreateModule { .. }
             | Change::AlterModule { .. }
@@ -1041,6 +1057,7 @@ impl Change {
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -1148,6 +1165,7 @@ impl Change {
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -1201,7 +1219,8 @@ impl Change {
             } => vec![table.column(from), table.column(to)],
             Change::DropColumn { column, .. }
             | Change::AlterColumnType { column, .. }
-            | Change::AlterColumnDefault { column, .. } => vec![column.clone()],
+            | Change::AlterColumnDefault { column, .. }
+            | Change::AlterColumnExpression { column, .. } => vec![column.clone()],
             Change::AlterColumnNullability { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::CreateTable { .. }
@@ -1298,6 +1317,9 @@ impl Change {
             Change::AlterColumnDefault { column, .. } => {
                 vec![(column.clone(), ColumnField::Default)]
             }
+            Change::AlterColumnExpression { column, .. } => {
+                vec![(column.clone(), ColumnField::Generated)]
+            }
             Change::SetColumnDeprecated { column, .. } => {
                 vec![(column.clone(), ColumnField::Deprecated)]
             }
@@ -1356,6 +1378,7 @@ impl Change {
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -1427,6 +1450,7 @@ impl Change {
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -1475,6 +1499,7 @@ impl Change {
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -1519,6 +1544,7 @@ impl Change {
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -1595,6 +1621,11 @@ impl Change {
             Change::AlterColumnDefault { column, to, .. } => {
                 vec![(column.clone(), ColumnPromise::Default(to.is_some()))]
             }
+            // Held to being generated, not to its text, which the engine
+            // respells as it does a default's (DEC-1168.1).
+            Change::AlterColumnExpression { column, .. } => {
+                vec![(column.clone(), ColumnPromise::Generated(true))]
+            }
             Change::RenameColumn { .. }
             | Change::DropColumn { .. }
             | Change::SetColumnDeprecated { .. }
@@ -1650,6 +1681,7 @@ impl Change {
             Change::AlterColumnType { column, .. }
             | Change::AlterColumnNullability { column, .. }
             | Change::AlterColumnDefault { column, .. }
+            | Change::AlterColumnExpression { column, .. }
             | Change::SetColumnDeprecated { column, .. } => {
                 vec![(column.clone(), Presence::Present)]
             }
@@ -1770,6 +1802,7 @@ impl Change {
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
@@ -1807,6 +1840,7 @@ impl Change {
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -1857,6 +1891,7 @@ impl Change {
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -1895,6 +1930,7 @@ impl Change {
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -2030,6 +2066,7 @@ impl Change {
                 to_nullable: true, ..
             }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             // These relaxations add no intrinsic risk class; the uniqueness
             // exception above is deliberate, not a rule for all drops (486).

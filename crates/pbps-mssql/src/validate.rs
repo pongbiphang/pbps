@@ -476,6 +476,14 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
         if let Err(e) = ident::quote(col_name) {
             errs.push(e);
         }
+        // PostgreSQL's (DEC-1168.1): SQL Server's computed columns are a
+        // different object, with no declared type, and #1174's to model.
+        if col.generated.is_some() {
+            errs.push(invalid(format!(
+                "column `{col_name}` is a generated column, which this model holds for \
+                 PostgreSQL only"
+            )));
+        }
         match types::normalize(&col.ty) {
             Ok(_) => {}
             Err(e) => {
@@ -903,6 +911,34 @@ mod tests {
             },
         );
         assert_eq!(messages(&table(&name, &t)), "");
+    }
+
+    /// A generated column is PostgreSQL's in this model, and is refused on
+    /// SQL Server by name (DEC-1168.1).
+    #[test]
+    fn a_generated_column_is_refused_on_sql_server() {
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("a".into(), Column::new("int".parse().unwrap()));
+        let mut b = Column::new("int".parse().unwrap());
+        b.generated = Some(pbps_model::Generated {
+            expression: "a * 2".into(),
+            stored: true,
+        });
+        let found = |t: &Table| {
+            super::table(&"dbo.t".parse().unwrap(), t)
+                .into_iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(found(&table).is_empty());
+        table.columns.insert("b".into(), b);
+        let refused = found(&table);
+        assert!(
+            refused.iter().any(|m| m.contains("generated column")),
+            "{refused:?}"
+        );
     }
 
     /// A GIN method or an operator class is PostgreSQL's, and is refused on

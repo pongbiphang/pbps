@@ -128,8 +128,10 @@ pub struct RawColumn {
     pub default: Option<String>,
     /// `attidentity`: `a` for ALWAYS, `d` for BY DEFAULT, empty for neither.
     pub identity: Option<RawIdentity>,
-    /// `attgenerated`: `s` for a stored generated column, empty for neither.
-    pub generated: bool,
+    /// `attgenerated`: `s` for a stored generated column, `v` for a virtual
+    /// one (PostgreSQL 18), `None` for neither. A kind and not a flag: the
+    /// two are different columns, and only one is held (DEC-1168.1).
+    pub generated: Option<char>,
     /// The sequence this column merely *defaults from* — a `serial`'s, whose
     /// `pg_depend` entry is `deptype = 'a'`. An identity's sequence is not
     /// here: that one is part of the column, and arrives as [`RawIdentity`].
@@ -1900,20 +1902,35 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
     // `DEFAULT (id * 2)` — a value computed once at insert where the live
     // column is recomputed on every write, and a declaration that recreates
     // the table would silently produce the first.
-    if raw.generated {
-        note(
-            pulled,
-            &parts.name,
-            format!(
-                "column `{}`.`{}` is a generated column, which this model does not hold. Its \
-                 expression is `{}`, and it is **not** read back as a `default:` — a default is \
-                 computed once when a row is inserted, and this is recomputed on every write.",
-                parts.name,
-                raw.name,
-                raw.default.as_deref().unwrap_or("not readable")
-            ),
-        );
-    }
+    // A stored generated column with a readable expression is held
+    // (DEC-1168.1). A virtual one computes on read, which a declaration of
+    // `stored: true` would silently turn into stored data, and one whose
+    // expression the catalog did not render cannot be recreated at all.
+    let generated = match (raw.generated, &raw.default) {
+        (None, _) => None,
+        (Some('s'), Some(expression)) => Some(pbps_model::Generated {
+            expression: expression.clone(),
+            stored: true,
+        }),
+        (Some(kind), expression) => {
+            note(
+                pulled,
+                &parts.name,
+                format!(
+                    "column `{}`.`{}` is a {} generated column, which this model does not hold. \
+                     Its expression is `{}`, and it is **not** read back as a `default:` — a \
+                     default is computed once when a row is inserted, and this is recomputed on \
+                     every {}.",
+                    parts.name,
+                    raw.name,
+                    if kind == 'v' { "virtual" } else { "stored" },
+                    expression.as_deref().unwrap_or("not readable"),
+                    if kind == 'v' { "read" } else { "write" },
+                ),
+            );
+            None
+        }
+    };
 
     // A `serial` is not a type (DECISIONS 227): the column is an `integer`
     // whose default is `nextval(...)`, and the sequence that default needs is a
@@ -2041,11 +2058,16 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
         // Verbatim, cast and all: see this module's own documentation — except
         // for a generated column, whose expression shares `pg_attrdef` with
         // the defaults and is not one.
-        default: (!raw.generated).then(|| raw.default.clone()).flatten(),
+        default: raw
+            .generated
+            .is_none()
+            .then(|| raw.default.clone())
+            .flatten(),
         identity,
         description: None,
         deprecated: None,
         collation: None,
+        generated,
     }
 }
 
@@ -4165,7 +4187,7 @@ mod tests {
             nullable: true,
             default: None,
             identity: None,
-            generated: false,
+            generated: None,
             owned_sequence: None,
             default_sequences: None,
             collation: None,
@@ -4634,23 +4656,34 @@ mod tests {
         }
     }
 
-    /// A generated column has no home in the model, and reading it back as an
-    /// ordinary column with a default it does not have would be worse than
-    /// saying so.
+    /// A virtual generated column, or a stored one whose expression the
+    /// catalog did not render, has no home in the model, and reading it back
+    /// as an ordinary column would be worse than saying so (DEC-1168.1).
     #[test]
-    fn a_generated_column_is_named() {
-        let mut column = col(1, 1, "total", "integer");
-        column.generated = true;
-        let raw = RawCatalog {
-            tables: vec![table(1, "t")],
-            columns: vec![column],
-            constraints: Vec::new(),
-            indexes: Vec::new(),
-            ..RawCatalog::default()
-        };
-        let pulled = assemble(&raw);
-        assert_eq!(pulled.limitations.len(), 1);
-        assert!(pulled.warnings[0].contains("generated column"));
+    fn a_generated_column_the_model_cannot_hold_is_named() {
+        for (kind, expression, expected) in [
+            ('v', Some("(id * 2)"), "virtual generated column"),
+            ('s', None, "not readable"),
+        ] {
+            let mut column = col(1, 1, "total", "integer");
+            column.generated = Some(kind);
+            column.default = expression.map(str::to_owned);
+            let raw = RawCatalog {
+                tables: vec![table(1, "t")],
+                columns: vec![column],
+                constraints: Vec::new(),
+                indexes: Vec::new(),
+                ..RawCatalog::default()
+            };
+            let pulled = assemble(&raw);
+            assert_eq!(pulled.limitations.len(), 1, "{kind}");
+            assert!(
+                pulled.warnings[0].contains(expected),
+                "{:?}",
+                pulled.warnings
+            );
+            assert_eq!(only(&pulled).columns["total"].generated, None);
+        }
     }
 
     /// **Measured**: a generated column's expression lives in `pg_attrdef`,
@@ -4660,7 +4693,7 @@ mod tests {
     #[test]
     fn a_generated_columns_expression_is_never_read_back_as_a_default() {
         let mut column = col(1, 1, "total", "integer");
-        column.generated = true;
+        column.generated = Some('s');
         column.default = Some("(id * 2)".to_owned());
         let raw = RawCatalog {
             tables: vec![table(1, "t")],
@@ -4670,9 +4703,17 @@ mod tests {
             ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
-        assert_eq!(only(&pulled).columns["total"].default, None);
-        assert!(pulled.warnings[0].contains("(id * 2)"));
-        assert!(pulled.warnings[0].contains("every write"));
+        // Held as what it is, and never also as a default (DEC-1168.1).
+        let total = &only(&pulled).columns["total"];
+        assert_eq!(total.default, None);
+        assert_eq!(
+            total.generated,
+            Some(pbps_model::Generated {
+                expression: "(id * 2)".into(),
+                stored: true
+            })
+        );
+        assert!(pulled.limitations.is_empty(), "{:?}", pulled.warnings);
     }
 
     /// A key whose check can be deferred is a different key, and the model has
@@ -5651,7 +5692,7 @@ mod tests {
     #[test]
     fn every_limitation_names_the_table_it_belongs_to() {
         let mut column = col(2, 1, "total", "integer");
-        column.generated = true;
+        column.generated = Some('v');
         let raw = RawCatalog {
             tables: vec![table(1, "plain"), table(2, "odd")],
             columns: vec![col(1, 1, "a", "integer"), column],

@@ -42,6 +42,17 @@ pub enum DiffError {
     )]
     IdentityChangeUnsupported { column: ColumnRef },
 
+    /// A column that becomes generated, stops being generated, or changes
+    /// its generation kind (DEC-1168.1). The engine has no in-place form for
+    /// any of those: an ordinary column cannot be given an expression, and
+    /// dropping one would keep today's computed values as ordinary data. Only
+    /// the expression of a column that stays generated is changed in place.
+    #[error(
+        "column {column}: a change between generated and not generated, or between stored and \
+         virtual, has no in-place form. To change it, add a new column and drop this one."
+    )]
+    GenerationChangeUnsupported { column: ColumnRef },
+
     /// A `data:` block on a table whose primary key cannot key its rows
     /// (ADR-0004). `validate` says the same thing against the file and the
     /// line; this is here so that a differ reached another way never quietly
@@ -376,6 +387,7 @@ fn diff_partial_rebuilding(
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -415,6 +427,7 @@ fn diff_partial_rebuilding(
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -555,6 +568,7 @@ fn diff_partial_rebuilding(
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -596,6 +610,7 @@ fn diff_partial_rebuilding(
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -775,6 +790,22 @@ fn diff_columns(
             errs.push(DiffError::IdentityChangeUnsupported {
                 column: declared_ref.clone(),
             });
+        }
+        match (&base_col.generated, &col.generated) {
+            (None, None) => {}
+            (Some(from), Some(to)) if from.stored == to.stored => {
+                if from.expression != to.expression {
+                    changes.push(Change::AlterColumnExpression {
+                        uid: uid.clone(),
+                        column: declared_ref.clone(),
+                        from: from.expression.clone(),
+                        to: to.expression.clone(),
+                    });
+                }
+            }
+            _ => errs.push(DiffError::GenerationChangeUnsupported {
+                column: declared_ref.clone(),
+            }),
         }
 
         let norm = |t: &ColumnType| dialect.normalize_type(t).unwrap_or_else(|_| t.clone());
@@ -969,6 +1000,7 @@ fn recreate_referenced_foreign_keys(
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -1124,6 +1156,7 @@ fn recreate_retyped_dependents(
             | Change::RenameColumn { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -1584,12 +1617,13 @@ fn diff_data(
                     if *column == key_column {
                         continue;
                     }
-                    // A non-key `IDENTITY` column is the engine's: never
+                    // A non-key `IDENTITY` column, or a generated one
+                    // (DEC-1168.1), is the engine's: never
                     // written by a row (`validate` refuses it) and never read
                     // back (DECISIONS 94), so both sides resolve it to NULL
                     // and it is neither a change nor a cell the row can be
                     // held to — the engine assigned it.
-                    if spec.identity.is_some() {
+                    if spec.engine_assigned() {
                         continue;
                     }
                     // Each side against *its own* table, and the base side
@@ -1707,7 +1741,7 @@ fn diff_data(
                     let Some(spec) = base.columns.get(base_column) else {
                         continue;
                     };
-                    if spec.identity.is_some() {
+                    if spec.engine_assigned() {
                         continue;
                     }
                     row.insert(
@@ -1742,7 +1776,7 @@ fn diff_data(
                 // reviewer-only cells need their own map (DECISIONS 442).
                 let mut dropped = BTreeMap::new();
                 for (base_column, spec) in &base.columns {
-                    if spec.identity.is_some() || surviving.contains(base_column.as_str()) {
+                    if spec.engine_assigned() || surviving.contains(base_column.as_str()) {
                         continue;
                     }
                     dropped.insert(base_column.clone(), cell(before, base_column, Some(spec)));
@@ -1959,6 +1993,9 @@ fn dependency_rank(
         // when the type moves, so both ranks have something to order.
         Change::AlterColumnDefault { to: None, .. } => -2,
         Change::AlterColumnDefault { to: Some(_), .. } => 0,
+        // After any type change, as a new default is: the expression is
+        // recomputed under the column's final type (DEC-1168.1).
+        Change::AlterColumnExpression { .. } => 0,
         // Rows follow the foreign keys between their tables: a referenced
         // table's rows go in first, and out last.
         Change::InsertRow { table, .. } | Change::UpdateRow { table, .. } => {
@@ -2480,7 +2517,8 @@ fn order_key(c: &Change) -> u8 {
         Change::AddColumn { .. } => 8,
         Change::AlterColumnType { .. }
         | Change::AlterColumnNullability { .. }
-        | Change::AlterColumnDefault { .. } => 9,
+        | Change::AlterColumnDefault { .. }
+        | Change::AlterColumnExpression { .. } => 9,
         Change::SetColumnDeprecated { .. } => 10,
         // Rows arrive once every column they name exists and has its final
         // type, and before the constraints below: ADR-0004's "create table ->
@@ -8121,6 +8159,78 @@ mod tests {
 
     /// The expressible half of the same comparison survives. `diff` accumulates
     /// every change it can phrase and only then checks for errors, so returning
+    /// A generated column's expression changes in place, as one typed change
+    /// that carries both texts; a column that becomes or stops being
+    /// generated, or changes kind, has no in-place form and is refused by name
+    /// (DEC-1168.1). An ordinary default beside it is a default change.
+    #[test]
+    fn a_generated_expression_changes_in_place_and_nothing_else_about_generation_does() {
+        let generated = |expression: &str, stored: bool| {
+            let mut c = Column::new(ty("int"));
+            c.generated = Some(pbps_model::Generated {
+                expression: expression.into(),
+                stored,
+            });
+            c
+        };
+        let diff_of = |from: Column, to: Column| {
+            let base = schema_of("app.t", table(&[("b", from)]));
+            let want = schema_of("app.t", table(&[("b", to)]));
+            let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let ids = crate::resolve(&want, &base_ids, &[], &ctx()).unwrap().ids;
+            diff_partial(
+                Side {
+                    schema: &base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: &want,
+                    ids: &ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+        };
+        let changed = diff_of(generated("a * 2", true), generated("a * 3", true));
+        assert!(changed.errors.is_empty(), "{:?}", changed.errors);
+        assert!(
+            matches!(
+                changed.changes.changes.as_slice(),
+                [p] if matches!(&p.change, Change::AlterColumnExpression { from, to, .. } if from == "a * 2" && to == "a * 3")
+            ),
+            "{:?}",
+            changed.changes
+        );
+        assert!(
+            diff_of(generated("a * 2", true), generated("a * 2", true))
+                .changes
+                .changes
+                .is_empty()
+        );
+        for (from, to) in [
+            (Column::new(ty("int")), generated("a * 2", true)),
+            (generated("a * 2", true), Column::new(ty("int"))),
+            (generated("a * 2", true), generated("a * 2", false)),
+        ] {
+            let refused = diff_of(from, to);
+            assert!(
+                matches!(
+                    refused.errors.as_slice(),
+                    [DiffError::GenerationChangeUnsupported { .. }]
+                ),
+                "{:?}",
+                refused.errors
+            );
+        }
+        // Negative: a default is not a generation, and changes as a default.
+        let mut with_default = Column::new(ty("int"));
+        with_default.default = Some("7".into());
+        let defaulted = diff_of(Column::new(ty("int")), with_default);
+        assert_eq!(kinds(&defaulted.changes), ["AlterColumnDefault"]);
+    }
+
     /// `Err(errs)` threw away work it had already done — and `verify`, whose
     /// job is to *report* differences rather than approve them, showed only the
     /// identity error. The nullability drift beside it went missing from the

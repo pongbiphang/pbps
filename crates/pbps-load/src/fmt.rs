@@ -69,6 +69,14 @@ pub fn render(
         if let Some(id) = &c.identity {
             let _ = writeln!(s, "    identity: [{}, {}]", id.seed, id.increment);
         }
+        if let Some(g) = &c.generated {
+            let _ = writeln!(
+                s,
+                "    generated: {{expression: {}, stored: {}}}",
+                scalar(&g.expression),
+                g.stored
+            );
+        }
         if let Some(collation) = &c.collation {
             let _ = writeln!(s, "    collation: {}", scalar(collation.as_str()));
         }
@@ -776,6 +784,27 @@ indexes:
             "{out}"
         );
         assert_eq!(out.matches("collation").count(), 1, "{out}");
+    }
+
+    /// A generation expression reads back with its kind and renders again,
+    /// and the kind is required: unstated, it would be a virtual column on
+    /// PostgreSQL 18 (DEC-1168.1).
+    #[test]
+    fn a_generated_column_round_trips_and_its_kind_is_required() {
+        let yaml = "table: app.t\ncolumns:\n  a: {type: integer}\n  b:\n    type: integer\n    generated: {expression: 'a * 2', stored: true}\n";
+        round_trip(yaml);
+        let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
+        assert_eq!(
+            t.table.columns["b"].generated,
+            Some(pbps_model::Generated {
+                expression: "a * 2".into(),
+                stored: true
+            })
+        );
+        assert_eq!(t.table.columns["b"].default, None);
+        assert_eq!(t.table.columns["a"].generated, None);
+        let unstated = "table: app.t\ncolumns:\n  a: {type: integer}\n  b:\n    type: integer\n    generated: {expression: 'a * 2'}\n";
+        assert!(crate::load_table_str(Path::new("t.yml"), unstated).is_err());
     }
 
     /// A kind the selector does not have is a load error, not a default

@@ -2269,6 +2269,9 @@ fn column_as_declared(
         && declared.nullable == now.nullable
         && declared.identity == now.identity
         && declared.default.is_some() == now.default.is_some()
+        // A generation expression by presence, as a default: the engine
+        // respells its text. Its kind is read back exactly (DEC-1168.1).
+        && declared.generated.as_ref().map(|g| g.stored) == now.generated.as_ref().map(|g| g.stored)
         && declared.collation == now.collation
 }
 
@@ -3314,6 +3317,7 @@ fn refuse_unplanned_movement(
                         | pbps_model::Change::AlterColumnType { .. }
                         | pbps_model::Change::AlterColumnNullability { .. }
                         | pbps_model::Change::AlterColumnDefault { .. }
+                        | pbps_model::Change::AlterColumnExpression { .. }
                         | pbps_model::Change::SetColumnDeprecated { .. }
                         | pbps_model::Change::SetPrimaryKey { .. }
                         | pbps_model::Change::AddUnique { .. }
@@ -3628,6 +3632,9 @@ fn refuse_unplanned_movement(
                 ColumnPromise::Type(to) => (same_type(dialect, to, &now.ty), "type"),
                 ColumnPromise::Nullable(to) => (now.nullable == to, "nullability"),
                 ColumnPromise::Default(has) => (now.default.is_some() == has, "default"),
+                ColumnPromise::Generated(has) => {
+                    (now.generated.is_some() == has, "generation expression")
+                }
                 ColumnPromise::Collation(c) => (now.collation.as_ref() == c, "collation"),
             };
             if !kept {
@@ -5251,6 +5258,7 @@ pub fn cmd_plan_db(
 
         findings.extend(policy);
         let permission_support = crate::engine::permission_support(&mut conn, &cs).await?;
+        let generation_support = crate::engine::generation_support(&mut conn, &cs).await?;
         // Asked of the read this plan was built from, not of the connection
         // again: the owners came out of the same statement snapshot as the
         // schema, so the two cannot disagree (DECISIONS 174).
@@ -5316,6 +5324,7 @@ pub fn cmd_plan_db(
             format!("{} as queried (entry #{})", target.label, entry.id),
             vec![
                 permission_support,
+                generation_support,
                 owned_targets,
                 unrevocable_grants,
                 drop_blockers,
@@ -5707,6 +5716,7 @@ fn apply_identified(
         // This capability is constant for the connection and needs no ledger
         // lock. Check before any writes, including staged resumes.
         crate::engine::permission_support(&mut conn, &plan.changes).await?;
+        crate::engine::generation_support(&mut conn, &plan.changes).await?;
 
         // The lock comes first, before the checks and not after them: a
         // pre-flight that passed while another pipeline was mid-apply would

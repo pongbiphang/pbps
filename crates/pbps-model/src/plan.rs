@@ -140,7 +140,11 @@ use crate::schema::Schema;
 ///
 /// Bumped to 15 for expression index keys (DEC-1169.2): a key written as
 /// `expression` in an `AddIndex` or created table's payload.
-pub const CURRENT_VERSION: u32 = 15;
+///
+/// Bumped to 16 for generated columns (DEC-1168.1): a column's `generated`
+/// in a created table's or added column's payload, and
+/// `AlterColumnExpression`.
+pub const CURRENT_VERSION: u32 = 16;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -599,7 +603,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 15);
+        assert_eq!(CURRENT_VERSION, 16);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads

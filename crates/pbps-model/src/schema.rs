@@ -247,7 +247,7 @@ impl Table {
     ) -> impl Iterator<Item = (&'a String, &'a Column)> {
         self.columns
             .iter()
-            .filter(move |(c, spec)| c.as_str() != key_column && spec.identity.is_none())
+            .filter(move |(c, spec)| c.as_str() != key_column && !spec.engine_assigned())
     }
 }
 
@@ -349,6 +349,13 @@ pub struct Column {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<Identity>,
 
+    /// A generation expression (DEC-1168.1): the column's value is computed
+    /// from the row's other columns on every write, where a default is
+    /// computed once, when a row that omits it is inserted. Never both: the
+    /// engine refuses a default beside a generation expression.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated: Option<Generated>,
+
     /// An explicit collation (#1175). `None` is the database's default
     /// collation — whichever database the column is created in — which is
     /// what a column declared without one gets, and what the reader reports
@@ -378,10 +385,18 @@ impl Column {
             nullable: true,
             default: None,
             identity: None,
+            generated: None,
             collation: None,
             description: None,
             deprecated: None,
         }
+    }
+
+    /// Whether the engine assigns this column's value and a row may not: an
+    /// IDENTITY outside the key, or a generated column, which is computed on
+    /// every write (DEC-1168.1).
+    pub fn engine_assigned(&self) -> bool {
+        self.identity.is_some() || self.generated.is_some()
     }
 
     pub fn not_null(mut self) -> Self {
@@ -663,6 +678,18 @@ impl IndexMethod {
     }
 }
 
+/// How a generated column is computed (DEC-1168.1).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Generated {
+    /// The generation expression, kept verbatim as a default's is.
+    pub expression: String,
+    /// Whether the value is computed on write and stored (`STORED`), rather
+    /// than computed on read. A kind, not a flag to leave off: PostgreSQL 18
+    /// reads a generation expression with no kind as `VIRTUAL`.
+    pub stored: bool,
+}
+
 /// One key of an index, in the index's order.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "RawIndexColumn", into = "RawIndexColumn")]
@@ -799,6 +826,28 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    /// A generated column is the engine's to fill, like a non-key identity:
+    /// no row writes it (DEC-1168.1).
+    #[test]
+    fn a_generated_column_is_not_a_row_column() {
+        let mut t = sample();
+        let mut total = Column::new(ty("int"));
+        total.generated = Some(Generated {
+            expression: "customer_id * 2".into(),
+            stored: true,
+        });
+        t.columns.insert("total".into(), total);
+        let columns: Vec<&String> = t.row_columns("customer_id").map(|(c, _)| c).collect();
+        assert!(
+            !columns.iter().any(|c| c.as_str() == "total"),
+            "{columns:?}"
+        );
+        // Negative: an ordinary column is one.
+        assert!(columns.iter().any(|c| c.as_str() == "email"), "{columns:?}");
+        assert!(t.columns["total"].engine_assigned());
+        assert!(!t.columns["email"].engine_assigned());
     }
 
     #[test]

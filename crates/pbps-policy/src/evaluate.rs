@@ -247,6 +247,7 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                 | Change::RenameColumn { .. }
                 | Change::AlterColumnNullability { .. }
                 | Change::AlterColumnDefault { .. }
+                | Change::AlterColumnExpression { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
                 | Change::AddUnique { .. }

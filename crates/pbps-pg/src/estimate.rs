@@ -637,6 +637,17 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             Lock::AccessExclusive,
         ),
 
+        // Measured on 17.11 and 18.6: `SET EXPRESSION` recomputes every row
+        // and rewrites the table under `ACCESS EXCLUSIVE`, rebuilding its
+        // indexes (DEC-1168.1).
+        Change::AlterColumnExpression { column, .. } => e(
+            format!("recomputing the generated column {column}"),
+            &column.table,
+            Rewrite::Yes,
+            Reads::EveryRow,
+            Lock::AccessExclusive,
+        ),
+
         Change::RenameColumn { table, from, .. } => e(
             format!("renaming {}", table.column(from)),
             table,

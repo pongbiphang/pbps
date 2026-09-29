@@ -945,6 +945,7 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
             | change @ pbps_model::Change::DropColumn { .. }
             | change @ pbps_model::Change::RenameColumn { .. }
             | change @ pbps_model::Change::AlterColumnDefault { .. }
+            | change @ pbps_model::Change::AlterColumnExpression { .. }
             | change @ pbps_model::Change::SetColumnDeprecated { .. }
             | change @ pbps_model::Change::SetPrimaryKey { .. }
             | change @ pbps_model::Change::AddUnique { .. }
@@ -5741,6 +5742,111 @@ fn bootstrap_grants_to_an_existing_cluster_role_without_adopting_existing_grants
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 fn the_deployment_loop_runs_end_to_end_on_postgres() {
     deployment_loop(&server(), "loop");
+}
+
+/// A stored generated column through the CLI (DEC-1168.1): the pull writes
+/// `generated:`, a declared expression the engine respells applies once and
+/// then plans nothing, and a retype of a column the expression reads is
+/// refused before anything runs. On PostgreSQL 16, which has no
+/// `SET EXPRESSION`, the expression change is refused by name instead.
+fn generated_column_flow(server: &str, slug: &str, has_set_expression: bool) {
+    let own = OwnDatabase::new(server, slug);
+    let connection = own.connection().to_owned();
+    on_server(
+        &connection,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.t (id integer PRIMARY KEY, a integer, \
+                             b integer GENERATED ALWAYS AS (a * 2) STORED); \
+         INSERT INTO app.t (id, a) VALUES (1, 5), (2, NULL)",
+    );
+    let d = Demo::new(slug);
+    succeeds(d.run(&["pull", "--db", &connection]));
+    let path = d.dir.join("schema/app.t.yml");
+    let table = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        table.contains("generated: {expression:") && table.contains("stored: true"),
+        "{table}"
+    );
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+
+    // Declared as a person would write it; the engine renders `(a * 3)`.
+    let respelled: String = table
+        .lines()
+        .map(|l| {
+            if l.trim_start().starts_with("generated:") {
+                "    generated: {expression: 'a * 3', stored: true}".to_owned()
+            } else {
+                l.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(&path, &respelled).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    if !has_set_expression {
+        assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+        assert!(
+            stderr(&o).contains("generation_support") && stderr(&o).contains("PostgreSQL 17"),
+            "{}",
+            stderr(&o)
+        );
+        return;
+    }
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("generated as a * 3"), "{}", stdout(&o));
+    succeeds(approved_apply(&d, &connection, &plan, &[]));
+    assert_eq!(
+        scalar(&connection, "SELECT b::int8 FROM app.t WHERE id = 1"),
+        15
+    );
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
+    // A retype of `a`, which `b` is computed from: refused before anything
+    // runs, naming the generated column, where the engine would refuse it
+    // halfway through the apply.
+    let retyped: String = std::fs::read_to_string(&path).unwrap().replacen(
+        "  a:\n    type: integer",
+        "  a:\n    type: bigint",
+        1,
+    );
+    assert_ne!(
+        retyped, respelled,
+        "the fixture's `a` is where this test expects it"
+    );
+    std::fs::write(&path, retyped).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("generation_support") && stderr(&o).contains("`b` is computed from it"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_generated_columns_expression_changes_through_the_cli_and_its_inputs_are_held() {
+    generated_column_flow(&server(), "generated-1168", true);
+}
+
+#[test]
+#[ignore = "needs PostgreSQL 16; set PBPS_TEST_PG_OLD_DB"]
+fn a_generated_columns_expression_change_is_refused_by_name_before_postgres_17() {
+    let server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    on_server(
+        &server,
+        "DO $$ BEGIN IF current_setting('server_version_num')::integer >= 170000 THEN RAISE EXCEPTION 'this regression needs a pre-17 server'; END IF; END $$",
+    );
+    generated_column_flow(&server, "generated-1168-old", false);
 }
 
 #[test]

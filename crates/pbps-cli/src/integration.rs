@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 21;
+pub const SCHEMA_VERSION: u32 = 22;
+// 22: a column's `generated:` (issue #1168).
 // 21: an index's `keys:`, which may hold expression keys (issue #1169).
 // 20: an index's `method:` and a key's operator class (issue #1169).
 // 19: a column's `collation:` (issue #1175).

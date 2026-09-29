@@ -478,7 +478,9 @@ struct AddedColumn {
     ty: pbps_model::ColumnType,
     /// `GENERATED … AS IDENTITY`: the engine assigns every stored row a value
     /// from the sequence during the `ADD COLUMN` — measured, `1`, `2`, … —
-    /// which no probe can evaluate and which may be a key of the parent.
+    /// which no probe can evaluate and which may be a key of the parent. A
+    /// generated column's values are the engine's in the same way, computed
+    /// from each row during the `ADD COLUMN` (DEC-1168.1).
     identity: bool,
 }
 
@@ -737,7 +739,7 @@ impl AsStored {
                         AddedColumn {
                             default: column.default.clone(),
                             ty: column.ty.clone(),
-                            identity: column.identity.is_some(),
+                            identity: column.engine_assigned(),
                         },
                     );
                 }
@@ -753,6 +755,7 @@ impl AsStored {
                 Change::DropColumn { .. }
                 | Change::AlterColumnNullability { .. }
                 | Change::AlterColumnDefault { .. }
+                | Change::AlterColumnExpression { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
                 | Change::AddUnique { .. }
@@ -2990,6 +2993,19 @@ fn build(
             // engine `(expr) IS NULL` would run the operator's own function
             // before the plan is approved, which is the shape of #274 and
             // something no probe in this crate does.
+            // A generated column's value is its expression over each row, and
+            // evaluating it here would run the operator's code before the plan
+            // is approved, exactly as a default's would. Unchecked, not counted
+            // as the whole table: its inputs may never be null, and the engine
+            // refuses `contains null values` at `ADD` when they are
+            // (DEC-1168.1).
+            if column.generated.is_some() {
+                return Ok(skip(
+                    change,
+                    "a generated column's values cannot be evaluated before apply",
+                    unchecked,
+                ));
+            }
             if let Some(default) = column.default.as_deref() {
                 let Some(literal) = constant_default(default) else {
                     return Ok(skip(change, "the default cannot be evaluated before apply", unchecked));
@@ -3243,6 +3259,7 @@ fn build(
             to_nullable: true, ..
         }
         | Change::AlterColumnDefault { .. }
+        | Change::AlterColumnExpression { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::SetPrimaryKey { to: None, .. }
         | Change::DropUnique { .. }
@@ -3489,6 +3506,7 @@ pub(crate) fn probes(changes: &ChangeSet) -> Preflight {
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }

@@ -233,6 +233,10 @@ indexes:
   slice holds `method: gin` over `jsonb` columns, with the class left out or
   `jsonb_path_ops`. SQL Server has only the default method and no classes, so
   it refuses `method: gin` and any class (DEC-1169.1).
+- **A stored generated column is `generated: {expression: "a * 2", stored:
+  true}`** (PostgreSQL): computed on every write, never a default, and its
+  kind always said. Its expression changes in place on PostgreSQL 17 and
+  later; a change to or from generated is refused (DEC-1168.1).
 - **An index with an expression key lists its keys under `keys:`**, one
   mapping each: `{column: id}` or `{expression: "lower(email)"}`, with
   optional `opclass:` and `order: desc`. An index names its keys under

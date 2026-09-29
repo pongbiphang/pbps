@@ -62,6 +62,10 @@ use crate::schema::Schema;
 /// record gained its text (DEC-1169.2). Versions 6 to 10 stay readable: see
 /// `OLDEST_READABLE_VERSION`.
 ///
+/// Bumped to 12 when a column gained its generation expression and the
+/// declared record its text (DEC-1168.1). Versions 6 to 11 stay readable:
+/// see `OLDEST_READABLE_VERSION`.
+///
 /// Readers refuse a version they do not understand rather than reading it
 /// partially.
 ///
@@ -80,7 +84,7 @@ use crate::schema::Schema;
 /// order, which can drop a schema-bound dependency before its dependent.
 /// Refused, with the remedy `check_version` already names: re-record it with
 /// `pbps baseline --reason ...`.
-pub const CURRENT_VERSION: u32 = 11;
+pub const CURRENT_VERSION: u32 = 12;
 
 /// The oldest snapshot version this build reads as its own.
 ///
@@ -117,6 +121,11 @@ pub const CURRENT_VERSION: u32 = 11;
 /// older state lacks (DEC-1169.2): an older reader recorded every key as a
 /// column, which each was, and reported an expression index as a limitation,
 /// which no recorder accepts on a managed table.
+///
+/// Still 6 at version 12, whose generation expressions an older state lacks
+/// (DEC-1168.1): an older reader reported every generated column as a
+/// limitation, and no recorder accepts one on a managed table, so no
+/// recorded column was generated.
 pub const OLDEST_READABLE_VERSION: u32 = 6;
 
 /// How this state came about.
@@ -519,7 +528,7 @@ mod tests {
         // the whole story rather than a sample of it; 6 is readable because
         // the field 7 added is one it truly lacks.
         assert_eq!(OLDEST_READABLE_VERSION, 6);
-        assert_eq!(CURRENT_VERSION, 11);
+        assert_eq!(CURRENT_VERSION, 12);
     }
 
     fn schema_with(ty: &str) -> Schema {

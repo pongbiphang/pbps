@@ -828,6 +828,18 @@ pub fn check(name: &TableName, table: &Table) -> Vec<String> {
                      assigns — leave it out"
                 ));
             }
+            // A generated column is computed from the row's other columns on
+            // every write, and the engine refuses a value for it (DEC-1168.1).
+            if table
+                .columns
+                .get(column)
+                .is_some_and(|c| c.generated.is_some())
+            {
+                problems.push(format!(
+                    "{name}: row `{key}` sets `{column}`, which is a generated column the engine \
+                     computes — leave it out"
+                ));
+            }
             if key_column.as_deref() == Some(column.as_str()) {
                 // Not a style rule. If the body could restate the key, it could
                 // disagree with it, and there would be two answers to "which
@@ -858,7 +870,7 @@ pub fn check(name: &TableName, table: &Table) -> Vec<String> {
                         ""
                     }
                 )),
-                None if spec.default.is_none() && spec.identity.is_none() => {
+                None if spec.default.is_none() && !spec.engine_assigned() => {
                     problems.push(format!(
                         "{name}: row `{key}` leaves `{column}` unset, but it is NOT NULL with no default"
                     ));
@@ -1046,6 +1058,40 @@ mod tests {
             cell(&written, "n", Some(&with_default)),
             Cell::Value(Value::Int(7))
         );
+    }
+
+    /// A generated column is computed by the engine on every write: a row
+    /// that sets one is refused, and a `NOT NULL` one a row leaves out is
+    /// not "unset" (DEC-1168.1).
+    #[test]
+    fn a_row_writing_a_generated_column_is_refused_and_leaving_it_out_is_not() {
+        let mut t = table(
+            Some(vec!["code"]),
+            vec![(
+                "new",
+                vec![
+                    ("label", Value::Text("New".into())),
+                    ("twice", Value::Int(2)),
+                ],
+            )],
+        );
+        let mut twice = Column::new(ColumnType::from_str("int").unwrap()).not_null();
+        twice.generated = Some(crate::schema::Generated {
+            expression: "length(label) * 2".into(),
+            stored: true,
+        });
+        t.columns.insert("twice".to_owned(), twice);
+        let p = check(&name(), &t);
+        assert!(p.iter().any(|m| m.contains("generated column")), "{p:?}");
+        t.data.as_mut().unwrap().rows = [(
+            RowKey::from("new"),
+            [("label".to_owned(), Value::Text("New".into()))]
+                .into_iter()
+                .collect(),
+        )]
+        .into_iter()
+        .collect();
+        assert_eq!(check(&name(), &t), Vec::<String>::new());
     }
 
     /// The fourth review's shape, one step over: only the key may pin an

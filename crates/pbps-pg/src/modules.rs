@@ -1522,11 +1522,12 @@ pub enum Holds {
     TablePart { table: TableName, part: Part },
     /// Something no declaration can hold, whatever this project declares.
     ///
-    /// "Managed" means **representable**, and one of the four objects
-    /// ADR-0009 §4 measured is not: `Column` has no generated-expression
-    /// field, so a generated column has nothing for a planner to recreate it
-    /// from. Promising to restore it would be promising to emit a statement
-    /// pbps cannot write. An expression index was the second until an index
+    /// "Managed" means **restorable around the rebuild**, and one of the four
+    /// objects ADR-0009 §4 measured is not: a generated column. `Column` holds
+    /// its expression since DEC-1168.1, but no statement takes the expression
+    /// off and puts it back — `DROP EXPRESSION` leaves an ordinary column, and
+    /// `SET EXPRESSION` is refused on one — so promising to restore it would
+    /// be promising to emit a statement pbps cannot write. An expression index was the second until an index
     /// key could be an expression (DEC-1169.2): a declared one is now a table
     /// part like any other index, and one the model still cannot hold is
     /// never declared, so it is refused as unmanaged.
@@ -1985,7 +1986,7 @@ fn dependents_query(refclass: &str) -> String {
           UNION ALL
          SELECT 'default', {described}, n2.nspname, c2.relname, a.attname, 0::int8,
                 CASE WHEN a.attgenerated <> ''
-                     THEN 'a generated column, which `Column` has no field for'
+                     THEN 'a generated column, whose expression no statement can take off and put back around the rebuild'
                      ELSE '' END
            FROM pg_catalog.pg_depend d
            JOIN pg_catalog.pg_attrdef ad ON ad.oid = d.objid

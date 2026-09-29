@@ -234,6 +234,7 @@ pub fn planned_estimates(changes: &ChangeSet) -> Vec<(usize, Estimate)> {
                 | Change::AlterColumnType { .. }
                 | Change::AlterColumnNullability { .. }
                 | Change::AlterColumnDefault { .. }
+                | Change::AlterColumnExpression { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
                 | Change::AddUnique { .. }
@@ -318,6 +319,7 @@ pub fn planned_estimates(changes: &ChangeSet) -> Vec<(usize, Estimate)> {
                 | Change::DropColumn { .. }
                 | Change::RenameColumn { .. }
                 | Change::AlterColumnDefault { .. }
+                | Change::AlterColumnExpression { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
                 | Change::AddUnique { .. }

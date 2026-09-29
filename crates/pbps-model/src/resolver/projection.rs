@@ -293,6 +293,11 @@ fn changed_owners(change: &Change) -> Option<(Vec<OwnerScope>, bool, bool)> {
             from.is_some(),
             to.is_some(),
         ),
+        // A generation expression is the column's `pg_attrdef` row, as a
+        // default is, replaced in place (DEC-1168.1).
+        Change::AlterColumnExpression { column, .. } => {
+            (Exact(Surface::Default(column.clone())), true, true)
+        }
         Change::SetPrimaryKey { table, .. }
         | Change::AddUnique { table, .. }
         | Change::DropUnique { table, .. }
