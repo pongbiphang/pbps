@@ -2073,15 +2073,13 @@ impl ScratchRun {
                 .cloned()
                 .collect::<BTreeSet<_>>()
         };
-        let captured: Result<
-            (
-                Option<engine::CompiledCapture>,
-                Option<engine::CapturedInputs>,
-                engine::CaptureScope,
-                Option<InputManifest>,
-            ),
-            String,
-        > = match (key, planning) {
+        type DesiredCapture = (
+            Option<engine::CompiledCapture>,
+            Option<engine::CapturedInputs>,
+            engine::CaptureScope,
+            Option<InputManifest>,
+        );
+        let captured: Result<DesiredCapture, String> = match (key, planning) {
             (Some(key), Some((_, wanted))) => engine::capture_desired_for_plan(
                 admin,
                 &base,

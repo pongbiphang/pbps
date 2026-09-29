@@ -231,14 +231,49 @@ fn rename_source(
     let final_table = match &transition.surface {
         Surface::Table(table) => table,
         Surface::Column(column) => &column.table,
-        _ => return None,
+        Surface::Namespace(_)
+        | Surface::Default(_)
+        | Surface::Check { .. }
+        | Surface::Index { .. }
+        | Surface::Module(_) => return None,
     };
     let prior_table = changes
         .changes
         .iter()
         .find_map(|step| match &step.change {
             Change::RenameTable { from, to, .. } if to == final_table => Some(from),
-            _ => None,
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. }
+            | Change::PublicExecution { .. } => None,
         })
         .unwrap_or(final_table);
     let before_relation = relation_identity(prior_table);
@@ -250,7 +285,38 @@ fn rename_source(
                 Change::RenameColumn {
                     table, from, to, ..
                 } if table == final_table && to == name => Some(from.as_str()),
-                _ => None,
+                Change::CreateTable { .. }
+                | Change::DropTable { .. }
+                | Change::RenameTable { .. }
+                | Change::AddColumn { .. }
+                | Change::DropColumn { .. }
+                | Change::RenameColumn { .. }
+                | Change::AlterColumnType { .. }
+                | Change::AlterColumnNullability { .. }
+                | Change::AlterColumnDefault { .. }
+                | Change::SetColumnDeprecated { .. }
+                | Change::SetPrimaryKey { .. }
+                | Change::AddUnique { .. }
+                | Change::DropUnique { .. }
+                | Change::AddForeignKey { .. }
+                | Change::DropForeignKey { .. }
+                | Change::AddCheck { .. }
+                | Change::DropCheck { .. }
+                | Change::AddIndex { .. }
+                | Change::DropIndex { .. }
+                | Change::InsertRow { .. }
+                | Change::UpdateRow { .. }
+                | Change::DeleteRow { .. }
+                | Change::SetDataMode { .. }
+                | Change::CreateModule { .. }
+                | Change::AlterModule { .. }
+                | Change::DropModule { .. }
+                | Change::CreateRole { .. }
+                | Change::DropRole { .. }
+                | Change::RenameRole { .. }
+                | Change::Grant { .. }
+                | Change::Revoke { .. }
+                | Change::PublicExecution { .. } => None,
             })
             .unwrap_or(name);
         ObjectIdentity {
@@ -390,7 +456,7 @@ fn relocated_value(
                 .map(|member| relocated_value(member, names))
                 .collect::<Result<_, _>>()?,
         )),
-        _ => Ok(value.clone()),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => Ok(value.clone()),
     }
 }
 
@@ -545,12 +611,43 @@ impl CompiledCapture {
                         }
                         Some(*to_nullable)
                     }
-                    _ => None,
+                    Change::CreateTable { .. }
+                    | Change::DropTable { .. }
+                    | Change::RenameTable { .. }
+                    | Change::AddColumn { .. }
+                    | Change::DropColumn { .. }
+                    | Change::RenameColumn { .. }
+                    | Change::AlterColumnType { .. }
+                    | Change::AlterColumnNullability { .. }
+                    | Change::AlterColumnDefault { .. }
+                    | Change::SetColumnDeprecated { .. }
+                    | Change::SetPrimaryKey { .. }
+                    | Change::AddUnique { .. }
+                    | Change::DropUnique { .. }
+                    | Change::AddForeignKey { .. }
+                    | Change::DropForeignKey { .. }
+                    | Change::AddCheck { .. }
+                    | Change::DropCheck { .. }
+                    | Change::AddIndex { .. }
+                    | Change::DropIndex { .. }
+                    | Change::InsertRow { .. }
+                    | Change::UpdateRow { .. }
+                    | Change::DeleteRow { .. }
+                    | Change::SetDataMode { .. }
+                    | Change::CreateModule { .. }
+                    | Change::AlterModule { .. }
+                    | Change::DropModule { .. }
+                    | Change::CreateRole { .. }
+                    | Change::DropRole { .. }
+                    | Change::RenameRole { .. }
+                    | Change::Grant { .. }
+                    | Change::Revoke { .. }
+                    | Change::PublicExecution { .. } => None,
                 };
-                if let Some(to_nullable) = to_nullable {
-                    if nullable_after.replace(to_nullable).is_some() {
-                        return Err(ManifestError::Invalid);
-                    }
+                if let Some(to_nullable) = to_nullable
+                    && nullable_after.replace(to_nullable).is_some()
+                {
+                    return Err(ManifestError::Invalid);
                 }
             }
             if nullable_after.is_none() && old_not_null != new_not_null {
@@ -675,10 +772,8 @@ impl CompiledCapture {
         }
         self.captured.scope.retained = relocated_set(&self.captured.scope.retained, &names)?;
         self.captured.limitations = relocated_set(&self.captured.limitations, &names)?;
-        for found in self.captured.dropped.values_mut() {
-            if let Some(object) = found {
-                *object = relocated_identity(object, &names);
-            }
+        for object in self.captured.dropped.values_mut().flatten() {
+            *object = relocated_identity(object, &names);
         }
         Ok(())
     }
@@ -715,7 +810,37 @@ impl CompiledCapture {
             .iter()
             .filter_map(|step| match &step.change {
                 Change::DropModule { id, .. } => Some(id.clone()),
-                _ => None,
+                Change::CreateTable { .. }
+                | Change::DropTable { .. }
+                | Change::RenameTable { .. }
+                | Change::AddColumn { .. }
+                | Change::DropColumn { .. }
+                | Change::RenameColumn { .. }
+                | Change::AlterColumnType { .. }
+                | Change::AlterColumnNullability { .. }
+                | Change::AlterColumnDefault { .. }
+                | Change::SetColumnDeprecated { .. }
+                | Change::SetPrimaryKey { .. }
+                | Change::AddUnique { .. }
+                | Change::DropUnique { .. }
+                | Change::AddForeignKey { .. }
+                | Change::DropForeignKey { .. }
+                | Change::AddCheck { .. }
+                | Change::DropCheck { .. }
+                | Change::AddIndex { .. }
+                | Change::DropIndex { .. }
+                | Change::InsertRow { .. }
+                | Change::UpdateRow { .. }
+                | Change::DeleteRow { .. }
+                | Change::SetDataMode { .. }
+                | Change::CreateModule { .. }
+                | Change::AlterModule { .. }
+                | Change::CreateRole { .. }
+                | Change::DropRole { .. }
+                | Change::RenameRole { .. }
+                | Change::Grant { .. }
+                | Change::Revoke { .. }
+                | Change::PublicExecution { .. } => None,
             })
             .collect();
         let rebuilt: BTreeSet<_> = changes
@@ -724,7 +849,37 @@ impl CompiledCapture {
             .filter_map(|step| match &step.change {
                 Change::AlterModule { id, .. } => Some(id.clone()),
                 Change::CreateModule { id, .. } if dropped.contains(id) => Some(id.clone()),
-                _ => None,
+                Change::CreateTable { .. }
+                | Change::DropTable { .. }
+                | Change::RenameTable { .. }
+                | Change::AddColumn { .. }
+                | Change::DropColumn { .. }
+                | Change::RenameColumn { .. }
+                | Change::AlterColumnType { .. }
+                | Change::AlterColumnNullability { .. }
+                | Change::AlterColumnDefault { .. }
+                | Change::SetColumnDeprecated { .. }
+                | Change::SetPrimaryKey { .. }
+                | Change::AddUnique { .. }
+                | Change::DropUnique { .. }
+                | Change::AddForeignKey { .. }
+                | Change::DropForeignKey { .. }
+                | Change::AddCheck { .. }
+                | Change::DropCheck { .. }
+                | Change::AddIndex { .. }
+                | Change::DropIndex { .. }
+                | Change::InsertRow { .. }
+                | Change::UpdateRow { .. }
+                | Change::DeleteRow { .. }
+                | Change::SetDataMode { .. }
+                | Change::CreateModule { .. }
+                | Change::DropModule { .. }
+                | Change::CreateRole { .. }
+                | Change::DropRole { .. }
+                | Change::RenameRole { .. }
+                | Change::Grant { .. }
+                | Change::Revoke { .. }
+                | Change::PublicExecution { .. } => None,
             })
             .collect();
         for id in rebuilt {
@@ -762,7 +917,9 @@ impl CompiledCapture {
                         }
                     }
                 }
-                _ => return Err(SealError::OpeningAcl),
+                Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Object(_) => {
+                    return Err(SealError::OpeningAcl);
+                }
             }
         }
         Ok(())
@@ -813,7 +970,36 @@ impl CompiledCapture {
             .filter_map(|step| match &step.change {
                 Change::RenameTable { to, .. } => Some(Surface::Table(to.clone())),
                 Change::RenameColumn { table, to, .. } => Some(Surface::Column(table.column(to))),
-                _ => None,
+                Change::CreateTable { .. }
+                | Change::DropTable { .. }
+                | Change::AddColumn { .. }
+                | Change::DropColumn { .. }
+                | Change::AlterColumnType { .. }
+                | Change::AlterColumnNullability { .. }
+                | Change::AlterColumnDefault { .. }
+                | Change::SetColumnDeprecated { .. }
+                | Change::SetPrimaryKey { .. }
+                | Change::AddUnique { .. }
+                | Change::DropUnique { .. }
+                | Change::AddForeignKey { .. }
+                | Change::DropForeignKey { .. }
+                | Change::AddCheck { .. }
+                | Change::DropCheck { .. }
+                | Change::AddIndex { .. }
+                | Change::DropIndex { .. }
+                | Change::InsertRow { .. }
+                | Change::UpdateRow { .. }
+                | Change::DeleteRow { .. }
+                | Change::SetDataMode { .. }
+                | Change::CreateModule { .. }
+                | Change::AlterModule { .. }
+                | Change::DropModule { .. }
+                | Change::CreateRole { .. }
+                | Change::DropRole { .. }
+                | Change::RenameRole { .. }
+                | Change::Grant { .. }
+                | Change::Revoke { .. }
+                | Change::PublicExecution { .. } => None,
             })
             .collect();
         let added_indexes: BTreeSet<Surface> = changes
@@ -824,7 +1010,37 @@ impl CompiledCapture {
                     table: table.clone(),
                     name: name.clone(),
                 }),
-                _ => None,
+                Change::CreateTable { .. }
+                | Change::DropTable { .. }
+                | Change::RenameTable { .. }
+                | Change::AddColumn { .. }
+                | Change::DropColumn { .. }
+                | Change::RenameColumn { .. }
+                | Change::AlterColumnType { .. }
+                | Change::AlterColumnNullability { .. }
+                | Change::AlterColumnDefault { .. }
+                | Change::SetColumnDeprecated { .. }
+                | Change::SetPrimaryKey { .. }
+                | Change::AddUnique { .. }
+                | Change::DropUnique { .. }
+                | Change::AddForeignKey { .. }
+                | Change::DropForeignKey { .. }
+                | Change::AddCheck { .. }
+                | Change::DropCheck { .. }
+                | Change::DropIndex { .. }
+                | Change::InsertRow { .. }
+                | Change::UpdateRow { .. }
+                | Change::DeleteRow { .. }
+                | Change::SetDataMode { .. }
+                | Change::CreateModule { .. }
+                | Change::AlterModule { .. }
+                | Change::DropModule { .. }
+                | Change::CreateRole { .. }
+                | Change::DropRole { .. }
+                | Change::RenameRole { .. }
+                | Change::Grant { .. }
+                | Change::Revoke { .. }
+                | Change::PublicExecution { .. } => None,
             })
             .collect();
         let verified_indexes =
@@ -1214,18 +1430,18 @@ fn normalize_identity(
         .collect::<Result<_, _>>()?;
     if object.class == TARGET_ROLE {
         result.class = "pg_authid".into();
-    } else if object.class == "pg_authid" {
-        if let Some(roles) = roles {
-            let [name] = object.name.as_slice() else {
-                return Err(ManifestError::Invalid);
-            };
-            if let Some(logical) = roles.logical_of(name) {
-                result.name = vec![logical];
-            } else {
-                // The scratch server's own role is a separate observed
-                // prerequisite, even if its spelling equals a target role.
-                result.class = SCRATCH_ROLE.into();
-            }
+    } else if object.class == "pg_authid"
+        && let Some(roles) = roles
+    {
+        let [name] = object.name.as_slice() else {
+            return Err(ManifestError::Invalid);
+        };
+        if let Some(logical) = roles.logical_of(name) {
+            result.name = vec![logical];
+        } else {
+            // The scratch server's own role is a separate observed
+            // prerequisite, even if its spelling equals a target role.
+            result.class = SCRATCH_ROLE.into();
         }
     }
     Ok(result)
@@ -1363,10 +1579,10 @@ impl CapturedInputs {
                     .iter()
                     .map(|(name, value)| {
                         let mut normalized = normalize_value(value, roles)?;
-                        if acl_field(&object.class, name) {
-                            if let Value::Array(entries) = &mut normalized {
-                                entries.sort_by_cached_key(Value::to_string);
-                            }
+                        if acl_field(&object.class, name)
+                            && let Value::Array(entries) = &mut normalized
+                        {
+                            entries.sort_by_cached_key(Value::to_string);
                         }
                         Ok((name.clone(), normalized))
                     })

@@ -63,13 +63,13 @@ fn assign(
     object: ObjectIdentity,
     surface: Surface,
 ) -> Result<(), Uncovered> {
-    if let Some(previous) = owned.insert(object.clone(), surface.clone()) {
-        if previous != surface {
-            return Err(Uncovered::object(
-                &object,
-                "catalog record has conflicting declared owners",
-            ));
-        }
+    if let Some(previous) = owned.insert(object.clone(), surface.clone())
+        && previous != surface
+    {
+        return Err(Uncovered::object(
+            &object,
+            "catalog record has conflicting declared owners",
+        ));
     }
     Ok(())
 }
@@ -109,14 +109,14 @@ fn physical_attributes(
         .filter(|id| id.class == "column" && id.signature.first() == Some(parent))
     {
         let fail = || Uncovered::object(child, "physical attribute provenance is unreadable");
-        let number = *capture.attribute_numbers.get(child).ok_or_else(|| fail())?;
-        let input = capture.inputs.get(child).ok_or_else(|| fail())?;
+        let number = *capture.attribute_numbers.get(child).ok_or_else(&fail)?;
+        let input = capture.inputs.get(child).ok_or_else(&fail)?;
         let relation: ObjectIdentity = serde_json::from_value(
             input
                 .properties
                 .get("attrelid")
                 .cloned()
-                .ok_or_else(|| fail())?,
+                .ok_or_else(&fail)?,
         )
         .map_err(|_| fail())?;
         if number == 0

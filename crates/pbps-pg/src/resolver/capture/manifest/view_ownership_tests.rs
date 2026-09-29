@@ -147,9 +147,8 @@ fn system_and_referenced_columns_do_not_inherit_view_ownership() {
 fn absent_or_wrong_kind_view_root_cannot_own_a_same_named_column() {
     let (mut missing, view, column) = snapshot(18);
     missing.inputs.remove(&view);
-    match ownership(&missing) {
-        Ok(found) => assert_eq!(found.get(&column), Some(&ObjectOwnership::Unqualified)),
-        Err(_) => {}
+    if let Ok(found) = ownership(&missing) {
+        assert_eq!(found.get(&column), Some(&ObjectOwnership::Unqualified));
     }
 
     let (mut wrong_kind, view, _) = snapshot(18);

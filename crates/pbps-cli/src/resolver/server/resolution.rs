@@ -116,20 +116,20 @@ pub(super) fn from_records(
             .contains(surface)
             .then(|| bound(compiled, surface))
             .transpose()?;
-        if let (Some(current), Some(desired)) = (&current, &desired) {
-            if current.object == desired.object {
-                match assessment.surfaces.get(&current.object) {
-                    Some(Verdict::Unaffected | Verdict::Rebuild) => {}
-                    Some(Verdict::Unresolved { condition }) => {
-                        return Err(Error::Binding(format!(
-                            "the declared surface is unresolved: {condition}"
-                        )));
-                    }
-                    None => {
-                        return Err(Error::Binding(
-                            "the declared surface lacks its binding verdict".into(),
-                        ));
-                    }
+        if let (Some(current), Some(desired)) = (&current, &desired)
+            && current.object == desired.object
+        {
+            match assessment.surfaces.get(&current.object) {
+                Some(Verdict::Unaffected | Verdict::Rebuild) => {}
+                Some(Verdict::Unresolved { condition }) => {
+                    return Err(Error::Binding(format!(
+                        "the declared surface is unresolved: {condition}"
+                    )));
+                }
+                None => {
+                    return Err(Error::Binding(
+                        "the declared surface lacks its binding verdict".into(),
+                    ));
                 }
             }
         }
