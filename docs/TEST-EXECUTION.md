@@ -67,6 +67,22 @@ containers pass their elements, and native indexing/slicing with literal integer
 bounds preserves immutable reads and independent copies. Shared mutable children
 still escape. Unknown base expressions and nested classes retain conservative
 reference tracking; this proof does not extend the selector assignment grammar.
+
+The exact-value class-base exemption also requires a pristine execution prefix
+and a bounded proof of the whole construction. Literal keywords and native dict
+unpacking (including pristine literal dictionary aliases) are accepted. A custom
+metaclass must be a directly defined, unmodified function (or a proven alias),
+whose reachable helpers only operate on native arguments. Any `type` construction
+must use the unshadowed builtin with empty bases, only as the metaclass return
+operation; helper-produced classes cannot be treated as native containers.
+Mutable global access, reflection, unknown calls, modified prepare hooks,
+and unsupported callable bodies retain conservative base-reference effects.
+The class body may contain literal local assignments and plain method definitions
+with inert definition-time expressions; an uncalled method body is not executed.
+This is a deliberately bounded proof, not execution or import of fixture code.
+Empty native base expansions also permit the default metaclass or an unshadowed
+builtin `type`, with the same class-body proof.
+
 Literal tuples
 retain their immutability and Python concatenation semantics; a tuple can still
 expose mutable children. Data selectors accept lists or tuples of names. Unsupported

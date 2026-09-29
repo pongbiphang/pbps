@@ -822,6 +822,93 @@ class Ownership(unittest.TestCase):
                 self.assertEqual(self.check(), 1)
 
 
+    def test_class_construction_callbacks_cannot_hide_selector_mutations(self):
+        construct = ('def construct(name, bases, namespace, **keywords):\n'
+                     '    return type(name, (), namespace)\n')
+        mutate = ('def mutate(*unused):\n    TESTS.clear()\n    return True\n')
+        prepare = ('def prepare(name, bases):\n    TESTS.clear()\n    return {}\n')
+        header = 'class Holder(TESTS[0], metaclass=construct): pass\n'
+        cases = [
+            ('def build(name, namespace): return type(name, (), namespace)\n'
+             'def construct(name, bases, namespace):\n    result = build(name, namespace)\n'
+             '    result.clear()\n    return result\n',
+             'class Holder(TESTS[0], metaclass=construct):\n    def clear(): TESTS.clear()\n'),
+            (construct + mutate, 'class Holder(TESTS[0], flag=mutate(), metaclass=construct): pass\n'),
+            (construct + mutate, 'class Holder(TESTS[0], **{"flag": mutate()}, metaclass=construct): pass\n'),
+            (construct + 'def select():\n    TESTS.clear()\n    return construct\n',
+             'class Holder(TESTS[0], metaclass=select()): pass\n'),
+            (construct + mutate, 'class Holder(TESTS[0], metaclass=construct): mutate()\n'),
+            (construct + mutate, 'class Holder(TESTS[0], metaclass=construct):\n'
+             '    class Inner:\n        mutate()\n'),
+            (construct + mutate, 'class Holder(TESTS[0], metaclass=construct):\n'
+             '    def method(self, value=mutate()): pass\n'),
+            (construct + 'def decorate(fn):\n    TESTS.clear()\n    return fn\n',
+             'class Holder(TESTS[0], metaclass=construct):\n'
+             '    @decorate\n    def method(self): pass\n'),
+            ('def construct(name, bases, namespace):\n    TESTS.clear()\n'
+             '    return type(name, (), namespace)\n', header),
+            ('def change(): TESTS.clear()\ndef construct(name, bases, namespace):\n'
+             '    change()\n    return type(name, (), namespace)\n', header),
+            ('def type(*args):\n    TESTS.clear()\n    return object\n' + construct, header),
+            (construct + prepare + 'construct.__prepare__ = prepare\n', header),
+            (construct + prepare + 'ALIAS = construct\nALIAS.__prepare__ = prepare\n', header),
+            (construct + prepare + 'setattr(construct, "__prepare__", prepare)\n', header),
+            (construct + prepare + 'def install(): construct.__prepare__ = prepare\ninstall()\n', header),
+            (construct + 'class Mapping:\n    def keys(self):\n        TESTS.clear()\n'
+             '        return ["flag"]\n    def __getitem__(self, key): return True\nMAPPING = Mapping()\n',
+             'class Holder(TESTS[0], **MAPPING, metaclass=construct): pass\n'),
+            ('def clear(value): ALIAS.clear()\ndef construct(name, bases, namespace):\n'
+             '    clear(bases)\n    return type(name, (), namespace)\n', 'ALIAS = TESTS\n' + header),
+            ('', 'def clear(value=TESTS): value.clear()\ndef construct(name, bases, namespace):\n'
+             '    clear()\n    return type(name, (), namespace)\n' + header),
+        ]
+        self.inventory['owners']['live']['selection'] = {
+            'kind': 'data', 'file': 'runner.py', 'expression': 'TESTS'}
+        for setup, suffix in cases:
+            with self.subTest(setup=setup, suffix=suffix):
+                source = setup + 'TESTS = ["owned"]\n' + suffix
+                actual = subprocess.run([sys.executable, '-c', source + 'print(TESTS)'],
+                                        check=True, capture_output=True, text=True, timeout=10)
+                self.assertEqual(actual.stdout, '[]\n')
+                (self.root / 'runner.py').write_text(source, encoding='utf-8')
+                with self.assertRaises(audit.InventoryError):
+                    self.check()
+
+    def test_proven_native_class_execution_preserves_selector_ownership(self):
+        construct = ('def construct(name, bases, namespace, **keywords):\n'
+                     '    return type(name, (), namespace)\n')
+        header = 'class Holder(TESTS[0], metaclass=construct): pass\n'
+        cases = [
+            (construct, 'class Holder(TESTS[0], metaclass=construct):\n'
+             '    def unused(self): TESTS.clear()\n'),
+            (construct, 'class Holder(TESTS[0], metaclass=construct):\n'
+             '    async def unused(self, value=1): TESTS.clear()\n'),
+            ('', 'class Holder(*TESTS[:0]): pass\n'),
+            ('', 'class Holder(*TESTS[:0], metaclass=type): pass\n'),
+            (construct + 'OPTIONS = {"flag": True}\nALIAS = OPTIONS\n',
+             'class Holder(TESTS[0], **ALIAS, metaclass=construct): pass\n'),
+            (construct, 'class Holder(TESTS[0], flag=True, metaclass=construct): pass\n'),
+            (construct, 'class Holder(*TESTS, **{"flag": True}, metaclass=construct): pass\n'),
+            (construct, 'class Holder(TESTS[0], flag={"x": [1]}, metaclass=construct): pass\n'),
+            (construct + 'ALIAS = construct\n', 'class Holder(TESTS[0], metaclass=ALIAS): pass\n'),
+            (construct, 'class Holder(TESTS[0], metaclass=construct):\n    TESTS = 0\n    count = TESTS + 1\n'),
+            ('def construct(name, bases, namespace):\n    copied = list(bases)\n'
+             '    copied.clear()\n    return type(name, (), namespace)\n', header),
+            ('def clear(value):\n    if isinstance(value, list): value.clear()\nALIAS = clear\n'
+             'def construct(name, bases, namespace):\n    for base in bases: ALIAS(base)\n'
+             '    return type(name, (), namespace)\n', header),
+        ]
+        self.inventory['owners']['live']['selection'] = {
+            'kind': 'data', 'file': 'runner.py', 'expression': 'TESTS'}
+        for setup, suffix in cases:
+            with self.subTest(setup=setup, suffix=suffix):
+                source = setup + 'TESTS = ["owned"]\n' + suffix
+                actual = subprocess.run([sys.executable, '-c', source + 'print(TESTS)'],
+                                        check=True, capture_output=True, text=True, timeout=10)
+                self.assertEqual(actual.stdout, "['owned']\n")
+                (self.root / 'runner.py').write_text(source, encoding='utf-8')
+                self.assertEqual(self.check(), 1)
+
     def test_literal_base_elements_and_copies_preserve_selector_ownership(self):
         setup = ('def clear(value):\n'
                  '    if isinstance(value, list): value.clear()\n'

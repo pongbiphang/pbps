@@ -230,8 +230,8 @@ class SelectorEffects(ast.NodeVisitor):
         self.writes.add(node.name)
         for expression in [*node.decorator_list, *node.bases, *node.keywords]:
             self.visit(expression)
-        # Only a direct module class has these exact bindings. Decorator/base
-        # callbacks or class-local rebinding make a literal result unsafe to use.
+        # Only a direct module class with proven construction effects receives
+        # this exemption. Unknown hooks can invalidate even immutable reads.
         exposed = None
         if node is self.literal_class and not node.decorator_list:
             try:
@@ -464,9 +464,174 @@ class NamespaceImports:
 
 
 
+class ClassExecutionProof:
+    """Bounded native-argument functions; no fixture code is executed."""
+    def __init__(self):
+        self.functions = {}
+        self.bound = set()
+        self.literal_mappings = set()
+
+    def advance(self, node, effects):
+        alias = (self.functions.get(node.value.id)
+                 if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name) else None)
+        mapping = False
+        if isinstance(node, ast.Assign):
+            mapping = isinstance(node.value, ast.Name) and node.value.id in self.literal_mappings
+            if isinstance(node.value, ast.Dict):
+                try:
+                    value = ast.literal_eval(node.value)
+                    mapping = all(type(key) is str for key in value)
+                except (ValueError, TypeError):
+                    pass
+        self.literal_mappings.difference_update(effects.writes)
+        if mapping:
+            self.literal_mappings.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        self.bound.update(effects.writes)
+        for name in effects.writes:
+            self.functions.pop(name, None)
+        if isinstance(node, ast.FunctionDef):
+            self.functions[node.name] = node
+        elif alias is not None and all(isinstance(t, ast.Name) for t in node.targets):
+            for target in node.targets:
+                self.functions[target.id] = alias
+
+    def callable(self, name, visiting=None, *, constructor=False):
+        visiting = set() if visiting is None else visiting
+        # Helpers must remain native-valued: a constructed class can expose
+        # user-defined methods even through a familiar operation such as clear.
+        if (name, constructor) in visiting:
+            return True
+        function = self.functions.get(name)
+        if function is None or function.decorator_list or getattr(function, 'type_params', []):
+            return False
+        args = function.args
+        parameters = [*args.posonlyargs, *args.args, *args.kwonlyargs,
+                      *([args.vararg] if args.vararg else []), *([args.kwarg] if args.kwarg else [])]
+        if (args.defaults or any(x is not None for x in args.kw_defaults)
+            or function.returns or any(x.annotation for x in parameters)):
+            return False
+        # Only straight local bindings and native-container loops are supported.
+        locals_ = {x.arg for x in parameters}
+        for node in ast.walk(function):
+            if isinstance(node, (ast.Assign, ast.For)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if any(not isinstance(target, ast.Name) for target in targets):
+                    return False
+                locals_.update(target.id for target in targets)
+        visiting = visiting | {(name, constructor)}
+        builtins = {'isinstance', 'list', 'tuple'}
+        def builtin(name):
+            return name not in self.bound and name not in locals_ and '__builtins__' not in self.bound
+        def expression(node):
+            if isinstance(node, ast.Constant): return True
+            if isinstance(node, ast.Name):
+                return node.id in locals_ or node.id in builtins and builtin(node.id)
+            if isinstance(node, (ast.List, ast.Tuple)):
+                return all(expression(item) for item in node.elts)
+            if isinstance(node, ast.Subscript):
+                return expression(node.value) and isinstance(node.slice, ast.Constant) and type(node.slice.value) is int
+            if isinstance(node, ast.BoolOp): return all(expression(value) for value in node.values)
+            if isinstance(node, ast.Call) and not node.keywords:
+                if not all(expression(arg) for arg in node.args): return False
+                if isinstance(node.func, ast.Attribute):
+                    return node.func.attr == 'clear' and not node.args and expression(node.func.value)
+                if isinstance(node.func, ast.Name) and node.func.id not in locals_:
+                    callee = node.func.id
+                    if callee in builtins and builtin(callee): return True
+                    return self.callable(callee, visiting)
+            return False
+        def statement(node):
+            if isinstance(node, ast.Pass): return True
+            if isinstance(node, ast.Expr): return expression(node.value)
+            if isinstance(node, ast.Assign): return expression(node.value)
+            if isinstance(node, ast.If):
+                return expression(node.test) and all(statement(s) for s in [*node.body, *node.orelse])
+            if isinstance(node, ast.For):
+                return expression(node.iter) and all(statement(s) for s in [*node.body, *node.orelse])
+            if isinstance(node, ast.Return):
+                value = node.value
+                if value is None: return True
+                if (constructor and isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+                    and value.func.id == 'type'
+                    and builtin('type') and not value.keywords and len(value.args) == 3
+                    and isinstance(value.args[1], ast.Tuple) and not value.args[1].elts):
+                    return expression(value.args[0]) and expression(value.args[2])
+                return expression(value)
+            return False
+        return all(statement(node) for node in function.body)
+
+    def safe(self, node, imports, values):
+        if not imports.inert_prefix or node.decorator_list: return False
+        metaclass = [keyword.value for keyword in node.keywords if keyword.arg == 'metaclass']
+        ordinary = (not metaclass or len(metaclass) == 1 and isinstance(metaclass[0], ast.Name)
+                    and metaclass[0].id == 'type' and 'type' not in self.bound)
+        if not ordinary:
+            if (len(metaclass) != 1 or not isinstance(metaclass[0], ast.Name)
+                or not self.callable(metaclass[0].id, constructor=True)):
+                return False
+        else:
+            # Empty native expansions use the ordinary object/type construction;
+            # no user base or metaclass can add a protocol hook.
+            if '__builtins__' in self.bound:
+                return False
+            try:
+                for base in node.bases:
+                    if not isinstance(base, ast.Starred):
+                        return False
+                    value = static_value(base.value, values, subscripts=True)
+                    if type(value) not in (list, tuple, str) or value:
+                        return False
+            except (ValueError, TypeError):
+                return False
+        def literal(value, scope):
+            if isinstance(value, ast.Name) and value.id in self.literal_mappings:
+                return True
+            if isinstance(value, ast.Dict):
+                return all(isinstance(key, ast.Constant) and type(key.value) is str and literal(item, scope)
+                           for key, item in zip(value.keys, value.values))
+            try:
+                static_value(value, scope, subscripts=True)
+                return True
+            except (ValueError, TypeError):
+                return False
+        for keyword in node.keywords:
+            if keyword.arg == 'metaclass': continue
+            if (keyword.arg is None and not isinstance(keyword.value, ast.Dict)
+                and not (isinstance(keyword.value, ast.Name) and keyword.value.id in self.literal_mappings)):
+                return False
+            if not literal(keyword.value, values): return False
+        scope = dict(values)
+        for statement in node.body:
+            if isinstance(statement, ast.Pass): continue
+            if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant): continue
+            if isinstance(statement, ast.Assign) and all(isinstance(t, ast.Name) for t in statement.targets):
+                try:
+                    value = static_value(statement.value, scope, subscripts=True)
+                except (ValueError, TypeError):
+                    return False
+                for target in statement.targets: scope[target.id] = value
+                continue
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                args = statement.args
+                parameters = [*args.posonlyargs, *args.args, *args.kwonlyargs,
+                              *([args.vararg] if args.vararg else []), *([args.kwarg] if args.kwarg else [])]
+                evaluated = [*args.defaults, *args.kw_defaults, statement.returns,
+                             *(parameter.annotation for parameter in parameters)]
+                if (statement.decorator_list or getattr(statement, 'type_params', [])
+                    or not all(value is None or literal(value, scope) for value in evaluated)):
+                    return False
+                # Plain function descriptors have no construction-time callback.
+                # Do not treat that function as literal data in later statements.
+                scope.pop(statement.name, None)
+                continue
+            return False
+        return True
+
+
 def python_values(tree):
     values = {}
     imports = NamespaceImports(values)
+    class_proof = ClassExecutionProof()
     namespace_exposed = False
     for node in tree.body:
         replacement = None
@@ -476,9 +641,11 @@ def python_values(tree):
             except (InventoryError, TypeError):
                 pass
         harmless = imports.harmless_call(node)
-        effects = SelectorEffects(node if replacement is not None or harmless is not None else None, harmless,
-                                  node if isinstance(node, ast.ClassDef) else None, values)
+        literal_class = node if isinstance(node, ast.ClassDef) and class_proof.safe(node, imports, values) else None
+        effects = SelectorEffects(node if replacement is not None or harmless is not None else None,
+                                  harmless, literal_class, values)
         effects.visit(node)
+        class_proof.advance(node, effects)
         imports.advance(node, effects)
         namespace_exposed |= effects.namespace_exposed
         mutated = effects.exposed_ids.union(*(mutable_ids(values[name]) for name in effects.mutations if name in values))
