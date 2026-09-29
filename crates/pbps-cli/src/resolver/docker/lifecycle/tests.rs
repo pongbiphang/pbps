@@ -284,7 +284,8 @@ async fn first_owner_deadline_precedes_a_delayed_create_reply() {
     );
     assert!(run.deadline() >= before_start + Duration::from_secs(LIFETIME_SECS));
     assert!(
-        run.deadline() < after_start + Duration::from_secs(LIFETIME_SECS) - Duration::from_millis(100),
+        run.deadline()
+            < after_start + Duration::from_secs(LIFETIME_SECS) - Duration::from_millis(100),
         "creation delay cannot extend the first owner's deadline"
     );
     run.close().await.unwrap();

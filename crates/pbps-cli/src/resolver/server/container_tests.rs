@@ -447,15 +447,16 @@ async fn delayed_container_analysis_expires_at_its_first_owner_bound() {
             .await;
         let still_running = inspect(&workload_id)["State"]["Running"].as_bool() == Some(true);
         let terminal = if matches!(&result, Err(Error::Deadline)) {
-            let checked = DEADLINE_NOW.scope(before_bound, run.check(&mut target)).await;
+            let checked = DEADLINE_NOW
+                .scope(before_bound, run.check(&mut target))
+                .await;
             let qualified = DEADLINE_NOW
                 .scope(
                     before_bound,
                     run.qualify(&mut target, &ScopeRequest::default()),
                 )
                 .await;
-            matches!(checked, Err(Error::Deadline))
-                && matches!(qualified, Err(Error::Deadline))
+            matches!(checked, Err(Error::Deadline)) && matches!(qualified, Err(Error::Deadline))
         } else {
             false
         };
