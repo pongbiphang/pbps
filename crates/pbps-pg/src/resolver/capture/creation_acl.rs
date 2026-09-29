@@ -143,7 +143,7 @@ pub(super) fn creation_acl(
     kind: &str,
 ) -> Result<Value, ManifestError> {
     let owner = role(owner_name);
-    let built_in = builtin(&owner, kind, captured.major)?;
+    let built_in = builtin(&owner, kind, captured.major())?;
     let global = defaults(captured, &owner, None, kind)?.unwrap_or_else(|| built_in.clone());
     let scoped = defaults(captured, &owner, Some(namespace), kind)?.unwrap_or_default();
     let merged = merge(global.into_iter().chain(scoped));
