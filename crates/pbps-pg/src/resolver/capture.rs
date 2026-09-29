@@ -119,6 +119,35 @@ pub async fn capture_identifying(
     .map_err(CaptureError::Coverage)
 }
 
+/// Capture and seal in the same authorized read. The caller fixes the key
+/// before this read starts; no method on a retained capture can rekey it.
+pub async fn capture_identifying_sealed(
+    connection: &mut impl pbps_db::transport::QueryConnection,
+    scope: &CaptureScope,
+    dropped: &BTreeSet<DroppedSignature>,
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+) -> Result<(CapturedInputs, pbps_model::resolver::InputManifest), CaptureError> {
+    let captured = capture_identifying(connection, scope, dropped).await?;
+    let manifest = captured.seal(key).map_err(|_| CaptureError::Incomplete)?;
+    Ok((captured, manifest))
+}
+
+/// Seal scratch's fresh capture with the role map the qualified run made.
+/// No caller-supplied text rewrite or retained-capture rekey entry is exposed.
+pub async fn capture_identifying_sealed_with_roles(
+    connection: &mut impl pbps_db::transport::QueryConnection,
+    scope: &CaptureScope,
+    dropped: &BTreeSet<DroppedSignature>,
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+    roles: &crate::resolver::authorization::RoleMap,
+) -> Result<(CapturedInputs, pbps_model::resolver::InputManifest), CaptureError> {
+    let captured = capture_identifying(connection, scope, dropped).await?;
+    let manifest = captured
+        .seal_with_roles(key, Some(roles))
+        .map_err(|_| CaptureError::Incomplete)?;
+    Ok((captured, manifest))
+}
+
 /// Read and seal on behalf of the holder of catalog-read authority. A
 /// previously captured result cannot be fingerprinted under a recipient's
 /// chosen key: that would expose its private properties as a guessing oracle.
@@ -129,8 +158,9 @@ pub async fn capture_sealed(
     dropped: &BTreeSet<DroppedSignature>,
     key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
 ) -> Result<pbps_model::resolver::InputManifest, CaptureError> {
-    let captured = capture_identifying(connection, scope, dropped).await?;
-    captured.seal(key).map_err(|_| CaptureError::Incomplete)
+    capture_identifying_sealed(connection, scope, dropped, key)
+        .await
+        .map(|(_, manifest)| manifest)
 }
 
 /// Give the producer of a fresh coherent database read its native-input

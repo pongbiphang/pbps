@@ -48,7 +48,10 @@ pub enum ResolverRuntime {
 #[serde(deny_unknown_fields)]
 pub struct Qualification {
     pub rule: String,
+    /// Raw opening target catalog facts, before any approved grant projection.
     pub target_environment: String,
+    /// The same observation after projecting exactly the ordered approved grants.
+    pub target_environment_after: String,
     pub resolver_environment: String,
     pub target_build: String,
     pub resolver_build: String,
@@ -121,7 +124,7 @@ impl ResolverEvidence {
     ) -> Result<Self, EvidenceError> {
         let after = before.project(changes, compiled, &transitions)?;
         let evidence = Self {
-            version: 1,
+            version: 2,
             handling: EvidenceHandling::KeyedFingerprints,
             coverage: BindingCoverage::CreationTimeV1,
             qualification,
@@ -157,7 +160,7 @@ impl ResolverEvidence {
 
     #[allow(clippy::wildcard_enum_match_arm)]
     pub fn validate(&self, changes: &ChangeSet) -> Result<(), EvidenceError> {
-        if self.version != 1
+        if self.version != 2
             || self.qualification.rule.is_empty()
             || self.authorization.rule.is_empty()
         {
@@ -166,6 +169,7 @@ impl ResolverEvidence {
         let q = &self.qualification;
         if [
             &q.target_environment,
+            &q.target_environment_after,
             &q.resolver_environment,
             &q.target_build,
             &q.resolver_build,
@@ -419,6 +423,7 @@ mod tests {
             Qualification {
                 rule: "fixture-environment-v1".into(),
                 target_environment: "01".repeat(32),
+                target_environment_after: "01".repeat(32),
                 resolver_environment: "02".repeat(32),
                 target_build: "03".repeat(32),
                 resolver_build: "04".repeat(32),
@@ -532,7 +537,7 @@ mod tests {
             );
         }
         for (pointer, value) in [
-            ("/analysis/evidence/version", json!(2)),
+            ("/analysis/evidence/version", json!(3)),
             ("/analysis/evidence/coverage", json!("all-runtime-code")),
             ("/analysis/evidence/handling", json!("public")),
             ("/analysis/evidence/qualification/target_build", json!("")),

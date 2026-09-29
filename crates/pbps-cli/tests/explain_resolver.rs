@@ -34,6 +34,7 @@ fn resolved_plan() -> SavedPlan {
         Qualification {
             rule: pbps_pg::resolver::compatibility::RULE.into(),
             target_environment: "04".repeat(32),
+            target_environment_after: "04".repeat(32),
             resolver_environment: "05".repeat(32),
             target_build: "06".repeat(32),
             resolver_build: "07".repeat(32),

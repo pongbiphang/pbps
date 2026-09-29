@@ -172,6 +172,45 @@ pub(crate) async fn capture_desired(
     }
 }
 
+/// The qualified run fixes the key and principal map before either fresh
+/// scratch capture. Only the second capture's facts support the verdict.
+pub(crate) async fn capture_desired_sealed(
+    connection: &mut StreamConn,
+    base: &Managed,
+    desired: &Managed,
+    paths: &Paths,
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+    principals: &crate::resolver::scope::Principals,
+) -> Result<
+    (
+        CapturedInputs,
+        CaptureScope,
+        pbps_model::resolver::InputManifest,
+    ),
+    String,
+> {
+    use pbps_pg::resolver::capture;
+    match (connection.driver(), principals) {
+        (Driver::Postgres, crate::resolver::scope::Principals::Postgres(roles)) => {
+            let first = capture::capture(connection, &capture::managed_scope(desired))
+                .await
+                .map_err(|error| error.to_string())?;
+            let scope = capture::scope(&first, &[base, desired], paths);
+            let (captured, manifest) = capture::capture_identifying_sealed_with_roles(
+                connection,
+                &scope,
+                &Default::default(),
+                key,
+                roles,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            Ok((captured, scope, manifest))
+        }
+        _ => Err(NO_BINDING_ADAPTER.into()),
+    }
+}
+
 pub(super) fn assess(
     target: &CapturedInputs,
     desired: &CapturedInputs,

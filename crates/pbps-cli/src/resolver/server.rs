@@ -21,11 +21,13 @@ use crate::resolver::native::{
 };
 use crate::resolver::scope::{self, PlannedGrant};
 use pbps_db::Driver;
+use pbps_db::fingerprint::EnvironmentFingerprintKey;
 use pbps_db::resolver::environment::{
     AuthorizationFingerprint, EnvironmentFacts, FactStatus, RuleVersion, ScopeReport, Verdict,
 };
 use pbps_db::resolver::{InstanceObservation, ScratchNames};
 use pbps_db::transport::{StreamConn, StreamLogin};
+use pbps_model::resolver::InputManifest;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -1399,6 +1401,21 @@ struct QualifiedScope {
     scratch_connection: pbps_db::transport::ConnectionId,
 }
 
+/// The keyed facts and safe verdict from one completed, verified run.
+/// Raw source-bearing captures and any rekey operation remain inside the
+/// fresh-read producer; this value can only finish with its selected key.
+pub struct ResolvedAnalysis {
+    pub assessment: pbps_db::resolver::capture::Assessment,
+    pub opening: InputManifest,
+    pub compiled: InputManifest,
+}
+
+struct AnalysisOutcome {
+    assessment: pbps_db::resolver::capture::Assessment,
+    opening: Option<InputManifest>,
+    compiled: Option<InputManifest>,
+}
+
 impl ScratchRun {
     pub(crate) fn from_container(
         control: ContainerControl,
@@ -1885,10 +1902,40 @@ impl ScratchRun {
         target: &mut NativeTarget,
         request: &BindingRequest<'_>,
     ) -> Result<pbps_db::resolver::capture::Assessment, Error> {
+        self.resolve_with_key(target, request, None)
+            .await
+            .map(|outcome| outcome.assessment)
+    }
+
+    /// Fix the environment key before the authorized fresh captures. The
+    /// returned manifests come from exactly the reads used for the verdict;
+    /// an ordinary result recipient cannot choose a key for an old capture.
+    pub async fn resolve_sealed(
+        &mut self,
+        target: &mut NativeTarget,
+        request: &BindingRequest<'_>,
+        key: &EnvironmentFingerprintKey,
+    ) -> Result<ResolvedAnalysis, Error> {
+        let outcome = self.resolve_with_key(target, request, Some(key)).await?;
+        Ok(ResolvedAnalysis {
+            assessment: outcome.assessment,
+            opening: outcome.opening.expect("keyed resolve has opening manifest"),
+            compiled: outcome
+                .compiled
+                .expect("keyed resolve has compiled manifest"),
+        })
+    }
+
+    async fn resolve_with_key(
+        &mut self,
+        target: &mut NativeTarget,
+        request: &BindingRequest<'_>,
+        key: Option<&EnvironmentFingerprintKey>,
+    ) -> Result<AnalysisOutcome, Error> {
         self.begin_operation()?;
         let mut entered_runtime = false;
         let outcome = self
-            .resolve_inner(target, request, &mut entered_runtime)
+            .resolve_inner(target, request, key, &mut entered_runtime)
             .await;
         self.operation_in_flight = false;
         let must_retire = entered_runtime || self.inner.refusal().is_some();
@@ -1902,8 +1949,9 @@ impl ScratchRun {
         &mut self,
         target: &mut NativeTarget,
         request: &BindingRequest<'_>,
+        key: Option<&EnvironmentFingerprintKey>,
         entered_runtime: &mut bool,
-    ) -> Result<pbps_db::resolver::capture::Assessment, Error> {
+    ) -> Result<AnalysisOutcome, Error> {
         // A held session, or a refusal already recorded, ends the run before
         // the scope and compiled guards below can answer in its place.
         self.refuse_held_admin()?;
@@ -1933,7 +1981,7 @@ impl ScratchRun {
         self.check_inner(target).await?;
         self.compiled = true;
         let outcome = self
-            .resolve_checked(target, request, &extras, &mut reconstruction)
+            .resolve_checked(target, request, &extras, &mut reconstruction, key)
             .await;
         if let Err(cause) = &outcome {
             self.inner.refuse(cause.clone());
@@ -1950,7 +1998,8 @@ impl ScratchRun {
         request: &BindingRequest<'_>,
         extras: &[String],
         reconstruction: &mut engine::Reconstruction,
-    ) -> Result<pbps_db::resolver::capture::Assessment, Error> {
+        key: Option<&EnvironmentFingerprintKey>,
+    ) -> Result<AnalysisOutcome, Error> {
         // In flight across the compilation: dropped part-way, the scratch
         // session is mid-transaction, and the next check must end the run.
         let base = engine::Managed::from_schema(request.base);
@@ -1979,15 +2028,32 @@ impl ScratchRun {
         #[cfg(test)]
         container_tests::pause("container-capture-admin-owned").await;
         let admin = self.inner.admin_connection().ok_or(Error::Cancelled)?;
-        let captured = engine::capture_desired(admin, &base, &desired, &paths).await;
+        let principals = self.scope.as_ref().ok_or(Error::Cancelled)?.map.clone();
+        let captured = match key {
+            Some(key) => {
+                engine::capture_desired_sealed(admin, &base, &desired, &paths, key, &principals)
+                    .await
+                    .map(|(captured, scope, manifest)| (captured, scope, Some(manifest)))
+            }
+            None => engine::capture_desired(admin, &base, &desired, &paths)
+                .await
+                .map(|(captured, scope)| (captured, scope, None)),
+        };
         self.retire_admin();
-        let (compiled, scope) = captured.map_err(Error::Binding)?;
+        let (compiled, scope, compiled_manifest) = captured.map_err(Error::Binding)?;
         self.check_inner(target).await?;
         let signatures = dropped.iter().filter_map(|(_, s)| s.clone()).collect();
-        let current = target
-            .capture_postgres(&scope, &signatures)
-            .await
-            .map_err(|error| Error::Binding(error.to_string()))?;
+        let (current, opening_manifest) = match key {
+            Some(key) => target
+                .capture_postgres_sealed(&scope, &signatures, key)
+                .await
+                .map(|(captured, manifest)| (captured, Some(manifest))),
+            None => target
+                .capture_postgres(&scope, &signatures)
+                .await
+                .map(|captured| (captured, None)),
+        }
+        .map_err(|error| Error::Binding(error.to_string()))?;
         self.check_inner(target).await?;
         let identified = current.catalog().dropped();
         reconstruction.identified(
@@ -1999,13 +2065,11 @@ impl ScratchRun {
                 })
                 .collect(),
         );
-        Ok(engine::assess(
-            current.catalog(),
-            &compiled,
-            &base,
-            &paths,
-            reconstruction,
-        ))
+        Ok(AnalysisOutcome {
+            assessment: engine::assess(current.catalog(), &compiled, &base, &paths, reconstruction),
+            opening: opening_manifest,
+            compiled: compiled_manifest,
+        })
     }
 
     /// Re-qualifies the supplied server, the channels, exclusivity and the

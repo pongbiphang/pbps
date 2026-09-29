@@ -74,6 +74,62 @@ pub struct CapturedInputs {
     dropped: BTreeMap<super::DroppedSignature, Option<ObjectIdentity>>,
 }
 
+fn normalize_identity(
+    object: &ObjectIdentity,
+    roles: Option<&crate::resolver::authorization::RoleMap>,
+) -> Result<ObjectIdentity, pbps_model::resolver::ManifestError> {
+    use pbps_model::resolver::ManifestError;
+    let mut result = object.clone();
+    result.signature = object
+        .signature
+        .iter()
+        .map(|id| normalize_identity(id, roles))
+        .collect::<Result<_, _>>()?;
+    if let Some(roles) = roles {
+        if object.class == "pg_authid" {
+            let [name] = object.name.as_slice() else {
+                return Err(ManifestError::Invalid);
+            };
+            if let Some(logical) = roles.logical_of(name) {
+                result.name = vec![logical];
+            } else if name.starts_with("pbps_role_") {
+                // A run-local name without a recorded mapping is unreadable,
+                // not an unrelated stable principal.
+                return Err(ManifestError::Incomplete);
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn normalize_value(
+    value: &Value,
+    roles: Option<&crate::resolver::authorization::RoleMap>,
+) -> Result<Value, pbps_model::resolver::ManifestError> {
+    if let Value::Object(map) = value {
+        if map.get("class").and_then(Value::as_str) == Some("pg_authid") {
+            let identity: ObjectIdentity = serde_json::from_value(value.clone())
+                .map_err(|_| pbps_model::resolver::ManifestError::Invalid)?;
+            return serde_json::to_value(normalize_identity(&identity, roles)?)
+                .map_err(|_| pbps_model::resolver::ManifestError::Invalid);
+        }
+        return Ok(Value::Object(
+            map.iter()
+                .map(|(name, member)| Ok((name.clone(), normalize_value(member, roles)?)))
+                .collect::<Result<_, pbps_model::resolver::ManifestError>>()?,
+        ));
+    }
+    if let Value::Array(items) = value {
+        return Ok(Value::Array(
+            items
+                .iter()
+                .map(|item| normalize_value(item, roles))
+                .collect::<Result<_, _>>()?,
+        ));
+    }
+    Ok(value.clone())
+}
+
 impl CapturedInputs {
     /// Persistable catalog facts, keyed by the target environment. This is
     /// still catalog evidence only: it does not confer runtime qualification.
@@ -92,9 +148,20 @@ impl CapturedInputs {
         &self,
         key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
     ) -> Result<pbps_model::resolver::InputManifest, pbps_model::resolver::ManifestError> {
+        self.seal_with_roles(key, None)
+    }
+
+    /// The mapped variant is used only during the scratch read owned by the
+    /// qualified run. Every principal position is normalized before hashing;
+    /// neither NULL ACLs nor grant options are collapsed.
+    pub(super) fn seal_with_roles(
+        &self,
+        key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+        roles: Option<&crate::resolver::authorization::RoleMap>,
+    ) -> Result<pbps_model::resolver::InputManifest, pbps_model::resolver::ManifestError> {
         use pbps_model::resolver::{
-            Binding, CandidateSet, InputManifest, Membership, Prerequisite, ReadScope,
-            RoutineLookup,
+            Binding, CandidateSet, InputManifest, ManifestError, Membership, Prerequisite,
+            ReadScope, RoutineLookup,
         };
         let digest = |component: &str, bytes: Vec<u8>| -> String {
             key.fingerprint(self.rule, component, &bytes)
@@ -102,6 +169,7 @@ impl CapturedInputs {
                 .map(|b| format!("{b:02x}"))
                 .collect()
         };
+        let normalized = |object: &ObjectIdentity| normalize_identity(object, roles);
         let candidate = |q: &super::CandidateSet| CandidateSet {
             class: q.class.catalog().into(),
             namespace: q.namespace.clone(),
@@ -110,68 +178,90 @@ impl CapturedInputs {
         let mut membership: Vec<_> = self
             .candidates
             .iter()
-            .map(|(q, members)| Membership {
-                predicate: candidate(q),
-                members: members.clone(),
+            .map(|(q, members)| {
+                Ok(Membership {
+                    predicate: candidate(q),
+                    members: members.iter().map(&normalized).collect::<Result<_, _>>()?,
+                })
             })
-            .collect();
+            .collect::<Result<_, ManifestError>>()?;
         membership.sort_by(|a, b| a.predicate.cmp(&b.predicate));
+        let mut prerequisites: Vec<Prerequisite> = self
+            .inputs
+            .iter()
+            .map(|(object, input)| {
+                let mut bindings: Vec<Binding> = input
+                    .bindings
+                    .iter()
+                    .map(|binding| {
+                        Ok(Binding {
+                            node: binding.node.clone(),
+                            path: binding.path.clone(),
+                            target: normalized(&binding.target)?,
+                        })
+                    })
+                    .collect::<Result<_, ManifestError>>()?;
+                bindings.sort();
+                let properties: BTreeMap<String, Value> = input
+                    .properties
+                    .iter()
+                    .map(|(name, value)| Ok((name.clone(), normalize_value(value, roles)?)))
+                    .collect::<Result<_, ManifestError>>()?;
+                Ok(Prerequisite {
+                    object: normalized(object)?,
+                    // An ordinary read still proves no ownership. The qualified
+                    // producer assigns it only from the recorded managed UID.
+                    ownership: pbps_model::resolver::ObjectOwnership::Unqualified,
+                    canonicalization: self.rule.into(),
+                    properties: digest(
+                        "properties",
+                        serde_json::to_vec(&properties).expect("canonical properties serialize"),
+                    ),
+                    bindings,
+                })
+            })
+            .collect::<Result<_, ManifestError>>()?;
+        prerequisites.sort_by(|a, b| a.object.cmp(&b.object));
         InputManifest::new(
             self.rule.into(),
             self.major,
             key.id().as_str().into(),
             ReadScope {
-                retained: self.scope.retained.clone(),
+                retained: self
+                    .scope
+                    .retained
+                    .iter()
+                    .map(&normalized)
+                    .collect::<Result<_, _>>()?,
                 candidates: self.scope.candidates.iter().map(candidate).collect(),
             },
             digest(
                 "baseline",
                 serde_json::to_vec(&self.baseline).expect("baseline serializes"),
             ),
+            // Projection retains the opening target session; the scratch
+            // admin's session hash is not used as an approved postcondition.
             digest(
                 "session",
                 serde_json::to_vec(&self.session).expect("session serializes"),
             ),
-            self.inputs
-                .iter()
-                .map(|(object, input)| {
-                    let mut bindings: Vec<_> = input
-                        .bindings
-                        .iter()
-                        .map(|b| Binding {
-                            node: b.node.clone(),
-                            path: b.path.clone(),
-                            target: b.target.clone(),
-                        })
-                        .collect();
-                    bindings.sort();
-                    Prerequisite {
-                        object: object.clone(),
-                        // A raw capture supplies read prerequisites. The qualified
-                        // producer's ownership bridge must prove managed ownership
-                        // before any record may enter a transition (#615).
-                        ownership: pbps_model::resolver::ObjectOwnership::Unqualified,
-                        canonicalization: self.rule.into(),
-                        properties: digest(
-                            "properties",
-                            serde_json::to_vec(&input.properties)
-                                .expect("canonical properties serialize"),
-                        ),
-                        bindings,
-                    }
-                })
-                .collect(),
+            prerequisites,
             membership,
-            self.limitations.clone(),
+            self.limitations
+                .iter()
+                .map(&normalized)
+                .collect::<Result<_, _>>()?,
             self.dropped
                 .iter()
-                .map(|(query, resolved)| RoutineLookup {
-                    signature: query.spelled.clone(),
-                    search_path: query.path.clone(),
-                    kind: query.kind.into(),
-                    resolved: resolved.clone(),
+                .map(|(query, resolved)| {
+                    Ok(RoutineLookup {
+                        signature: query.spelled.clone(),
+                        search_path: query.path.clone(),
+                        kind: query.kind.into(),
+                        resolved: resolved.as_ref().map(&normalized).transpose()?,
+                    })
                 })
-                .collect(),
+                .collect::<Result<_, ManifestError>>()?,
         )
     }
 
