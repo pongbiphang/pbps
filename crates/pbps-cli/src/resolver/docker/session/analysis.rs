@@ -14,8 +14,8 @@ use pbps_db::resolver::environment::DatabaseRecipe;
 use pbps_db::resolver::{ScratchNames, SessionCounter};
 use pbps_db::transport::{StreamConn, StreamLogin};
 use std::collections::BTreeSet;
-use std::time::Instant;
 use tokio::io::AsyncWriteExt as _;
+use tokio::time::Instant;
 
 fn invalid() -> Error {
     Error::Unqualified("the owned container run changed or became unreadable")
@@ -934,6 +934,9 @@ impl CandidateSession {
             run: relay,
             kernel,
         };
+        // The workload is the first supervised owner. Its deadline began
+        // before reservation launched it; scratch setup cannot renew it.
+        let deadline = state.workload.deadline();
         let state = self.state.take().expect("candidate owns state");
         self.pending = None;
         self.analysis_in_flight = false;
@@ -942,8 +945,7 @@ impl CandidateSession {
             opened: 1,
             epoch: inventory.counter.epoch,
             continuity: inventory.counter.continuity.into_iter().collect(),
-            deadline: Instant::now()
-                + std::time::Duration::from_secs(super::super::profile::LIFETIME_SECS),
+            deadline,
         };
         let control = ContainerControl {
             state: Some(state),
