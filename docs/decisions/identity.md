@@ -607,8 +607,15 @@ by its own count. It grows each generated name's reach to a fixpoint: a
 claimant can reach its `s`th fallback when its first choice and the fallbacks
 before it can each be taken by a different other claimant that reaches them.
 Each claimant is judged against the others' reach separately, not as one
-creation order, so this may over-approximate. A declared name in any reach is
-refused. Its remedy is a landing claimant's own when taking that claimant out
+creation order, so this may over-approximate. A primary key's index also yields
+to constraint names (#1112). PostgreSQL names it with `ChooseRelationName(...,
+isconstraint = true)`, so a check or foreign key already named `t_pkey`, in any
+table of the schema, sends an unnamed key to `t_pkey1` with no other generated
+name in play. Created after the key, the same check leaves the key its name
+(measured on 16 and 18). So for a key, the schema's declared constraint names
+count as taken without a claimant to take them. An identity sequence's retry
+looks at relations only, and they do not count for it. A declared name in any
+reach is refused. Its remedy is a landing claimant's own when taking that claimant out
 puts the name out of every reach. Each landing claimant is asked, since the
 over-approximation can keep a name in reach without one claimant and not
 without another. It is asked once per first choice, because claimants meeting
