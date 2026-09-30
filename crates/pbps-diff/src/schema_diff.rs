@@ -682,8 +682,10 @@ fn diff_partial_rebuilding(
     // `order_key`'s own doc names.
     // The base's generated columns, whose drops go first in their class: an
     // input column cannot be dropped while a generated column still reads it
-    // (DEC-1168.1).
-    let generated_in_base: BTreeSet<(TableName, String)> = base
+    // (DEC-1168.1). By uid, not by name: a `DropColumn` names the column
+    // under the declared table name, which a rename in the same plan makes
+    // differ from the base's.
+    let generated_in_base: BTreeSet<pbps_model::Uid> = base
         .schema
         .tables
         .iter()
@@ -692,7 +694,7 @@ fn diff_partial_rebuilding(
                 .columns
                 .iter()
                 .filter(|(_, c)| c.generated.is_some())
-                .map(move |(column, _)| (name.clone(), column.clone()))
+                .filter_map(move |(column, _)| base.ids.column_uid(&name.column(column)).cloned())
         })
         .collect();
     let sort_class = |c: &Change| -> (u8, usize) {
@@ -720,8 +722,8 @@ fn diff_partial_rebuilding(
         // a generated column reads, and refuses a generation expression over a
         // column that is not there yet; a generated column never reads another
         // (DEC-1168.1), so one layer each way is the whole order.
-        if let Change::DropColumn { column, .. } = c
-            && generated_in_base.contains(&(column.table.clone(), column.name.clone()))
+        if let Change::DropColumn { uid, .. } = c
+            && generated_in_base.contains(uid)
         {
             return (order_key(c), 0);
         }
@@ -8256,6 +8258,19 @@ mod tests {
             reason: "gone".into(),
         });
         assert_eq!(order(&with("zz", "a"), &bare, &drops), ["-zz", "-a"]);
+        // And when the same plan renames the table, so each `DropColumn`
+        // names it under the declared name: found by uid, not by name.
+        let renamed = schema_of("app.u", table(&[("id", Column::new(ty("int")))]));
+        let mut intents = vec![pbps_model::Intent::RenameTable {
+            from: t.clone(),
+            to: "app.u".parse().unwrap(),
+        }];
+        let u: TableName = "app.u".parse().unwrap();
+        intents.extend(["a", "zz"].map(|c| pbps_model::Intent::DropColumn {
+            column: u.column(c),
+            reason: "gone".into(),
+        }));
+        assert_eq!(order(&with("zz", "a"), &renamed, &intents), ["-zz", "-a"]);
     }
 
     /// A generated column's expression changes in place, as one typed change

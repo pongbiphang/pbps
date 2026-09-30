@@ -1127,6 +1127,19 @@ Measured on 16.15, 17.11 and 18.6:
   `NOT NULL` over null inputs at `ADD`. The first is refused at validation.
   The rest are the engine's, inside the transaction.
 
+Within their ordering classes a generated column is added after the
+ordinary columns and dropped before them, keyed by uid so a table rename in
+the same plan does not hide it. The engine refuses an expression over a
+column not yet added, and refuses to drop a column a generated column still
+reads. A generated column never reads another, so one layer each way is the
+whole order. Its expression binds the functions it calls as a default's
+does. An `AlterColumnExpression`, and an `AddColumn` carrying one, follow a
+function the plan creates. A new table's generated column is split out of
+`CREATE TABLE` as an `AddColumn` for the same reason, unless a key,
+uniqueness, index or foreign key kept in the table names it. It then sits
+after the table's other columns, which only the engine's layout sees, since
+table equality ignores column order.
+
 A generated column is the engine's to fill, like a non-key identity
 (`Column::engine_assigned`). It leaves `row_columns` and the row
 read-back, and a row that sets one is refused. A `NOT NULL` generated add

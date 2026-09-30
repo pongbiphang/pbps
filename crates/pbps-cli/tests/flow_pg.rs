@@ -1464,7 +1464,8 @@ fn a_new_tables_expressions_calling_a_rebuilt_function_follow_it() {
     std::fs::write(
         d.dir.join("schema/app.n.yml"),
         "table: app.n\ncolumns:\n  id: {type: integer, nullable: false}\n  \
-         v: {type: integer, default: 'app.f(1)'}\n\
+         v: {type: integer, default: 'app.f(1)'}\n  \
+         g: {type: integer, generated: {expression: 'app.f(id)', stored: true}}\n\
          primary_key: {name: n_pkey, columns: [id]}\n\
          checks:\n  ck_n: 'app.f(id) >= 0'\n\
          indexes:\n  ix_n: {columns: [id], where: 'app.f(id) > 0'}\n",
@@ -1498,6 +1499,13 @@ fn a_new_tables_expressions_calling_a_rebuilt_function_follow_it() {
     assert!(create < at("CREATE INDEX \"ix_n\""), "{script}");
     assert!(
         create < at("ALTER TABLE \"app\".\"n\" ALTER COLUMN \"v\" SET DEFAULT"),
+        "{script}"
+    );
+    // A generated column's expression calls the function too, and no
+    // statement gives an existing column one, so it is split out of the new
+    // table as a column of its own (DEC-1168.1).
+    assert!(
+        create < at("ALTER TABLE \"app\".\"n\" ADD COLUMN \"g\""),
         "{script}"
     );
     let allow = ["--allow", "constraint", "--allow", "grant-widen"];
