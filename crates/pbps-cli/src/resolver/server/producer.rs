@@ -206,8 +206,8 @@ impl ScratchRun {
             .authorization_context
             .persisted(key, &changes)
             .map_err(Error::Scope)?;
-        let creator = match &sealed.authorization_context {
-            scope::Authorization::Postgres(context) => &context.principal.effective,
+        let pg_authorization = match &sealed.authorization_context {
+            scope::Authorization::Postgres(context) => context,
             scope::Authorization::Mssql(_) => {
                 return Err(Error::Scope("SQL Server evidence is unsupported".into()));
             }
@@ -229,7 +229,7 @@ impl ScratchRun {
                 &transitions,
                 base.ids,
                 desired.ids,
-                creator,
+                pg_authorization,
             )
             .map_err(|error| Error::Binding(format!("final compiled catalog manifest: {error}")))?;
         // Typed preservation can replace the scratch owner's shared-dependency

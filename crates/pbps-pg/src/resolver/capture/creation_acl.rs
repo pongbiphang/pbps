@@ -5,6 +5,7 @@
 //! compiled facts are sealed; it is never an independent target read.
 
 use super::{CandidateClass, CandidateSet, CapturedInputs};
+use crate::resolver::authorization::AuthorizationContext;
 use pbps_db::resolver::capture::ObjectIdentity;
 use pbps_model::resolver::{ManifestError, Surface};
 use pbps_model::{Change, ChangeSet, GrantTarget, ModuleId, Permission, PublicAccess, RoutineId};
@@ -37,6 +38,66 @@ fn public() -> ObjectIdentity {
         name: vec!["PUBLIC".into()],
         signature: Vec::new(),
     }
+}
+
+/// The exact grantor is a property of the effective principal and the ACL at
+/// this typed step, not the subject's owner alone. Without verified target
+/// role traversal order, multiple inherited full-option holders are not a
+/// choice the producer can make from their logical names (DEC-483).
+fn grantor_for(
+    authorization: &AuthorizationContext,
+    owner: &ObjectIdentity,
+    acl: &BTreeMap<AclKey, bool>,
+    privileges: &[&str],
+    field: &str,
+) -> Result<ObjectIdentity, ManifestError> {
+    if privileges.is_empty() {
+        return Err(ManifestError::Invalid);
+    }
+    let actor = role(&authorization.principal.effective);
+    if authorization.principal.superuser || actor == *owner {
+        return Ok(owner.clone());
+    }
+    let holds_all = |principal: &ObjectIdentity| {
+        principal == owner
+            || privileges.iter().all(|privilege| {
+                acl.iter().any(|((_, grantee, held), option)| {
+                    grantee == principal && held.as_str() == *privilege && *option
+                })
+            })
+    };
+    // The current role is the first eligible role in select_best_grantor.
+    // This also wins over an inherited owner when it holds the full option.
+    if holds_all(&actor) {
+        // The separate schema-authorization projection still gives inherited
+        // ownership precedence. Refuse only this conflicting schema shape;
+        // sealing two different postconditions would record a false success.
+        if field == "nspacl"
+            && authorization
+                .roles
+                .get(&owner.name[0])
+                .is_some_and(|attrs| attrs.inherits)
+        {
+            return Err(ManifestError::Incomplete);
+        }
+        return Ok(actor);
+    }
+    let mut inherited = authorization
+        .roles
+        .iter()
+        .filter(|(name, attrs)| {
+            attrs.inherits && name.as_str() != authorization.principal.effective.as_str()
+        })
+        .map(|(name, _)| role(name))
+        .filter(holds_all);
+    // Partial option masks can make the engine grant only some requested
+    // privileges. That is not the complete typed change we may seal.
+    let first = inherited.next().ok_or(ManifestError::Incomplete)?;
+    if inherited.next().is_some() {
+        // A logical-name sort is not PostgreSQL's role traversal order.
+        return Err(ManifestError::Incomplete);
+    }
+    Ok(first)
 }
 
 fn defaults(
@@ -167,6 +228,7 @@ pub(super) fn retained_acl_after_plan(
     surface: &Surface,
     field: &str,
     changes: &ChangeSet,
+    authorization: &AuthorizationContext,
 ) -> Result<Option<Value>, ManifestError> {
     let row = opening
         .inputs
@@ -210,7 +272,8 @@ pub(super) fn retained_acl_after_plan(
             } if matches!(surface, Surface::Module(ModuleId::Routine(named)) if named == routine) =>
             {
                 changed = true;
-                let key = (owner.clone(), public(), "EXECUTE".into());
+                let grantor = grantor_for(authorization, &owner, &acl, &["EXECUTE"], field)?;
+                let key = (grantor, public(), "EXECUTE".into());
                 match access {
                     PublicAccess::Kept => {
                         acl.entry(key).or_insert(false);
@@ -244,36 +307,35 @@ pub(super) fn retained_acl_after_plan(
             } =>
             {
                 changed = true;
-                for permission in permissions {
-                    let privilege = match permission {
-                        Permission::Select => "SELECT",
-                        Permission::Insert => "INSERT",
-                        Permission::Update => "UPDATE",
-                        Permission::Delete => "DELETE",
-                        Permission::References => "REFERENCES",
-                        Permission::Execute => "EXECUTE",
-                        Permission::Usage => "USAGE",
-                        Permission::Create => "CREATE",
-                        Permission::Truncate => "TRUNCATE",
-                        Permission::Trigger => "TRIGGER",
-                        Permission::Maintain => "MAINTAIN",
-                        Permission::Alter | Permission::ViewDefinition => {
-                            return Err(ManifestError::Invalid);
-                        }
+                let privileges = permissions
+                    .iter()
+                    .map(privilege)
+                    .collect::<Result<Vec<_>, _>>()?;
+                // PostgreSQL selects one grantor for a GRANT statement's whole
+                // privilege set; the emitter writes each REVOKE separately.
+                let grantor = if matches!(&step.change, Change::Grant { .. }) {
+                    Some(grantor_for(
+                        authorization,
+                        &owner,
+                        &acl,
+                        &privileges,
+                        field,
+                    )?)
+                } else {
+                    None
+                };
+                for privilege in privileges {
+                    let selected = if let Some(grantor) = &grantor {
+                        grantor.clone()
+                    } else {
+                        grantor_for(authorization, &owner, &acl, &[privilege], field)?
                     };
-                    let grantee = role(grantee);
-                    let key = (owner.clone(), grantee.clone(), privilege.into());
-                    if matches!(&step.change, Change::Grant { .. }) {
+                    let key = (selected, role(grantee), privilege.into());
+                    if grantor.is_some() {
                         acl.entry(key).or_insert(false);
                     } else {
-                        if acl.keys().any(|(grantor, recipient, held)| {
-                            recipient == &grantee && held == privilege && grantor != &owner
-                        }) {
-                            // The emitter's REVOKE selects one grantor. Its
-                            // choice is not derivable from a different grantor's
-                            // ACL row, so do not claim that row was removed.
-                            return Err(ManifestError::Incomplete);
-                        }
+                        // A revoke touches only the selected grantor's ACL
+                        // row. A second grantor's matching entry survives.
                         acl.remove(&key);
                     }
                 }
@@ -313,6 +375,23 @@ pub(super) fn retained_acl_after_plan(
         }
     }
     Ok(changed.then(|| explicit(acl)))
+}
+
+fn privilege(permission: &Permission) -> Result<&'static str, ManifestError> {
+    match permission {
+        Permission::Select => Ok("SELECT"),
+        Permission::Insert => Ok("INSERT"),
+        Permission::Update => Ok("UPDATE"),
+        Permission::Delete => Ok("DELETE"),
+        Permission::References => Ok("REFERENCES"),
+        Permission::Execute => Ok("EXECUTE"),
+        Permission::Usage => Ok("USAGE"),
+        Permission::Create => Ok("CREATE"),
+        Permission::Truncate => Ok("TRUNCATE"),
+        Permission::Trigger => Ok("TRIGGER"),
+        Permission::Maintain => Ok("MAINTAIN"),
+        Permission::Alter | Permission::ViewDefinition => Err(ManifestError::Invalid),
+    }
 }
 
 fn explicit(acl: BTreeMap<AclKey, bool>) -> Value {
