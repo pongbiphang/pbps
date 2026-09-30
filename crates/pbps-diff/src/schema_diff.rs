@@ -830,10 +830,12 @@ fn diff_columns(
                 column: declared_ref.clone(),
             });
         }
+        let mut recomputed = false;
         match (&base_col.generated, &col.generated) {
             (None, None) => {}
             (Some(from), Some(to)) if from.stored == to.stored => {
                 if from.expression != to.expression {
+                    recomputed = true;
                     changes.push(Change::AlterColumnExpression {
                         uid: uid.clone(),
                         column: declared_ref.clone(),
@@ -857,17 +859,32 @@ fn diff_columns(
         // A type change subsumes a nullability change rather than sitting beside
         // one: `ALTER COLUMN` restates the whole definition, so two changes would
         // mean two statements where the second undoes half of the first.
+        //
+        // Except a tightening of a recomputed column. The type goes before the
+        // new expression, so the values are computed in the final type, and
+        // `NOT NULL` after it, so it is checked against the new values rather
+        // than the old expression's (DEC-1168.1).
+        let tightened_after = recomputed && base_col.nullable && !col.nullable;
         if retyped {
             changes.push(Change::AlterColumnType {
                 uid: uid.clone(),
                 column: declared_ref.clone(),
-                from: from_ty,
-                to: to_ty,
+                from: from_ty.clone(),
+                to: to_ty.clone(),
                 from_nullable: base_col.nullable,
-                to_nullable: col.nullable,
+                to_nullable: col.nullable || tightened_after,
                 from_collation: base_col.collation.clone(),
                 to_collation: col.collation.clone(),
             });
+            if tightened_after {
+                changes.push(Change::AlterColumnNullability {
+                    uid: uid.clone(),
+                    column: declared_ref.clone(),
+                    ty: to_ty,
+                    to_nullable: false,
+                    collation: col.collation.clone(),
+                });
+            }
         } else if base_col.nullable != col.nullable {
             changes.push(Change::AlterColumnNullability {
                 uid: uid.clone(),
@@ -8320,8 +8337,8 @@ mod tests {
     /// after it, whatever the names say (DEC-1168.1).
     #[test]
     fn a_generated_columns_nullability_relaxes_before_and_tightens_after_its_expression() {
-        let generated = |expression: &str, nullable: bool| {
-            let mut c = Column::new(ty("int"));
+        let generated_as = |type_: &str, expression: &str, nullable: bool| {
+            let mut c = Column::new(ty(type_));
             c.nullable = nullable;
             c.generated = Some(pbps_model::Generated {
                 expression: expression.into(),
@@ -8329,6 +8346,8 @@ mod tests {
             });
             c
         };
+        let generated =
+            |expression: &str, nullable: bool| generated_as("int", expression, nullable);
         let order = |from: Column, to: Column| {
             let base = schema_of(
                 "app.t",
@@ -8362,6 +8381,9 @@ mod tests {
                 Change::AlterColumnNullability {
                     to_nullable: false, ..
                 } => "tighten",
+                Change::AlterColumnType {
+                    to_nullable: true, ..
+                } => "retype",
                 other => panic!("unexpected {other:?}"),
             })
             .collect::<Vec<_>>()
@@ -8373,6 +8395,15 @@ mod tests {
         assert_eq!(
             order(generated("a", true), generated("coalesce(a, 0)", false)),
             ["expression", "tighten"]
+        );
+        // Retyped as well: the type change would carry the tightening, and
+        // leaves it to a step after the new expression instead.
+        assert_eq!(
+            order(
+                generated("a", true),
+                generated_as("bigint", "coalesce(a, 0)", false)
+            ),
+            ["retype", "expression", "tighten"]
         );
     }
 

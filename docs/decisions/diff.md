@@ -1135,7 +1135,9 @@ reads. A generated column never reads another, so one layer each way is the
 whole order. That holds in the class a column rename brings all of its
 table's drops into. A recomputed value is checked against the column's
 nullability as it stands, so relaxing it runs before the expression change
-and tightening it after, measured on 17.11. Its expression binds the functions it calls as a default's
+and tightening it after, measured on 17.11. A retype of the recomputed column
+runs first, so the values are computed in the final type, and leaves the
+tightening it would carry to that later step. Its expression binds the functions it calls as a default's
 does. An `AlterColumnExpression` follows a function the plan creates or
 rebuilds (DEC-942.1), and a tightening of the recomputed column moves with
 its expression. A column added with a generation expression does not move,
