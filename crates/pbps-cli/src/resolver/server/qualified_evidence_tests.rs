@@ -11,7 +11,7 @@ use crate::resolver::docker::CandidateSession;
 use pbps_config::resolver::{PullPolicy, ResolverProfile};
 use pbps_db::fingerprint::FingerprintKey;
 use pbps_db::transport::PeerVerifiedConn;
-use pbps_model::resolver::{ObjectOwnership, Surface};
+use pbps_model::resolver::{ObjectOwnership, PlanAnalysis, Surface};
 use pbps_model::{Change, ChangeSet, Hints, IdsFile, PlanBaseline, PlanOrigin, SavedPlan, Schema};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -550,6 +550,8 @@ async fn positive(profile: Profile) {
     target.check().await.unwrap();
     setup(&[]).await;
     result.evidence.validate(&result.changes).unwrap();
+    pbps_pg::resolver::validate_evidence(&result.evidence)
+        .expect("the actual producer evidence must pass the artifact reader");
 
     let affected = view(&result.evidence, "v");
     let control = view(&result.evidence, "control");
@@ -687,6 +689,11 @@ async fn positive(profile: Profile) {
     let restored: SavedPlan =
         serde_json::from_str(&serde_json::to_string(&artifact).unwrap()).unwrap();
     restored.validate_analysis().unwrap();
+    let PlanAnalysis::Resolved(evidence) = &restored.analysis else {
+        panic!("roundtripping producer evidence must retain resolved analysis");
+    };
+    pbps_pg::resolver::validate_evidence(evidence)
+        .expect("roundtripped producer evidence must pass the artifact reader");
     assert_eq!(restored.checksum(), artifact.checksum());
 }
 
