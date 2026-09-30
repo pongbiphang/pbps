@@ -281,7 +281,38 @@ pub(crate) fn planned_schema_grants(
                 target: GrantTarget::Schema(schema),
                 permissions,
             } => Some((role, schema, permissions)),
-            _ => None,
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. }
+            | Change::PublicExecution { .. } => None,
         };
         if let Some((role, schema, permissions)) = statement {
             let privileges = permissions
