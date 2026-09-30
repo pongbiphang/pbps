@@ -369,6 +369,142 @@ class Ownership(unittest.TestCase):
                     with self.assertRaises(audit.InventoryError):
                         self.check()
 
+    def test_qualified_builtin_namespace_access_tracks_executed_bindings(self):
+        cases = []
+        for reader in ['globals', 'locals', 'vars']:
+            for setup, call in [('import builtins as defaults', f'defaults.{reader}'), (f'from builtins import {reader} as inspect', 'inspect'), ('import builtins as defaults\nother = defaults\ninspect = other.' + reader, 'inspect')]:
+                for before in [True, False]:
+                    capture = f'namespace = {call}()\n'
+                    source = setup + '\n' + (capture + 'TESTS = ["owned"]\n' if before else 'TESTS = ["owned"]\n' + capture) + 'namespace["TESTS"] = []\n'
+                    cases.append((f'{reader}/{call}/before={before}', source, False))
+        for setup, call in [('import builtins as defaults', 'defaults'), ('import builtins as defaults\nother = defaults', 'other')]:
+            for reader, code in [('eval', '"globals()"'), ('exec', '"namespace = globals()"')]:
+                source = setup + '\n' + (f'namespace = {call}.eval({code})\n' if reader == 'eval' else f'{call}.exec({code})\n') + 'TESTS = ["owned"]\nnamespace["TESTS"] = []\n'
+                cases.append((call + '/' + reader, source, False))
+        for reader in ['exec', 'eval']:
+            capture = 'namespace = inspect("globals()")' if reader == 'eval' else 'inspect("namespace = globals()")'
+            cases.append(('imported/' + reader, f'from builtins import {reader} as inspect\n{capture}\nTESTS = ["owned"]\nnamespace["TESTS"] = []\n', False))
+        for body in ['namespace = defaults.globals()', 'from builtins import globals as inspect\nnamespace = inspect()', 'import builtins as inner\nnamespace = inner.globals()']:
+            cases.append(('class/' + body, 'import builtins as defaults\nclass Holder:\n' + ''.join(('    ' + l + '\n' for l in body.splitlines())) + 'TESTS = ["owned"]\nHolder.namespace["TESTS"] = []\n', False))
+        for declaration in ['def unused(): return defaults.globals()', 'unused = lambda: defaults.globals()', 'class Holder:\n    def unused(self): return defaults.globals()']:
+            cases.append(('uncalled/' + declaration, 'import builtins as defaults\n' + declaration + '\nTESTS = ["owned"]\n', True))
+        for setup in [(
+            'from types import SimpleNamespace\n'
+            'import builtins as defaults\n'
+            'defaults = SimpleNamespace(globals=lambda: {})\n'
+            'namespace = defaults.globals()'
+        ), (
+            'from builtins import globals as inspect\n'
+            'inspect = lambda: {}\n'
+            'namespace = inspect()'
+        ), (
+            'import builtins as defaults, types as defaults\n'
+            'namespace = defaults.SimpleNamespace()'
+        )]:
+            cases.append(('shadow/' + setup, setup + '\nTESTS = ["owned"]\n', True))
+        for label, source in [('default', (
+            'import builtins as defaults\n'
+            'def holder(namespace=defaults.globals()): pass\n'
+            'namespace = holder.__defaults__[0]'
+        )), ('lambda-default', (
+            'from builtins import globals as inspect\n'
+            'holder = lambda namespace=inspect(): None\n'
+            'namespace = holder.__defaults__[0]'
+        )), ('alias-chain', (
+            'import builtins as defaults\n'
+            'inspect = defaults.globals\n'
+            'other = inspect\n'
+            'namespace = other()'
+        )), ('escaped-module', (
+            'import builtins as defaults\n'
+            'def consume(value): pass\n'
+            'consume(defaults)\n'
+            'namespace = defaults.globals()'
+        )), ('class-delete-shadow', (
+            'import builtins as defaults\n'
+            'class Holder:\n'
+            '    defaults = None\n'
+            '    del defaults\n'
+            '    namespace = defaults.globals()\n'
+            'namespace = Holder.namespace'
+        )), ('class-global-alias', (
+            'import builtins as defaults\n'
+            'class Holder:\n'
+            '    global inspect\n'
+            '    inspect = defaults.globals\n'
+            'namespace = inspect()'
+        )), ('nested-class-lookup', (
+            'import builtins as defaults\n'
+            'class Outer:\n'
+            '    defaults = None\n'
+            '    class Inner:\n'
+            '        namespace = defaults.globals()\n'
+            'namespace = Outer.Inner.namespace'
+        )), ('class-dynamic-global', (
+            'class Outer:\n'
+            '    class Inner:\n'
+            '        global defaults\n'
+            '        import builtins as defaults\n'
+            '    namespace = defaults.globals()\n'
+            'namespace = Outer.namespace'
+        )), ('conditional-alias', (
+            'import builtins as defaults\n'
+            'if True:\n'
+            '    inspect = defaults.globals\n'
+            'namespace = inspect()'
+        )), ('final-import-binding', 'import types as defaults, builtins as defaults\nnamespace = defaults.globals()'), ('conditional-shadow', (
+            'import builtins as defaults\n'
+            'if False:\n'
+            '    defaults = None\n'
+            'namespace = defaults.globals()'
+        )), ('conditional-class-global-shadow', (
+            'import builtins as defaults\n'
+            'if False:\n'
+            '    class Holder:\n'
+            '        global defaults\n'
+            '        defaults = None\n'
+            'namespace = defaults.globals()'
+        )), ('preserved-copy', (
+            'import builtins as defaults\n'
+            'other = defaults\n'
+            'defaults = None\n'
+            'namespace = other.globals()'
+        )), ('final-callable-import', 'from builtins import len as inspect, globals as inspect\nnamespace = inspect()')]:
+            cases.append((label, source + '\nTESTS = ["owned"]\nnamespace["TESTS"] = []\n', False))
+        for label, source in [('function-shadow', (
+            'from builtins import globals as inspect\n'
+            'def inspect(): return {}\n'
+            'namespace = inspect()'
+        )), ('class-local-module-shadow', (
+            'from types import SimpleNamespace\n'
+            'import builtins as defaults\n'
+            'class Holder:\n'
+            '    defaults = SimpleNamespace(globals=lambda: {})\n'
+            '    namespace = defaults.globals()'
+        )), ('class-local-function-shadow', (
+            'from builtins import globals as inspect\n'
+            'class Holder:\n'
+            '    def inspect(): return {}\n'
+            '    namespace = inspect()'
+        )), ('unexecuted-qualified-import', 'def unused():\n    from builtins import globals as inspect\n    return inspect()'), ('uncalled-alias-helper', 'from builtins import globals as inspect\ndef unused(): return inspect()'), ('unused-alias', 'import builtins as defaults\ninspect = defaults.globals'), ('overwritten-callable-import', 'from builtins import globals as inspect, len as inspect\nvalue = inspect([])'), ('fresh-object', (
+            'from types import SimpleNamespace\n'
+            'import builtins as defaults\n'
+            'namespace = vars(SimpleNamespace())'
+        ))]:
+            cases.append((label, source + '\nTESTS = ["owned"]\n', True))
+        self.inventory['owners']['live']['selection'] = {'kind': 'data', 'file': 'runner.py', 'expression': 'TESTS'}
+        for label, source, expected in cases:
+            with self.subTest(label=label, expected=expected):
+                # Observe outside audited source: print could hide a missed escape.
+                actual = subprocess.run([sys.executable, '-c', source + 'print(TESTS)'], check=True, capture_output=True, text=True, timeout=10)
+                self.assertEqual(actual.stdout, "['owned']\n" if expected else '[]\n')
+                (self.root / 'runner.py').write_text(source, encoding='utf-8')
+                if expected:
+                    self.assertEqual(self.check(), 1)
+                else:
+                    with self.assertRaises(audit.InventoryError):
+                        self.check()
+
     def test_fresh_object_namespaces_do_not_expose_module_selectors(self):
         imports = [
             ('from types import SimpleNamespace', 'SimpleNamespace'),
