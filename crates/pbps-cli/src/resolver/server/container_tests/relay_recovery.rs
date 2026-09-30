@@ -300,7 +300,10 @@ async fn exercise(site: Site, mode: Mode) {
         "the actual {site:?} preparation boundary was not reached exactly once"
     );
     let name = &observed.prepared_names[0];
-    assert!(terminal, "{site:?}/{mode:?} must remain permanently refused");
+    assert!(
+        terminal,
+        "{site:?}/{mode:?} must remain permanently refused"
+    );
     let expected_starts = usize::from(mode != Mode::Prelaunch);
     assert_eq!(observed.start_names.len(), expected_starts);
     assert_eq!(
@@ -346,18 +349,21 @@ async fn all_controls(site: Site) {
 
 #[tokio::test]
 #[ignore = "requires the owned native Docker daemon and a pinned PostgreSQL TLS target"]
-async fn admin_launch_recovery_distinguishes_absence_from_uncertainty_without_losing_other_owners() {
+async fn admin_launch_recovery_distinguishes_absence_from_uncertainty_without_losing_other_owners()
+{
     all_controls(Site::Admin).await;
 }
 
 #[tokio::test]
 #[ignore = "requires the owned native Docker daemon and a pinned PostgreSQL TLS target"]
-async fn scratch_launch_recovery_distinguishes_absence_from_uncertainty_without_losing_other_owners() {
+async fn scratch_launch_recovery_distinguishes_absence_from_uncertainty_without_losing_other_owners()
+ {
     all_controls(Site::Scratch).await;
 }
 
 #[tokio::test]
 #[ignore = "requires the owned native Docker daemon and a pinned PostgreSQL TLS target"]
-async fn janitor_launch_recovery_distinguishes_absence_from_uncertainty_without_losing_other_owners() {
+async fn janitor_launch_recovery_distinguishes_absence_from_uncertainty_without_losing_other_owners()
+ {
     all_controls(Site::Janitor).await;
 }
