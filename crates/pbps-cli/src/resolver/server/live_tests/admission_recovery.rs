@@ -405,17 +405,148 @@ async fn failed_admission_names_every_unconfirmed_forwarder() {
 // paused and this observer's daemon connections cut, so that nothing can
 // remove the forwarder unless cleanup still holds it (#1031).
 tokio::task_local! {
-    static HOLD: Rc<RefCell<Fault>>;
+    static HOLD: HeldStep;
+}
+
+struct HeldStep {
+    fault: Rc<RefCell<Fault>>,
+    arrived: RefCell<Option<tokio::sync::oneshot::Sender<std::time::Instant>>>,
 }
 
 pub(in crate::resolver::server) fn after_admin_open(forwarder: &Forwarder) {
-    let _ = HOLD.try_with(|fault| fault.borrow_mut().apply(forwarder));
+    let _ = HOLD.try_with(|held| {
+        held.fault.borrow_mut().apply(forwarder);
+        // The run stores the session before this hook; signal only once the
+        // real forwarder and observer fault have also been established.
+        held.arrived
+            .borrow_mut()
+            .take()
+            .expect("one held administrative session")
+            .send(std::time::Instant::now())
+            .expect("the cancellation observer is still waiting");
+    });
 }
 
 pub(in crate::resolver::server) async fn hold() {
     if HOLD.try_with(|_| ()).is_ok() {
         std::future::pending::<()>().await;
     }
+}
+
+async fn cancel_at_admin_arrival<F>(
+    step: F,
+    arrival: tokio::sync::oneshot::Receiver<std::time::Instant>,
+    deadline: std::time::Duration,
+) -> Result<(std::time::Instant, std::time::Instant), String>
+where
+    F: std::future::Future,
+    F::Output: std::fmt::Debug,
+{
+    let mut step = Box::pin(step);
+    let arrived = tokio::time::timeout(deadline, async {
+        tokio::select! {
+            // An operation that already finished is not a held session, even
+            // if it sent the signal in its last poll.
+            biased;
+            result = &mut step => Err(format!("step completed before administrative hold: {result:?}")),
+            signal = arrival => signal.map_err(|_| "administrative arrival channel closed".to_owned()),
+        }
+    })
+    .await
+    .map_err(|_| "administrative session arrival deadline expired".to_owned())??;
+    // Drop the owned operation, not just a pinned reference to it. Cleanup
+    // must observe cancellation before the observer restores its real fault.
+    drop(step);
+    Ok((arrived, std::time::Instant::now()))
+}
+
+struct DropFlag(Rc<std::cell::Cell<bool>>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.set(true);
+    }
+}
+
+async fn pending_step(
+    dropped: Rc<std::cell::Cell<bool>>,
+    arrived: Option<tokio::sync::oneshot::Sender<std::time::Instant>>,
+) {
+    let _guard = DropFlag(dropped);
+    if let Some(arrived) = arrived {
+        arrived.send(std::time::Instant::now()).unwrap();
+    }
+    std::future::pending::<()>().await;
+}
+
+#[tokio::test]
+async fn an_arrived_step_is_cancelled_in_the_poll_that_observes_it() {
+    let (arrived, arrival) = tokio::sync::oneshot::channel();
+    let dropped = Rc::new(std::cell::Cell::new(false));
+    let mut cancellation = Box::pin(cancel_at_admin_arrival(
+        pending_step(dropped.clone(), Some(arrived)),
+        arrival,
+        std::time::Duration::from_secs(60),
+    ));
+    let (arrived, cancelled) = std::future::poll_fn(|cx| {
+        let result = std::future::Future::poll(cancellation.as_mut(), cx);
+        assert!(result.is_ready(), "arrival must not wait for the deadline");
+        result
+    })
+    .await
+    .unwrap();
+    assert!(dropped.get(), "the exact in-flight operation was dropped");
+    assert!(cancelled >= arrived);
+}
+
+#[tokio::test]
+async fn a_missing_arrival_fails_and_drops_the_operation() {
+    let (sender, arrival) = tokio::sync::oneshot::channel();
+    let dropped = Rc::new(std::cell::Cell::new(false));
+    let result = cancel_at_admin_arrival(
+        pending_step(dropped.clone(), None),
+        arrival,
+        std::time::Duration::ZERO,
+    )
+    .await;
+    assert_eq!(
+        result.unwrap_err(),
+        "administrative session arrival deadline expired"
+    );
+    assert!(dropped.get());
+    drop(sender);
+}
+
+#[tokio::test]
+async fn a_closed_arrival_fails_and_drops_the_operation() {
+    let (sender, arrival) = tokio::sync::oneshot::channel();
+    drop(sender);
+    let dropped = Rc::new(std::cell::Cell::new(false));
+    let result = cancel_at_admin_arrival(
+        pending_step(dropped.clone(), None),
+        arrival,
+        std::time::Duration::from_secs(60),
+    )
+    .await;
+    assert_eq!(result.unwrap_err(), "administrative arrival channel closed");
+    assert!(dropped.get());
+}
+
+#[tokio::test]
+async fn a_completed_step_is_refused_even_when_it_sent_arrival() {
+    let (arrived, arrival) = tokio::sync::oneshot::channel();
+    let dropped = Rc::new(std::cell::Cell::new(false));
+    let step = async {
+        let _guard = DropFlag(dropped.clone());
+        arrived.send(std::time::Instant::now()).unwrap();
+        "completed"
+    };
+    let result = cancel_at_admin_arrival(step, arrival, std::time::Duration::from_secs(60)).await;
+    assert_eq!(
+        result.unwrap_err(),
+        "step completed before administrative hold: \"completed\""
+    );
+    assert!(dropped.get());
 }
 
 #[tokio::test]
@@ -454,20 +585,31 @@ async fn a_cancelled_step_leaves_its_admin_session_to_cleanup() {
             true,
             false,
         )));
+        let (arrived, arrival) = tokio::sync::oneshot::channel();
+        let started = std::time::Instant::now();
         let held = HOLD
-            .scope(fault.clone(), async {
-                let step = async {
-                    match stage {
-                        "qualify" => run.qualify(&mut target, &request).await.map(|_| ()),
-                        _ => run.resolve(&mut target, &binding).await.map(|_| ()),
-                    }
-                };
-                tokio::time::timeout(std::time::Duration::from_secs(60), step).await
-            })
+            .scope(
+                HeldStep {
+                    fault: fault.clone(),
+                    arrived: RefCell::new(Some(arrived)),
+                },
+                async {
+                    let step = async {
+                        match stage {
+                            "qualify" => run.qualify(&mut target, &request).await.map(|_| ()),
+                            _ => run.resolve(&mut target, &binding).await.map(|_| ()),
+                        }
+                    };
+                    cancel_at_admin_arrival(step, arrival, std::time::Duration::from_secs(60)).await
+                },
+            )
             .await;
-        assert!(
-            held.is_err(),
-            "{stage}: the step was held at its admin session"
+        let (arrived, cancelled) = held.unwrap_or_else(|error| panic!("{stage}: {error}"));
+        eprintln!(
+            "cancellation timing {stage} retry={retry}: arrival={:?} after_arrival={:?} step={:?}",
+            arrived.duration_since(started),
+            cancelled.duration_since(arrived),
+            cancelled.duration_since(started),
         );
         let (name, id) = {
             let mut state = fault.borrow_mut();

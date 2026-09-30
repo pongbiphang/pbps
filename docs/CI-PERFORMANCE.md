@@ -1,4 +1,4 @@
-# Live-test build performance
+# Live-test performance
 
 CPU-heavy PostgreSQL capture and resolver fixtures use Cargo's `live-test`
 profile. It inherits `test` and enables basic optimization (`opt-level = 1`)
@@ -89,3 +89,50 @@ versions, catalog rereads, content hashes and cleanup assertions remain in
 place. A faster build mode does not authorize relaxing those checks. Further
 parallelization would require independent fixtures for namespace mutation,
 runtime failures, session census and server shutdown.
+
+## Arrival-triggered cancellation
+
+The administrative-session cancellation regression (#1295) previously held
+each operation indefinitely, then dropped it at a 60-second deadline. That
+deadline included reaching the hook; only the subsequent wait was unnecessary.
+The test now signals arrival after the run stores its owned administrative
+session and the hook establishes the real forwarder/observer fault. It drops
+the exact boxed operation on arrival. The 60-second timeout bounds missing
+arrival only. Production code and all cleanup observations remain unchanged.
+
+Paired local runs used the same `live-test` profile, pinned SQL Server 2025
+and PostgreSQL 18.6 images, native Docker 29.8.1, and maintained dedicated-server
+fixture. The baseline added arrival instrumentation without changing the old
+deadline. Prebuilt baseline and replacement binaries were retained separately;
+compilation is excluded from the following measurements.
+
+| Workload | SQL Server before | SQL Server after | PostgreSQL before | PostgreSQL after |
+| --- | ---: | ---: | ---: | ---: |
+| Cancellation case, including retries and cleanup | 139.45s | 17.85s | 193.71s | 12.62s |
+| Complete dedicated-server segment, 22 fixture invocations | 612.46s | 367.53s | 449.74s | 252.66s |
+
+The baseline's measured post-arrival waits totaled 117.32s for SQL Server's
+two variants and 177.14s for PostgreSQL's three. After replacement, arrival
+to dropping the operation took 34–52 microseconds and 14–38 microseconds,
+respectively. These intervals distinguish a test-imposed wait from engine work.
+The shared host and other cases' variable runtimes prevent attributing every
+segment-level difference to this change. A segment is not the whole resolver
+CI job, and overlapping jobs' savings cannot be added as pipeline wall time.
+
+Reproduce each complete segment by discovering the compiled `pbps_cli` artifact
+as above, retaining each variant's executable outside the repository, and
+running the maintained fixture on a qualified native host:
+
+```bash
+sudo python3 scripts/live-resolver-server.py mssql --test-binary "$PBPS_FIXTURE_BINARY"
+sudo python3 scripts/live-resolver-server.py pg --test-binary "$PBPS_FIXTURE_BINARY"
+```
+
+Use `--socket` when the owned native daemon has a non-default socket. Keep the
+same fixture source and pinned images, and record build time, each variant's
+arrival/post-arrival interval, case runtime, complete segment runtime, and CI
+job runtime separately. The four ordinary controls require same-poll
+cancellation and refuse missing arrival, a closed channel, or an operation
+that completed instead of remaining held. The existing real-engine assertions
+still require retry refusal, unchanged roles, actual leftover detection,
+reported recovery names, exact owned-resource removal, and target integrity.
