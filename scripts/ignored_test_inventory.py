@@ -320,6 +320,34 @@ def mutable_ids(value):
     return set()
 
 
+_UNKNOWN_NAMESPACE_VALUE = object()
+
+
+class NamespaceValue:
+    """Possible builtin identities plus only native, non-executing value facts."""
+    def __init__(self, aliases=(), *, native=_UNKNOWN_NAMESPACE_VALUE, kind=None, truth=None):
+        self.aliases = frozenset(aliases)
+        self.native = native
+        self.kind = kind
+        self.truth = bool(native) if native is not _UNKNOWN_NAMESPACE_VALUE else truth
+
+    def merge(self, other):
+        native = _UNKNOWN_NAMESPACE_VALUE
+        if (type(self.native) in (type(None), bool, int, float, complex, str, bytes)
+                and type(self.native) is type(other.native) and self.native == other.native):
+            native = self.native
+        return NamespaceValue(self.aliases | other.aliases, native=native,
+                              kind=self.kind if self.kind == other.kind else None,
+                              truth=self.truth if self.truth == other.truth else None)
+
+    def binding(self):
+        # Container structure is known only while evaluating its literal. A
+        # stored container can be mutated or escaped through procedural code.
+        if type(self.native) in (list, tuple, dict):
+            return NamespaceValue(self.aliases)
+        return self
+
+
 class NamespaceExposure(ast.NodeVisitor):
     """Potential builtin aliases, independent of pristine object-inspection proof."""
     reflective = frozenset({"globals", "locals", "vars", "exec", "eval"})
@@ -332,19 +360,146 @@ class NamespaceExposure(ast.NodeVisitor):
         self.harmless = None
         self.conditional = False
 
+    def builtin(self, name):
+        if name == 'builtins':
+            return NamespaceValue({'builtins'}, kind='builtins', truth=True)
+        if name in self.reflective:
+            return NamespaceValue({name}, kind='callable', truth=True)
+        if name == 'len':
+            return NamespaceValue(kind='callable', truth=True)
+        return NamespaceValue()
+
     def value(self, node):
+        # Resolve and visit once, in Python's order. Looking up a result after
+        # visiting the whole expression loses earlier values when a later
+        # named expression shadows their spelling.
         if isinstance(node, ast.Name):
-            fallback = self.module.get(node.id, {node.id} if node.id in self.reflective else set())
+            fallback = self.module.get(node.id, self.builtin(node.id))
             return fallback if node.id in self.globals else self.bindings.get(node.id, fallback)
-        if (isinstance(node, ast.Attribute) and node.attr in self.reflective
-            and "builtins" in self.value(node.value)):
-            return {node.attr}
-        return set()
+        if isinstance(node, ast.Constant):
+            return NamespaceValue(native=node.value)
+        if isinstance(node, ast.Attribute):
+            receiver = self.value(node.value)
+            if 'builtins' in receiver.aliases and node.attr in self.reflective:
+                return NamespaceValue({node.attr}, kind='callable' if receiver.kind == 'builtins' else None,
+                                      truth=True if receiver.kind == 'builtins' else None)
+            if receiver.kind == 'builtins' and node.attr == 'len':
+                return self.builtin('len')
+            return NamespaceValue()
+        if isinstance(node, ast.NamedExpr):
+            return self.named_value(node)
+        if isinstance(node, ast.IfExp):
+            return self.conditional_value(node)
+        if isinstance(node, ast.BoolOp):
+            return self.short_circuit_value(node)
+        if isinstance(node, (ast.List, ast.Tuple, ast.Dict)):
+            return self.container_value(node)
+        if isinstance(node, ast.Subscript):
+            return self.selected_value(node)
+        if isinstance(node, ast.UnaryOp):
+            operand = self.value(node.operand)
+            if isinstance(node.op, ast.Not) and operand.truth is not None:
+                return NamespaceValue(native=not operand.truth)
+            if type(operand.native) in (bool, int, float, complex):
+                if isinstance(node.op, ast.USub):
+                    return NamespaceValue(native=-operand.native)
+                if isinstance(node.op, ast.UAdd):
+                    return NamespaceValue(native=+operand.native)
+            return NamespaceValue(operand.aliases)
+        if isinstance(node, ast.Starred):
+            return self.value(node.value)
+        if isinstance(node, ast.Lambda):
+            self.visit(node.args)
+            return NamespaceValue(kind='callable', truth=True)
+        self.visit(node)
+        return NamespaceValue()
+
+    def named_value(self, node):
+        result = self.value(node.value)
+        self.bind(node.target.id, result)
+        return result
+
+    def conditional_value(self, node):
+        condition = self.value(node.test)
+        if condition.truth is not None:
+            return self.value(node.body if condition.truth else node.orelse)
+        conditional = self.conditional
+        self.conditional = True
+        try:
+            return self.value(node.body).merge(self.value(node.orelse))
+        finally:
+            self.conditional = conditional
+
+    def short_circuit_value(self, node):
+        stop = isinstance(node.op, ast.Or)
+        def remaining(index):
+            result = self.value(node.values[index])
+            if index == len(node.values) - 1 or result.truth is stop:
+                return result
+            if result.truth is not None:
+                return remaining(index + 1)
+            conditional = self.conditional
+            self.conditional = True
+            try:
+                return result.merge(remaining(index + 1))
+            finally:
+                self.conditional = conditional
+        return remaining(0)
+
+    def container_value(self, node):
+        aliases = set()
+        if isinstance(node, ast.Dict):
+            native, supported = {}, True
+            for key, expression in zip(node.keys, node.values):
+                key_value = self.value(key) if key is not None else None
+                item = self.value(expression)
+                aliases.update(item.aliases)
+                if key is None:
+                    if type(item.native) is dict:
+                        native.update(item.native)
+                    else:
+                        supported = False
+                elif type(key_value.native) in (type(None), bool, int, float, complex, str, bytes):
+                    native[key_value.native] = item
+                else:
+                    supported = False
+            return NamespaceValue(aliases, native=native if supported else _UNKNOWN_NAMESPACE_VALUE)
+        native, supported = [], True
+        for expression in node.elts:
+            item = self.value(expression)
+            aliases.update(item.aliases)
+            if isinstance(expression, ast.Starred):
+                if type(item.native) in (list, tuple):
+                    native.extend(item.native)
+                else:
+                    supported = False
+            else:
+                native.append(item)
+        if isinstance(node, ast.Tuple):
+            native = tuple(native)
+        return NamespaceValue(aliases, native=native if supported else _UNKNOWN_NAMESPACE_VALUE)
+
+    def selected_value(self, node):
+        container = self.value(node.value)
+        key = self.value(node.slice)
+        native = container.native
+        if ((type(native) in (list, tuple) and type(key.native) in (bool, int))
+                or (type(native) is dict and type(key.native) in (type(None), bool, int, float, complex, str, bytes))):
+            try:
+                return native[key.native]
+            except (IndexError, KeyError):
+                pass
+        # Unknown keys/structure cannot prove a selected value harmless:
+        # procedural code may have replaced even an initially inert item.
+        # Preserve possible callables/modules without running an index protocol.
+        return NamespaceValue(container.aliases | self.reflective | {'builtins'})
 
     def bind(self, name, value):
-        value = set(value)
+        if not isinstance(value, NamespaceValue):
+            value = self.builtin(next(iter(value))) if len(value) == 1 else NamespaceValue(value)
+        value = value.binding()
         if self.conditional:
-            value |= self.value(ast.Name(id=name, ctx=ast.Load()))
+            value = value.merge(self.value(ast.Name(id=name, ctx=ast.Load())))
         if name in self.globals:
             self.module[name] = value
         else:
@@ -365,28 +520,33 @@ class NamespaceExposure(ast.NodeVisitor):
     def visit_Call(self, node):
         if node is self.harmless:
             return
-        if self.value(node.func) & self.reflective:
+        callable_value = self.value(node.func)
+        # Python obtains the callable before arguments can rebind its name.
+        for argument in [*node.args, *(keyword.value for keyword in node.keywords)]:
+            self.value(argument)
+        if callable_value.aliases & self.reflective:
             self.exposed = True
-        self.generic_visit(node)
 
     def visit_Assign(self, node):
         value = self.value(node.value)
-        self.visit(node.value)
         for target in node.targets:
             self.visit(target)
             if isinstance(target, ast.Name):
                 self.bind(target.id, value)
 
     def visit_NamedExpr(self, node):
-        value = self.value(node.value)
-        self.visit(node.value)
-        if isinstance(node.target, ast.Name):
-            self.bind(node.target.id, value)
+        return self.value(node)
+
+    visit_IfExp = visit_NamedExpr
+    visit_BoolOp = visit_NamedExpr
+    visit_List = visit_NamedExpr
+    visit_Tuple = visit_NamedExpr
+    visit_Dict = visit_NamedExpr
+    visit_Subscript = visit_NamedExpr
 
     def visit_AnnAssign(self, node):
         if node.value is not None:
             value = self.value(node.value)
-            self.visit(node.value)
             self.visit(node.target)
             if isinstance(node.target, ast.Name):
                 self.bind(node.target.id, value)
@@ -403,8 +563,8 @@ class NamespaceExposure(ast.NodeVisitor):
             if alias.name == '*':
                 continue
             self.bind(alias.asname or alias.name,
-                      {alias.name} if not node.level and node.module == 'builtins'
-                      and alias.name in self.reflective else set())
+                      self.builtin(alias.name) if not node.level and node.module == 'builtins'
+                      else NamespaceValue())
 
     def visit_Delete(self, node):
         for target in node.targets:

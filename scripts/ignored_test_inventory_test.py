@@ -505,6 +505,133 @@ class Ownership(unittest.TestCase):
                     with self.assertRaises(audit.InventoryError):
                         self.check()
 
+    def compound_namespace_reads_refuse_stale_ownership(self, captures):
+        self.inventory['owners']['live']['selection'] = {
+            'kind': 'data', 'file': 'runner.py', 'expression': 'TESTS'}
+        for label, capture in captures:
+            for before in [True, False]:
+                with self.subTest(label=label, before=before):
+                    source = 'import builtins as defaults\n'
+                    source += (capture + '\nTESTS = ["owned"]\n' if before
+                               else 'TESTS = ["owned"]\n' + capture + '\n')
+                    source += 'namespace["TESTS"] = []\n'
+                    actual = subprocess.run([sys.executable, '-c', source + 'print(TESTS)'],
+                                            check=True, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(actual.stdout, '[]\n')
+                    (self.root / 'runner.py').write_text(source, encoding='utf-8')
+                    with self.assertRaises(audit.InventoryError):
+                        self.check()
+
+    def test_named_expression_results_preserve_called_namespace_aliases(self):
+        self.compound_namespace_reads_refuse_stale_ownership([
+            ('callee', 'namespace = (inspect := defaults.globals)()'),
+            ('receiver', 'namespace = (module := defaults).globals()'),
+            ('reused-callee', 'unused = (inspect := defaults.globals)\nnamespace = inspect()'),
+            ('reused-receiver', 'unused = (module := defaults)\nnamespace = module.globals()'),
+            ('assigned-result', 'inspect = (other := defaults.globals)\nnamespace = inspect()'),
+            ('nested-result', 'namespace = (inspect := (other := defaults.globals))()'),
+        ])
+
+    def test_conditional_values_preserve_selected_namespace_aliases(self):
+        captures = []
+        for flag, expression in [('True', 'defaults.globals if flag else len'),
+                                 ('False', 'len if flag else defaults.globals')]:
+            captures += [
+                ('assigned/' + flag, f'flag = {flag}\ninspect = {expression}\nnamespace = inspect()'),
+                ('callee/' + flag, f'flag = {flag}\nnamespace = ({expression})()'),
+            ]
+        for flag, expression in [('True', 'defaults if flag else None'),
+                                 ('False', 'None if flag else defaults')]:
+            captures.append(('receiver/' + flag, f'flag = {flag}\nnamespace = ({expression}).globals()'))
+        captures += [
+            ('unknown-first-branch', 'import sys\nflag = len(sys.argv) > 0\nnamespace = (defaults.globals if flag else len)()'),
+            ('unknown-second-branch', 'import sys\nflag = len(sys.argv) == 0\nnamespace = (len if flag else defaults.globals)()'),
+            ('test-binding-order', 'namespace = (inspect if (inspect := defaults.globals) else len)()'),
+        ]
+        self.compound_namespace_reads_refuse_stale_ownership(captures)
+
+    def test_short_circuit_values_preserve_selected_namespace_aliases(self):
+        captures = []
+        for expression in ['True and defaults.globals', 'False or defaults.globals',
+                           'defaults.globals or len', 'len and defaults.globals']:
+            captures += [
+                ('assigned/' + expression, f'inspect = {expression}\nnamespace = inspect()'),
+                ('callee/' + expression, f'namespace = ({expression})()'),
+            ]
+        for expression in ['True and defaults', 'False or defaults', 'defaults or None']:
+            captures.append(('receiver/' + expression, f'namespace = ({expression}).globals()'))
+        captures += [
+            ('unknown-and', 'import sys\nflag = len(sys.argv) > 0\nnamespace = (flag and defaults.globals)()'),
+            ('unknown-or', 'import sys\nflag = len(sys.argv) == 0\nnamespace = (flag or defaults.globals)()'),
+            ('possible-skipped-shadow', 'import sys\ninspect = defaults.globals\nunused = (len(sys.argv) == 0) and (inspect := len)\nnamespace = inspect()'),
+        ]
+        self.compound_namespace_reads_refuse_stale_ownership(captures)
+
+    def test_literal_selections_preserve_the_selected_namespace_value(self):
+        captures = []
+        for expression in ['(len, defaults.globals)[1]', '[len, defaults.globals][-1]',
+                           '{"safe": len, "reader": defaults.globals}["reader"]',
+                           '[{"reader": (len, defaults.globals)}][0]["reader"][-1]',
+                           '{"reader": len, "reader": defaults.globals}["reader"]']:
+            captures += [
+                ('assigned/' + expression, f'inspect = {expression}\nnamespace = inspect()'),
+                ('callee/' + expression, f'namespace = ({expression})()'),
+            ]
+        for expression in ['(None, defaults)[1]', '[None, defaults][-1]',
+                           '{"module": defaults}["module"]']:
+            captures.append(('receiver/' + expression, f'namespace = ({expression}).globals()'))
+        captures += [
+            ('earlier-binding-snapshot', 'inspect = defaults.globals\nnamespace = (inspect, (inspect := lambda: {}))[0]()'),
+            ('later-element-binding', 'namespace = ((inspect := defaults.globals), inspect)[1]()'),
+            ('key-binding-order', 'namespace = {"reader": defaults.globals}[(key := "reader")]()'),
+            ('earlier-dictionary-value', 'inspect = defaults.globals\nnamespace = {"reader": inspect, "other": (inspect := lambda: {})}["reader"]()'),
+            ('unknown-key', 'index = int("1")\nnamespace = (len, defaults.globals)[index]()'),
+            ('stored-container-unknown-key', 'readers = [len, defaults.globals]\nindex = int("1")\nnamespace = readers[index]()'),
+            ('unproven-mutated-container', 'readers = [len]\nreaders[0] = defaults.globals\nnamespace = readers[0]()'),
+            ('unproven-procedural-container', 'namespace = (lambda: (defaults.globals,))()[0]()'),
+        ]
+        self.compound_namespace_reads_refuse_stale_ownership(captures)
+
+    def test_unused_or_harmless_compound_values_preserve_real_ownership(self):
+        controls = [
+            'unused = (inspect := defaults.globals)',
+            'unused = (module := defaults)',
+            'unused = defaults.globals if True else len',
+            'unused = (len, defaults.globals)[1]',
+            'inspect = (other := defaults.globals)\ninspect = len\nvalue = inspect([])',
+            'inspect = defaults.globals if False else len\nvalue = inspect([])',
+            'inspect = len if True else defaults.globals\nvalue = inspect([])',
+            'inspect = defaults.globals and len\nvalue = inspect([])',
+            'inspect = len or defaults.globals\nvalue = inspect([])',
+            'from builtins import len as inspect\nvalue = (inspect or defaults.globals)([])',
+            'import sys\ninspect = defaults.globals if len(sys.argv) > 0 else len\ninspect = len\nvalue = inspect([])',
+            'inspect = False or len\nvalue = inspect([])',
+            'inspect = (len, defaults.globals)[0]\nvalue = inspect([])',
+            'inspect = [defaults.globals, len][-1]\nvalue = inspect([])',
+            'inspect = {"reader": defaults.globals, "reader": len}["reader"]\nvalue = inspect([])',
+            'inspect = [({"safe": len}, defaults.globals)][0][0]["safe"]\nvalue = inspect([])',
+            'unused = False and defaults.globals()',
+            'unused = True or defaults.globals()',
+            'unused = 0 if True else defaults.globals()',
+            'inspect = lambda value: {}\nunused = inspect((inspect := defaults.globals))',
+            'inspect = defaults.globals\nnamespace = (inspect, (inspect := lambda: {}))[1]()',
+            'def unused(): return (inspect := defaults.globals)()',
+            'unused = lambda: (module := defaults).globals()',
+        ]
+        self.inventory['owners']['live']['selection'] = {
+            'kind': 'data', 'file': 'runner.py', 'expression': 'TESTS'}
+        for body in controls:
+            for before in [True, False]:
+                with self.subTest(body=body, before=before):
+                    source = 'import builtins as defaults\n'
+                    source += (body + '\nTESTS = ["owned"]\n' if before
+                               else 'TESTS = ["owned"]\n' + body + '\n')
+                    actual = subprocess.run([sys.executable, '-c', source + 'print(TESTS)'],
+                                            check=True, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(actual.stdout, "['owned']\n")
+                    (self.root / 'runner.py').write_text(source, encoding='utf-8')
+                    self.assertEqual(self.check(), 1)
+
     def test_fresh_object_namespaces_do_not_expose_module_selectors(self):
         imports = [
             ('from types import SimpleNamespace', 'SimpleNamespace'),
