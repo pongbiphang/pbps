@@ -430,7 +430,10 @@ fn covers_change(c: &Change, surface: &Surface) -> bool {
             Surface::Column(_) => {
                 !matches!(c, Change::CreateTable { .. } | Change::DropTable { .. })
             }
-            Surface::Default(_) => matches!(c, Change::AlterColumnDefault { .. }),
+            Surface::Default(_) => matches!(
+                c,
+                Change::AlterColumnDefault { .. } | Change::AlterColumnExpression { .. }
+            ),
             Surface::Namespace(_)
             | Surface::Table(_)
             | Surface::Check { .. }
@@ -459,7 +462,7 @@ pub(super) fn touches(c: &Change, surface: &Surface) -> bool {
                 || matches!(c, Change::CreateTable { name, .. } | Change::DropTable { name, .. } if name == &column.table)
         }
         Surface::Default(column) => {
-            matches!(c, Change::AlterColumnDefault { column: r, .. } if r == column)
+            matches!(c, Change::AlterColumnDefault { column: r, .. } | Change::AlterColumnExpression { column: r, .. } if r == column)
                 || matches!(c, Change::CreateTable { name, .. } | Change::DropTable { name, .. } if name == &column.table)
                 || matches!(c, Change::AddColumn { table, name, .. } if &table.column(name) == column)
         }

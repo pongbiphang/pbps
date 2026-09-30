@@ -1136,13 +1136,14 @@ whole order. That holds in the class a column rename brings all of its
 table's drops into. A recomputed value is checked against the column's
 nullability as it stands, so relaxing it runs before the expression change
 and tightening it after, measured on 17.11. Its expression binds the functions it calls as a default's
-does. An `AlterColumnExpression`, and an `AddColumn` carrying one, follow a
-function the plan creates, and a tightening of the recomputed column moves
-with its expression. A new table's generated column is split out of
-`CREATE TABLE` as an `AddColumn` for the same reason, unless a key,
-uniqueness, index or foreign key kept in the table names it. It then sits
-after the table's other columns, which only the engine's layout sees, since
-table equality ignores column order.
+does. An `AlterColumnExpression` follows a function the plan creates or
+rebuilds (DEC-942.1), and a tightening of the recomputed column moves with
+its expression. A column added with a generation expression does not move,
+in an existing table or a new one, as a column added with a default does
+not: a function the plan creates may read it, and measured on 17.11 the
+engine resolves a SQL body's columns at `CREATE FUNCTION`, `BEGIN ATOMIC` or
+not. One whose expression calls a function the same plan creates or rebuilds
+is refused by the engine, and the apply rolls back.
 
 A generated column is the engine's to fill, like a non-key identity
 (`Column::engine_assigned`). It leaves `row_columns` and the row

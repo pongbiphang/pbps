@@ -307,3 +307,39 @@ fn default_inventories_respect_creation_and_removal_endpoints() {
             .unwrap();
     }
 }
+
+/// A generation expression is the column's `pg_attrdef` row, as a default is
+/// (DEC-1168.1): a plan that changes one seals over that record and no other,
+/// just as a default change does.
+#[test]
+fn a_generation_expression_change_accounts_for_its_record_and_nothing_else() {
+    let (mut changes, mut evidence) = fixture();
+    changes.changes[0] = PlannedChange::new(Change::AlterColumnExpression {
+        uid: "c_000000".parse().unwrap(),
+        column: "app.v".parse::<TableName>().unwrap().column("n"),
+        from: "(a * 2)".into(),
+        to: "a * 3".into(),
+    });
+    evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
+    // Aggregated under the table, and named exactly as the record's own
+    // surface, which only a change to that surface authorizes.
+    let exact = {
+        let mut exact = evidence.clone();
+        exact.transitions[0].surface =
+            Surface::Default("app.v".parse::<TableName>().unwrap().column("n"));
+        exact
+    };
+    for sealed in [&evidence, &exact] {
+        seal(&changes, sealed).unwrap().validate(&changes).unwrap();
+    }
+    // The record's resolution is required, as a changed default's is.
+    let mut unresolved = evidence.clone();
+    unresolved.surfaces.clear();
+    assert!(seal(&changes, &unresolved).is_err());
+    for name in ["sibling-default", "column", "check"] {
+        let mut wrong = evidence.clone();
+        wrong.transitions[0].before.insert(object(name));
+        wrong.transitions[0].after.insert(object(name));
+        refuses(&changes, &wrong);
+    }
+}

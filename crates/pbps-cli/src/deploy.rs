@@ -2561,11 +2561,6 @@ fn refuse_unplanned_movement(
     // by another session would be recorded as this plan's.
     let mut added_indexes: BTreeMap<(&TableName, &str), &pbps_model::Index> = BTreeMap::new();
     let mut added_parts: BTreeMap<&TableName, BTreeSet<(pbps_model::Part, &str)>> = BTreeMap::new();
-    // And a column taken out of a created table's payload and added by a
-    // change of its own: a generated column split out to follow a rebuilt
-    // function (DEC-1168.1). Its definition answers through `AddColumn`'s own
-    // promise; here it only has to count as declared.
-    let mut added_columns: BTreeMap<&TableName, BTreeSet<&str>> = BTreeMap::new();
     let mut redefined: BTreeMap<TableName, BTreeMap<String, BTreeSet<pbps_model::ColumnField>>> =
         BTreeMap::new();
     let mut gone: BTreeSet<pbps_model::Dropped> = BTreeSet::new();
@@ -2623,12 +2618,6 @@ fn refuse_unplanned_movement(
                 .entry(&column.table)
                 .or_default()
                 .insert(column.name.as_str());
-        }
-        if let pbps_model::Change::AddColumn { table, name, .. } = &p.change {
-            added_columns
-                .entry(part_table_after(table, &changes.changes[index + 1..]))
-                .or_default()
-                .insert(name.as_str());
         }
         if let Some((table, key, _)) = p.change.row() {
             written.entry(table).or_default().insert(key);
@@ -2949,18 +2938,13 @@ fn refuse_unplanned_movement(
                     }
                 }
             };
-            // No `Part` for the columns: the only column split out of a
-            // `CREATE` is a generated one following a rebuilt function
-            // (DEC-1168.1), added by an `AddColumn` of the same plan.
+            // No `Part` for the columns: the differ never splits one out of a
+            // `CREATE`, and `AddColumn` is not emitted for a table this plan
+            // also creates.
             named(
                 "column",
                 None,
-                declared
-                    .columns
-                    .keys()
-                    .map(String::as_str)
-                    .chain(added_columns.get(now_name).into_iter().flatten().copied())
-                    .collect(),
+                declared.columns.keys().map(String::as_str).collect(),
                 now.columns.keys().map(String::as_str).collect(),
             );
             named(

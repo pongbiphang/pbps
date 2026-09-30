@@ -1464,8 +1464,7 @@ fn a_new_tables_expressions_calling_a_rebuilt_function_follow_it() {
     std::fs::write(
         d.dir.join("schema/app.n.yml"),
         "table: app.n\ncolumns:\n  id: {type: integer, nullable: false}\n  \
-         v: {type: integer, default: 'app.f(1)'}\n  \
-         g: {type: integer, generated: {expression: 'app.f(id)', stored: true}}\n\
+         v: {type: integer, default: 'app.f(1)'}\n\
          primary_key: {name: n_pkey, columns: [id]}\n\
          checks:\n  ck_n: 'app.f(id) >= 0'\n\
          indexes:\n  ix_n: {columns: [id], where: 'app.f(id) > 0'}\n",
@@ -1499,13 +1498,6 @@ fn a_new_tables_expressions_calling_a_rebuilt_function_follow_it() {
     assert!(create < at("CREATE INDEX \"ix_n\""), "{script}");
     assert!(
         create < at("ALTER TABLE \"app\".\"n\" ALTER COLUMN \"v\" SET DEFAULT"),
-        "{script}"
-    );
-    // A generated column's expression calls the function too, and no
-    // statement gives an existing column one, so it is split out of the new
-    // table as a column of its own (DEC-1168.1).
-    assert!(
-        create < at("ALTER TABLE \"app\".\"n\" ADD COLUMN \"g\""),
         "{script}"
     );
     let allow = ["--allow", "constraint", "--allow", "grant-widen"];
@@ -1545,9 +1537,12 @@ fn a_new_tables_expressions_calling_a_rebuilt_function_follow_it() {
 }
 
 /// A function new to the database, with nothing rebuilt: a new table's and an
-/// existing table's check and generated column calling it follow its
-/// `CREATE FUNCTION`, and the plan applies (DEC-942.1). Before, only a rebuild
-/// moved them, and the engine refused the check over a missing function.
+/// existing table's check calling it follow its `CREATE FUNCTION`, and the
+/// plan applies (DEC-942.1). Before, only a rebuild moved them, and the engine
+/// refused the check over a missing function. A column added with a
+/// generation expression stays ahead of the new functions, and one of them
+/// reads it: the engine resolves a SQL body's columns when it creates the
+/// function (DEC-1168.1).
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn what_calls_a_new_function_follows_its_create() {
@@ -1569,18 +1564,25 @@ fn what_calls_a_new_function_follows_its_create() {
          (x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x * 10 $$\n",
     )
     .unwrap();
+    std::fs::write(
+        d.dir.join("schema/app.reader%28integer%29.function.yml"),
+        "function: app.reader(integer)\npublic_execute: true\n\ndefinition: |-\n  \
+         (x integer) RETURNS integer LANGUAGE sql STABLE \
+         AS $$ SELECT t.g + k.g FROM app.t t JOIN app.k k USING (id) WHERE t.id = x $$\n",
+    )
+    .unwrap();
     let table = d.dir.join("schema/app.t.yml");
     let text = std::fs::read_to_string(&table).unwrap();
     let text = text.replacen(
         "columns:\n",
-        "columns:\n  g: {type: integer, generated: {expression: 'app.h(id)', stored: true}}\n",
+        "columns:\n  g: {type: integer, generated: {expression: 'id * 10', stored: true}}\n",
         1,
     );
     std::fs::write(&table, format!("{text}checks:\n  ck_t: 'app.h(id) >= 0'\n")).unwrap();
     std::fs::write(
         d.dir.join("schema/app.k.yml"),
         "table: app.k\ncolumns:\n  id: {type: integer, nullable: false}\n  \
-         g: {type: integer, generated: {expression: 'app.h(id)', stored: true}}\n\
+         g: {type: integer, generated: {expression: 'id * 10', stored: true}}\n\
          primary_key: {name: k_pkey, columns: [id]}\n\
          checks:\n  ck_k: 'app.h(id) >= 0'\n",
     )
@@ -1606,14 +1608,19 @@ fn what_calls_a_new_function_follows_its_create() {
     };
     let create = at("CREATE FUNCTION \"app\".\"h\"");
     assert!(!script.contains("DROP FUNCTION"), "{script}");
-    for caller in [
-        "ADD CONSTRAINT \"ck_t\"",
-        "ADD CONSTRAINT \"ck_k\"",
-        "ALTER TABLE \"app\".\"t\" ADD COLUMN \"g\"",
-        "ALTER TABLE \"app\".\"k\" ADD COLUMN \"g\"",
-    ] {
+    for caller in ["ADD CONSTRAINT \"ck_t\"", "ADD CONSTRAINT \"ck_k\""] {
         assert!(create < at(caller), "{caller}: {script}");
     }
+    let reader = at("CREATE FUNCTION \"app\".\"reader\"");
+    assert!(
+        at("ALTER TABLE \"app\".\"t\" ADD COLUMN \"g\"") < reader,
+        "{script}"
+    );
+    assert!(at("CREATE TABLE \"app\".\"k\"") < reader, "{script}");
+    assert!(
+        !script.contains("ALTER TABLE \"app\".\"k\" ADD COLUMN"),
+        "{script}"
+    );
     let allow = ["--allow", "constraint", "--allow", "grant-widen"];
     succeeds(approved_apply(&d, connection, &plan, &allow));
     assert_eq!(

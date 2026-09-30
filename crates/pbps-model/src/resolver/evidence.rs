@@ -229,7 +229,10 @@ impl ResolverEvidence {
                 Change::CreateModule { id, .. }
                 | Change::AlterModule { id, .. }
                 | Change::DropModule { id, .. } => Some(super::Surface::Module(id.clone())),
-                Change::AlterColumnDefault { column, .. } => {
+                // A generation expression is the column's `pg_attrdef` row,
+                // as a default is (DEC-1168.1).
+                Change::AlterColumnDefault { column, .. }
+                | Change::AlterColumnExpression { column, .. } => {
                     Some(super::Surface::Default(column.clone()))
                 }
                 Change::AddColumn {

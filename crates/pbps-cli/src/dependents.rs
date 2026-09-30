@@ -706,11 +706,10 @@ fn last_function_create(cs: &ChangeSet) -> Option<usize> {
 /// for `--allow constraint` as any added check does. The approver sees the
 /// constraint as its own step, where before it was inside `CREATE TABLE`.
 ///
-/// A generated column is split out as an `AddColumn` too, because its
-/// expression may call the function as a default's may, and the engine has
-/// no way to give an existing column one (DEC-1168.1). It then sits after
-/// the table's other columns rather than where it was declared: the order
-/// is the engine's layout only, and table equality ignores it.
+/// A generated column is not split out. Its expression may call the function
+/// as a default's may, but the engine has no way to give an existing column
+/// one, and taking the column out of the table would leave a function the
+/// plan creates reading a column that is not there yet (DEC-1168.1).
 // The complement is every change that writes no rows.
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(crate) fn split_new_tables(
@@ -729,61 +728,6 @@ pub(crate) fn split_new_tables(
         };
         let name = name.clone();
         let mut parts: Vec<Change> = Vec::new();
-        // A generated column first, since a check or an expression index
-        // split out below may read it (DEC-1168.1). Only one no key, unique
-        // constraint, remaining index or foreign key of the table names: those
-        // stay in `CREATE TABLE`, which would then name a column not there yet.
-        let kept_names: BTreeSet<String> = table
-            .primary_key
-            .iter()
-            .flat_map(|pk| pk.columns.iter().cloned())
-            .chain(
-                table
-                    .unique
-                    .values()
-                    .flat_map(|u| u.columns.iter().cloned()),
-            )
-            .chain(
-                table
-                    .indexes
-                    .values()
-                    .filter(|index| !index.holds_expression())
-                    .flat_map(|index| {
-                        index
-                            .columns
-                            .iter()
-                            .filter_map(|c| c.key.column().map(str::to_owned))
-                            .chain(index.include.iter().cloned())
-                            .collect::<Vec<_>>()
-                    }),
-            )
-            .chain(
-                table
-                    .foreign_keys
-                    .values()
-                    .flat_map(|f| f.columns.iter().cloned()),
-            )
-            .collect();
-        let generated: Vec<String> = table
-            .columns
-            .iter()
-            .filter(|(column, spec)| spec.generated.is_some() && !kept_names.contains(*column))
-            .map(|(column, _)| column.clone())
-            .collect();
-        for column in generated {
-            let column_ref = ColumnRef::new(name.clone(), column.clone());
-            let Some(uid) = ids.iter().find_map(|ids| ids.column_uid(&column_ref)) else {
-                continue;
-            };
-            if let Some(spec) = table.columns.shift_remove(&column) {
-                parts.push(Change::AddColumn {
-                    uid: uid.clone(),
-                    table: name.clone(),
-                    name: column,
-                    column: Box::new(spec),
-                });
-            }
-        }
         for (check, constraint) in std::mem::take(&mut table.checks) {
             parts.push(Change::AddCheck {
                 table: name.clone(),
@@ -898,11 +842,11 @@ pub(crate) fn after_the_rebuilds(cs: &mut ChangeSet) -> usize {
                 ..
             } => !taken.contains(column),
             // A generation expression binds the functions it calls exactly
-            // as a default does, and is written by a changed expression and
-            // by a column added with one (DEC-1168.1). No row writes a
-            // generated column, so none is taken ahead of it.
+            // as a default does (DEC-1168.1). No row writes a generated
+            // column, so none is taken ahead of it. A column added with one
+            // stays, as a column added with a default does: a function the
+            // plan creates may read it.
             Change::AlterColumnExpression { .. } => true,
-            Change::AddColumn { column, .. } => column.generated.is_some(),
             // A `NOT NULL` over a recomputed column stays behind its new
             // expression, which the order kept among the moved preserves.
             Change::AlterColumnNullability {
@@ -1154,9 +1098,9 @@ mod tests {
     }
 
     /// A generation expression binds the functions it calls, as a default
-    /// does: a changed expression and a column added with one follow the
-    /// rebuilt function's create, and an ordinary column added beside them
-    /// does not move (DEC-1168.1).
+    /// does: a changed expression follows the rebuilt function's create. A
+    /// column added with one stays ahead of it, as a column added with a
+    /// default does, since the function may read the column (DEC-1168.1).
     #[test]
     fn generation_expressions_follow_a_rebuilt_functions_create() {
         let (s, _) = declared();
@@ -1193,19 +1137,19 @@ mod tests {
             add("plain", pbps_model::Column::new("integer".parse().unwrap())),
             alter(&s, "app.f(integer)"),
         ]);
-        assert_eq!(after_the_rebuilds(&mut cs), 3);
+        assert_eq!(after_the_rebuilds(&mut cs), 2);
         let at =
             |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
         let rebuilt = at(&|c| matches!(c, Change::AlterModule { .. }));
         let expression = at(&|c| matches!(c, Change::AlterColumnExpression { .. }));
         let generated_add = at(&|c| matches!(c, Change::AddColumn { name, .. } if name == "g"));
         let plain_add = at(&|c| matches!(c, Change::AddColumn { name, .. } if name == "plain"));
+        assert!(rebuilt < expression, "{:?}", names(&cs));
         assert!(
-            rebuilt < expression && rebuilt < generated_add,
+            generated_add < rebuilt && plain_add < rebuilt,
             "{:?}",
             names(&cs)
         );
-        assert!(plain_add < rebuilt, "{:?}", names(&cs));
         let tightened = |name: &str| {
             at(
                 &|c| matches!(c, Change::AlterColumnNullability { column, .. } if column.name == name),
@@ -1391,8 +1335,9 @@ mod tests {
 
     /// A function new to the database, with nothing rebuilt, is a boundary
     /// too: a check, a default and a generation expression calling it follow
-    /// its `CREATE FUNCTION` (DEC-942.1). A new procedure is not: nothing
-    /// calls one from an expression.
+    /// its `CREATE FUNCTION` (DEC-942.1). A column added with a generation
+    /// expression stays ahead of it, since the function may read the column.
+    /// A new procedure is no boundary: nothing calls one from an expression.
     #[test]
     fn what_may_call_a_new_function_follows_its_create() {
         let new_routine = |kind| Change::CreateModule {
@@ -1408,15 +1353,27 @@ mod tests {
             from: "id * 2".into(),
             to: "app.h(id)".into(),
         };
+        let mut generated = pbps_model::Column::new("integer".parse().unwrap());
+        generated.generated = Some(pbps_model::Generated {
+            expression: "id * 2".into(),
+            stored: true,
+        });
         let mut cs = plan(vec![
             add_check("ck"),
             set_default("t"),
             recompute.clone(),
+            Change::AddColumn {
+                uid: "c_a1b2c3".parse().unwrap(),
+                table: TableName::new("app", "t"),
+                name: "read".into(),
+                column: Box::new(generated),
+            },
             new_routine(ModuleKind::Function),
         ]);
         assert_eq!(after_the_rebuilds(&mut cs), 3);
         assert!(
-            matches!(cs.changes[0].change, Change::CreateModule { .. }),
+            matches!(cs.changes[0].change, Change::AddColumn { .. })
+                && matches!(cs.changes[1].change, Change::CreateModule { .. }),
             "{:?}",
             names(&cs)
         );
