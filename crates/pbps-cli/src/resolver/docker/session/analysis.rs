@@ -400,8 +400,8 @@ impl ContainerControl {
         self.census.counted(&closing)
     }
 
-    /// A relay name is saved before launching it; its handle is saved before
-    /// attach/login. Cancellation therefore cannot lose either obligation.
+    /// Preparation cannot create a relay. Save its name at the launch boundary
+    /// and its handle before attach/login, so cancellation loses neither.
     pub(crate) async fn open_channel(
         &mut self,
         login: StreamLogin,
@@ -412,7 +412,6 @@ impl ContainerControl {
             .map_err(|cause| failed(cause, self.recovery_names()))?;
         let owner = generated_owner();
         let name = format!("pbps-resolver-{owner}");
-        self.pending_relay_name = Some(name);
         self.in_flight = true;
         let state = self
             .state
@@ -431,7 +430,8 @@ impl ContainerControl {
             .additional()
             .await
             .map_err(|error| failed(converted(error), self.recovery_names()))?;
-        let relay = CandidateRun::start_launch(
+        self.pending_relay_name = Some(name);
+        let relay = match CandidateRun::start_launch(
             api,
             state.image.clone(),
             owner,
@@ -439,7 +439,17 @@ impl ContainerControl {
             super::super::profile::LIFETIME_SECS,
         )
         .await
-        .map_err(|error| failed(converted(error.cause), self.recovery_names()))?;
+        {
+            Ok(relay) => relay,
+            Err(error) => {
+                if error.recovery_names.is_empty() {
+                    self.pending_relay_name = None;
+                } else {
+                    self.unconfirmed.extend(error.recovery_names);
+                }
+                return Err(failed(converted(error.cause), self.recovery_names()));
+            }
+        };
         self.pending_relay = Some(relay);
         let mut connection = connect_relay(
             state,
@@ -652,7 +662,6 @@ async fn remove_with_janitor(
 ) -> bool {
     let owner = generated_owner();
     let name = format!("pbps-resolver-{owner}");
-    unconfirmed.push(name.clone());
     let result = async {
         state.workload.check().await.map_err(|_| ())?;
         let launch = Launch::control(
@@ -664,7 +673,9 @@ async fn remove_with_janitor(
         )
         .map_err(|_| ())?;
         let api = state.analysis_api.additional().await.map_err(|_| ())?;
-        let relay = CandidateRun::start_launch(
+        let registration = unconfirmed.len();
+        unconfirmed.push(name.clone());
+        let relay = match CandidateRun::start_launch(
             api,
             state.image.clone(),
             owner,
@@ -672,7 +683,19 @@ async fn remove_with_janitor(
             super::super::profile::LIFETIME_SECS,
         )
         .await
-        .map_err(|_| ())?;
+        {
+            Ok(relay) => relay,
+            Err(error) => {
+                if error.recovery_names.is_empty() {
+                    // The vector is exclusively borrowed across launch. Remove
+                    // this registration without erasing an earlier obligation.
+                    unconfirmed.remove(registration);
+                } else {
+                    unconfirmed.extend(error.recovery_names);
+                }
+                return Err(());
+            }
+        };
         let mut connection = connect_relay(
             state,
             &relay,
@@ -845,7 +868,6 @@ impl CandidateSession {
         crate::resolver::server::container_tests::pause("container-create-owned").await;
         let pending = self.pending.as_mut().expect("names");
         let owner = generated_owner();
-        pending.relay_name = Some(format!("pbps-resolver-{owner}"));
         let launch = Launch::control(
             &state.image.clone(),
             state.connection.driver(),
@@ -859,17 +881,27 @@ impl CandidateSession {
             .additional()
             .await
             .map_err(|error| failed(converted(error), pending.names()))?;
-        pending.relay = Some(
-            CandidateRun::start_launch(
-                api,
-                state.image.clone(),
-                owner,
-                launch,
-                super::super::profile::LIFETIME_SECS,
-            )
-            .await
-            .map_err(|error| failed(converted(error.cause), pending.names()))?,
-        );
+        pending.relay_name = Some(format!("pbps-resolver-{owner}"));
+        let relay = match CandidateRun::start_launch(
+            api,
+            state.image.clone(),
+            owner,
+            launch,
+            super::super::profile::LIFETIME_SECS,
+        )
+        .await
+        {
+            Ok(relay) => relay,
+            Err(error) => {
+                if error.recovery_names.is_empty() {
+                    pending.relay_name = None;
+                } else {
+                    pending.unconfirmed.extend(error.recovery_names);
+                }
+                return Err(failed(converted(error.cause), pending.names()));
+            }
+        };
+        pending.relay = Some(relay);
         let login = StreamLogin {
             user: names.login().to_owned(),
             password: names.password().to_owned(),
