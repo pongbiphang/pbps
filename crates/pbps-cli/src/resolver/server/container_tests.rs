@@ -785,3 +785,6 @@ async fn cancelled_container_analysis_removes_or_names_every_owned_resource() {
         target.check().await.unwrap();
     }
 }
+
+// Keep independent recovery controls beside their actual native callers.
+pub(crate) mod relay_recovery;
