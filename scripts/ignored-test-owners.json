@@ -1110,6 +1110,7 @@
         "a_reused_tables_key_and_the_renamed_tables_key_of_one_name_both_go",
         "a_revoke_that_does_not_land_is_refused_at_the_closing_read",
         "a_rewrite_rule_on_a_reached_table_is_refused",
+        "a_routine_named_like_a_table_a_view_reads_leaves_the_view_alone",
         "a_routine_reopened_or_closed_behind_the_plan_refuses_to_close_the_run",
         "a_routine_replaced_after_approval_refuses_the_apply_before_its_first_statement",
         "a_routine_replaced_during_a_staged_step_is_caught_after_its_checkpoint",

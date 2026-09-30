@@ -2335,7 +2335,9 @@ pub fn rebound_by_this_plan(
             let Some(name) = new.referenced_name() else {
                 continue;
             };
-            if pbps_model::module::references_with(&definition.definition, &name, &LEXIS) {
+            if pbps_model::module::references_with(&definition.definition, &name, &LEXIS)
+                && !a_routine_cannot_capture(module, new, &definition.definition, &name)
+            {
                 out.push(Rebound {
                     module: module.clone(),
                     arriving: new.clone(),
@@ -2344,6 +2346,76 @@ pub fn rebound_by_this_plan(
         }
     }
     out
+}
+
+/// Whether a routine arriving under `name` provably cannot capture anything
+/// in the view `module` (DEC-230.1). The one exception to the conservative
+/// test above, and deliberately narrow: it answers `true` only for shapes it
+/// fully understands, and every other shape keeps the rebuild, so its only
+/// possible error is the rebuild the test would have synthesized anyway.
+///
+/// A routine is called with parentheses. **Measured** on 18.6 and 16.15, a
+/// bare word without them is never a call — `SELECT z` beside a function
+/// `z()` is `column "z" does not exist`, `SELECT * FROM fonly` beside
+/// `fonly()` is `relation "fonly" does not exist` — and a view reading
+/// `FROM orders` or `JOIN orders` still reads the table after `CREATE
+/// FUNCTION orders()`, created earlier on its path or not.
+///
+/// Only the bare word qualifies. A qualified one after `FROM` proves
+/// nothing, because `FROM` also opens `extract(... FROM t.dd)`, where column
+/// notation reads `t.dd` as `dd(t)`: measured, that view recreated after
+/// `CREATE FUNCTION a230.dd(s230.t)` binds the new function. A lexical scan
+/// cannot tell that position from a FROM clause, so a qualified mention, a
+/// quoted spelling, or any mention outside `FROM`/`JOIN` keeps the rebuild.
+fn a_routine_cannot_capture(
+    module: &ModuleId,
+    arriving: &ModuleId,
+    definition: &str,
+    name: &pbps_model::ObjectName,
+) -> bool {
+    if !matches!(module, ModuleId::Named(_)) || !matches!(arriving, ModuleId::Routine(_)) {
+        return false;
+    }
+    let continues = pbps_dialect::continues_ident;
+    let code = code_only(definition).to_lowercase();
+    let bare = name.name.to_lowercase();
+    // A quoted spelling is an identifier this scan does not reason about.
+    if bare.is_empty() || code.contains(&format!("\"{bare}\"")) {
+        return false;
+    }
+    let mut mentioned = false;
+    let mut searched = 0;
+    while let Some(at) = code[searched..].find(&bare) {
+        let start = searched + at;
+        let end = start + bare.len();
+        searched = end;
+        let before = code[..start].chars().next_back();
+        let after = code[end..].chars().next();
+        // Part of a longer word: not a mention of this name.
+        if before.is_some_and(continues) || after.is_some_and(continues) {
+            continue;
+        }
+        mentioned = true;
+        let head = code[..start].trim_end();
+        let tail = code[end..].trim_start();
+        // Qualified, quoted, a call, or a qualifier itself.
+        if head.ends_with(['.', '"']) || tail.starts_with(['(', '.']) {
+            return false;
+        }
+        let word_start = head
+            .char_indices()
+            .rev()
+            .take_while(|(_, c)| continues(*c))
+            .last()
+            .map_or(head.len(), |(i, _)| i);
+        let keyword = &head[word_start..];
+        let joined = head[..word_start].chars().next_back();
+        if !matches!(keyword, "from" | "join") || joined.is_some_and(|c| matches!(c, '.' | '"')) {
+            return false;
+        }
+    }
+    // A mention the name scan found and this one did not is not proved.
+    mentioned
 }
 
 #[cfg(test)]
@@ -2633,6 +2705,70 @@ mod tests {
         assert_eq!(found, vec![id("app.bare()"), id("app.caller()")]);
         assert!(callers_report(&id("app.g(integer)"), &found).is_some());
         assert_eq!(callers_report(&id("app.g(integer)"), &[]), None);
+    }
+
+    /// DEC-230.1: a routine arriving cannot capture a view's bare `FROM`/`JOIN`
+    /// mention, so that view is not rebuilt for it. Every other shape keeps
+    /// the conservative rebuild, and so does a relation arriving.
+    #[test]
+    fn a_routine_arrival_skips_a_view_that_names_it_only_as_a_relation() {
+        let view = |definition: &str| Module {
+            kind: ModuleKind::View,
+            description: None,
+            definition: definition.to_owned(),
+        };
+        let rebuilds = |definition: &str, arriving: &str| {
+            let mut declared = Schema::default();
+            declared.modules.insert(id("app.v"), view(definition));
+            !rebound_by_this_plan(&declared, &[], &[id(arriving)], &BTreeSet::new()).is_empty()
+        };
+        let routine = "app.orders()";
+
+        // Proved irrelevant: every mention is a bare relation after FROM/JOIN.
+        for skipped in [
+            "SELECT * FROM orders",
+            "SELECT o.id FROM orders o JOIN orders p USING (id)",
+            "SELECT * FROM\n  ORDERS AS o",
+            "SELECT * FROM /* the table */ orders",
+            "SELECT * FROM a LEFT JOIN orders ON true",
+        ] {
+            assert!(!rebuilds(skipped, routine), "{skipped}");
+        }
+
+        // Not proved: the conservative rebuild stays.
+        for kept in [
+            // A call, and a table function in FROM.
+            "SELECT orders()",
+            "SELECT * FROM orders()",
+            "SELECT * FROM orders ()",
+            // Qualified: after FROM it may be column notation (`t.dd` is
+            // `dd(t)`), which a routine arriving does capture.
+            "SELECT * FROM app.orders",
+            "SELECT extract(year FROM app.orders) FROM t",
+            // A qualifier itself, a cast, a comma list, a select-list word.
+            "SELECT orders.id FROM orders",
+            "SELECT x::orders FROM t",
+            "SELECT * FROM t, orders",
+            "SELECT orders FROM t",
+            // One unproved mention beside a proved one.
+            "SELECT * FROM orders WHERE orders() > 0",
+            // A quoted spelling.
+            "SELECT * FROM \"orders\"",
+        ] {
+            assert!(rebuilds(kept, routine), "{kept}");
+        }
+
+        // A relation arriving brings a row type too: still conservative.
+        assert!(rebuilds("SELECT * FROM orders", "app.orders"));
+        // And a routine mentioning the name keeps its rebuild.
+        let mut declared = Schema::default();
+        declared.modules.insert(
+            id("app.f()"),
+            module("() RETURNS int AS $$ SELECT count(*) FROM orders $$"),
+        );
+        assert!(!rebound_by_this_plan(&declared, &[], &[id(routine)], &BTreeSet::new()).is_empty());
+        // A longer word is not a mention, and nothing is rebuilt for it.
+        assert!(!rebuilds("SELECT * FROM orders_archive", routine));
     }
 
     /// The whole shape of ADR-0013 §3's answer, and its three negatives: a
