@@ -4525,7 +4525,8 @@ async fn competing_inherited_grant_options_refuse_before_publishing_evidence() {
     drop(target);
     let refusal = match result {
         Err(Error::Binding(message)) => message,
-        other => format!("unexpected producer outcome: {other:?}"),
+        Err(error) => format!("unexpected refusal: {error}"),
+        Ok(_) => "unexpected producer success".into(),
     };
     let mut observer = PeerVerifiedConn::connect(
         Driver::Postgres,
