@@ -891,6 +891,12 @@ impl CandidateSession {
             ));
         }
         #[cfg(test)]
+        crate::resolver::server::container_tests::sql_recovery::scratch_created(
+            &names,
+            &mut state.connection,
+        )
+        .await;
+        #[cfg(test)]
         crate::resolver::server::container_tests::pause("container-create-owned").await;
         let pending = self.pending.as_mut().expect("names");
         let owner = generated_owner();
