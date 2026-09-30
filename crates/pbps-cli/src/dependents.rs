@@ -871,6 +871,13 @@ pub(crate) fn after_the_rebuilds(cs: &mut ChangeSet) -> usize {
         return 0;
     };
     let taken = defaults_taken_by_rows(cs);
+    let recomputed: BTreeSet<&ColumnRef> = cs.changes[..last]
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::AlterColumnExpression { column, .. } => Some(column),
+            _ => None,
+        })
+        .collect();
     let moves: Vec<bool> = cs.changes[..last]
         .iter()
         .map(|p| match &p.change {
@@ -887,6 +894,13 @@ pub(crate) fn after_the_rebuilds(cs: &mut ChangeSet) -> usize {
             // generated column, so none is taken ahead of it.
             Change::AlterColumnExpression { .. } => true,
             Change::AddColumn { column, .. } => column.generated.is_some(),
+            // A `NOT NULL` over a recomputed column stays behind its new
+            // expression, which the order kept among the moved preserves.
+            Change::AlterColumnNullability {
+                column,
+                to_nullable: false,
+                ..
+            } => recomputed.contains(column),
             _ => false,
         })
         .collect();
@@ -1149,6 +1163,13 @@ mod tests {
             name: name.into(),
             column: Box::new(column),
         };
+        let tighten = |column: &str| Change::AlterColumnNullability {
+            uid: "c_m3n4p5".parse().unwrap(),
+            column: t.column(column),
+            ty: "integer".parse().unwrap(),
+            to_nullable: false,
+            collation: None,
+        };
         let mut cs = plan(vec![
             Change::AlterColumnExpression {
                 uid: "c_d4e5f6".parse().unwrap(),
@@ -1156,11 +1177,14 @@ mod tests {
                 from: "id * 2".into(),
                 to: "app.f(id)".into(),
             },
+            // `n`'s new NOT NULL follows its expression; `other`'s stays.
+            tighten("n"),
+            tighten("other"),
             add("g", generated),
             add("plain", pbps_model::Column::new("integer".parse().unwrap())),
             alter(&s, "app.f(integer)"),
         ]);
-        assert_eq!(after_the_rebuilds(&mut cs), 2);
+        assert_eq!(after_the_rebuilds(&mut cs), 3);
         let at =
             |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
         let rebuilt = at(&|c| matches!(c, Change::AlterModule { .. }));
@@ -1173,6 +1197,13 @@ mod tests {
             names(&cs)
         );
         assert!(plain_add < rebuilt, "{:?}", names(&cs));
+        let tightened = |name: &str| {
+            at(
+                &|c| matches!(c, Change::AlterColumnNullability { column, .. } if column.name == name),
+            )
+        };
+        assert!(expression < tightened("n"), "{:?}", names(&cs));
+        assert!(tightened("other") < rebuilt, "{:?}", names(&cs));
     }
 
     /// #1024: a procedure that becomes a function is dropped as a procedure

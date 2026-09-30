@@ -698,7 +698,20 @@ fn diff_partial_rebuilding(
         })
         .collect();
     let sort_class = |c: &Change| -> (u8, usize) {
+        // A generated column is dropped before, and added after, the ordinary
+        // columns of its class. Measured, the engine refuses to drop a column
+        // a generated column reads, and refuses a generation expression over a
+        // column that is not there yet; a generated column never reads another
+        // (DEC-1168.1), so one layer each way is the whole order.
+        let drops_generated =
+            matches!(c, Change::DropColumn { uid, .. } if generated_in_base.contains(uid));
         if frees_a_renamed_column(c) {
+            // The layer holds here too: every drop of a table that renames a
+            // column comes to this class, the generated one and its input
+            // alike, so the generated one keeps its place ahead.
+            if drops_generated {
+                return (2, 2);
+            }
             // Between the constraint and index drops of class 2 — a column a
             // check or an index names cannot be dropped while they stand —
             // and the `RenameColumn` of class 3 that is waiting for its name.
@@ -715,16 +728,9 @@ fn diff_partial_rebuilding(
             // occupied target and never reaches this sort, which is the
             // property `a_single_revision_cannot_rename_into_an_occupied_baseline_name`
             // holds.
-            return (2, 2);
+            return (2, 3);
         }
-        // A generated column is dropped before, and added after, the ordinary
-        // columns of its class. Measured, the engine refuses to drop a column
-        // a generated column reads, and refuses a generation expression over a
-        // column that is not there yet; a generated column never reads another
-        // (DEC-1168.1), so one layer each way is the whole order.
-        if let Change::DropColumn { uid, .. } = c
-            && generated_in_base.contains(uid)
-        {
+        if drops_generated {
             return (order_key(c), 0);
         }
         if let Change::AddColumn { column, .. } = c
@@ -1956,7 +1962,6 @@ fn dependency_rank(
         | Change::AddColumn { .. }
         | Change::DropColumn { .. }
         | Change::RenameColumn { .. }
-        | Change::AlterColumnNullability { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::DropUnique { .. }
         | Change::AddCheck { .. }
@@ -2029,6 +2034,17 @@ fn dependency_rank(
         // After any type change, as a new default is: the expression is
         // recomputed under the column's final type (DEC-1168.1).
         Change::AlterColumnExpression { .. } => 0,
+        // A recomputation is checked against the column's nullability as it
+        // stands, so a relaxation goes before one and a tightening after it.
+        // Measured on 17.11, `SET EXPRESSION` that yields a NULL is refused
+        // under `NOT NULL` ("contains null values") and accepted once
+        // `DROP NOT NULL` has run. Nothing else in the class reads nullability.
+        Change::AlterColumnNullability {
+            to_nullable: true, ..
+        } => -1,
+        Change::AlterColumnNullability {
+            to_nullable: false, ..
+        } => 1,
         // Rows follow the foreign keys between their tables: a referenced
         // table's rows go in first, and out last.
         Change::InsertRow { table, .. } | Change::UpdateRow { table, .. } => {
@@ -8271,6 +8287,93 @@ mod tests {
             reason: "gone".into(),
         }));
         assert_eq!(order(&with("zz", "a"), &renamed, &intents), ["-zz", "-a"]);
+        // And when the same plan renames another column of the table, which
+        // brings every drop of it into the rename's class.
+        let mut both = with("zz", "a");
+        both.tables
+            .get_mut(&t)
+            .unwrap()
+            .columns
+            .insert("x".into(), Column::new(ty("int")));
+        let kept = schema_of(
+            "app.t",
+            table(&[
+                ("id", Column::new(ty("int"))),
+                ("y", Column::new(ty("int"))),
+            ]),
+        );
+        let mut intents = vec![pbps_model::Intent::RenameColumn {
+            table: t.clone(),
+            from: "x".into(),
+            to: "y".into(),
+        }];
+        intents.extend(drops.clone());
+        // Uids are drawn fresh on every resolve, and they are what breaks a
+        // tie in the class, so one draw can land right by chance.
+        for _ in 0..32 {
+            assert_eq!(order(&both, &kept, &intents), ["-zz", "-a"]);
+        }
+    }
+
+    /// A recomputed generated column is checked against its nullability as it
+    /// stands: a relaxation goes before the new expression and a tightening
+    /// after it, whatever the names say (DEC-1168.1).
+    #[test]
+    fn a_generated_columns_nullability_relaxes_before_and_tightens_after_its_expression() {
+        let generated = |expression: &str, nullable: bool| {
+            let mut c = Column::new(ty("int"));
+            c.nullable = nullable;
+            c.generated = Some(pbps_model::Generated {
+                expression: expression.into(),
+                stored: true,
+            });
+            c
+        };
+        let order = |from: Column, to: Column| {
+            let base = schema_of(
+                "app.t",
+                table(&[("a", Column::new(ty("int"))), ("g", from)]),
+            );
+            let want = schema_of("app.t", table(&[("a", Column::new(ty("int"))), ("g", to)]));
+            let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let ids = crate::resolve(&want, &base_ids, &[], &ctx()).unwrap().ids;
+            diff_partial(
+                Side {
+                    schema: &base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: &want,
+                    ids: &ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .changes
+            .changes
+            .iter()
+            .map(|p| match &p.change {
+                Change::AlterColumnExpression { .. } => "expression",
+                Change::AlterColumnNullability {
+                    to_nullable: true, ..
+                } => "relax",
+                Change::AlterColumnNullability {
+                    to_nullable: false, ..
+                } => "tighten",
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            order(generated("coalesce(a, 0)", false), generated("a", true)),
+            ["relax", "expression"]
+        );
+        assert_eq!(
+            order(generated("a", true), generated("coalesce(a, 0)", false)),
+            ["expression", "tighten"]
+        );
     }
 
     /// A generated column's expression changes in place, as one typed change

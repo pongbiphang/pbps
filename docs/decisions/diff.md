@@ -1132,9 +1132,13 @@ ordinary columns and dropped before them, keyed by uid so a table rename in
 the same plan does not hide it. The engine refuses an expression over a
 column not yet added, and refuses to drop a column a generated column still
 reads. A generated column never reads another, so one layer each way is the
-whole order. Its expression binds the functions it calls as a default's
+whole order. That holds in the class a column rename brings all of its
+table's drops into. A recomputed value is checked against the column's
+nullability as it stands, so relaxing it runs before the expression change
+and tightening it after, measured on 17.11. Its expression binds the functions it calls as a default's
 does. An `AlterColumnExpression`, and an `AddColumn` carrying one, follow a
-function the plan creates. A new table's generated column is split out of
+function the plan creates, and a tightening of the recomputed column moves
+with its expression. A new table's generated column is split out of
 `CREATE TABLE` as an `AddColumn` for the same reason, unless a key,
 uniqueness, index or foreign key kept in the table names it. It then sits
 after the table's other columns, which only the engine's layout sees, since
