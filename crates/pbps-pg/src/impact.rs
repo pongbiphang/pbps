@@ -185,6 +185,14 @@ pub fn rename_targets(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
 /// an undeclared `plpgsql` function that reads a managed table is exactly the
 /// referrer nobody will notice, and it breaks the same way.
 ///
+/// Reading the whole database has a cost under concurrent DDL. Each
+/// `pg_get_function_identity_arguments` resolves the argument types through
+/// the syscache, not the statement's snapshot. So a type another session drops
+/// in the middle of the scan fails the query with `cache lookup failed for
+/// type` (XX000), measured under churn on 18.6. That fails loudly rather than
+/// reporting less, and the live tests that call this each take a database of
+/// their own for it (#648).
+///
 /// Extension-owned routines are left out. They are somebody else's objects,
 /// installed and upgraded by somebody else's script, and a rename in a schema
 /// this tool manages cannot be the reason one of them is listed
