@@ -73,6 +73,9 @@ PRODUCER_TESTS = [
     "resolver::server::qualified_evidence_tests::unnamed_primary_key_on_existing_table_owns_only_its_exact_constraint_and_index",
     "resolver::server::qualified_evidence_tests::unnamed_primary_key_on_created_table_owns_only_its_exact_constraint_and_index",
     "resolver::server::qualified_evidence_tests::adding_index_keeps_existing_table_metadata_and_sets_the_engine_index_flag",
+    "resolver::server::qualified_evidence_tests::direct_actor_option_beats_inherited_owner_for_retained_table_grant",
+    "resolver::server::qualified_evidence_tests::unique_inherited_delegate_is_the_retained_table_grantor",
+    "resolver::server::qualified_evidence_tests::revoke_by_actor_keeps_an_unrelated_owners_grant_row",
 ]
 NATIVE_TESTS = [DAEMON_TEST, TARGET_TEST, FACTORY_TEST, RECIPE_TEST, ANALYSIS_TEST,
                 INVALIDATION_TEST, CANCELLATION_TEST, DEADLINE_TEST,
