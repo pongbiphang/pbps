@@ -67,6 +67,12 @@ PRODUCER_TESTS = [
     "resolver::server::qualified_evidence_tests::recorded_renames_and_reused_old_spellings_keep_distinct_owned_inventories",
     "resolver::server::qualified_evidence_tests::recorded_renames_with_type_and_nullability_edits_match_actual_child_catalog",
     "resolver::server::qualified_evidence_tests::persisted_authorization_is_stable_across_processes_only_with_the_same_environment_key",
+    "resolver::server::qualified_evidence_tests::adding_named_key_and_check_keeps_existing_table_owner_and_grants",
+    "resolver::server::qualified_evidence_tests::adding_check_alone_keeps_existing_table_owner_and_grants",
+    "resolver::server::qualified_evidence_tests::granting_on_an_existing_table_keeps_old_acl_and_adds_the_declared_role",
+    "resolver::server::qualified_evidence_tests::unnamed_primary_key_on_existing_table_owns_only_its_exact_constraint_and_index",
+    "resolver::server::qualified_evidence_tests::unnamed_primary_key_on_created_table_owns_only_its_exact_constraint_and_index",
+    "resolver::server::qualified_evidence_tests::adding_index_keeps_existing_table_metadata_and_sets_the_engine_index_flag",
 ]
 NATIVE_TESTS = [DAEMON_TEST, TARGET_TEST, FACTORY_TEST, RECIPE_TEST, ANALYSIS_TEST,
                 INVALIDATION_TEST, CANCELLATION_TEST, DEADLINE_TEST,
