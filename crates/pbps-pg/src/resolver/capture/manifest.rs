@@ -993,7 +993,7 @@ impl CompiledCapture {
         desired_ids: &pbps_model::IdsFile,
         authorization: &crate::resolver::authorization::AuthorizationContext,
     ) -> Result<pbps_model::resolver::InputManifest, pbps_model::resolver::ManifestError> {
-        let effective_creator = &authorization.principal.effective;
+        let effective_creator = authorization.principal.effective.as_str();
         use pbps_model::Change;
         use pbps_model::resolver::{ManifestError, ObjectOwnership, Surface};
         let added_indexes: BTreeSet<Surface> = changes
