@@ -1226,7 +1226,8 @@
         "unapproved_data_triggers_cannot_use_the_deployers_privileges",
         "unrelated_routine_limitations_do_not_refuse_a_managed_table_or_overload",
         "update_of_generated_columns_follows_their_source_columns",
-        "update_of_triggers_only_guard_columns_the_statement_can_fire"
+        "update_of_triggers_only_guard_columns_the_statement_can_fire",
+        "what_calls_a_new_function_follows_its_create"
       ]
     },
     {

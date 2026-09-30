@@ -647,10 +647,17 @@ fn defaults_taken_by_rows(cs: &ChangeSet) -> std::collections::BTreeSet<ColumnRe
     out
 }
 
-/// Where the last function create is, when the plan rebuilds a function;
-/// `None` when it rebuilds none, and nothing has to follow a create.
+/// Where the last function create is, when the plan creates or rebuilds a
+/// function; `None` when it does neither, and nothing has to follow a create.
 #[allow(clippy::wildcard_enum_match_arm)]
 fn last_function_create(cs: &ChangeSet) -> Option<usize> {
+    // A function new to the database binds what calls it exactly as a rebuilt
+    // one does: a check, default or generation expression the differ put
+    // ahead of its `CREATE FUNCTION` names a function not there yet, and the
+    // engine refuses it (DEC-942.1).
+    let created = cs.changes.iter().any(|p| {
+        matches!(&p.change, Change::CreateModule { module, .. } if module.kind == ModuleKind::Function)
+    });
     // A routine the plan drops and creates counts when either side is a
     // function. The created side counts because a procedure that becomes a
     // function is a `DropModule` of the procedure and a `CreateModule` of the
@@ -667,7 +674,7 @@ fn last_function_create(cs: &ChangeSet) -> Option<usize> {
             _ => false,
         })
     });
-    if !rebuilt {
+    if !rebuilt && !created {
         return None;
     }
     cs.changes.iter().rposition(|p| match &p.change {
@@ -678,10 +685,10 @@ fn last_function_create(cs: &ChangeSet) -> Option<usize> {
     })
 }
 
-/// Splits a table this plan creates, ahead of a function it rebuilds, into
-/// the table and its expression-bearing parts as separate changes, so that
-/// [`after_the_rebuilds`] can move them after the function (#1027,
-/// DEC-942.1). Returns how many changes it added.
+/// Splits a table this plan creates, ahead of a function it creates or
+/// rebuilds, into the table and its expression-bearing parts as separate
+/// changes, so that [`after_the_rebuilds`] can move them after the function
+/// (#1027, DEC-942.1). Returns how many changes it added.
 ///
 /// The differ writes a new table as one `CreateTable` carrying its checks,
 /// indexes and column defaults, and emits them together. Moving that change
@@ -835,8 +842,9 @@ pub(crate) fn split_new_tables(
     added
 }
 
-/// Moves what this plan adds that may call a function it rebuilds to after
-/// that function's create (#942, DEC-942.1). Returns how many changes moved.
+/// Moves what this plan adds that may call a function it creates or rebuilds
+/// to after that function's create (#942, DEC-942.1). Returns how many changes
+/// moved.
 ///
 /// [`weave`] reads the catalog, where an addition this plan makes does not
 /// exist yet, so it never sees one. The differ puts a check or an index in
@@ -844,13 +852,14 @@ pub(crate) fn split_new_tables(
 /// everywhere else is right: a view needs its table's columns, and nothing a
 /// module holds needs a constraint. With a function rebuilt, it is exactly
 /// wrong: the check is created against the old function, and the rebuild's
-/// `DROP FUNCTION` is refused because of it.
+/// `DROP FUNCTION` is refused because of it. With a function new to the
+/// database, it names one not there yet, and the check is refused itself.
 ///
 /// Which function an expression calls is not known without parsing it, and
 /// the planner does not parse expressions (DECISIONS 174). So the rule is
-/// positional: when the plan rebuilds a function, every addition that can
-/// carry an expression goes after the last function the plan creates, in the
-/// order it had. That is a check, an index with a filter (an index's columns
+/// positional: when the plan creates or rebuilds a function, every addition
+/// that can carry an expression goes after the last function the plan
+/// creates, in the order it had. That is a check, an index with a filter (an index's columns
 /// are names, so its filter is the only place a call can be), and a default
 /// being set. A unique index with no filter stays where it is, since a
 /// foreign key in its class may rest on it and holds no expression anyway.
@@ -1378,6 +1387,47 @@ mod tests {
         let mut cs = plan(vec![create]);
         assert_eq!(split_new_tables(&mut cs, &[&ids], pg().as_ref()), 0);
         assert_eq!(table_of(&cs), t);
+    }
+
+    /// A function new to the database, with nothing rebuilt, is a boundary
+    /// too: a check, a default and a generation expression calling it follow
+    /// its `CREATE FUNCTION` (DEC-942.1). A new procedure is not: nothing
+    /// calls one from an expression.
+    #[test]
+    fn what_may_call_a_new_function_follows_its_create() {
+        let new_routine = |kind| Change::CreateModule {
+            id: id("app.h(integer)"),
+            module: Box::new(module(
+                kind,
+                "(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$",
+            )),
+        };
+        let recompute = Change::AlterColumnExpression {
+            uid: "c_d4e5f6".parse().unwrap(),
+            column: TableName::new("app", "t").column("g"),
+            from: "id * 2".into(),
+            to: "app.h(id)".into(),
+        };
+        let mut cs = plan(vec![
+            add_check("ck"),
+            set_default("t"),
+            recompute.clone(),
+            new_routine(ModuleKind::Function),
+        ]);
+        assert_eq!(after_the_rebuilds(&mut cs), 3);
+        assert!(
+            matches!(cs.changes[0].change, Change::CreateModule { .. }),
+            "{:?}",
+            names(&cs)
+        );
+        let mut cs = plan(vec![
+            add_check("ck"),
+            recompute,
+            new_routine(ModuleKind::Procedure),
+        ]);
+        let before = names(&cs);
+        assert_eq!(after_the_rebuilds(&mut cs), 0);
+        assert_eq!(names(&cs), before);
     }
 
     /// Negatives: no function rebuilt (a view rebuilt, or nothing), and a

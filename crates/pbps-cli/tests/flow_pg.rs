@@ -1544,6 +1544,87 @@ fn a_new_tables_expressions_calling_a_rebuilt_function_follow_it() {
     succeeds(d.run(&["verify", "--db", connection]));
 }
 
+/// A function new to the database, with nothing rebuilt: a new table's and an
+/// existing table's check and generated column calling it follow its
+/// `CREATE FUNCTION`, and the plan applies (DEC-942.1). Before, only a rebuild
+/// moved them, and the engine refused the check over a missing function.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn what_calls_a_new_function_follows_its_create() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "new-function-callers");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; CREATE TABLE app.t (id integer PRIMARY KEY); \
+         INSERT INTO app.t VALUES (1), (2)",
+    );
+    let d = Demo::new("new-function-callers");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    std::fs::write(
+        d.dir.join("schema/app.h%28integer%29.function.yml"),
+        "function: app.h(integer)\npublic_execute: true\n\ndefinition: |-\n  \
+         (x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x * 10 $$\n",
+    )
+    .unwrap();
+    let table = d.dir.join("schema/app.t.yml");
+    let text = std::fs::read_to_string(&table).unwrap();
+    let text = text.replacen(
+        "columns:\n",
+        "columns:\n  g: {type: integer, generated: {expression: 'app.h(id)', stored: true}}\n",
+        1,
+    );
+    std::fs::write(&table, format!("{text}checks:\n  ck_t: 'app.h(id) >= 0'\n")).unwrap();
+    std::fs::write(
+        d.dir.join("schema/app.k.yml"),
+        "table: app.k\ncolumns:\n  id: {type: integer, nullable: false}\n  \
+         g: {type: integer, generated: {expression: 'app.h(id)', stored: true}}\n\
+         primary_key: {name: k_pkey, columns: [id]}\n\
+         checks:\n  ck_k: 'app.h(id) >= 0'\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    let create = at("CREATE FUNCTION \"app\".\"h\"");
+    assert!(!script.contains("DROP FUNCTION"), "{script}");
+    for caller in [
+        "ADD CONSTRAINT \"ck_t\"",
+        "ADD CONSTRAINT \"ck_k\"",
+        "ALTER TABLE \"app\".\"t\" ADD COLUMN \"g\"",
+        "ALTER TABLE \"app\".\"k\" ADD COLUMN \"g\"",
+    ] {
+        assert!(create < at(caller), "{caller}: {script}");
+    }
+    let allow = ["--allow", "constraint", "--allow", "grant-widen"];
+    succeeds(approved_apply(&d, connection, &plan, &allow));
+    assert_eq!(
+        scalar(connection, "SELECT g::int8 FROM app.t WHERE id = 2"),
+        20
+    );
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
 /// A new default calling a function the revision rebuilds, on a table whose
 /// row the same plan updates in another column: the update takes nothing from
 /// the default, so the default follows `CREATE FUNCTION` and the plan applies
