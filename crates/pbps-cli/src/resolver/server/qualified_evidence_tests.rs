@@ -4107,12 +4107,43 @@ async fn grantor_route_case(route: GrantorRoute) {
         "the actor's measured inherited route is actually usable"
     );
     if revoke {
+        // The same grantee/privilege has two original grantors. The actor's
+        // later REVOKE cannot erase the owner's independently granted row.
+        admin
+            .query("GRANT SELECT ON pbps_evidence1274.t TO pg_monitor")
+            .await
+            .unwrap();
         admin.query("SET ROLE pbps_native_alt").await.unwrap();
         admin
             .query("GRANT SELECT ON pbps_evidence1274.t TO pg_monitor")
             .await
             .unwrap();
         admin.query("RESET ROLE").await.unwrap();
+        let opening = admin
+            .query(
+                "SELECT pg_catalog.pg_get_userbyid(a.grantor)::text AS grantor, \
+                        a.is_grantable AS grant_option \
+                 FROM pg_catalog.pg_class t \
+                 CROSS JOIN LATERAL pg_catalog.aclexplode(t.relacl) a \
+                 WHERE t.oid = 'pbps_evidence1274.t'::regclass \
+                   AND a.grantee = 'pg_monitor'::regrole \
+                   AND a.privilege_type = 'SELECT'",
+            )
+            .await
+            .unwrap();
+        let mut grantors = opening
+            .iter()
+            .map(|row| {
+                (
+                    row.try_get::<&str>("grantor").unwrap().unwrap().to_owned(),
+                    row.try_get::<bool>("grant_option").unwrap().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        grantors.sort();
+        let mut expected = vec![(ACTOR.to_owned(), false), (OWNER.to_owned(), false)];
+        expected.sort();
+        assert_eq!(grantors, expected);
     }
     drop(admin);
 
@@ -4261,10 +4292,9 @@ async fn grantor_route_case(route: GrantorRoute) {
     );
     let reader: Vec<_> = entries.iter().filter(|entry| entry.0 == READER).collect();
     if revoke {
-        assert!(
-            reader.is_empty(),
-            "REVOKE removes only the actor's reader row"
-        );
+        assert_eq!(reader.len(), 1, "only the actor's ACL row is revoked");
+        assert_eq!(reader[0].1, OWNER, "the owner's same-grantee row survives");
+        assert!(!reader[0].2, "the owner's grant option stays absent");
     } else {
         assert_eq!(reader.len(), 1);
         assert_eq!(reader[0].1, selected_grantor);
