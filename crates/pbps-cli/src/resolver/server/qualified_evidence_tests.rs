@@ -3502,7 +3502,7 @@ async fn assert_review_closing_matches_target(
     target: &mut NativeTarget,
     closing: &pbps_model::resolver::InputManifest,
     key: &ProjectKey,
-) {
+) -> pbps_model::resolver::InputManifest {
     let selected =
         pbps_db::fingerprint::EnvironmentFingerprintKey::from_file(&key.root.join("key")).unwrap();
     let (_, observed) = target
@@ -3530,6 +3530,7 @@ async fn assert_review_closing_matches_target(
             expected.object
         );
     }
+    observed
 }
 
 async fn review_plan(
@@ -3974,4 +3975,394 @@ async fn adding_index_keeps_existing_table_metadata_and_sets_the_engine_index_fl
     assert_review_closing_matches_target(&mut target, &closing, &key).await;
     target.check().await.unwrap();
     setup(&[]).await;
+}
+
+#[derive(Clone, Copy)]
+enum GrantorRoute {
+    DirectWithInheritedOwner,
+    UniqueInheritedDelegate,
+    RevokeBesideOwnerGrant,
+}
+
+/// These roles and the schema live only in the runner's disposable target.
+/// The actor's prior catalog-read membership is restored after each case.
+async fn grantor_route_case(route: GrantorRoute) {
+    use pbps_db::resolver::capture::ObjectIdentity;
+    use pbps_model::{GrantTarget, Permission, Role};
+
+    const OWNER: &str = "pbps_1274_grant_owner";
+    const DELEGATE: &str = "pbps_1274_grant_delegate";
+    const OTHER: &str = "pbps_1274_grant_other";
+    const ACTOR: &str = "pbps_native_alt";
+    const READER: &str = "pg_monitor";
+    let inherited = matches!(route, GrantorRoute::UniqueInheritedDelegate);
+    let revoke = matches!(route, GrantorRoute::RevokeBesideOwnerGrant);
+    let selected_grantor = if inherited { DELEGATE } else { ACTOR };
+
+    setup(&[
+        "CREATE SCHEMA pbps_evidence1274",
+        "CREATE TABLE pbps_evidence1274.t (n integer NOT NULL)",
+    ])
+    .await;
+    let mut admin = PeerVerifiedConn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    let present = admin
+        .query(
+            "SELECT count(*)::int8 AS n FROM pg_catalog.pg_roles \
+             WHERE rolname IN ('pbps_1274_grant_owner', 'pbps_1274_grant_delegate', \
+                               'pbps_1274_grant_other')",
+        )
+        .await
+        .unwrap();
+    assert_eq!(present[0].try_get::<i64>("n").unwrap(), Some(0));
+    admin
+        .query("CREATE ROLE pbps_1274_grant_owner")
+        .await
+        .unwrap();
+    admin
+        .query("CREATE ROLE pbps_1274_grant_other")
+        .await
+        .unwrap();
+    if inherited {
+        admin
+            .query("CREATE ROLE pbps_1274_grant_delegate")
+            .await
+            .unwrap();
+    }
+    let settings_membership_sql = concat!(
+        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members m ",
+        "JOIN pg_catalog.pg_roles granted ON granted.oid = m.roleid ",
+        "JOIN pg_catalog.pg_roles member ON member.oid = m.member ",
+        "WHERE granted.rolname = 'pg_read_all_settings' ",
+        "AND member.rolname = 'pbps_native_alt') AS member"
+    );
+    let prior = admin.query(settings_membership_sql).await.unwrap();
+    assert_eq!(prior.len(), 1);
+    let had_settings = prior[0].try_get::<bool>("member").unwrap().unwrap();
+    if !had_settings {
+        admin
+            .query("GRANT pg_read_all_settings TO pbps_native_alt")
+            .await
+            .unwrap();
+    }
+    admin
+        .query(
+            "GRANT USAGE, CREATE ON SCHEMA pbps_evidence1274 \
+             TO pbps_native_alt, pbps_1274_grant_owner",
+        )
+        .await
+        .unwrap();
+    admin
+        .query("ALTER TABLE pbps_evidence1274.t OWNER TO pbps_1274_grant_owner")
+        .await
+        .unwrap();
+    admin
+        .query("GRANT SELECT ON pbps_evidence1274.t TO pbps_1274_grant_other")
+        .await
+        .unwrap();
+    if inherited {
+        admin
+            .query(
+                "GRANT SELECT ON pbps_evidence1274.t \
+                 TO pbps_1274_grant_delegate WITH GRANT OPTION",
+            )
+            .await
+            .unwrap();
+        admin
+            .query("GRANT pbps_1274_grant_delegate TO pbps_native_alt")
+            .await
+            .unwrap();
+    } else {
+        if matches!(route, GrantorRoute::DirectWithInheritedOwner) {
+            admin
+                .query("GRANT pbps_1274_grant_owner TO pbps_native_alt")
+                .await
+                .unwrap();
+        }
+        admin
+            .query(
+                "GRANT SELECT ON pbps_evidence1274.t \
+                 TO pbps_native_alt WITH GRANT OPTION",
+            )
+            .await
+            .unwrap();
+    }
+    let inherited_option = admin
+        .query(if inherited {
+            "SELECT pg_catalog.pg_has_role('pbps_native_alt'::regrole, \
+             'pbps_1274_grant_delegate'::regrole, 'USAGE') AS inherited"
+        } else {
+            "SELECT pg_catalog.pg_has_role('pbps_native_alt'::regrole, \
+             'pbps_1274_grant_owner'::regrole, 'USAGE') AS inherited"
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        inherited_option[0].try_get::<bool>("inherited").unwrap(),
+        Some(!revoke),
+        "the actor's measured inherited route is actually usable"
+    );
+    if revoke {
+        admin.query("SET ROLE pbps_native_alt").await.unwrap();
+        admin
+            .query("GRANT SELECT ON pbps_evidence1274.t TO pg_monitor")
+            .await
+            .unwrap();
+        admin.query("RESET ROLE").await.unwrap();
+    }
+    drop(admin);
+
+    // Admission and its first fresh read bind this same ordinary actor. A
+    // separate observer's SET ROLE would not establish the grantor context.
+    let mut peer = PeerVerifiedConn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    peer.query("SET ROLE pbps_native_alt").await.unwrap();
+    let principal = peer
+        .query(
+            "SELECT current_user::text AS effective, \
+             pg_catalog.current_setting('is_superuser') AS superuser",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        principal[0].try_get::<&str>("effective").unwrap(),
+        Some(ACTOR)
+    );
+    assert_eq!(
+        principal[0].try_get::<&str>("superuser").unwrap(),
+        Some("off")
+    );
+    let mut target = NativeTarget::establish(
+        peer,
+        std::env::var("PBPS_NATIVE_SERVICE_PID")
+            .unwrap()
+            .parse()
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let table_name: pbps_model::TableName = "pbps_evidence1274.t".parse().unwrap();
+    let grant_target: GrantTarget = "pbps_evidence1274.t".parse().unwrap();
+    let mut base = Schema::default();
+    base.tables.insert(table_name.clone(), review_table());
+    for role in [OWNER, OTHER, ACTOR, READER] {
+        base.roles.insert(role.into(), Role::default());
+    }
+    if inherited {
+        base.roles.insert(DELEGATE.into(), Role::default());
+    }
+    let declared_select = BTreeSet::from([Permission::Select]);
+    base.roles
+        .get_mut(OTHER)
+        .unwrap()
+        .grants
+        .insert(grant_target.clone(), declared_select.clone());
+    if revoke {
+        base.roles
+            .get_mut(READER)
+            .unwrap()
+            .grants
+            .insert(grant_target.clone(), declared_select.clone());
+    }
+    let mut desired = base.clone();
+    if revoke {
+        desired.roles.get_mut(READER).unwrap().grants.clear();
+    } else {
+        desired
+            .roles
+            .get_mut(READER)
+            .unwrap()
+            .grants
+            .insert(grant_target.clone(), declared_select.clone());
+    }
+    let inputs = Inputs::from_pair((base, desired));
+    let key = ProjectKey::new(true);
+    let mut owned = Some(ObservedContainers::begin());
+    let mut run = open(Profile::Container, &mut target).await;
+    let result = review_plan(&mut target, &mut run, &mut owned, &inputs, &key).await;
+    assert!(
+        result
+            .changes
+            .changes
+            .iter()
+            .any(|step| match &step.change {
+                Change::Grant {
+                    role,
+                    target,
+                    permissions,
+                } if !revoke => {
+                    role == READER && target == &grant_target && permissions == &declared_select
+                }
+                Change::Revoke {
+                    role,
+                    target,
+                    permissions,
+                } if revoke => {
+                    role == READER && target == &grant_target && permissions == &declared_select
+                }
+                _ => false,
+            })
+    );
+    let closing = result.evidence.after().clone();
+    let mut writer = pbps_db::Conn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    writer.execute("SET ROLE pbps_native_alt").await.unwrap();
+    execute_plan(&mut writer, &result.changes).await;
+    drop(writer);
+    let mut observer = PeerVerifiedConn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    let acl = observer
+        .query(
+            "SELECT pg_catalog.pg_get_userbyid(a.grantee)::text AS grantee, \
+                    pg_catalog.pg_get_userbyid(a.grantor)::text AS grantor, \
+                    a.is_grantable AS grant_option \
+             FROM pg_catalog.pg_class t \
+             CROSS JOIN LATERAL pg_catalog.aclexplode(t.relacl) a \
+             WHERE t.oid = 'pbps_evidence1274.t'::regclass \
+               AND a.privilege_type = 'SELECT' \
+               AND a.grantee IN ('pg_monitor'::regrole, \
+                                 'pbps_1274_grant_other'::regrole)",
+        )
+        .await
+        .unwrap();
+    let entries: Vec<_> = acl
+        .iter()
+        .map(|row| {
+            (
+                row.try_get::<&str>("grantee").unwrap().unwrap().to_owned(),
+                row.try_get::<&str>("grantor").unwrap().unwrap().to_owned(),
+                row.try_get::<bool>("grant_option").unwrap().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.0 == OTHER && entry.1 == OWNER && !entry.2)
+            .count(),
+        1,
+        "the unrelated owner's exact ACL row survives the typed step"
+    );
+    let reader: Vec<_> = entries.iter().filter(|entry| entry.0 == READER).collect();
+    if revoke {
+        assert!(
+            reader.is_empty(),
+            "REVOKE removes only the actor's reader row"
+        );
+    } else {
+        assert_eq!(reader.len(), 1);
+        assert_eq!(reader[0].1, selected_grantor);
+        assert!(!reader[0].2, "the typed GRANT adds no grant option");
+    }
+    drop(observer);
+    let observed = assert_review_closing_matches_target(&mut target, &closing, &key).await;
+    let table_id = ObjectIdentity {
+        class: "pg_class".into(),
+        name: vec![cases::SCHEMA.into(), "t".into()],
+        signature: Vec::new(),
+    };
+    let dependencies = |manifest: &pbps_model::resolver::InputManifest| {
+        manifest
+            .prerequisites()
+            .iter()
+            .filter(|row| {
+                row.object.class == "pg_shdepend" && row.object.signature.first() == Some(&table_id)
+            })
+            .map(|row| row.object.clone())
+            .collect::<BTreeSet<_>>()
+    };
+    assert!(!dependencies(&closing).is_empty());
+    assert_eq!(
+        dependencies(&closing),
+        dependencies(&observed),
+        "the projected owner/ACL shared dependencies equal the fresh post-DDL catalog"
+    );
+    target.check().await.unwrap();
+    drop(target);
+    setup(&[]).await;
+    let mut admin = PeerVerifiedConn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    if inherited {
+        admin
+            .query("REVOKE pbps_1274_grant_delegate FROM pbps_native_alt")
+            .await
+            .unwrap();
+    } else if matches!(route, GrantorRoute::DirectWithInheritedOwner) {
+        admin
+            .query("REVOKE pbps_1274_grant_owner FROM pbps_native_alt")
+            .await
+            .unwrap();
+    }
+    if !had_settings {
+        admin
+            .query("REVOKE pg_read_all_settings FROM pbps_native_alt")
+            .await
+            .unwrap();
+    }
+    if inherited {
+        admin
+            .query("DROP ROLE pbps_1274_grant_delegate")
+            .await
+            .unwrap();
+    }
+    admin
+        .query("DROP ROLE pbps_1274_grant_other")
+        .await
+        .unwrap();
+    admin
+        .query("DROP ROLE pbps_1274_grant_owner")
+        .await
+        .unwrap();
+    let restored = admin.query(settings_membership_sql).await.unwrap();
+    assert_eq!(
+        restored[0].try_get::<bool>("member").unwrap(),
+        Some(had_settings)
+    );
+    let absent = admin
+        .query(
+            "SELECT count(*)::int8 AS n FROM pg_catalog.pg_roles \
+             WHERE rolname IN ('pbps_1274_grant_owner', 'pbps_1274_grant_delegate', \
+                               'pbps_1274_grant_other')",
+        )
+        .await
+        .unwrap();
+    assert_eq!(absent[0].try_get::<i64>("n").unwrap(), Some(0));
+}
+
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn direct_actor_option_beats_inherited_owner_for_retained_table_grant() {
+    grantor_route_case(GrantorRoute::DirectWithInheritedOwner).await;
+}
+
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn unique_inherited_delegate_is_the_retained_table_grantor() {
+    grantor_route_case(GrantorRoute::UniqueInheritedDelegate).await;
+}
+
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn revoke_by_actor_keeps_an_unrelated_owners_grant_row() {
+    grantor_route_case(GrantorRoute::RevokeBesideOwnerGrant).await;
 }
