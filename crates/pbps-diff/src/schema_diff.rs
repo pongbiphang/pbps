@@ -353,7 +353,13 @@ fn diff_partial_rebuilding(
     recreate_referenced_foreign_keys(base, declared, &renames, &mut changes);
     rebind_foreign_keys_to_a_new_occupant(base, declared, &mut changes);
 
-    diff_modules(base.schema, declared.schema, dialect, &mut changes);
+    diff_modules(
+        base.schema,
+        declared.schema,
+        &names_changing_hands(base, declared),
+        dialect,
+        &mut changes,
+    );
     // A module declaration can stay byte-for-byte identical while a new
     // overload or shadow changes what it should bind to. Ask the dialect
     // before sorting, rather than appending unreviewed SQL at apply time.
@@ -2025,6 +2031,21 @@ fn diff_roles(
         .filter_map(|(uid, name)| declared.ids.tables.get(uid).map(|to| (name, to)))
         .filter(|(from, to)| from != to)
         .collect();
+    // A name that passes to another table (DEC-1118.1). The baseline's grants
+    // under it belonged to a table this plan drops, and went with it: the
+    // occupant's own grants are the ones carried here by `forward`, so the
+    // name is compared as the occupant's, not as a dropped object's.
+    let changing_hands = names_changing_hands(base, declared);
+    let base_uid: BTreeMap<&TableName, &Uid> = base
+        .ids
+        .tables
+        .iter()
+        .map(|(uid, name)| (name, uid))
+        .collect();
+    let dropped_with_its_table = |target: &GrantTarget| -> bool {
+        matches!(target, GrantTarget::Object(o)
+            if base_uid.get(o).is_some_and(|uid| !declared.ids.tables.contains_key(*uid)))
+    };
     let forward = |target: &GrantTarget| -> GrantTarget {
         match target {
             GrantTarget::Object(o) => match renamed.get(o) {
@@ -2064,11 +2085,16 @@ fn diff_roles(
             continue;
         };
         for (target, permissions) in &held.grants {
+            if dropped_with_its_table(target) {
+                continue;
+            }
             let target = forward(target);
             // A `REVOKE` on an object this same plan drops would fail on an
             // object that is gone — the same rule the per-target comparison
             // below applies, and for the same reason.
-            if permissions.is_empty() || dropped.iter().any(|d| d.takes(&target)) {
+            let target_dropped = dropped.iter().any(|d| d.takes(&target))
+                && !matches!(&target, GrantTarget::Object(o) if changing_hands.contains(o));
+            if permissions.is_empty() || target_dropped {
                 continue;
             }
             changes.push(Change::Revoke {
@@ -2135,6 +2161,9 @@ fn diff_roles(
         let mut before: BTreeMap<GrantTarget, BTreeSet<Permission>> = BTreeMap::new();
         if let Some(b) = base.schema.roles.get(base_name) {
             for (target, permissions) in &b.grants {
+                if dropped_with_its_table(target) {
+                    continue;
+                }
                 before
                     .entry(forward(target))
                     .or_default()
@@ -2145,7 +2174,8 @@ fn diff_roles(
         for target in targets {
             // By whole identity: where routines overload, the drop of one
             // takes its own grants and leaves the sibling's to be compared.
-            let target_dropped = dropped.iter().any(|d| d.takes(target));
+            let target_dropped = dropped.iter().any(|d| d.takes(target))
+                && !matches!(target, GrantTarget::Object(o) if changing_hands.contains(o));
             // A DROP takes the object's permissions with it. An object this
             // plan drops and creates again under the same name — a table
             // replaced by a new one, a module changing kind — therefore has
@@ -2269,9 +2299,30 @@ fn revoke_public_execution(
 /// a module whose *kind* or trigger table changed is not an alteration at all —
 /// `CREATE OR ALTER` cannot turn a view into a procedure, or move a trigger to
 /// another table — so it is emitted as a drop followed by a create.
+/// Table names held by one table in the baseline and another after this plan:
+/// a table dropped, or renamed away, and another renamed or created into its
+/// name, across skipped revisions (DEC-1118.1). Anything keyed by such a name
+/// compares equal across the two tables while belonging to different ones.
+fn names_changing_hands(base: Side<'_>, declared: Side<'_>) -> BTreeSet<TableName> {
+    let before: BTreeMap<&TableName, &Uid> = base
+        .ids
+        .tables
+        .iter()
+        .map(|(uid, name)| (name, uid))
+        .collect();
+    declared
+        .ids
+        .tables
+        .iter()
+        .filter(|(uid, name)| before.get(name).is_some_and(|was| was != uid))
+        .map(|(_, name)| name.clone())
+        .collect()
+}
+
 fn diff_modules(
     base: &Schema,
     declared: &Schema,
+    changing_hands: &BTreeSet<TableName>,
     dialect: &dyn Dialect,
     changes: &mut Vec<Change>,
 ) {
@@ -2281,6 +2332,24 @@ fn diff_modules(
                 id: id.clone(),
                 module: Box::new(module.clone()),
             }),
+            // A trigger on a name that passes to another table: one id for
+            // two triggers, the doomed or departed table's and the one this
+            // plan declares on the new occupant. The first goes before the
+            // table changes and the second is created after them, exactly as
+            // for a trigger that changes kind (DEC-1118.1).
+            Some(before)
+                if matches!(id, ModuleId::Trigger { on, .. }
+                    if changing_hands.contains(&TableName::new(on.schema.clone(), on.name.clone()))) =>
+            {
+                changes.push(Change::DropModule {
+                    id: id.clone(),
+                    kind: before.kind,
+                });
+                changes.push(Change::CreateModule {
+                    id: id.clone(),
+                    module: Box::new(module.clone()),
+                });
+            }
             // A trigger moved to another table needs no case of its own any
             // more: its table is part of its identity, so the move is a key
             // that is gone and a key that is new, and the two loops here
@@ -5357,6 +5426,132 @@ mod tests {
             ],
         );
         assert_eq!(order(&cs).len(), 2, "{cs:?}");
+    }
+
+    /// DEC-1118.1: a trigger keyed by a name that passes to another table is
+    /// two triggers under one id. The doomed table's goes first; the one
+    /// declared on the new occupant is created after the rename. Compared by
+    /// id alone, nothing changed, and the occupant never got its trigger.
+    #[test]
+    fn a_trigger_on_a_name_that_changes_hands_is_dropped_and_created() {
+        let keyed = || table(&[("id", Column::new(ty("int")).not_null())]);
+        let trigger = || {
+            (
+                pbps_model::ModuleId::Trigger {
+                    on: "app.target".parse().unwrap(),
+                    name: "audit".to_owned(),
+                },
+                pbps_model::Module {
+                    kind: pbps_model::ModuleKind::Trigger,
+                    description: None,
+                    definition: "AFTER INSERT AS SELECT 1".to_owned(),
+                },
+            )
+        };
+        let mut base = two_tables(("app.old", keyed()), ("app.target", keyed()));
+        base.modules.extend([trigger()]);
+        let intermediate = schema_of("app.old", keyed());
+        let mut declared = schema_of("app.target", keyed());
+        declared.modules.extend([trigger()]);
+
+        let cs = a_dropped_tables_name_reused_by_a_later_rename(
+            &MinimalDialect,
+            &base,
+            &intermediate,
+            &declared,
+        );
+        let at = |f: &dyn Fn(&Change) -> bool| {
+            cs.changes
+                .iter()
+                .position(|p| f(&p.change))
+                .unwrap_or_else(|| panic!("{:?}", cs.changes))
+        };
+        let dropped = at(&|c| matches!(c, Change::DropModule { .. }));
+        let table_dropped = at(&|c| matches!(c, Change::DropTable { .. }));
+        let rename = at(&|c| matches!(c, Change::RenameTable { .. }));
+        let created = at(&|c| matches!(c, Change::CreateModule { .. }));
+        assert!(
+            dropped < table_dropped && rename < created,
+            "{:?}",
+            cs.changes
+        );
+
+        // The same trigger on a table that keeps its identity is untouched.
+        let cs = run(&declared, &declared, &[]);
+        assert!(cs.changes.is_empty(), "{:?}", cs.changes);
+    }
+
+    /// DEC-1118.1: a grant keyed by a name that passes to another table is
+    /// compared as the occupant's. The doomed table's grants go with it; the
+    /// occupant keeps what it held under its old name, gains what is declared
+    /// and loses what is not. The last was skipped: the name read as a
+    /// dropped object, whose grants nothing revokes.
+    #[test]
+    fn grants_on_a_name_that_changes_hands_are_compared_as_the_occupants() {
+        use pbps_model::{GrantTarget, Permission, Role};
+        let keyed = || table(&[("id", Column::new(ty("int")).not_null())]);
+        let role = |grants: &[(&str, Permission)]| {
+            let mut r = Role::default();
+            for (target, permission) in grants {
+                r.grants
+                    .entry(target.parse::<GrantTarget>().unwrap())
+                    .or_default()
+                    .insert(*permission);
+            }
+            r
+        };
+        let with_role = |mut s: Schema, r: Role| {
+            s.roles.insert("app_reader".to_owned(), r);
+            s
+        };
+        let base = with_role(
+            two_tables(("app.old", keyed()), ("app.target", keyed())),
+            role(&[
+                ("app.target", Permission::Select),
+                ("app.old", Permission::Insert),
+            ]),
+        );
+        let intermediate = with_role(
+            schema_of("app.old", keyed()),
+            role(&[("app.old", Permission::Insert)]),
+        );
+        let declared = with_role(
+            schema_of("app.target", keyed()),
+            role(&[("app.target", Permission::Select)]),
+        );
+
+        let cs = a_dropped_tables_name_reused_by_a_later_rename(
+            &MinimalDialect,
+            &base,
+            &intermediate,
+            &declared,
+        );
+        let grants: BTreeSet<String> = cs
+            .changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::Grant {
+                    target,
+                    permissions,
+                    ..
+                } => Some(format!("grant {target} {permissions:?}")),
+                Change::Revoke {
+                    target,
+                    permissions,
+                    ..
+                } => Some(format!("revoke {target} {permissions:?}")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            grants,
+            BTreeSet::from([
+                "grant app.target {Select}".to_owned(),
+                "revoke app.target {Insert}".to_owned(),
+            ]),
+            "{:?}",
+            cs.changes
+        );
     }
 
     /// Only a drop whose name a rename claims moves. Another table's drop

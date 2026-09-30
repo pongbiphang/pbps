@@ -14492,3 +14492,163 @@ fn a_routine_named_like_a_table_a_view_reads_leaves_the_view_alone() {
     assert_eq!(scalar(connection, "SELECT app.orders()::int8"), 42);
     succeeds(d.run(&["verify", "--db", connection]));
 }
+
+/// DEC-1118.1: across skipped revisions `app.target` is dropped and `app.old`
+/// is renamed into its name. The trigger and the grant keyed by that name
+/// belong to the new occupant after the plan: the trigger declared on it is
+/// created there, the grant it did not hold is given, and the grant it held
+/// under its old name but no longer declares is taken away.
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn a_trigger_and_grants_on_a_name_that_changes_hands_follow_the_occupant() {
+    struct Role(String, String);
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
+    let server = server();
+    let role = Role(
+        server.clone(),
+        format!("pbps_reader_1118_{}", std::process::id()),
+    );
+    let own = OwnDatabase::new(&server, "handsdependents1118");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!("CREATE ROLE {} NOLOGIN; CREATE SCHEMA app", role.1),
+    );
+    let d = Demo::new("handsdependents1118");
+    let declare = |file: &str, body: Option<String>| {
+        let path = d.dir.join("schema").join(file);
+        match body {
+            Some(body) => std::fs::write(path, body).unwrap(),
+            None => std::fs::remove_file(path).unwrap(),
+        }
+    };
+    let keyed = |name: &str, pk: &str| {
+        format!(
+            "table: app.{name}\ncolumns:\n  id: {{type: integer, nullable: false}}\n  \
+             stamped: {{type: integer}}\nprimary_key: {{name: {pk}, columns: [id]}}\n"
+        )
+    };
+    let grants = |targets: &str| {
+        format!(
+            "role: {}\ngrants:\n  schema::app: [usage]\n{targets}",
+            role.1
+        )
+    };
+    let step = |d: &Demo| {
+        succeeds(d.run(&["plan"]));
+        d.commit();
+    };
+
+    declare("app.old.yml", Some(keyed("old", "pk_old")));
+    declare("app.target.yml", Some(keyed("target", "pk_target")));
+    declare(
+        "app.stamp%28%29.function.yml",
+        Some(
+            "function: app.stamp()\ndefinition: |-\n  () RETURNS trigger LANGUAGE plpgsql AS \
+             $$BEGIN NEW.stamped := 42; RETURN NEW; END$$\n"
+                .to_owned(),
+        ),
+    );
+    declare(
+        "reader.yml",
+        Some(grants("  app.target: [select]\n  app.old: [insert]\n")),
+    );
+    step(&d);
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    // The trigger on the table that goes, adopted in the engine's spelling.
+    on_server(
+        connection,
+        "CREATE TRIGGER audit BEFORE INSERT ON app.target FOR EACH ROW \
+         EXECUTE FUNCTION app.stamp()",
+    );
+    let pulled = Demo::new("handsdependents1118-pull");
+    succeeds(pulled.run(&["pull", "--db", connection]));
+    let mut trigger = None;
+    let mut pending = vec![pulled.dir.join("schema")];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let body = std::fs::read_to_string(&path).unwrap();
+            if body.lines().any(|line| line.starts_with("trigger:")) {
+                trigger = Some((path.file_name().unwrap().to_owned(), body));
+            }
+        }
+    }
+    let (trigger_file, trigger_body) = trigger.expect("the trigger was pulled");
+    let trigger_file = trigger_file.to_str().unwrap().to_owned();
+    declare(&trigger_file, Some(trigger_body.clone()));
+    step(&d);
+    succeeds(d.run(&[
+        "baseline",
+        "--db",
+        connection,
+        "--reason",
+        "adopt the trigger",
+    ]));
+
+    // v2: `target` goes, with its trigger and its grant. Never deployed.
+    declare("app.target.yml", None);
+    declare(&trigger_file, None);
+    declare("reader.yml", Some(grants("  app.old: [insert]\n")));
+    succeeds(d.run(&["drop-table", "app.target", "--reason", "no longer used"]));
+    step(&d);
+
+    // v3: `old` takes the name, and the same trigger and a select are
+    // declared on it; its insert is not.
+    declare("app.old.yml", None);
+    declare("app.target.yml", Some(keyed("target", "pk_old")));
+    declare(&trigger_file, Some(trigger_body));
+    declare("reader.yml", Some(grants("  app.target: [select]\n")));
+    succeeds(d.run(&["rename-table", "app.old", "app.target"]));
+    step(&d);
+
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    let checksum = plan_checksum(&plan);
+    succeeds(d.run(&[
+        "apply",
+        "--db",
+        connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+        "--allow",
+        "rename,destructive,revoke",
+    ]));
+    on_server(connection, "INSERT INTO app.target (id) VALUES (1)");
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT stamped::int8 FROM app.target WHERE id = 1"
+        ),
+        42,
+        "the declared trigger is on the new occupant"
+    );
+    let has = |privilege: &str| {
+        scalar(
+            connection,
+            &format!(
+                "SELECT has_table_privilege('{}', 'app.target', '{privilege}')::int::int8",
+                role.1
+            ),
+        )
+    };
+    assert_eq!(has("SELECT"), 1, "the declared select is given");
+    assert_eq!(
+        has("INSERT"),
+        0,
+        "the insert it held as `app.old` is taken away"
+    );
+    succeeds(d.run(&["verify", "--db", connection]));
+    let o = d.run(&["plan", "--db", connection]);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+}
