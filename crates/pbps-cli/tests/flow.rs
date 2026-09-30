@@ -17279,3 +17279,112 @@ fn column_names_change_hands(slug: &str, reclaimed: bool) {
     let o = d.run(&["plan", "--db", connection]);
     assert!(stdout(&o).contains("No changes"), "{slug}: {}", stdout(&o));
 }
+
+/// DEC-1118.1 on SQL Server: `dbo.target` is dropped and `dbo.old` renamed
+/// into its name across skipped revisions. The trigger declared on the name
+/// is created on the new occupant, and the role's grants on the name are the
+/// occupant's: the declared select is given, the insert it held as
+/// `dbo.old` and no longer declares is revoked.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_trigger_and_grants_on_a_name_that_changes_hands_follow_the_occupant() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "handsdependents1118");
+    let connection = own.connection();
+    let d = Demo::new("handsdependents1118");
+    let declare = |file: &str, body: Option<String>| {
+        let path = d.dir.join("schema").join(file);
+        match body {
+            Some(body) => std::fs::write(path, body).unwrap(),
+            None => std::fs::remove_file(path).unwrap(),
+        }
+    };
+    let keyed = |name: &str, pk: &str| {
+        format!(
+            "table: dbo.{name}\ncolumns:\n  id: {{type: int, nullable: false}}\n  \
+             stamped: {{type: int}}\nprimary_key: {{name: {pk}, columns: [id]}}\n"
+        )
+    };
+    let trigger = "trigger: dbo.audit\non: dbo.target\ndefinition: |-\n  AFTER INSERT AS \
+                   UPDATE t SET stamped = 42 FROM dbo.target t JOIN inserted i ON i.id = t.id\n";
+    let grants = |targets: &str| format!("role: reader_1118\ngrants:\n{targets}");
+    let step = |d: &Demo| {
+        assert_eq!(code(&d.run(&["plan"])), 0);
+        d.commit();
+    };
+
+    declare("dbo.old.yml", Some(keyed("old", "pk_old")));
+    declare("dbo.target.yml", Some(keyed("target", "pk_target")));
+    declare("dbo.audit.trigger.yml", Some(trigger.to_owned()));
+    declare(
+        "reader.yml",
+        Some(grants("  dbo.target: [select]\n  dbo.old: [insert]\n")),
+    );
+    step(&d);
+    let o = d.run(&["bootstrap", "--db", connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+
+    declare("dbo.target.yml", None);
+    declare("dbo.audit.trigger.yml", None);
+    declare("reader.yml", Some(grants("  dbo.old: [insert]\n")));
+    let o = d.run(&["drop-table", "dbo.target", "--reason", "no longer used"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    step(&d);
+
+    declare("dbo.old.yml", None);
+    declare("dbo.target.yml", Some(keyed("target", "pk_old")));
+    declare("dbo.audit.trigger.yml", Some(trigger.to_owned()));
+    declare("reader.yml", Some(grants("  dbo.target: [select]\n")));
+    let o = d.run(&["rename-table", "dbo.old", "dbo.target"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    step(&d);
+
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let checksum = plan_checksum(&plan);
+    let o = d.run(&[
+        "apply",
+        "--db",
+        connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+        "--allow",
+        "rename,destructive,revoke",
+    ]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    on_server(connection, "INSERT INTO dbo.target (id) VALUES (1)");
+    assert_eq!(
+        text_on_server(
+            connection,
+            "SELECT CAST(stamped AS nvarchar(10)) FROM dbo.target WHERE id = 1"
+        ),
+        "42",
+        "the declared trigger is on the new occupant"
+    );
+    let has = |permission: &str| {
+        text_on_server(
+            connection,
+            &format!(
+                "SELECT CAST(COUNT(*) AS nvarchar(10)) FROM sys.database_permissions p \
+                 JOIN sys.database_principals r ON r.principal_id = p.grantee_principal_id \
+                 WHERE r.name = 'reader_1118' AND p.major_id = OBJECT_ID('dbo.target') \
+                 AND p.permission_name = '{permission}' AND p.state = 'G'"
+            ),
+        )
+    };
+    assert_eq!(has("SELECT"), "1", "the declared select is given");
+    assert_eq!(
+        has("INSERT"),
+        "0",
+        "the insert it held as `dbo.old` is revoked"
+    );
+    let o = d.run(&["verify", "--db", connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["plan", "--db", connection]);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+}

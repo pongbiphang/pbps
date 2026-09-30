@@ -1065,3 +1065,31 @@ Pinned by `a_btree_expression_index_round_trips_and_changes_as_a_typed_plan`
 (`crates/pbps-pg/tests/live.rs`) and
 `a_declared_expression_index_is_dropped_and_restored_around_a_function_rebuild`
 (`crates/pbps-cli/tests/flow_pg.rs`).
+
+<a id="dec-1118-1"></a>
+
+**DEC-1118.1. A table name that passes to another uid rebuilds what is keyed
+by the name: the trigger is dropped and created, and the grants are compared
+as the occupant's.** Across skipped revisions a table can be dropped, or
+renamed away, while another is renamed or created into its name. The ordering
+of that plan is DEC-536.1's. What is keyed by the table's *name* rather than
+its uid compared equal across the two tables and emitted nothing:
+
+- A trigger's id names its table. The doomed table's trigger went with its
+  `DROP TABLE`, and the one declared on the new occupant was never created. On
+  SQL Server the closing check then refused the plan (`dbo.target.audit is
+  gone`). On PostgreSQL a synthesized rebuild dropped it after the table and
+  was refused (`trigger "audit" for table "target" does not exist`).
+- The grants under the name read as a dropped object's, whose grants nothing
+  revokes. The occupant kept a permission it held under its old name and no
+  longer declares.
+
+`names_changing_hands` is the set of names whose baseline and declared uids
+differ. A trigger on such a name is planned as a drop and a create, as a
+trigger that changes kind is: the drop runs with the module drops, before the
+table changes, and the create runs after them. For grants, a baseline grant
+on a table this plan drops is left out (it goes with the table), and the name
+is compared as the occupant's: its own grants arrive through the rename, the
+declared ones are granted, and the rest are revoked. A name replaced by a new
+table keeps its previous answer, grant everything and revoke nothing, because
+the new table holds no grants of its own.
