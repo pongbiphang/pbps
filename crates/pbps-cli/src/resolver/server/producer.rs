@@ -243,7 +243,7 @@ impl ScratchRun {
             &super::resolution::records(&compiled),
         )?;
         let qualification = Qualification {
-            rule: "pg-qualified-evidence-v2".into(),
+            rule: pbps_pg::resolver::compatibility::RULE.into(),
             target_environment: crate::resolver::sealing::target_catalog_fingerprint(
                 key,
                 &sealed.opening_catalog,
