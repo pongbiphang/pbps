@@ -23198,7 +23198,10 @@ async fn an_orphan_is_counted_under_the_referenced_columns_own_collation() {
 async fn a_rename_is_carried_into_what_the_catalog_holds_and_not_into_a_text_body() {
     use pbps_pg::impact::{RenameTarget, rename_impact};
 
-    let mut conn = connect().await;
+    // A database of its own: `rename_impact` reads every routine in the
+    // database, and another test dropping a type underneath that scan fails it
+    // with `cache lookup failed for type` (#648).
+    let mut conn = TestDb::create("impact_carried648").await;
     let s = probe_schema_9("impact");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -23293,6 +23296,7 @@ async fn a_rename_is_carried_into_what_the_catalog_holds_and_not_into_a_text_bod
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 #[tokio::test]
@@ -23509,7 +23513,10 @@ async fn impact_lexer_ignores_literal_and_comment_contents() {
 async fn a_routine_body_naming_an_unquoted_column_in_another_case_is_found() {
     use pbps_pg::impact::{RenameTarget, rename_impact};
 
-    let mut conn = connect().await;
+    // A database of its own: `rename_impact` reads every routine in the
+    // database, and another test dropping a type underneath that scan fails it
+    // with `cache lookup failed for type` (#648).
+    let mut conn = TestDb::create("impact_case_fold648").await;
     let s = probe_schema_9("impact_case_fold");
     fresh(&mut conn, &s).await;
     conn.execute(&format!(
@@ -23541,6 +23548,7 @@ async fn a_routine_body_naming_an_unquoted_column_in_another_case_is_found() {
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// A column the report cannot find is a question that could not be asked, and
@@ -23553,7 +23561,10 @@ async fn a_routine_body_naming_an_unquoted_column_in_another_case_is_found() {
 async fn a_column_the_catalog_does_not_have_is_not_a_rename_that_breaks_nothing() {
     use pbps_pg::impact::{ImpactError, RenameTarget, rename_impact};
 
-    let mut conn = connect().await;
+    // A database of its own: `rename_impact` reads every routine in the
+    // database, and another test dropping a type underneath that scan fails it
+    // with `cache lookup failed for type` (#648).
+    let mut conn = TestDb::create("impact_absent_column648").await;
     let s = probe_schema_9("absent");
     fresh(&mut conn, &s).await;
     conn.execute(&format!("CREATE TABLE {s}.t (id integer)"))
@@ -23582,6 +23593,7 @@ async fn a_column_the_catalog_does_not_have_is_not_a_rename_that_breaks_nothing(
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// The same for a **table** target, which used to reach the queries without its
@@ -23601,7 +23613,10 @@ async fn a_column_the_catalog_does_not_have_is_not_a_rename_that_breaks_nothing(
 async fn a_table_the_catalog_does_not_have_is_not_a_rename_that_breaks_nothing() {
     use pbps_pg::impact::{ImpactError, RenameTarget, rename_impact};
 
-    let mut conn = connect().await;
+    // A database of its own: `rename_impact` reads every routine in the
+    // database, and another test dropping a type underneath that scan fails it
+    // with `cache lookup failed for type` (#648).
+    let mut conn = TestDb::create("impact_absent_table648").await;
     let s = probe_schema_9("absent_table");
     fresh(&mut conn, &s).await;
     conn.execute(&format!("CREATE TABLE {s}.t (id integer)"))
@@ -23635,6 +23650,7 @@ async fn a_table_the_catalog_does_not_have_is_not_a_rename_that_breaks_nothing()
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await
         .expect("drop");
+    conn.drop().await;
 }
 
 /// ADR-0012 §3's dataset, re-measured in full: for every ordered pair of the
