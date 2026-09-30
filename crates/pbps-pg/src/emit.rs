@@ -1134,6 +1134,28 @@ const fn keyword(kind: ModuleKind) -> &'static str {
 /// which is the same fact ADR-0009 §1 records from the other side: the schema
 /// in `ModuleId::Trigger` is the table's, and there is nowhere else for it to
 /// come from (DECISIONS 302).
+/// A trigger body that begins with the `CONSTRAINT` marker, as the text from
+/// the marker on and the marker's length. The marker is declaration syntax,
+/// retained by the pull because it cannot be derived from the trigger's
+/// identity (473). Read one bare token: comments, quotes and identifier
+/// continuations must not turn an ordinary body into a constraint trigger.
+fn constraint_marker(body: &str) -> Option<(&str, usize)> {
+    let start = after_the_gap(body).0;
+    let end = start
+        .find(|c: char| !pbps_dialect::continues_ident(c))
+        .unwrap_or(start.len());
+    start[..end]
+        .eq_ignore_ascii_case("constraint")
+        .then_some((start, end))
+}
+
+/// Whether a trigger declaration is a constraint trigger, which PostgreSQL
+/// records in `pg_constraint` under its own name (#1112).
+pub(crate) fn is_constraint_trigger(module: &Module) -> bool {
+    module.kind == ModuleKind::Trigger
+        && constraint_marker(ascii_trim(&module.definition)).is_some()
+}
+
 fn create_module(pg: &Postgres, id: &ModuleId, module: &Module) -> Result<Statement, DialectError> {
     // ASCII, not Unicode: a non-breaking space is an identifier byte to this
     // engine (DECISIONS 313), and **measured**, `CREATE VIEW v AS SELECT 1 AS
@@ -1158,15 +1180,7 @@ fn create_module(pg: &Postgres, id: &ModuleId, module: &Module) -> Result<Statem
             qualified(&id.object_name())?
         ),
         ModuleKind::Trigger => {
-            // The leading marker is declaration syntax, retained by the pull
-            // because it cannot be derived from the trigger's identity (473).
-            // Read one bare token; comments, quotes and identifier continuations
-            // must not turn an ordinary body into a constraint trigger.
-            let start = after_the_gap(body).0;
-            let end = start
-                .find(|c: char| !pbps_dialect::continues_ident(c))
-                .unwrap_or(start.len());
-            if start[..end].eq_ignore_ascii_case("constraint") {
+            if let Some((start, end)) = constraint_marker(body) {
                 let leading = &body[..body.len() - start.len()];
                 let rest = &start[end..];
                 format!(

@@ -136,6 +136,13 @@ pub struct ImplicitRelation {
     /// after its table and column when it is created, but keeps that name
     /// when either is renamed later, so only the other object can move.
     pub remedy: &'static str,
+    /// Whether the engine's retry also treats a constraint's name in the
+    /// schema as taken, not only a relation's. PostgreSQL names a primary
+    /// key's index with `ChooseRelationName(..., isconstraint = true)`, so a
+    /// named check or foreign key at the key's first choice sends it to a
+    /// fallback with no other generated name in play (#1112). An identity
+    /// sequence's retry looks at relations only.
+    pub yields_to_constraints: bool,
 }
 
 /// One executable statement.
@@ -1999,6 +2006,14 @@ pub trait Dialect {
         Vec::new()
     }
 
+    /// Whether a module is also a constraint under its own name in its
+    /// schema, which a retry that yields to constraints finds taken (#1112):
+    /// PostgreSQL's constraint trigger has a `pg_constraint` row. The default,
+    /// none, is right for an engine whose modules are never constraints.
+    fn declares_a_constraint(&self, _module: &Module) -> bool {
+        false
+    }
+
     /// The name the engine falls back to for each of
     /// [`Dialect::implicit_relation_names`], in the same order, when its first
     /// choice is taken and this is its `suffix`-th retry (#987). Two tables
@@ -2518,7 +2533,36 @@ pub fn check_index_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> 
             });
         }
     }
-    let reach = fallback_reach(&claimants, None, dialect);
+    // The constraint names already in each schema, which a claimant that
+    // yields to constraints finds taken before any other claimant is created.
+    let constraint_names: BTreeSet<ObjectName> = schema
+        .tables
+        .iter()
+        .flat_map(|(table_name, table)| {
+            table
+                .primary_key
+                .iter()
+                .filter_map(|pk| pk.name.as_deref())
+                .chain(table.unique.keys().map(String::as_str))
+                .chain(table.foreign_keys.keys().map(String::as_str))
+                .chain(table.checks.keys().map(String::as_str))
+                .map(move |name| ObjectName::new(table_name.schema.clone(), name))
+        })
+        .chain(
+            schema
+                .modules
+                .iter()
+                .filter(|(_, module)| dialect.declares_a_constraint(module))
+                .filter_map(|(id, _)| match id {
+                    // A trigger's constraint is in its table's schema.
+                    ModuleId::Trigger { on, name } => {
+                        Some(ObjectName::new(on.schema.clone(), name.clone()))
+                    }
+                    ModuleId::Named(_) | ModuleId::Routine(_) => None,
+                }),
+        )
+        .collect();
+    let reach = fallback_reach(&claimants, None, &constraint_names, dialect);
     let mut reported = BTreeSet::new();
     for (k, names) in reach.iter().enumerate() {
         for claim_name in names.iter().skip(1) {
@@ -2537,7 +2581,7 @@ pub fn check_index_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> 
                 .filter(|j| reach[*j].iter().skip(1).any(|n| n == claim_name))
                 .filter(|j| asked.insert(&claimants[*j].first))
                 .find(|j| {
-                    !fallback_reach(&claimants, Some(*j), dialect)
+                    !fallback_reach(&claimants, Some(*j), &constraint_names, dialect)
                         .iter()
                         .flatten()
                         .any(|n| n == claim_name)
@@ -2549,9 +2593,10 @@ pub fn check_index_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> 
             let descriptor = &claimants[landing].relation.descriptor;
             let existing = &claimed[claim_name];
             problems.push(format!(
-                "{} and {descriptor} may both be named `{claim_name}`: {descriptor} \
-                 meets another generated name, and {} gives one of them this name \
-                 instead, which one depending on the order they are created in. {}",
+                "{} and {descriptor} may both be named `{claim_name}`: {} gives \
+                 {descriptor} this name when the name it would take first is already \
+                 taken, by another generated name or by a constraint, which depends on \
+                 the order they are created in. {}",
                 existing.descriptor,
                 dialect.name(),
                 remedy
@@ -2589,9 +2634,14 @@ struct Claimant<'a> {
 /// Reaches only grow, so a claimant's matching stays valid as they do: each
 /// keeps its own and matches only the names added since, which keeps
 /// hundreds of names meeting at one first choice cheap.
+///
+/// A name in `constraint_names` is taken for a claimant that yields to
+/// constraints without any other claimant taking it: the constraint can be
+/// created first (#1112).
 fn fallback_reach(
     claimants: &[Claimant<'_>],
     without: Option<usize>,
+    constraint_names: &BTreeSet<ObjectName>,
     dialect: &dyn Dialect,
 ) -> Vec<Vec<ObjectName>> {
     let live: Vec<usize> = (0..claimants.len())
@@ -2606,24 +2656,40 @@ fn fallback_reach(
             .or_default()
             .push(k);
     }
-    // Per claimant: which other claimant takes which of its names.
+    // Per claimant: which other claimant takes which of its names, and how
+    // many of its names so far are taken, by a claimant or a constraint.
     let mut takers: Vec<BTreeMap<usize, usize>> = vec![BTreeMap::new(); claimants.len()];
+    let mut taken = vec![0; claimants.len()];
     loop {
         let mut grew = false;
         for &k in &live {
             let retry = reach[k].len();
-            // `retry` names to take needs `retry` other claimants.
-            if retry >= live.len() {
+            let yields = claimants[k].relation.yields_to_constraints;
+            // The names a constraint takes need no claimant; the rest need a
+            // different other claimant each, so no more than there are.
+            let by_constraints = if yields {
+                reach[k]
+                    .iter()
+                    .filter(|n| constraint_names.contains(*n))
+                    .count()
+            } else {
+                0
+            };
+            if retry - by_constraints >= live.len() {
                 continue;
             }
             let taker = &mut takers[k];
-            while taker.len() < retry {
-                let t = taker.len();
-                if !augment(t, &reach[k], k, &holders, &mut BTreeSet::new(), taker) {
+            while taken[k] < retry {
+                let t = taken[k];
+                let by_constraint = yields && constraint_names.contains(&reach[k][t]);
+                if !by_constraint
+                    && !augment(t, &reach[k], k, &holders, &mut BTreeSet::new(), taker)
+                {
                     break;
                 }
+                taken[k] += 1;
             }
-            if taker.len() < retry {
+            if taken[k] < retry {
                 continue;
             }
             let claimant = &claimants[k];

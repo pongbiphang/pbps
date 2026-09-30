@@ -847,6 +847,8 @@ impl Dialect for Postgres {
                     types::DIALECT
                 ),
                 remedy: "Name the primary key, or rename the other object.",
+                // `ChooseRelationName(..., isconstraint = true)` (#1112).
+                yields_to_constraints: true,
             });
         }
         for (column, spec) in &table.columns {
@@ -863,10 +865,18 @@ impl Dialect for Postgres {
                         types::DIALECT
                     ),
                     remedy: "Rename the other object.",
+                    yields_to_constraints: false,
                 });
             }
         }
         out
+    }
+
+    /// A constraint trigger has a `pg_constraint` row under its own name, in
+    /// its table's schema, which a primary key's index retry finds taken
+    /// (#1112). An ordinary trigger has none.
+    fn declares_a_constraint(&self, module: &pbps_model::Module) -> bool {
+        emit::is_constraint_trigger(module)
     }
 
     /// `ChooseRelationName` retries with the number on the *label*, and cuts
@@ -1462,6 +1472,144 @@ mod tests {
         assert!(
             pbps_dialect::check_index_names(&schema(&at(100)), &pg).is_empty(),
             "a hundred claimants retry at most 99 times"
+        );
+    }
+
+    /// #1112: PostgreSQL names a primary key's index with
+    /// `ChooseRelationName(..., isconstraint = true)`, which also takes a
+    /// constraint's name in the schema as used. A check named `t_pkey` on
+    /// another table sends `t`'s unnamed key to `t_pkey1` with no other
+    /// generated name in play, so a declared index there is order-dependent
+    /// and refused, with the key's own remedy. Negatives: without the named
+    /// check `t_pkey1` is free, and an identity sequence's retry does not
+    /// look at constraints. A constraint trigger named `t_pkey` counts as a
+    /// constraint; an ordinary trigger does not.
+    #[test]
+    fn a_named_constraint_at_a_keys_first_choice_puts_its_fallback_in_play() {
+        use pbps_model::{
+            CheckConstraint, Column, Identity, Index, IndexColumn, PrimaryKey, Schema, Table,
+        };
+        let index = |name: &str| {
+            (
+                name.to_owned(),
+                Index {
+                    columns: vec![IndexColumn {
+                        key: pbps_model::IndexKey::Column("id".into()),
+                        descending: false,
+                        opclass: None,
+                    }],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                    method: Default::default(),
+                },
+            )
+        };
+        let table = |pk: bool, identity: bool, index_name: Option<&str>| {
+            let mut t = Table::default();
+            let mut id = Column::new("integer".parse().unwrap()).not_null();
+            if identity {
+                id.identity = Some(Identity {
+                    seed: 1,
+                    increment: 1,
+                });
+            }
+            t.columns.insert("id".into(), id);
+            if pk {
+                t.primary_key = Some(PrimaryKey {
+                    name: None,
+                    columns: vec!["id".into()],
+                });
+            }
+            t.indexes.extend(index_name.map(index));
+            t
+        };
+        let other = |check: Option<&str>| {
+            let mut t = table(false, false, None);
+            if let Some(name) = check {
+                t.checks.insert(
+                    name.into(),
+                    CheckConstraint {
+                        expression: "id > 0".into(),
+                    },
+                );
+            }
+            t
+        };
+        let schema = |t: Table, o: Table| {
+            let mut s = Schema::default();
+            s.tables.insert(TableName::new("app", "t"), t);
+            s.tables.insert(TableName::new("app", "other"), o);
+            s
+        };
+        let pg = super::Postgres::new();
+
+        let found = pbps_dialect::check_index_names(
+            &schema(table(true, false, Some("t_pkey1")), other(Some("t_pkey"))),
+            &pg,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("may both be named `app.t_pkey1`"),
+            "{found:?}"
+        );
+        assert!(found[0].contains("Name the primary key"), "{found:?}");
+        // The retry is the constraint's doing, and the refusal says a
+        // constraint can be why, not only another generated name.
+        assert!(found[0].contains("or by a constraint"), "{found:?}");
+
+        assert!(
+            pbps_dialect::check_index_names(
+                &schema(table(true, false, Some("t_pkey1")), other(None)),
+                &pg
+            )
+            .is_empty(),
+            "a key alone keeps its first choice"
+        );
+        assert!(
+            pbps_dialect::check_index_names(
+                &schema(
+                    table(false, true, Some("t_id_seq1")),
+                    other(Some("t_id_seq"))
+                ),
+                &pg
+            )
+            .is_empty(),
+            "a sequence's retry does not look at constraint names"
+        );
+
+        // A constraint trigger is a constraint under its own name; an
+        // ordinary trigger is not.
+        let with_trigger = |definition: &str| {
+            let mut s = schema(table(true, false, Some("t_pkey1")), other(None));
+            s.modules.insert(
+                pbps_model::ModuleId::Trigger {
+                    on: TableName::new("app", "other"),
+                    name: "t_pkey".into(),
+                },
+                pbps_model::Module {
+                    kind: pbps_model::ModuleKind::Trigger,
+                    description: None,
+                    definition: definition.into(),
+                },
+            );
+            s
+        };
+        let found = pbps_dialect::check_index_names(
+            &with_trigger(
+                "CONSTRAINT AFTER INSERT ON app.other FOR EACH ROW EXECUTE FUNCTION app.f()",
+            ),
+            &pg,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("`app.t_pkey1`"), "{found:?}");
+        assert!(
+            pbps_dialect::check_index_names(
+                &with_trigger("AFTER INSERT ON app.other FOR EACH ROW EXECUTE FUNCTION app.f()"),
+                &pg
+            )
+            .is_empty(),
+            "an ordinary trigger has no constraint row"
         );
     }
 
