@@ -1084,7 +1084,8 @@ pub fn unrevocable_grants(
 /// live generated column is computed from cannot be retyped, nor dropped
 /// without `CASCADE` — measured on 16, 17 and 18 — so a plan that retypes or
 /// drops one is refused here rather than by the engine halfway through,
-/// unless the same plan drops the generated column too.
+/// unless the same plan drops the generated column too. An expression change
+/// in the same plan does not release it: the retype or drop is ordered first.
 pub async fn generation_support(
     conn: &mut Conn,
     changes: &ChangeSet,
@@ -1161,7 +1162,9 @@ pub async fn generation_support(
                 problems.push(format!(
                     "{column} is {what} by this plan, and the generated column `{}` is computed \
                      from it: the engine refuses to retype such a column and drops it only with \
-                     CASCADE. Drop or change the generated column in the same plan first.",
+                     CASCADE. Drop the generated column in the same plan, or apply a plan that \
+                     changes its expression to stop reading this column first: in one plan \
+                     the expression change runs after this one.",
                     d.generated
                 ));
             }

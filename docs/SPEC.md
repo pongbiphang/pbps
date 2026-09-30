@@ -702,7 +702,7 @@ exists when prod deploys the rename five versions later.
 |---|---|---|
 | `rename` | A column, table or role is renamed | Dependent objects break (see 7.4); a role's old name is gone to `IS_ROLEMEMBER` and its kin |
 | `destructive` | DROP COLUMN / DROP TABLE / DROP INDEX / DROP UNIQUE constraint | Data loss or loss of a uniqueness guarantee |
-| `narrowing` | Type narrowing or a value-changing or incompatible conversion | Changed values (including binary padding), truncation, failed conversion |
+| `narrowing` | Type narrowing, a value-changing or incompatible conversion, or a changed generation expression | Changed values (including binary padding, or every row recomputed), truncation, failed conversion |
 | `not-null` | nullable → NOT NULL with no DEFAULT | Existing NULLs violate it |
 | `constraint` | Adding UNIQUE / FK / CHECK, or a **unique index** | Existing rows may not satisfy it |
 | `data-update` | A declared reference row's values are overwritten (4.6) | What is there now is being replaced, and the plan does not record it |

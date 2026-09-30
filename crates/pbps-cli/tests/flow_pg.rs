@@ -5807,7 +5807,21 @@ fn generated_column_flow(server: &str, slug: &str, has_set_expression: bool) {
     }
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
     assert!(stdout(&o).contains("generated as a * 3"), "{}", stdout(&o));
-    succeeds(approved_apply(&d, &connection, &plan, &[]));
+    // Every stored value is recomputed, so the change faces the gate as a
+    // value-changing conversion does (SPEC §7.2), and nothing runs without it.
+    let o = approved_apply(&d, &connection, &plan, &[]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("--allow narrowing"), "{}", stderr(&o));
+    assert_eq!(
+        scalar(&connection, "SELECT b::int8 FROM app.t WHERE id = 1"),
+        10
+    );
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--allow", "narrowing"],
+    ));
     assert_eq!(
         scalar(&connection, "SELECT b::int8 FROM app.t WHERE id = 1"),
         15

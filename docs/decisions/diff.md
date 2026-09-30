@@ -1154,7 +1154,9 @@ does. The engine rewrites what it stores, and the declaration spells the new
 name. Around a function rebuild, a generated column that calls the function
 stays refused. No statement takes its expression off and puts it back:
 `DROP EXPRESSION` leaves an ordinary column, and `SET EXPRESSION` is refused
-on one.
+on one. A changed expression faces the gate as `narrowing` (SPEC §7.2): the
+engine recomputes every stored row, and a `NOT NULL`, check or unique index
+over the column can refuse what it computes.
 
 State version 12 carries the field and still reads 6 to 11. An older
 reader reported every generated column as a limitation, which no recorder
