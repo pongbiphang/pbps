@@ -5918,6 +5918,38 @@ fn generated_column_flow(server: &str, slug: &str, has_set_expression: bool) {
     let next = succeeds(d.run(&["plan", "--db", &connection]));
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
 
+    // Row 2's `a` is NULL, so `b` holds a NULL now. An expression that never
+    // yields one, with `b` made NOT NULL in the same revision, is valid: the
+    // recomputation runs before the tightening, and the pre-flight does not
+    // judge the old NULL (DEC-1168.1).
+    let tightened: String = respelled.replacen(
+        "    generated: {expression: 'a * 3', stored: true}",
+        "    nullable: false\n    generated: {expression: 'coalesce(a, 0) * 3', stored: true}",
+        1,
+    );
+    assert_ne!(
+        tightened, respelled,
+        "the fixture's `b` is where this test expects it"
+    );
+    std::fs::write(&path, &tightened).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    std::fs::remove_file(&plan).unwrap();
+    succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--allow", "narrowing", "--allow", "not-null"],
+    ));
+    assert_eq!(
+        scalar(&connection, "SELECT b::int8 FROM app.t WHERE id = 2"),
+        0
+    );
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
     // A retype of `a`, which `b` is computed from: refused before anything
     // runs, naming the generated column, where the engine would refuse it
     // halfway through the apply.
@@ -5927,7 +5959,7 @@ fn generated_column_flow(server: &str, slug: &str, has_set_expression: bool) {
         1,
     );
     assert_ne!(
-        retyped, respelled,
+        retyped, tightened,
         "the fixture's `a` is where this test expects it"
     );
     std::fs::write(&path, retyped).unwrap();

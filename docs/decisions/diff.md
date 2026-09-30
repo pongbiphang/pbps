@@ -1152,6 +1152,9 @@ A generated column is the engine's to fill, like a non-key identity
 read-back, and a row that sets one is refused. A `NOT NULL` generated add
 is not counted as every stored row. Evaluating its expression before
 approval would run the operator's code, so the probe reports it unchecked.
+For the same reason, a probe that would read a column the plan recomputes is
+reported unchecked rather than run over the old expression's values: its
+tightening, a key over it, and any check or filtered index of its table.
 
 Its declared text is recorded, advanced and overlaid as a default's is
 (`DeclaredExpressions::generated`), and compared by presence (SPEC §7.6),
