@@ -32,8 +32,10 @@ use pbps_mssql::resolver::authorization as mssql_auth;
 use pbps_pg::resolver::authorization as pg_auth;
 use std::collections::BTreeMap;
 
-/// A schema grant or revoke the plan performs before its DDL, in the shape
-/// both emitters produce. `principal` is the role or user it names.
+/// A schema grant or revoke the plan performs before its DDL. A GRANT keeps
+/// the emitter's whole comma-separated privilege mask in one entry; REVOKE
+/// has one privilege per entry because PostgreSQL emits separate statements.
+/// `principal` is the role or user the statement names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedGrant {
     pub principal: String,
@@ -55,13 +57,19 @@ fn pg_planned(planned: &[PlannedGrant]) -> Vec<pg_auth::PlannedGrant> {
 }
 
 fn mssql_planned(planned: &[PlannedGrant]) -> Vec<mssql_auth::PlannedGrant> {
+    // SQL Server's reproduction retains its original per-permission shape.
     planned
         .iter()
-        .map(|grant| mssql_auth::PlannedGrant {
-            principal: grant.principal.clone(),
-            schema: grant.schema.clone(),
-            permission: grant.privilege.clone(),
-            revoke: grant.revoke,
+        .flat_map(|grant| {
+            grant
+                .privilege
+                .split(", ")
+                .map(|permission| mssql_auth::PlannedGrant {
+                    principal: grant.principal.clone(),
+                    schema: grant.schema.clone(),
+                    permission: permission.to_owned(),
+                    revoke: grant.revoke,
+                })
         })
         .collect()
 }
@@ -262,24 +270,44 @@ pub(crate) fn planned_schema_grants(
                     .into(),
             );
         }
-        if let Change::Grant {
-            role,
-            target: GrantTarget::Schema(schema),
-            permissions,
-        }
-        | Change::Revoke {
-            role,
-            target: GrantTarget::Schema(schema),
-            permissions,
-        } = &p.change
-        {
-            for permission in permissions {
+        let statement = match &p.change {
+            Change::Grant {
+                role,
+                target: GrantTarget::Schema(schema),
+                permissions,
+            }
+            | Change::Revoke {
+                role,
+                target: GrantTarget::Schema(schema),
+                permissions,
+            } => Some((role, schema, permissions)),
+            _ => None,
+        };
+        if let Some((role, schema, permissions)) = statement {
+            let privileges = permissions
+                .iter()
+                .map(|permission| permission.as_str().to_ascii_uppercase().replace('-', " "))
+                .collect::<Vec<_>>();
+            if privileges.is_empty() {
+                return Err("a planned schema grant names no permission".into());
+            }
+            if matches!(&p.change, Change::Grant { .. }) {
                 planned.push(PlannedGrant {
                     principal: role.clone(),
                     schema: schema.clone(),
-                    privilege: permission.as_str().to_ascii_uppercase().replace('-', " "),
-                    revoke: matches!(p.change, Change::Revoke { .. }),
+                    privilege: privileges.join(", "),
+                    revoke: false,
                 });
+            } else {
+                // PostgreSQL emits one REVOKE statement per permission.
+                for privilege in privileges {
+                    planned.push(PlannedGrant {
+                        principal: role.clone(),
+                        schema: schema.clone(),
+                        privilege,
+                        revoke: true,
+                    });
+                }
             }
         }
     }

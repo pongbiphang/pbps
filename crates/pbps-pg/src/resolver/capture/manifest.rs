@@ -1114,7 +1114,6 @@ impl CompiledCapture {
                                     raw,
                                     &source,
                                     &transition.surface,
-                                    field,
                                     changes,
                                     authorization,
                                 )?
