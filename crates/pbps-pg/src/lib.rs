@@ -1554,6 +1554,9 @@ mod tests {
             "{found:?}"
         );
         assert!(found[0].contains("Name the primary key"), "{found:?}");
+        // The retry is the constraint's doing, and the refusal says a
+        // constraint can be why, not only another generated name.
+        assert!(found[0].contains("or by a constraint"), "{found:?}");
 
         assert!(
             pbps_dialect::check_index_names(

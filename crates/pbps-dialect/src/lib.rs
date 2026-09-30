@@ -2593,9 +2593,10 @@ pub fn check_index_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> 
             let descriptor = &claimants[landing].relation.descriptor;
             let existing = &claimed[claim_name];
             problems.push(format!(
-                "{} and {descriptor} may both be named `{claim_name}`: {descriptor} \
-                 meets another generated name, and {} gives one of them this name \
-                 instead, which one depending on the order they are created in. {}",
+                "{} and {descriptor} may both be named `{claim_name}`: {} gives \
+                 {descriptor} this name when the name it would take first is already \
+                 taken, by another generated name or by a constraint, which depends on \
+                 the order they are created in. {}",
                 existing.descriptor,
                 dialect.name(),
                 remedy
