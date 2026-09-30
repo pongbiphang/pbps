@@ -1455,3 +1455,30 @@ A plan that rebuilds no function keeps the differ's order. Measured on
 PostgreSQL: a function edit together with a new check, filtered index and
 default calling it applies, `verify` is clean, and planning again reports no
 changes. Before the move, the plan put the check ahead of `CREATE FUNCTION`.
+
+<a id="dec-230-1"></a>
+
+**DEC-230.1. A routine arriving does not rebuild a view that names it only as
+a bare relation after `FROM` or `JOIN`; every other shape keeps DECISIONS
+307's conservative rebuild.** The name-and-path test rebuilt such a view
+although a `pg_proc` row cannot capture a `pg_class` reference, and the
+rebuild is refused wherever the view has a dependent the plan does not
+manage, so a plan that only added the routine was refused.
+
+The exception proves irrelevance rather than classifying syntax, which is
+where PR #542 grew into a partial grammar and was abandoned. It answers only
+for a view and a routine arrival, and only when every mention of the name in
+the view's code-only text is a bare word after `FROM` or `JOIN`, followed by
+neither `(` nor `.`. Any other mention, a qualified or quoted one, or no
+mention this scan can see, keeps the rebuild. Its only possible error is
+therefore the rebuild the test already synthesized.
+
+Measured on PostgreSQL 18.6 and 16.15: a bare word without parentheses is
+never a call (`SELECT z` beside `z()` is `column "z" does not exist`,
+`FROM fonly` beside `fonly()` is `relation "fonly" does not exist`), and a
+view reading `FROM orders`/`JOIN orders` keeps reading the table after
+`CREATE FUNCTION orders()` earlier on its path. Qualified mentions are
+excluded on evidence: `FROM` also opens `extract(... FROM t.dd)`, where
+column notation reads `t.dd` as `dd(t)`, and that view recreated after a new
+`dd(t)` arrives binds it. A relation arriving also brings a row type that
+type positions capture, so relation arrivals stay conservative.

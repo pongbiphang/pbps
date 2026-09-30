@@ -14430,3 +14430,65 @@ fn column_names_change_hands(slug: &str, reclaimed: bool) {
     let o = d.run(&["plan", "--db", connection]);
     assert!(stdout(&o).contains("No changes"), "{slug}: {}", stdout(&o));
 }
+
+/// DEC-230.1: a routine arriving under the name a view reads only as a bare
+/// relation (`FROM orders`) cannot capture it, so the plan does not rebuild
+/// the view. The rebuild it used to synthesize is refused wherever the view
+/// has a dependent the plan does not manage, so the plan that only adds the
+/// routine was refused. Measured, the view keeps reading the table.
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn a_routine_named_like_a_table_a_view_reads_leaves_the_view_alone() {
+    let own = OwnDatabase::new(&server(), "relationonly230");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "relationonly230", ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("schema/app.orders.yml"),
+        "table: app.orders\ncolumns:\n  id: {type: integer, nullable: false}\n\
+         primary_key: {name: pk_orders, columns: [id]}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/app.v.view.yml"),
+        "view: app.v\ndefinition: SELECT o.id FROM orders o JOIN orders p USING (id)\n",
+    )
+    .unwrap();
+    let apply = |d: &Demo| -> Output {
+        let plan = d.dir.join("plan.json");
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let o = succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+        let checksum = plan_checksum(&plan);
+        succeeds(d.run(&[
+            "apply",
+            "--db",
+            connection,
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+        ]));
+        o
+    };
+    apply(&d);
+    on_server(
+        connection,
+        "INSERT INTO app.orders VALUES (1); CREATE VIEW app.w AS SELECT id FROM app.v",
+    );
+
+    std::fs::write(
+        d.dir.join("schema/app.orders.function.yml"),
+        "function: app.orders()\ndefinition: |-\n  () RETURNS SETOF integer LANGUAGE sql AS $$ SELECT 42 $$\n",
+    )
+    .unwrap();
+    let planned = apply(&d);
+    let text = stdout(&planned);
+    assert!(!text.contains("app.v"), "the view is not rebuilt: {text}");
+    assert_eq!(
+        scalar(connection, "SELECT id::int8 FROM app.w"),
+        1,
+        "the view and its dependent still read the table"
+    );
+    assert_eq!(scalar(connection, "SELECT app.orders()::int8"), 42);
+    succeeds(d.run(&["verify", "--db", connection]));
+}
