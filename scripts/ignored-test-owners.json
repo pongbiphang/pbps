@@ -1658,6 +1658,7 @@
         "a_foreign_key_this_plan_adds_on_a_narrowing_pair_still_counts_a_row_whose_value_fits",
         "a_foreign_keys_width_is_the_servers_answer_and_it_answers_before_looking_for_a_key",
         "a_fully_migrated_ledger_answers_the_timeline_without_reading_state_json",
+        "a_generated_columns_inputs_leave_out_its_own_column",
         "a_generated_fallback_is_the_one_the_engine_uses_and_order_decides_it",
         "a_gin_index_over_jsonb_round_trips_and_changes_as_a_typed_plan",
         "a_grant_in_the_public_schema_reaches_the_table_with_no_schema_grant",

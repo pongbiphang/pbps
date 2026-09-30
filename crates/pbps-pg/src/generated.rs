@@ -30,6 +30,11 @@ pub struct Dependence {
 /// such a column ("cannot alter type of a column used by a generated
 /// column") and drops it only with `CASCADE`.
 ///
+/// Not the expression's edge to the column it belongs to: measured on 16.15,
+/// 17.11 and 18.6, `pg_attrdef` also depends on its own column (`deptype`
+/// `i`), and that column retypes freely. A generated column never reads
+/// another generated column, let alone itself, so no input is lost.
+///
 /// Empty where the table has no generated column or does not exist yet, which
 /// is the same answer here: nothing live depends on anything.
 pub async fn dependences(conn: &mut Conn, table: &TableName) -> Result<Vec<Dependence>, DbError> {
@@ -42,6 +47,7 @@ pub async fn dependences(conn: &mut Conn, table: &TableName) -> Result<Vec<Depen
              ON d.classid = 'pg_catalog.pg_attrdef'::pg_catalog.regclass AND d.objid = ad.oid
             AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
             AND d.refobjid = ad.adrelid AND d.refobjsubid > 0
+            AND d.refobjsubid <> ad.adnum
            JOIN pg_catalog.pg_attribute base
              ON base.attrelid = d.refobjid AND base.attnum = d.refobjsubid
            JOIN pg_catalog.pg_class c ON c.oid = ad.adrelid

@@ -2873,6 +2873,46 @@ async fn a_btree_expression_index_round_trips_and_changes_as_a_typed_plan() {
     );
 }
 
+/// The columns a generated column reads are its inputs, and its own column
+/// is not one: `pg_attrdef` depends on the column it belongs to as well, and
+/// that column retypes where an input does not (DEC-1168.1).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_generated_columns_inputs_leave_out_its_own_column() {
+    use pbps_pg::generated::{Dependence, dependences};
+    let s = emit_schema("gendep1168");
+    let mut db = TestDb::create("gendep1168").await;
+    fresh(&mut db, &s).await;
+    db.execute(&format!(
+        "CREATE TABLE {s}.t (id integer PRIMARY KEY, a integer, c integer,
+                             b integer GENERATED ALWAYS AS (a * 2) STORED);"
+    ))
+    .await
+    .expect("the table");
+    let found = dependences(&mut db.conn, &TableName::new(&s, "t"))
+        .await
+        .expect("the catalog answers");
+    // Neither `b` itself nor `c`, which the expression does not read.
+    assert_eq!(
+        found,
+        [Dependence {
+            base: "a".into(),
+            generated: "b".into(),
+        }]
+    );
+    db.execute(&format!("ALTER TABLE {s}.t ALTER COLUMN b TYPE bigint;"))
+        .await
+        .expect("the generated column itself retypes");
+    assert!(
+        db.execute(&format!("ALTER TABLE {s}.t ALTER COLUMN a TYPE bigint;"))
+            .await
+            .is_err(),
+        "an input does not"
+    );
+    drop_schema(&mut db, &s).await;
+    db.drop().await;
+}
+
 /// A stored generated column is read from DDL written by hand as the
 /// generated column it is, rebuilt from that read in another database, read
 /// back the same, and its expression changed as a typed plan that recomputes
