@@ -4875,6 +4875,23 @@ async fn schema_grantor_case(route: SchemaGrantorRoute) {
     );
     drop(observer);
     assert_review_closing_matches_target(&mut target, &closing, &key).await;
+    // Re-read as the original deployer after DDL. A catalog-only oracle would
+    // miss an incorrect projection of the grouped schema grant's authorization.
+    let schemas = vec![cases::SCHEMA.to_owned()];
+    let (_, fresh_authorization) = target
+        .scope_facts(&schemas, &[], &schemas, &[])
+        .await
+        .unwrap();
+    let selected =
+        pbps_db::fingerprint::EnvironmentFingerprintKey::from_file(&key.root.join("key")).unwrap();
+    let fresh = fresh_authorization
+        .persisted(&selected, &ChangeSet::default())
+        .unwrap();
+    assert_eq!(
+        fresh.before,
+        result.evidence.authorization().after,
+        "the sealed closing authorization equals the same actor's fresh post-DDL context"
+    );
     target.check().await.unwrap();
     drop(target);
     setup(&[]).await;
