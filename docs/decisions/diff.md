@@ -1152,7 +1152,10 @@ approval would run the operator's code, so the probe reports it unchecked.
 
 Its declared text is recorded, advanced and overlaid as a default's is
 (`DeclaredExpressions::generated`), and compared by presence (SPEC §7.6),
-since the engine respells `a * 3` as `(a * 3)`. A column the expression
+since the engine respells `a * 3` as `(a * 3)`. Across an apply, two
+read-backs are compared outright: a planned expression change excuses a
+new expression and nothing else, and a column that stops being generated or
+changes kind is movement (SPEC §7.6). A column the expression
 reads keeps its name in the declared text across a rename, as a filter
 does. The engine rewrites what it stores, and the declaration spells the new
 name. Around a function rebuild, a generated column that calls the function
