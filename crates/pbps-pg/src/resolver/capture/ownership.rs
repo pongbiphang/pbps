@@ -306,6 +306,75 @@ pub(super) fn classify(
                 )?;
             }
         }
+        if table
+            .primary_key
+            .as_ref()
+            .is_some_and(|key| key.name.is_none())
+            && owned.get(&table_id) == Some(&table_owner)
+        {
+            // The declaration leaves the spelling to PostgreSQL (DEC-61).
+            // Only the unique primary constraint of this qualified table and
+            // its measured internal index edge can supply the missing root.
+            let mut primary = None;
+            for object in capture.inputs.keys().filter(|object| {
+                object.class == "pg_constraint" && object.signature.get(1) == Some(&table_id)
+            }) {
+                if property(capture, object, "contype")? != Some("p") {
+                    continue;
+                }
+                if primary.replace(object.clone()).is_some() {
+                    return Err(Uncovered::object(
+                        &table_id,
+                        "declared unnamed primary key has multiple catalog roots",
+                    ));
+                }
+            }
+            let constraint = primary.ok_or_else(|| {
+                Uncovered::object(&table_id, "declared unnamed primary key is absent")
+            })?;
+            let fail =
+                || Uncovered::object(&constraint, "primary key index provenance is unreadable");
+            let constraint_row = capture.inputs.get(&constraint).ok_or_else(&fail)?;
+            let parent: ObjectIdentity = serde_json::from_value(
+                constraint_row
+                    .properties
+                    .get("conrelid")
+                    .cloned()
+                    .ok_or_else(&fail)?,
+            )
+            .map_err(|_| fail())?;
+            let index: ObjectIdentity = serde_json::from_value(
+                constraint_row
+                    .properties
+                    .get("conindid")
+                    .cloned()
+                    .ok_or_else(&fail)?,
+            )
+            .map_err(|_| fail())?;
+            let index_row = capture.inputs.get(&index).ok_or_else(&fail)?;
+            let metadata = identity("pg_index", Vec::new(), vec![index.clone()]);
+            let metadata_row = capture.inputs.get(&metadata).ok_or_else(&fail)?;
+            if parent != table_id
+                || index.class != "pg_class"
+                || !matches!(
+                    index_row.properties.get("relkind").and_then(Value::as_str),
+                    Some("i" | "I")
+                )
+                || metadata_row.properties.get("indrelid")
+                    != Some(&serde_json::to_value(&table_id).map_err(|_| fail())?)
+                || metadata_row.properties.get("indexrelid")
+                    != Some(&serde_json::to_value(&index).map_err(|_| fail())?)
+                || metadata_row.properties.get("indisprimary") != Some(&Value::Bool(true))
+                || !capture.inputs.contains_key(&identity(
+                    "pg_depend",
+                    vec!["i".into()],
+                    vec![index, constraint.clone()],
+                ))
+            {
+                return Err(fail());
+            }
+            assign(&mut owned, constraint, table_owner)?;
+        }
     }
     for (id, module) in &recorded.schema.modules {
         match (id, module.kind) {

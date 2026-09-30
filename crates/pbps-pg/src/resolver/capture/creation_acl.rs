@@ -6,7 +6,7 @@
 
 use super::{CandidateClass, CandidateSet, CapturedInputs};
 use pbps_db::resolver::capture::ObjectIdentity;
-use pbps_model::resolver::ManifestError;
+use pbps_model::resolver::{ManifestError, Surface};
 use pbps_model::{Change, ChangeSet, GrantTarget, ModuleId, Permission, PublicAccess, RoutineId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -98,6 +98,7 @@ fn builtin(owner: &ObjectIdentity, kind: &str, major: u32) -> Result<Vec<AclEntr
             }
         }
         "S" => &["SELECT", "UPDATE", "USAGE"],
+        "n" => &["CREATE", "USAGE"],
         "f" => &["EXECUTE"],
         "T" => &["USAGE"],
         _ => return Err(ManifestError::Invalid),
@@ -152,6 +153,135 @@ pub(super) fn creation_acl(
         return Ok(Value::Null);
     }
     Ok(explicit(merged))
+}
+
+/// Apply only the final ordered ACL statements for a retained, independently
+/// qualified subject. Scratch never received the target's object ACL, so its
+/// final ACL cannot stand in for either the opening entries or a typed delta.
+/// Return None when no statement addresses this subject.
+pub(super) fn retained_acl_after_plan(
+    opening: &CapturedInputs,
+    compiled: &CapturedInputs,
+    compiled_object: &ObjectIdentity,
+    source: &ObjectIdentity,
+    surface: &Surface,
+    field: &str,
+    changes: &ChangeSet,
+) -> Result<Option<Value>, ManifestError> {
+    let row = opening
+        .inputs
+        .get(source)
+        .ok_or(ManifestError::Incomplete)?;
+    let original = row.properties.get(field).ok_or(ManifestError::Incomplete)?;
+    let owner_field = match field {
+        "relacl" => "relowner",
+        "proacl" => "proowner",
+        "nspacl" => "nspowner",
+        _ => return Err(ManifestError::Invalid),
+    };
+    let owner: ObjectIdentity = serde_json::from_value(
+        row.properties
+            .get(owner_field)
+            .cloned()
+            .ok_or(ManifestError::Incomplete)?,
+    )
+    .map_err(|_| ManifestError::Invalid)?;
+    if owner.class != "pg_authid" || owner.name.len() != 1 {
+        return Err(ManifestError::Invalid);
+    }
+    let kind = match field {
+        "relacl" => "r",
+        "proacl" => "f",
+        "nspacl" => "n",
+        _ => return Err(ManifestError::Invalid),
+    };
+    let mut acl = if original.is_null() {
+        merge(builtin(&owner, kind, opening.major())?)
+    } else {
+        let entries: Vec<AclEntry> =
+            serde_json::from_value(original.clone()).map_err(|_| ManifestError::Invalid)?;
+        merge(entries)
+    };
+    let mut changed = false;
+    for step in &changes.changes {
+        match &step.change {
+            Change::PublicExecution {
+                routine, access, ..
+            } if matches!(surface, Surface::Module(ModuleId::Routine(named)) if named == routine) =>
+            {
+                changed = true;
+                let key = (owner.clone(), public(), "EXECUTE".into());
+                match access {
+                    PublicAccess::Kept => {
+                        acl.entry(key).or_insert(false);
+                    }
+                    PublicAccess::Revoked => {
+                        acl.remove(&key);
+                    }
+                }
+            }
+            Change::Grant {
+                role: grantee,
+                target,
+                permissions,
+            }
+            | Change::Revoke {
+                role: grantee,
+                target,
+                permissions,
+            } if match (surface, target) {
+                (Surface::Namespace(name), GrantTarget::Schema(target)) => name == target,
+                (Surface::Table(table), GrantTarget::Object(target)) => {
+                    table == target && !permissions.contains(&Permission::Execute)
+                }
+                (Surface::Module(ModuleId::Named(name)), GrantTarget::Object(target)) => {
+                    name == target && !permissions.contains(&Permission::Execute)
+                }
+                (Surface::Module(ModuleId::Routine(routine)), target) => {
+                    addresses_routine(compiled, compiled_object, target, permissions, routine)?
+                }
+                _ => false,
+            } =>
+            {
+                changed = true;
+                for permission in permissions {
+                    let privilege = match permission {
+                        Permission::Select => "SELECT",
+                        Permission::Insert => "INSERT",
+                        Permission::Update => "UPDATE",
+                        Permission::Delete => "DELETE",
+                        Permission::References => "REFERENCES",
+                        Permission::Execute => "EXECUTE",
+                        Permission::Usage => "USAGE",
+                        Permission::Create => "CREATE",
+                        Permission::Truncate => "TRUNCATE",
+                        Permission::Trigger => "TRIGGER",
+                        Permission::Maintain => "MAINTAIN",
+                        Permission::Alter | Permission::ViewDefinition => {
+                            return Err(ManifestError::Invalid);
+                        }
+                    };
+                    let grantee = role(grantee);
+                    let key = (owner.clone(), grantee.clone(), privilege.into());
+                    if matches!(&step.change, Change::Grant { .. }) {
+                        acl.entry(key).or_insert(false);
+                    } else {
+                        if acl.keys().any(|(grantor, recipient, held)| {
+                            recipient == &grantee && held == privilege && grantor != &owner
+                        }) {
+                            // The emitter's REVOKE selects one grantor. Its
+                            // choice is not derivable from a different grantor's
+                            // ACL row, so do not claim that row was removed.
+                            return Err(ManifestError::Incomplete);
+                        }
+                        acl.remove(&key);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(changed.then(|| explicit(acl)))
 }
 
 fn explicit(acl: BTreeMap<AclKey, bool>) -> Value {
@@ -219,10 +349,19 @@ pub(super) fn routine_acl_after_plan(
 ) -> Result<Value, ManifestError> {
     let owner = role(owner_name);
     let created = creation_acl(captured, owner_name, namespace, "f")?;
-    let mut creates = changes.changes.iter().enumerate().filter_map(|(index, step)| {
-        matches!(&step.change, Change::CreateModule { id: ModuleId::Routine(r), .. } if r == routine)
+    let mut creates = changes
+        .changes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, step)| {
+            matches!(
+                &step.change,
+                Change::CreateModule { id: ModuleId::Routine(r), .. }
+                    | Change::AlterModule { id: ModuleId::Routine(r), .. }
+                    if r == routine
+            )
             .then_some(index)
-    });
+        });
     let create = creates.next().ok_or(ManifestError::Incomplete)?;
     if creates.next().is_some() {
         return Err(ManifestError::Invalid);
