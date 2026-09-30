@@ -60,9 +60,11 @@ fn null_column(column: &str) -> DbError {
 ///
 /// One integer rather than the three-part string, because the only questions
 /// asked of it are comparisons and `version()` is prose.
-pub async fn server_version_num(conn: &mut Conn) -> Result<i64, DbError> {
+pub async fn server_version_num(
+    conn: &mut impl pbps_db::transport::QueryConnection,
+) -> Result<i64, DbError> {
     let rows = conn
-        .query("SELECT current_setting('server_version_num')::int8 AS num")
+        .query("SELECT pg_catalog.current_setting('server_version_num')::pg_catalog.int8 AS num")
         .await?;
     number(rows.first().ok_or_else(|| null_column("num"))?, "num")
 }

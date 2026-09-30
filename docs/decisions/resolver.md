@@ -1129,3 +1129,38 @@ must qualify the mapping, including engine-internal records. Raw PG catalog
 capture records ownership as unqualified: useful read evidence, no authority to
 change a record. The complete qualified producer/mapping remains #615. No
 optional default turns omitted or unknown ownership into permission.
+
+
+<a id="dec-1302-1"></a>
+
+**DEC-1302.1. A PG16 supplied server names a child-only storage profile and
+proves major 16 on its qualified administrative channel.** The pinned PostgreSQL
+16 image declares a VOLUME at `/var/lib/postgresql/data`: putting a tmpfs at its
+parent leaves an anonymous host-backed child, which both the daemon and the
+complete kernel table must refuse. A real Docker 29.8.1 measurement instead
+mounted one fresh tmpfs at that exact child, with root `/`, rw/nosuid/nodev/noexec,
+UID/GID 999 and mode 700. The engine reported `160015` and data directory
+`/var/lib/postgresql/data/run-data`; the daemon had no volume/bind Mounts and
+owned cleanup was confirmed. This storage observation is not resolver evidence
+or the held producer's supplied acceptance.
+
+`linux-dedicated-pg16-v1` therefore names that exact child layout for PostgreSQL
+only. Its fixed bootstrap uses `/usr/lib/postgresql/16/bin`. Admission first
+selects the explicit name and Driver, preserves process separation and every
+daemon/kernel control, then reads the numeric version through the already
+qualified administrative StreamConn. Only `160000 <= server_version_num < 170000`
+meets the new profile. A basename or image tag cannot supply this observation;
+unreadable/null/query-error results refuse through the existing admission
+cleanup, retaining any unconfirmed forwarder name. The existing sealed query
+primitive lets the numeric engine reader answer without exposing transport
+internals or adding version to InstanceObservation.
+
+Both existing `linux-dedicated-v1` layouts remain unchanged: PostgreSQL's parent
+storage and SQL Server's storage, identities and bounds acquire no new version
+query or requirement. Every later runtime/channel check retains the selected
+profile and full current mount table; there is no accepted prefix, second
+writable storage mount or skipped volume row. Saved readers recognize the exact
+new name as a known contract, never an unknown name or an admission substitute.
+The fixed fixture selects pinned PG16/PG18 recipes explicitly, defaults to 18,
+and retains the ordinary SQL Server recipe. This does not admit a Podman-native
+daemon, arbitrary layouts, publish the held producer or enable resolved apply.

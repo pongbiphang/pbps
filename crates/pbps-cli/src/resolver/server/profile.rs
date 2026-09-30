@@ -1,4 +1,4 @@
-//! Named, versioned dedicated-server profiles, one per engine.
+//! Named, versioned dedicated-server profiles for measured engine layouts.
 //!
 //! A supplied server is not qualified by its URL, its separate database or an
 //! operator's assertion. The operator names the externally enforced runtime
@@ -37,6 +37,9 @@ pub(crate) struct ServerProfile {
     /// The one writable place the engine keeps its files: a tmpfs the
     /// container runtime created for it, so no host path is in the container.
     pub storage_path: &'static str,
+    /// A version-specific layout is checked on the qualified admin channel;
+    /// legacy layouts acquire no new version requirement (DEC-1302.1).
+    pub postgres_major: Option<u16>,
     pub resources: ResourceCeilings,
     /// The bound the whole run may occupy on the supplied server. Past it
     /// the next check refuses and the caller's exit path removes the
@@ -45,6 +48,16 @@ pub(crate) struct ServerProfile {
     pub lifetime: Duration,
     /// The administrative database the supplied credentials connect to.
     pub maintenance_database: &'static str,
+}
+
+impl ServerProfile {
+    /// The same decision admission uses after the engine reports its version.
+    pub(crate) fn accepts_postgres_version(&self, server_version_num: i64) -> bool {
+        self.postgres_major.is_none_or(|major| {
+            let first = i64::from(major) * 10_000;
+            (first..first + 10_000).contains(&server_version_num)
+        })
+    }
 }
 
 /// Every supported profile. The list is deliberately short: each entry names
@@ -59,6 +72,27 @@ static PROFILES: &[ServerProfile] = &[
         capabilities: 0,
         port: 5432,
         storage_path: "/var/lib/postgresql",
+        postgres_major: None,
+        resources: ResourceCeilings {
+            memory: 8 * 1024 * 1024 * 1024,
+            nano_cpus: 4_000_000_000,
+            pids: 2048,
+        },
+        lifetime: Duration::from_secs(3600),
+        maintenance_database: "postgres",
+    },
+    // The PG16 image declares this child VOLUME. A parent tmpfs leaves that
+    // host-backed volume visible; one exact child tmpfs replaces it (DEC-1302.1).
+    ServerProfile {
+        name: "linux-dedicated-pg16-v1",
+        driver: Driver::Postgres,
+        executable: "postgres",
+        uid: 999,
+        gid: 999,
+        capabilities: 0,
+        port: 5432,
+        storage_path: "/var/lib/postgresql/data",
+        postgres_major: Some(16),
         resources: ResourceCeilings {
             memory: 8 * 1024 * 1024 * 1024,
             nano_cpus: 4_000_000_000,
@@ -82,6 +116,7 @@ static PROFILES: &[ServerProfile] = &[
         capabilities: 0x400,
         port: 1433,
         storage_path: "/var/opt/mssql",
+        postgres_major: None,
         resources: ResourceCeilings {
             memory: 8 * 1024 * 1024 * 1024,
             nano_cpus: 4_000_000_000,
@@ -382,7 +417,10 @@ mod tests {
         assert!(supported("linux-dedicated-v1", Driver::Mssql).is_some());
         assert!(supported("linux-dedicated-v2", Driver::Postgres).is_none());
         assert!(supported("", Driver::Mssql).is_none());
-        assert_eq!(implemented(Driver::Postgres), ["linux-dedicated-v1"]);
+        assert_eq!(
+            implemented(Driver::Postgres),
+            ["linux-dedicated-pg16-v1", "linux-dedicated-v1"]
+        );
     }
 
     #[test]

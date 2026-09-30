@@ -89,6 +89,13 @@ and closed between two checks still ends the run. Run-owned resources are one
 uniquely named database and login, removed on every exit path, with
 unconfirmed removals reporting exactly those names.
 
+The additional PostgreSQL-only `linux-dedicated-pg16-v1` profile names one exact
+child storage tmpfs at `/var/lib/postgresql/data` and requires actual major 16
+on its already qualified administrative channel before admission or scratch
+DDL (DEC-1302.1). The existing PG18/MSSQL layouts and all continued runtime
+checks remain. The fixed fixture defaults to PG18 and selects PG16 explicitly
+with `--pg-major 16`; this prerequisite does not publish the held #1274 producer.
+
 This is the lifecycle and exclusivity portion of ADR cases 6, 11, 13, 14 and
 19–21 for supplied servers. It is not engine build or deployment-context
 qualification (#610/#611), source handling (#617) or binding evidence: no

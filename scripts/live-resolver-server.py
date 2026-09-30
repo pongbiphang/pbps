@@ -2,7 +2,7 @@
 """Qualify the dedicated scratch-server profile against actual engines.
 
 Builds disposable deployments on a native Linux host: a TLS target, one
-supplied scratch server contained exactly as `linux-dedicated-v1` requires, an
+supplied scratch server contained exactly as its named profile requires, an
 alias endpoint whose container *is* the target's, and one whose container is
 on a bridge network. Requires root, because reading another service's process,
 namespace and cgroup facts does, and a container runtime on the Docker API.
@@ -30,6 +30,11 @@ IMAGES = {
     "pg": "postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280",
     "mssql": "mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1",
 }
+PG_IMAGES = {
+    16: "postgres@sha256:485935f94cc7165afa896978809c37b592dc07f0a37d2c8f645f12412d0212c8",
+    18: IMAGES["pg"],
+}
+PG_PROFILES = {16: "linux-dedicated-pg16-v1", 18: "linux-dedicated-v1"}
 PASSWORD = "Pbps!DedicatedFixture12345"
 MARKER = "pbps_marker_preexisting"
 ENGINE_UID = {"pg": 999, "mssql": 10001}
@@ -114,6 +119,32 @@ rm /var/lib/postgresql/pw
 exec /usr/lib/postgresql/18/bin/postgres -D /var/lib/postgresql/run-data \
   -c listen_addresses=127.0.0.1 -c unix_socket_directories=
 """
+
+
+# One child tmpfs replaces the PG16 image's declared VOLUME (DEC-1302.1).
+# Keep the existing PG18 parent recipe unchanged instead of adding a mount.
+PG_STORAGE = {
+    16: "/var/lib/postgresql/data:rw,nosuid,nodev,noexec,size=268435456,uid=999,gid=999,mode=700",
+    18: STORAGE["pg"],
+}
+PG_BOOT = {
+    16: """
+set -e
+umask 077
+printf '%s' "$PBPS_FIXTURE_PASSWORD" > /var/lib/postgresql/data/pw
+/usr/lib/postgresql/16/bin/initdb \
+  -D /var/lib/postgresql/data/run-data --auth-local=reject --auth-host=scram-sha-256 \
+  --pwfile=/var/lib/postgresql/data/pw >/dev/null
+rm /var/lib/postgresql/data/pw
+exec /usr/lib/postgresql/16/bin/postgres -D /var/lib/postgresql/data/run-data \
+  -c listen_addresses=127.0.0.1 -c unix_socket_directories=
+""",
+    18: POSTGRES_BOOT,
+}
+
+
+def fixture_image(engine, pg_major=18):
+    return PG_IMAGES[pg_major] if engine == "pg" else IMAGES[engine]
 
 
 def run(*args, **kwargs):
@@ -215,18 +246,20 @@ def ready(container, engine, start):
         await_engine(container, engine)
 
 
-def start_dedicated(engine, name, owned, network=None, empty_runtime_files=False):
-    """One supplied server, contained as `linux-dedicated-v1` requires."""
+def start_dedicated(engine, name, owned, network=None, empty_runtime_files=False, pg_major=18):
+    """One supplied server, contained as its explicit measured profile requires."""
     owned.append(name)
     recipe = list(RECIPE)
     if network is not None:
         recipe[recipe.index("none")] = network
+    storage = PG_STORAGE[pg_major] if engine == "pg" else STORAGE[engine]
+    image = fixture_image(engine, pg_major)
     common = ["--name", name, "--label", "io.pbps.resolver.fixture=dedicated-server",
-              "--pull", "never", *recipe, "--tmpfs", STORAGE[engine]]
+              "--pull", "never", *recipe, "--tmpfs", storage]
     if engine == "pg":
         run("docker", "create", *common, "--user", "999:999", "--cap-drop", "ALL",
             "-e", f"PBPS_FIXTURE_PASSWORD={PASSWORD}",
-            "--entrypoint", "/bin/bash", IMAGES[engine], "-ec", POSTGRES_BOOT, **QUIET)
+            "--entrypoint", "/bin/bash", image, "-ec", PG_BOOT[pg_major], **QUIET)
     else:
         # sqlservr carries cap_net_bind_service as a file capability, so an
         # empty bounding set makes its exec fail outright. The profile's
@@ -235,7 +268,7 @@ def start_dedicated(engine, name, owned, network=None, empty_runtime_files=False
             "--cap-drop", "ALL", "--cap-add", "NET_BIND_SERVICE",
             "-e", "ACCEPT_EULA=Y", "-e", f"MSSQL_SA_PASSWORD={PASSWORD}",
             "-e", "MSSQL_MEMORY_LIMIT_MB=1024",
-            "--entrypoint", "/bin/bash", IMAGES[engine], "-ec", MSSQL_BOOT, **QUIET)
+            "--entrypoint", "/bin/bash", image, "-ec", MSSQL_BOOT, **QUIET)
     if empty_runtime_files:
         # Docker's API-only NetworkDisabled layout leaves all three runtime
         # files empty while the kernel UTS names remain observable (#804).
@@ -276,7 +309,7 @@ def started(name):
         raise RuntimeError(f"owned fixture {name} did not start")
 
 
-def start_target(engine, name, root, owned):
+def start_target(engine, name, root, owned, pg_major=18):
     owned.append(name)
     if engine == "pg":
         environment = ["-e", f"POSTGRES_PASSWORD={PASSWORD}"]
@@ -293,7 +326,7 @@ def start_target(engine, name, root, owned):
             "tlskey=/tmp/peer.key\nforceencryption=0\n")
     run("docker", "create", "--name", name, "--pull", "never", "--network", "host",
         "--user", "0", "--memory", "3g", "--cpus", "2", "--pids-limit", "512",
-        *environment, "--entrypoint", "/bin/bash", IMAGES[engine], "-ec", boot, **QUIET)
+        *environment, "--entrypoint", "/bin/bash", fixture_image(engine, pg_major), "-ec", boot, **QUIET)
     for leaf in ("peer.key", "peer.pem"):
         run("docker", "cp", str(root / leaf), name + ":/tmp/" + leaf, **QUIET)
     if engine == "mssql":
@@ -338,8 +371,9 @@ def describe(container):
         print(f"== {label} ==\n{output}", end="", flush=True)
 
 
-def endpoint(container):
-    return (f"profile=linux-dedicated-v1 container={container} daemon={DOCKER_SOCKET} "
+def endpoint(container, pg_major=18):
+    profile = PG_PROFILES[pg_major] if ENGINE == "pg" else "linux-dedicated-v1"
+    return (f"profile={profile} container={container} daemon={DOCKER_SOCKET} "
             f"user={'postgres' if ENGINE == 'pg' else 'sa'} password={PASSWORD}")
 
 
@@ -360,15 +394,16 @@ ENGINE = None
 def fixture(args, binary, root, owned):
     global ENGINE
     ENGINE = engine = args.engine
+    pg_major = args.pg_major
     certificates(root)
     unique = uuid.uuid4().hex[:12]
 
     target = f"pbps-dedicated-target-{unique}"
-    start_target(engine, target, root, owned)
+    start_target(engine, target, root, owned, pg_major=pg_major)
     supplied = f"pbps-dedicated-server-{unique}"
-    start_dedicated(engine, supplied, owned)
-    ready(target, engine, lambda: start_target(engine, target, root, owned))
-    ready(supplied, engine, lambda: start_dedicated(engine, supplied, owned))
+    start_dedicated(engine, supplied, owned, pg_major=pg_major)
+    ready(target, engine, lambda: start_target(engine, target, root, owned, pg_major=pg_major))
+    ready(supplied, engine, lambda: start_dedicated(engine, supplied, owned, pg_major=pg_major))
     describe(supplied)
     # A pre-existing database no run may touch, and the counter's baseline.
     statement(supplied, engine, f"CREATE DATABASE {MARKER}")
@@ -388,11 +423,12 @@ def fixture(args, binary, root, owned):
     environment = dict(
         PBPS_SERVER_FIXTURE="1",
         PBPS_SERVER_DRIVER=engine,
+        PBPS_SERVER_PG_MAJOR=str(pg_major),
         PBPS_NATIVE_CONNECTION=primary,
         PBPS_NATIVE_SERVICE_PID=service_pid(target, EXECUTABLE[engine]),
-        PBPS_SERVER_ENDPOINT=endpoint(supplied),
-        PBPS_SERVER_ALIAS_ENDPOINT=endpoint(target),
-        PBPS_SERVER_EXPOSED_ENDPOINT=endpoint(exposed),
+        PBPS_SERVER_ENDPOINT=endpoint(supplied, pg_major),
+        PBPS_SERVER_ALIAS_ENDPOINT=endpoint(target, pg_major),
+        PBPS_SERVER_EXPOSED_ENDPOINT=endpoint(exposed, pg_major),
         PBPS_SERVER_MARKER_DATABASE=MARKER,
         SSL_CERT_FILE=str(root / "ca.pem"),
         SSL_CERT_DIR=str(root / "empty-ca"),
@@ -406,18 +442,18 @@ def fixture(args, binary, root, owned):
     for test, empty in cases:
         empty_server = f"pbps-dedicated-empty-{unique}"
         if empty:
-            start_dedicated(engine, empty_server, owned, empty_runtime_files=True)
+            start_dedicated(engine, empty_server, owned, empty_runtime_files=True, pg_major=pg_major)
             ready(empty_server, engine, lambda: start_dedicated(
-                engine, empty_server, owned, empty_runtime_files=True))
+                engine, empty_server, owned, empty_runtime_files=True, pg_major=pg_major))
             statement(empty_server, engine, f"CREATE DATABASE {MARKER}")
         # The exposed control is a second supplied server whose runtime does
         # not give it a private network; everything else about it qualifies.
         # Started only for its own test and removed after it, so that only
         # one extra engine's startup is ever in flight.
         if test == exposing:
-            start_dedicated(engine, exposed, owned, network="bridge")
+            start_dedicated(engine, exposed, owned, network="bridge", pg_major=pg_major)
             ready(exposed, engine, lambda: start_dedicated(engine, exposed, owned,
-                                                           network="bridge"))
+                                                           network="bridge", pg_major=pg_major))
         # One test needs a process the engine never started, sharing its
         # namespaces: `docker exec` joins them without becoming a descendant,
         # which is exactly the shape a subtree walk cannot see. Root, so it
@@ -431,12 +467,12 @@ def fixture(args, binary, root, owned):
             owned.append(joined)
             run("docker", "run", "-d", "--name", joined, "--pull", "never",
                 "--network", "container:" + supplied, "--entrypoint", "/bin/sleep",
-                IMAGES[engine], "120", **QUIET)
+                fixture_image(engine, pg_major), "120", **QUIET)
         command = [binary, "--ignored", "--exact",
                    f"resolver::server::live_tests::{test}", "--nocapture"]
         selected = dict(os.environ, **environment)
         if empty:
-            selected["PBPS_SERVER_ENDPOINT"] = endpoint(empty_server)
+            selected["PBPS_SERVER_ENDPOINT"] = endpoint(empty_server, pg_major)
         selected["PBPS_SERVER_EMPTY_RUNTIME_FILES"] = "1" if empty else "0"
         if test.startswith("guard_limits::"):
             # Only this test's observer view hides an owned guard's limits.
@@ -473,7 +509,11 @@ def main():
     parser.add_argument("--test-binary", required=True,
                         help="the pbps-cli unit test binary carrying the live tests")
     parser.add_argument("--socket", default="/var/run/docker.sock")
+    parser.add_argument("--pg-major", type=int, choices=[16, 18], default=18,
+                        help="the pinned PostgreSQL version and supplied layout (default: 18)")
     args = parser.parse_args()
+    if args.engine != "pg" and args.pg_major != 18:
+        parser.error("--pg-major 16 requires the PostgreSQL engine")
     global DOCKER_SOCKET
     DOCKER_SOCKET = args.socket
     if os.geteuid() != 0:

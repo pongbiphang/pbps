@@ -285,6 +285,24 @@ executable carries that file capability and an empty bounding set makes its
 exec fail. Both recipes, including their complete containment options, live
 in [`live-resolver-server.py`](../scripts/live-resolver-server.py).
 
+The explicitly selected PostgreSQL profile `linux-dedicated-pg16-v1` keeps all
+these premises and changes only its one storage target to
+`/var/lib/postgresql/data`. Its fresh tmpfs has root `/`, rw/nosuid/nodev/noexec,
+UID/GID 999 and mode 700; the parent remains part of the read-only image. This
+replaces the pinned PG16 image's declared child VOLUME instead of hiding it
+under a parent tmpfs or accepting another writable mount (DEC-1302.1).
+Admission also requires the actual numeric PostgreSQL major to be 16, read
+through the already qualified administrative channel before admission succeeds
+or scratch DDL. Missing, null or unreadable results and other majors refuse
+through the ordinary forwarder cleanup path. Existing `linux-dedicated-v1`
+PostgreSQL and SQL Server paths acquire no new major query or requirement.
+
+The retained PG16 storage measurement used 1 GiB, one CPU and 256 PIDs; the
+maintained fixture uses its existing 3 GiB, two CPUs and 512 PIDs, within the
+profile's unchanged ceilings. These recipes are not byte-identical evidence:
+integrated acceptance must record its actual daemon/kernel/resource facts.
+The storage measurement alone does not qualify the profile or producer.
+
 For the measured Podman 4.9 component, which rejects Docker's tmpfs `uid`
 option, the alternative is a fresh root-owned tmpfs, `chown` of its root to
 the final engine identity, then `setpriv` **before** password-file preparation
@@ -598,7 +616,13 @@ namespace. The containerized inspectors need `SYS_ADMIN` for the supported UTS
 read; the missing-permission case must refuse. These test access paths are not
 production adapters.
 
-`scripts/live-resolver-server.py <pg|mssql>` builds a disposable TLS target and
+`scripts/live-resolver-server.py <pg|mssql>` defaults to the existing pinned
+PG18/SQL Server recipes. With `pg --pg-major 16`, target, supplied server,
+retries, empty/exposed controls and profile endpoints all select the pinned
+PG16 recipe: `/usr/lib/postgresql/16/bin` with data at
+`/var/lib/postgresql/data/run-data`. `--pg-major 18` retains the default parent
+layout; no image-tag or Driver-only inference chooses a different profile.
+The fixture builds a disposable TLS target and
 a supplied scratch server this script — not pbps — starts from the documented
 recipe, plus an alias endpoint naming the target's own container and, for one
 test, a second supplied server on an ordinary bridge network. It compiles a
