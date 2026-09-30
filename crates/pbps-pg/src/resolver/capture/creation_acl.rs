@@ -49,7 +49,6 @@ fn grantor_for(
     owner: &ObjectIdentity,
     acl: &BTreeMap<AclKey, bool>,
     privileges: &[&str],
-    field: &str,
 ) -> Result<ObjectIdentity, ManifestError> {
     if privileges.is_empty() {
         return Err(ManifestError::Invalid);
@@ -69,17 +68,6 @@ fn grantor_for(
     // The current role is the first eligible role in select_best_grantor.
     // This also wins over an inherited owner when it holds the full option.
     if holds_all(&actor) {
-        // The separate schema-authorization projection still gives inherited
-        // ownership precedence. Refuse only this conflicting schema shape;
-        // sealing two different postconditions would record a false success.
-        if field == "nspacl"
-            && authorization
-                .roles
-                .get(&owner.name[0])
-                .is_some_and(|attrs| attrs.inherits)
-        {
-            return Err(ManifestError::Incomplete);
-        }
         return Ok(actor);
     }
     let mut inherited = authorization
@@ -226,7 +214,6 @@ pub(super) fn retained_acl_after_plan(
     compiled_object: &ObjectIdentity,
     source: &ObjectIdentity,
     surface: &Surface,
-    field: &str,
     changes: &ChangeSet,
     authorization: &AuthorizationContext,
 ) -> Result<Option<Value>, ManifestError> {
@@ -234,13 +221,16 @@ pub(super) fn retained_acl_after_plan(
         .inputs
         .get(source)
         .ok_or(ManifestError::Incomplete)?;
-    let original = row.properties.get(field).ok_or(ManifestError::Incomplete)?;
-    let owner_field = match field {
-        "relacl" => "relowner",
-        "proacl" => "proowner",
-        "nspacl" => "nspowner",
+    // An independently qualified retained subject has exactly one ACL field.
+    // Derive it from its captured class instead of accepting a second caller
+    // choice that could name another property of the same subject.
+    let (field, owner_field, kind) = match source.class.as_str() {
+        "pg_class" => ("relacl", "relowner", "r"),
+        "pg_proc" => ("proacl", "proowner", "f"),
+        "pg_namespace" => ("nspacl", "nspowner", "n"),
         _ => return Err(ManifestError::Invalid),
     };
+    let original = row.properties.get(field).ok_or(ManifestError::Incomplete)?;
     let owner: ObjectIdentity = serde_json::from_value(
         row.properties
             .get(owner_field)
@@ -251,12 +241,6 @@ pub(super) fn retained_acl_after_plan(
     if owner.class != "pg_authid" || owner.name.len() != 1 {
         return Err(ManifestError::Invalid);
     }
-    let kind = match field {
-        "relacl" => "r",
-        "proacl" => "f",
-        "nspacl" => "n",
-        _ => return Err(ManifestError::Invalid),
-    };
     let mut acl = if original.is_null() {
         merge(builtin(&owner, kind, opening.major())?)
     } else {
@@ -272,7 +256,7 @@ pub(super) fn retained_acl_after_plan(
             } if matches!(surface, Surface::Module(ModuleId::Routine(named)) if named == routine) =>
             {
                 changed = true;
-                let grantor = grantor_for(authorization, &owner, &acl, &["EXECUTE"], field)?;
+                let grantor = grantor_for(authorization, &owner, &acl, &["EXECUTE"])?;
                 let key = (grantor, public(), "EXECUTE".into());
                 match access {
                     PublicAccess::Kept => {
@@ -314,13 +298,7 @@ pub(super) fn retained_acl_after_plan(
                 // PostgreSQL selects one grantor for a GRANT statement's whole
                 // privilege set; the emitter writes each REVOKE separately.
                 let grantor = if matches!(&step.change, Change::Grant { .. }) {
-                    Some(grantor_for(
-                        authorization,
-                        &owner,
-                        &acl,
-                        &privileges,
-                        field,
-                    )?)
+                    Some(grantor_for(authorization, &owner, &acl, &privileges)?)
                 } else {
                     None
                 };
@@ -328,7 +306,7 @@ pub(super) fn retained_acl_after_plan(
                     let selected = if let Some(grantor) = &grantor {
                         grantor.clone()
                     } else {
-                        grantor_for(authorization, &owner, &acl, &[privilege], field)?
+                        grantor_for(authorization, &owner, &acl, &[privilege])?
                     };
                     let key = (selected, role(grantee), privilege.into());
                     if grantor.is_some() {

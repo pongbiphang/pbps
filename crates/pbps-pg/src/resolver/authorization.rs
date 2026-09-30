@@ -476,7 +476,9 @@ impl RoleMap {
 /// A planned authorization change the plan performs before its DDL, applied
 /// to scratch so the deployer's effective privileges match what apply will
 /// see (SPEC §7.6). Only schema grants and revokes; role creation in a plan
-/// is refused by the emitter, so it cannot reach here.
+/// is refused by the emitter, so it cannot reach here. A GRANT's `privilege`
+/// retains the comma-separated mask of its one emitted SQL statement, whereas
+/// a REVOKE carries one privilege because the emitter splits those statements.
 #[derive(Debug, Clone)]
 pub struct PlannedGrant {
     pub role: String,
@@ -840,21 +842,22 @@ pub fn with_planned(
     grants: &[PlannedGrant],
 ) -> AuthorizationContext {
     for grant in grants {
-        // A grant the deployer holds no option for is still recorded, as the
-        // deployer's own: the engine would refuse or ignore it, so the
-        // reproduction lacks it, and the difference refuses the plan rather
-        // than certifying a grant that did not take.
-        let grantor = grantor_for(&context, &grant.schema, &grant.privilege)
-            .unwrap_or_else(|| context.principal.effective.clone());
+        let privileges = grant.privilege.split(", ").collect::<Vec<_>>();
+        // Select once for the whole GRANT statement, before any ACL entry is
+        // changed. A REVOKE has only one privilege in this ordered sequence.
+        // The qualified scope rejects Ambiguous before calling this projector;
+        // Missing still projects the actor so failed/partial scratch execution
+        // differs from the claimed authorization rather than certifying it.
+        let grantor = match grantor_choice(&context, &grant.schema, &privileges) {
+            GrantorChoice::Known(role) => role,
+            GrantorChoice::Missing | GrantorChoice::Ambiguous(_) => {
+                context.principal.effective.clone()
+            }
+        };
         let Some(schema) = context.schemas.get_mut(&grant.schema) else {
             continue;
         };
-        // A schema nobody granted anything on has a NULL ACL, read as no
-        // entries. The engine's first grant or revoke on it materializes the
-        // owner's default entries beside whatever it changes (measured on 18:
-        // `{owner=UC/owner,=U/owner}` after one `GRANT USAGE ... TO PUBLIC`),
-        // so the expected context must gain them too, or a valid first grant
-        // reads as an unexpected owner entry on scratch (finding on #688).
+        // A first GRANT/REVOKE materializes the owner's built-in entries.
         if schema.acl.is_empty() {
             let owner = schema.owner.clone();
             let mut defaults: Vec<Grant> = ["CREATE", "USAGE"]
@@ -868,119 +871,98 @@ pub fn with_planned(
             defaults.sort();
             schema.acl.insert(owner, defaults);
         }
-        let entry = schema.acl.entry(grant.role.clone()).or_default();
-        let had_option = entry
-            .iter()
-            .any(|g| g.privilege == grant.privilege && g.grantor == grantor && g.grantable);
-        entry.retain(|g| !(g.privilege == grant.privilege && g.grantor == grantor));
-        if !grant.revoke {
-            // A plain re-grant to a holder of the option changes nothing on
-            // the engine, so the option stays.
-            entry.push(Grant {
-                privilege: grant.privilege.clone(),
-                grantable: had_option,
-                grantor: grantor.clone(),
-            });
-            entry.sort();
-        }
-        if entry.is_empty() {
-            schema.acl.remove(&grant.role);
+        for privilege in privileges {
+            let entry = schema.acl.entry(grant.role.clone()).or_default();
+            let had_option = entry
+                .iter()
+                .any(|g| g.privilege == privilege && g.grantor == grantor && g.grantable);
+            entry.retain(|g| !(g.privilege == privilege && g.grantor == grantor));
+            if !grant.revoke {
+                // A plain re-grant does not clear an existing grant option.
+                entry.push(Grant {
+                    privilege: privilege.into(),
+                    grantable: had_option,
+                    grantor: grantor.clone(),
+                });
+                entry.sort();
+            }
+            if entry.is_empty() {
+                schema.acl.remove(&grant.role);
+            }
         }
     }
     recompute_schema_effective(&mut context);
     context
 }
 
-/// The role the engine records as grantor when the deployer grants or
-/// revokes `privilege` on `schema`: the owner when the deployer is the owner,
-/// a superuser, or inherits the owner; otherwise the deployer itself when it
-/// holds the option directly, or else the inherited role it holds it through.
-/// `None` when it holds no option at all.
-fn grantor_for(context: &AuthorizationContext, schema: &str, privilege: &str) -> Option<String> {
-    let deployer = &context.principal.effective;
-    let schema = context.schemas.get(schema)?;
-    let inherited: BTreeSet<&String> = context
-        .roles
-        .iter()
-        .filter(|(_, attrs)| attrs.inherits)
-        .map(|(role, _)| role)
-        .collect();
-    if context.principal.superuser || &schema.owner == deployer || inherited.contains(&schema.owner)
-    {
-        return Some(schema.owner.clone());
-    }
-    let holds = |role: &String| {
-        schema.acl.get(role).is_some_and(|grants| {
-            grants
-                .iter()
-                .any(|g| g.privilege == privilege && g.grantable)
-        })
-    };
-    if holds(deployer) {
-        return Some(deployer.clone());
-    }
-    inherited.into_iter().find(|role| holds(role)).cloned()
+/// The grantor decision for one emitted schema statement. Effective owner or
+/// superuser acts as owner; the current role's complete option mask wins over
+/// an inherited owner. Without verified traversal order, multiple inherited
+/// full-mask holders cannot be selected by spelling (DEC-483).
+enum GrantorChoice {
+    Known(String),
+    Missing,
+    Ambiguous(Vec<String>),
 }
 
-/// The planned grants whose grantor the engine would choose among several
-/// inherited option holders. `grantor_for` names one of them, but the
-/// engine's `select_best_grantor` walks the deployer's memberships in
-/// catalog order — measured on 18: of two inherited roles both holding
-/// `USAGE` with the option, the one created first is recorded, not the
-/// first by name — and the reproduction's roles are new catalog identities,
-/// so which one the target would record cannot be predicted from here. Such
-/// a context is refused before anything is built rather than guessed at: a
-/// wrong guess reads as an unexpected grantor on scratch and refuses the
-/// plan anyway, or fingerprints it under a grantor the target would not
-/// record (finding on #688). Each entry names the grant and the holders.
-pub fn ambiguous_grantors(context: &AuthorizationContext, grants: &[PlannedGrant]) -> Vec<String> {
-    let deployer = &context.principal.effective;
-    let inherited: BTreeSet<&String> = context
-        .roles
-        .iter()
-        .filter(|(_, attrs)| attrs.inherits)
-        .map(|(role, _)| role)
-        .collect();
-    let mut seen = BTreeSet::new();
-    let mut ambiguous = Vec::new();
-    for grant in grants {
-        if !seen.insert((grant.schema.clone(), grant.privilege.clone())) {
-            continue;
-        }
-        let Some(schema) = context.schemas.get(&grant.schema) else {
-            continue;
-        };
-        if context.principal.superuser
-            || &schema.owner == deployer
-            || inherited.contains(&schema.owner)
-        {
-            continue;
-        }
-        let holds = |role: &String| {
+fn grantor_choice(
+    context: &AuthorizationContext,
+    schema: &str,
+    privileges: &[&str],
+) -> GrantorChoice {
+    let Some(schema) = context.schemas.get(schema) else {
+        return GrantorChoice::Missing;
+    };
+    let actor = &context.principal.effective;
+    if context.principal.superuser || &schema.owner == actor {
+        return GrantorChoice::Known(schema.owner.clone());
+    }
+    let holds_all = |role: &String| {
+        privileges.iter().all(|privilege| {
             schema.acl.get(role).is_some_and(|grants| {
                 grants
                     .iter()
-                    .any(|g| g.privilege == grant.privilege && g.grantable)
+                    .any(|grant| grant.privilege == *privilege && grant.grantable)
             })
-        };
-        if holds(deployer) {
-            continue;
-        }
-        let holders: Vec<&str> = inherited
-            .iter()
-            .filter(|role| holds(role))
-            .map(|role| role.as_str())
-            .collect();
-        if holders.len() > 1 {
-            ambiguous.push(format!(
+        })
+    };
+    if holds_all(actor) {
+        return GrantorChoice::Known(actor.clone());
+    }
+    let inherited = context
+        .roles
+        .iter()
+        .filter(|(role, attrs)| attrs.inherits && role.as_str() != actor.as_str())
+        .filter(|(role, _)| *role == &schema.owner || holds_all(role))
+        .map(|(role, _)| role.clone())
+        .collect::<Vec<_>>();
+    match inherited.as_slice() {
+        [] => GrantorChoice::Missing,
+        [only] => GrantorChoice::Known(only.clone()),
+        _ => GrantorChoice::Ambiguous(inherited),
+    }
+}
+
+/// Report only statements whose inherited full-mask grantor is ambiguous.
+/// Apply each preceding typed statement to the private context before asking
+/// about the next, so a changed ACL cannot silently reuse an old decision.
+pub fn ambiguous_grantors(context: &AuthorizationContext, grants: &[PlannedGrant]) -> Vec<String> {
+    let mut projected = context.clone();
+    for grant in grants {
+        let privileges = grant.privilege.split(", ").collect::<Vec<_>>();
+        if let GrantorChoice::Ambiguous(holders) =
+            grantor_choice(&projected, &grant.schema, &privileges)
+        {
+            return vec![format!(
                 "{} on schema {} is held with the grant option through {}",
                 grant.privilege,
                 grant.schema,
                 holders.join(" and ")
-            ));
+            )];
         }
+        projected = with_planned(projected, std::slice::from_ref(grant));
     }
-    ambiguous
+    Vec::new()
 }
 
 /// Recomputes the deployer's effective USAGE/CREATE for each schema from the
