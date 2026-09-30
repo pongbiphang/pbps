@@ -2006,6 +2006,14 @@ pub trait Dialect {
         Vec::new()
     }
 
+    /// Whether a module is also a constraint under its own name in its
+    /// schema, which a retry that yields to constraints finds taken (#1112):
+    /// PostgreSQL's constraint trigger has a `pg_constraint` row. The default,
+    /// none, is right for an engine whose modules are never constraints.
+    fn declares_a_constraint(&self, _module: &Module) -> bool {
+        false
+    }
+
     /// The name the engine falls back to for each of
     /// [`Dialect::implicit_relation_names`], in the same order, when its first
     /// choice is taken and this is its `suffix`-th retry (#987). Two tables
@@ -2540,6 +2548,19 @@ pub fn check_index_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> 
                 .chain(table.checks.keys().map(String::as_str))
                 .map(move |name| ObjectName::new(table_name.schema.clone(), name))
         })
+        .chain(
+            schema
+                .modules
+                .iter()
+                .filter(|(_, module)| dialect.declares_a_constraint(module))
+                .filter_map(|(id, _)| match id {
+                    // A trigger's constraint is in its table's schema.
+                    ModuleId::Trigger { on, name } => {
+                        Some(ObjectName::new(on.schema.clone(), name.clone()))
+                    }
+                    ModuleId::Named(_) | ModuleId::Routine(_) => None,
+                }),
+        )
         .collect();
     let reach = fallback_reach(&claimants, None, &constraint_names, dialect);
     let mut reported = BTreeSet::new();

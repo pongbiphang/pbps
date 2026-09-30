@@ -872,6 +872,13 @@ impl Dialect for Postgres {
         out
     }
 
+    /// A constraint trigger has a `pg_constraint` row under its own name, in
+    /// its table's schema, which a primary key's index retry finds taken
+    /// (#1112). An ordinary trigger has none.
+    fn declares_a_constraint(&self, module: &pbps_model::Module) -> bool {
+        emit::is_constraint_trigger(module)
+    }
+
     /// `ChooseRelationName` retries with the number on the *label*, and cuts
     /// the table name again to fit it. Measured on 18.6, three 60-byte tables
     /// that generate one `_pkey` get `…_pkey`, then a 57-byte cut with
@@ -1475,7 +1482,8 @@ mod tests {
     /// generated name in play, so a declared index there is order-dependent
     /// and refused, with the key's own remedy. Negatives: without the named
     /// check `t_pkey1` is free, and an identity sequence's retry does not
-    /// look at constraints.
+    /// look at constraints. A constraint trigger named `t_pkey` counts as a
+    /// constraint; an ordinary trigger does not.
     #[test]
     fn a_named_constraint_at_a_keys_first_choice_puts_its_fallback_in_play() {
         use pbps_model::{
@@ -1565,6 +1573,40 @@ mod tests {
             )
             .is_empty(),
             "a sequence's retry does not look at constraint names"
+        );
+
+        // A constraint trigger is a constraint under its own name; an
+        // ordinary trigger is not.
+        let with_trigger = |definition: &str| {
+            let mut s = schema(table(true, false, Some("t_pkey1")), other(None));
+            s.modules.insert(
+                pbps_model::ModuleId::Trigger {
+                    on: TableName::new("app", "other"),
+                    name: "t_pkey".into(),
+                },
+                pbps_model::Module {
+                    kind: pbps_model::ModuleKind::Trigger,
+                    description: None,
+                    definition: definition.into(),
+                },
+            );
+            s
+        };
+        let found = pbps_dialect::check_index_names(
+            &with_trigger(
+                "CONSTRAINT AFTER INSERT ON app.other FOR EACH ROW EXECUTE FUNCTION app.f()",
+            ),
+            &pg,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("`app.t_pkey1`"), "{found:?}");
+        assert!(
+            pbps_dialect::check_index_names(
+                &with_trigger("AFTER INSERT ON app.other FOR EACH ROW EXECUTE FUNCTION app.f()"),
+                &pg
+            )
+            .is_empty(),
+            "an ordinary trigger has no constraint row"
         );
     }
 

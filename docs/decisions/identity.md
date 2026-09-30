@@ -612,8 +612,11 @@ to constraint names (#1112). PostgreSQL names it with `ChooseRelationName(...,
 isconstraint = true)`, so a check or foreign key already named `t_pkey`, in any
 table of the schema, sends an unnamed key to `t_pkey1` with no other generated
 name in play. Created after the key, the same check leaves the key its name
+(measured on 16 and 18). A constraint trigger is a constraint under its own
+name, in its table's schema, and does the same; an ordinary trigger does not
 (measured on 16 and 18). So for a key, the schema's declared constraint names
-count as taken without a claimant to take them. An identity sequence's retry
+and constraint-trigger names count as taken without a claimant to take them.
+The engine says which modules are constraints (`declares_a_constraint`). An identity sequence's retry
 looks at relations only, and they do not count for it. A declared name in any
 reach is refused. Its remedy is a landing claimant's own when taking that claimant out
 puts the name out of every reach. Each landing claimant is asked, since the

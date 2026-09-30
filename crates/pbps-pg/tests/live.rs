@@ -23843,9 +23843,10 @@ async fn a_generated_fallback_is_the_one_the_engine_uses_and_order_decides_it() 
 /// isconstraint = true)`, so a check named `t_pkey` on another table,
 /// created first, sends `t`'s unnamed key to `t_pkey1`. A declared index
 /// there then lands by order: after the key it fails with `42P07`, and with
-/// the key created first everything succeeds. An identity sequence's retry
-/// looks at relations only: a check named `t_id_seq` leaves the sequence
-/// its first choice.
+/// the key created first everything succeeds. A constraint trigger named
+/// `t_pkey` does the same, and an ordinary trigger does not. An identity
+/// sequence's retry looks at relations only: a check named `t_id_seq` leaves
+/// the sequence its first choice.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_named_constraint_sends_an_unnamed_key_to_its_fallback() {
@@ -23891,6 +23892,23 @@ async fn a_named_constraint_sends_an_unnamed_key_to_its_fallback() {
         .await
         .expect("t_pkey1 is free when the key came first");
     assert_eq!(text(&mut conn, &relations).await, "t_pkey,t_pkey1");
+
+    // A constraint trigger is a constraint under its own name, and sends the
+    // key on as the check did; an ordinary trigger of that name does not.
+    for (kind, expected) in [("CONSTRAINT TRIGGER", "t_pkey1"), ("TRIGGER", "t_pkey")] {
+        fresh(&mut conn, &s).await;
+        conn.execute(&format!(
+            "CREATE TABLE {s}.other (id integer); \
+             CREATE FUNCTION {s}.f() RETURNS trigger LANGUAGE plpgsql AS 'begin return null; end'; \
+             CREATE {kind} t_pkey AFTER INSERT ON {s}.other FOR EACH ROW EXECUTE FUNCTION {s}.f()"
+        ))
+        .await
+        .expect("the trigger");
+        conn.execute(&format!("CREATE TABLE {s}.t (id integer PRIMARY KEY)"))
+            .await
+            .expect("the keyed table");
+        assert_eq!(text(&mut conn, &relations).await, expected, "{kind}");
+    }
 
     // A sequence does not yield to a constraint's name.
     fresh(&mut conn, &s).await;
