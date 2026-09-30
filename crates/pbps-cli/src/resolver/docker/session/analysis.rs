@@ -8,6 +8,8 @@ use crate::resolver::native::{
     ExecutionLease, MqueueLease, ProcessLease, WorkloadPrivileges, guarded_tasks,
     observed_socket_holders, private_network,
 };
+#[cfg(test)]
+use crate::resolver::server::container_tests::relay_recovery::{self, Site};
 use crate::resolver::server::{self, Error, ScratchRun, ServerFailure, exclusivity};
 use pbps_db::Driver;
 use pbps_db::resolver::environment::DatabaseRecipe;
@@ -425,21 +427,25 @@ impl ContainerControl {
             super::super::profile::LIFETIME_SECS,
         )
         .map_err(|error| failed(converted(error), self.recovery_names()))?;
+        #[cfg(test)]
+        relay_recovery::before_prepare(Site::Admin, &name, &mut self.unconfirmed)
+            .map_err(|error| failed(converted(error), self.recovery_names()))?;
         let api = state
             .analysis_api
             .additional()
             .await
             .map_err(|error| failed(converted(error), self.recovery_names()))?;
-        self.pending_relay_name = Some(name);
-        let relay = match CandidateRun::start_launch(
+        self.pending_relay_name = Some(name.clone());
+        let start = CandidateRun::start_launch(
             api,
             state.image.clone(),
             owner,
             launch,
             super::super::profile::LIFETIME_SECS,
-        )
-        .await
-        {
+        );
+        #[cfg(test)]
+        let start = relay_recovery::start(Site::Admin, &name, start);
+        let relay = match start.await {
             Ok(relay) => relay,
             Err(error) => {
                 if error.recovery_names.is_empty() {
@@ -672,18 +678,21 @@ async fn remove_with_janitor(
             super::super::profile::LIFETIME_SECS,
         )
         .map_err(|_| ())?;
+        #[cfg(test)]
+        relay_recovery::before_prepare(Site::Janitor, &name, unconfirmed).map_err(|_| ())?;
         let api = state.analysis_api.additional().await.map_err(|_| ())?;
         let registration = unconfirmed.len();
         unconfirmed.push(name.clone());
-        let relay = match CandidateRun::start_launch(
+        let start = CandidateRun::start_launch(
             api,
             state.image.clone(),
             owner,
             launch,
             super::super::profile::LIFETIME_SECS,
-        )
-        .await
-        {
+        );
+        #[cfg(test)]
+        let start = relay_recovery::start(Site::Janitor, &name, start);
+        let relay = match start.await {
             Ok(relay) => relay,
             Err(error) => {
                 if error.recovery_names.is_empty() {
@@ -868,6 +877,7 @@ impl CandidateSession {
         crate::resolver::server::container_tests::pause("container-create-owned").await;
         let pending = self.pending.as_mut().expect("names");
         let owner = generated_owner();
+        let name = format!("pbps-resolver-{owner}");
         let launch = Launch::control(
             &state.image.clone(),
             state.connection.driver(),
@@ -876,21 +886,25 @@ impl CandidateSession {
             super::super::profile::LIFETIME_SECS,
         )
         .map_err(|error| failed(converted(error), pending.names()))?;
+        #[cfg(test)]
+        relay_recovery::before_prepare(Site::Scratch, &name, &mut pending.unconfirmed)
+            .map_err(|error| failed(converted(error), pending.names()))?;
         let api = state
             .analysis_api
             .additional()
             .await
             .map_err(|error| failed(converted(error), pending.names()))?;
-        pending.relay_name = Some(format!("pbps-resolver-{owner}"));
-        let relay = match CandidateRun::start_launch(
+        pending.relay_name = Some(name.clone());
+        let start = CandidateRun::start_launch(
             api,
             state.image.clone(),
             owner,
             launch,
             super::super::profile::LIFETIME_SECS,
-        )
-        .await
-        {
+        );
+        #[cfg(test)]
+        let start = relay_recovery::start(Site::Scratch, &name, start);
+        let relay = match start.await {
             Ok(relay) => relay,
             Err(error) => {
                 if error.recovery_names.is_empty() {
