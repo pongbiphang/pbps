@@ -450,8 +450,7 @@ def fixture(args, binary, root, owned):
     selected_tests = [test for test in TESTS if engine == "pg" or test !=
                       "pg16_storage::the_supplied_storage_layout_admits_its_observed_major_and_survives_live_checks"]
     cases = [(test, empty) for test in selected_tests for empty in ([False, True] if test == uts else [False])]
-    if engine == "pg":
-        cases.extend((test, False) for test in PRODUCER_TESTS)
+    cases.extend([(test, False) for test in PRODUCER_TESTS if engine == "pg"])
     if args.producer_only:
         cases = [(test, False) for test in PRODUCER_TESTS]
     # The legacy cleanup case stops this same supplied engine. Keep it last
