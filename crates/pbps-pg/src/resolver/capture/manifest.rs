@@ -175,6 +175,38 @@ fn qualified_explicit_indexes(
     Ok(indexes)
 }
 
+/// A constraint-backed or explicit index belongs to its table's owner,
+/// even when scratch used a different creator. The recorded table UID selects
+/// the opening owner across a rename; a newly created table uses this plan's
+/// effective creator.
+fn table_owner_for_index(
+    opening: &CapturedInputs,
+    base_ids: &pbps_model::IdsFile,
+    desired_ids: &pbps_model::IdsFile,
+    table: &pbps_model::TableName,
+    creator: &ObjectIdentity,
+) -> Result<ObjectIdentity, pbps_model::resolver::ManifestError> {
+    use pbps_model::resolver::ManifestError;
+    let uid = desired_ids.table_uid(table).ok_or(ManifestError::Invalid)?;
+    let Some(prior) = base_ids.tables.get(uid) else {
+        return Ok(creator.clone());
+    };
+    let prior = relation_identity(prior);
+    let owner: ObjectIdentity = serde_json::from_value(
+        opening
+            .inputs
+            .get(&prior)
+            .and_then(|input| input.properties.get("relowner"))
+            .cloned()
+            .ok_or(ManifestError::Incomplete)?,
+    )
+    .map_err(|_| ManifestError::Invalid)?;
+    if owner.class != "pg_authid" || !opening.role_pinned.contains_key(&owner) {
+        return Err(ManifestError::Invalid);
+    }
+    Ok(owner)
+}
+
 // Target metadata inserted into a scratch capture has already been named in
 // the opening catalog. Keep that provenance until sealing: an opening role
 // must not be mistaken for the scratch server's native role of the same name,
@@ -216,10 +248,10 @@ fn target_value(value: &Value) -> Result<Value, pbps_model::resolver::ManifestEr
     Ok(value.clone())
 }
 
-/// An ALTER TABLE/COLUMN RENAME preserves only typed owner/ACL metadata.
+/// A retained subject keeps only metadata the typed statement preserves.
 /// The recorded change and its UID-backed transition locate the opening
 /// subject; a reused spelling cannot serve as a substitute source.
-fn rename_source(
+fn retained_source(
     object: &ObjectIdentity,
     transition: &pbps_model::resolver::ObjectTransition,
     changes: &pbps_model::ChangeSet,
@@ -231,11 +263,10 @@ fn rename_source(
     let final_table = match &transition.surface {
         Surface::Table(table) => table,
         Surface::Column(column) => &column.table,
-        Surface::Namespace(_)
-        | Surface::Default(_)
-        | Surface::Check { .. }
-        | Surface::Index { .. }
-        | Surface::Module(_) => return None,
+        Surface::Namespace(_) | Surface::Module(_) => {
+            return transition.before.contains(object).then(|| object.clone());
+        }
+        Surface::Default(_) | Surface::Check { .. } | Surface::Index { .. } => return None,
     };
     let prior_table = changes
         .changes
@@ -964,44 +995,6 @@ impl CompiledCapture {
     ) -> Result<pbps_model::resolver::InputManifest, pbps_model::resolver::ManifestError> {
         use pbps_model::Change;
         use pbps_model::resolver::{ManifestError, ObjectOwnership, Surface};
-        let inplace: BTreeSet<Surface> = changes
-            .changes
-            .iter()
-            .filter_map(|step| match &step.change {
-                Change::RenameTable { to, .. } => Some(Surface::Table(to.clone())),
-                Change::RenameColumn { table, to, .. } => Some(Surface::Column(table.column(to))),
-                Change::CreateTable { .. }
-                | Change::DropTable { .. }
-                | Change::AddColumn { .. }
-                | Change::DropColumn { .. }
-                | Change::AlterColumnType { .. }
-                | Change::AlterColumnNullability { .. }
-                | Change::AlterColumnDefault { .. }
-                | Change::SetColumnDeprecated { .. }
-                | Change::SetPrimaryKey { .. }
-                | Change::AddUnique { .. }
-                | Change::DropUnique { .. }
-                | Change::AddForeignKey { .. }
-                | Change::DropForeignKey { .. }
-                | Change::AddCheck { .. }
-                | Change::DropCheck { .. }
-                | Change::AddIndex { .. }
-                | Change::DropIndex { .. }
-                | Change::InsertRow { .. }
-                | Change::UpdateRow { .. }
-                | Change::DeleteRow { .. }
-                | Change::SetDataMode { .. }
-                | Change::CreateModule { .. }
-                | Change::AlterModule { .. }
-                | Change::DropModule { .. }
-                | Change::CreateRole { .. }
-                | Change::DropRole { .. }
-                | Change::RenameRole { .. }
-                | Change::Grant { .. }
-                | Change::Revoke { .. }
-                | Change::PublicExecution { .. } => None,
-            })
-            .collect();
         let added_indexes: BTreeSet<Surface> = changes
             .changes
             .iter()
@@ -1057,18 +1050,21 @@ impl CompiledCapture {
         let mut dependency_mappings = Vec::new();
         let mut dependencies_to_copy = Vec::new();
         let mut created_owner_edges = Vec::new();
+        let mut updated_acl_subjects = BTreeSet::new();
         let creator = ObjectIdentity {
             class: "pg_authid".into(),
             name: vec![effective_creator.into()],
             signature: Vec::new(),
         };
         for transition in transitions {
-            let preserved = inplace.contains(&transition.surface);
             let created = transition.before.is_empty()
-                || changes.changes.iter().any(|step| matches!(
-                    &step.change,
-                    Change::CreateModule { id, .. } if transition.surface == Surface::Module(id.clone())
-                ));
+                || changes.changes.iter().any(|step| {
+                    matches!(
+                        &step.change,
+                        Change::CreateModule { id, .. } | Change::AlterModule { id, .. }
+                            if transition.surface == Surface::Module(id.clone())
+                    )
+                });
             for object in &transition.after {
                 if object.class == "pg_shdepend" {
                     continue;
@@ -1080,38 +1076,102 @@ impl CompiledCapture {
                 if !matches!(owner, ObjectOwnership::Surface(_)) {
                     continue;
                 }
-                if created && !preserved {
+                // A transition may retain its table while replacing its
+                // constraint or index. Preserve only records with a proved
+                // opening counterpart, never the entire surface inventory.
+                let source = (!created)
+                    .then(|| retained_source(object, transition, changes, opening, &self.captured))
+                    .flatten();
+                if source.is_none() {
                     created_owned_subjects.insert(object.clone());
                 }
-                if preserved {
-                    let source =
-                        rename_source(object, transition, changes, opening, &self.captured);
-                    let before = source
-                        .as_ref()
-                        .and_then(|source| opening.inputs.get(source));
+                if let Some(source) = source {
+                    let before = opening
+                        .inputs
+                        .get(&source)
+                        .ok_or(ManifestError::Incomplete)?;
                     let fields: &[&str] = match object.class.as_str() {
                         "pg_class" => &["relowner", "relacl"],
                         "pg_proc" => &["proowner", "proacl"],
-                        "column" if source.is_some() => &["attacl"],
+                        "pg_namespace" => &["nspowner", "nspacl"],
+                        "column" => &["attacl"],
                         "pg_type" => &["typowner"],
                         _ => &[],
                     };
                     if !fields.is_empty() {
-                        let source = source.ok_or(ManifestError::Incomplete)?;
-                        let before = before.ok_or(ManifestError::Incomplete)?;
+                        let mut values = Vec::new();
+                        let mut changed_acl = None;
+                        for field in fields {
+                            let original = before
+                                .properties
+                                .get(*field)
+                                .ok_or(ManifestError::Incomplete)?;
+                            let projected = if matches!(*field, "relacl" | "proacl" | "nspacl") {
+                                super::creation_acl::retained_acl_after_plan(
+                                    opening,
+                                    &self.captured,
+                                    raw,
+                                    &source,
+                                    &transition.surface,
+                                    field,
+                                    changes,
+                                )?
+                            } else {
+                                None
+                            };
+                            if let Some(acl) = &projected {
+                                changed_acl = Some(acl.clone());
+                            }
+                            values.push((
+                                (*field).to_owned(),
+                                target_value(projected.as_ref().unwrap_or(original))?,
+                            ));
+                        }
+                        if let Some(acl) = changed_acl {
+                            updated_acl_subjects.insert(object.clone());
+                            let owner_field = match object.class.as_str() {
+                                "pg_class" => "relowner",
+                                "pg_proc" => "proowner",
+                                "pg_namespace" => "nspowner",
+                                _ => return Err(ManifestError::Invalid),
+                            };
+                            let owner: ObjectIdentity = serde_json::from_value(
+                                before
+                                    .properties
+                                    .get(owner_field)
+                                    .cloned()
+                                    .ok_or(ManifestError::Incomplete)?,
+                            )
+                            .map_err(|_| ManifestError::Invalid)?;
+                            let Value::Array(entries) = acl else {
+                                return Err(ManifestError::Invalid);
+                            };
+                            for entry in entries {
+                                for principal in ["grantor", "grantee"] {
+                                    let role: ObjectIdentity = serde_json::from_value(
+                                        entry
+                                            .get(principal)
+                                            .cloned()
+                                            .ok_or(ManifestError::Invalid)?,
+                                    )
+                                    .map_err(|_| ManifestError::Invalid)?;
+                                    if role.class == "pg_authid" && role != owner {
+                                        dependencies_to_copy.push((
+                                            object.clone(),
+                                            role,
+                                            transition.surface.clone(),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
                         let after = self
                             .captured
                             .inputs
                             .get_mut(raw)
                             .ok_or(ManifestError::Incomplete)?;
-                        for field in fields {
-                            let value = before
-                                .properties
-                                .get(*field)
-                                .ok_or(ManifestError::Incomplete)?;
-                            after
-                                .properties
-                                .insert((*field).into(), target_value(value)?);
+                        for (field, value) in values {
+                            after.properties.insert(field, value);
                         }
                         preserved_dependencies.insert(object.clone());
                         dependency_mappings.push((
@@ -1120,7 +1180,7 @@ impl CompiledCapture {
                             transition.surface.clone(),
                         ));
                     }
-                } else if created {
+                } else if created || !transition.before.contains(object) {
                     let kind = match object.class.as_str() {
                         "pg_proc" => Some(("f", "proacl", "proowner")),
                         "pg_class" => match self
@@ -1214,6 +1274,73 @@ impl CompiledCapture {
                         }
                     }
                 }
+                if let Surface::Table(table) = &transition.surface
+                    && object.class == "pg_class"
+                    && owner == &ObjectOwnership::Surface(transition.surface.clone())
+                    && matches!(
+                        self.captured
+                            .inputs
+                            .get(raw)
+                            .and_then(|input| input.properties.get("relkind"))
+                            .and_then(Value::as_str),
+                        Some("i" | "I")
+                    )
+                {
+                    // Only the exact internal dependency of a qualified key
+                    // constraint may carry a table-owned index. An ordinary
+                    // index is independently declared on Surface::Index.
+                    let mut parents = self.captured.inputs.keys().filter(|id| {
+                        id.class == "pg_depend"
+                            && id.name == ["i"]
+                            && id.signature.first() == Some(raw)
+                            && id.signature.get(1).is_some_and(|constraint| {
+                                constraint.class == "pg_constraint"
+                                    && self.ownership.get(constraint)
+                                        == Some(&ObjectOwnership::Surface(
+                                            transition.surface.clone(),
+                                        ))
+                            })
+                    });
+                    let dependency = parents.next().ok_or(ManifestError::Incomplete)?;
+                    if parents.next().is_some() {
+                        return Err(ManifestError::Invalid);
+                    }
+                    let constraint = dependency.signature[1].clone();
+                    let metadata = ObjectIdentity {
+                        class: "pg_index".into(),
+                        name: Vec::new(),
+                        signature: vec![raw.clone()],
+                    };
+                    let parent = relation_identity(table);
+                    if self.captured.inputs.get(&metadata).is_none_or(|row| {
+                        row.properties.get("indrelid")
+                            != serde_json::to_value(&parent).ok().as_ref()
+                    }) || self.captured.inputs.get(&constraint).is_none_or(|row| {
+                        !matches!(
+                            row.properties.get("contype").and_then(Value::as_str),
+                            Some("p" | "u")
+                        ) || row.properties.get("conindid")
+                            != serde_json::to_value(raw).ok().as_ref()
+                    }) || self.captured.inputs.keys().any(|id| {
+                        id.class == "pg_shdepend"
+                            && id.name == ["o"]
+                            && id.signature.first() == Some(raw)
+                    }) {
+                        return Err(ManifestError::Incomplete);
+                    }
+                    let target_owner =
+                        table_owner_for_index(opening, base_ids, desired_ids, table, &creator)?;
+                    self.captured
+                        .inputs
+                        .get_mut(raw)
+                        .ok_or(ManifestError::Incomplete)?
+                        .properties
+                        .insert(
+                            "relowner".into(),
+                            serde_json::to_value(target_identity(&target_owner))
+                                .map_err(|_| ManifestError::Invalid)?,
+                        );
+                }
                 if let Surface::Index { table, .. } = &transition.surface
                     && added_indexes.contains(&transition.surface)
                     && verified_indexes.contains(raw)
@@ -1223,25 +1350,8 @@ impl CompiledCapture {
                     // owner, even when another role issues CREATE INDEX. The
                     // recorded table UID selects the opening owner across a
                     // rename; a newly created table has this plan's creator.
-                    let table_uid = desired_ids.table_uid(table).ok_or(ManifestError::Invalid)?;
-                    let target_owner = if let Some(prior) = base_ids.tables.get(table_uid) {
-                        let prior = relation_identity(prior);
-                        let owner: ObjectIdentity = serde_json::from_value(
-                            opening
-                                .inputs
-                                .get(&prior)
-                                .and_then(|input| input.properties.get("relowner"))
-                                .cloned()
-                                .ok_or(ManifestError::Incomplete)?,
-                        )
-                        .map_err(|_| ManifestError::Invalid)?;
-                        if owner.class != "pg_authid" || !opening.role_pinned.contains_key(&owner) {
-                            return Err(ManifestError::Invalid);
-                        }
-                        owner
-                    } else {
-                        creator.clone()
-                    };
+                    let target_owner =
+                        table_owner_for_index(opening, base_ids, desired_ids, table, &creator)?;
                     self.captured
                         .inputs
                         .get_mut(raw)
@@ -1311,7 +1421,10 @@ impl CompiledCapture {
         }
         for (source, destination, surface) in dependency_mappings {
             for (id, input) in &opening.inputs {
-                if id.class != "pg_shdepend" || id.signature.first() != Some(&source) {
+                if id.class != "pg_shdepend"
+                    || id.signature.first() != Some(&source)
+                    || id.name == ["a"] && updated_acl_subjects.contains(&destination)
+                {
                     continue;
                 }
                 let mut final_id = id.clone();
