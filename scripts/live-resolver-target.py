@@ -76,6 +76,9 @@ PRODUCER_TESTS = [
     "resolver::server::qualified_evidence_tests::direct_actor_option_beats_inherited_owner_for_retained_table_grant",
     "resolver::server::qualified_evidence_tests::unique_inherited_delegate_is_the_retained_table_grantor",
     "resolver::server::qualified_evidence_tests::revoke_by_actor_keeps_an_unrelated_owners_grant_row",
+    "resolver::server::qualified_evidence_tests::competing_inherited_grant_options_refuse_before_publishing_evidence",
+    "resolver::server::qualified_evidence_tests::direct_schema_option_beats_inherited_owner_for_the_typed_grant",
+    "resolver::server::qualified_evidence_tests::combined_schema_grant_uses_one_inherited_grantor_for_its_whole_mask",
 ]
 NATIVE_TESTS = [DAEMON_TEST, TARGET_TEST, FACTORY_TEST, RECIPE_TEST, ANALYSIS_TEST,
                 INVALIDATION_TEST, CANCELLATION_TEST, DEADLINE_TEST,
