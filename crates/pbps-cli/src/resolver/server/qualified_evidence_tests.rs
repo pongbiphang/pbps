@@ -3465,3 +3465,513 @@ async fn a_prequalified_scope_rejects_changed_preliminary_grants_before_compilat
     assert!(matches!(result, Err(Error::Scope(ref reason))
         if reason == "the existing verified scope does not match the planning request"));
 }
+
+fn review_table() -> pbps_model::Table {
+    let mut table = pbps_model::Table::default();
+    table.columns.insert(
+        "n".into(),
+        pbps_model::Column::new("integer".parse().unwrap()).not_null(),
+    );
+    table
+}
+
+async fn table_catalog_flags() -> (i64, bool) {
+    let mut peer = PeerVerifiedConn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    let rows = peer
+        .query(
+            "SELECT c.relchecks::int8 AS checks, c.relhasindex AS has_index \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'pbps_evidence1274' AND c.relname = 't'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    (
+        rows[0].try_get::<i64>("checks").unwrap().unwrap(),
+        rows[0].try_get::<bool>("has_index").unwrap().unwrap(),
+    )
+}
+
+async fn assert_review_closing_matches_target(
+    target: &mut NativeTarget,
+    closing: &pbps_model::resolver::InputManifest,
+    key: &ProjectKey,
+) {
+    let selected =
+        pbps_db::fingerprint::EnvironmentFingerprintKey::from_file(&key.root.join("key")).unwrap();
+    let (_, observed) = target
+        .capture_postgres_sealed(
+            &catalog_scope(closing.scope()),
+            &Default::default(),
+            &selected,
+        )
+        .await
+        .unwrap();
+    for expected in closing.prerequisites() {
+        let actual = observed
+            .prerequisites()
+            .iter()
+            .find(|row| row.object == expected.object)
+            .unwrap_or_else(|| panic!("post-DDL catalog omitted {:?}", expected.object));
+        assert_eq!(
+            expected.properties, actual.properties,
+            "post-DDL properties differ for {:?}",
+            expected.object
+        );
+        assert_eq!(
+            expected.bindings, actual.bindings,
+            "post-DDL bindings differ for {:?}",
+            expected.object
+        );
+    }
+}
+
+async fn review_plan(
+    target: &mut NativeTarget,
+    run: &mut ScratchRun,
+    owned: &mut Option<ObservedContainers>,
+    inputs: &Inputs,
+    key: &ProjectKey,
+) -> ResolvedPlan {
+    let result = run
+        .plan_resolved(
+            target,
+            &inputs.binding(),
+            inputs.base(),
+            inputs.desired(),
+            &inputs.hints,
+            &[],
+            &key.project,
+            Some(ENVIRONMENT),
+        )
+        .await;
+    close(run, owned).await;
+    let result = result.expect("the review fixture's typed plan is valid");
+    result.evidence.validate(&result.changes).unwrap();
+    result
+}
+
+/// ADD CONSTRAINT changes the table in place. Its target owner and ACLs are
+/// not replaced by those of the scratch table used to compile the plan.
+async fn key_check_case(include_key: bool) {
+    setup(&[
+        "CREATE SCHEMA pbps_evidence1274",
+        "CREATE TABLE pbps_evidence1274.t (n integer NOT NULL)",
+        "ALTER TABLE pbps_evidence1274.t OWNER TO pbps_native_alt",
+        "GRANT SELECT ON pbps_evidence1274.t TO pg_monitor WITH GRANT OPTION",
+        "GRANT UPDATE(n) ON pbps_evidence1274.t TO pg_monitor WITH GRANT OPTION",
+    ])
+    .await;
+    let opening_acl = table_column_grants("t", "n").await;
+    assert_eq!(table_catalog_flags().await, (0, false));
+    let opening_owner = catalog_owner_dependency("table-t").await;
+    assert_eq!(opening_owner, ("pbps_native_alt".into(), 1, 1));
+    let mut base = Schema::default();
+    base.tables
+        .insert("pbps_evidence1274.t".parse().unwrap(), review_table());
+    base.roles
+        .insert("pbps_native_alt".into(), pbps_model::Role::default());
+    let mut desired = base.clone();
+    let table = desired
+        .tables
+        .get_mut(&"pbps_evidence1274.t".parse().unwrap())
+        .unwrap();
+    if include_key {
+        table.primary_key = Some(pbps_model::PrimaryKey {
+            name: Some("t_named_pk".into()),
+            columns: vec!["n".into()],
+        });
+    }
+    table.checks.insert(
+        "n_positive".into(),
+        pbps_model::CheckConstraint {
+            expression: "n >= 0".into(),
+        },
+    );
+    let inputs = Inputs::from_pair((base, desired));
+    let key = ProjectKey::new(true);
+    let mut owned = Some(ObservedContainers::begin());
+    let mut target = target().await;
+    let mut run = open(Profile::Container, &mut target).await;
+    let result = review_plan(&mut target, &mut run, &mut owned, &inputs, &key).await;
+    assert_eq!(
+        result
+            .changes
+            .changes
+            .iter()
+            .any(|step| matches!(step.change, Change::SetPrimaryKey { .. })),
+        include_key
+    );
+    assert!(
+        result
+            .changes
+            .changes
+            .iter()
+            .any(|step| matches!(step.change, Change::AddCheck { .. }))
+    );
+    assert!(!result.changes.changes.iter().any(|step| matches!(
+        step.change,
+        Change::CreateTable { .. } | Change::DropTable { .. } | Change::RenameTable { .. }
+    )));
+    let closing = result.evidence.after().clone();
+    let mut peer = pbps_db::Conn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    execute_plan(&mut peer, &result.changes).await;
+    drop(peer);
+    assert_eq!(table_column_grants("t", "n").await, opening_acl);
+    assert_eq!(catalog_owner_dependency("table-t").await, opening_owner);
+    assert_eq!(table_catalog_flags().await, (1, include_key));
+    assert_review_closing_matches_target(&mut target, &closing, &key).await;
+    target.check().await.unwrap();
+    setup(&[]).await;
+}
+
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn adding_named_key_and_check_keeps_existing_table_owner_and_grants() {
+    key_check_case(true).await;
+}
+
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn adding_check_alone_keeps_existing_table_owner_and_grants() {
+    key_check_case(false).await;
+}
+
+/// The new typed grant and the unrelated old grant must both survive. A
+/// blanket opening-ACL copy loses the new grant; scratch-only ACLs lose the
+/// target's independently granted pg_monitor privileges.
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn granting_on_an_existing_table_keeps_old_acl_and_adds_the_declared_role() {
+    setup(&[
+        "CREATE SCHEMA pbps_evidence1274",
+        "CREATE TABLE pbps_evidence1274.t (n integer NOT NULL)",
+        "ALTER TABLE pbps_evidence1274.t OWNER TO pbps_native_alt",
+        "GRANT SELECT ON pbps_evidence1274.t TO pg_monitor WITH GRANT OPTION",
+        "GRANT UPDATE(n) ON pbps_evidence1274.t TO pg_monitor WITH GRANT OPTION",
+    ])
+    .await;
+    let opening_acl = table_column_grants("t", "n").await;
+    assert_eq!(
+        catalog_owner_dependency("table-t").await,
+        ("pbps_native_alt".into(), 1, 1)
+    );
+    let mut base = Schema::default();
+    base.tables
+        .insert("pbps_evidence1274.t".parse().unwrap(), review_table());
+    base.roles
+        .insert("pbps_native_alt".into(), pbps_model::Role::default());
+    base.roles
+        .insert("pg_monitor".into(), pbps_model::Role::default());
+    let mut desired = base.clone();
+    desired.roles.get_mut("pg_monitor").unwrap().grants.insert(
+        "pbps_evidence1274.t".parse().unwrap(),
+        BTreeSet::from([pbps_model::Permission::Update]),
+    );
+    let inputs = Inputs::from_pair((base, desired));
+    let key = ProjectKey::new(true);
+    let mut owned = Some(ObservedContainers::begin());
+    let mut target = target().await;
+    let mut run = open(Profile::Container, &mut target).await;
+    let result = review_plan(&mut target, &mut run, &mut owned, &inputs, &key).await;
+    assert!(result.changes.changes.iter().any(|step| matches!(
+        &step.change,
+        Change::Grant { role, target, permissions }
+            if role == "pg_monitor"
+                && target.to_string() == "pbps_evidence1274.t"
+                && permissions == &BTreeSet::from([pbps_model::Permission::Update])
+    )));
+    assert!(!result.changes.changes.iter().any(|step| matches!(
+        step.change,
+        Change::CreateTable { .. } | Change::DropTable { .. } | Change::RenameTable { .. }
+    )));
+    let closing = result.evidence.after().clone();
+    let mut peer = pbps_db::Conn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    execute_plan(&mut peer, &result.changes).await;
+    drop(peer);
+    let after_acl = table_column_grants("t", "n").await;
+    assert_eq!(after_acl.0, opening_acl.0);
+    assert_eq!(after_acl.2, opening_acl.2);
+    let mut observer = PeerVerifiedConn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    let grants = observer
+        .query(
+            "SELECT a.grantee = 'pg_monitor'::regrole AS old_grantee, \
+                    a.privilege_type = 'UPDATE' AS new_permission, \
+                    pg_catalog.pg_get_userbyid(a.grantor)::text AS grantor, \
+                    a.is_grantable AS grant_option \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) a \
+             WHERE n.nspname = 'pbps_evidence1274' AND c.relname = 't' \
+               AND a.privilege_type IN ('SELECT', 'UPDATE')",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        grants
+            .iter()
+            .filter(
+                |row| row.try_get::<bool>("old_grantee").unwrap() == Some(true)
+                    && row.try_get::<bool>("new_permission").unwrap() == Some(false)
+                    && row.try_get::<bool>("grant_option").unwrap() == Some(true)
+            )
+            .count(),
+        1,
+        "the undeclared opening grant and its option survive"
+    );
+    assert_eq!(
+        grants
+            .iter()
+            .filter(
+                |row| row.try_get::<bool>("old_grantee").unwrap() == Some(true)
+                    && row.try_get::<bool>("new_permission").unwrap() == Some(true)
+                    && row.try_get::<bool>("grant_option").unwrap() == Some(false)
+                    && row.try_get::<&str>("grantor").unwrap() == Some("pbps_native_alt")
+            )
+            .count(),
+        1,
+        "the typed UPDATE is granted once by the actual ordinary owner"
+    );
+    drop(observer);
+    assert_review_closing_matches_target(&mut target, &closing, &key).await;
+    target.check().await.unwrap();
+    setup(&[]).await;
+}
+
+async fn unnamed_primary_key_case(new_table: bool) {
+    use pbps_db::resolver::capture::ObjectIdentity;
+
+    if new_table {
+        setup(&["CREATE SCHEMA pbps_evidence1274"]).await;
+    } else {
+        setup(&[
+            "CREATE SCHEMA pbps_evidence1274",
+            "CREATE TABLE pbps_evidence1274.t (n integer NOT NULL, CONSTRAINT unrelated_ck CHECK (n < 100))",
+        ])
+        .await;
+    }
+    let table_name: pbps_model::TableName = "pbps_evidence1274.t".parse().unwrap();
+    let mut base = Schema::default();
+    if !new_table {
+        base.tables.insert(table_name.clone(), review_table());
+    }
+    let mut desired = base.clone();
+    let mut keyed = review_table();
+    keyed.primary_key = Some(pbps_model::PrimaryKey {
+        name: None,
+        columns: vec!["n".into()],
+    });
+    desired.tables.insert(table_name.clone(), keyed);
+    let inputs = Inputs::from_pair((base, desired));
+    let key = ProjectKey::new(true);
+    let mut owned = Some(ObservedContainers::begin());
+    let mut target = target().await;
+    let mut run = open(Profile::Container, &mut target).await;
+    let result = review_plan(&mut target, &mut run, &mut owned, &inputs, &key).await;
+    assert!(result.changes.changes.iter().any(|step| {
+        if new_table {
+            matches!(&step.change, Change::CreateTable { name, .. } if name == &table_name)
+        } else {
+            matches!(&step.change, Change::SetPrimaryKey { table, to: Some(key), .. }
+                if table == &table_name && key.name.is_none())
+        }
+    }));
+    let closing = result.evidence.after().clone();
+    let table_id = ObjectIdentity {
+        class: "pg_class".into(),
+        name: vec![cases::SCHEMA.into(), "t".into()],
+        signature: Vec::new(),
+    };
+    let key_records: Vec<_> = closing
+        .prerequisites()
+        .iter()
+        .filter(|row| {
+            row.object.class == "pg_constraint"
+                && row.object.signature.get(1) == Some(&table_id)
+                && row.ownership == ObjectOwnership::Surface(Surface::Table(table_name.clone()))
+        })
+        .collect();
+    assert_eq!(
+        key_records.len(),
+        1,
+        "the unnamed PK owns one exact table constraint, without sweeping peers"
+    );
+    if !new_table {
+        let unrelated = closing
+            .prerequisites()
+            .iter()
+            .find(|row| {
+                row.object.class == "pg_constraint"
+                    && row.object.name == ["unrelated_ck"]
+                    && row.object.signature.get(1) == Some(&table_id)
+            })
+            .expect("the unrelated same-parent CHECK is visible in the capture");
+        assert_eq!(
+            unrelated.ownership,
+            ObjectOwnership::Unqualified,
+            "a same-parent constraint of another kind gains no PK authority"
+        );
+    }
+    let key_name = &key_records[0].object.name[0];
+    let index_id = ObjectIdentity {
+        class: "pg_class".into(),
+        name: vec![cases::SCHEMA.into(), key_name.clone()],
+        signature: Vec::new(),
+    };
+    assert!(closing.prerequisites().iter().any(|row| {
+        row.object == index_id
+            && row.ownership == ObjectOwnership::Surface(Surface::Table(table_name.clone()))
+    }));
+    let mut peer = pbps_db::Conn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    execute_plan(&mut peer, &result.changes).await;
+    drop(peer);
+    let mut observer = PeerVerifiedConn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    let rows = observer
+        .query(
+            "SELECT c.conname::text AS key_name, i.relname::text AS index_name, \
+                    count(d.objid) AS internal_edges \
+             FROM pg_catalog.pg_constraint c \
+             JOIN pg_catalog.pg_class t ON t.oid = c.conrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace \
+             JOIN pg_catalog.pg_class i ON i.oid = c.conindid \
+             LEFT JOIN pg_catalog.pg_depend d \
+               ON d.classid = 'pg_catalog.pg_class'::regclass AND d.objid = i.oid \
+              AND d.refclassid = 'pg_catalog.pg_constraint'::regclass \
+              AND d.refobjid = c.oid AND d.deptype = 'i' \
+             WHERE n.nspname = 'pbps_evidence1274' AND t.relname = 't' AND c.contype = 'p' \
+             GROUP BY c.conname, i.relname",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "the actual table has one primary key");
+    assert_eq!(
+        rows[0].try_get::<&str>("key_name").unwrap(),
+        Some(key_name.as_str())
+    );
+    assert_eq!(
+        rows[0].try_get::<&str>("index_name").unwrap(),
+        Some(key_name.as_str())
+    );
+    assert_eq!(rows[0].try_get::<i64>("internal_edges").unwrap(), Some(1));
+    drop(observer);
+    assert_review_closing_matches_target(&mut target, &closing, &key).await;
+    target.check().await.unwrap();
+    setup(&[]).await;
+}
+
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn unnamed_primary_key_on_existing_table_owns_only_its_exact_constraint_and_index() {
+    unnamed_primary_key_case(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn unnamed_primary_key_on_created_table_owns_only_its_exact_constraint_and_index() {
+    unnamed_primary_key_case(true).await;
+}
+
+/// A standalone index addition changes the table's catalog flag even though
+/// it neither renames nor replaces the relation or its existing column ACL.
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn adding_index_keeps_existing_table_metadata_and_sets_the_engine_index_flag() {
+    setup(&[
+        "CREATE SCHEMA pbps_evidence1274",
+        "CREATE TABLE pbps_evidence1274.t (n integer NOT NULL)",
+        "ALTER TABLE pbps_evidence1274.t OWNER TO pbps_native_alt",
+        "GRANT SELECT ON pbps_evidence1274.t TO pg_monitor WITH GRANT OPTION",
+        "GRANT UPDATE(n) ON pbps_evidence1274.t TO pg_monitor WITH GRANT OPTION",
+    ])
+    .await;
+    let opening_acl = table_column_grants("t", "n").await;
+    let opening_owner = catalog_owner_dependency("table-t").await;
+    assert_eq!(opening_owner, ("pbps_native_alt".into(), 1, 1));
+    assert_eq!(table_catalog_flags().await, (0, false));
+    let mut base = Schema::default();
+    base.tables
+        .insert("pbps_evidence1274.t".parse().unwrap(), review_table());
+    base.roles
+        .insert("pbps_native_alt".into(), pbps_model::Role::default());
+    let mut desired = base.clone();
+    desired
+        .tables
+        .get_mut(&"pbps_evidence1274.t".parse().unwrap())
+        .unwrap()
+        .indexes
+        .insert(
+            "ix".into(),
+            pbps_model::Index {
+                columns: vec![pbps_model::IndexColumn {
+                    key: pbps_model::IndexKey::Column("n".into()),
+                    descending: false,
+                    opclass: None,
+                }],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: Default::default(),
+            },
+        );
+    let inputs = Inputs::from_pair((base, desired));
+    let key = ProjectKey::new(true);
+    let mut owned = Some(ObservedContainers::begin());
+    let mut target = target().await;
+    let mut run = open(Profile::Container, &mut target).await;
+    let result = review_plan(&mut target, &mut run, &mut owned, &inputs, &key).await;
+    assert!(result.changes.changes.iter().any(|step| matches!(
+        &step.change,
+        Change::AddIndex { table, name, .. }
+            if table.to_string() == "pbps_evidence1274.t" && name == "ix"
+    )));
+    assert!(!result.changes.changes.iter().any(|step| matches!(
+        step.change,
+        Change::CreateTable { .. } | Change::DropTable { .. } | Change::RenameTable { .. }
+    )));
+    let closing = result.evidence.after().clone();
+    let mut peer = pbps_db::Conn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    execute_plan(&mut peer, &result.changes).await;
+    drop(peer);
+    assert_eq!(table_column_grants("t", "n").await, opening_acl);
+    assert_eq!(catalog_owner_dependency("table-t").await, opening_owner);
+    assert_eq!(table_catalog_flags().await, (0, true));
+    assert_review_closing_matches_target(&mut target, &closing, &key).await;
+    target.check().await.unwrap();
+    setup(&[]).await;
+}
