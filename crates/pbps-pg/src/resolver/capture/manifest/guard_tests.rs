@@ -341,7 +341,7 @@ fn synthetic_automatic_child_owner_edge(
         &[transition],
         &IdsFile::default(),
         &IdsFile::default(),
-        "postgres",
+        &context,
     )?;
     Ok((sealed, expected_edge))
 }

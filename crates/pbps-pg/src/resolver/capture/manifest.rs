@@ -966,7 +966,7 @@ impl CompiledCapture {
         transitions: &[pbps_model::resolver::ObjectTransition],
         base_ids: &pbps_model::IdsFile,
         desired_ids: &pbps_model::IdsFile,
-        effective_creator: &str,
+        authorization: &crate::resolver::authorization::AuthorizationContext,
     ) -> Result<pbps_model::resolver::InputManifest, SealError> {
         self.admit_rebuilt_routine_grant_options(opening, changes, transitions)?;
         self.seal_for_plan_inner(
@@ -975,7 +975,7 @@ impl CompiledCapture {
             transitions,
             base_ids,
             desired_ids,
-            effective_creator,
+            authorization,
         )
         .map_err(SealError::from)
     }
@@ -991,8 +991,9 @@ impl CompiledCapture {
         transitions: &[pbps_model::resolver::ObjectTransition],
         base_ids: &pbps_model::IdsFile,
         desired_ids: &pbps_model::IdsFile,
-        effective_creator: &str,
+        authorization: &crate::resolver::authorization::AuthorizationContext,
     ) -> Result<pbps_model::resolver::InputManifest, pbps_model::resolver::ManifestError> {
+        let effective_creator = &authorization.principal.effective;
         use pbps_model::Change;
         use pbps_model::resolver::{ManifestError, ObjectOwnership, Surface};
         let added_indexes: BTreeSet<Surface> = changes
@@ -1115,6 +1116,7 @@ impl CompiledCapture {
                                     &transition.surface,
                                     field,
                                     changes,
+                                    authorization,
                                 )?
                             } else {
                                 None
