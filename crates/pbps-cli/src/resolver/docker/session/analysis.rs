@@ -781,21 +781,13 @@ impl CandidateSession {
         if !self.analysis_in_flight {
             return Err(failed(Error::Consumed, Vec::new()));
         }
-        // SQL cleanup can fail before the owner containers are closed. Keep
-        // SQL and container names before the first await, including when
-        // cancellation takes State, and clear only confirmed obligations.
+        // Retain container names before the first cleanup await. Pending
+        // already owns the SQL names; merge its cleanup report before taking
+        // State so cancellation keeps outstanding SQL/container names.
         if let Some(state) = self.state.as_ref() {
             self.analysis_recovery.extend([
                 state.control.resource_name().to_owned(),
                 state.workload.resource_name().to_owned(),
-            ]);
-        }
-        if let Some(pending) = &self.pending
-            && !pending.removed
-        {
-            self.analysis_recovery.extend([
-                pending.names.database().to_owned(),
-                pending.names.login().to_owned(),
             ]);
         }
         #[cfg(test)]
