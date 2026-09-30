@@ -18,6 +18,7 @@ struct Observations {
     creations: usize,
     deletions: usize,
     deletion_in_progress: bool,
+    deletion_refused: bool,
     deletion_reads: usize,
 }
 
@@ -214,6 +215,16 @@ fn answer(
         format!("DELETE /v1.47/containers/{id}?force=1&v=1 HTTP/1.1")
     );
     seen.deletions += 1;
+    if seen.deletion_refused {
+        // A refused DELETE is not absence: the exact owned record remains
+        // readable through every subsequent inspect until cleanup times out.
+        return (
+            "503 Service Unavailable",
+            json!({"message": "private removal failure"}),
+            false,
+            false,
+        );
+    }
     if seen.deletion_in_progress {
         seen.deletion_reads = 2;
         return (
@@ -332,6 +343,54 @@ async fn failed_startup_is_cleaned_and_does_not_echo_the_server_error() {
     assert!(failure.recovery_names.is_empty());
     assert!(!format!("{failure:?}").contains("private server error"));
     assert_eq!(fixture.seen.lock().unwrap().deletions, 1);
+}
+
+#[tokio::test]
+async fn failed_startup_keeps_the_exact_owned_name_when_removal_cannot_be_confirmed() {
+    let fixture = Fixture::new(Observations {
+        start_failed: true,
+        deletion_refused: true,
+        ..Default::default()
+    });
+    let failure = CandidateRun::start(fixture.api().await, candidate(), Driver::Postgres)
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(failure.cause, Error::Start));
+    let seen = fixture.seen.lock().unwrap();
+    let retained = seen
+        .container
+        .as_ref()
+        .expect("failed removal retains the owned ID");
+    let exact_name = retained["Name"]
+        .as_str()
+        .unwrap()
+        .strip_prefix('/')
+        .unwrap();
+    assert_eq!(failure.recovery_names, vec![exact_name.to_owned()]);
+    assert_eq!(seen.creations, 1);
+    assert_eq!(seen.deletions, 1);
+    assert_eq!(retained["Id"], "a".repeat(64));
+    let deletion = seen
+        .requests
+        .iter()
+        .position(|request| {
+            request
+                == &format!(
+                    "DELETE /v1.47/containers/{}?force=1&v=1 HTTP/1.1",
+                    "a".repeat(64)
+                )
+        })
+        .expect("cleanup must attempt removal of the acknowledged immutable ID");
+    let inspect = format!("GET /v1.47/containers/{}/json HTTP/1.1", "a".repeat(64));
+    assert!(
+        seen.requests[deletion + 1..]
+            .iter()
+            .filter(|r| *r == &inspect)
+            .count()
+            > 1
+    );
+    assert!(!format!("{failure:?}").contains("private removal failure"));
 }
 
 #[tokio::test]

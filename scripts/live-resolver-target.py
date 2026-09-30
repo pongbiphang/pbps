@@ -36,6 +36,9 @@ ANALYSIS_TEST = "resolver::server::container_tests::the_owned_container_resolves
 INVALIDATION_TEST = "resolver::server::container_tests::a_changed_owned_runtime_or_target_ends_container_analysis_permanently"
 CANCELLATION_TEST = "resolver::server::container_tests::cancelled_container_analysis_removes_or_names_every_owned_resource"
 DEADLINE_TEST = "resolver::server::container_tests::delayed_container_analysis_expires_at_its_first_owner_bound"
+ADMIN_RECOVERY_TEST = "resolver::server::container_tests::relay_recovery::admin_launch_recovery_distinguishes_absence_from_uncertainty_without_losing_other_owners"
+SCRATCH_RECOVERY_TEST = "resolver::server::container_tests::relay_recovery::scratch_launch_recovery_distinguishes_absence_from_uncertainty_without_losing_other_owners"
+JANITOR_RECOVERY_TEST = "resolver::server::container_tests::relay_recovery::janitor_launch_recovery_distinguishes_absence_from_uncertainty_without_losing_other_owners"
 DAEMON_TEST = "resolver::docker::tests::direct_native_daemon_is_accepted_but_a_root_owned_proxy_is_not"
 QUIET = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
 DOCKER_SOCKET = "/var/run/docker.sock"
@@ -59,8 +62,8 @@ def interrupted(signum, _frame):
 def native_tests(binary, env):
     # The daemon/proxy case needs the same disposable root host as the factory;
     # the ordinary library run only compiles it and leaves it ignored.
-    for test in (DAEMON_TEST, TARGET_TEST, FACTORY_TEST, RECIPE_TEST, ANALYSIS_TEST, INVALIDATION_TEST, CANCELLATION_TEST, DEADLINE_TEST):
-        if test in (RECIPE_TEST, ANALYSIS_TEST, INVALIDATION_TEST, CANCELLATION_TEST, DEADLINE_TEST) and env.get("PBPS_NATIVE_DRIVER") != "pg":
+    for test in (DAEMON_TEST, TARGET_TEST, FACTORY_TEST, RECIPE_TEST, ANALYSIS_TEST, INVALIDATION_TEST, CANCELLATION_TEST, DEADLINE_TEST, ADMIN_RECOVERY_TEST, SCRATCH_RECOVERY_TEST, JANITOR_RECOVERY_TEST):
+        if test in (RECIPE_TEST, ANALYSIS_TEST, INVALIDATION_TEST, CANCELLATION_TEST, DEADLINE_TEST, ADMIN_RECOVERY_TEST, SCRATCH_RECOVERY_TEST, JANITOR_RECOVERY_TEST) and env.get("PBPS_NATIVE_DRIVER") != "pg":
             continue
         result = run(binary, "--ignored", "--exact", test, "--nocapture",
                      env=dict(os.environ, **env), stdout=subprocess.PIPE,
