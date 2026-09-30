@@ -5,6 +5,8 @@
 //! silently become drop-only cleanup.
 
 use super::*;
+
+pub(crate) mod sql_recovery;
 use crate::resolver::docker::CandidateSession;
 use pbps_config::resolver::{PullPolicy, ResolverProfile};
 use pbps_db::resolver::capture::Verdict as BindingVerdict;
