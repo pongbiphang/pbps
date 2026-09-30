@@ -268,7 +268,10 @@ mod contained611 {
             Some("PARTIAL")
         );
 
-        admin.execute(&drop_database(&scratch)).await.unwrap();
+        {
+            let _gate = crate::SINGLE_USER_GATE.read().await;
+            admin.execute(&drop_database(&scratch)).await.unwrap();
+        }
         admin.execute(&option(0)).await.unwrap();
     }
 }
