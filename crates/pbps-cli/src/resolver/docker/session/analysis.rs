@@ -618,10 +618,15 @@ impl ContainerControl {
             let workload_ok = state.workload.close().await.is_ok();
             if workload_ok {
                 self.unconfirmed.retain(|name| name != &workload_name);
+                // Confirmed removal destroys this workload's private SQL
+                // storage (DECISIONS 497), even when SQL cleanup failed.
+                // Independent relay obligations remain in recovery_names.
+                self.removed = true;
+                self.roles.clear();
             }
         }
         let mut recovery = self.recovery_names();
-        if !removed {
+        if !self.removed {
             recovery.extend([names.database().to_owned(), names.login().to_owned()]);
         }
         recovery.sort_unstable();
@@ -776,13 +781,21 @@ impl CandidateSession {
         if !self.analysis_in_flight {
             return Err(failed(Error::Consumed, Vec::new()));
         }
-        // Pending scratch removal can fail before the owner containers are
-        // closed. Keep their names in the report from the first await onward,
-        // and clear each only after its close confirms removal.
+        // SQL cleanup can fail before the owner containers are closed. Keep
+        // SQL and container names before the first await, including when
+        // cancellation takes State, and clear only confirmed obligations.
         if let Some(state) = self.state.as_ref() {
             self.analysis_recovery.extend([
                 state.control.resource_name().to_owned(),
                 state.workload.resource_name().to_owned(),
+            ]);
+        }
+        if let Some(pending) = &self.pending
+            && !pending.removed
+        {
+            self.analysis_recovery.extend([
+                pending.names.database().to_owned(),
+                pending.names.login().to_owned(),
             ]);
         }
         #[cfg(test)]
@@ -797,11 +810,6 @@ impl CandidateSession {
                 });
             }
             self.analysis_recovery.extend(current);
-            if !pending.removed {
-                self.analysis_recovery.sort_unstable();
-                self.analysis_recovery.dedup();
-                return Err(failed(Error::Cleanup, self.analysis_recovery.clone()));
-            }
         }
         if let Some(state) = self.state.take() {
             let control_name = state.control.resource_name().to_owned();
@@ -812,6 +820,15 @@ impl CandidateSession {
             }
             if state.workload.close().await.is_ok() {
                 self.analysis_recovery.retain(|name| name != &workload_name);
+                if let Some(pending) = self.pending.as_mut() {
+                    // Only confirmed destruction of this private workload
+                    // completes its SQL obligations (DECISIONS 497).
+                    // Keep relay names and persist completion for a retry.
+                    pending.removed = true;
+                    self.analysis_recovery.retain(|name| {
+                        name != pending.names.database() && name != pending.names.login()
+                    });
+                }
             }
         }
         self.analysis_recovery.sort_unstable();
