@@ -189,6 +189,7 @@ mod contained611 {
                 .await
                 .unwrap();
             drop(conn);
+            let _gate = crate::SINGLE_USER_GATE.read().await;
             admin
                 .execute(&format!(
                     "ALTER DATABASE [{probe}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; \
@@ -218,7 +219,10 @@ mod contained611 {
                  DROP DATABASE [{database}];"
             )
         };
-        admin.execute(&drop_database(&target)).await.unwrap();
+        {
+            let _gate = crate::SINGLE_USER_GATE.read().await;
+            admin.execute(&drop_database(&target)).await.unwrap();
+        }
         admin.execute(&option(0)).await.unwrap();
         let refused = contained_databases_are_allowed(&mut admin, &recipe)
             .await

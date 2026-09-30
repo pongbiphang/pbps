@@ -1005,6 +1005,18 @@ fn only_model_lock_contention_is_retried_and_only_so_often() {
     );
 }
 
+/// Keeps a test's `SET SINGLE_USER WITH ROLLBACK IMMEDIATE` apart from the
+/// estimate matrix tests' long batches (#669).
+///
+/// Every recorded Msg 596 killed an estimate matrix session in the middle of
+/// its batch, within milliseconds of another test in this binary taking its
+/// own database single-user. The session held no lock on that database, and
+/// nothing in the matrix reads another database. The cause inside the engine
+/// is not established, so the two are kept from overlapping. A teardown that
+/// takes a database single-user holds this shared. The matrix batches hold it
+/// exclusively, which also runs the two of them one after the other.
+pub(crate) static SINGLE_USER_GATE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
 /// A throwaway database that removes itself.
 struct TestDb {
     name: String,
@@ -1038,6 +1050,7 @@ impl TestDb {
     }
 
     async fn drop(mut self) {
+        let _gate = SINGLE_USER_GATE.read().await;
         // Failure to clean up must not obscure the test's own verdict; the
         // container is throwaway anyway.
         let _ = self

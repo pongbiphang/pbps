@@ -43,12 +43,17 @@ async fn the_estimate_agrees_with_the_catalogues_row_update_and_scan_paths() {
             ));
         }
     }
+    // Exclusive for the batch: no test takes a database single-user while it
+    // runs (#669).
+    let gate = crate::SINGLE_USER_GATE.write().await;
     db.conn.execute(&sql).await.unwrap();
     let rows = db
         .conn
         .query("SELECT * FROM dbo.matrix_results")
         .await
         .unwrap();
+    // Released before this test's own teardown, which takes it shared.
+    drop(gate);
     assert_eq!(rows.len(), ESTIMATE_TYPES.len().pow(2) * 2 + 4);
     let mut accepted = 0;
     let mut refused = 0;
@@ -180,12 +185,17 @@ async fn nullability_and_storage_boundaries_keep_the_measured_row_paths() {
             }
         }
     }
+    // Exclusive for the batch: no test takes a database single-user while it
+    // runs (#669).
+    let gate = crate::SINGLE_USER_GATE.write().await;
     db.conn.execute(&sql).await.unwrap();
     let rows = db
         .conn
         .query("SELECT * FROM dbo.matrix_results")
         .await
         .unwrap();
+    // Released before this test's own teardown, which takes it shared.
+    drop(gate);
     assert_eq!(rows.len(), cases.len() * 24);
     let mut accepted = 0;
     for row in &rows {
