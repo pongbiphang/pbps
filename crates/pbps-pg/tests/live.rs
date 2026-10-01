@@ -5762,16 +5762,105 @@ struct TestDb {
     name: String,
     conn: Conn,
     /// Held for the database's whole life: see [`CLUSTER_ROLE_GATE`].
-    _roles: tokio::sync::RwLockReadGuard<'static, ()>,
+    _roles: Shared<'static>,
 }
 
 /// Roles are cluster-wide, and the ledger refuses to write while any login
 /// role could reset its id sequence, whatever database that login was made
 /// for. `recon610_super` gives its run login membership in a reproduced
 /// superuser deployer, which can, so a ledger test that ran beside it was
-/// refused over a role it never made (#1357). That test takes this for
-/// writing; every [`TestDb`] holds it for reading.
-pub(crate) static CLUSTER_ROLE_GATE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+/// refused over a role it never made (#1357). That test runs [`RoleGate::alone`];
+/// every [`TestDb`] holds the gate [`RoleGate::shared`].
+pub(crate) static CLUSTER_ROLE_GATE: RoleGate = RoleGate::new();
+
+/// A gate that prefers its sharers: one waits only while a sole holder is
+/// inside, never while one merely waits. A fair lock (tokio's `RwLock`)
+/// queues a sharer behind a waiting sole holder, and a test that holds two
+/// `TestDb`s at once then deadlocks against a sole holder queued between
+/// them (review of #1390). The sole holder may wait until the suite has no
+/// `TestDb` open; that costs time, never a hang. Polled, not notified: it is
+/// a test fixture, and a missed wake-up is the bug a poll cannot have.
+pub(crate) struct RoleGate {
+    /// Sharers inside, and whether the sole holder is.
+    state: std::sync::Mutex<(usize, bool)>,
+}
+
+pub(crate) struct Shared<'a>(&'a RoleGate);
+pub(crate) struct Alone<'a>(&'a RoleGate);
+
+impl RoleGate {
+    pub(crate) const fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new((0, false)),
+        }
+    }
+
+    pub(crate) async fn shared(&self) -> Shared<'_> {
+        loop {
+            {
+                let mut state = self.state.lock().unwrap();
+                if !state.1 {
+                    state.0 += 1;
+                    return Shared(self);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    pub(crate) async fn alone(&self) -> Alone<'_> {
+        loop {
+            {
+                let mut state = self.state.lock().unwrap();
+                if !state.1 && state.0 == 0 {
+                    state.1 = true;
+                    return Alone(self);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+}
+
+impl Drop for Shared<'_> {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap().0 -= 1;
+    }
+}
+
+impl Drop for Alone<'_> {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap().1 = false;
+    }
+}
+
+/// A test holding one share can take a second while a sole holder waits,
+/// and the sole holder gets in once both are released. A fair lock fails
+/// this: the second share queues behind the waiting sole holder, which
+/// waits for the first (review of #1390).
+#[tokio::test]
+async fn a_second_share_is_not_queued_behind_a_waiting_sole_holder() {
+    static GATE: RoleGate = RoleGate::new();
+    let first = GATE.shared().await;
+    let alone = tokio::spawn(async {
+        let _alone = GATE.alone().await;
+    });
+    // Long enough for the sole holder to be waiting.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let second = tokio::time::timeout(std::time::Duration::from_secs(2), GATE.shared())
+        .await
+        .expect("a second share must not wait for a sole holder that has not got in");
+    assert!(
+        !alone.is_finished(),
+        "the sole holder got in beside a share"
+    );
+    drop(first);
+    drop(second);
+    tokio::time::timeout(std::time::Duration::from_secs(2), alone)
+        .await
+        .expect("the sole holder gets in once the shares are gone")
+        .unwrap();
+}
 
 #[tokio::test]
 #[ignore = "needs live PostgreSQL"]
@@ -5861,7 +5950,7 @@ impl TestDb {
         // The pid keeps two concurrent `cargo test` runs apart; the tag keeps
         // this run's own tests apart.
         let name = format!("pbps_test_{tag}_{}", std::process::id());
-        let roles = CLUSTER_ROLE_GATE.read().await;
+        let roles = CLUSTER_ROLE_GATE.shared().await;
         let mut admin = connect().await;
         // `WITH (FORCE)` disconnects whatever is still attached — a previous
         // run killed halfway leaves a database behind, and `DROP DATABASE`
@@ -6495,7 +6584,7 @@ async fn two_pipelines_creating_the_ledger_at_once_both_find_it_there() {
 #[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
 async fn a_row_type_of_the_ledgers_name_without_the_table_is_still_refused() {
     // Writes the ledger outside a `TestDb` (#1357).
-    let _roles = CLUSTER_ROLE_GATE.read().await;
+    let _roles = CLUSTER_ROLE_GATE.shared().await;
     let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("the PostgreSQL 16 fixture");
     for connection in [conn_str(), old] {
         let mut admin = Conn::connect(Driver::Postgres, &connection).await.unwrap();
@@ -29110,7 +29199,7 @@ async fn doctor_reports_an_absent_target_of_a_recorded_only_grant() {
 #[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
 async fn doctor_reports_maintain_on_an_old_server_for_a_reused_table_name() {
     // Writes the ledger outside a `TestDb` (#1357).
-    let _roles = CLUSTER_ROLE_GATE.read().await;
+    let _roles = CLUSTER_ROLE_GATE.shared().await;
     let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("the PostgreSQL 16 fixture");
     let name = format!("pbps_test_maint569_{}", std::process::id());
     for connection in [conn_str(), old] {
