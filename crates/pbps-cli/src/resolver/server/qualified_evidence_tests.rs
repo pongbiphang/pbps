@@ -5645,11 +5645,7 @@ async fn generation_producer_case(case: GenerationCase) {
                 .map(|record| record.object.clone()),
         );
         let (_, observed) = target
-            .capture_postgres_sealed(
-                &closing_scope,
-                &Default::default(),
-                &selected,
-            )
+            .capture_postgres_sealed(&closing_scope, &Default::default(), &selected)
             .await
             .map_err(|error| error.to_string())?;
         target.check().await.map_err(|error| error.to_string())?;
@@ -5886,7 +5882,9 @@ async fn generation_producer_case(case: GenerationCase) {
     let properties_mismatches: Vec<_> = common
         .iter()
         .copied()
-        .filter(|object| expected_records[*object].properties != observed_records[*object].properties)
+        .filter(|object| {
+            expected_records[*object].properties != observed_records[*object].properties
+        })
         .collect();
     let bindings_mismatches: Vec<_> = common
         .iter()
