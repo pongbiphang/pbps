@@ -1275,7 +1275,13 @@ expression change first, then the retype or drop. It is one plan now.
   (`may_read`, DECISIONS 477). A new expression that names the column, even in
   a function or field of the same name, may still read it, and the retype or
   drop stays refused. A false yes costs a second plan; a false no would cost
-  an apply that rolls back. Only the first is allowed.
+  an apply that rolls back. Only the first is allowed. The text speaks the
+  plan's names, so it is scanned for the input's catalog name and for the name
+  the plan gives it after a rename.
+
+A retype names its column as declared, after the plan's renames. A drop names
+it by the catalog's own name, so only its table is reversed; a rename into the
+freed name belongs to another column.
 
 On a connected plan, `release_generated_inputs` moves the retype or drop of a
 released column to right after the expression change that releases it. A

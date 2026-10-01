@@ -1116,6 +1116,34 @@ impl LiveNames {
         Self { tables, columns }
     }
 
+    fn table(&self, table: &TableName) -> TableName {
+        self.tables.get(table).unwrap_or(table).clone()
+    }
+
+    /// The catalog's table and column for a column a retype or drop changes,
+    /// with the column as the change names it and what it does. A retype names
+    /// the column as declared, after the plan's renames; a drop names it by
+    /// the catalog's own name, so only its table is reversed. A rename into
+    /// the freed name belongs to another column.
+    fn changed<'c>(
+        &self,
+        change: &'c pbps_model::Change,
+    ) -> Option<(TableName, String, &'c pbps_model::ColumnRef, &'static str)> {
+        if let pbps_model::Change::AlterColumnType { column, .. } = change {
+            let (table, live) = self.column(column);
+            Some((table, live, column, "retyped"))
+        } else if let pbps_model::Change::DropColumn { column, .. } = change {
+            Some((
+                self.table(&column.table),
+                column.name.clone(),
+                column,
+                "dropped",
+            ))
+        } else {
+            None
+        }
+    }
+
     /// The catalog's table and column for a column the plan names.
     fn column(&self, column: &pbps_model::ColumnRef) -> (TableName, String) {
         let table = self
@@ -1132,32 +1160,27 @@ impl LiveNames {
     }
 }
 
-/// The change at `i`, when it retypes or drops a column, with what it does.
-fn retype_or_drop(change: &pbps_model::Change) -> Option<(&pbps_model::ColumnRef, &'static str)> {
-    if let pbps_model::Change::AlterColumnType { column, .. } = change {
-        Some((column, "retyped"))
-    } else if let pbps_model::Change::DropColumn { column, .. } = change {
-        Some((column, "dropped"))
-    } else {
-        None
-    }
-}
-
 /// Where the plan changes the expression of the generated column `generated`
 /// (catalog names) to one that does not read `base`: the change that releases
 /// `base` from it (DEC-1316.1). `None` when the plan does not change it, or
 /// when its new text may still read `base`.
+///
+/// `base` is the input's catalog name and `named` the name the plan gives it,
+/// after a rename: the new text speaks the plan's names, so naming either one
+/// may still read it.
 fn release_of(
     changes: &ChangeSet,
     names: &LiveNames,
     table: &TableName,
     generated: &str,
     base: &str,
+    named: &str,
 ) -> Option<usize> {
     changes.changes.iter().position(|p| {
         matches!(&p.change, pbps_model::Change::AlterColumnExpression { column, to, .. }
             if names.column(column) == (table.clone(), generated.to_owned())
-                && !pbps_pg::generated::may_read(to, base))
+                && !pbps_pg::generated::may_read(to, base)
+                && !pbps_pg::generated::may_read(to, named))
     })
 }
 
@@ -1179,18 +1202,17 @@ pub(crate) fn order_after_releases(
     let mut moved = 0;
     let mut i = 0;
     while i < changes.changes.len() {
-        let Some((column, _)) = retype_or_drop(&changes.changes[i].change) else {
+        let Some((table, live, column, _)) = names.changed(&changes.changes[i].change) else {
             i += 1;
             continue;
         };
-        let (table, live) = names.column(column);
         let column = column.clone();
         let release = dependences
             .get(&table)
             .into_iter()
             .flatten()
             .filter(|d| d.base == live)
-            .filter_map(|d| release_of(changes, &names, &table, &d.generated, &live))
+            .filter_map(|d| release_of(changes, &names, &table, &d.generated, &live, &column.name))
             .max();
         let Some(release) = release.filter(|r| *r > i) else {
             i += 1;
@@ -1254,16 +1276,63 @@ pub async fn release_generated_inputs(
     let names = LiveNames::of(changes);
     let mut dependences = BTreeMap::new();
     for p in &changes.changes {
-        if let Some((column, _)) = retype_or_drop(&p.change) {
-            let (table, _) = names.column(column);
-            if let std::collections::btree_map::Entry::Vacant(e) = dependences.entry(table) {
-                let found = pbps_pg::generated::dependences(conn, e.key()).await?;
-                e.insert(found);
-            }
+        if let Some((table, ..)) = names.changed(&p.change)
+            && let std::collections::btree_map::Entry::Vacant(e) = dependences.entry(table)
+        {
+            let found = pbps_pg::generated::dependences(conn, e.key()).await?;
+            e.insert(found);
         }
     }
     order_after_releases(changes, &dependences)
         .map_err(|why| anyhow::anyhow!("generation_support (PostgreSQL): {why}"))
+}
+
+/// Every retype or drop of a column a live generated column reads that
+/// nothing releases first: the same plan dropping the generated column, or an
+/// earlier change to its expression whose text does not name the column
+/// (DEC-1168.1, DEC-1316.1). `dependences` is each table's live edges.
+fn unreleased(
+    changes: &ChangeSet,
+    dependences: &BTreeMap<TableName, Vec<pbps_pg::generated::Dependence>>,
+) -> Vec<String> {
+    let names = LiveNames::of(changes);
+    // A drop names its column by the catalog's name already: only its table
+    // is reversed. A rename into the freed name is another column's.
+    let dropped: std::collections::BTreeSet<(TableName, String)> = changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let pbps_model::Change::DropColumn { column, .. } = &p.change {
+                Some((names.table(&column.table), column.name.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let mut problems = Vec::new();
+    for (i, p) in changes.changes.iter().enumerate() {
+        let Some((table, live, column, what)) = names.changed(&p.change) else {
+            continue;
+        };
+        for d in dependences.get(&table).into_iter().flatten() {
+            if d.base != live || dropped.contains(&(table.clone(), d.generated.clone())) {
+                continue;
+            }
+            if release_of(changes, &names, &table, &d.generated, &live, &column.name)
+                .is_some_and(|r| r < i)
+            {
+                continue;
+            }
+            problems.push(format!(
+                "{column} is {what} by this plan, and the generated column `{}` is computed \
+                 from it: the engine refuses to retype such a column and drops it only with \
+                 CASCADE. Drop the generated column in the same plan, or change its expression \
+                 to one that does not name `{}`.",
+                d.generated, column.name
+            ));
+        }
+    }
+    problems
 }
 
 /// What a plan over generated columns needs of this server and of the columns
@@ -1312,38 +1381,16 @@ pub async fn generation_support(
         }
     }
     let names = LiveNames::of(changes);
-    let mut dropped: std::collections::BTreeSet<(TableName, String)> = Default::default();
+    let mut dependences = BTreeMap::new();
     for p in &changes.changes {
-        if let pbps_model::Change::DropColumn { column, .. } = &p.change {
-            dropped.insert(names.column(column));
+        if let Some((table, ..)) = names.changed(&p.change)
+            && let std::collections::btree_map::Entry::Vacant(e) = dependences.entry(table)
+        {
+            let found = pbps_pg::generated::dependences(conn, e.key()).await?;
+            e.insert(found);
         }
     }
-    let mut asked: BTreeMap<TableName, Vec<pbps_pg::generated::Dependence>> = BTreeMap::new();
-    for (i, p) in changes.changes.iter().enumerate() {
-        let Some((column, what)) = retype_or_drop(&p.change) else {
-            continue;
-        };
-        let (table, live) = names.column(column);
-        if !asked.contains_key(&table) {
-            let found = pbps_pg::generated::dependences(conn, &table).await?;
-            asked.insert(table.clone(), found);
-        }
-        for d in &asked[&table] {
-            if d.base != live || dropped.contains(&(table.clone(), d.generated.clone())) {
-                continue;
-            }
-            if release_of(changes, &names, &table, &d.generated, &live).is_some_and(|r| r < i) {
-                continue;
-            }
-            problems.push(format!(
-                "{column} is {what} by this plan, and the generated column `{}` is computed \
-                 from it: the engine refuses to retype such a column and drops it only with \
-                 CASCADE. Drop the generated column in the same plan, or change its expression \
-                 to one that does not name `{live}`.",
-                d.generated
-            ));
-        }
-    }
+    problems.extend(unreleased(changes, &dependences));
     if !problems.is_empty() {
         anyhow::bail!("generation_support (PostgreSQL): {}", problems.join("\n"));
     }
@@ -2213,6 +2260,7 @@ mod tests {
                     Change::AlterColumnExpression { .. } => "expression",
                     Change::AddColumn { .. } => "add",
                     Change::AlterColumnDefault { .. } => "default",
+                    Change::RenameColumn { .. } => "rename",
                     other => panic!("unexpected {other:?}"),
                 })
                 .collect()
@@ -2246,6 +2294,33 @@ mod tests {
         );
         assert!(matches!(&cs.changes[3].change,
             Change::AlterColumnDefault { column, .. } if column.name == "a"));
+        // Released, the check has nothing left to refuse; unreleased, it
+        // does.
+        let mut cs = plan(vec![retype("a"), recompute("b * 2")]);
+        assert_eq!(unreleased(&cs, &reads_a).len(), 1);
+        order_after_releases(&mut cs, &reads_a).unwrap();
+        assert!(unreleased(&cs, &reads_a).is_empty());
+        // The input renamed to `x` in the same plan, and the new text naming
+        // `x`: it still reads the column, whatever the catalog calls it.
+        let rename = |from: &str, to: &str| Change::RenameColumn {
+            uid: uid("c_cccccc"),
+            table: t.clone(),
+            from: from.into(),
+            to: to.into(),
+            table_was: None,
+        };
+        let mut cs = plan(vec![rename("a", "x"), retype("x"), recompute("x * 2")]);
+        assert_eq!(order_after_releases(&mut cs, &reads_a), Ok(0));
+        assert_eq!(unreleased(&cs, &reads_a).len(), 1);
+        // The generated column dropped while another column is renamed into
+        // its name: the drop still names the catalog's `g`, which releases
+        // its input.
+        let cs = plan(vec![drop("g"), rename("c", "g"), retype("a")]);
+        assert!(
+            unreleased(&cs, &reads_a).is_empty(),
+            "{:?}",
+            unreleased(&cs, &reads_a)
+        );
         // The new text may still read `a`: nothing moves, and the check
         // refuses it.
         let mut cs = plan(vec![drop("a"), recompute("a + b")]);
