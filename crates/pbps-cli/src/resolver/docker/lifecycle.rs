@@ -337,19 +337,27 @@ async fn cleanup_with(api: &mut LocalApi, owner: &Owner) -> Result<(), Error> {
     // delete can precede final removal. The reply code alone is not cleanup
     // evidence. Wait for this exact owned ID to become absent; never retry a
     // delete against a name or accept a changed ownership marker.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match inspect(api, id).await? {
-                None => return Ok(()),
-                Some(state) => {
-                    owned_id(owner, &state).map_err(|_| Error::Cleanup)?;
-                }
+    //
+    // The wait's deadline is checked between inspections, never by
+    // cancelling one: a cancelled request drops the connection
+    // (`RequestGuard`), and `cleanup` then reads its own deadline as a lost
+    // peer and deletes again through a janitor, so a slow runner decided
+    // whether the ID was deleted once or twice (#1327). An inspection that
+    // itself hangs is bounded by `REQUEST_BUDGET`, and that is a lost
+    // connection.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match inspect(api, id).await? {
+            None => return Ok(()),
+            Some(state) => {
+                owned_id(owner, &state).map_err(|_| Error::Cleanup)?;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-    })
-    .await
-    .map_err(|_| Error::Cleanup)?
+        if Instant::now() >= deadline {
+            return Err(Error::Cleanup);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn cleanup(api: &mut LocalApi, owner: &Owner) -> Result<(), Error> {
