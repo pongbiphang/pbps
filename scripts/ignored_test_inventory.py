@@ -362,6 +362,21 @@ class NamespaceExposure(ast.NodeVisitor):
         finally:
             self.conditional = conditional
 
+    def visit_With(self, node):
+        for item in node.items:
+            # The first expression is reached under the incoming state.
+            # An entered manager can suppress a failure before later
+            # contexts or body writes, so none proves an older alias gone.
+            self.visit(item.context_expr)
+            if item.optional_vars is not None:
+                self.visit(item.optional_vars)
+            self.conditional = True
+        for statement in node.body:
+            self.visit(statement)
+        # visit() restores the incoming state for the following statement.
+
+    visit_AsyncWith = visit_With
+
     def visit_Call(self, node):
         if node is self.harmless:
             return

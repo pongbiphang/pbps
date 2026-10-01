@@ -505,6 +505,145 @@ class Ownership(unittest.TestCase):
                     with self.assertRaises(audit.InventoryError):
                         self.check()
 
+    def assert_runner_selector(self, source, *, owned, accepted):
+        # The executed child is an oracle; the auditor sees only its source.
+        actual = subprocess.run([sys.executable, '-B', '-c', source + 'print(TESTS)'],
+                                check=True, capture_output=True, text=True, timeout=10)
+        self.assertEqual(actual.stdout, "['owned']\n" if owned else '[]\n')
+        self.inventory['owners']['live']['selection'] = {
+            'kind': 'data', 'file': 'runner.py', 'expression': 'TESTS'}
+        (self.root / 'runner.py').write_text(source, encoding='utf-8')
+        if accepted:
+            self.assertEqual(self.check(), 1)
+        else:
+            with self.assertRaises(audit.InventoryError):
+                self.check()
+
+    def test_suppressed_body_writes_cannot_erase_earlier_reflective_aliases(self):
+        aliases = [
+            ('bare', 'inspect = globals', 'inspect()', 'inspect = len'),
+            ('imported', 'from builtins import globals as inspect', 'inspect()',
+             'from builtins import len as inspect'),
+            ('qualified', 'inspect = defaults.globals', 'inspect()', 'inspect = len'),
+            ('module', 'inspect = defaults', 'inspect.globals()', 'inspect = None'),
+        ]
+        bodies = [
+            ('raise-before-write', 'raise RuntimeError("stop")\n{shadow}'),
+            ('nested-suppression', 'with suppress(RuntimeError):\n'
+             '    raise RuntimeError("stop")\n    {shadow}'),
+            ('definition-after-raise', 'raise RuntimeError("stop")\n'
+             'def inspect(*args): return {{}}'),
+        ]
+        for alias, setup, capture, shadow in aliases:
+            for label, body in bodies:
+                for before in (True, False):
+                    with self.subTest(alias=alias, body=label, selector_before=before):
+                        # A skipped function definition is a callable shadow;
+                        # the module case needs its ordinary assignment instead.
+                        if label == 'definition-after-raise' and alias == 'module':
+                            body = 'raise RuntimeError("stop")\n{shadow}'
+                        block = 'with suppress(RuntimeError):\n' + indent(body.format(shadow=shadow), '    ')
+                        source = 'import builtins as defaults\nfrom contextlib import suppress\n' + setup + '\n'
+                        if before:
+                            source += 'TESTS = ["owned"]\n'
+                        source += block + '\nnamespace = ' + capture + '\n'
+                        if not before:
+                            source += 'TESTS = ["owned"]\n'
+                        source += 'namespace["TESTS"] = []\n'
+                        self.assert_runner_selector(source, owned=False, accepted=False)
+        for global_ in ('', 'global inspect\n'):
+            with self.subTest(class_global=bool(global_)):
+                source = ('import builtins as defaults\nfrom contextlib import suppress\n'
+                          'inspect = defaults.globals\nclass Holder:\n'
+                          + indent(global_ + 'inspect = defaults.globals\n'
+                                   'with suppress(RuntimeError):\n'
+                                   '    raise RuntimeError("stop")\n    inspect = len\n'
+                                   'namespace = inspect()\n', '    ')
+                          + 'TESTS = ["owned"]\nHolder.namespace["TESTS"] = []\n')
+                self.assert_runner_selector(source, owned=False, accepted=False)
+        source = ('import builtins as defaults\nfrom contextlib import suppress\n'
+                  'def fail(): raise RuntimeError("stop")\ninspect = defaults.globals\n'
+                  'with suppress(RuntimeError), fail(), factory(inspect := len):\n    pass\n'
+                  'namespace = inspect()\nTESTS = ["owned"]\nnamespace["TESTS"] = []\n')
+        self.assert_runner_selector(source, owned=False, accepted=False)
+
+    def test_context_headers_and_following_shadows_keep_their_execution_order(self):
+        prefix = 'import builtins as defaults\nfrom contextlib import suppress, nullcontext\n'
+        safe = [
+            ('guaranteed-first-context-shadow', 'inspect = defaults.globals\n'
+             'def manager(ignored): return suppress(RuntimeError)\n'
+             'with manager(inspect := len):\n    raise RuntimeError("stop")\n'
+             'value = inspect([])\n'),
+            ('following-callable-shadow', 'inspect = defaults.globals\n'
+             'with suppress(RuntimeError):\n    raise RuntimeError("stop")\n    inspect = len\n'
+             'inspect = len\nvalue = inspect([])\n'),
+            ('following-module-shadow', 'from types import SimpleNamespace\n'
+             'inspect = defaults\nwith suppress(RuntimeError):\n'
+             '    raise RuntimeError("stop")\n    inspect = None\n'
+             'inspect = SimpleNamespace(globals=lambda: {})\nnamespace = inspect.globals()\n'),
+            ('completed-inert-body', 'inspect = len\nwith nullcontext():\n    inspect = len\n'
+             'value = inspect([])\n'),
+            ('unused-reflective-alias', 'inspect = defaults.globals\n'
+             'with suppress(RuntimeError):\n    raise RuntimeError("stop")\n    inspect = len\n'),
+            ('exception-after-actual-shadow', 'inspect = defaults.globals\n'
+             'with suppress(RuntimeError):\n    inspect = len\n    raise RuntimeError("stop")\n'
+             'inspect = len\nvalue = inspect([])\n'),
+        ]
+        for label, body in safe:
+            for before in (True, False):
+                with self.subTest(control=label, selector_before=before):
+                    source = prefix + ('TESTS = ["owned"]\n' if before else '') + body
+                    if not before:
+                        source += 'TESTS = ["owned"]\n'
+                    self.assert_runner_selector(source, owned=True, accepted=True)
+        for label, body in [
+            ('context-expression-reflection', 'with nullcontext(namespace := defaults.globals()):\n    pass\n'),
+            ('completed-body-reflection', 'inspect = defaults.globals\n'
+             'with nullcontext():\n    namespace = inspect()\n'),
+            ('following-guaranteed-reflection', 'inspect = len\nwith nullcontext():\n    pass\n'
+             'inspect = defaults.globals\nnamespace = inspect()\n'),
+        ]:
+            for before in (True, False):
+                with self.subTest(control=label, selector_before=before):
+                    source = prefix + ('TESTS = ["owned"]\n' if before else '') + body
+                    if not before:
+                        source += 'TESTS = ["owned"]\n'
+                    self.assert_runner_selector(source + 'namespace["TESTS"] = []\n',
+                                                owned=False, accepted=False)
+
+    def test_async_suppression_preserves_aliases_in_a_legally_executed_body(self):
+        # Module witnesses do not interpret called helper bodies. Replay just
+        # the legal async body's statements to qualify the shared visitor rule.
+        for module in (False, True):
+            for following_shadow in (False, True):
+                with self.subTest(module=module, following_shadow=following_shadow):
+                    setup = 'inspect = defaults' if module else 'inspect = defaults.globals'
+                    call = 'inspect.globals()' if module else 'inspect()'
+                    harmless = 'inspect = SimpleNamespace(globals=lambda: {})' if module else 'inspect = lambda: {}'
+                    source = ('import asyncio\nimport builtins as defaults\n'
+                              'from types import SimpleNamespace\nclass Suppress:\n'
+                              '    async def __aenter__(self): return None\n'
+                              '    async def __aexit__(self, *args): return True\n'
+                              + setup + '\nasync def scenario():\n    global inspect\n'
+                              '    async with Suppress():\n        raise RuntimeError("stop")\n'
+                              '        inspect = None\n'
+                              + ('    ' + harmless + '\n' if following_shadow else '')
+                              + '    return ' + call + '\nnamespace = asyncio.run(scenario())\n'
+                              'TESTS = ["owned"]\nnamespace["TESTS"] = []\n')
+                    actual = subprocess.run([sys.executable, '-B', '-c', source + 'print(TESTS)'],
+                                            check=True, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(actual.stdout, "['owned']\n" if following_shadow else '[]\n')
+                    tree = audit.ast.parse(source)
+                    observer = audit.NamespaceExposure()
+                    for statement in tree.body:
+                        if isinstance(statement, audit.ast.AsyncFunctionDef):
+                            break
+                        observer.visit(statement)
+                    observer.globals = {'inspect'}
+                    for statement in statement.body:
+                        observer.visit(statement)
+                    self.assertEqual(observer.exposed, not following_shadow)
+
     def test_fresh_object_namespaces_do_not_expose_module_selectors(self):
         imports = [
             ('from types import SimpleNamespace', 'SimpleNamespace'),
