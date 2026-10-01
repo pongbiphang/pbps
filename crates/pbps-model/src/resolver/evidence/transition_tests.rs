@@ -730,9 +730,7 @@ pub(super) fn rename_endpoints(column: bool) -> (ChangeSet, ResolverEvidence) {
             .before
             .prerequisites()
             .iter()
-            .find(|p| {
-                p.ownership == ObjectOwnership::Surface(Surface::Table(table.clone()))
-            })
+            .find(|p| p.ownership == ObjectOwnership::Surface(Surface::Table(table.clone())))
             .unwrap()
             .object
             .clone();
@@ -1933,13 +1931,22 @@ mod column_vector_parent {
 
     fn refuse(changes: &ChangeSet, evidence: &ResolverEvidence, reason: &str) {
         assert!(
-            evidence.before.project(changes, &evidence.after, &evidence.transitions).is_err(),
+            evidence
+                .before
+                .project(changes, &evidence.after, &evidence.transitions)
+                .is_err(),
             "projection accepted {reason}"
         );
-        assert!(construct(changes, evidence).is_err(), "constructor accepted {reason}");
+        assert!(
+            construct(changes, evidence).is_err(),
+            "constructor accepted {reason}"
+        );
         let decoded: ResolverEvidence =
             serde_json::from_value(serde_json::to_value(evidence).unwrap()).unwrap();
-        assert!(decoded.validate(changes).is_err(), "reader accepted {reason}");
+        assert!(
+            decoded.validate(changes).is_err(),
+            "reader accepted {reason}"
+        );
     }
 
     #[test]
@@ -1960,12 +1967,16 @@ mod column_vector_parent {
                 serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
             assert_eq!(decoded, plan);
             decoded.validate_analysis().unwrap();
-            let parent = evidence.transitions.iter().position(|t| {
-                matches!(t.surface, Surface::Table(_))
-            }).unwrap();
-            let column = evidence.transitions.iter().position(|t| {
-                matches!(t.surface, Surface::Column(_))
-            }).unwrap();
+            let parent = evidence
+                .transitions
+                .iter()
+                .position(|t| matches!(t.surface, Surface::Table(_)))
+                .unwrap();
+            let column = evidence
+                .transitions
+                .iter()
+                .position(|t| matches!(t.surface, Surface::Column(_)))
+                .unwrap();
             assert_eq!(evidence.transitions[parent].before.len(), 1);
             assert_eq!(evidence.transitions[parent].after.len(), 1);
             // Identical parent fingerprints are deliberate: neither a hash
@@ -1985,7 +1996,9 @@ mod column_vector_parent {
                 refuse(&changes, &omitted, "one surviving parent endpoint omitted");
             }
             let mut duplicate = evidence.clone();
-            duplicate.transitions.push(evidence.transitions[parent].clone());
+            duplicate
+                .transitions
+                .push(evidence.transitions[parent].clone());
             refuse(&changes, &duplicate, "duplicate parent transition");
         }
     }
@@ -1993,9 +2006,11 @@ mod column_vector_parent {
     #[test]
     fn a_column_vector_parent_cannot_authorize_unrelated_records() {
         let (changes, evidence) = fixtures().remove(0);
-        let parent = evidence.transitions.iter().position(|t| {
-            matches!(t.surface, Surface::Table(_))
-        }).unwrap();
+        let parent = evidence
+            .transitions
+            .iter()
+            .position(|t| matches!(t.surface, Surface::Table(_)))
+            .unwrap();
         let table: TableName = "app.v".parse().unwrap();
         for ownership in [
             ObjectOwnership::Surface(Surface::Column(table.column("unrelated"))),
@@ -2025,7 +2040,11 @@ mod column_vector_parent {
             excessive.validate(&changes).unwrap();
             excessive.transitions[parent].before.insert(object.clone());
             excessive.transitions[parent].after.insert(object);
-            refuse(&changes, &excessive, "parent escalation to unrelated authority");
+            refuse(
+                &changes,
+                &excessive,
+                "parent escalation to unrelated authority",
+            );
         }
     }
 
@@ -2038,19 +2057,32 @@ mod column_vector_parent {
             } else {
                 fixtures().remove(3)
             };
-            let parent = evidence.transitions.iter().position(|t| {
-                matches!(t.surface, Surface::Table(_))
-            }).unwrap();
-            let manifest = if creating { &mut evidence.before } else { &mut evidence.after };
-            let object = evidence.transitions[parent].after.iter().next().unwrap().clone();
+            let parent = evidence
+                .transitions
+                .iter()
+                .position(|t| matches!(t.surface, Surface::Table(_)))
+                .unwrap();
+            let manifest = if creating {
+                &mut evidence.before
+            } else {
+                &mut evidence.after
+            };
+            let object = evidence.transitions[parent]
+                .after
+                .iter()
+                .next()
+                .unwrap()
+                .clone();
             let mut json = serde_json::to_value(&*manifest).unwrap();
-            json["prerequisites"].as_array_mut().unwrap().retain(|p| {
-                p["object"] != serde_json::to_value(&object).unwrap()
-            });
+            json["prerequisites"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|p| p["object"] != serde_json::to_value(&object).unwrap());
             for membership in json["membership"].as_array_mut().unwrap() {
-                membership["members"].as_array_mut().unwrap().retain(|member| {
-                    member != &serde_json::to_value(&object).unwrap()
-                });
+                membership["members"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|member| member != &serde_json::to_value(&object).unwrap());
             }
             *manifest = serde_json::from_value(json).unwrap();
             if creating {
@@ -2058,7 +2090,11 @@ mod column_vector_parent {
             } else {
                 evidence.transitions[parent].after.clear();
             }
-            refuse(&changes, &evidence, "absent parent without its lifecycle change");
+            refuse(
+                &changes,
+                &evidence,
+                "absent parent without its lifecycle change",
+            );
             let lifecycle = if creating {
                 Change::CreateTable {
                     uid: "t_000000".parse().unwrap(),
@@ -2077,7 +2113,10 @@ mod column_vector_parent {
                 changes.changes.push(PlannedChange::new(lifecycle));
             }
             evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
-            construct(&changes, &evidence).unwrap().validate(&changes).unwrap();
+            construct(&changes, &evidence)
+                .unwrap()
+                .validate(&changes)
+                .unwrap();
         }
     }
 
@@ -2085,43 +2124,92 @@ mod column_vector_parent {
     fn nonvector_edits_cannot_borrow_a_parent_transition() {
         let table: TableName = "app.v".parse().unwrap();
         let (_, fixture) = fixtures().remove(3);
-        let parent = fixture.transitions.iter().find(|t| {
-            matches!(t.surface, Surface::Table(_))
-        }).unwrap().clone();
-        let column = fixture.before.prerequisites().iter().find(|p| {
-            p.ownership == ObjectOwnership::Surface(Surface::Column(table.column("n")))
-        }).unwrap().object.clone();
-        let default = fixture.before.prerequisites().iter().find(|p| {
-            p.ownership == ObjectOwnership::Surface(Surface::Default(table.column("n")))
-        }).unwrap().object.clone();
+        let parent = fixture
+            .transitions
+            .iter()
+            .find(|t| matches!(t.surface, Surface::Table(_)))
+            .unwrap()
+            .clone();
+        let column = fixture
+            .before
+            .prerequisites()
+            .iter()
+            .find(|p| p.ownership == ObjectOwnership::Surface(Surface::Column(table.column("n"))))
+            .unwrap()
+            .object
+            .clone();
+        let default = fixture
+            .before
+            .prerequisites()
+            .iter()
+            .find(|p| p.ownership == ObjectOwnership::Surface(Surface::Default(table.column("n"))))
+            .unwrap()
+            .object
+            .clone();
         let uid: crate::Uid = "c_000000".parse().unwrap();
         for (change, surface, inventory) in [
-            (Change::AlterColumnType {
-                uid: uid.clone(), column: table.column("n"),
-                from: "integer".parse().unwrap(), to: "bigint".parse().unwrap(),
-                from_nullable: true, to_nullable: true, from_collation: None, to_collation: None,
-            }, Surface::Column(table.column("n")), BTreeSet::from([column.clone(), default.clone()])),
-            (Change::AlterColumnNullability {
-                uid: uid.clone(), column: table.column("n"), ty: "integer".parse().unwrap(),
-                to_nullable: false, collation: None,
-            }, Surface::Column(table.column("n")), BTreeSet::from([column.clone()])),
-            (Change::AlterColumnDefault {
-                uid: uid.clone(), column: table.column("n"),
-                from: Some("7".into()), to: Some("8".into()),
-            }, Surface::Default(table.column("n")), BTreeSet::from([default.clone()])),
-            (Change::AlterColumnExpression {
-                uid, column: table.column("n"), from: "1 + 4".into(), to: "1 + 5".into(),
-            }, Surface::Default(table.column("n")), BTreeSet::from([default.clone()])),
+            (
+                Change::AlterColumnType {
+                    uid: uid.clone(),
+                    column: table.column("n"),
+                    from: "integer".parse().unwrap(),
+                    to: "bigint".parse().unwrap(),
+                    from_nullable: true,
+                    to_nullable: true,
+                    from_collation: None,
+                    to_collation: None,
+                },
+                Surface::Column(table.column("n")),
+                BTreeSet::from([column.clone(), default.clone()]),
+            ),
+            (
+                Change::AlterColumnNullability {
+                    uid: uid.clone(),
+                    column: table.column("n"),
+                    ty: "integer".parse().unwrap(),
+                    to_nullable: false,
+                    collation: None,
+                },
+                Surface::Column(table.column("n")),
+                BTreeSet::from([column.clone()]),
+            ),
+            (
+                Change::AlterColumnDefault {
+                    uid: uid.clone(),
+                    column: table.column("n"),
+                    from: Some("7".into()),
+                    to: Some("8".into()),
+                },
+                Surface::Default(table.column("n")),
+                BTreeSet::from([default.clone()]),
+            ),
+            (
+                Change::AlterColumnExpression {
+                    uid,
+                    column: table.column("n"),
+                    from: "1 + 4".into(),
+                    to: "1 + 5".into(),
+                },
+                Surface::Default(table.column("n")),
+                BTreeSet::from([default.clone()]),
+            ),
         ] {
             let mut evidence = fixture.clone();
             evidence.after = evidence.before.clone();
             evidence.surfaces[0].desired = evidence.surfaces[0].current.clone();
             evidence.transitions = vec![ObjectTransition {
-                surface, before: inventory.clone(), after: inventory,
+                surface,
+                before: inventory.clone(),
+                after: inventory,
             }];
-            let changes = ChangeSet { changes: vec![PlannedChange::new(change)] };
+            let changes = ChangeSet {
+                changes: vec![PlannedChange::new(change)],
+            };
             evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
-            construct(&changes, &evidence).unwrap().validate(&changes).unwrap();
+            construct(&changes, &evidence)
+                .unwrap()
+                .validate(&changes)
+                .unwrap();
             evidence.transitions.push(parent.clone());
             refuse(&changes, &evidence, "parent authority for a nonvector edit");
         }

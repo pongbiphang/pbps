@@ -190,8 +190,8 @@ pub(super) fn derive(
         }
     }
     for step in &changes.changes {
-        let parent = if let Change::AddColumn { table, .. }
-        | Change::RenameColumn { table, .. } = &step.change
+        let parent = if let Change::AddColumn { table, .. } | Change::RenameColumn { table, .. } =
+            &step.change
         {
             Some(table)
         } else if let Change::DropColumn { column, .. } = &step.change {
@@ -208,7 +208,12 @@ pub(super) fn derive(
                     "a parent inventory lacks its recorded closing table endpoint".into(),
                 )
             })?;
-            if desired.ids.tables.get(uid).is_some_and(|recorded| recorded != final_table) {
+            if desired
+                .ids
+                .tables
+                .get(uid)
+                .is_some_and(|recorded| recorded != final_table)
+            {
                 return Err(Error::Binding(
                     "a parent inventory disagrees with its closing table UID".into(),
                 ));
@@ -254,7 +259,11 @@ pub(super) fn derive(
                     true,
                     false,
                     Some(Surface::Table(
-                        base.ids.tables.get(uid).cloned().unwrap_or_else(|| name.clone()),
+                        base.ids
+                            .tables
+                            .get(uid)
+                            .cloned()
+                            .unwrap_or_else(|| name.clone()),
                     )),
                 )
             }
@@ -277,7 +286,9 @@ pub(super) fn derive(
                     base.ids.tables.get(uid).cloned().map(Surface::Table),
                 )
             }
-            Change::AddColumn { uid, table, name, .. } => {
+            Change::AddColumn {
+                uid, table, name, ..
+            } => {
                 let final_column = final_column(uid, &table.column(name), desired);
                 (Surface::Column(final_column), true, false, true, None)
             }
@@ -287,7 +298,11 @@ pub(super) fn derive(
                 true,
                 false,
                 Some(Surface::Column(
-                    base.ids.columns.get(uid).cloned().unwrap_or_else(|| column.clone()),
+                    base.ids
+                        .columns
+                        .get(uid)
+                        .cloned()
+                        .unwrap_or_else(|| column.clone()),
                 )),
             ),
             Change::RenameColumn { uid, table, to, .. } => {
@@ -345,7 +360,8 @@ pub(super) fn derive(
                 })?;
                 if desired.ids.columns.get(uid) != Some(column) {
                     return Err(Error::Binding(
-                        "an expression change disagrees with its recorded desired column UID".into(),
+                        "an expression change disagrees with its recorded desired column UID"
+                            .into(),
                     ));
                 }
                 // SET EXPRESSION replaces pg_attrdef, not the column (DEC-1168.1).
