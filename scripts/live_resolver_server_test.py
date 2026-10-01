@@ -155,6 +155,8 @@ class TheFixedStorageRecipe(unittest.TestCase):
                 stack.enter_context(mock.patch.object(server, name))
             stack.enter_context(mock.patch.object(server, "service_pid", return_value="123"))
             stack.enter_context(mock.patch.object(server, "TESTS", [LEGACY_CASE, STORAGE_CASE]))
+            # This recipe oracle stays focused when other owners add cases.
+            stack.enter_context(mock.patch.object(server, "PRODUCER_TESTS", [], create=True))
             server.main()
         return commands
 
