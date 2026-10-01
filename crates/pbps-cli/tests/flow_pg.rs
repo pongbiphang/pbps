@@ -13932,6 +13932,41 @@ fn a_routine_replaced_while_the_statements_run_rolls_the_apply_back() {
     );
 }
 
+/// Polls until `reached` holds while the spawned `apply` runs. A child that
+/// exits first fails at once with its own output: it will never get there,
+/// and its stderr says why. The bound only caps how long a stuck run takes to
+/// fail, so it is generous: a loaded host spent more than the old 60 s in the
+/// apply's pre-flight alone (#1040).
+fn wait_for_the_apply(
+    what: &str,
+    child: &mut std::process::Child,
+    mut reached: impl FnMut() -> bool,
+) {
+    use std::io::Read;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    while !reached() {
+        if let Some(status) = child.try_wait().unwrap() {
+            let mut out = String::new();
+            for pipe in [
+                child.stdout.take().map(|p| Box::new(p) as Box<dyn Read>),
+                child.stderr.take().map(|p| Box::new(p) as Box<dyn Read>),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let mut pipe = pipe;
+                pipe.read_to_string(&mut out).unwrap();
+            }
+            panic!("{what}: the apply exited ({status}) before getting there:\n{out}");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: the apply never got there in 300 s"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 /// Another session replaces the helper while the apply's `ALTER TABLE` waits
 /// on a lock, after the in-transaction check before the first statement has
 /// already read `pg_proc`. Under a `repeatable read` default, a bare `BEGIN`
@@ -13970,7 +14005,7 @@ fn a_concurrent_replacement_is_seen_under_a_repeatable_read_default() {
         c
     });
     let checksum = plan_checksum(&plan);
-    let child = Command::new(BIN)
+    let mut child = Command::new(BIN)
         .arg("--project")
         .arg(&h.demo.dir)
         .args([
@@ -13988,18 +14023,17 @@ fn a_concurrent_replacement_is_seen_under_a_repeatable_read_default() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    // Wait until the apply's ALTER TABLE is queued behind the lock.
-    let mut waited = 0;
-    while scalar(
-        h.db.connection(),
-        "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation \
-         WHERE c.relname = 't' AND NOT l.granted AND l.mode = 'AccessExclusiveLock'",
-    ) == 0
-    {
-        waited += 1;
-        assert!(waited < 600, "the apply never reached its ALTER TABLE");
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    wait_for_the_apply(
+        "the apply's ALTER TABLE queued behind the lock",
+        &mut child,
+        || {
+            scalar(
+                h.db.connection(),
+                "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation \
+             WHERE c.relname = 't' AND NOT l.granted AND l.mode = 'AccessExclusiveLock'",
+            ) > 0
+        },
+    );
     h.replace_helper();
     rt.block_on(async { holder.execute("COMMIT").await.unwrap() });
     let refused = child.wait_with_output().unwrap();
