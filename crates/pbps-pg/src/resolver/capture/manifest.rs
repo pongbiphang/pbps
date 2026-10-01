@@ -143,9 +143,11 @@ fn projected_column_order(
     }
     let Some(prior) = base_ids.tables.get(table_uid) else {
         // Only an explicit CREATE explains the absence of an opening order.
-        if changes.changes.iter().any(|step| {
-            matches!(&step.change, Change::CreateTable { uid, .. } if uid == table_uid)
-        }) {
+        if changes
+            .changes
+            .iter()
+            .any(|step| matches!(&step.change, Change::CreateTable { uid, .. } if uid == table_uid))
+        {
             return Ok(None);
         }
         return Err(ManifestError::Invalid);
@@ -179,10 +181,10 @@ fn projected_column_order(
             affected |= column.table == current;
         }
         if let Change::SetPrimaryKey { table, .. }
-            | Change::AddUnique { table, .. }
-            | Change::DropUnique { table, .. }
-            | Change::AddForeignKey { table, .. }
-            | Change::DropForeignKey { table, .. } = &step.change
+        | Change::AddUnique { table, .. }
+        | Change::DropUnique { table, .. }
+        | Change::AddForeignKey { table, .. }
+        | Change::DropForeignKey { table, .. } = &step.change
         {
             separate |= table == &current;
             key_change |= table == &current;
@@ -248,7 +250,10 @@ fn projected_column_order(
     let mut used = BTreeSet::new();
     for column in opening_order {
         let reference = prior.column(&column.name[0]);
-        let mut recorded = base_ids.columns.iter().filter(|(_, name)| *name == &reference);
+        let mut recorded = base_ids
+            .columns
+            .iter()
+            .filter(|(_, name)| *name == &reference);
         let (uid, _) = recorded.next().ok_or(ManifestError::Invalid)?;
         if recorded.next().is_some() {
             return Err(ManifestError::Invalid);
@@ -275,12 +280,16 @@ fn projected_column_order(
             && uid == table_uid
         {
             return Err(ManifestError::Invalid);
-        } else if let Change::AddColumn { uid, table, name, .. } = &step.change
+        } else if let Change::AddColumn {
+            uid, table, name, ..
+        } = &step.change
             && table == &current
         {
             if name.is_empty()
                 || !used.insert(uid.clone())
-                || order.iter().any(|(_, column)| column.name == [name.clone()])
+                || order
+                    .iter()
+                    .any(|(_, column)| column.name == [name.clone()])
             {
                 return Err(ManifestError::Invalid);
             }
@@ -300,7 +309,13 @@ fn projected_column_order(
                 .position(|(known, object)| known == uid && object.name == [column.name.clone()])
                 .ok_or(ManifestError::Invalid)?;
             order.remove(position);
-        } else if let Change::RenameColumn { uid, table, from, to, .. } = &step.change
+        } else if let Change::RenameColumn {
+            uid,
+            table,
+            from,
+            to,
+            ..
+        } = &step.change
             && table == &current
         {
             if to.is_empty() || order.iter().any(|(_, column)| column.name == [to.clone()]) {
@@ -318,7 +333,12 @@ fn projected_column_order(
     for (uid, column) in order {
         let reference = table.column(&column.name[0]);
         if desired_ids.columns.get(&uid) != Some(&reference)
-            || desired_ids.columns.values().filter(|name| *name == &reference).count() != 1
+            || desired_ids
+                .columns
+                .values()
+                .filter(|name| *name == &reference)
+                .count()
+                != 1
         {
             return Err(ManifestError::Invalid);
         }
@@ -1288,9 +1308,9 @@ impl CompiledCapture {
                 } else {
                     false
                 };
-                let preserve_parent = parent.is_some_and(|parent| {
-                    parent_relation || !parent.separate_table_mutation
-                }) && owner == &ObjectOwnership::Surface(transition.surface.clone());
+                let preserve_parent = parent
+                    .is_some_and(|parent| parent_relation || !parent.separate_table_mutation)
+                    && owner == &ObjectOwnership::Surface(transition.surface.clone());
                 let source = if preserve_parent {
                     let source = if parent_relation {
                         parent.ok_or(ManifestError::Invalid)?.source.clone()
@@ -1361,11 +1381,14 @@ impl CompiledCapture {
                             // A column operation preserves the existing table;
                             // only a separately approved rename/key operation
                             // may replace these other relation properties.
-                            let renamed_relation = parent_relation && source != *object
+                            let renamed_relation = parent_relation
+                                && source != *object
                                 && matches!(*field, "relname" | "relnamespace" | "reltype");
-                            let changed_key = parent_relation && *field == "relreplident"
+                            let changed_key = parent_relation
+                                && *field == "relreplident"
                                 && parent.is_some_and(|parent| parent.key_change);
-                            let projected = if renamed_relation || changed_key
+                            let projected = if renamed_relation
+                                || changed_key
                                 || *field == "engine_definition" && references_changed
                             {
                                 Some(

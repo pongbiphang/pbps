@@ -52,19 +52,10 @@ impl InputManifest {
         for transition in transitions {
             if (transition.before.is_empty() && transition.after.is_empty())
                 || !owners.insert(&transition.surface)
-                || !changes
-                    .changes
-                    .iter()
-                    .enumerate()
-                    .any(|(index, p)| {
-                        touches(&p.change, &transition.surface)
-                            || vector_transition_matches(
-                                &p.change,
-                                changes,
-                                index,
-                                &transition.surface,
-                            )
-                    })
+                || !changes.changes.iter().enumerate().any(|(index, p)| {
+                    touches(&p.change, &transition.surface)
+                        || vector_transition_matches(&p.change, changes, index, &transition.surface)
+                })
             {
                 return Err(ManifestError::Invalid);
             }
@@ -83,7 +74,12 @@ impl InputManifest {
                     // also authorize replacing it (SPEC 9.3.2).
                     let affected = changes.changes.iter().enumerate().any(|(index, step)| {
                         vector_inventory_permitted(
-                            &step.change, changes, index, before, &transition.surface, ownership,
+                            &step.change,
+                            changes,
+                            index,
+                            before,
+                            &transition.surface,
+                            ownership,
                         ) || touches(&step.change, &transition.surface)
                             && ownership.permits(&transition_at_endpoint(
                                 &transition.surface,
@@ -177,7 +173,8 @@ impl InputManifest {
                     if records.is_empty() && planned_absence(owner.surface(), changes, before) {
                         continue;
                     }
-                    if records.is_empty() || records.iter().any(|p| !inventory.contains(&p.object)) {
+                    if records.is_empty() || records.iter().any(|p| !inventory.contains(&p.object))
+                    {
                         return Err(ManifestError::Incomplete);
                     }
                 }
@@ -326,7 +323,9 @@ fn vector_transition_matches(
     };
     vector_owner_matches(&OwnerScope::Exact(parent), changes, index, surface)
         || changed_owners(change).is_some_and(|(owners, _, _)| {
-            owners.iter().any(|owner| vector_owner_matches(owner, changes, index, surface))
+            owners
+                .iter()
+                .any(|owner| vector_owner_matches(owner, changes, index, surface))
         })
 }
 
@@ -343,12 +342,16 @@ fn vector_inventory_permitted(
     };
     let parent = OwnerScope::Exact(parent);
     (vector_owner_matches(&parent, changes, index, surface)
-        && parent.at_endpoint(changes, index, before).contains(ownership))
+        && parent
+            .at_endpoint(changes, index, before)
+            .contains(ownership))
         || changed_owners(change).is_some_and(|(owners, opening, closing)| {
             (if before { opening } else { closing })
                 && owners.iter().any(|owner| {
                     vector_owner_matches(owner, changes, index, surface)
-                        && owner.at_endpoint(changes, index, before).contains(ownership)
+                        && owner
+                            .at_endpoint(changes, index, before)
+                            .contains(ownership)
                 })
         })
 }
