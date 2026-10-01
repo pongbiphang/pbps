@@ -656,24 +656,103 @@ fn diff_partial_rebuilding(
             }
         })
         .collect();
-    let mut chain_depth: BTreeMap<(TableName, String), usize> = BTreeMap::new();
     let mut cycles: BTreeSet<(TableName, BTreeSet<String>)> = BTreeSet::new();
     for ((table, from), to) in &vacates {
-        let mut depth = 0usize;
         let mut path = vec![from.clone()];
-        let mut next = to;
+        let mut next = to.clone();
         while let Some(after) = vacates.get(&(table.clone(), next.clone())) {
             // Only the links that close the loop: a chain can lead into one.
-            if let Some(start) = path.iter().position(|seen| seen == next) {
+            if let Some(start) = path.iter().position(|seen| *seen == next) {
                 cycles.insert((table.clone(), path[start..].iter().cloned().collect()));
                 break;
             }
             path.push(next.clone());
-            depth += 1;
-            next = after;
+            next = after.clone();
         }
-        chain_depth.insert((table.clone(), from.clone()), depth);
     }
+    // What each rename waits on: the rename vacating its target. Under a
+    // case-insensitive collation `a -> B` also waits on `b -> c`, since the
+    // engine reads `B` as held by `b` (DEC-981.3). Such a link is added after
+    // every exact one and only where it closes no cycle: on a case-sensitive
+    // database `a -> B` beside `b -> A` is a valid pair, not a swap, and a
+    // folded link must not hide an exact one it would loop through.
+    type Rename = (TableName, String);
+    let mut waits: BTreeMap<&Rename, BTreeSet<&Rename>> = vacates
+        .iter()
+        .map(|(rename, to)| {
+            let exact = vacates.get_key_value(&(rename.0.clone(), to.clone()));
+            (rename, exact.map(|(k, _)| k).into_iter().collect())
+        })
+        .collect();
+    fn reaches<'a>(
+        waits: &BTreeMap<&'a Rename, BTreeSet<&'a Rename>>,
+        from: &'a Rename,
+        to: &Rename,
+    ) -> bool {
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![from];
+        while let Some(at) = stack.pop() {
+            if at == to {
+                return true;
+            }
+            if seen.insert(at) {
+                stack.extend(waits.get(at).into_iter().flatten().copied());
+            }
+        }
+        false
+    }
+    for (rename, to) in &vacates {
+        let folded = crate::rename_order::case_folded(to);
+        for vacating in vacates.keys() {
+            if vacating != rename
+                && vacating.0 == rename.0
+                && vacating.1 != *to
+                && crate::rename_order::case_folded(&vacating.1) == folded
+                && !reaches(&waits, vacating, rename)
+            {
+                waits
+                    .get_mut(rename)
+                    .expect("every rename has an entry")
+                    .insert(vacating);
+            }
+        }
+    }
+    // Its depth is the longest run of renames it waits on; the chain's far
+    // end, whose target is free, goes first. A rename on an exact cycle is
+    // refused below, so its depth is only cut short, never relied on.
+    fn depth<'a>(
+        waits: &BTreeMap<&'a Rename, BTreeSet<&'a Rename>>,
+        at: &'a Rename,
+        open: &mut BTreeSet<&'a Rename>,
+        memo: &mut BTreeMap<&'a Rename, usize>,
+    ) -> usize {
+        if let Some(&d) = memo.get(at) {
+            return d;
+        }
+        if !open.insert(at) {
+            return 0;
+        }
+        let d = waits
+            .get(at)
+            .into_iter()
+            .flatten()
+            .map(|&next| 1 + depth(waits, next, open, memo))
+            .max()
+            .unwrap_or(0);
+        open.remove(at);
+        memo.insert(at, d);
+        d
+    }
+    let mut memo = BTreeMap::new();
+    let chain_depth: BTreeMap<Rename, usize> = vacates
+        .keys()
+        .map(|rename| {
+            (
+                rename.clone(),
+                depth(&waits, rename, &mut BTreeSet::new(), &mut memo),
+            )
+        })
+        .collect();
     for (table, columns) in cycles {
         errs.push(DiffError::ColumnRenameCycle { table, columns });
     }
@@ -4936,10 +5015,397 @@ mod tests {
         diff(base, declared, dialect, &Hints::default()).unwrap()
     }
 
+    /// DEC-981.3, the other two release paths: a table rename vacating a name
+    /// a later rename claims in another case, and a check drop freeing a name
+    /// a rename claims in another case. Each goes first.
+    #[test]
+    fn every_release_path_orders_a_claim_spelled_differently_in_case() {
+        let t = |n: &str| table(&[(n, Column::new(ty("int")))]);
+        let tables = |list: &[(&str, &str)]| {
+            let mut s = Schema::default();
+            for (name, column) in list {
+                s.tables.insert(name.parse().unwrap(), t(column));
+            }
+            s
+        };
+        let renames = |cs: &ChangeSet| -> Vec<String> {
+            cs.changes
+                .iter()
+                .filter_map(|p| match &p.change {
+                    Change::RenameTable { from, to, .. } => Some(format!("{from} -> {to}")),
+                    Change::DropCheck { name, .. } => Some(format!("drop check {name}")),
+                    _ => None,
+                })
+                .collect()
+        };
+        // `app.b -> app.c`, then `app.a -> app.B`: `a` sorts first by name.
+        let cs = across_revisions(
+            &tables(&[("app.a", "ay"), ("app.b", "bee")]),
+            &[
+                (
+                    tables(&[("app.a", "ay"), ("app.c", "bee")]),
+                    vec![Intent::RenameTable {
+                        from: "app.b".parse().unwrap(),
+                        to: "app.c".parse().unwrap(),
+                    }],
+                ),
+                (
+                    tables(&[("app.B", "ay"), ("app.c", "bee")]),
+                    vec![Intent::RenameTable {
+                        from: "app.a".parse().unwrap(),
+                        to: "app.B".parse().unwrap(),
+                    }],
+                ),
+            ],
+        );
+        assert_eq!(renames(&cs), ["app.b -> app.c", "app.a -> app.B"], "{cs:?}");
+
+        // A check `Target` on another table, dropped, and `app.old` renamed to
+        // `app.target` (constraints share the namespace here).
+        let old_t = table(&[("id", Column::new(ty("int")))]);
+        let mut other = table(&[("n", Column::new(ty("int")))]);
+        other.checks.insert(
+            "Target".into(),
+            pbps_model::schema::CheckConstraint {
+                expression: "n > 0".into(),
+            },
+        );
+        let base = two_tables(("app.old", old_t.clone()), ("app.other", other));
+        let declared = two_tables(
+            ("app.target", old_t),
+            ("app.other", table(&[("n", Column::new(ty("int")))])),
+        );
+        let cs = run(
+            &base,
+            &declared,
+            &[Intent::RenameTable {
+                from: "app.old".parse().unwrap(),
+                to: "app.target".parse().unwrap(),
+            }],
+        );
+        assert_eq!(
+            renames(&cs),
+            ["drop check Target", "app.old -> app.target"],
+            "{cs:?}"
+        );
+    }
+
+    /// DEC-981.3: dropping `app.Target` and renaming `app.old` to
+    /// `app.target` across skipped revisions is one name to a case-insensitive
+    /// collation, so the drop goes first there too (`sp_rename` is Msg 15335
+    /// otherwise). On a case-sensitive database the extra order is harmless.
+    #[test]
+    fn a_dropped_table_frees_a_name_spelled_differently_in_case() {
+        let t = |n: &str| table(&[(n, Column::new(ty("int")))]);
+        let tables = |list: &[(&str, &str)]| {
+            let mut s = Schema::default();
+            for (name, column) in list {
+                s.tables.insert(name.parse().unwrap(), t(column));
+            }
+            s
+        };
+        let order = |cs: &ChangeSet| -> Vec<String> {
+            cs.changes
+                .iter()
+                .filter_map(|p| match &p.change {
+                    Change::DropTable { name, .. } => Some(format!("drop {name}")),
+                    Change::RenameTable { from, to, .. } => Some(format!("{from} -> {to}")),
+                    _ => None,
+                })
+                .collect()
+        };
+        let cs = across_revisions(
+            &tables(&[("app.Target", "doomed"), ("app.old", "kept")]),
+            &[
+                (
+                    tables(&[("app.old", "kept")]),
+                    vec![Intent::DropTable {
+                        table: "app.Target".parse().unwrap(),
+                        reason: "gone".into(),
+                    }],
+                ),
+                (
+                    tables(&[("app.target", "kept")]),
+                    vec![Intent::RenameTable {
+                        from: "app.old".parse().unwrap(),
+                        to: "app.target".parse().unwrap(),
+                    }],
+                ),
+            ],
+        );
+        assert_eq!(
+            order(&cs),
+            ["drop app.Target", "app.old -> app.target"],
+            "{cs:?}"
+        );
+    }
+
     /// Measured on both engines, the rename is refused while the doomed table
     /// still holds the name: Msg 15335 on SQL Server, `42P07` on PostgreSQL.
     /// So the drop moves ahead of it, on a dialect where nothing else shares
     /// the namespace as well as on one where indexes do.
+    /// #981's original case: `s1.old` carries a check `c` into `s2` while the
+    /// plan drops the table `s2.c`. A dropped table releases its own name
+    /// (DEC-536.1), so the drop runs before the move that claims it; before
+    /// that, `DropTable` was class 6 and the transfer was refused.
+    #[test]
+    fn a_dropped_table_frees_a_name_a_moved_table_carries_in() {
+        let mut moving = table(&[("n", Column::new(ty("int")))]);
+        moving.checks.insert(
+            "c".into(),
+            pbps_model::schema::CheckConstraint {
+                expression: "n > 0".into(),
+            },
+        );
+        let base = two_tables(
+            ("s1.old", moving.clone()),
+            ("s2.c", table(&[("id", Column::new(ty("int")))])),
+        );
+        let declared = schema_of("s2.new", moving);
+        let cs = run(
+            &base,
+            &declared,
+            &[
+                Intent::RenameTable {
+                    from: "s1.old".parse().unwrap(),
+                    to: "s2.new".parse().unwrap(),
+                },
+                Intent::DropTable {
+                    table: "s2.c".parse().unwrap(),
+                    reason: "gone".into(),
+                },
+            ],
+        );
+        assert_eq!(kinds(&cs), ["DropTable", "RenameTable"], "{cs:?}");
+    }
+
+    /// A move to another schema takes the constraints it carries out of the
+    /// source schema, so a rename into one of their names there runs after
+    /// it, under the exact spelling and under one differing only in case
+    /// (review of #1346). `a` sorts first by name, so without the link the
+    /// rename into `c` ran while the check still held it.
+    #[test]
+    fn a_rename_into_a_name_a_moved_table_carries_away_runs_after_the_move() {
+        let mut moving = table(&[("n", Column::new(ty("int")))]);
+        moving.checks.insert(
+            "c".into(),
+            pbps_model::schema::CheckConstraint {
+                expression: "n > 0".into(),
+            },
+        );
+        let other = table(&[("id", Column::new(ty("int")))]);
+        let base = two_tables(("s1.old", moving.clone()), ("s1.a", other.clone()));
+        for into in ["s1.c", "s1.C"] {
+            let declared = two_tables(("s2.new", moving.clone()), (into, other.clone()));
+            let cs = run(
+                &base,
+                &declared,
+                &[
+                    Intent::RenameTable {
+                        from: "s1.old".parse().unwrap(),
+                        to: "s2.new".parse().unwrap(),
+                    },
+                    Intent::RenameTable {
+                        from: "s1.a".parse().unwrap(),
+                        to: into.parse().unwrap(),
+                    },
+                ],
+            );
+            let order: Vec<String> = cs
+                .changes
+                .iter()
+                .filter_map(|p| match &p.change {
+                    Change::RenameTable { from, .. } => Some(from.to_string()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(order, ["s1.old", "s1.a"], "{into}: {cs:?}");
+        }
+    }
+
+    /// A generated default constraint leaves the source schema with its
+    /// table too, so a rename into its name there runs after the move
+    /// (review of #1346). A table without a default releases no such name.
+    #[test]
+    fn a_rename_into_a_moved_tables_generated_default_name_runs_after_the_move() {
+        let other = table(&[("id", Column::new(ty("int")))]);
+        let order = |moving: &Table| -> Vec<String> {
+            let base = two_tables(("s1.old", moving.clone()), ("s1.a", other.clone()));
+            let declared = two_tables(("s2.new", moving.clone()), ("s1.df_old_x", other.clone()));
+            run_with(
+                &NamesItsDefaults,
+                &base,
+                &declared,
+                &[
+                    Intent::RenameTable {
+                        from: "s1.old".parse().unwrap(),
+                        to: "s2.new".parse().unwrap(),
+                    },
+                    Intent::RenameTable {
+                        from: "s1.a".parse().unwrap(),
+                        to: "s1.df_old_x".parse().unwrap(),
+                    },
+                ],
+            )
+            .changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::RenameTable { from, .. } => Some(from.to_string()),
+                _ => None,
+            })
+            .collect()
+        };
+        let mut x = Column::new(ty("int"));
+        x.default = Some("0".into());
+        assert_eq!(order(&table(&[("x", x)])), ["s1.old", "s1.a"]);
+        // Nothing frees the name here, so the name order stands.
+        assert_eq!(
+            order(&table(&[("x", Column::new(ty("int")))])),
+            ["s1.a", "s1.old"]
+        );
+    }
+
+    /// A generated default name is one of the alternatives the table may
+    /// hold, so its edge is weak. `a.new` moves to `z.df_old_x` and `z.old`
+    /// takes `a.new`: the real edge puts `a.new`'s move first. `z.old`'s
+    /// default may hold `z.df_old_x`, or an alternative, in which case the
+    /// plan is valid; the generated edge would close a cycle, and it is the
+    /// one that gives way (review of #1346).
+    #[test]
+    fn a_generated_default_name_never_displaces_a_real_release_edge() {
+        let mut x = Column::new(ty("int"));
+        x.default = Some("0".into());
+        let old = table(&[("id", Column::new(ty("int"))), ("x", x)]);
+        let other = table(&[("id", Column::new(ty("int")))]);
+        // Two revisions, skipped: `a.new` leaves first, then `z.old` takes it.
+        let base = two_tables(("z.old", old.clone()), ("a.new", other.clone()));
+        let cs = across_revisions_with(
+            &NamesItsDefaults,
+            &base,
+            &[
+                (
+                    two_tables(("z.old", old.clone()), ("z.df_old_x", other.clone())),
+                    vec![Intent::RenameTable {
+                        from: "a.new".parse().unwrap(),
+                        to: "z.df_old_x".parse().unwrap(),
+                    }],
+                ),
+                (
+                    two_tables(("a.new", old), ("z.df_old_x", other)),
+                    vec![Intent::RenameTable {
+                        from: "z.old".parse().unwrap(),
+                        to: "a.new".parse().unwrap(),
+                    }],
+                ),
+            ],
+        );
+        let order: Vec<String> = cs
+            .changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::RenameTable { from, .. } => Some(from.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, ["a.new", "z.old"], "{cs:?}");
+
+        // Nor a case-folded one: `a.other` leaves, then `z.old` takes
+        // `a.Other`, one name to a case-insensitive collation. That edge
+        // outranks the generated name's, whichever was found first.
+        let other = table(&[("id", Column::new(ty("int")))]);
+        let mut x = Column::new(ty("int"));
+        x.default = Some("0".into());
+        let old = table(&[("id", Column::new(ty("int"))), ("x", x)]);
+        let cs = across_revisions_with(
+            &NamesItsDefaults,
+            &two_tables(("z.old", old.clone()), ("a.other", other.clone())),
+            &[
+                (
+                    two_tables(("z.old", old.clone()), ("z.df_old_x", other.clone())),
+                    vec![Intent::RenameTable {
+                        from: "a.other".parse().unwrap(),
+                        to: "z.df_old_x".parse().unwrap(),
+                    }],
+                ),
+                (
+                    two_tables(("a.Other", old), ("z.df_old_x", other)),
+                    vec![Intent::RenameTable {
+                        from: "z.old".parse().unwrap(),
+                        to: "a.Other".parse().unwrap(),
+                    }],
+                ),
+            ],
+        );
+        let order: Vec<String> = cs
+            .changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::RenameTable { from, .. } => Some(from.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, ["a.other", "z.old"], "{cs:?}");
+    }
+
+    /// A rename within its schema renames its generated defaults too, so it
+    /// releases the old table name's and claims the new one's (review of
+    /// #1346). `dbo.a` into `dbo.df_old_x` waits for `dbo.old`'s rename, and
+    /// `dbo.b`'s rename to `dbo.c` waits for `dbo.df_c_x` to leave. Without a
+    /// default neither name is involved, and the name order stands.
+    #[test]
+    fn a_rename_in_its_schema_releases_and_claims_generated_default_names() {
+        let other = table(&[("id", Column::new(ty("int")))]);
+        let mut x = Column::new(ty("int"));
+        x.default = Some("0".into());
+        let defaulted = table(&[("id", Column::new(ty("int"))), ("x", x)]);
+        let plain = table(&[
+            ("id", Column::new(ty("int"))),
+            ("x", Column::new(ty("int"))),
+        ]);
+        let order = |moving: &Table, from: &str, to: &str, other_from: &str, other_to: &str| {
+            let cs = run_with(
+                &NamesItsDefaults,
+                &two_tables((from, moving.clone()), (other_from, other.clone())),
+                &two_tables((to, moving.clone()), (other_to, other.clone())),
+                &[
+                    Intent::RenameTable {
+                        from: from.parse().unwrap(),
+                        to: to.parse().unwrap(),
+                    },
+                    Intent::RenameTable {
+                        from: other_from.parse().unwrap(),
+                        to: other_to.parse().unwrap(),
+                    },
+                ],
+            );
+            cs.changes
+                .iter()
+                .filter_map(|p| match &p.change {
+                    Change::RenameTable { from, .. } => Some(from.to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        // Released: `df_old_x` leaves with `dbo.old`'s rename.
+        assert_eq!(
+            order(&defaulted, "dbo.old", "dbo.new", "dbo.a", "dbo.df_old_x"),
+            ["dbo.old", "dbo.a"]
+        );
+        assert_eq!(
+            order(&plain, "dbo.old", "dbo.new", "dbo.a", "dbo.df_old_x"),
+            ["dbo.a", "dbo.old"]
+        );
+        // Claimed: `dbo.b -> dbo.c` names its default `df_c_x`.
+        assert_eq!(
+            order(&defaulted, "dbo.b", "dbo.c", "dbo.df_c_x", "dbo.z"),
+            ["dbo.df_c_x", "dbo.b"]
+        );
+        assert_eq!(
+            order(&plain, "dbo.b", "dbo.c", "dbo.df_c_x", "dbo.z"),
+            ["dbo.b", "dbo.df_c_x"]
+        );
+    }
+
     #[test]
     fn a_dropped_tables_name_is_free_before_a_later_rename_reuses_it() {
         let old_t = table(&[("id", Column::new(ty("int")))]);
@@ -5233,6 +5699,105 @@ mod tests {
         );
     }
 
+    /// DEC-981.3: under a case-insensitive collation `b -> c` then `a -> B` is
+    /// a chain, because the engine reads `B` as held by `b`. The fold only
+    /// orders: `a -> B` beside `b -> A` is a valid pair on a case-sensitive
+    /// database, and a cycle closed through the fold is not reported.
+    #[test]
+    fn a_column_rename_chain_linked_only_by_case_still_orders() {
+        let cols = |c: &[(&str, &str)]| {
+            schema_of(
+                "dbo.t",
+                table(
+                    &c.iter()
+                        .map(|(n, t)| (*n, Column::new(ty(t))))
+                        .collect::<Vec<_>>(),
+                ),
+            )
+        };
+        let rename = |from: &str, to: &str| Intent::RenameColumn {
+            table: "dbo.t".parse().unwrap(),
+            from: from.into(),
+            to: to.into(),
+        };
+        let order = |cs: &ChangeSet| -> Vec<String> {
+            cs.changes
+                .iter()
+                .filter_map(|p| match &p.change {
+                    Change::RenameColumn { from, to, .. } => Some(format!("{from} -> {to}")),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Fresh uids each time: without the link the order was theirs.
+        for _ in 0..32 {
+            let cs = across_revisions(
+                &cols(&[("a", "int"), ("b", "bigint")]),
+                &[
+                    (
+                        cols(&[("a", "int"), ("c", "bigint")]),
+                        vec![rename("b", "c")],
+                    ),
+                    (
+                        cols(&[("B", "int"), ("c", "bigint")]),
+                        vec![rename("a", "B")],
+                    ),
+                ],
+            );
+            assert_eq!(order(&cs), ["b -> c", "a -> B"], "{cs:?}");
+        }
+
+        // `a -> B` and `b -> A`: a cycle only through the fold. Both renames
+        // are planned, and no cycle is reported.
+        let diffed = revisions_diffed(
+            &cols(&[("a", "int"), ("b", "bigint")]),
+            &[
+                (
+                    cols(&[("x", "int"), ("b", "bigint")]),
+                    vec![rename("a", "x")],
+                ),
+                (
+                    cols(&[("x", "int"), ("A", "bigint")]),
+                    vec![rename("b", "A")],
+                ),
+                (
+                    cols(&[("B", "int"), ("A", "bigint")]),
+                    vec![rename("x", "B")],
+                ),
+            ],
+        );
+        assert!(diffed.errors.is_empty(), "{:?}", diffed.errors);
+        assert_eq!(order(&diffed.changes).len(), 2, "{:?}", diffed.changes);
+
+        // `a -> B`, `b -> c`, `c -> A`: a cycle only through two folded
+        // links, around the exact one that `b -> c` waits on `c -> A`. The
+        // link that would close the cycle is dropped, and the exact one keeps
+        // its order.
+        for _ in 0..32 {
+            let diffed = revisions_diffed(
+                &cols(&[("a", "int"), ("b", "bigint"), ("c", "smallint")]),
+                &[
+                    (
+                        cols(&[("a", "int"), ("b", "bigint"), ("A", "smallint")]),
+                        vec![rename("c", "A")],
+                    ),
+                    (
+                        cols(&[("a", "int"), ("c", "bigint"), ("A", "smallint")]),
+                        vec![rename("b", "c")],
+                    ),
+                    (
+                        cols(&[("B", "int"), ("c", "bigint"), ("A", "smallint")]),
+                        vec![rename("a", "B")],
+                    ),
+                ],
+            );
+            assert!(diffed.errors.is_empty(), "{:?}", diffed.errors);
+            let order = order(&diffed.changes);
+            let at = |r: &str| order.iter().position(|o| o == r).unwrap();
+            assert!(at("c -> A") < at("b -> c"), "{order:?}");
+        }
+    }
+
     /// Revisions resolved in turn from `base`, each with its own intents,
     /// then diffed from the undeployed baseline.
     /// A chain longer than a byte counts: each link keeps its own rank, so a
@@ -5408,6 +5973,15 @@ mod tests {
     }
 
     fn across_revisions(base: &Schema, revisions: &[(Schema, Vec<Intent>)]) -> ChangeSet {
+        across_revisions_with(&MinimalDialect, base, revisions)
+    }
+
+    /// [`across_revisions`], against a caller-chosen dialect.
+    fn across_revisions_with(
+        dialect: &dyn Dialect,
+        base: &Schema,
+        revisions: &[(Schema, Vec<Intent>)],
+    ) -> ChangeSet {
         let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
             .unwrap()
             .ids;
@@ -5424,7 +5998,7 @@ mod tests {
                 schema: &revisions.last().unwrap().0,
                 ids: &ids,
             },
-            &MinimalDialect,
+            dialect,
         )
     }
 
@@ -7239,6 +7813,75 @@ mod tests {
         }
         fn constraints_share_namespace_with_tables(&self) -> bool {
             false
+        }
+        fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
+            MinimalDialect.quote_ident(ident)
+        }
+        fn emit(
+            &self,
+            change: &Change,
+            strategy: pbps_model::Strategy,
+        ) -> Result<Vec<pbps_dialect::Statement>, pbps_dialect::DialectError> {
+            MinimalDialect.emit(change, strategy)
+        }
+        fn normalize_type(
+            &self,
+            ty: &pbps_model::ColumnType,
+        ) -> Result<pbps_model::ColumnType, pbps_dialect::DialectError> {
+            MinimalDialect.normalize_type(ty)
+        }
+        fn type_change_risk(
+            &self,
+            from: &pbps_model::ColumnType,
+            to: &pbps_model::ColumnType,
+        ) -> pbps_dialect::TypeChangeRisk {
+            MinimalDialect.type_change_risk(from, to)
+        }
+        fn fold_ident<'a>(&self, ident: &'a str) -> std::borrow::Cow<'a, str> {
+            MinimalDialect.fold_ident(ident)
+        }
+        fn lexicon(&self) -> pbps_dialect::Lexicon {
+            MinimalDialect.lexicon()
+        }
+        fn validate_table(
+            &self,
+            name: &pbps_model::TableName,
+            table: &Table,
+        ) -> Vec<pbps_dialect::DialectError> {
+            MinimalDialect.validate_table(name, table)
+        }
+        fn transaction_framing(&self) -> pbps_dialect::TransactionFraming {
+            MinimalDialect.transaction_framing()
+        }
+        fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
+            MinimalDialect.probe_framing()
+        }
+    }
+
+    /// A dialect where constraints share the schema's namespace and a column
+    /// default's constraint is named by the engine, `df_<table>_<column>`:
+    /// SQL Server's shape, without its digests. Everything else is
+    /// `MinimalDialect`'s.
+    #[derive(Debug, Clone, Copy, Default)]
+    struct NamesItsDefaults;
+
+    impl Dialect for NamesItsDefaults {
+        fn name(&self) -> &'static str {
+            "names-its-defaults"
+        }
+        fn indexes_share_namespace_with_tables(&self) -> bool {
+            false
+        }
+        fn constraints_share_namespace_with_tables(&self) -> bool {
+            true
+        }
+        fn generated_constraint_names(&self, name: &TableName, table: &Table) -> Vec<String> {
+            table
+                .columns
+                .iter()
+                .filter(|(_, c)| c.default.is_some())
+                .map(|(column, _)| format!("df_{}_{column}", name.name))
+                .collect()
         }
         fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
             MinimalDialect.quote_ident(ident)

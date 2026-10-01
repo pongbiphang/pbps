@@ -556,6 +556,9 @@ pub(crate) fn object_reads(cs: &pbps_model::ChangeSet) -> (Vec<TableName>, Vec<T
                 from, to, defaults, ..
             } => {
                 parents.push(from.clone());
+                // The target itself, so the walk sees an object the project
+                // does not record holding it (DEC-981.2).
+                names.push(to.clone());
                 for c in defaults {
                     names.push(in_schema(to, generated(to, c)));
                     names.push(in_schema(to, fallback_name(to, c)));
@@ -841,6 +844,19 @@ pub(crate) fn refuse_occupied_objects_under(
             Change::RenameTable {
                 from, to, defaults, ..
             } => {
+                // The rename's own target, held when it runs by an object
+                // other than the table: the same name, or one the database
+                // reads as the same (DEC-981.2). The plan's order already puts
+                // the drops that free it first (DEC-536.1), so what still
+                // holds it here is a collision `sp_rename` refuses: two renames
+                // into names alike under the collation, or an object the
+                // project does not record.
+                //
+                // Asked after the table's constraints have moved with it: a
+                // transfer runs before the `sp_rename`, so a carried check
+                // `New` lands in the target schema first and holds `new`
+                // there (review of #1346).
+                let table = held.iter().position(|h| &h.name == from);
                 for h in held.iter_mut() {
                     if &h.name == from {
                         h.name = to.clone();
@@ -853,11 +869,22 @@ pub(crate) fn refuse_occupied_objects_under(
                         }
                     }
                 }
+                let spelled = catalog_spelling.get(to).copied();
+                let collides = held.iter().enumerate().any(|(i, h)| {
+                    Some(i) != table
+                        && (&h.name == to || Some(&h.name) == spelled || one(&h.name) == one(to))
+                });
+                if collides {
+                    // Out of the way, so the refusal names the holder and
+                    // not the table; the claim puts it back.
+                    if let Some(i) = table {
+                        held.remove(i);
+                    }
+                    claim(&mut held, object(to, "user table"));
+                }
                 // The table itself holds its new name from here on, whether
                 // or not the read found it: a later change adding a name the
-                // database reads as the same one fails (review of #1240). Not
-                // claimed: whether the rename's own target is free is the
-                // ordering question #981 keeps, not this walk's.
+                // database reads as the same one fails (review of #1240).
                 if !held.iter().any(|h| &h.name == to) {
                     held.push(Held {
                         name: to.clone(),
@@ -7460,6 +7487,109 @@ mod tests {
     /// and a constraint of a table it drops or moves to another schema. A
     /// constraint of a table renamed within its schema stays behind, and a
     /// module the plan rebuilds already owns its name.
+    /// DEC-981.2: a table rename's own target is claimed when it runs. Two
+    /// renames into names the database reads as one (`Ck_Name`, `ck_name` on a
+    /// case-insensitive catalog) are refused at `plan --db`; on a database that
+    /// reads them as two, and for a rename into a case variant of the table's
+    /// own name, nothing is refused. An object the project does not record
+    /// that holds the target is refused too.
+    #[test]
+    fn a_table_renames_target_is_claimed_when_the_rename_runs() {
+        use pbps_model::{Change, ChangeSet, PlannedChange};
+        use pbps_mssql::catalog::NameOccupant;
+        let rename = |from: &str, to: &str| {
+            PlannedChange::new(Change::RenameTable {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, from, 0),
+                from: from.parse().unwrap(),
+                to: to.parse().unwrap(),
+                defaults: vec![],
+            })
+        };
+        let both = ChangeSet {
+            changes: vec![
+                rename("dbo.a", "dbo.Ck_Name"),
+                rename("dbo.b", "dbo.ck_name"),
+            ],
+        };
+        let alike = [(
+            TableName::new("dbo", "Ck_Name"),
+            TableName::new("dbo", "ck_name"),
+        )];
+        let e = refuse_occupied_objects_under(&both, &[], &alike, "prod")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("`dbo.ck_name`"), "{e}");
+        assert!(
+            e.contains("this plan puts user table `dbo.Ck_Name` there first"),
+            "{e}"
+        );
+        refuse_occupied_objects_under(&both, &[], &[], "prod")
+            .expect("two names where the database reads them as two");
+
+        // A case variant of the table's own name is the table, not a holder.
+        let own = ChangeSet {
+            changes: vec![rename("dbo.orders", "dbo.Orders")],
+        };
+        let self_alike = [(
+            TableName::new("dbo", "orders"),
+            TableName::new("dbo", "Orders"),
+        )];
+        refuse_occupied_objects_under(&own, &[], &self_alike, "prod")
+            .expect("a rename into a case variant of its own name");
+
+        // An object the project does not record, holding the target.
+        let sequence = NameOccupant {
+            wanted: TableName::new("dbo", "fresh"),
+            name: TableName::new("dbo", "fresh"),
+            kind: "sequence object".into(),
+            parent: None,
+            parent_column: None,
+        };
+        let into_sequence = ChangeSet {
+            changes: vec![rename("dbo.old", "dbo.fresh")],
+        };
+        // Read from the catalog, so a holder no other change names is seen.
+        assert!(
+            object_reads(&into_sequence)
+                .0
+                .contains(&TableName::new("dbo", "fresh")),
+            "the rename target is read"
+        );
+        let e = refuse_occupied_objects_under(&into_sequence, &[sequence], &[], "prod")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("the database already has sequence object `dbo.fresh`"),
+            "{e}"
+        );
+
+        // A check the table carries into the target schema, whose name there
+        // is the target's under the collation: the transfer runs first, so it
+        // holds the name when `sp_rename` runs (review of #1346).
+        let check = NameOccupant {
+            wanted: TableName::new("s1", "New"),
+            name: TableName::new("s1", "New"),
+            kind: "check constraint".into(),
+            parent: Some(TableName::new("s1", "old")),
+            parent_column: None,
+        };
+        let moved = ChangeSet {
+            changes: vec![rename("s1.old", "s2.new")],
+        };
+        let carried_alike = [(TableName::new("s2", "New"), TableName::new("s2", "new"))];
+        let e = refuse_occupied_objects_under(
+            &moved,
+            std::slice::from_ref(&check),
+            &carried_alike,
+            "prod",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("check constraint `s2.New` on `s2.new`"), "{e}");
+        refuse_occupied_objects_under(&moved, &[check], &[], "prod")
+            .expect("two names where the database reads them as two");
+    }
+
     #[test]
     fn a_sys_objects_occupant_refuses_unless_the_plan_frees_it() {
         use pbps_model::{Change, ChangeSet, Module, ModuleKind, PlannedChange};

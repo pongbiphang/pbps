@@ -1194,3 +1194,65 @@ Pinned by `a_stored_generated_column_round_trips_and_changes_its_expression`
 `a_generated_columns_expression_changes_through_the_cli_and_its_inputs_are_held`
 and `a_generated_columns_expression_change_is_refused_by_name_before_postgres_17`
 (`crates/pbps-cli/tests/flow_pg.rs`).
+
+<a id="dec-981-2"></a>
+
+**DEC-981.2. The SQL Server namespace walk claims a table rename's own target
+when the rename runs, under the database's answer on which names are one.**
+The walk that refuses a created name held by another object (#1077, #1215)
+deliberately left a rename's target unclaimed, as an ordering question. The
+plan's order already puts the drops that free a target first (DECISIONS 496,
+DEC-536.1), so whatever still holds it when the rename runs is a collision
+`sp_rename` refuses:
+
+- two renames into names alike under the catalog collation (`dbo.Ck_Name` and
+  `dbo.ck_name` on a case-insensitive database), which passed connected
+  planning and failed at apply with Msg 15335;
+- or an object the project does not record, such as a sequence.
+
+The catalog read includes each rename target, so an object no other change
+names is still seen. The target is checked after the table's constraints have
+moved with it, since a transfer to another schema runs before `sp_rename`: a
+carried check `New` holds `new` in the target schema by then. The table's own entry is not a holder, so a rename into a
+case variant of its own name passes. The alike pairs are the database's (`object_names_alike`,
+DEC-1243.1). A case-sensitive database reads the pair as two names, and the
+plan applies there.
+
+<a id="dec-981-3"></a>
+
+**DEC-981.3. Ordering edges are also added for names that differ only in
+case, and only where they close no cycle.** Which spellings are one name is the
+target database's to say, and a plan is ordered offline (SPEC 7.3). Under a
+case-insensitive collation, `DROP TABLE dbo.Target` must precede a rename to
+`dbo.target`, and the column rename `b -> c` must precede `a -> B`. With exact
+spellings alone, the rename could run first (Msg 15335).
+
+The released-name graph (`rename_order`) and the column chain depth
+(DEC-541.1) therefore also link names equal after lower-casing each character.
+In the graph this applies on every path that releases a name: a dropped table,
+a dropped constraint or index, and a rename vacating its source, as in the
+table chain `b -> c` followed by `a -> B`. A move to another schema also
+releases, in the source schema, the names of the indexes or constraints it
+carries away, the engine's own generated default names among them
+(`Dialect::generated_constraint_names`); a rename into one of them runs after
+the move, under the exact spelling as under a folded one. A generated name is
+one of several alternatives the table may hold, so its edges are weaker
+still: added after the folded ones, and only where they close no cycle, so an
+alternative the table does not hold never displaces an exact or a folded
+edge. Any table rename, within its schema too, releases the generated names
+of its old table name and claims those of the new one, as the SQL Server
+emitter renames them. Between two generated alternatives the offline order
+cannot tell which one the table holds; that is the catalog's to say (#1361).
+The rule is:
+
+- An edge found only this way is added after every exact edge, and only if it
+  closes no cycle.
+- A cycle closed through it is never reported: `a -> B` beside `b -> A` is a
+  valid pair on a case-sensitive database.
+- So a fold that is wrong for the target database costs an order the plan did
+  not need, and never refuses a plan. Refusing is left to the connected check,
+  which asks the database (DEC-981.2).
+
+Accent-insensitive collations are not folded offline, since the fold is case
+only. Where they make two names one, the connected check still asks the
+database.

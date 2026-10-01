@@ -53,6 +53,17 @@ impl Dialect for Mssql {
         types::DIALECT
     }
 
+    /// Both spellings of each column default's generated name: which one a
+    /// database holds is the catalog's to say, and the plan is ordered offline.
+    fn generated_constraint_names(&self, name: &TableName, table: &Table) -> Vec<String> {
+        table
+            .columns
+            .iter()
+            .filter(|(_, column)| column.default.is_some())
+            .flat_map(|(column, _)| emit::generated_default_names(name, column))
+            .collect()
+    }
+
     /// `[…]` and `"…"` both quote an identifier here, and neither of
     /// PostgreSQL's two extensions to the string literal exists: there is no
     /// `E'…'`, and `$` is an ordinary identifier character (`total$`) and the
