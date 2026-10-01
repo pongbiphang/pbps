@@ -90,6 +90,40 @@ place. A faster build mode does not authorize relaxing those checks. Further
 parallelization would require independent fixtures for namespace mutation,
 runtime failures, session census and server shutdown.
 
+## The run's critical path
+
+Before #1370 a `ci.yml` run took about 45 minutes, measured on merge-group
+runs 36841115280, 36830024040 and 36817575465. Every job first waited about
+seven minutes for `quick`. Then `live-pg` ran for 36–40 minutes while every
+other job finished within 17. Two serial suites made up most of `live-pg`:
+`flow_pg` with 150 cases in about 1,200s, and the private `pbps-pg` regressions
+with 55 cases in about 770s. Compilation took one to three minutes per job.
+
+The run is now shaped by DEC-1370.1:
+
+| Job | Variants | Each runs |
+| --- | --- | --- |
+| `lint` | 1 | Python self-tests, fmt, clippy. Every other job waits for it |
+| `live-pg` | `dialect`, `capture`, `flow-programs`, `flow-rest` | its share of the PostgreSQL suites, against its own PG18 + PG16 |
+| `resolver` | `engine` × `half` | half of that engine's fixture scripts, in their original order |
+
+The splits are exact complements:
+
+- `flow_pg` divides on `trigger routine function grant` against the
+  `--skip` of each, into 72 and 78 cases (about 594s and 604s).
+- The private library suite divides on `resolver::binding_tests`, into 34 and
+  21 cases (about 335s and 435s). The binding half rides with the short
+  dialect suites.
+
+`scripts/ignored_test_inventory.py` refuses a split that leaves any ignored
+case unselected. To rebalance, move a word between the filter and its
+`--skip`, and keep the two lists equal. Then check the listed counts:
+
+```bash
+cargo test -p pbps-cli --test flow_pg -- --ignored --list --format terse \
+  trigger routine function grant | grep -c ': test$'
+```
+
 ## Arrival-triggered cancellation
 
 The administrative-session cancellation regression (#1295) previously held

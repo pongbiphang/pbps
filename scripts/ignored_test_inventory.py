@@ -1018,6 +1018,11 @@ def check_witness(root, witness):
                 f"missing command literal in {witness['file']}::{witness['scope']}: {fragment}")
 
 
+# Plain scalars YAML 1.1 or 1.2 may resolve to a boolean or null rather than a
+# string; GitHub's parser is not pinned to either, so both sets are refused.
+YAML_NON_STRINGS = {"true", "false", "yes", "no", "on", "off", "y", "n", "null"}
+
+
 def workflow_runs(source, job, platform=None):
     """Read the repository's run scalar/block subset; ambiguous owners fail."""
     match = re.search(r"^  " + re.escape(job) + r":\s*$", source, re.M)
@@ -1032,21 +1037,46 @@ def workflow_runs(source, job, platform=None):
     job_conditions = re.findall(r"^    if: (.+)$", body, re.M)
     require(not job_conditions, f"conditional owner job needs an explicit audit: {job}")
     steps = re.split(r"^      - ", body, flags=re.M)[1:]
-    matrix = re.search(r"^        engine: \[([^\]]+)\]", body, re.M)
-    engines = set(x.strip().strip("'\"") for x in matrix[1].split(",")) if matrix else set()
     require(not re.search(r"^        (include|exclude):", body, re.M),
             f"matrix include/exclude needs an explicit execution audit: {job}")
-    if re.search(r"^      matrix:", body, re.M):
-        require(matrix is not None and engines and "" not in engines,
-                f"owner matrix has no known executed variant: {job}")
+    # Without include/exclude every combination of the axes runs, so a
+    # conjunction of equalities executes exactly when each value is on its axis.
+    axes = {}
+    # Any strategy must be the block form read below. A flow or expression
+    # matrix on one line would otherwise skip this reading altogether, and
+    # its unconditional steps would count although it may yield no variant.
+    strategy = re.search(r"^    strategy:(.*)$", body, re.M)
+    if strategy:
+        block = re.search(r"^      matrix:[ \t]*\n((?:        .*\n?)*)", body, re.M)
+        require(not strategy[1].strip() and block is not None,
+                f"unsupported matrix definition needs an explicit audit: {job}")
+        for line in block[1].splitlines():
+            axis = re.fullmatch(r"        ([\w-]+): \[([^\]]*)\]\s*", line)
+            require(axis is not None, f"unsupported matrix line needs an explicit audit: {job}: {line.strip()}")
+            require(axis[2].strip(), f"owner matrix has no known executed variant: {job}")
+            # Only tokens YAML can read as nothing but a string. A quoted value
+            # may hold a comma, and splitting it would invent variants; a
+            # boolean, null or number keeps its type in the matrix, and
+            # `matrix.x == 'true'` then compares it as a number and never holds.
+            values = [x.strip() for x in axis[2].split(",")]
+            require(all(re.fullmatch(r"[A-Za-z][\w-]*", v) and v.lower() not in YAML_NON_STRINGS for v in values),
+                    f"unsupported matrix value needs an explicit audit: {job}: {line.strip()}")
+            axes[axis[1]] = set(values)
+        require(axes, f"owner matrix has no known executed variant: {job}")
     for step in steps:
         condition = re.search(r"^        if: (.+)$", step, re.M)
         active = True
         if condition:
             value = condition[1].strip()
+            clauses = [re.fullmatch(r"matrix\.([\w-]+) == '([^']+)'", c.strip()) for c in value.split("&&")]
             if value in ("false", "${{ false }}"): active = False
             elif value in ("true", "${{ true }}"): pass
-            elif re.fullmatch(r"matrix.engine == '[^']+'", value): active = value.split("'")[1] in engines
+            elif all(clauses):
+                # One combination holds one value per axis, so two different
+                # values asked of the same axis select nothing.
+                wanted = {}
+                for clause in clauses: wanted.setdefault(clause[1], set()).add(clause[2])
+                active = all(len(values) == 1 and values <= axes.get(axis, set()) for axis, values in wanted.items())
             else: active = False
         if not active: continue
         run = re.search(r"(?:^|\n)(?:        )?run: (.*)", step)
