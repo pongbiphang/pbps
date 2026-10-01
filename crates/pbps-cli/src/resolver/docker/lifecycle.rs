@@ -353,10 +353,11 @@ async fn cleanup_with(api: &mut LocalApi, owner: &Owner) -> Result<(), Error> {
                 owned_id(owner, &state).map_err(|_| Error::Cleanup)?;
             }
         }
+        // After the pause, so no inspection starts once the deadline passed.
+        tokio::time::sleep(Duration::from_millis(100)).await;
         if Instant::now() >= deadline {
             return Err(Error::Cleanup);
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
