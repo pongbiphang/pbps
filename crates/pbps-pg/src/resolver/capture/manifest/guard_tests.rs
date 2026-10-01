@@ -666,7 +666,7 @@ mod column_vector_parent {
             for (name, recorded) in scratch {
                 desired_ids
                     .columns
-                    .insert(uid(recorded), table.column(name));
+                    .insert(uid(recorded), table.column(*name));
             }
             Self {
                 opening: ordered_capture(major, &table, &["a", "g", "d"]),
