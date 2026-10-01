@@ -2582,6 +2582,137 @@ fn two_added_checks_one_name_under_the_collation_refuse_the_plan() {
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
 }
 
+/// #1192: metadata visibility filters `sys.objects`, so a sequence this login
+/// is denied `VIEW DEFINITION` on returns no row and used to read as a free
+/// name. A connected plan that cannot prove the schema it creates into fully
+/// visible is refused by name, and no plan is written. Control: with the
+/// `DENY` lifted, the same login sees the sequence and gets the ordinary
+/// occupied-name refusal, so the read itself was never what failed; and a
+/// schema `DENY` on `other`, which the plan creates nothing in, refuses
+/// nothing. Under the `DENY`, a plan that drops a column and replaces a
+/// check under the name this login sees it at plans: neither needs the read
+/// to have missed nothing. A table in a schema whose name needs quoting,
+/// `x]y`, plans.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_name_metadata_visibility_hides_is_not_read_as_free() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "hidden_occupant");
+    let login = format!("pbps_flow_hidden_{}", std::process::id());
+    // Not a secret: this login exists for one test inside a throwaway container.
+    let password = "pbpsLeastPrivilege!1";
+    on_server(
+        &server,
+        &format!(
+            "IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]; \
+             CREATE LOGIN [{login}] WITH PASSWORD = '{password}', CHECK_POLICY = OFF;"
+        ),
+    );
+    on_server(
+        own.connection(),
+        &format!(
+            "EXEC(N'CREATE SCHEMA other;'); EXEC(N'CREATE SCHEMA [x]]y];'); CREATE TABLE dbo.keep (id int, old int, CONSTRAINT ck_keep CHECK (id > 0)); \
+             CREATE SEQUENCE dbo.s; \
+             CREATE USER [{login}] FOR LOGIN [{login}]; \
+             GRANT VIEW DEFINITION, SELECT, INSERT, UPDATE, DELETE, ALTER, REFERENCES \
+                 ON SCHEMA::dbo TO [{login}]; \
+             GRANT CREATE TABLE, VIEW DEFINITION TO [{login}]; \
+             GRANT SELECT ON sys.sql_expression_dependencies TO [{login}]; \
+             DENY VIEW DEFINITION ON SCHEMA::other TO [{login}];"
+        ),
+    );
+    let d = Demo::new("hidden-occupant");
+    let o = d.run(&["pull", "--db", own.connection()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    d.commit();
+    let o = d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let as_login = with_key(
+        &with_key(own.connection(), "User Id", &login),
+        "Password",
+        password,
+    );
+    let plan = d.dir.join("plan.json");
+
+    // `HAS_PERMS_BY_NAME` parses the schema it is given, so `x]y` has to be
+    // asked for quoted (review of #1360). Applied, so the plans below do not
+    // carry it.
+    std::fs::write(
+        d.dir.join("schema/x_y.yml"),
+        "table: \"x]y.t\"\ncolumns:\n  id: {type: int}\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["plan", "--db", &as_login, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let checksum = plan_checksum(&plan);
+    let o = d.run(&[
+        "apply",
+        "--db",
+        own.connection(),
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+    ]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    std::fs::remove_file(&plan).unwrap();
+
+    on_server(
+        own.connection(),
+        &format!("DENY VIEW DEFINITION ON OBJECT::dbo.s TO [{login}];"),
+    );
+
+    // Neither dropping `dbo.keep.old`, which claims no name, nor replacing
+    // `ck_keep` under its own name, which this login sees there, needs the
+    // read to have missed nothing, so the DENY on `dbo.s` refuses neither
+    // (review of #1360).
+    std::fs::write(
+        d.dir.join("schema/dbo.keep.yml"),
+        "table: dbo.keep\ncolumns:\n  id:\n    type: int\nchecks:\n  ck_keep: id > 1\n",
+    )
+    .unwrap();
+    let o = d.run(&["drop", "dbo.keep.old", "--reason", "retired"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    d.commit();
+    let o = d.run(&["plan", "--db", &as_login, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("ck_keep"), "{}", stdout(&o));
+    assert!(plan.exists(), "{}", stderr(&o));
+    std::fs::remove_file(&plan).unwrap();
+
+    std::fs::write(
+        d.dir.join("schema/dbo.s.yml"),
+        "table: dbo.s\ncolumns:\n  id: {type: int}\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    let o = d.run(&["plan", "--db", &as_login, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    let err = stderr(&o);
+    assert!(
+        err.contains("cannot prove the names this plan creates are free"),
+        "{err}"
+    );
+    assert!(!plan.exists(), "a refused plan wrote {}", plan.display());
+
+    on_server(
+        own.connection(),
+        &format!("REVOKE VIEW DEFINITION ON OBJECT::dbo.s FROM [{login}];"),
+    );
+    let o = d.run(&["plan", "--db", &as_login, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    let err = stderr(&o);
+    assert!(err.contains("already has sequence object `dbo.s`"), "{err}");
+    assert!(!plan.exists(), "a refused plan wrote {}", plan.display());
+
+    on_server(own.connection(), &format!("DROP USER [{login}];"));
+    after_test_on_server(&server, &format!("DROP LOGIN [{login}];"));
+}
+
 /// A sequence or a synonym already at the name of a table this plan creates
 /// refuses the plan by name, and no plan is written (#1077). SQL Server keeps
 /// tables, views, routines, sequences, synonyms and constraints in one

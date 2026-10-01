@@ -710,6 +710,77 @@ pub struct NameOccupant {
     pub parent_column: Option<String>,
 }
 
+/// Whether everything in `schemas` is visible to this connection, which an
+/// absent row from [`object_name_occupants`] has to mean before it can be
+/// read as a free name (#1192). `sys.objects` is filtered by metadata
+/// visibility: an object under an effective `DENY VIEW DEFINITION` returns no
+/// row, and a hidden sequence or synonym would read as free.
+///
+/// DEC-1192.1: the proof `impact::key_drop_blockers` uses (DECISIONS 460),
+/// measured on the pinned image for this read. `VIEW DEFINITION` on each
+/// schema answers for a missing grant and for a schema `DENY` alike. An
+/// object `DENY` cannot be scoped: its row in `sys.database_permissions`
+/// stays visible, through role membership too, but `OBJECT_SCHEMA_NAME` of
+/// the hidden object reads NULL, and `HAS_PERMS_BY_NAME` answers 0 for a
+/// hidden name and an absent one alike. So any effective object `DENY`
+/// refuses, and `HAS_PERMS_BY_NAME` on the object keeps an owner's or
+/// sysadmin's override from reading as one.
+pub async fn prove_schemas_visible(conn: &mut Conn, schemas: &[String]) -> Result<(), DbError> {
+    if schemas.is_empty() {
+        return Ok(());
+    }
+    let rows = schemas
+        .iter()
+        .map(|s| format!("({})", crate::ident::literal(s)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Resolved through `sys.schemas` and quoted: `HAS_PERMS_BY_NAME` parses
+    // its argument, so a raw `a.b` answers 0 and `x]y` NULL (measured;
+    // review of #1360). A schema the database does not hold has nothing in
+    // it to hide, and `HAS_PERMS_BY_NAME` answers 0 for it even to sysadmin,
+    // so it is left out rather than reported as a missing grant; a table
+    // planned into it fails at apply naming the schema, as it did before.
+    let hidden: Vec<String> = conn
+        .query(&format!(
+            "SELECT s.name AS schema_name FROM (VALUES {rows}) AS w(schema_name)
+               JOIN sys.schemas s ON s.name = w.schema_name COLLATE CATALOG_DEFAULT
+              WHERE COALESCE(HAS_PERMS_BY_NAME(QUOTENAME(s.name), 'SCHEMA', 'VIEW DEFINITION'), 0) <> 1;"
+        ))
+        .await?
+        .iter()
+        .map(|row| get::<&str>(row, "schema_name").map(str::to_owned))
+        .collect::<Result<_, _>>()?;
+    if !hidden.is_empty() {
+        return Err(DbError::Refused(format!(
+            "cannot prove the names this plan creates are free: this login does not hold \
+             VIEW DEFINITION on schema {}, so objects there can be hidden from sys.objects",
+            hidden.join(", ")
+        )));
+    }
+    let denials = conn
+        .query(
+            "SELECT TOP (1) dp.major_id FROM sys.database_permissions dp
+              WHERE dp.class = 1 AND dp.state = N'D'
+                AND dp.permission_name IN (N'VIEW DEFINITION', N'CONTROL')
+                AND (dp.grantee_principal_id = USER_ID()
+                     OR IS_MEMBER(USER_NAME(dp.grantee_principal_id)) = 1)
+                AND COALESCE(HAS_PERMS_BY_NAME(
+                      QUOTENAME(OBJECT_SCHEMA_NAME(dp.major_id)) + N'.'
+                        + QUOTENAME(OBJECT_NAME(dp.major_id)),
+                      'OBJECT', 'VIEW DEFINITION'), 0) <> 1;",
+        )
+        .await?;
+    if !denials.is_empty() {
+        return Err(DbError::Refused(
+            "cannot prove the names this plan creates are free: an object DENY of VIEW \
+             DEFINITION or CONTROL hides an object from this login, and the catalog does not \
+             say which schema it is in"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// The [`NameOccupant`]s at `names`, and every object whose parent is one of
 /// `parents` (its constraints, defaults and triggers), compared under the
 /// catalog collation that names them (see [`object_names_alike`]), read in the

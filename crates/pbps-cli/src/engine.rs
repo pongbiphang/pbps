@@ -572,6 +572,22 @@ pub async fn refuse_created_name_occupants(
             let (names, parents) = crate::deploy::object_reads(cs);
             let occupants =
                 pbps_mssql::catalog::object_name_occupants(conn, &names, &parents).await?;
+            // An absent row is a free name only where nothing can be hidden
+            // from this login (#1192), so only the names the read found no
+            // row at need the proof. A name holds one object per schema, so
+            // one this login sees leaves no room for a hidden one: a table
+            // dropped and recreated at its own name is not asked. Nor are
+            // `parents`, read for what the walk moves or removes with a
+            // table, so a drop-only plan claims nothing to prove (review of
+            // #1360).
+            let mut schemas: Vec<String> = names
+                .iter()
+                .filter(|n| !occupants.iter().any(|o| &o.wanted == *n))
+                .map(|n| n.schema.clone())
+                .collect();
+            schemas.sort();
+            schemas.dedup();
+            pbps_mssql::catalog::prove_schemas_visible(conn, &schemas).await?;
             // Which of the plan's own names are one under the database's
             // collation (#1215).
             let candidates = crate::deploy::alike_candidates(cs, &names, &occupants);
