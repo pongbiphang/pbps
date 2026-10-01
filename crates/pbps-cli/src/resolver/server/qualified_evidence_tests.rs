@@ -2472,6 +2472,444 @@ fn final_coordinate_default_removal_uses_the_recorded_opening_uid() {
     assert!(derive(&wrong_uid).is_err());
 }
 
+// These qualified-record fixtures exercise the producer's actual resolution
+// and transition gates. Raw OIDs are not logical addresses: PG18 replaced the
+// measured generated attrdef while preserving its table and column.
+fn generation_schema(table: &pbps_model::TableName) -> Schema {
+    use pbps_model::{Column, Generated, Table};
+
+    let mut definition = Table::default();
+    definition
+        .columns
+        .insert("a".into(), Column::new("integer".parse().unwrap()));
+    let mut generated = Column::new("integer".parse().unwrap());
+    generated.generated = Some(Generated {
+        expression: "a * 2 + 1".into(),
+        stored: true,
+    });
+    definition.columns.insert("g".into(), generated);
+    let mut ordinary = Column::new("integer".parse().unwrap());
+    ordinary.default = Some("7".into());
+    definition.columns.insert("d".into(), ordinary);
+    let mut schema = Schema::default();
+    schema.tables.insert(table.clone(), definition);
+    schema
+}
+
+fn generation_objects(
+    table: &pbps_model::TableName,
+    column: &str,
+) -> [pbps_model::resolver::ObjectIdentity; 4] {
+    use pbps_model::resolver::ObjectIdentity;
+
+    let relation = ObjectIdentity {
+        class: "pg_class".into(),
+        name: vec![table.schema.clone(), table.name.clone()],
+        signature: vec![],
+    };
+    let column = ObjectIdentity {
+        class: "column".into(),
+        name: vec![column.into()],
+        signature: vec![relation.clone()],
+    };
+    let attrdef = ObjectIdentity {
+        class: "pg_attrdef".into(),
+        name: vec![],
+        signature: vec![column.clone()],
+    };
+    let owner = ObjectIdentity {
+        class: "pg_depend".into(),
+        name: vec!["i".into()],
+        signature: vec![attrdef.clone(), column.clone()],
+    };
+    let reference = ObjectIdentity {
+        class: "pg_depend".into(),
+        name: vec!["n".into()],
+        signature: vec![
+            attrdef.clone(),
+            ObjectIdentity {
+                class: "column".into(),
+                name: vec!["a".into()],
+                signature: vec![relation],
+            },
+        ],
+    };
+    [column, attrdef, owner, reference]
+}
+
+fn generation_records(
+    table: &pbps_model::TableName,
+    generated_name: &str,
+) -> Vec<pbps_pg::resolver::capture::BindingRecord> {
+    use pbps_pg::resolver::capture::BindingRecord;
+
+    let owned = |object, surface| BindingRecord {
+        object,
+        ownership: ObjectOwnership::Surface(surface),
+        bindings: vec![],
+    };
+    let [generated, attrdef, owner, reference] = generation_objects(table, generated_name);
+    let relation = generated.signature[0].clone();
+    let [source, ..] = generation_objects(table, "a");
+    let [ordinary, default, mut automatic, ..] = generation_objects(table, "d");
+    automatic.name = vec!["a".into()];
+    let surface = Surface::Default(table.column(generated_name));
+    vec![
+        owned(relation, Surface::Table(table.clone())),
+        owned(source, Surface::Column(table.column("a"))),
+        owned(generated, Surface::Column(table.column(generated_name))),
+        owned(ordinary, Surface::Column(table.column("d"))),
+        owned(attrdef, surface.clone()),
+        owned(owner, surface.clone()),
+        owned(reference, surface),
+        owned(default, Surface::Default(table.column("d"))),
+        owned(automatic, Surface::Default(table.column("d"))),
+    ]
+}
+
+#[test]
+fn generated_expression_transitions_keep_exact_inventory_and_recorded_rename_identity() {
+    use pbps_model::PlannedChange;
+
+    let old = pbps_model::TableName::new("app", "t");
+    for rename in [false, true] {
+        let final_table = if rename {
+            pbps_model::TableName::new("app", "renamed")
+        } else {
+            old.clone()
+        };
+        let final_name = if rename { "n" } else { "g" };
+        let base = generation_schema(&old);
+        let base_ids = ids(&base, &IdsFile::default());
+        let table_uid = base_ids.table_uid(&old).unwrap().clone();
+        let column_uid = base_ids.column_uid(&old.column("g")).unwrap().clone();
+        let source_uid = base_ids.column_uid(&old.column("a")).unwrap().clone();
+        let mut desired = base.clone();
+        let mut definition = desired.tables.remove(&old).unwrap();
+        let mut column = definition.columns.shift_remove("g").unwrap();
+        column.generated.as_mut().unwrap().expression = "a * 3".into();
+        definition.columns.insert(final_name.into(), column);
+        desired.tables.insert(final_table.clone(), definition);
+        let mut desired_ids = base_ids.clone();
+        desired_ids.rename_table(&old, &final_table);
+        desired_ids.columns.get_mut(&column_uid).unwrap().name = final_name.into();
+        let opening = generation_records(&old, "g");
+        let compiled = generation_records(&final_table, final_name);
+        let mut changes = ChangeSet::default();
+        if rename {
+            changes.changes.extend([
+                PlannedChange::new(Change::RenameTable {
+                    uid: table_uid.clone(),
+                    from: old.clone(),
+                    to: final_table.clone(),
+                    defaults: vec!["d".into()],
+                }),
+                PlannedChange::new(Change::RenameColumn {
+                    uid: column_uid.clone(),
+                    table: final_table.clone(),
+                    from: "g".into(),
+                    to: final_name.into(),
+                    table_was: Some(old.clone()),
+                }),
+            ]);
+        }
+        changes
+            .changes
+            .push(PlannedChange::new(Change::AlterColumnExpression {
+                uid: column_uid.clone(),
+                column: final_table.column(final_name),
+                from: "a * 2 + 1".into(),
+                to: "a * 3".into(),
+            }));
+        let derive = |changes: &ChangeSet, opening_ids: &IdsFile| {
+            super::transitions::derive(
+                changes,
+                pbps_diff::Side {
+                    schema: &base,
+                    ids: opening_ids,
+                },
+                pbps_diff::Side {
+                    schema: &desired,
+                    ids: &desired_ids,
+                },
+                &opening,
+                &compiled,
+            )
+        };
+        let transitions = derive(&changes, &base_ids).unwrap();
+        let expression = transitions
+            .iter()
+            .find(|transition| {
+                transition.surface == Surface::Default(final_table.column(final_name))
+            })
+            .expect("SET EXPRESSION has its own exact attrdef transition");
+        let [old_column, before, old_owner, old_reference] = generation_objects(&old, "g");
+        let [new_column, after, new_owner, new_reference] =
+            generation_objects(&final_table, final_name);
+        assert_eq!(
+            expression.before,
+            BTreeSet::from([before, old_owner, old_reference])
+        );
+        assert_eq!(
+            expression.after,
+            BTreeSet::from([after, new_owner, new_reference])
+        );
+        assert!(!expression.before.contains(&old_column));
+        assert!(!expression.after.contains(&new_column));
+        for opening in [true, false] {
+            let claimed: Vec<_> = transitions
+                .iter()
+                .flat_map(|transition| {
+                    if opening {
+                        &transition.before
+                    } else {
+                        &transition.after
+                    }
+                })
+                .collect();
+            assert_eq!(claimed.len(), claimed.iter().collect::<BTreeSet<_>>().len());
+        }
+
+        let mut missing = base_ids.clone();
+        missing.columns.remove(&column_uid);
+        assert!(matches!(derive(&changes, &missing), Err(Error::Binding(_))));
+        // A valid UID for a different recorded column is also wrong authority.
+        // It must not select that input column's empty attrdef inventory.
+        for wrong in [table_uid, source_uid] {
+            let mut invalid = changes.clone();
+            let Change::AlterColumnExpression { uid, .. } =
+                &mut invalid.changes.last_mut().unwrap().change
+            else {
+                unreachable!()
+            };
+            *uid = wrong;
+            assert!(matches!(
+                derive(&invalid, &base_ids),
+                Err(Error::Binding(_))
+            ));
+        }
+    }
+}
+
+#[test]
+fn create_and_add_stored_generation_keep_the_attrdef_child_inventory() {
+    use pbps_model::PlannedChange;
+
+    let table = pbps_model::TableName::new("app", "t");
+    let desired = generation_schema(&table);
+    let desired_ids = ids(&desired, &IdsFile::default());
+    let compiled = generation_records(&table, "g");
+    for create in [true, false] {
+        let mut base = Schema::default();
+        let (surface, change, expected) = if create {
+            (
+                Surface::Table(table.clone()),
+                Change::CreateTable {
+                    uid: desired_ids.table_uid(&table).unwrap().clone(),
+                    name: table.clone(),
+                    table: Box::new(desired.tables[&table].clone()),
+                },
+                compiled
+                    .iter()
+                    .map(|record| record.object.clone())
+                    .collect(),
+            )
+        } else {
+            base = desired.clone();
+            base.tables
+                .get_mut(&table)
+                .unwrap()
+                .columns
+                .shift_remove("g");
+            let [column, attrdef, owner, reference] = generation_objects(&table, "g");
+            (
+                Surface::Column(table.column("g")),
+                Change::AddColumn {
+                    uid: desired_ids.column_uid(&table.column("g")).unwrap().clone(),
+                    table: table.clone(),
+                    name: "g".into(),
+                    column: Box::new(desired.tables[&table].columns["g"].clone()),
+                },
+                BTreeSet::from([column, attrdef, owner, reference]),
+            )
+        };
+        let base_ids = ids(&base, &desired_ids);
+        let transitions = super::transitions::derive(
+            &ChangeSet {
+                changes: vec![PlannedChange::new(change)],
+            },
+            pbps_diff::Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            pbps_diff::Side {
+                schema: &desired,
+                ids: &desired_ids,
+            },
+            &[],
+            &compiled,
+        )
+        .unwrap();
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].surface, surface);
+        assert!(transitions[0].before.is_empty());
+        assert_eq!(transitions[0].after, expected);
+    }
+}
+
+#[test]
+fn generated_creation_surfaces_require_unique_qualified_attrdef_records() {
+    use pbps_pg::resolver::capture::Assessment;
+
+    let table = pbps_model::TableName::new("app", "t");
+    let desired = generation_schema(&table);
+    let compiled = generation_records(&table, "g");
+    let [_, generated, ..] = generation_objects(&table, "g");
+    let [_, ordinary, ..] = generation_objects(&table, "d");
+    for create in [true, false] {
+        let mut base = Schema::default();
+        let mut opening = Vec::new();
+        let mut assessment = Assessment::default();
+        if !create {
+            base = desired.clone();
+            base.tables
+                .get_mut(&table)
+                .unwrap()
+                .columns
+                .shift_remove("g");
+            let new_objects = BTreeSet::from(generation_objects(&table, "g"));
+            opening = compiled
+                .iter()
+                .filter(|record| !new_objects.contains(&record.object))
+                .cloned()
+                .collect();
+            assessment.surfaces.insert(
+                ordinary.clone(),
+                pbps_pg::resolver::capture::Verdict::Unaffected,
+            );
+        }
+        let resolutions =
+            super::resolution::from_records(&base, &desired, &opening, &compiled, &assessment)
+                .unwrap();
+        assert_eq!(resolutions.len(), 2);
+        for (name, object) in [("g", &generated), ("d", &ordinary)] {
+            let resolved = resolutions
+                .iter()
+                .find(|resolved| resolved.surface == Surface::Default(table.column(name)))
+                .expect("ordinary defaults and generated expressions both require an attrdef");
+            assert_eq!(resolved.current.is_some(), !create && name == "d");
+            assert_eq!(&resolved.desired.as_ref().unwrap().object, object);
+        }
+    }
+
+    for name in ["g", "d"] {
+        let [_, attrdef, ..] = generation_objects(&table, name);
+        for defect in ["missing", "duplicate", "unqualified", "reference-only"] {
+            let mut records = compiled.clone();
+            let index = records
+                .iter()
+                .position(|record| record.object == attrdef)
+                .unwrap();
+            match defect {
+                "missing" => {
+                    records.remove(index);
+                }
+                "duplicate" => {
+                    records.push(records[index].clone());
+                }
+                "unqualified" => records[index].ownership = ObjectOwnership::Unqualified,
+                "reference-only" => {
+                    records[index].ownership =
+                        ObjectOwnership::Surface(Surface::Column(table.column("a")));
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    super::resolution::from_records(
+                        &Schema::default(),
+                        &desired,
+                        &[],
+                        &records,
+                        &Assessment::default(),
+                    ),
+                    Err(Error::Binding(_))
+                ),
+                "{name}: {defect} must refuse instead of omitting the required surface"
+            );
+        }
+    }
+}
+
+#[test]
+fn existing_generated_surfaces_require_both_records_and_a_resolved_binding_verdict() {
+    use pbps_pg::resolver::capture::{Assessment, Verdict};
+
+    let table = pbps_model::TableName::new("app", "t");
+    let schema = generation_schema(&table);
+    let records = generation_records(&table, "g");
+    let [_, generated, ..] = generation_objects(&table, "g");
+    let [_, ordinary, ..] = generation_objects(&table, "d");
+    let assessment = |verdict| Assessment {
+        surfaces: BTreeMap::from([
+            (generated.clone(), verdict),
+            (ordinary.clone(), Verdict::Unaffected),
+        ]),
+        ..Assessment::default()
+    };
+    for verdict in [Verdict::Unaffected, Verdict::Rebuild] {
+        let resolutions = super::resolution::from_records(
+            &schema,
+            &schema,
+            &records,
+            &records,
+            &assessment(verdict),
+        )
+        .unwrap();
+        assert_eq!(resolutions.len(), 2);
+        assert!(
+            resolutions
+                .iter()
+                .all(|resolved| { resolved.current.is_some() && resolved.desired.is_some() })
+        );
+    }
+    let mut no_verdict = assessment(Verdict::Unaffected);
+    no_verdict.surfaces.remove(&generated);
+    for verdict in [
+        no_verdict,
+        assessment(Verdict::Unresolved {
+            condition: "test binding is unqualified",
+        }),
+    ] {
+        assert!(matches!(
+            super::resolution::from_records(&schema, &schema, &records, &records, &verdict),
+            Err(Error::Binding(_))
+        ));
+    }
+    let missing: Vec<_> = records
+        .iter()
+        .filter(|record| record.object != generated)
+        .cloned()
+        .collect();
+    for opening in [true, false] {
+        let (before, after) = if opening {
+            (&missing, &records)
+        } else {
+            (&records, &missing)
+        };
+        assert!(matches!(
+            super::resolution::from_records(
+                &schema,
+                &schema,
+                before,
+                after,
+                &assessment(Verdict::Unaffected),
+            ),
+            Err(Error::Binding(_))
+        ));
+    }
+}
+
 /// The explicit ordered extra is an input to ordinary bootstrap, qualification,
 /// scratch compilation and final planning, not a value inferred from the
 /// target session's transient search_path.
