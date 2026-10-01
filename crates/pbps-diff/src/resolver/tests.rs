@@ -835,3 +835,244 @@ fn new_table_indexes_are_offline_while_existing_table_indexes_keep_the_requested
         }
     }
 }
+
+mod generated_surface_coverage {
+    use super::*;
+    use pbps_model::resolver::{Binding, BoundSurface, ObjectIdentity};
+    use pbps_model::{Column, Generated, Hints, IdsFile, Schema, Table};
+
+    struct Fixture {
+        base: Schema,
+        desired: Schema,
+        before_ids: IdsFile,
+        after_ids: IdsFile,
+        resolution: Vec<SurfaceResolution>,
+    }
+
+    fn generated(expression: &str) -> Column {
+        let mut column = Column::new("int".parse().unwrap());
+        column.generated = Some(Generated {
+            expression: expression.into(),
+            stored: true,
+        });
+        column
+    }
+
+    fn attrdef(name: &str, present_before: bool, reads_input: bool) -> SurfaceResolution {
+        let input = ObjectIdentity {
+            class: "pg_attribute".into(),
+            name: vec!["app".into(), "t".into(), "a".into()],
+            signature: vec![],
+        };
+        let bound = BoundSurface {
+            object: ObjectIdentity {
+                class: "pg_attrdef".into(),
+                name: vec!["app".into(), "t".into(), name.into()],
+                signature: vec![],
+            },
+            bindings: if reads_input {
+                vec![Binding {
+                    node: "Var".into(),
+                    path: vec!["a".into()],
+                    target: input,
+                }]
+            } else {
+                vec![]
+            },
+            managed_inputs: if reads_input {
+                BTreeSet::from([Surface::Column("app.t.a".parse().unwrap())])
+            } else {
+                BTreeSet::new()
+            },
+        };
+        SurfaceResolution {
+            surface: Surface::Default(format!("app.t.{name}").parse().unwrap()),
+            current: present_before.then(|| bound.clone()),
+            desired: Some(bound),
+        }
+    }
+
+    // These are the two connected generation shapes, not engine admission or
+    // version qualification. The pure planner uses the existing minimal dialect.
+    fn fixture(add_stored: bool) -> Fixture {
+        let table_name = "app.t".parse().unwrap();
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("a".into(), Column::new("int".parse().unwrap()));
+        table.columns.insert("g".into(), generated("a * 2 + 1"));
+        let mut ordinary = Column::new("int".parse().unwrap());
+        ordinary.default = Some("7".into());
+        table.columns.insert("d".into(), ordinary);
+        let mut base = Schema::default();
+        base.tables.insert(table_name, table);
+        let before_ids = ids(&base, &IdsFile::default());
+        let mut desired = base.clone();
+        let columns = &mut desired
+            .tables
+            .get_mut(&"app.t".parse().unwrap())
+            .unwrap()
+            .columns;
+        let mut resolution = vec![attrdef("g", true, true), attrdef("d", true, false)];
+        if add_stored {
+            columns.insert("h".into(), generated("a + 4"));
+            resolution.push(attrdef("h", false, true));
+        } else {
+            columns.insert("g".into(), generated("a * 3"));
+        }
+        let after_ids = ids(&desired, &before_ids);
+        Fixture {
+            base,
+            desired,
+            before_ids,
+            after_ids,
+            resolution,
+        }
+    }
+
+    impl Fixture {
+        fn plan(&self, resolution: &[SurfaceResolution]) -> Result<Ordered, Error> {
+            super::plan(
+                crate::Side {
+                    schema: &self.base,
+                    ids: &self.before_ids,
+                },
+                crate::Side {
+                    schema: &self.desired,
+                    ids: &self.after_ids,
+                },
+                &Hints::default(),
+                resolution,
+                &pbps_dialect::MinimalDialect,
+            )
+        }
+
+        fn retained_column_uid(&self, name: &str) -> pbps_model::Uid {
+            let column = format!("app.t.{name}").parse().unwrap();
+            let before = self.before_ids.column_uid(&column).unwrap();
+            assert_eq!(Some(before), self.after_ids.column_uid(&column));
+            before.clone()
+        }
+    }
+
+    #[test]
+    fn replacing_a_stored_expression_keeps_its_uid_and_ordinary_default() {
+        let fixture = fixture(false);
+        assert_eq!(fixture.before_ids.tables, fixture.after_ids.tables);
+        let uid = fixture.retained_column_uid("g");
+        fixture.retained_column_uid("a");
+        fixture.retained_column_uid("d");
+        let ordered = fixture
+            .plan(&fixture.resolution)
+            .expect("generated attrdef evidence must admit the expression replacement");
+        assert_eq!(ordered.changes.changes.len(), 1);
+        assert_eq!(
+            ordered.changes.changes[0].change,
+            Change::AlterColumnExpression {
+                uid,
+                column: "app.t.g".parse().unwrap(),
+                from: "a * 2 + 1".into(),
+                to: "a * 3".into(),
+            }
+        );
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    #[test]
+    fn adding_stored_generation_retains_existing_generation_and_ordinary_default() {
+        let fixture = fixture(true);
+        assert_eq!(fixture.before_ids.tables, fixture.after_ids.tables);
+        for name in ["a", "g", "d"] {
+            fixture.retained_column_uid(name);
+        }
+        let column = "app.t.h".parse().unwrap();
+        assert!(fixture.before_ids.column_uid(&column).is_none());
+        let uid = fixture.after_ids.column_uid(&column).unwrap().clone();
+        let ordered = fixture
+            .plan(&fixture.resolution)
+            .expect("generated attrdef evidence must admit ADD STORED beside retained generation");
+        assert_eq!(ordered.changes.changes.len(), 1);
+        assert_eq!(
+            ordered.changes.changes[0].change,
+            Change::AddColumn {
+                uid,
+                table: "app.t".parse().unwrap(),
+                name: "h".into(),
+                column: Box::new(generated("a + 4")),
+            }
+        );
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    #[test]
+    fn generated_and_ordinary_attrdefs_require_exact_coverage_and_per_side_presence() {
+        for add_stored in [false, true] {
+            let fixture = fixture(add_stored);
+            for (index, record) in fixture.resolution.iter().enumerate() {
+                let mut missing = fixture.resolution.clone();
+                missing.remove(index);
+                assert!(matches!(
+                    fixture.plan(&missing),
+                    Err(Error::Coverage(surface)) if surface == record.surface
+                ));
+
+                let mut wrong_current = fixture.resolution.clone();
+                wrong_current[index].current = if record.current.is_some() {
+                    None
+                } else {
+                    record.desired.clone()
+                };
+                assert!(matches!(
+                    fixture.plan(&wrong_current),
+                    Err(Error::Coverage(surface)) if surface == record.surface
+                ));
+
+                let mut missing_desired = fixture.resolution.clone();
+                missing_desired[index].desired = None;
+                assert!(matches!(
+                    fixture.plan(&missing_desired),
+                    Err(Error::Coverage(surface)) if surface == record.surface
+                ));
+            }
+
+            let mut extra = fixture.resolution.clone();
+            extra.push(attrdef("a", false, false));
+            assert!(matches!(
+                fixture.plan(&extra),
+                Err(Error::Coverage(surface))
+                    if surface == Surface::Default("app.t.a".parse().unwrap())
+            ));
+
+            let mut duplicate = fixture.resolution.clone();
+            duplicate.push(fixture.resolution[0].clone());
+            assert!(matches!(
+                fixture.plan(&duplicate),
+                Err(Error::Coverage(surface)) if surface == fixture.resolution[0].surface
+            ));
+
+            let mut reference_only = fixture.resolution.clone();
+            reference_only[0].surface = Surface::Column("app.t.a".parse().unwrap());
+            assert!(matches!(
+                fixture.plan(&reference_only),
+                Err(Error::Coverage(surface))
+                    if surface == Surface::Column("app.t.a".parse().unwrap())
+            ));
+
+            let mut absent_desired_default = fixture;
+            absent_desired_default
+                .desired
+                .tables
+                .get_mut(&"app.t".parse().unwrap())
+                .unwrap()
+                .columns
+                .get_mut("d")
+                .unwrap()
+                .default = None;
+            assert!(matches!(
+                absent_desired_default.plan(&absent_desired_default.resolution),
+                Err(Error::Coverage(surface))
+                    if surface == Surface::Default("app.t.d".parse().unwrap())
+            ));
+        }
+    }
+}
