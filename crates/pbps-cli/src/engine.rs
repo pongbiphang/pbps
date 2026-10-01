@@ -1075,6 +1075,116 @@ pub fn unrevocable_grants(
     })
 }
 
+/// What a plan over generated columns needs of this server and of the columns
+/// already there, asked before anything is written (DEC-1168.1).
+///
+/// `SET EXPRESSION` is PostgreSQL 17's; on 16 a plan that changes an
+/// expression is refused by name, never turned into a drop and re-add that
+/// would take the column's dependents and its place with it. And a column a
+/// live generated column is computed from cannot be retyped, nor dropped
+/// without `CASCADE` — measured on 16, 17 and 18 — so a plan that retypes or
+/// drops one is refused here rather than by the engine halfway through,
+/// unless the same plan drops the generated column too. An expression change
+/// in the same plan does not release it: the retype or drop is ordered first.
+pub async fn generation_support(
+    conn: &mut Conn,
+    changes: &ChangeSet,
+) -> anyhow::Result<ConnectedCheck> {
+    if conn.driver() == Driver::Mssql {
+        return Ok(ConnectedCheck {
+            name: "generation_support",
+            engine: "SQL Server",
+            status: "not_applicable",
+            message: "this model holds generated columns for PostgreSQL only".to_owned(),
+        });
+    }
+    let mut problems = Vec::new();
+    let expressions: Vec<&pbps_model::ColumnRef> = changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let pbps_model::Change::AlterColumnExpression { column, .. } = &p.change {
+                Some(column)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let version = pbps_pg::roles::server_version_num(conn).await?;
+    if !expressions.is_empty() && version < pbps_pg::generated::SET_EXPRESSION_ARRIVED_IN {
+        for column in &expressions {
+            problems.push(format!(
+                "{column}: changing a generated column's expression needs PostgreSQL 17 or \
+                 later (`SET EXPRESSION`), and this server is {version}"
+            ));
+        }
+    }
+    // The live name of a column this plan retypes or drops: a rename in the
+    // same plan runs first, so the declared name is not yet the catalog's.
+    let mut live_names: BTreeMap<(TableName, String), String> = BTreeMap::new();
+    let mut live_tables: BTreeMap<TableName, TableName> = BTreeMap::new();
+    let mut dropped: std::collections::BTreeSet<(TableName, String)> = Default::default();
+    for p in &changes.changes {
+        if let pbps_model::Change::RenameColumn {
+            table, from, to, ..
+        } = &p.change
+        {
+            live_names.insert((table.clone(), to.clone()), from.clone());
+        } else if let pbps_model::Change::RenameTable { from, to, .. } = &p.change {
+            live_tables.insert(to.clone(), from.clone());
+        } else if let pbps_model::Change::DropColumn { column, .. } = &p.change {
+            dropped.insert((column.table.clone(), column.name.clone()));
+        }
+    }
+    let mut asked: BTreeMap<TableName, Vec<pbps_pg::generated::Dependence>> = BTreeMap::new();
+    for p in &changes.changes {
+        let (column, what) = if let pbps_model::Change::AlterColumnType { column, .. } = &p.change {
+            (column, "retyped")
+        } else if let pbps_model::Change::DropColumn { column, .. } = &p.change {
+            (column, "dropped")
+        } else {
+            continue;
+        };
+        let table = live_tables
+            .get(&column.table)
+            .unwrap_or(&column.table)
+            .clone();
+        let live = live_names
+            .get(&(column.table.clone(), column.name.clone()))
+            .unwrap_or(&column.name)
+            .clone();
+        if !asked.contains_key(&table) {
+            let found = pbps_pg::generated::dependences(conn, &table).await?;
+            asked.insert(table.clone(), found);
+        }
+        for d in &asked[&table] {
+            if d.base == live && !dropped.contains(&(column.table.clone(), d.generated.clone())) {
+                problems.push(format!(
+                    "{column} is {what} by this plan, and the generated column `{}` is computed \
+                     from it: the engine refuses to retype such a column and drops it only with \
+                     CASCADE. Drop the generated column in the same plan, or apply a plan that \
+                     changes its expression to stop reading this column first: in one plan \
+                     the expression change runs after this one.",
+                    d.generated
+                ));
+            }
+        }
+    }
+    if !problems.is_empty() {
+        anyhow::bail!("generation_support (PostgreSQL): {}", problems.join("\n"));
+    }
+    Ok(ConnectedCheck {
+        name: "generation_support",
+        engine: "PostgreSQL",
+        status: "passed",
+        message: format!(
+            "PostgreSQL server_version_num {version}: every generated-column change this plan \
+             makes has an in-place form here, and no column it retypes or drops is one a live \
+             generated column is computed from"
+        ),
+    })
+}
+
 pub async fn permission_support(
     conn: &mut Conn,
     changes: &ChangeSet,
@@ -1676,7 +1786,8 @@ pub async fn account_for_module_dependents(
     let added = crate::dependents::weave(changes, &found, declared, ids, dialect)
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
     let split = crate::dependents::split_new_tables(changes, ids, dialect);
-    let moved = crate::dependents::after_the_rebuilds(changes);
+    let released = crate::dependents::released(changes, &found);
+    let moved = crate::dependents::after_the_rebuilds(changes, &released);
     let left = crate::dependents::unaccounted(changes, &found);
     if !left.is_empty() {
         anyhow::bail!(

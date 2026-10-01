@@ -1093,3 +1093,104 @@ is compared as the occupant's: its own grants arrive through the rename, the
 declared ones are granted, and the rest are revoked. A name replaced by a new
 table keeps its previous answer, grant everything and revoke nothing, because
 the new table holds no grants of its own.
+
+<a id="dec-1168-1"></a>
+
+**DEC-1168.1. A column may be a stored generated column, carried as its
+expression and its kind, and its expression changes in place on PostgreSQL
+17 and later.** `generated: {expression, stored}` is a generation kind and
+not a flag. `stored` is required, because PostgreSQL 18 reads a generation
+expression with no kind as `VIRTUAL`, and 16 and 17 read it as a syntax
+error. This model holds `stored: true` only. A virtual column computes on
+read, and a declaration of it as stored would turn it into data. The reader
+tells the two apart by `attgenerated` (`s` or `v`) rather than treating any
+generation as one, and the emitter always spells `STORED`. A generated
+column is never also a default. The engine refuses both together, and the
+reader takes the expression out of `pg_attrdef`, where defaults live,
+without also reading it back as one.
+
+Measured on 16.15, 17.11 and 18.6:
+- `SET EXPRESSION` recomputes every row, rewriting the table under `ACCESS
+  EXCLUSIVE` on 17 and 18, and is a syntax error on 16. The supported change
+  is therefore `AlterColumnExpression` on 17 and later. On 16 it is refused
+  by name through a connected check (`generation_support`), never emitted as
+  a drop and re-add that would take the column's dependents and its place.
+- A change between generated and ordinary, or between kinds, has no in-place
+  form and is refused by the differ (`GenerationChangeUnsupported`).
+- The engine refuses to retype a column a generated column reads, and drops
+  one only with `CASCADE`. The same connected check reads that dependence
+  from `pg_depend`, from the expression's `pg_attrdef` row, and refuses such
+  a retype or drop before anything runs, unless the plan also drops the
+  generated column. It does not parse the expression.
+- The engine also refuses a default beside a generation expression, a
+  reference to another generated column, a non-immutable expression, and
+  `NOT NULL` over null inputs at `ADD`. The first is refused at validation.
+  The rest are the engine's, inside the transaction.
+
+A generated column is dropped before the ordinary columns of its class,
+keyed by uid so a table rename in the same plan does not hide it. It is added
+after every column addition and every in-place column alteration (type,
+nullability, default, expression). The engine refuses an expression over a
+column not yet added, refuses to drop a column a generated column still
+reads, and refuses to retype one, measured on 17.11. A generated column never reads another, so one layer each way is the
+whole order. That holds in the class a column rename brings all of its
+table's drops into. A recomputed value is checked against the column's
+nullability as it stands, so relaxing it runs before the expression change
+and tightening it after, measured on 17.11. A retype of the recomputed column
+runs first, so the values are computed in the final type, and leaves the
+tightening it would carry to that later step. Its expression binds the functions it calls as a default's
+does. An `AlterColumnExpression` follows a function the plan creates or
+rebuilds (DEC-942.1), and what validates the recomputed column moves with
+its expression: a tightening, and a key over it on either side of a foreign
+key. A column added with a generation expression does not move,
+in an existing table or a new one, as a column added with a default does
+not: a function the plan creates may read it, and measured on 17.11 the
+engine resolves a SQL body's columns at `CREATE FUNCTION`, `BEGIN ATOMIC` or
+not. One whose expression calls a function the same plan creates or rebuilds
+is refused by the engine, and the apply rolls back.
+
+A generated column is the engine's to fill, like a non-key identity
+(`Column::engine_assigned`). It leaves `row_columns` and the row
+read-back, and a row that sets one is refused. A `NOT NULL` generated add
+is not counted as every stored row. Evaluating its expression before
+approval would run the operator's code, so the probe reports it unchecked.
+For the same reason, a probe that would read a column the plan recomputes is
+reported unchecked rather than run over the old expression's values: its
+tightening, a key over it, and any check or filtered index of its table. A
+reference row's delete is counted against keys the catalog names at run
+time, so any recomputation in the plan leaves it unchecked too.
+
+Its declared text is recorded, advanced and overlaid as a default's is
+(`DeclaredExpressions::generated`), and compared by presence (SPEC §7.6),
+since the engine respells `a * 3` as `(a * 3)`. Across an apply, two
+read-backs are compared outright: a planned expression change excuses a
+new expression and nothing else, and a column that stops being generated or
+changes kind is movement (SPEC §7.6). A column the expression
+reads keeps its name in the declared text across a rename, as a filter
+does. The engine rewrites what it stores, and the declaration spells the new
+name. A function a generated column calls cannot be dropped or rebuilt
+around it. No statement takes its expression off and puts it back:
+`DROP EXPRESSION` leaves an ordinary column, and `SET EXPRESSION` is refused
+on one. Such a plan is refused, naming the column, unless it also changes that
+expression or drops the column or its table. The catalog's edge then has a
+release, and the function's drop moves after it, and after the drops of the
+modules that depend on it, which may have moved after their own releases. The release keeps the place
+the differ gave it, after the additions, renames, retypes and relaxations its
+new expression may need. What the moved drop leaves to the engine is a
+function whose own body reads a column the plan drops or retypes before the
+release. If the new expression calls the
+function again, the drop is refused inside the transaction and the apply
+rolls back. Telling the two apart would mean parsing the expression. A changed expression faces the gate as `narrowing` (SPEC §7.2): the
+engine recomputes every stored row, and a `NOT NULL`, check or unique index
+over the column can refuse what it computes.
+
+State version 12 carries the field and still reads 6 to 11. An older
+reader reported every generated column as a limitation, which no recorder
+accepts. Plan version 16 turns 15 away. The declaration schema is published
+as set 22. SQL Server refuses `generated:`: its computed columns are #1174's.
+
+Pinned by `a_stored_generated_column_round_trips_and_changes_its_expression`
+(`crates/pbps-pg/tests/live.rs`),
+`a_generated_columns_expression_changes_through_the_cli_and_its_inputs_are_held`
+and `a_generated_columns_expression_change_is_refused_by_name_before_postgres_17`
+(`crates/pbps-cli/tests/flow_pg.rs`).

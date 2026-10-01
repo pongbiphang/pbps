@@ -743,6 +743,23 @@ fn column_definition(name: &str, column: &Column) -> Result<String, DialectError
             id.seed, id.increment
         ));
     }
+    // Always `STORED`: measured on 18.6, a generation expression with no kind
+    // is `VIRTUAL`, and on 16 and 17 it is a syntax error. A virtual column is
+    // refused by validation (DEC-1168.1).
+    if let Some(generated) = &column.generated {
+        if !generated.stored {
+            return Err(DialectError::Invalid {
+                dialect: DIALECT,
+                message: format!(
+                    "column `{name}` is a virtual generated column, which this model does not hold"
+                ),
+            });
+        }
+        s.push_str(&format!(
+            " GENERATED ALWAYS AS ({}) STORED",
+            verbatim(&generated.expression)
+        ));
+    }
     s.push(' ');
     s.push_str(null_clause(column.nullable));
     if let Some(expr) = &column.default {
@@ -2250,6 +2267,21 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                     quote(&column.name)?
                 ),
             },
+        ),
+
+        // Recomputes every row under the new expression. PostgreSQL 17 and
+        // later only: 16 has no in-place form, and the connected path refuses
+        // a plan that needs one there rather than emitting a drop and re-add
+        // that would take the column's dependents with it (DEC-1168.1).
+        Change::AlterColumnExpression { column, to, .. } => one(
+            pg,
+            &column.table,
+            format!(
+                "ALTER TABLE {} ALTER COLUMN {} SET EXPRESSION AS ({});",
+                qualified(&column.table)?,
+                quote(&column.name)?,
+                verbatim(to)
+            ),
         ),
 
         // Deprecation is a fact about the declarations, not about the database.
@@ -5281,6 +5313,49 @@ mod tests {
             ..index
         };
         assert!(built_concurrently(&plain, Strategy { online: true }));
+    }
+
+    /// A generated column is created `STORED`, always spelled, since no kind
+    /// is `VIRTUAL` on 18; its expression changes by `SET EXPRESSION`, as
+    /// declared and ended by a newline against a trailing comment
+    /// (DEC-1168.1).
+    #[test]
+    fn a_generated_column_is_created_stored_and_changed_in_place() {
+        let mut b = pbps_model::Column::new("integer".parse().unwrap());
+        b.generated = Some(pbps_model::Generated {
+            expression: "a * 2".into(),
+            stored: true,
+        });
+        let added = sql_of(
+            &Postgres::new(),
+            &Change::AddColumn {
+                uid: "c_a1b2c3".parse().unwrap(),
+                table: name("app", "t"),
+                name: "b".into(),
+                column: Box::new(b),
+            },
+        )
+        .remove(0);
+        assert!(
+            added.contains("\"b\" integer GENERATED ALWAYS AS (a * 2\n) STORED NULL"),
+            "{added}"
+        );
+        let changed = sql_of(
+            &Postgres::new(),
+            &Change::AlterColumnExpression {
+                uid: "c_a1b2c3".parse().unwrap(),
+                column: name("app", "t").column("b"),
+                from: "a * 2".into(),
+                to: "a * 3 -- why".into(),
+            },
+        )
+        .remove(0);
+        assert!(
+            changed.contains(
+                "ALTER TABLE \"app\".\"t\" ALTER COLUMN \"b\" SET EXPRESSION AS (a * 3 -- why\n);"
+            ),
+            "{changed}"
+        );
     }
 
     /// A GIN index is built `USING gin`, with no direction on its keys, which

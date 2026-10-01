@@ -183,13 +183,14 @@ pub fn query(
         if *column == key {
             continue;
         }
-        // An identity column that is not the key is the engine's to assign: a
+        // An identity column that is not the key, or a generated column
+        // (DEC-1168.1), is the engine's to assign: a
         // declaration cannot set it (the model refuses the cell) and an UPDATE
         // cannot change it. Read back, its value would be compared with the
         // omission every declaration has to make, and every connected plan
         // would restate an UPDATE the engine refuses. So it is never read:
         // both sides omit it, and omission agrees with omission (DECISIONS 94).
-        if spec.identity.is_some() {
+        if spec.engine_assigned() {
             continue;
         }
         let quoted = quote(column)?;
@@ -1226,7 +1227,7 @@ pub fn spelling_queries(
         out.push(query(None, &base, ty, keys)?);
     }
     for (column, spec) in &table.columns {
-        if *column == key || spec.identity.is_some() {
+        if *column == key || spec.engine_assigned() {
             continue;
         }
         let (base, ty) = ty_of(column)?;

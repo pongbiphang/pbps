@@ -233,6 +233,10 @@ indexes:
   slice holds `method: gin` over `jsonb` columns, with the class left out or
   `jsonb_path_ops`. SQL Server has only the default method and no classes, so
   it refuses `method: gin` and any class (DEC-1169.1).
+- **A stored generated column is `generated: {expression: "a * 2", stored:
+  true}`** (PostgreSQL): computed on every write, never a default, and its
+  kind always said. Its expression changes in place on PostgreSQL 17 and
+  later; a change to or from generated is refused (DEC-1168.1).
 - **An index with an expression key lists its keys under `keys:`**, one
   mapping each: `{column: id}` or `{expression: "lower(email)"}`, with
   optional `opclass:` and `order: desc`. An index names its keys under
@@ -698,7 +702,7 @@ exists when prod deploys the rename five versions later.
 |---|---|---|
 | `rename` | A column, table or role is renamed | Dependent objects break (see 7.4); a role's old name is gone to `IS_ROLEMEMBER` and its kin |
 | `destructive` | DROP COLUMN / DROP TABLE / DROP INDEX / DROP UNIQUE constraint | Data loss or loss of a uniqueness guarantee |
-| `narrowing` | Type narrowing or a value-changing or incompatible conversion | Changed values (including binary padding), truncation, failed conversion |
+| `narrowing` | Type narrowing, a value-changing or incompatible conversion, or a changed generation expression | Changed values (including binary padding, or every row recomputed), truncation, failed conversion |
 | `not-null` | nullable → NOT NULL with no DEFAULT | Existing NULLs violate it |
 | `constraint` | Adding UNIQUE / FK / CHECK, or a **unique index** | Existing rows may not satisfy it |
 | `data-update` | A declared reference row's values are overwritten (4.6) | What is there now is being replaced, and the plan does not record it |

@@ -59,6 +59,7 @@ pub(crate) const LEXICON: Lexicon = Lexicon {
     unicode_identifiers: true,
 };
 pub mod estimate;
+pub mod generated;
 pub mod impact;
 pub mod introspect;
 pub mod modules;
@@ -131,6 +132,45 @@ pub(crate) const MAX_IDENT_BYTES: usize = 63;
 /// `validate` is where a declaration should fail, and until the catalogue
 /// existed this could not be asked: `validate_table` refused every table
 /// outright, so nothing reached the question.
+/// What the engine refuses in a generated column, or this model does not
+/// hold, refused before it is applied (DEC-1168.1). Measured on 16.15, 17.11
+/// and 18.6: a default beside a generation expression is refused ("both
+/// default and generation expression specified"), and a virtual kind is 18's
+/// only and computes on read, which this model does not hold.
+fn generation_problems(column: &str, declared: &pbps_model::Column) -> Vec<DialectError> {
+    let Some(generated) = &declared.generated else {
+        return Vec::new();
+    };
+    let invalid = |message: String| DialectError::Invalid {
+        dialect: crate::types::DIALECT,
+        message,
+    };
+    let mut found = Vec::new();
+    if declared.default.is_some() {
+        found.push(invalid(format!(
+            "column `{column}` has both a default and a generation expression; a generated \
+             column is computed on every write, and a default would never apply"
+        )));
+    }
+    if declared.identity.is_some() {
+        found.push(invalid(format!(
+            "column `{column}` is both an identity and a generated column"
+        )));
+    }
+    if !generated.stored {
+        found.push(invalid(format!(
+            "column `{column}` is a virtual generated column (`stored: false`), which this model \
+             does not hold; declare `stored: true`"
+        )));
+    }
+    if crate::LEXICON.expression_in(&generated.expression) == pbps_dialect::Expression::Absent {
+        found.push(invalid(format!(
+            "column `{column}` has an empty generation expression"
+        )));
+    }
+    found
+}
+
 fn identity_problems(column: &str, declared: &pbps_model::Column) -> Vec<DialectError> {
     let Some(identity) = declared.identity else {
         return Vec::new();
@@ -747,6 +787,7 @@ impl Dialect for Postgres {
                 }
             }
             found.extend(identity_problems(column_name, column));
+            found.extend(generation_problems(column_name, column));
         }
         // Reference data: the rules whose answer is this engine's, ADR-0013 §2
         // among them. The model's own rules — a row's key is its identity in
@@ -3004,6 +3045,57 @@ mod tests {
     }
 
     /// The three the engine refuses for a reason that is not the type:
+    /// A generated column is refused beside a default or an identity, as a
+    /// virtual one, and with an empty expression; a stored one alone is
+    /// accepted (DEC-1168.1).
+    #[test]
+    fn a_generated_column_is_held_to_what_the_engine_and_the_model_take() {
+        let generated = |expression: &str, stored: bool| {
+            let mut c = pbps_model::Column::new(ty("integer"));
+            c.generated = Some(pbps_model::Generated {
+                expression: expression.into(),
+                stored,
+            });
+            c
+        };
+        let problems = |column: pbps_model::Column| {
+            let mut table = Table::default();
+            table
+                .columns
+                .insert("a".into(), pbps_model::Column::new(ty("integer")));
+            table.columns.insert("b".into(), column);
+            Postgres::new()
+                .validate_table(&"app.t".parse().unwrap(), &table)
+                .into_iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(problems(generated("a * 2", true)).is_empty());
+        let mut defaulted = generated("a * 2", true);
+        defaulted.default = Some("0".into());
+        let mut identity = generated("a * 2", true);
+        identity.nullable = false;
+        identity.identity = Some(pbps_model::Identity {
+            seed: 1,
+            increment: 1,
+        });
+        for (column, expected) in [
+            (defaulted, "both a default and a generation expression"),
+            (identity, "both an identity and a generated column"),
+            (generated("a * 2", false), "virtual generated column"),
+            (
+                generated(" -- nothing", true),
+                "empty generation expression",
+            ),
+        ] {
+            let found = problems(column);
+            assert!(
+                found.iter().any(|m| m.contains(expected)),
+                "{expected}: {found:?}"
+            );
+        }
+    }
+
     /// `conflicting NULL/NOT NULL declarations`, `both default and identity
     /// specified for column`, and `INCREMENT must not be zero`. Each is a rule
     /// the shipped SQL Server dialect carries too; the one that does *not*

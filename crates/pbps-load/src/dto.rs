@@ -403,6 +403,13 @@ pub struct ColumnDto {
     #[serde(default)]
     pub identity: Option<[i64; 2]>,
 
+    /// A generation expression (PostgreSQL): `{expression: "a * 2", stored:
+    /// true}`. The value is computed from the row on every write, where a
+    /// default is computed once; never both. `stored` is required, because a
+    /// generation expression with no kind is a virtual one on PostgreSQL 18.
+    #[serde(default)]
+    pub generated: Option<GeneratedDto>,
+
     /// An explicit collation, on SQL Server (`Latin1_General_CS_AS`). Absent
     /// means the collation of the database the column is created in.
     #[serde(default)]
@@ -471,6 +478,17 @@ pub struct ForeignKeyDto {
 
     #[serde(default)]
     pub on_update: ReferentialAction,
+}
+
+/// How a generated column is computed (DEC-1168.1).
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GeneratedDto {
+    /// The expression, kept verbatim.
+    pub expression: String,
+    /// `true` for a value computed on write and stored. PostgreSQL holds only
+    /// stored generated columns in this model.
+    pub stored: bool,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]

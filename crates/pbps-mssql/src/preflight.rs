@@ -355,6 +355,7 @@ impl AsStored {
                 | Change::RenameColumn { .. }
                 | Change::AlterColumnNullability { .. }
                 | Change::AlterColumnDefault { .. }
+                | Change::AlterColumnExpression { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
                 | Change::AddUnique { .. }
@@ -552,6 +553,7 @@ impl AsStored {
                 Change::DropColumn { .. }
                 | Change::AlterColumnNullability { .. }
                 | Change::AlterColumnDefault { .. }
+                | Change::AlterColumnExpression { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
                 | Change::AddUnique { .. }
@@ -971,6 +973,7 @@ fn build(
             to_nullable: true, ..
         }
         | Change::AlterColumnDefault { .. }
+        | Change::AlterColumnExpression { .. }
         // A module holds no rows. A definition the engine will not compile
         // fails inside the plan's transaction, where the rollback is total.
         | Change::CreateModule { .. }

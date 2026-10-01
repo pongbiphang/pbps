@@ -386,6 +386,7 @@ impl Unchecked {
             | Change::DropColumn { .. }
             | Change::RenameColumn { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::DropUnique { .. }
             | Change::DropForeignKey { .. }

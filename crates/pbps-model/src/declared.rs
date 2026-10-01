@@ -37,6 +37,9 @@ pub struct DeclaredExpressions {
     /// `Column::default`, by table and column.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub defaults: BTreeMap<TableName, BTreeMap<String, String>>,
+    /// `Generated::expression`, by table and column (DEC-1168.1).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub generated: BTreeMap<TableName, BTreeMap<String, String>>,
     /// `CheckConstraint::expression`, by table and constraint name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub checks: BTreeMap<TableName, BTreeMap<String, String>>,
@@ -53,6 +56,7 @@ pub struct DeclaredExpressions {
 impl DeclaredExpressions {
     pub fn is_empty(&self) -> bool {
         self.defaults.is_empty()
+            && self.generated.is_empty()
             && self.checks.is_empty()
             && self.filters.is_empty()
             && self.keys.is_empty()
@@ -195,6 +199,13 @@ impl Declared {
                         .or_default()
                         .insert(column.clone(), default.clone());
                 }
+                if let Some(generated) = &spec.generated {
+                    d.expressions
+                        .generated
+                        .entry(name.clone())
+                        .or_default()
+                        .insert(column.clone(), generated.expression.clone());
+                }
             }
             for (check, spec) in &table.checks {
                 d.expressions
@@ -241,6 +252,9 @@ impl Declared {
                     });
                     self.forget_table(name);
                     self.expressions.defaults.extend(fresh.expressions.defaults);
+                    self.expressions
+                        .generated
+                        .extend(fresh.expressions.generated);
                     self.expressions.checks.extend(fresh.expressions.checks);
                     self.expressions.filters.extend(fresh.expressions.filters);
                     self.expressions.keys.extend(fresh.expressions.keys);
@@ -248,6 +262,7 @@ impl Declared {
                 Change::DropTable { name, .. } => self.forget_table(name),
                 Change::RenameTable { from, to, .. } => {
                     rekey_table(&mut self.expressions.defaults, from, to);
+                    rekey_table(&mut self.expressions.generated, from, to);
                     rekey_table(&mut self.expressions.checks, from, to);
                     rekey_table(&mut self.expressions.filters, from, to);
                     rekey_table(&mut self.expressions.keys, from, to);
@@ -262,6 +277,7 @@ impl Declared {
                     ..
                 } => {
                     remove_nested(&mut self.expressions.defaults, table, name);
+                    remove_nested(&mut self.expressions.generated, table, name);
                     remove_nested(&mut self.bindings.defaults, table, name);
                     if let Some(default) = &column.default {
                         self.expressions
@@ -270,15 +286,24 @@ impl Declared {
                             .or_default()
                             .insert(name.clone(), default.clone());
                     }
+                    if let Some(generated) = &column.generated {
+                        self.expressions
+                            .generated
+                            .entry(table.clone())
+                            .or_default()
+                            .insert(name.clone(), generated.expression.clone());
+                    }
                 }
                 Change::DropColumn { column, .. } => {
                     remove_nested(&mut self.expressions.defaults, &column.table, &column.name);
+                    remove_nested(&mut self.expressions.generated, &column.table, &column.name);
                     remove_nested(&mut self.bindings.defaults, &column.table, &column.name);
                 }
                 Change::RenameColumn {
                     table, from, to, ..
                 } => {
                     rekey_nested(&mut self.expressions.defaults, table, from, to);
+                    rekey_nested(&mut self.expressions.generated, table, from, to);
                     rekey_nested(&mut self.bindings.defaults, table, from, to);
                 }
                 Change::AlterColumnDefault { column, to, .. } => {
@@ -291,6 +316,13 @@ impl Declared {
                             .or_default()
                             .insert(column.name.clone(), default.clone());
                     }
+                }
+                Change::AlterColumnExpression { column, to, .. } => {
+                    self.expressions
+                        .generated
+                        .entry(column.table.clone())
+                        .or_default()
+                        .insert(column.name.clone(), to.clone());
                 }
                 Change::AddCheck {
                     table,
@@ -367,6 +399,7 @@ impl Declared {
 
     fn forget_table(&mut self, name: &TableName) {
         self.expressions.defaults.remove(name);
+        self.expressions.generated.remove(name);
         self.expressions.checks.remove(name);
         self.expressions.filters.remove(name);
         self.expressions.keys.remove(name);
@@ -397,6 +430,17 @@ impl Declared {
                         && spec.default.is_some()
                     {
                         spec.default = Some(declared.clone());
+                    }
+                }
+            }
+            // Presence-compared, as a default is: only over a column the
+            // read-back holds as generated (DEC-1168.1).
+            if let Some(generated) = self.expressions.generated.get(name) {
+                for (column, spec) in &mut table.columns {
+                    if let Some(declared) = generated.get(column)
+                        && let Some(read) = &mut spec.generated
+                    {
+                        read.expression = declared.clone();
                     }
                 }
             }
@@ -623,6 +667,49 @@ mod tests {
                 .get(&u)
                 .is_none_or(|m| m.is_empty())
         );
+    }
+
+    /// A generation expression is recorded as declared, overlaid on the
+    /// engine's respelling only over a column read back as generated, and
+    /// advanced by the change that rewrites it (DEC-1168.1).
+    #[test]
+    fn a_generation_expressions_declared_text_is_recorded_overlaid_and_advanced() {
+        let with_generated = |expression: &str| {
+            let mut s = schema();
+            let mut b = Column::new("int".parse().unwrap());
+            b.generated = Some(crate::schema::Generated {
+                expression: expression.into(),
+                stored: true,
+            });
+            s.tables
+                .get_mut(&t())
+                .unwrap()
+                .columns
+                .insert("b".into(), b);
+            s
+        };
+        let d = Declared::from_schema(&with_generated("n*2"));
+        assert_eq!(d.expressions.generated[&t()]["b"], "n*2");
+        let base = d.overlay(&with_generated("(n * 2)"));
+        assert_eq!(
+            base.tables[&t()].columns["b"]
+                .generated
+                .as_ref()
+                .unwrap()
+                .expression,
+            "n*2"
+        );
+        // Negative: nothing is conjured over a column read back ordinary.
+        let plain = d.overlay(&schema());
+        assert!(!plain.tables[&t()].columns.contains_key("b"));
+        let mut advanced = d.clone();
+        advanced.advance(&changes(vec![Change::AlterColumnExpression {
+            uid: "c_a1b2c3".parse().unwrap(),
+            column: t().column("b"),
+            from: "n*2".into(),
+            to: "n*3".into(),
+        }]));
+        assert_eq!(advanced.expressions.generated[&t()]["b"], "n*3");
     }
 
     /// Only what is compared as text is recorded: a default, a check, a

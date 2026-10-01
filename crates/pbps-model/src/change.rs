@@ -109,7 +109,7 @@ impl RiskClass {
             }
             RiskClass::Destructive => "data can be lost or a uniqueness guarantee removed",
             RiskClass::Narrowing => {
-                "converting to the new type can change stored values: values may be changed by padding, truncated, or the statement rejected if conversion fails"
+                "converting to the new type can change stored values: values may be changed by padding, truncated, or the statement rejected if conversion fails; a changed generation expression recomputes every stored row"
             }
             RiskClass::NotNull => {
                 "existing NULLs, or rows with no value for a newly required column, make the statement fail"
@@ -268,6 +268,16 @@ pub enum Change {
         column: ColumnRef,
         from: Option<String>,
         to: Option<String>,
+    },
+    /// A generated column's expression, changed in place (DEC-1168.1).
+    /// PostgreSQL 17 and later recompute every row under the new expression
+    /// (`SET EXPRESSION`); older servers have no in-place form, and a plan
+    /// that needs one is refused before it runs.
+    AlterColumnExpression {
+        uid: Uid,
+        column: ColumnRef,
+        from: String,
+        to: String,
     },
     /// Deprecation flag changed. Produces no structural change; may optionally be
     /// written to an extended property.
@@ -709,6 +719,8 @@ pub enum ColumnField {
     Type,
     Nullable,
     Default,
+    /// The generation expression (DEC-1168.1).
+    Generated,
     /// The explicit collation (#1175).
     Collation,
     /// Named for exhaustiveness rather than because a comparison turns on it:
@@ -830,6 +842,8 @@ pub enum ColumnPromise<'a> {
     Nullable(bool),
     /// Whether the column has a default at all.
     Default(bool),
+    /// Whether the column is generated at all (DEC-1168.1).
+    Generated(bool),
     /// The explicit collation the column has after the change, `None` being
     /// the database default (#1175).
     Collation(Option<&'a Collation>),
@@ -852,6 +866,7 @@ impl ColumnPromise<'_> {
             ColumnPromise::Type(_) => ColumnField::Type,
             ColumnPromise::Nullable(_) => ColumnField::Nullable,
             ColumnPromise::Default(_) => ColumnField::Default,
+            ColumnPromise::Generated(_) => ColumnField::Generated,
             ColumnPromise::Collation(_) => ColumnField::Collation,
         }
     }
@@ -991,6 +1006,7 @@ impl Change {
             | Change::AlterColumnType { column, .. }
             | Change::AlterColumnNullability { column, .. }
             | Change::AlterColumnDefault { column, .. }
+            | Change::AlterColumnExpression { column, .. }
             | Change::SetColumnDeprecated { column, .. } => &column.table,
             Change::CreateModule { .. }
             | Change::AlterModule { .. }
@@ -1041,6 +1057,7 @@ impl Change {
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -1148,6 +1165,7 @@ impl Change {
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -1201,7 +1219,8 @@ impl Change {
             } => vec![table.column(from), table.column(to)],
             Change::DropColumn { column, .. }
             | Change::AlterColumnType { column, .. }
-            | Change::AlterColumnDefault { column, .. } => vec![column.clone()],
+            | Change::AlterColumnDefault { column, .. }
+            | Change::AlterColumnExpression { column, .. } => vec![column.clone()],
             Change::AlterColumnNullability { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::CreateTable { .. }
@@ -1298,6 +1317,9 @@ impl Change {
             Change::AlterColumnDefault { column, .. } => {
                 vec![(column.clone(), ColumnField::Default)]
             }
+            Change::AlterColumnExpression { column, .. } => {
+                vec![(column.clone(), ColumnField::Generated)]
+            }
             Change::SetColumnDeprecated { column, .. } => {
                 vec![(column.clone(), ColumnField::Deprecated)]
             }
@@ -1356,6 +1378,7 @@ impl Change {
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -1427,6 +1450,7 @@ impl Change {
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -1475,6 +1499,7 @@ impl Change {
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -1519,6 +1544,7 @@ impl Change {
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -1595,6 +1621,11 @@ impl Change {
             Change::AlterColumnDefault { column, to, .. } => {
                 vec![(column.clone(), ColumnPromise::Default(to.is_some()))]
             }
+            // Held to being generated, not to its text, which the engine
+            // respells as it does a default's (DEC-1168.1).
+            Change::AlterColumnExpression { column, .. } => {
+                vec![(column.clone(), ColumnPromise::Generated(true))]
+            }
             Change::RenameColumn { .. }
             | Change::DropColumn { .. }
             | Change::SetColumnDeprecated { .. }
@@ -1650,6 +1681,7 @@ impl Change {
             Change::AlterColumnType { column, .. }
             | Change::AlterColumnNullability { column, .. }
             | Change::AlterColumnDefault { column, .. }
+            | Change::AlterColumnExpression { column, .. }
             | Change::SetColumnDeprecated { column, .. } => {
                 vec![(column.clone(), Presence::Present)]
             }
@@ -1770,6 +1802,7 @@ impl Change {
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
@@ -1807,6 +1840,7 @@ impl Change {
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -1857,6 +1891,7 @@ impl Change {
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -1895,6 +1930,7 @@ impl Change {
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -1965,6 +2001,13 @@ impl Change {
             }
             Change::AddUnique { .. } | Change::AddForeignKey { .. } | Change::AddCheck { .. } => {
                 r.insert(RiskClass::Constraint);
+            }
+            // The engine recomputes and rewrites the value of every stored
+            // row, and a NOT NULL, check or unique index over the column can
+            // refuse what it computes: a value-changing conversion in all but
+            // name (SPEC §7.2, DEC-1168.1).
+            Change::AlterColumnExpression { .. } => {
+                r.insert(RiskClass::Narrowing);
             }
             // A unique index and a UNIQUE constraint ask the data the same
             // question, and in SQL Server they *are* the same object: the
@@ -2329,6 +2372,30 @@ mod tests {
         let (tighten, loosen) = (make(false), make(true));
         assert!(tighten.intrinsic_risks().contains(&RiskClass::NotNull));
         assert!(loosen.intrinsic_risks().is_empty());
+    }
+
+    /// A changed generation expression rewrites every stored value, which is
+    /// what the narrowing gate asks about (SPEC §7.2); a changed default
+    /// rewrites none and stays ungated.
+    #[test]
+    fn a_changed_generation_expression_is_gated_and_a_changed_default_is_not() {
+        let expression = Change::AlterColumnExpression {
+            uid: uid("c_k7x2mq"),
+            column: col("app.t.b"),
+            from: "(a * 2)".to_owned(),
+            to: "a * 3".to_owned(),
+        };
+        assert_eq!(
+            expression.intrinsic_risks(),
+            BTreeSet::from([RiskClass::Narrowing])
+        );
+        let default = Change::AlterColumnDefault {
+            uid: uid("c_k7x2mq"),
+            column: col("app.t.b"),
+            from: Some("2".to_owned()),
+            to: Some("3".to_owned()),
+        };
+        assert!(default.intrinsic_risks().is_empty());
     }
 
     /// Type narrowing needs a dialect to judge; the model layer must not decide

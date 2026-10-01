@@ -573,6 +573,16 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             ))
         }
 
+        // Refused by validation: this model holds generated columns for
+        // PostgreSQL only (DEC-1168.1). An error rather than a statement for a
+        // column this engine was never given.
+        Change::AlterColumnExpression { column, .. } => Err(DialectError::Invalid {
+            dialect: DIALECT,
+            message: format!(
+                "{column} is a generated column, which this model holds for PostgreSQL only"
+            ),
+        }),
+
         Change::AlterColumnDefault {
             column, from, to, ..
         } => {

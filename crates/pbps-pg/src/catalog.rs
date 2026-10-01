@@ -1012,7 +1012,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             nullable: flag(row, "nullable")?,
             default: optional_text(row, "default_expr")?,
             identity,
-            generated: first_char(&text(row, "generated")?).is_some(),
+            generated: first_char(&text(row, "generated")?),
             owned_sequence,
             default_sequences: optional_text(row, "default_sequences")?,
             collation: optional_text(row, "collation")?,

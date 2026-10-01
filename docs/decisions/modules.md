@@ -1394,22 +1394,25 @@ the refusal (2026-09-25).
 
 <a id="dec-942-1"></a>
 
-**DEC-942.1. When a PostgreSQL plan rebuilds a function, what the plan itself
-adds that can call one goes after the last function it creates (#942).** DEC-314.1
-places what the catalog says depends on a dropped module. An addition this plan
-makes is not in the catalog yet, so that pass never sees it. The differ puts a
-check or an index in class 13 and a default in class 9, ahead of every module
-in class 14. A check calling the rebuilt function was therefore created against
-the old one, and the rebuild's `DROP FUNCTION` was refused because of it.
+**DEC-942.1. When a PostgreSQL plan creates or rebuilds a function, what the
+plan itself adds that can call one goes after the last function it creates
+(#942).** DEC-314.1 places what the catalog says depends on a dropped module.
+An addition this plan makes is not in the catalog yet, so that pass never sees
+it. The differ puts a check or an index in class 13 and a default in class 9,
+ahead of every module in class 14. A check calling the rebuilt function was
+therefore created against the old one, and the rebuild's `DROP FUNCTION` was
+refused because of it.
 
 Which function an expression calls cannot be known without parsing it, and the
 planner does not parse expressions (DECISIONS 174). So the rule is positional
-rather than per call. When the plan rebuilds a function, these move after the
-last function the plan creates, keeping their order. A routine counts as a
-rebuilt function when the plan drops and creates it and either side is a
-function. A procedure that becomes a function counts (#1024), and so does a
-function that becomes a procedure, since the same revision may create another
-function a new check calls (#1047). What moves:
+rather than per call. When the plan creates or rebuilds a function, these move
+after the last function the plan creates, keeping their order. A function new
+to the database counts as well (#1168): what calls it names a function that is
+not there yet, and the engine refuses it. A routine counts as a rebuilt
+function when the plan drops and creates it and either side is a function. A
+procedure that becomes a function counts (#1024), and so does a function that
+becomes a procedure, since the same revision may create another function a new
+check calls (#1047). What moves:
 
 - every check;
 - every index with a filter, since an index's columns are names and its filter
@@ -1433,8 +1436,8 @@ and rolls back.
 
 A table the plan creates carries its checks, indexes and column defaults
 inside one `CreateTable`. That change cannot move, since views and routines
-may read the table. So when the plan rebuilds a function, a new table ahead of
-the last function create is split first (#1027):
+may read the table. So when the plan creates or rebuilds a function, a new
+table ahead of the last function create is split first (#1027):
 
 - its checks become `AddCheck`;
 - its filtered indexes become `AddIndex`;

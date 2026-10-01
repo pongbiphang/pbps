@@ -464,6 +464,11 @@ struct AsStored {
     /// for, as the plan leaves it: a literal the probe compares against
     /// another literal is compared through it (DECISIONS 341).
     column_types: BTreeMap<ColumnRef, pbps_model::ColumnType>,
+    /// Generated columns whose expression this plan changes. `SET EXPRESSION`
+    /// rewrites every stored value before what follows it is checked, and the
+    /// new values cannot be computed here without running the operator's
+    /// expression before approval (DEC-1168.1).
+    recomputed: BTreeSet<ColumnRef>,
 }
 
 /// A column this plan adds, as the pre-delete probe needs it.
@@ -478,7 +483,9 @@ struct AddedColumn {
     ty: pbps_model::ColumnType,
     /// `GENERATED … AS IDENTITY`: the engine assigns every stored row a value
     /// from the sequence during the `ADD COLUMN` — measured, `1`, `2`, … —
-    /// which no probe can evaluate and which may be a key of the parent.
+    /// which no probe can evaluate and which may be a key of the parent. A
+    /// generated column's values are the engine's in the same way, computed
+    /// from each row during the `ADD COLUMN` (DEC-1168.1).
     identity: bool,
 }
 
@@ -737,7 +744,7 @@ impl AsStored {
                         AddedColumn {
                             default: column.default.clone(),
                             ty: column.ty.clone(),
-                            identity: column.identity.is_some(),
+                            identity: column.engine_assigned(),
                         },
                     );
                 }
@@ -750,6 +757,9 @@ impl AsStored {
                 // Exhaustive rather than `_`: a change added later that moves a
                 // name has to be reflected here, or every probe downstream of
                 // it would quietly query the wrong object.
+                Change::AlterColumnExpression { column, .. } => {
+                    this.recomputed.insert(column.clone());
+                }
                 Change::DropColumn { .. }
                 | Change::AlterColumnNullability { .. }
                 | Change::AlterColumnDefault { .. }
@@ -784,6 +794,48 @@ impl AsStored {
     /// valid plan (DECISIONS 410).
     fn retypes_in(&self, table: &TableName) -> bool {
         self.retyped.keys().any(|c| c.table == *table)
+    }
+
+    /// Whether a change's probe would read a generated column this plan
+    /// recomputes, and so judge the values the old expression stored. A
+    /// predicate is arbitrary SQL this module does not parse, so a check or
+    /// a filtered index counts any recomputed column of its table; a key
+    /// counts its own columns, on either side of a foreign key.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    fn reads_recomputed(&self, change: &Change) -> bool {
+        let named = |table: &TableName, columns: &[String]| {
+            columns
+                .iter()
+                .any(|c| self.recomputed.contains(&table.column(c)))
+        };
+        let anywhere = |table: &TableName| self.recomputed.iter().any(|c| c.table == *table);
+        match change {
+            Change::AlterColumnNullability {
+                column,
+                to_nullable: false,
+                ..
+            } => self.recomputed.contains(column),
+            Change::AddCheck { table, .. } => anywhere(table),
+            Change::AddIndex { table, index, .. } => {
+                (index.holds_expression() && anywhere(table))
+                    || index.column_keys().is_some_and(|keys| named(table, &keys))
+            }
+            Change::AddUnique {
+                table, constraint, ..
+            } => named(table, &constraint.columns),
+            Change::SetPrimaryKey {
+                table,
+                to: Some(pk),
+                ..
+            } => named(table, &pk.columns),
+            Change::AddForeignKey {
+                table, constraint, ..
+            } => {
+                named(table, &constraint.columns)
+                    || named(&constraint.references_table, &constraint.references_columns)
+            }
+            _ => false,
+        }
     }
 
     /// The name the catalog has for a table this plan names, or `None` where
@@ -2948,6 +3000,13 @@ fn build(
     names: &AsStored,
     unchecked: &mut Vec<Unchecked>,
 ) -> Result<Vec<Probe>, DialectError> {
+    if names.reads_recomputed(change) {
+        return Ok(skip(
+            change,
+            "a generated column this plan recomputes cannot be evaluated before apply",
+            unchecked,
+        ));
+    }
     match change {
         // A new column the declarations require a value in, with nothing to
         // put there. Every existing row breaks it, so the count is the table's
@@ -2990,6 +3049,19 @@ fn build(
             // engine `(expr) IS NULL` would run the operator's own function
             // before the plan is approved, which is the shape of #274 and
             // something no probe in this crate does.
+            // A generated column's value is its expression over each row, and
+            // evaluating it here would run the operator's code before the plan
+            // is approved, exactly as a default's would. Unchecked, not counted
+            // as the whole table: its inputs may never be null, and the engine
+            // refuses `contains null values` at `ADD` when they are
+            // (DEC-1168.1).
+            if column.generated.is_some() {
+                return Ok(skip(
+                    change,
+                    "a generated column's values cannot be evaluated before apply",
+                    unchecked,
+                ));
+            }
             if let Some(default) = column.default.as_deref() {
                 let Some(literal) = constant_default(default) else {
                     return Ok(skip(change, "the default cannot be evaluated before apply", unchecked));
@@ -3243,6 +3315,7 @@ fn build(
             to_nullable: true, ..
         }
         | Change::AlterColumnDefault { .. }
+        | Change::AlterColumnExpression { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::SetPrimaryKey { to: None, .. }
         | Change::DropUnique { .. }
@@ -3489,6 +3562,7 @@ pub(crate) fn probes(changes: &ChangeSet) -> Preflight {
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -3533,6 +3607,21 @@ pub(crate) fn probes(changes: &ChangeSet) -> Preflight {
                 );
                 continue;
             };
+            // A recomputed generated column may be a referencing column of a
+            // foreign key the probe finds in the catalog, and its new values
+            // are written at rank 9, before the delete. Which keys read it is
+            // the catalog's to say at run time, so any recomputation in the
+            // plan leaves the delete unchecked rather than counted against
+            // the old expression's values (DEC-1168.1).
+            if !names.recomputed.is_empty() {
+                skip(
+                    &p.change,
+                    "a generated column this plan recomputes may reference the deleted row, \
+                     and its new values cannot be evaluated before apply",
+                    &mut unchecked,
+                );
+                continue;
+            }
             match delete_probe(table, key, &stored, &names) {
                 Ok(probe) => out.push(probe),
                 Err(error) => {
@@ -3682,6 +3771,69 @@ mod tests {
         ChangeSet {
             changes: changes.into_iter().map(planned).collect(),
         }
+    }
+
+    /// `SET EXPRESSION` rewrites a generated column before the tightening
+    /// and the constraints after it are checked, so a probe over its stored
+    /// values would judge what the old expression computed: `g = a` holding
+    /// NULLs refused `g = coalesce(a, 0) NOT NULL`. What reads it is left
+    /// unchecked, and what does not is still probed (DEC-1168.1).
+    #[test]
+    fn what_reads_a_recomputed_generated_column_is_unchecked_not_judged() {
+        let table: TableName = "app.t".parse().unwrap();
+        let recompute = Change::AlterColumnExpression {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: table.column("g"),
+            from: "a".into(),
+            to: "COALESCE(a, 0)".into(),
+        };
+        let tighten = |column: &str| Change::AlterColumnNullability {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: table.column(column),
+            ty: "integer".parse().unwrap(),
+            to_nullable: false,
+            collation: None,
+        };
+        let unique = |column: &str| Change::AddUnique {
+            table: table.clone(),
+            name: format!("uq_{column}"),
+            constraint: pbps_model::UniqueConstraint {
+                columns: vec![column.to_owned()],
+            },
+            clustered: false,
+        };
+        let check = Change::AddCheck {
+            table: table.clone(),
+            name: "ck".into(),
+            constraint: pbps_model::CheckConstraint {
+                expression: "g >= 0".into(),
+            },
+        };
+        let report = super::probes(&set(vec![
+            recompute.clone(),
+            tighten("g"),
+            unique("g"),
+            check.clone(),
+        ]));
+        assert!(report.probes.is_empty(), "{report:#?}");
+        assert_eq!(report.unchecked.len(), 3, "{report:#?}");
+        // The same changes with no recomputation are probed as ever.
+        let report = super::probes(&set(vec![tighten("g"), unique("g"), check]));
+        assert_eq!(report.probes.len(), 3, "{report:#?}");
+        assert!(report.unchecked.is_empty(), "{report:#?}");
+        // And a key or a tightening over another column of the table is too.
+        let report = super::probes(&set(vec![recompute.clone(), tighten("a"), unique("a")]));
+        assert_eq!(report.probes.len(), 2, "{report:#?}");
+        assert!(report.unchecked.is_empty(), "{report:#?}");
+        // A reference row deleted in the same plan is counted against foreign
+        // keys the catalog names at run time, which a recomputed column may
+        // be part of: unchecked with a recomputation, probed without one.
+        let report = super::probes(&set(vec![recompute, deleting("app.p", "1")]));
+        assert!(report.probes.is_empty(), "{report:#?}");
+        assert_eq!(report.unchecked.len(), 1, "{report:#?}");
+        let report = super::probes(&set(vec![deleting("app.p", "1")]));
+        assert!(!report.probes.is_empty(), "{report:#?}");
+        assert!(report.unchecked.is_empty(), "{report:#?}");
     }
 
     #[test]

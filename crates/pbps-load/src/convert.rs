@@ -258,6 +258,10 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
                 description: c.description,
                 deprecated: c.deprecated,
                 collation: c.collation.map(pbps_model::Collation::new),
+                generated: c.generated.map(|g| pbps_model::Generated {
+                    expression: g.expression,
+                    stored: g.stored,
+                }),
             },
         );
     }

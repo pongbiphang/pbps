@@ -329,6 +329,7 @@ fn role_of(change: &Change) -> Option<&str> {
         | Change::AlterColumnType { .. }
         | Change::AlterColumnNullability { .. }
         | Change::AlterColumnDefault { .. }
+        | Change::AlterColumnExpression { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::SetPrimaryKey { .. }
         | Change::AddUnique { .. }
@@ -374,6 +375,7 @@ fn renames(cs: &ChangeSet) -> Renames {
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -672,6 +674,9 @@ pub fn describe(c: &Change) -> String {
             Some(v) => format!("~ {} default -> {v}", column.name),
             None => format!("~ {} default removed", column.name),
         },
+        Change::AlterColumnExpression { column, to, .. } => {
+            format!("~ {} generated as {to}", column.name)
+        }
         Change::SetColumnDeprecated { column, reason, .. } => match reason {
             Some(r) => format!("~ {} marked deprecated: {r}", column.name),
             None => format!("~ {} no longer deprecated", column.name),

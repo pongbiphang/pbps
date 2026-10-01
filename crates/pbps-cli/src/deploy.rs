@@ -2269,6 +2269,9 @@ fn column_as_declared(
         && declared.nullable == now.nullable
         && declared.identity == now.identity
         && declared.default.is_some() == now.default.is_some()
+        // A generation expression by presence, as a default: the engine
+        // respells its text. Its kind is read back exactly (DEC-1168.1).
+        && declared.generated.as_ref().map(|g| g.stored) == now.generated.as_ref().map(|g| g.stored)
         && declared.collation == now.collation
 }
 
@@ -2386,6 +2389,19 @@ fn differing(
     }
     if was.collation != now.collation {
         out.push((Some(ColumnField::Collation), "collation"));
+    }
+    // Only the expression text is a planned change's to move
+    // (`AlterColumnExpression`, DEC-1168.1). A column becoming or ceasing to
+    // be generated, or changing kind, has no change in this model, so it
+    // falls to the `None` below.
+    match (&was.generated, &now.generated) {
+        (Some(a), Some(b)) if a.stored == b.stored => {
+            if a.expression != b.expression {
+                out.push((Some(ColumnField::Generated), "generation expression"));
+            }
+        }
+        (None, None) => {}
+        _ => out.push((None, "generation")),
     }
     // `None` is "no change of this model moves this", so nothing can excuse
     // it: an identity or a description that differs across an apply is
@@ -3314,6 +3330,7 @@ fn refuse_unplanned_movement(
                         | pbps_model::Change::AlterColumnType { .. }
                         | pbps_model::Change::AlterColumnNullability { .. }
                         | pbps_model::Change::AlterColumnDefault { .. }
+                        | pbps_model::Change::AlterColumnExpression { .. }
                         | pbps_model::Change::SetColumnDeprecated { .. }
                         | pbps_model::Change::SetPrimaryKey { .. }
                         | pbps_model::Change::AddUnique { .. }
@@ -3628,6 +3645,9 @@ fn refuse_unplanned_movement(
                 ColumnPromise::Type(to) => (same_type(dialect, to, &now.ty), "type"),
                 ColumnPromise::Nullable(to) => (now.nullable == to, "nullability"),
                 ColumnPromise::Default(has) => (now.default.is_some() == has, "default"),
+                ColumnPromise::Generated(has) => {
+                    (now.generated.is_some() == has, "generation expression")
+                }
                 ColumnPromise::Collation(c) => (now.collation.as_ref() == c, "collation"),
             };
             if !kept {
@@ -5251,6 +5271,7 @@ pub fn cmd_plan_db(
 
         findings.extend(policy);
         let permission_support = crate::engine::permission_support(&mut conn, &cs).await?;
+        let generation_support = crate::engine::generation_support(&mut conn, &cs).await?;
         // Asked of the read this plan was built from, not of the connection
         // again: the owners came out of the same statement snapshot as the
         // schema, so the two cannot disagree (DECISIONS 174).
@@ -5316,6 +5337,7 @@ pub fn cmd_plan_db(
             format!("{} as queried (entry #{})", target.label, entry.id),
             vec![
                 permission_support,
+                generation_support,
                 owned_targets,
                 unrevocable_grants,
                 drop_blockers,
@@ -5707,6 +5729,7 @@ fn apply_identified(
         // This capability is constant for the connection and needs no ledger
         // lock. Check before any writes, including staged resumes.
         crate::engine::permission_support(&mut conn, &plan.changes).await?;
+        crate::engine::generation_support(&mut conn, &plan.changes).await?;
 
         // The lock comes first, before the checks and not after them: a
         // pre-flight that passed while another pipeline was mid-apply would
@@ -9561,6 +9584,78 @@ mod tests {
         assert!(e.contains("dbo.t is gone"), "{e}");
         let e = refuse(&changes(vec![]), &gone, &before).expect_err("the table arrived");
         assert!(e.contains("dbo.t is there"), "{e}");
+    }
+
+    /// A generated column's generation is compared across an apply like its
+    /// type: a planned expression change excuses a new expression and
+    /// nothing else, and a column that stops being generated, or changes
+    /// kind, is somebody else's work whatever the plan says (SPEC §7.6,
+    /// DEC-1168.1).
+    #[test]
+    fn a_generation_this_plan_does_not_move_is_still_compared() {
+        let schema = |generated: Option<(&str, bool)>| {
+            let mut c = pbps_model::Column::new("integer".parse().unwrap());
+            c.generated = generated.map(|(expression, stored)| pbps_model::Generated {
+                expression: expression.to_owned(),
+                stored,
+            });
+            let mut t = pbps_model::Table::default();
+            t.columns.insert(
+                "a".to_owned(),
+                pbps_model::Column::new("integer".parse().unwrap()),
+            );
+            t.columns.insert("g".to_owned(), c);
+            let mut s = Schema::default();
+            s.tables.insert("app.t".parse().unwrap(), t);
+            s
+        };
+        let changes = |c: Vec<pbps_model::Change>| pbps_model::ChangeSet {
+            changes: c.into_iter().map(pbps_model::PlannedChange::new).collect(),
+        };
+        let refuse = |cs: &pbps_model::ChangeSet, before: &Schema, after: &Schema| {
+            refuse_unplanned_movement(
+                &pbps_pg::Postgres::new(),
+                cs,
+                before,
+                after,
+                "prod",
+                Settled::Whole,
+            )
+            .map_err(|e| format!("{e:#}"))
+        };
+        let recompute = changes(vec![pbps_model::Change::AlterColumnExpression {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: pbps_model::ColumnRef::new("app.t".parse().unwrap(), "g"),
+            from: "(a * 2)".to_owned(),
+            to: "a * 3".to_owned(),
+        }]);
+        // A plan that touches the table through another column, so the
+        // table is compared column by column rather than whole.
+        let elsewhere = changes(vec![pbps_model::Change::AlterColumnDefault {
+            uid: "c_bbbbbb".parse().unwrap(),
+            column: pbps_model::ColumnRef::new("app.t".parse().unwrap(), "a"),
+            from: None,
+            to: Some("1".to_owned()),
+        }]);
+        let before = schema(Some(("(a * 2)", true)));
+        let changed = schema(Some(("(a * 3)", true)));
+        refuse(&recompute, &before, &changed).expect("the plan's own change");
+        let e = refuse(&elsewhere, &before, &changed).expect_err("an unplanned expression");
+        assert!(
+            e.contains("column `g` has a different generation expression"),
+            "{e}"
+        );
+        // `DROP EXPRESSION` by another session leaves an ordinary column,
+        // which no change of the plan makes, not even its expression change.
+        let ordinary = schema(None);
+        for plan in [elsewhere, recompute.clone()] {
+            let e = refuse(&plan, &before, &ordinary).expect_err("the generation went");
+            assert!(e.contains("column `g` has a different generation "), "{e}");
+        }
+        let virtual_ = schema(Some(("(a * 2)", false)));
+        let e = refuse(&recompute, &before, &virtual_).expect_err("the kind moved");
+        assert!(e.contains("different generation "), "{e}");
+        refuse(&changes(vec![]), &before, &before).expect("nothing moved");
     }
 
     /// A role the plan touches is exempt down to the permissions it moves, and

@@ -945,6 +945,7 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
             | change @ pbps_model::Change::DropColumn { .. }
             | change @ pbps_model::Change::RenameColumn { .. }
             | change @ pbps_model::Change::AlterColumnDefault { .. }
+            | change @ pbps_model::Change::AlterColumnExpression { .. }
             | change @ pbps_model::Change::SetColumnDeprecated { .. }
             | change @ pbps_model::Change::SetPrimaryKey { .. }
             | change @ pbps_model::Change::AddUnique { .. }
@@ -1533,6 +1534,102 @@ fn a_new_tables_expressions_calling_a_rebuilt_function_follow_it() {
     );
     succeeds(approved_apply(&d, connection, &plan, &allow));
     succeeds(d.run(&["verify", "--db", connection]));
+}
+
+/// A function new to the database, with nothing rebuilt: a new table's and an
+/// existing table's check calling it follow its `CREATE FUNCTION`, and the
+/// plan applies (DEC-942.1). Before, only a rebuild moved them, and the engine
+/// refused the check over a missing function. A column added with a
+/// generation expression stays ahead of the new functions, and one of them
+/// reads it: the engine resolves a SQL body's columns when it creates the
+/// function (DEC-1168.1).
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn what_calls_a_new_function_follows_its_create() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "new-function-callers");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; CREATE TABLE app.t (id integer PRIMARY KEY); \
+         INSERT INTO app.t VALUES (1), (2)",
+    );
+    let d = Demo::new("new-function-callers");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    std::fs::write(
+        d.dir.join("schema/app.h%28integer%29.function.yml"),
+        "function: app.h(integer)\npublic_execute: true\n\ndefinition: |-\n  \
+         (x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x * 10 $$\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/app.reader%28integer%29.function.yml"),
+        "function: app.reader(integer)\npublic_execute: true\n\ndefinition: |-\n  \
+         (x integer) RETURNS integer LANGUAGE sql STABLE \
+         AS $$ SELECT t.g + k.g FROM app.t t JOIN app.k k USING (id) WHERE t.id = x $$\n",
+    )
+    .unwrap();
+    let table = d.dir.join("schema/app.t.yml");
+    let text = std::fs::read_to_string(&table).unwrap();
+    let text = text.replacen(
+        "columns:\n",
+        "columns:\n  g: {type: integer, generated: {expression: 'id * 10', stored: true}}\n",
+        1,
+    );
+    std::fs::write(&table, format!("{text}checks:\n  ck_t: 'app.h(id) >= 0'\n")).unwrap();
+    std::fs::write(
+        d.dir.join("schema/app.k.yml"),
+        "table: app.k\ncolumns:\n  id: {type: integer, nullable: false}\n  \
+         g: {type: integer, generated: {expression: 'id * 10', stored: true}}\n\
+         primary_key: {name: k_pkey, columns: [id]}\n\
+         checks:\n  ck_k: 'app.h(id) >= 0'\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    let create = at("CREATE FUNCTION \"app\".\"h\"");
+    assert!(!script.contains("DROP FUNCTION"), "{script}");
+    for caller in ["ADD CONSTRAINT \"ck_t\"", "ADD CONSTRAINT \"ck_k\""] {
+        assert!(create < at(caller), "{caller}: {script}");
+    }
+    let reader = at("CREATE FUNCTION \"app\".\"reader\"");
+    assert!(
+        at("ALTER TABLE \"app\".\"t\" ADD COLUMN \"g\"") < reader,
+        "{script}"
+    );
+    assert!(at("CREATE TABLE \"app\".\"k\"") < reader, "{script}");
+    assert!(
+        !script.contains("ALTER TABLE \"app\".\"k\" ADD COLUMN"),
+        "{script}"
+    );
+    let allow = ["--allow", "constraint", "--allow", "grant-widen"];
+    succeeds(approved_apply(&d, connection, &plan, &allow));
+    assert_eq!(
+        scalar(connection, "SELECT g::int8 FROM app.t WHERE id = 2"),
+        20
+    );
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
 }
 
 /// A new default calling a function the revision rebuilds, on a table whose
@@ -5741,6 +5838,485 @@ fn bootstrap_grants_to_an_existing_cluster_role_without_adopting_existing_grants
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 fn the_deployment_loop_runs_end_to_end_on_postgres() {
     deployment_loop(&server(), "loop");
+}
+
+/// A stored generated column through the CLI (DEC-1168.1): the pull writes
+/// `generated:`, a declared expression the engine respells applies once and
+/// then plans nothing, and a retype of a column the expression reads is
+/// refused before anything runs. On PostgreSQL 16, which has no
+/// `SET EXPRESSION`, the expression change is refused by name instead.
+fn generated_column_flow(server: &str, slug: &str, has_set_expression: bool) {
+    let own = OwnDatabase::new(server, slug);
+    let connection = own.connection().to_owned();
+    on_server(
+        &connection,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.t (id integer PRIMARY KEY, a integer, \
+                             b integer GENERATED ALWAYS AS (a * 2) STORED); \
+         INSERT INTO app.t (id, a) VALUES (1, 5), (2, NULL)",
+    );
+    let d = Demo::new(slug);
+    succeeds(d.run(&["pull", "--db", &connection]));
+    let path = d.dir.join("schema/app.t.yml");
+    let table = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        table.contains("generated: {expression:") && table.contains("stored: true"),
+        "{table}"
+    );
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+
+    // Declared as a person would write it; the engine renders `(a * 3)`.
+    let respelled: String = table
+        .lines()
+        .map(|l| {
+            if l.trim_start().starts_with("generated:") {
+                "    generated: {expression: 'a * 3', stored: true}".to_owned()
+            } else {
+                l.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(&path, &respelled).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    if !has_set_expression {
+        assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+        assert!(
+            stderr(&o).contains("generation_support") && stderr(&o).contains("PostgreSQL 17"),
+            "{}",
+            stderr(&o)
+        );
+        return;
+    }
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("generated as a * 3"), "{}", stdout(&o));
+    // Every stored value is recomputed, so the change faces the gate as a
+    // value-changing conversion does (SPEC §7.2), and nothing runs without it.
+    let o = approved_apply(&d, &connection, &plan, &[]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("--allow narrowing"), "{}", stderr(&o));
+    assert_eq!(
+        scalar(&connection, "SELECT b::int8 FROM app.t WHERE id = 1"),
+        10
+    );
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--allow", "narrowing"],
+    ));
+    assert_eq!(
+        scalar(&connection, "SELECT b::int8 FROM app.t WHERE id = 1"),
+        15
+    );
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
+    // Row 2's `a` is NULL, so `b` holds a NULL now. An expression that never
+    // yields one, with `b` made NOT NULL in the same revision, is valid: the
+    // recomputation runs before the tightening, and the pre-flight does not
+    // judge the old NULL (DEC-1168.1).
+    let tightened: String = respelled.replacen(
+        "    generated: {expression: 'a * 3', stored: true}",
+        "    nullable: false\n    generated: {expression: 'coalesce(a, 0) * 3', stored: true}",
+        1,
+    );
+    assert_ne!(
+        tightened, respelled,
+        "the fixture's `b` is where this test expects it"
+    );
+    std::fs::write(&path, &tightened).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    std::fs::remove_file(&plan).unwrap();
+    succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--allow", "narrowing", "--allow", "not-null"],
+    ));
+    assert_eq!(
+        scalar(&connection, "SELECT b::int8 FROM app.t WHERE id = 2"),
+        0
+    );
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
+    // A retype of `a`, which `b` is computed from: refused before anything
+    // runs, naming the generated column, where the engine would refuse it
+    // halfway through the apply.
+    let retyped: String = std::fs::read_to_string(&path).unwrap().replacen(
+        "  a:\n    type: integer",
+        "  a:\n    type: bigint",
+        1,
+    );
+    assert_ne!(
+        retyped, tightened,
+        "the fixture's `a` is where this test expects it"
+    );
+    std::fs::write(&path, retyped).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("generation_support") && stderr(&o).contains("`b` is computed from it"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_generated_columns_expression_changes_through_the_cli_and_its_inputs_are_held() {
+    generated_column_flow(&server(), "generated-1168", true);
+}
+
+#[test]
+#[ignore = "needs PostgreSQL 16; set PBPS_TEST_PG_OLD_DB"]
+fn a_generated_columns_expression_change_is_refused_by_name_before_postgres_17() {
+    let server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    on_server(
+        &server,
+        "DO $$ BEGIN IF current_setting('server_version_num')::integer >= 170000 THEN RAISE EXCEPTION 'this regression needs a pre-17 server'; END IF; END $$",
+    );
+    generated_column_flow(&server, "generated-1168-old", false);
+}
+
+/// Two functions dropped together, `g` calling `f`, each released from a
+/// generated column by an expression change, and `f`'s release ordered first:
+/// `g` is still dropped before `f`. Each drop moves after its own release and
+/// after the drops of what depends on it (DEC-1168.1).
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn dropped_functions_keep_their_order_after_their_releases() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "generated-release-chain");
+    let connection = own.connection().to_owned();
+    on_server(
+        &connection,
+        "CREATE SCHEMA app; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE FUNCTION app.g(x integer) RETURNS integer LANGUAGE sql IMMUTABLE \
+           BEGIN ATOMIC SELECT app.f(x); END; \
+         CREATE TABLE app.a (id integer PRIMARY KEY, v integer, \
+                             c integer GENERATED ALWAYS AS (app.f(v)) STORED); \
+         CREATE TABLE app.z (id integer PRIMARY KEY, v integer, \
+                             c integer GENERATED ALWAYS AS (app.g(v)) STORED); \
+         INSERT INTO app.a (id, v) VALUES (1, 5); INSERT INTO app.z (id, v) VALUES (1, 5)",
+    );
+    let d = Demo::new("generated-release-chain");
+    succeeds(d.run(&["pull", "--db", &connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    for f in ["f", "g"] {
+        std::fs::remove_file(
+            d.dir
+                .join(format!("schema/app.{f}%28integer%29.function.yml")),
+        )
+        .unwrap();
+    }
+    for table in ["a", "z"] {
+        let path = d.dir.join(format!("schema/app.{table}.yml"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let edited: String = text
+            .lines()
+            .map(|l| {
+                if l.trim_start().starts_with("generated:") {
+                    "    generated: {expression: 'v * 2', stored: true}".to_owned()
+                } else {
+                    l.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert_ne!(
+            edited, text,
+            "app.{table}'s generated column is where this test expects it"
+        );
+        std::fs::write(&path, edited).unwrap();
+    }
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        &connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    assert!(
+        at("DROP FUNCTION \"app\".\"g\"") < at("DROP FUNCTION \"app\".\"f\""),
+        "{script}"
+    );
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &[
+            "--allow",
+            "narrowing",
+            "--allow",
+            "destructive",
+            "--allow",
+            "revoke",
+        ],
+    ));
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
+/// The drop of a function generated columns call follows what releases them,
+/// wherever the differ put that (DEC-1168.1): an expression change that reads
+/// a column the same revision adds, after that addition, and the drop of a
+/// generated column, in the column-drop class. Moving either up to the
+/// function's drop ran it ahead of what it needs, or was refused outright.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_dropped_function_follows_what_releases_its_generated_columns() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "generated-release-later");
+    let connection = own.connection().to_owned();
+    on_server(
+        &connection,
+        "CREATE SCHEMA app; \
+         CREATE FUNCTION app.f1(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE FUNCTION app.f2(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE TABLE app.t1 (id integer PRIMARY KEY, a integer, \
+                              g1 integer GENERATED ALWAYS AS (app.f1(a)) STORED); \
+         CREATE TABLE app.t2 (id integer PRIMARY KEY, a integer, \
+                              g2 integer GENERATED ALWAYS AS (app.f2(a)) STORED); \
+         INSERT INTO app.t1 (id, a) VALUES (1, 5); INSERT INTO app.t2 (id, a) VALUES (1, 5)",
+    );
+    let d = Demo::new("generated-release-later");
+    succeeds(d.run(&["pull", "--db", &connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    for f in ["f1", "f2"] {
+        std::fs::remove_file(
+            d.dir
+                .join(format!("schema/app.{f}%28integer%29.function.yml")),
+        )
+        .unwrap();
+    }
+    // `t1.g1` reads a new column `b` instead of calling `f1`.
+    let t1 = d.dir.join("schema/app.t1.yml");
+    let text = std::fs::read_to_string(&t1).unwrap();
+    let edited: String = text
+        .lines()
+        .flat_map(|l| {
+            if l == "  g1:" {
+                vec![
+                    "  b:".to_owned(),
+                    "    type: integer".to_owned(),
+                    l.to_owned(),
+                ]
+            } else if l.trim_start().starts_with("generated:") {
+                vec!["    generated: {expression: 'b * 3', stored: true}".to_owned()]
+            } else {
+                vec![l.to_owned()]
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert!(
+        edited.contains("  b:\n    type: integer\n  g1:"),
+        "{edited}"
+    );
+    std::fs::write(&t1, edited).unwrap();
+    // `t2.g2` goes, with the function it calls.
+    let t2 = d.dir.join("schema/app.t2.yml");
+    let text = std::fs::read_to_string(&t2).unwrap();
+    let mut in_g2 = false;
+    let edited: String = text
+        .lines()
+        .filter(|l| {
+            if !l.starts_with("   ") {
+                in_g2 = *l == "  g2:";
+            }
+            !in_g2
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert!(!edited.contains("g2"), "{edited}");
+    std::fs::write(&t2, edited).unwrap();
+    succeeds(d.run(&["drop", "app.t2.g2", "--reason", "computed elsewhere now"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        &connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    assert!(
+        at("ADD COLUMN \"b\"") < at("SET EXPRESSION")
+            && at("SET EXPRESSION") < at("DROP FUNCTION \"app\".\"f1\""),
+        "{script}"
+    );
+    assert!(
+        at("DROP COLUMN \"g2\"") < at("DROP FUNCTION \"app\".\"f2\""),
+        "{script}"
+    );
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &[
+            "--allow",
+            "narrowing",
+            "--allow",
+            "destructive",
+            "--allow",
+            "revoke",
+        ],
+    ));
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
+/// A function a generated column calls, dropped for good in the revision that
+/// changes the column's expression to stop calling it: the expression change
+/// releases the dependency, so it runs before `DROP FUNCTION` and the plan
+/// applies. The same drop without the expression change is still refused by
+/// name, since nothing else can take the expression off (DEC-1168.1).
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn an_expression_change_releases_a_generated_column_from_a_dropped_function() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "generated-release");
+    let connection = own.connection().to_owned();
+    on_server(
+        &connection,
+        "CREATE SCHEMA app; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x * 2 $$; \
+         CREATE TABLE app.t (id integer PRIMARY KEY, a integer, \
+                             g integer NOT NULL GENERATED ALWAYS AS (app.f(a)) STORED); \
+         INSERT INTO app.t (id, a) VALUES (1, 5)",
+    );
+    let d = Demo::new("generated-release");
+    succeeds(d.run(&["pull", "--db", &connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    std::fs::remove_file(d.dir.join("schema/app.f%28integer%29.function.yml")).unwrap();
+
+    // The drop alone: refused, naming the generated column.
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("a generated column") && stderr(&o).contains("releases it"),
+        "{}",
+        stderr(&o)
+    );
+
+    // With the expression changed off the function, to one that yields a
+    // NULL, and the column made nullable: the relaxation goes ahead of the
+    // drop with the expression change, or `SET EXPRESSION` is refused under
+    // the old NOT NULL.
+    let path = d.dir.join("schema/app.t.yml");
+    let table = std::fs::read_to_string(&path).unwrap();
+    let mut in_g = false;
+    let released: String = table
+        .lines()
+        .filter_map(|l| {
+            if l.starts_with("  ") && !l.starts_with("   ") {
+                in_g = l == "  g:";
+            }
+            if in_g && l.trim() == "nullable: false" {
+                None
+            } else if l.trim_start().starts_with("generated:") {
+                Some("    generated: {expression: 'nullif(a, 5) * 3', stored: true}".to_owned())
+            } else {
+                Some(l.to_owned())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert_ne!(
+        released, table,
+        "the fixture's `g` is where this test expects it"
+    );
+    std::fs::write(&path, released).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        &connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    assert!(at("SET EXPRESSION") < at("DROP FUNCTION"), "{script}");
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &[
+            "--allow",
+            "narrowing",
+            "--allow",
+            "destructive",
+            "--allow",
+            "revoke",
+        ],
+    ));
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT count(*)::int8 FROM app.t WHERE id = 1 AND g IS NULL"
+        ),
+        1
+    );
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
 }
 
 #[test]
