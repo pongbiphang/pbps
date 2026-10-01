@@ -5,6 +5,18 @@ use crate::{PlannedChange, TableName};
 
 fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, ResolverEvidence) {
     let (_, mut evidence) = super::transition_tests::rename_endpoints(column);
+    let fixture_parent = column.then(|| {
+        evidence
+            .transitions
+            .iter()
+            .find(|t| matches!(t.surface, Surface::Table(_)))
+            .unwrap()
+            .before
+            .iter()
+            .next()
+            .unwrap()
+            .clone()
+    });
     let template = evidence
         .before
         .prerequisites()
@@ -133,6 +145,20 @@ fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, Re
         }];
         opening.push(before);
         closing.push(after);
+    } else if column {
+        // The helper's app.v parent is not this chain's app.t parent. Column
+        // renames preserve app.t and need its independent exact inventory.
+        let mut parent = template.clone();
+        parent.object = object("retained-table");
+        parent.ownership = ObjectOwnership::Surface(Surface::Table(table.clone()));
+        parent.bindings.clear();
+        evidence.transitions.push(ObjectTransition {
+            surface: Surface::Table(table),
+            before: BTreeSet::from([parent.object.clone()]),
+            after: BTreeSet::from([parent.object.clone()]),
+        });
+        opening.push(parent.clone());
+        closing.push(parent);
     }
     for (manifest, removed, added) in [
         (&mut evidence.before, old_object, opening),
@@ -141,7 +167,7 @@ fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, Re
         let mut records: Vec<_> = manifest
             .prerequisites()
             .iter()
-            .filter(|p| p.object != removed)
+            .filter(|p| p.object != removed && fixture_parent.as_ref() != Some(&p.object))
             .cloned()
             .collect();
         records.extend(added);

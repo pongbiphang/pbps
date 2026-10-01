@@ -572,3 +572,374 @@ fn generated_attrdef_ownership_refuses_missing_or_invalid_recorded_roots() {
         .insert("relkind".into(), json!("v"));
     assert!(classify_attrdefs(&wrong_root, &schema, &ids).is_err());
 }
+
+mod column_vector_parent {
+    use super::*;
+    use pbps_model::resolver::ObjectTransition;
+    use pbps_model::{Column, Generated, Uid};
+
+    fn uid(value: &str) -> Uid {
+        value.parse().unwrap()
+    }
+
+    fn column(table: &TableName, name: &str) -> ObjectIdentity {
+        identity("column", &[name], vec![relation_identity(table)])
+    }
+
+    fn ordered_capture(major: u32, table: &TableName, names: &[&str]) -> CapturedInputs {
+        let relation = relation_identity(table);
+        let columns: Vec<_> = names.iter().map(|name| column(table, name)).collect();
+        let mut inputs = BTreeMap::from([(
+            relation.clone(),
+            input(BTreeMap::from([
+                ("relkind".into(), json!("r")),
+                ("column_order".into(), json!(&columns)),
+            ])),
+        )]);
+        let mut numbers = BTreeMap::new();
+        for (position, object) in columns.into_iter().enumerate() {
+            // Dropped physical slots are not logical vector members.
+            numbers.insert(object.clone(), (position as i32) * 2 + 1);
+            inputs.insert(object.clone(), input(BTreeMap::from([
+                ("attrelid".into(), json!(&relation)),
+                ("attname".into(), json!(&object.name[0])),
+                ("attisdropped".into(), json!(false)),
+                ("attnotnull".into(), json!(false)),
+                ("attacl".into(), Value::Null),
+            ])));
+        }
+        let mut result = capture(major, inputs);
+        result.attribute_numbers = numbers;
+        result
+    }
+
+    fn add(table: &TableName, name: &str, recorded: &str, kind: &str) -> Change {
+        let mut definition = Column::new("integer".parse().unwrap());
+        if kind == "default" {
+            definition.default = Some("7".into());
+        } else if kind == "generated" {
+            definition.generated = Some(Generated {
+                expression: "a + 4".into(),
+                stored: true,
+            });
+        }
+        Change::AddColumn {
+            uid: uid(recorded), table: table.clone(), name: name.into(),
+            column: Box::new(definition),
+        }
+    }
+
+    fn rename(table: &TableName, from: &str, to: &str, recorded: &str) -> Change {
+        Change::RenameColumn {
+            uid: uid(recorded), table: table.clone(), from: from.into(), to: to.into(),
+            table_was: None,
+        }
+    }
+
+    struct Fixture {
+        table: TableName,
+        opening: CapturedInputs,
+        compiled: CapturedInputs,
+        changes: ChangeSet,
+        base_ids: IdsFile,
+        desired_ids: IdsFile,
+    }
+
+    impl Fixture {
+        fn new(major: u32, changes: Vec<Change>, scratch: &[(&str, &str)]) -> Self {
+            let table = TableName::new("app", "t");
+            let mut base_ids = IdsFile::default();
+            base_ids.tables.insert(uid("t_000000"), table.clone());
+            for (name, recorded) in [("a", "c_000000"), ("g", "c_000001"), ("d", "c_000002")] {
+                base_ids.columns.insert(uid(recorded), table.column(name));
+            }
+            let mut desired_ids = IdsFile::default();
+            desired_ids.tables = base_ids.tables.clone();
+            for (name, recorded) in scratch {
+                desired_ids.columns.insert(uid(recorded), table.column(name));
+            }
+            Self {
+                opening: ordered_capture(major, &table, &["a", "g", "d"]),
+                compiled: ordered_capture(major, &table, &scratch.iter().map(|(name, _)| *name).collect::<Vec<_>>()),
+                table,
+                changes: ChangeSet { changes: changes.into_iter().map(PlannedChange::new).collect() },
+                base_ids,
+                desired_ids,
+            }
+        }
+
+        fn addition(major: u32, kind: &str) -> Self {
+            let table = TableName::new("app", "t");
+            Self::new(major, vec![add(&table, "h", "c_000003", kind)], &[
+                ("a", "c_000000"), ("d", "c_000002"), ("g", "c_000001"), ("h", "c_000003"),
+            ])
+        }
+
+        fn project(&self) -> Result<Option<ParentColumnOrder>, ManifestError> {
+            projected_column_order(
+                &self.opening, &self.compiled, &self.changes,
+                &self.base_ids, &self.desired_ids, &self.table,
+            )
+        }
+
+        fn assert_order(&self, names: &[&str]) {
+            let projected = self.project().unwrap().unwrap();
+            assert_eq!(projected.source, relation_identity(&TableName::new("app", "t")));
+            assert_eq!(projected.columns, names.iter().map(|name| column(&self.table, name)).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn parent_column_order_follows_opening_positions_and_ordered_typed_changes() {
+        let table = TableName::new("app", "t");
+        for major in [16, 18] {
+            for kind in ["plain", "default", "generated"] {
+                Fixture::addition(major, kind).assert_order(&["a", "g", "d", "h"]);
+            }
+            Fixture::new(major, vec![
+                add(&table, "h", "c_000003", "generated"),
+                add(&table, "z", "c_000004", "plain"),
+                rename(&table, "h", "renamed_h", "c_000003"),
+                Change::DropColumn { uid: uid("c_000003"), column: table.column("renamed_h") },
+            ], &[("a", "c_000000"), ("d", "c_000002"), ("g", "c_000001"), ("z", "c_000004")])
+                .assert_order(&["a", "g", "d", "z"]);
+            Fixture::new(major, vec![Change::DropColumn {
+                uid: uid("c_000001"), column: table.column("g"),
+            }], &[("a", "c_000000"), ("d", "c_000002")]).assert_order(&["a", "d"]);
+            Fixture::new(major, vec![rename(&table, "g", "m", "c_000001")], &[
+                ("a", "c_000000"), ("d", "c_000002"), ("m", "c_000001"),
+            ]).assert_order(&["a", "m", "d"]);
+        }
+    }
+
+    #[test]
+    fn parent_column_order_refuses_incomplete_or_malformed_catalog_vectors() {
+        for fault in [
+            "missing-parent", "missing-vector", "malformed", "wrong-relkind", "duplicate", "wrong-class",
+            "empty-name", "wrong-parent", "missing-column", "missing-live-member",
+            "missing-attnums", "duplicate-attnum", "wrong-attnum-order", "compiled-missing",
+            "compiled-extra", "missing-base-uid", "duplicate-base-uid", "missing-desired-uid",
+            "wrong-desired-name", "duplicate-desired-name", "duplicate-table-uid",
+        ] {
+            let mut fixture = Fixture::addition(16, "plain");
+            let relation = relation_identity(&fixture.table);
+            let a = column(&fixture.table, "a");
+            let g = column(&fixture.table, "g");
+            let d = column(&fixture.table, "d");
+            match fault {
+                "missing-parent" => { fixture.opening.inputs.remove(&relation); }
+                "missing-vector" => { fixture.opening.inputs.get_mut(&relation).unwrap().properties.remove("column_order"); }
+                "malformed" => { fixture.opening.inputs.get_mut(&relation).unwrap().properties.insert("column_order".into(), Value::Null); }
+                "wrong-relkind" => { fixture.opening.inputs.get_mut(&relation).unwrap().properties.insert("relkind".into(), json!("v")); }
+                "duplicate" => { fixture.opening.inputs.get_mut(&relation).unwrap().properties.insert("column_order".into(), json!([&a, &g, &d, &g])); }
+                "wrong-class" | "empty-name" | "wrong-parent" => {
+                    let mut wrong = g.clone();
+                    if fault == "wrong-class" { wrong.class = "pg_attribute".into(); }
+                    if fault == "empty-name" { wrong.name.clear(); }
+                    if fault == "wrong-parent" { wrong.signature = vec![relation_identity(&TableName::new("app", "other"))]; }
+                    fixture.opening.inputs.get_mut(&relation).unwrap().properties.insert("column_order".into(), json!([&a, wrong, &d]));
+                }
+                "missing-column" => { fixture.opening.inputs.remove(&g); }
+                "missing-live-member" => { fixture.opening.inputs.get_mut(&relation).unwrap().properties.insert("column_order".into(), json!([&a, &d])); }
+                "missing-attnums" => { fixture.opening.attribute_numbers.clear(); }
+                "duplicate-attnum" => { fixture.opening.attribute_numbers.insert(g.clone(), 1); }
+                "wrong-attnum-order" => { fixture.opening.attribute_numbers.insert(g.clone(), 5); fixture.opening.attribute_numbers.insert(d, 3); }
+                "compiled-missing" => { fixture.compiled = ordered_capture(16, &fixture.table, &["a", "d", "g"]); }
+                "compiled-extra" => { fixture.compiled = ordered_capture(16, &fixture.table, &["a", "d", "g", "h", "unplanned"]); }
+                "missing-base-uid" => { fixture.base_ids.columns.remove(&uid("c_000001")); }
+                "duplicate-base-uid" => { fixture.base_ids.columns.insert(uid("c_000005"), fixture.table.column("g")); }
+                "missing-desired-uid" => { fixture.desired_ids.columns.remove(&uid("c_000003")); }
+                "wrong-desired-name" => { fixture.desired_ids.columns.insert(uid("c_000003"), fixture.table.column("wrong")); }
+                "duplicate-desired-name" => { fixture.desired_ids.columns.insert(uid("c_000005"), fixture.table.column("h")); }
+                "duplicate-table-uid" => { fixture.desired_ids.tables.insert(uid("t_000001"), fixture.table.clone()); }
+                _ => unreachable!("unlisted fixture fault"),
+            }
+            let expected = match fault {
+                "missing-parent" | "missing-vector" | "missing-live-member" | "missing-attnums"
+                    | "compiled-missing" | "compiled-extra" => ManifestError::Incomplete,
+                _ => ManifestError::Invalid,
+            };
+            assert!(matches!(fixture.project(), Err(error) if error == expected), "{fault}");
+        }
+    }
+
+    #[test]
+    fn parent_column_order_tracks_recorded_uids_across_renames_and_name_reuse() {
+        let before = TableName::new("app", "t");
+        let after = TableName::new("app", "renamed");
+        let mut moved = Fixture::new(16, vec![
+            Change::RenameTable { uid: uid("t_000000"), from: before.clone(), to: after.clone(), defaults: vec![] },
+            rename(&after, "g", "m", "c_000001"),
+            add(&after, "h", "c_000003", "plain"),
+        ], &[("a", "c_000000"), ("d", "c_000002"), ("m", "c_000001"), ("h", "c_000003")]);
+        moved.table = after.clone();
+        moved.compiled = ordered_capture(16, &after, &["a", "d", "m", "h"]);
+        moved.desired_ids.tables.insert(uid("t_000000"), after.clone());
+        for endpoint in moved.desired_ids.columns.values_mut() { endpoint.table = after.clone(); }
+        moved.assert_order(&["a", "m", "d", "h"]);
+
+        let reused = Fixture::new(16, vec![
+            Change::DropColumn { uid: uid("c_000001"), column: before.column("g") },
+            add(&before, "g", "c_000003", "plain"),
+        ], &[("a", "c_000000"), ("g", "c_000003"), ("d", "c_000002")]);
+        reused.assert_order(&["a", "d", "g"]);
+        for fault in ["historical-uid", "wrong-drop-uid", "wrong-rename-uid", "occupied-name", "empty-name", "unrecorded-table"] {
+            let mut fixture = Fixture::addition(16, "plain");
+            fixture.changes.changes = match fault {
+                "historical-uid" => vec![
+                    PlannedChange::new(Change::DropColumn { uid: uid("c_000001"), column: before.column("g") }),
+                    PlannedChange::new(add(&before, "g", "c_000001", "plain")),
+                ],
+                "wrong-drop-uid" => vec![PlannedChange::new(Change::DropColumn { uid: uid("c_000000"), column: before.column("g") })],
+                "wrong-rename-uid" => vec![PlannedChange::new(rename(&before, "g", "m", "c_000000"))],
+                "occupied-name" => vec![PlannedChange::new(rename(&before, "g", "d", "c_000001"))],
+                "empty-name" => vec![PlannedChange::new(add(&before, "", "c_000003", "plain"))],
+                "unrecorded-table" => vec![
+                    PlannedChange::new(Change::RenameTable { uid: uid("t_000001"), from: before.clone(), to: after.clone(), defaults: vec![] }),
+                    PlannedChange::new(add(&before, "h", "c_000003", "plain")),
+                ],
+                _ => unreachable!("unlisted UID fault"),
+            };
+            if fault == "unrecorded-table" {
+                fixture.table = after.clone();
+                fixture.desired_ids.tables.insert(uid("t_000000"), after.clone());
+            }
+            assert!(matches!(fixture.project(), Err(ManifestError::Invalid)), "{fault}");
+        }
+    }
+
+    #[test]
+    fn preseal_vector_changes_preserve_complete_opening_parent_metadata_and_bindings() {
+        for major in [16, 18] {
+            let mut fixture = Fixture::addition(major, "plain");
+            let table = fixture.table.clone();
+            let relation = relation_identity(&table);
+            let row_type = identity("pg_type", &["app", "t"], vec![]);
+            let deployer = identity("pg_authid", &["deployer"], vec![]);
+            let reader = identity("pg_authid", &["reader"], vec![]);
+            let context = AuthorizationContext {
+                principal: DeploymentPrincipal { login: "deployer".into(), effective: "deployer".into(), superuser: false },
+                schemas: BTreeMap::new(), roles: BTreeMap::new(), settings: BTreeMap::new(),
+            };
+            let roles = RoleMap::generate(&context, &[], "deployer", "vectorparent");
+            let run_owner = identity("pg_authid", &[&roles.deployer(&context).unwrap()], vec![]);
+            let acl = json!([{"grantor": deployer, "grantee": reader, "privilege": "SELECT", "grant_option": false}]);
+            let before = fixture.opening.inputs.get_mut(&relation).unwrap();
+            before.properties.extend(BTreeMap::from([
+                ("relname".into(), json!("t")), ("relowner".into(), json!(&deployer)),
+                ("relacl".into(), acl), ("reloptions".into(), json!(["fillfactor=70"])),
+                ("relreplident".into(), json!("d")), ("relchecks".into(), json!(2)),
+                ("reltype".into(), json!(&row_type)),
+            ]));
+            before.bindings.push(Binding { node: "relation".into(), path: vec!["reltype".into()], target: row_type.clone() });
+            let after = fixture.compiled.inputs.get_mut(&relation).unwrap();
+            after.properties.extend(BTreeMap::from([
+                ("relname".into(), json!("t")), ("relowner".into(), json!(&run_owner)),
+                ("relacl".into(), Value::Null), ("reloptions".into(), json!(["fillfactor=90"])),
+                ("relreplident".into(), json!("f")), ("relchecks".into(), json!(0)),
+                ("reltype".into(), json!(&row_type)),
+            ]));
+            // A row type belongs to the table, while a default and an unrelated
+            // prerequisite remain independently retained by model projection.
+            let metadata = Input {
+                properties: BTreeMap::from([
+                    ("typowner".into(), json!(&deployer)), ("typrelid".into(), json!(&relation)),
+                    ("typalign".into(), json!("i")), ("typacl".into(), Value::Null),
+                ]),
+                bindings: vec![
+                    Binding { node: "row_type".into(), path: vec!["typrelid".into()], target: relation.clone() },
+                    Binding { node: "row_type".into(), path: vec!["typowner".into()], target: deployer.clone() },
+                ],
+            };
+            fixture.opening.inputs.insert(row_type.clone(), metadata.clone());
+            let mut scratch_metadata = metadata;
+            scratch_metadata.properties.insert("typowner".into(), json!(&run_owner));
+            scratch_metadata.properties.insert("typalign".into(), json!("d"));
+            scratch_metadata.bindings.clear();
+            fixture.compiled.inputs.insert(row_type.clone(), scratch_metadata);
+            let attrdef = identity("pg_attrdef", &[], vec![column(&table, "g")]);
+            let unrelated = identity("pg_proc", &["app", "helper"], vec![]);
+            for object in [&attrdef, &unrelated] {
+                let original = Input {
+                    properties: BTreeMap::from([("engine_definition".into(), json!("a + 1"))]),
+                    bindings: vec![Binding { node: "expression".into(), path: vec!["input".into()], target: column(&table, "a") }],
+                };
+                fixture.opening.inputs.insert(object.clone(), original);
+                fixture.compiled.inputs.insert(object.clone(), Input {
+                    properties: BTreeMap::from([("engine_definition".into(), json!("d + 1"))]),
+                    bindings: vec![Binding { node: "expression".into(), path: vec!["input".into()], target: column(&table, "d") }],
+                });
+            }
+            let owner_edge = identity("pg_shdepend", &["o"], vec![relation.clone(), deployer.clone()]);
+            let acl_edge = identity("pg_shdepend", &["a"], vec![relation.clone(), reader]);
+            for edge in [&owner_edge, &acl_edge] { fixture.opening.inputs.insert(edge.clone(), input(BTreeMap::new())); }
+            for kind in ["o", "a"] {
+                fixture.compiled.inputs.insert(identity("pg_shdepend", &[kind], vec![relation.clone(), run_owner.clone()]), input(BTreeMap::new()));
+            }
+            let parent_objects = BTreeSet::from([relation.clone(), row_type.clone(), owner_edge.clone(), acl_edge.clone()]);
+            let mut ownership = BTreeMap::new();
+            for object in fixture.opening.inputs.keys().chain(fixture.compiled.inputs.keys()) {
+                let owner = if object == &relation || object == &row_type || object.class == "pg_shdepend" {
+                    ObjectOwnership::Surface(Surface::Table(table.clone()))
+                } else if object.class == "column" {
+                    ObjectOwnership::Surface(Surface::Column(table.column(&object.name[0])))
+                } else if object == &attrdef {
+                    ObjectOwnership::Surface(Surface::Default(table.column("g")))
+                } else {
+                    ObjectOwnership::Unqualified
+                };
+                ownership.insert(object.clone(), owner);
+            }
+            let h = column(&table, "h");
+            let transitions = vec![
+                ObjectTransition { surface: Surface::Table(table.clone()), before: parent_objects.clone(), after: parent_objects.clone() },
+                ObjectTransition { surface: Surface::Column(table.column("h")), before: BTreeSet::new(), after: BTreeSet::from([h.clone()]) },
+            ];
+            let fingerprint_key = key();
+            let opening = fixture.opening.seal_with_roles(&fingerprint_key, None, Some(&ownership)).unwrap();
+            let mut expected_inputs = fixture.opening.inputs.clone();
+            expected_inputs.insert(h.clone(), fixture.compiled.inputs[&h].clone());
+            expected_inputs.get_mut(&relation).unwrap().properties.insert("column_order".into(), json!([
+                column(&table, "a"), column(&table, "g"), column(&table, "d"), &h,
+            ]));
+            let expected = capture(major, expected_inputs).seal_with_roles(&fingerprint_key, None, Some(&ownership)).unwrap();
+            let compiled_inputs = fixture.compiled.inputs.clone();
+            let compiled_numbers = fixture.compiled.attribute_numbers.clone();
+            let qualified_ownership = ownership.clone();
+
+            // The actual private sealer must restore every parent property and
+            // binding; the public projection independently retains nonowners.
+            let sealed = CompiledCapture::new(fixture.compiled, &fingerprint_key, &roles, ownership).seal_for_plan_inner(
+                &fixture.opening, &fixture.changes, &transitions, &fixture.base_ids, &fixture.desired_ids, &context,
+            ).unwrap();
+            for object in &parent_objects {
+                assert_eq!(
+                    sealed.prerequisites().iter().find(|record| &record.object == object),
+                    expected.prerequisites().iter().find(|record| &record.object == object),
+                    "major {major}, parent record {object:?}",
+                );
+            }
+            let projected = opening.project(&fixture.changes, &sealed, &transitions).unwrap();
+            assert_eq!(projected.prerequisites(), expected.prerequisites(), "major {major}, complete properties, bindings and identities");
+            assert_eq!(projected.membership(), expected.membership());
+            for fault in ["wrong-owner", "missing-opening", "missing-closing"] {
+                let mut compiled = capture(major, compiled_inputs.clone());
+                compiled.attribute_numbers = compiled_numbers.clone();
+                let mut owners = qualified_ownership.clone();
+                let mut incomplete = transitions.clone();
+                match fault {
+                    "wrong-owner" => { owners.insert(relation.clone(), ObjectOwnership::Surface(Surface::Column(table.column("g")))); }
+                    "missing-opening" => { incomplete[0].before.remove(&relation); }
+                    "missing-closing" => { incomplete[0].after.remove(&relation); }
+                    _ => unreachable!("unlisted parent inventory fault"),
+                }
+                assert!(matches!(
+                    CompiledCapture::new(compiled, &fingerprint_key, &roles, owners).seal_for_plan_inner(
+                        &fixture.opening, &fixture.changes, &incomplete, &fixture.base_ids, &fixture.desired_ids, &context,
+                    ),
+                    Err(ManifestError::Incomplete)
+                ), "major {major}, {fault}");
+            }
+        }
+    }
+}

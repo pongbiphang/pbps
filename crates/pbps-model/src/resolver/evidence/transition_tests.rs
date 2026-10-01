@@ -518,9 +518,10 @@ fn owner_coverage(
         .unwrap();
     evidence.validate(&changes).unwrap();
     assert_eq!(evidence.after, compiled);
-    // A parent vector transition cannot substitute for the column owner.
+    // A table label alone does not prove its independent parent inventory.
     if matches!(evidence.transitions[0].surface, Surface::Column(_)) {
         let mut aggregate = evidence.clone();
+        aggregate.transitions.truncate(1);
         aggregate.transitions[0].surface = Surface::Table(table);
         assert!(aggregate.validate(&changes).is_err());
     }
@@ -761,6 +762,7 @@ pub(super) fn rename_endpoints(column: bool) -> (ChangeSet, ResolverEvidence) {
     split.validate(&changes).unwrap();
     if column {
         let mut aggregate = evidence.clone();
+        aggregate.transitions.truncate(1);
         aggregate.transitions[0].surface = Surface::Table(table);
         assert!(aggregate.validate(&changes).is_err());
     }
