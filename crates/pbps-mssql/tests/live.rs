@@ -16362,3 +16362,56 @@ async fn the_ledger_created_inside_a_callers_transaction_follows_that_transactio
     );
     db.drop().await;
 }
+
+/// The engine claim behind #1363, pinned for the ordering audit (#1351):
+/// tightening a column to NOT NULL is refused (5074) while an index covers it
+/// as a key, an `INCLUDE` column or in a filter's predicate, or a UNIQUE
+/// constraint does. A CHECK naming it, the child side of a foreign key and a
+/// DEFAULT do not block it, and relaxing is accepted under each.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn tightening_nullability_is_refused_by_what_indexes_the_column() {
+    let mut db = TestDb::create("tighten_nullability1351").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.p (k int NOT NULL CONSTRAINT pk_p PRIMARY KEY); \
+             INSERT dbo.p VALUES (5); \
+             CREATE TABLE dbo.t (id int NOT NULL CONSTRAINT pk_t PRIMARY KEY, \
+               k_ix int NULL, k_inc int NULL, k_filt int NULL, \
+               k_uq int NULL CONSTRAINT uq_t UNIQUE, \
+               k_ck int NULL CONSTRAINT ck_t CHECK (k_ck > 0), \
+               k_fk int NULL CONSTRAINT fk_t REFERENCES dbo.p (k), \
+               k_df int NULL CONSTRAINT df_t DEFAULT 1, \
+               n_ix int NOT NULL); \
+             CREATE INDEX ix_k ON dbo.t (k_ix); \
+             CREATE INDEX ix_inc ON dbo.t (id) INCLUDE (k_inc); \
+             CREATE INDEX ix_filt ON dbo.t (id) WHERE k_filt > 0; \
+             CREATE INDEX ix_n ON dbo.t (n_ix); \
+             INSERT dbo.t VALUES (1, 5, 5, 5, 5, 5, 5, 5, 5);",
+        )
+        .await
+        .expect("the fixture");
+    for column in ["k_ix", "k_inc", "k_filt", "k_uq"] {
+        let e = db
+            .conn
+            .execute(&format!(
+                "ALTER TABLE dbo.t ALTER COLUMN {column} int NOT NULL;"
+            ))
+            .await
+            .expect_err(column);
+        assert!(e.to_string().contains("5074"), "{column}: {e}");
+    }
+    for column in ["k_ck", "k_fk", "k_df"] {
+        db.conn
+            .execute(&format!(
+                "ALTER TABLE dbo.t ALTER COLUMN {column} int NOT NULL;"
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("{column}: {e}"));
+    }
+    db.conn
+        .execute("ALTER TABLE dbo.t ALTER COLUMN n_ix int NULL;")
+        .await
+        .expect("relaxing under an index");
+    db.drop().await;
+}

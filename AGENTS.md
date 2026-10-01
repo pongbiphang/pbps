@@ -20,6 +20,9 @@ checksum-pinned, and state lives in the database itself.
 - **[docs/PITFALLS.md](docs/PITFALLS.md)** — bugs shipped or nearly shipped, and
   the shapes they belong to.
 - **[docs/STATUS.md](docs/STATUS.md)** — phase, command surface, open items.
+- **[docs/ORDERING.md](docs/ORDERING.md)** — how a plan's order is decided,
+  and every pair of change kinds by how their order is decided. Read before
+  adding a kind of change, a sort class or a reordering pass.
 - `docs/ADR-*.md` — standalone decision records.
 
 ## Working with me
