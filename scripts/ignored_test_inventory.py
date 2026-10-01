@@ -1018,6 +1018,11 @@ def check_witness(root, witness):
                 f"missing command literal in {witness['file']}::{witness['scope']}: {fragment}")
 
 
+# Plain scalars YAML 1.1 or 1.2 may resolve to a boolean or null rather than a
+# string; GitHub's parser is not pinned to either, so both sets are refused.
+YAML_NON_STRINGS = {"true", "false", "yes", "no", "on", "off", "y", "n", "null"}
+
+
 def workflow_runs(source, job, platform=None):
     """Read the repository's run scalar/block subset; ambiguous owners fail."""
     match = re.search(r"^  " + re.escape(job) + r":\s*$", source, re.M)
@@ -1043,10 +1048,12 @@ def workflow_runs(source, job, platform=None):
             axis = re.fullmatch(r"        ([\w-]+): \[([^\]]*)\]\s*", line)
             require(axis is not None, f"unsupported matrix line needs an explicit audit: {job}: {line.strip()}")
             require(axis[2].strip(), f"owner matrix has no known executed variant: {job}")
-            # Only plain tokens: a quoted value may hold a comma, and splitting
-            # one would invent variants that never run.
+            # Only tokens YAML can read as nothing but a string. A quoted value
+            # may hold a comma, and splitting it would invent variants; a
+            # boolean, null or number keeps its type in the matrix, and
+            # `matrix.x == 'true'` then compares it as a number and never holds.
             values = [x.strip() for x in axis[2].split(",")]
-            require(all(re.fullmatch(r"[\w.-]+", v) for v in values),
+            require(all(re.fullmatch(r"[A-Za-z][\w-]*", v) and v.lower() not in YAML_NON_STRINGS for v in values),
                     f"unsupported matrix value needs an explicit audit: {job}: {line.strip()}")
             axes[axis[1]] = set(values)
         require(axes, f"owner matrix has no known executed variant: {job}")

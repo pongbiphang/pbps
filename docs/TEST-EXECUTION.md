@@ -33,8 +33,12 @@ names. Unsupported Cargo options, multiple TESTNAME arguments and ambiguous
 target selectors are refused rather than silently discarded. A step's `if:`
 counts as executing only when it is a literal truth value or a conjunction of
 `matrix.<axis> == '<value>'` that asks one value of each axis it names, and
-that value is on the axis. Axis values must be plain tokens; a quoted value,
-which could hold a comma, is refused. Without
+that value is on the axis. Axis values must be tokens YAML reads only as
+strings: a letter first, no dot, and not a boolean or null word. A quoted
+value could hold a comma. A boolean, null or number keeps its type, so the
+string comparison never holds. Both are refused. GitHub compares strings
+without regard to case; the audit compares them exactly, which can only make
+it refuse more. Without
 `include`/`exclude`, which are refused, every combination of the axes runs. A
 suite split across matrix variants is therefore owned only while the
 variants' filters together select each case (DEC-1370.1). Dedicated
