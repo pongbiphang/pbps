@@ -49,6 +49,8 @@ The differ sorts every planned change by, in order:
      tightened after it (DEC-1168.1);
    - modules are ranked by `creation_order_with` (DECISIONS 311, 315);
    - reference rows by the foreign keys between their tables;
+   - role drops by membership, holder before member (`member_depth`,
+     DECISIONS 127);
    - a foreign key comes after the key it references;
    - a clustered index comes before the other indexes of its table
      (DEC-1178.1).
@@ -58,6 +60,10 @@ Then, in this order:
 
 - **`rename_order::order`** (`crates/pbps-diff/src/rename_order.rs`) puts a
   rename chain or swap in an order the engine accepts (DEC-536.1).
+- **On a connected plan, `order_role_drops`** (called from `deploy.rs`, once
+  `plan --db` has read the dropped roles' members) ranks the role drops by
+  membership again. The differ saw no members when it sorted (DECISIONS 127,
+  139).
 - **On a connected PostgreSQL plan** (`module_dependents` in
   `crates/pbps-cli/src/engine.rs`):
   - `weave` puts each catalog dependent of a dropped or rebuilt module on the
@@ -154,6 +160,7 @@ other's requirement in the table above. Columns:
 | Constraint or index drop → add of the same name | fixed | class 2 before 13 | ✓ DECISIONS 168 (namespaces) |
 | `DropModule` → `CreateModule` of its id | fixed | class 0 before 14 | ✓ |
 | `DropRole` or `RenameRole` away → `CreateRole` of its name | fixed | class 0 or 1 before 15 | ✓ |
+| `DropRole` of a holder → `DropRole` of its member | fixed | `member_depth`, then `order_role_drops` once the members are read | ✓ DECISIONS 127, 139 |
 | Trigger and grants keyed by a table name that passes to another table | fixed | rebuilt as the occupant's | ✓ DEC-1118.1 |
 
 ### Something created before what needs it
