@@ -5721,7 +5721,9 @@ async fn generation_producer_case(case: GenerationCase) {
                 "{side} {flag}"
             );
         }
-        eprintln!("generation_principal side={side} effective={effective} login={login} ordinary=true");
+        eprintln!(
+            "generation_principal side={side} effective={effective} login={login} ordinary=true"
+        );
     }
     let before: Value = serde_json::from_str(&before_catalog).unwrap();
     let after: Value = serde_json::from_str(
@@ -5767,14 +5769,18 @@ async fn generation_producer_case(case: GenerationCase) {
     );
     let changed = &restored.changes.changes[0].change;
     if set_expression {
-        assert!(matches!(changed, Change::AlterColumnExpression { uid, column, from, to }
+        assert!(
+            matches!(changed, Change::AlterColumnExpression { uid, column, from, to }
             if Some(uid) == inputs.base_ids.column_uid(&table.column("g"))
-                && column == &table.column("g") && from == "a * 2 + 1" && to == "a * 3"));
+                && column == &table.column("g") && from == "a * 2 + 1" && to == "a * 3")
+        );
     } else {
-        assert!(matches!(changed, Change::AddColumn { uid, table: selected, name, column }
+        assert!(
+            matches!(changed, Change::AddColumn { uid, table: selected, name, column }
             if Some(uid) == restored.ids.column_uid(&table.column("h"))
                 && selected == &table && name == "h"
-                && column.as_ref() == &inputs.desired.tables[&table].columns["h"]));
+                && column.as_ref() == &inputs.desired.tables[&table].columns["h"])
+        );
     }
     let required = if set_expression {
         vec!["g", "d"]
@@ -5811,8 +5817,15 @@ async fn generation_producer_case(case: GenerationCase) {
                 if opening && name == "h" {
                     assert!(records.is_empty());
                 } else {
-                    assert_eq!(records.len(), 1, "exact child inventory for {name}: {object:?}");
-                    assert_eq!(records[0].ownership, ObjectOwnership::Surface(surface.clone()));
+                    assert_eq!(
+                        records.len(),
+                        1,
+                        "exact child inventory for {name}: {object:?}"
+                    );
+                    assert_eq!(
+                        records[0].ownership,
+                        ObjectOwnership::Surface(surface.clone())
+                    );
                 }
             }
             let columns: Vec<_> = manifest
@@ -5843,11 +5856,13 @@ async fn generation_producer_case(case: GenerationCase) {
             .unwrap();
         assert_eq!(
             record.properties, actual.properties,
-            "closing properties: {:?}", record.object
+            "closing properties: {:?}",
+            record.object
         );
         assert_eq!(
             record.bindings, actual.bindings,
-            "closing bindings: {:?}", record.object
+            "closing bindings: {:?}",
+            record.object
         );
     }
     assert_eq!(before.as_array().unwrap().len(), 3);
