@@ -77,6 +77,7 @@ impl Graph {
         root: Address,
         at_root: usize,
         removals: &[(usize, Address)],
+        replaced: &BTreeSet<Address>,
     ) -> Vec<String> {
         let reachable = self.closure(root, false);
         let mut removed = BTreeMap::<Address, usize>::new();
@@ -104,7 +105,11 @@ impl Graph {
             {
                 blocking.insert(edge.dependent_name.clone());
             }
+            // A replaced object keeps its owner: `SET EXPRESSION` swaps a
+            // generated column's `pg_attrdef` row and leaves the column, which
+            // owns the row internally (DEC-1316.1).
             if edge.owner()
+                && !replaced.iter().any(|r| r.contains(edge.dependent))
                 && reachable.iter().any(|a| a.contains(edge.dependent))
                 && let Some(at) = position(edge.dependent)
                 && position(edge.referenced).is_none_or(|before| before > at)
@@ -253,6 +258,11 @@ pub async fn drop_blockers(
         }
     }
     let roots: BTreeSet<_> = removals.iter().map(|(_, a)| *a).collect();
+    let replaced: BTreeSet<Address> = removals
+        .iter()
+        .filter(|(i, _)| matches!(cs.changes[*i].change, Change::AlterColumnExpression { .. }))
+        .map(|(_, a)| *a)
+        .collect();
     let graph = read_graph(conn, &roots).await?;
     let mut reports = Vec::new();
     for (index, target) in targets {
@@ -263,7 +273,7 @@ pub async fn drop_blockers(
                     .copied()
                     .filter(|(i, _)| *i <= index)
                     .collect();
-                graph.blockers(*root, index, &prior)
+                graph.blockers(*root, index, &prior, &replaced)
             }
             // An explicit earlier creation has no current catalog dependency
             // graph. Missing existing targets are errors in removal(), below.
@@ -420,11 +430,15 @@ async fn removal(
             from: Some(_),
             ..
         } => table_part(conn, classes, cs, index, table, Part::PrimaryKey).await,
+        // `SET EXPRESSION` replaces the column's `pg_attrdef` row as a default
+        // change does, and its old edges go with the old row: an input the
+        // old expression read is no longer blocked by it (DEC-1316.1).
         Change::AlterColumnDefault {
             column,
             from: Some(_),
             ..
-        } => {
+        }
+        | Change::AlterColumnExpression { column, .. } => {
             let Some((table, name)) = stored(cs, index, &column.table, Some(&column.name)) else {
                 return Ok(None);
             };
@@ -456,7 +470,6 @@ async fn removal(
         | Change::AlterColumnType { .. }
         | Change::AlterColumnNullability { .. }
         | Change::AlterColumnDefault { .. }
-        | Change::AlterColumnExpression { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::SetPrimaryKey { .. }
         | Change::AddUnique { .. }
@@ -643,12 +656,12 @@ mod tests {
         unknown.dependent.class = 999;
         let graph = Graph(vec![edge(2, 1, "n"), edge(2, 1, "a"), unknown]);
         assert_eq!(
-            graph.blockers(address(1), 0, &[(0, address(1))]),
+            graph.blockers(address(1), 0, &[(0, address(1))], &BTreeSet::new()),
             ["object 3"]
         );
         assert!(
             Graph(vec![edge(2, 1, "n"), edge(2, 1, "a")])
-                .blockers(address(1), 0, &[(0, address(1))])
+                .blockers(address(1), 0, &[(0, address(1))], &BTreeSet::new())
                 .is_empty()
         );
     }
@@ -663,7 +676,7 @@ mod tests {
             edge(4, 5, "i"),
         ]);
         assert_eq!(
-            graph.blockers(address(1), 0, &[(0, address(1))]),
+            graph.blockers(address(1), 0, &[(0, address(1))], &BTreeSet::new()),
             ["object 2", "object 4"]
         );
         assert!(
@@ -671,7 +684,8 @@ mod tests {
                 .blockers(
                     address(1),
                     2,
-                    &[(0, address(5)), (1, address(3)), (2, address(1))]
+                    &[(0, address(5)), (1, address(3)), (2, address(1))],
+                    &BTreeSet::new()
                 )
                 .is_empty()
         );
@@ -679,7 +693,8 @@ mod tests {
             graph.blockers(
                 address(1),
                 2,
-                &[(0, address(3)), (1, address(5)), (2, address(1))]
+                &[(0, address(3)), (1, address(5)), (2, address(1))],
+                &BTreeSet::new()
             ),
             ["object 4"]
         );
@@ -689,8 +704,27 @@ mod tests {
     fn deleting_an_internal_member_does_not_authorize_deleting_its_owner() {
         let graph = Graph(vec![edge(1, 2, "e")]);
         assert_eq!(
-            graph.blockers(address(1), 0, &[(0, address(1))]),
+            graph.blockers(address(1), 0, &[(0, address(1))], &BTreeSet::new()),
             ["object 2 (internal owner of object 1)"]
+        );
+    }
+
+    /// A generated column's expression replaced by `SET EXPRESSION` keeps its
+    /// owner: the replaced `pg_attrdef` row (2), owned internally by its
+    /// column (3), no longer blocks the drop of the input it read (1). The same
+    /// row removed outright still names its owner (DEC-1316.1).
+    #[test]
+    fn a_replaced_internal_member_keeps_its_owner() {
+        let graph = Graph(vec![edge(2, 1, "n"), edge(2, 3, "i")]);
+        let removals = [(0, address(2)), (1, address(1))];
+        assert!(
+            graph
+                .blockers(address(1), 1, &removals, &BTreeSet::from([address(2)]))
+                .is_empty()
+        );
+        assert_eq!(
+            graph.blockers(address(1), 1, &removals, &BTreeSet::new()),
+            ["object 3 (internal owner of object 2)"]
         );
     }
 

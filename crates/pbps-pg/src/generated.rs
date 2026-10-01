@@ -75,3 +75,13 @@ pub async fn dependences(conn: &mut Conn, table: &TableName) -> Result<Vec<Depen
 fn literal(value: &str) -> String {
     format!("E'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
 }
+
+/// Whether an expression's text may read `column`: it holds an identifier
+/// naming it, outside literals and comments, by the engine's quoting and
+/// folding rules. An over-approximation. A function or a field of the same
+/// name counts too, so a "yes" means *may* and a "no" means it does not
+/// (DEC-1316.1).
+#[must_use]
+pub fn may_read(expression: &str, column: &str) -> bool {
+    crate::impact::mentions(expression, column)
+}

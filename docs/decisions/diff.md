@@ -1121,7 +1121,8 @@ Measured on 16.15, 17.11 and 18.6:
   one only with `CASCADE`. The same connected check reads that dependence
   from `pg_depend`, from the expression's `pg_attrdef` row, and refuses such
   a retype or drop before anything runs, unless the plan also drops the
-  generated column. It does not parse the expression.
+  generated column, or changes its expression to one that does not name the
+  column (DEC-1316.1). It does not parse the expression.
 - The engine also refuses a default beside a generation expression, a
   reference to another generated column, a non-immutable expression, and
   `NOT NULL` over null inputs at `ADD`. The first is refused at validation.
@@ -1256,3 +1257,44 @@ The rule is:
 Accent-insensitive collations are not folded offline, since the fold is case
 only. Where they make two names one, the connected check still asks the
 database.
+
+<a id="dec-1316-1"></a>
+
+**DEC-1316.1. An expression change that stops reading a column releases it in
+the same plan: the column's retype or drop runs after the change (#1316).**
+A plan that moves a generated column from reading `a` to reading `b`, and
+retypes or drops `a`, was refused (DEC-1168.1). That took two plans: the
+expression change first, then the retype or drop. It is one plan now.
+
+- **Which columns the old expression read** is the catalog's answer: the
+  `pg_depend` edges of the column's `pg_attrdef` row (`dependences`). It is
+  exact.
+- **Whether the new expression still reads one** is a question of text, which
+  the planner does not parse (DECISIONS 174). It is answered by
+  over-approximation, with the identifier scan rename impact already uses
+  (`may_read`, DECISIONS 477). A new expression that names the column, even in
+  a function or field of the same name, may still read it, and the retype or
+  drop stays refused. A false yes costs a second plan; a false no would cost
+  an apply that rolls back. Only the first is allowed.
+
+On a connected plan, `release_generated_inputs` moves the retype or drop of a
+released column to right after the expression change that releases it. It
+runs after the module passes, which may move that change past a function's
+create, and before the checks that read the order (`drop_blockers`,
+`generation_support`). Both checks then see the release first:
+- `generation_support` exempts a retype or drop that a release precedes;
+- `drop_blockers` counts `SET EXPRESSION` as replacing the `pg_attrdef` row, so
+  the old row's edges go with it. Its internal owner, the column, stays. A
+  replaced row does not ask for its owner to be dropped, which a removed one
+  would.
+
+A change between the drop and its release that takes the dropped column's
+name, an `AddColumn` or a `RenameColumn` into it, needs the name free, and the
+release needs the column still there. The plan is refused by name, with the
+two-plan remedy.
+
+Pinned by `a_released_input_is_retyped_or_dropped_after_its_release`
+(`crates/pbps-cli/src/engine.rs`), `a_replaced_internal_member_keeps_its_owner`
+(`crates/pbps-pg/src/drop_impact.rs`), and the live
+`an_expression_change_releases_its_old_input_in_the_same_plan`
+(`crates/pbps-cli/tests/flow_pg.rs`).

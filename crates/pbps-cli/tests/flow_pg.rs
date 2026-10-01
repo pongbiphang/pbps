@@ -6401,6 +6401,132 @@ fn an_expression_change_releases_a_generated_column_from_a_dropped_function() {
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
 }
 
+/// One revision changes a generated column's expression to stop reading `a`
+/// and drops or retypes `a`: the expression change runs first, releasing `a`,
+/// and the plan applies (DEC-1316.1). An expression that still names `a` is
+/// still refused by name, before anything runs.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn an_expression_change_releases_its_old_input_in_the_same_plan() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "generated-input-release");
+    let connection = own.connection().to_owned();
+    on_server(
+        &connection,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.t1 (id integer PRIMARY KEY, a integer, b integer, \
+                              g integer GENERATED ALWAYS AS (a * 2) STORED); \
+         CREATE TABLE app.t2 (id integer PRIMARY KEY, a integer, b integer, \
+                              g integer GENERATED ALWAYS AS (a * 2) STORED); \
+         CREATE TABLE app.t3 (id integer PRIMARY KEY, a integer, b integer, \
+                              g integer GENERATED ALWAYS AS (a * 2) STORED); \
+         INSERT INTO app.t1 (id, a, b) VALUES (1, 5, 7); \
+         INSERT INTO app.t2 (id, a, b) VALUES (1, 5, 7); \
+         INSERT INTO app.t3 (id, a, b) VALUES (1, 5, 7)",
+    );
+    let d = Demo::new("generated-input-release");
+    succeeds(d.run(&["pull", "--db", &connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    // Rewrites one table's declaration: `g`'s expression, and `a` dropped
+    // (`None`) or retyped.
+    let edit = |table: &str, expression: &str, a_type: Option<&str>| {
+        let path = d.dir.join(format!("schema/app.{table}.yml"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut in_a = false;
+        let edited: String = text
+            .lines()
+            .filter_map(|l| {
+                if !l.starts_with("   ") {
+                    in_a = l == "  a:";
+                }
+                if in_a {
+                    return match a_type {
+                        None => None,
+                        Some(ty) if l.trim_start().starts_with("type:") => {
+                            Some(format!("    type: {ty}"))
+                        }
+                        Some(_) => Some(l.to_owned()),
+                    };
+                }
+                if l.trim_start().starts_with("generated:") {
+                    Some(format!(
+                        "    generated: {{expression: '{expression}', stored: true}}"
+                    ))
+                } else {
+                    Some(l.to_owned())
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert_ne!(edited, text, "app.{table} is where this test expects it");
+        std::fs::write(&path, edited).unwrap();
+    };
+    edit("t1", "b * 2", None);
+    edit("t2", "b * 2", Some("bigint"));
+    succeeds(d.run(&["drop", "app.t1.a", "--reason", "computed from b now"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        &connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    assert!(
+        at("ALTER TABLE \"app\".\"t1\" ALTER COLUMN \"g\" SET EXPRESSION")
+            < at("ALTER TABLE \"app\".\"t1\" DROP COLUMN \"a\""),
+        "{script}"
+    );
+    assert!(
+        at("ALTER TABLE \"app\".\"t2\" ALTER COLUMN \"g\" SET EXPRESSION")
+            < at("ALTER TABLE \"app\".\"t2\" ALTER COLUMN \"a\" TYPE"),
+        "{script}"
+    );
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--allow", "narrowing", "--allow", "destructive"],
+    ));
+    assert_eq!(
+        scalar(&connection, "SELECT g::int8 FROM app.t1 WHERE id = 1"),
+        14
+    );
+    assert_eq!(
+        scalar(&connection, "SELECT g::int8 FROM app.t2 WHERE id = 1"),
+        14
+    );
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
+    // Negative: the new expression still names `a`, so it may still read it,
+    // and the retype is refused by name before anything runs.
+    edit("t3", "a + b", Some("bigint"));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("generation_support") && stderr(&o).contains("does not name `a`"),
+        "{}",
+        stderr(&o)
+    );
+}
+
 #[test]
 #[ignore = "needs PostgreSQL 16; set PBPS_TEST_PG_OLD_DB"]
 fn the_deployment_loop_reads_constraints_before_postgres_18() {
