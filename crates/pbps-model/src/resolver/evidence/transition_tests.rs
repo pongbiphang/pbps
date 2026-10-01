@@ -61,6 +61,9 @@ fn drop_fixture(change: Change, surface: Surface) -> (ChangeSet, ResolverEvidenc
             after: BTreeSet::from([parent.object]),
         });
     }
+    evidence
+        .transitions
+        .sort_by(|a, b| a.surface.cmp(&b.surface));
     // Compilation's external hash differs from the target. Projection must
     // preserve the target's untouched record, even on an otherwise empty drop.
     evidence.after = evidence
@@ -751,6 +754,14 @@ pub(super) fn rename_endpoints(column: bool) -> (ChangeSet, ResolverEvidence) {
             after: BTreeSet::from([parent]),
         });
     }
+    evidence
+        .transitions
+        .sort_by(|a, b| a.surface.cmp(&b.surface));
+    let rename_index = evidence
+        .transitions
+        .iter()
+        .position(|transition| transition.surface == from)
+        .unwrap();
     evidence.after = evidence
         .before
         .project(&changes, &compiled, &evidence.transitions)
@@ -761,7 +772,7 @@ pub(super) fn rename_endpoints(column: bool) -> (ChangeSet, ResolverEvidence) {
     // A producer may split the old/new column inventory. The independent
     // parent inventory cannot stand in for either column endpoint.
     let mut split = evidence.clone();
-    split.transitions[0].after.clear();
+    split.transitions[rename_index].after.clear();
     split.transitions.push(ObjectTransition {
         surface: to,
         before: BTreeSet::new(),
@@ -771,15 +782,17 @@ pub(super) fn rename_endpoints(column: bool) -> (ChangeSet, ResolverEvidence) {
     split.validate(&changes).unwrap();
     if column {
         let mut aggregate = evidence.clone();
-        aggregate.transitions.truncate(1);
-        aggregate.transitions[0].surface = Surface::Table(table);
+        aggregate.transitions = vec![ObjectTransition {
+            surface: Surface::Table(table),
+            ..evidence.transitions[rename_index].clone()
+        }];
         assert!(aggregate.validate(&changes).is_err());
     }
     for omit_before in [false, true] {
         let mut omitted = evidence.clone();
         let mut after = serde_json::to_value(&evidence.before).unwrap();
         if omit_before {
-            omitted.transitions[0].before.clear();
+            omitted.transitions[rename_index].before.clear();
             let mut records = evidence.before.prerequisites().to_vec();
             records.extend(
                 compiled
@@ -796,7 +809,7 @@ pub(super) fn rename_endpoints(column: bool) -> (ChangeSet, ResolverEvidence) {
                         .unwrap();
             }
         } else {
-            omitted.transitions[0].after.clear();
+            omitted.transitions[rename_index].after.clear();
             after["prerequisites"] = serde_json::to_value(
                 evidence
                     .before
@@ -1178,13 +1191,23 @@ fn aggregate_column_changes_require_all_owned_records() {
 fn aggregate_renames_require_owned_records_at_both_endpoints() {
     for column in [false, true] {
         let (changes, mut evidence) = rename_endpoints(column);
-        let old = evidence.transitions[0]
+        let source = match &changes.changes[0].change {
+            Change::RenameColumn { table, from, .. } => Surface::Column(table.column(from)),
+            Change::RenameTable { from, .. } => Surface::Table(from.clone()),
+            _ => panic!("rename fixture"),
+        };
+        let rename_index = evidence
+            .transitions
+            .iter()
+            .position(|transition| transition.surface == source)
+            .unwrap();
+        let old = evidence.transitions[rename_index]
             .before
             .iter()
             .next()
             .unwrap()
             .clone();
-        let new = evidence.transitions[0].after.iter().next().unwrap().clone();
+        let new = evidence.transitions[rename_index].after.iter().next().unwrap().clone();
         let mut children = Vec::new();
         for (manifest, object) in [(&mut evidence.before, &old), (&mut evidence.after, &new)] {
             let owner = manifest
@@ -1225,15 +1248,15 @@ fn aggregate_renames_require_owned_records_at_both_endpoints() {
             *manifest = serde_json::from_value(json).unwrap();
             children.push(child);
         }
-        evidence.transitions[0].before.insert(children[0].clone());
-        evidence.transitions[0].after.insert(children[1].clone());
+        evidence.transitions[rename_index].before.insert(children[0].clone());
+        evidence.transitions[rename_index].after.insert(children[1].clone());
         evidence.validate(&changes).unwrap();
         for omit_before in [true, false] {
             let mut omitted = evidence.clone();
             if omit_before {
-                omitted.transitions[0].before.remove(&old);
+                omitted.transitions[rename_index].before.remove(&old);
             } else {
-                omitted.transitions[0].after.remove(&new);
+                omitted.transitions[rename_index].after.remove(&new);
             }
             assert!(
                 evidence
