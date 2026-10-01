@@ -537,3 +537,28 @@ their own results beside it, and `ci-gate` still requires every job.
 The price is runners: about fifteen jobs at once instead of nine. The
 organisation's concurrency limit can queue a few of them when two runs
 overlap. Standard runners bill nothing on a public repository.
+
+<a id="dec-1383-1"></a>
+
+**DEC-1383.1. An active With path and its suppressed continuation use separate
+binding states.** Merging skipped writes into every active read refused an
+ordinary safe shadow, but deleting suppression handling lost reflective aliases
+when an exception skipped that shadow. The running path therefore applies
+writes in order; snapshots of possible skipped prefixes join only at the exit.
+Class observers share module-state capture with their enclosing managers.
+Explicit following writes replace the joined state. A directly raised exception
+ends that body's statement scan; unknown exceptions retain conservative prefixes.
+
+A successful shadow does not prove an intervening opaque callback harmless.
+Narrow native-call and inert-manager facts distinguish the required safe
+controls from unproved execution after a reflective alias was erased. Opaque
+execution permanently removes that native proof and keeps selector evidence
+conservative. The proof is intentionally limited to literal/native arguments,
+empty fresh-object callables and trivial async-manager methods, without importing
+or executing source. It is not a general Python evaluator or a new witness
+adapter. Context-result targets, general manager effects, compound expression
+provenance and direct-spelling SelectorEffects precision remain separate issues.
+Acceptance requires actual Python plus complete ownership for synchronous
+cases, explicitly component-scoped legal async evidence, and independent
+counterfactual failures for active transfer, suppression joining and opaque-effect
+refusal. See [test execution](../TEST-EXECUTION.md).
