@@ -903,7 +903,6 @@ pub(crate) fn after_the_rebuilds(cs: &mut ChangeSet, released: &BTreeSet<ColumnR
         .iter()
         .map(|p| match &p.change {
             Change::AddCheck { .. } => true,
-            Change::AddIndex { index, .. } => index.holds_expression(),
             Change::AlterColumnDefault {
                 column,
                 to: Some(_),
@@ -917,13 +916,47 @@ pub(crate) fn after_the_rebuilds(cs: &mut ChangeSet, released: &BTreeSet<ColumnR
             // One that releases a generated column from a module the plan
             // drops stays ahead of that drop, which `weave` put after it.
             Change::AlterColumnExpression { column, .. } => !released.contains(column),
-            // A `NOT NULL` over a recomputed column stays behind its new
-            // expression, which the order kept among the moved preserves.
+            // What validates a recomputed column's values stays behind its new
+            // expression, which the order kept among the moved preserves: a
+            // `NOT NULL`, and a key over it on either side of a foreign key.
+            // Left here, it would judge the values the old expression stored.
             Change::AlterColumnNullability {
                 column,
                 to_nullable: false,
                 ..
             } => recomputed.contains(column),
+            Change::AddIndex { table, index, .. } => {
+                index.holds_expression()
+                    || index.column_keys().is_some_and(|keys| {
+                        keys.iter().any(|k| recomputed.contains(&table.column(k)))
+                    })
+            }
+            Change::AddUnique {
+                table, constraint, ..
+            } => constraint
+                .columns
+                .iter()
+                .any(|c| recomputed.contains(&table.column(c))),
+            Change::SetPrimaryKey {
+                table,
+                to: Some(pk),
+                ..
+            } => pk
+                .columns
+                .iter()
+                .any(|c| recomputed.contains(&table.column(c))),
+            Change::AddForeignKey {
+                table, constraint, ..
+            } => {
+                constraint
+                    .columns
+                    .iter()
+                    .any(|c| recomputed.contains(&table.column(c)))
+                    || constraint
+                        .references_columns
+                        .iter()
+                        .any(|c| recomputed.contains(&constraint.references_table.column(c)))
+            }
             _ => false,
         })
         .collect();
@@ -1223,6 +1256,14 @@ mod tests {
             to_nullable: false,
             collation: None,
         };
+        let unique = |column: &str| Change::AddUnique {
+            table: t.clone(),
+            name: format!("uq_{column}"),
+            constraint: pbps_model::UniqueConstraint {
+                columns: vec![column.to_owned()],
+            },
+            clustered: false,
+        };
         let mut cs = plan(vec![
             Change::AlterColumnExpression {
                 uid: "c_d4e5f6".parse().unwrap(),
@@ -1230,14 +1271,16 @@ mod tests {
                 from: "id * 2".into(),
                 to: "app.f(id)".into(),
             },
-            // `n`'s new NOT NULL follows its expression; `other`'s stays.
+            // `n`'s new NOT NULL and key follow its expression; `other`'s stay.
             tighten("n"),
             tighten("other"),
+            unique("n"),
+            unique("other"),
             add("g", generated),
             add("plain", pbps_model::Column::new("integer".parse().unwrap())),
             alter(&s, "app.f(integer)"),
         ]);
-        assert_eq!(after_the_rebuilds(&mut cs, &BTreeSet::new()), 2);
+        assert_eq!(after_the_rebuilds(&mut cs, &BTreeSet::new()), 3);
         let at =
             |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
         let rebuilt = at(&|c| matches!(c, Change::AlterModule { .. }));
@@ -1257,6 +1300,11 @@ mod tests {
         };
         assert!(expression < tightened("n"), "{:?}", names(&cs));
         assert!(tightened("other") < rebuilt, "{:?}", names(&cs));
+        let keyed = |name: &str| {
+            at(&|c| matches!(c, Change::AddUnique { name: n, .. } if n == &format!("uq_{name}")))
+        };
+        assert!(expression < keyed("n"), "{:?}", names(&cs));
+        assert!(keyed("other") < rebuilt, "{:?}", names(&cs));
     }
 
     /// An expression change that releases a generated column from a module
