@@ -35,15 +35,14 @@ impl InputManifest {
         }
         // Checking supplied entries alone accepts an empty inventory for a
         // DROP, leaving the closing manifest at the pre-DDL state (SPEC 9.3.2).
-        for step in changes
-            .changes
-            .iter()
-            .filter(|p| changes_catalog(&p.change))
-        {
-            if !transitions
-                .iter()
-                .any(|t| covers_change(&step.change, &t.surface))
-            {
+        for (index, step) in changes.changes.iter().enumerate() {
+            if !changes_catalog(&step.change) {
+                continue;
+            }
+            if !transitions.iter().any(|t| {
+                covers_change(&step.change, &t.surface)
+                    || vector_transition_matches(&step.change, changes, index, &t.surface)
+            }) {
                 return Err(ManifestError::Incomplete);
             }
         }
@@ -56,7 +55,16 @@ impl InputManifest {
                 || !changes
                     .changes
                     .iter()
-                    .any(|p| touches(&p.change, &transition.surface))
+                    .enumerate()
+                    .any(|(index, p)| {
+                        touches(&p.change, &transition.surface)
+                            || vector_transition_matches(
+                                &p.change,
+                                changes,
+                                index,
+                                &transition.surface,
+                            )
+                    })
             {
                 return Err(ManifestError::Invalid);
             }
@@ -74,14 +82,16 @@ impl InputManifest {
                     // The same typed scope that requires a record below must
                     // also authorize replacing it (SPEC 9.3.2).
                     let affected = changes.changes.iter().enumerate().any(|(index, step)| {
-                        touches(&step.change, &transition.surface)
+                        vector_inventory_permitted(
+                            &step.change, changes, index, before, &transition.surface, ownership,
+                        ) || touches(&step.change, &transition.surface)
                             && ownership.permits(&transition_at_endpoint(
                                 &transition.surface,
                                 changes,
                                 index,
                                 before,
                             ))
-                            && changed_owners(&step.change).is_some_and(
+                            && (changed_owners(&step.change).is_some_and(
                                 |(candidates, opening, closing)| {
                                     (if before { opening } else { closing })
                                         && candidates.iter().any(|owner| {
@@ -90,7 +100,11 @@ impl InputManifest {
                                                 .contains(ownership)
                                         })
                                 },
-                            )
+                            ) || column_parent(&step.change).is_some_and(|parent| {
+                                OwnerScope::Exact(parent)
+                                    .at_endpoint(changes, index, before)
+                                    .contains(ownership)
+                            }))
                     });
                     if !affected {
                         return Err(ManifestError::Invalid);
@@ -144,6 +158,28 @@ impl InputManifest {
                 });
                 if !complete {
                     return Err(ManifestError::Incomplete);
+                }
+            }
+            // A live column-vector change also changes its table's properties.
+            // This is an independent obligation, never an alternative that can
+            // excuse an omitted column/default inventory (SPEC 9.3.2).
+            if let Some(parent) = column_parent(&step.change) {
+                let owner = OwnerScope::Exact(parent);
+                for (manifest, inventory, before) in
+                    [(self, &removed, true), (compiled, &installed, false)]
+                {
+                    let owner = owner.at_endpoint(changes, index, before);
+                    let records: Vec<_> = manifest
+                        .prerequisites()
+                        .iter()
+                        .filter(|p| owner.contains(&p.ownership))
+                        .collect();
+                    if records.is_empty() && planned_absence(owner.surface(), changes, before) {
+                        continue;
+                    }
+                    if records.is_empty() || records.iter().any(|p| !inventory.contains(&p.object)) {
+                        return Err(ManifestError::Incomplete);
+                    }
                 }
             }
         }
@@ -252,6 +288,69 @@ impl OwnerScope {
             Self::WithChildren(surface) => ownership.permits(surface),
         }
     }
+}
+
+fn column_parent(change: &Change) -> Option<Surface> {
+    if let Change::AddColumn { table, .. } | Change::RenameColumn { table, .. } = change {
+        Some(Surface::Table(table.clone()))
+    } else if let Change::DropColumn { column, .. } = change {
+        Some(Surface::Table(column.table.clone()))
+    } else {
+        None
+    }
+}
+
+// A final transition label can follow several UID-preserving renames.
+// Compare it with both endpoints of the specific typed vector operation,
+// rather than treating another UID's reuse of a spelling as that operation.
+fn vector_owner_matches(
+    owner: &OwnerScope,
+    changes: &ChangeSet,
+    index: usize,
+    surface: &Surface,
+) -> bool {
+    [true, false].into_iter().any(|before| {
+        ObjectOwnership::Surface(owner.at_endpoint(changes, index, before).surface().clone())
+            .permits(surface)
+    })
+}
+
+fn vector_transition_matches(
+    change: &Change,
+    changes: &ChangeSet,
+    index: usize,
+    surface: &Surface,
+) -> bool {
+    let Some(parent) = column_parent(change) else {
+        return false;
+    };
+    vector_owner_matches(&OwnerScope::Exact(parent), changes, index, surface)
+        || changed_owners(change).is_some_and(|(owners, _, _)| {
+            owners.iter().any(|owner| vector_owner_matches(owner, changes, index, surface))
+        })
+}
+
+fn vector_inventory_permitted(
+    change: &Change,
+    changes: &ChangeSet,
+    index: usize,
+    before: bool,
+    surface: &Surface,
+    ownership: &ObjectOwnership,
+) -> bool {
+    let Some(parent) = column_parent(change) else {
+        return false;
+    };
+    let parent = OwnerScope::Exact(parent);
+    (vector_owner_matches(&parent, changes, index, surface)
+        && parent.at_endpoint(changes, index, before).contains(ownership))
+        || changed_owners(change).is_some_and(|(owners, opening, closing)| {
+            (if before { opening } else { closing })
+                && owners.iter().any(|owner| {
+                    vector_owner_matches(owner, changes, index, surface)
+                        && owner.at_endpoint(changes, index, before).contains(ownership)
+                })
+        })
 }
 
 // Exhaustive: every catalog mutation names its owner, extent and endpoints.
