@@ -75,3 +75,37 @@ pub async fn dependences(conn: &mut Conn, table: &TableName) -> Result<Vec<Depen
 fn literal(value: &str) -> String {
     format!("E'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
 }
+
+/// Whether an expression's text may read `column`: it holds an identifier
+/// naming it, outside literals and comments, by the engine's quoting and
+/// folding rules. An over-approximation. A function or a field of the same
+/// name counts too, so a "yes" means *may* and a "no" means it does not
+/// (DEC-1316.1).
+///
+/// A Unicode-escaped identifier is matched as the name it spells: the lexer
+/// decodes `U&"\0061"`, and `UESCAPE` with it, to `"a"` before the scan.
+#[must_use]
+pub fn may_read(expression: &str, column: &str) -> bool {
+    crate::impact::mentions(expression, column)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::may_read;
+
+    /// The scan reads a name however it is spelled, a Unicode escape and its
+    /// `UESCAPE` included, and data in a literal is no name (DEC-1316.1).
+    #[test]
+    fn an_escaped_identifier_is_read_as_the_name_it_spells() {
+        assert!(may_read("a * 2", "a"));
+        assert!(!may_read("b * 2", "a"));
+        // A literal is data, not a name.
+        assert!(!may_read("b || 'a'", "a"));
+        assert!(may_read("U&\"\\0061\" * 2", "a"));
+        assert!(may_read("u&\"\\0061\" * 2", "a"));
+        assert!(may_read("U&\"!0061\" UESCAPE '!' * 2", "a"));
+        assert!(!may_read("U&\"\\0062\" * 2", "a"));
+        // Inside a literal it is data again.
+        assert!(!may_read("b || 'U&\"x\"'", "a"));
+    }
+}

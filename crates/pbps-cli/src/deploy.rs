@@ -5233,6 +5233,11 @@ pub fn cmd_plan_db(
                 &rediff,
             )
             .await?;
+            // A retype or drop of a column a generated column reads goes
+            // after the plan's change to that expression which stops reading
+            // it (DEC-1316.1): after the module passes, which may move that
+            // change, and before the checks that read the order.
+            crate::engine::release_generated_inputs(&mut conn, &mut cs).await?;
             let rebuilds = crate::engine::check_module_rebuilds(&mut conn, &cs, false).await?;
             let drops = crate::engine::check_drop_blockers(&mut conn, &cs).await?;
             crate::engine::prepare_data_writes(&mut conn, &cs, &entry.snapshot, &resolved.ids)

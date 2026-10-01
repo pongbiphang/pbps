@@ -472,7 +472,7 @@ fn text(row: &Row, column: &str) -> Result<String, DbError> {
 /// A reserved word is a name only when quoted or following a dot. Whitespace
 /// and masked comments can separate that dot from its identifier. Advancing
 /// by complete characters keeps non-ASCII names intact (DECISIONS 408).
-fn mentions(body: &str, name: &str) -> bool {
+pub(crate) fn mentions(body: &str, name: &str) -> bool {
     let Ok(quoted_name) = crate::quote(name) else {
         return false;
     };
