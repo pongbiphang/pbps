@@ -16372,8 +16372,10 @@ async fn the_ledger_created_inside_a_callers_transaction_follows_that_transactio
 /// The engine claim behind #1363, pinned for the ordering audit (#1351):
 /// tightening a column to NOT NULL is refused (5074) while an index covers it
 /// as a key, an `INCLUDE` column or in a filter's predicate, or a UNIQUE
-/// constraint does. A CHECK naming it, the child side of a foreign key and a
-/// DEFAULT do not block it, and relaxing is accepted under each.
+/// constraint does, and inside a `varchar` widening that keeps its index
+/// alone. A CHECK naming it, the child side of a foreign key and a DEFAULT do
+/// not block it. Relaxing is accepted under each but a filtered index whose
+/// predicate names the column (#1363).
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
 async fn tightening_nullability_is_refused_by_what_indexes_the_column() {
@@ -16388,12 +16390,14 @@ async fn tightening_nullability_is_refused_by_what_indexes_the_column() {
                k_ck int NULL CONSTRAINT ck_t CHECK (k_ck > 0), \
                k_fk int NULL CONSTRAINT fk_t REFERENCES dbo.p (k), \
                k_df int NULL CONSTRAINT df_t DEFAULT 1, \
-               n_ix int NOT NULL); \
+               n_ix int NOT NULL, n_filt int NOT NULL, v varchar(10) NULL); \
              CREATE INDEX ix_k ON dbo.t (k_ix); \
              CREATE INDEX ix_inc ON dbo.t (id) INCLUDE (k_inc); \
              CREATE INDEX ix_filt ON dbo.t (id) WHERE k_filt > 0; \
              CREATE INDEX ix_n ON dbo.t (n_ix); \
-             INSERT dbo.t VALUES (1, 5, 5, 5, 5, 5, 5, 5, 5);",
+             CREATE INDEX ix_nfilt ON dbo.t (id) WHERE n_filt > 0; \
+             CREATE INDEX ix_v ON dbo.t (v); \
+             INSERT dbo.t VALUES (1, 5, 5, 5, 5, 5, 5, 5, 5, 5, 'abc');",
         )
         .await
         .expect("the fixture");
@@ -16415,9 +16419,25 @@ async fn tightening_nullability_is_refused_by_what_indexes_the_column() {
             .await
             .unwrap_or_else(|e| panic!("{column}: {e}"));
     }
+    let e = db
+        .conn
+        .execute("ALTER TABLE dbo.t ALTER COLUMN v varchar(20) NOT NULL;")
+        .await
+        .expect_err("a widening that tightens");
+    assert!(e.to_string().contains("5074"), "{e}");
+    db.conn
+        .execute("ALTER TABLE dbo.t ALTER COLUMN v varchar(20) NULL;")
+        .await
+        .expect("a widening alone keeps its index");
     db.conn
         .execute("ALTER TABLE dbo.t ALTER COLUMN n_ix int NULL;")
         .await
         .expect("relaxing under an index");
+    let e = db
+        .conn
+        .execute("ALTER TABLE dbo.t ALTER COLUMN n_filt int NULL;")
+        .await
+        .expect_err("relaxing under a filter");
+    assert!(e.to_string().contains("5074"), "{e}");
     db.drop().await;
 }

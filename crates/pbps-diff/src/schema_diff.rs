@@ -1265,6 +1265,13 @@ fn recreate_retyped_dependents(
     dialect: &dyn Dialect,
     changes: &mut Vec<Change>,
 ) {
+    let also = |dependents: &mut pbps_dialect::RetypeDependents,
+                more: pbps_dialect::RetypeDependents| {
+        dependents.keys_and_indexes |= more.keys_and_indexes;
+        dependents.checks |= more.checks;
+        dependents.filtered_indexes |= more.filtered_indexes;
+        dependents.foreign_keys |= more.foreign_keys;
+    };
     let retyped: BTreeMap<_, _> = changes
         .iter()
         .filter_map(|change| match change {
@@ -1272,27 +1279,37 @@ fn recreate_retyped_dependents(
                 column,
                 from,
                 to,
+                from_nullable,
+                to_nullable,
                 from_collation,
                 to_collation,
                 ..
             } => {
                 let mut dependents = dialect.retype_dependents(from, to);
                 if from_collation != to_collation {
-                    let also = dialect.recollate_dependents();
-                    dependents.keys_and_indexes |= also.keys_and_indexes;
-                    dependents.checks |= also.checks;
-                    dependents.filtered_indexes |= also.filtered_indexes;
-                    dependents.foreign_keys |= also.foreign_keys;
+                    also(&mut dependents, dialect.recollate_dependents());
+                }
+                // A nullability change in the same statement brings its own
+                // blockers, which a type change alone may not have (#1363).
+                if from_nullable != to_nullable {
+                    also(
+                        &mut dependents,
+                        dialect.nullability_dependents(*to_nullable),
+                    );
                 }
                 Some((column.clone(), dependents))
             }
+            Change::AlterColumnNullability {
+                column,
+                to_nullable,
+                ..
+            } => Some((column.clone(), dialect.nullability_dependents(*to_nullable))),
             Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
             | Change::DropColumn { .. }
             | Change::RenameColumn { .. }
-            | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
@@ -2921,8 +2938,11 @@ mod tests {
         .unwrap()
     }
 
-    /// A dialect whose collation changes take every dependent down, as SQL
-    /// Server's do (#1175); everything else is `MinimalDialect`'s.
+    /// A dialect whose collation changes take every dependent down, and whose
+    /// nullability changes take down the filtered indexes, and on tightening
+    /// the indexes and unique constraints over the column, as SQL Server's do
+    /// (#1175, #1363). Everything else is `MinimalDialect`'s, so a type change
+    /// alone rebuilds nothing.
     struct Recollates;
 
     impl Dialect for Recollates {
@@ -2935,6 +2955,14 @@ mod tests {
                 checks: true,
                 filtered_indexes: true,
                 foreign_keys: true,
+            }
+        }
+        fn nullability_dependents(&self, to_nullable: bool) -> pbps_dialect::RetypeDependents {
+            pbps_dialect::RetypeDependents {
+                keys_and_indexes: !to_nullable,
+                checks: false,
+                filtered_indexes: true,
+                foreign_keys: false,
             }
         }
         fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
@@ -2979,6 +3007,96 @@ mod tests {
         fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
             MinimalDialect.probe_framing()
         }
+    }
+
+    /// A nullability change takes down and puts back what the dialect says
+    /// blocks it, alone or inside a type change whose own dependents do not
+    /// include them: on tightening the indexes and unique constraints over the
+    /// column, and in both directions a filtered index. A check is not one of
+    /// them (#1363).
+    #[test]
+    fn a_nullability_change_rebuilds_what_the_dialect_says_blocks_it() {
+        let index = |column: &str| Index {
+            columns: vec![IndexColumn {
+                key: pbps_model::IndexKey::Column(column.into()),
+                descending: false,
+                opclass: None,
+            }],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method: Default::default(),
+        };
+        let shaped = |nullable: bool, v: &str| {
+            let col = |t: &str| {
+                let c = Column::new(ty(t));
+                if nullable { c } else { c.not_null() }
+            };
+            let mut t = table(&[
+                ("id", Column::new(ty("int")).not_null()),
+                ("k", col("int")),
+                ("u", col("int")),
+                ("c", col("int")),
+                ("v", col(v)),
+                ("other", Column::new(ty("int"))),
+            ]);
+            t.indexes.insert("ix_k".into(), index("k"));
+            t.indexes.insert("ix_v".into(), index("v"));
+            t.indexes.insert("ix_other".into(), index("other"));
+            t.indexes.insert(
+                "ix_filt".into(),
+                Index {
+                    filter: Some("other > 0".into()),
+                    ..index("id")
+                },
+            );
+            t.unique.insert(
+                "uq_u".into(),
+                UniqueConstraint {
+                    columns: vec!["u".into()],
+                },
+            );
+            t.checks.insert(
+                "ck_c".into(),
+                CheckConstraint {
+                    expression: "c > 0".into(),
+                },
+            );
+            schema_of("dbo.t", t)
+        };
+        let rebuilt = |cs: &ChangeSet| -> Vec<String> {
+            let mut names: Vec<String> = cs
+                .changes
+                .iter()
+                .filter_map(|p| match &p.change {
+                    Change::DropIndex { name, .. }
+                    | Change::DropUnique { name, .. }
+                    | Change::DropCheck { name, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect();
+            names.sort();
+            names
+        };
+        // `v` widens from varchar(10) to varchar(20) as it tightens: a type
+        // change the dialect rebuilds nothing for, so its index comes down for
+        // the tightening alone.
+        let (nullable, not_null) = (shaped(true, "varchar(10)"), shaped(false, "varchar(20)"));
+        let cs = run_with(&Recollates, &nullable, &not_null, &[]);
+        // Filters are opaque text, so every filtered index of the table is
+        // rebuilt, as for a type change (DEC-1169.2).
+        assert_eq!(rebuilt(&cs), ["ix_filt", "ix_k", "ix_v", "uq_u"]);
+        let k = kinds(&cs);
+        for kind in ["AddIndex", "AddUnique"] {
+            assert!(k.contains(&kind.to_owned()), "{kind}: {k:?}");
+        }
+        // Relaxing takes down the filtered index alone.
+        let relaxed = shaped(true, "varchar(30)");
+        let cs = run_with(&Recollates, &not_null, &relaxed, &[]);
+        assert_eq!(rebuilt(&cs), ["ix_filt"]);
+        // Negative: a dialect that tightens in place rebuilds nothing.
+        let cs = run(&nullable, &not_null, &[]);
+        assert!(rebuilt(&cs).is_empty(), "{:?}", kinds(&cs));
     }
 
     /// A collation change is the `ALTER COLUMN` a type change is, with both

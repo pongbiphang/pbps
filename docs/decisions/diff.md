@@ -1326,3 +1326,36 @@ Pinned by `a_released_input_is_retyped_or_dropped_after_its_release`
 (`crates/pbps-pg/src/drop_impact.rs`), and the live
 `an_expression_change_releases_its_old_input_in_the_same_plan`
 (`crates/pbps-cli/tests/flow_pg.rs`).
+
+<a id="dec-1363-1"></a>
+
+**DEC-1363.1. A nullability change on SQL Server takes down and puts back what
+blocks it, as a type change does (#1363).** Measured on 17.0:
+
+- Tightening to NOT NULL is refused (5074, 4922) by an index over the column,
+  whether as a key, an `INCLUDE` column or in a filter's predicate, and by a
+  UNIQUE constraint on it.
+- Relaxing to NULL is refused by a filtered index whose predicate names the
+  column, and by nothing else.
+- A CHECK, either side of a foreign key and a DEFAULT block neither direction.
+
+`Dialect::nullability_dependents` answers per direction, and
+`recreate_retyped_dependents` turns the answer into the same visible drop and
+add pairs a retype gets (DECISIONS 461). These are classes 2 and 13.
+
+A nullability change folded into an `AlterColumnType` adds its dependents to
+the type change's own. They are not already covered: a `varchar` widening
+keeps its index alone, and is refused once it also tightens.
+
+A filter is opaque text, so every filtered index of the table is rebuilt, as
+for a type change (DEC-1169.2).
+
+The issue assumed relaxing needs nothing. The filtered index is the one
+exception the live engine showed.
+
+Pinned by `a_nullability_change_rebuilds_what_the_dialect_says_blocks_it`
+(`crates/pbps-diff/src/schema_diff.rs`), and by
+`tightening_a_column_rebuilds_what_indexes_it_through_the_cli`
+(`crates/pbps-cli/tests/flow.rs`) and
+`tightening_nullability_is_refused_by_what_indexes_the_column`
+(`crates/pbps-mssql/tests/live.rs`).

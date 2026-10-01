@@ -1773,6 +1773,14 @@ pub trait Dialect {
         RetypeDependents::default()
     }
 
+    /// Dependencies that cannot remain standing while a column's
+    /// nullability changes to `to_nullable` (#1363), alone or in the same
+    /// statement as a type change. None by default: an engine that changes
+    /// nullability in place needs no extra changes.
+    fn nullability_dependents(&self, _to_nullable: bool) -> RetypeDependents {
+        RetypeDependents::default()
+    }
+
     /// Expands aliases and fills in omitted default arguments, so that two
     /// semantically identical spellings become the same value.
     ///

@@ -1031,6 +1031,7 @@
         "status_says_nothing_about_a_lock_on_a_database_with_no_ledger",
         "the_connected_envelopes_match_the_published_schema",
         "the_rehearsal_still_runs_when_the_output_is_json",
+        "tightening_a_column_rebuilds_what_indexes_it_through_the_cli",
         "two_added_checks_one_name_under_the_collation_refuse_the_plan",
         "unmodelled_check_and_unique_enforcement_refuses_connected_retypes_before_writes",
         "verify_and_status_reject_an_unreadable_unmanaged_module",
