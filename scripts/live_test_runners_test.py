@@ -82,6 +82,79 @@ class LiveExecution(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 native.native_tests("/owned/tests", {"PBPS_NATIVE_DRIVER": "pg"}, producer_only=True)
         self.assertEqual([call.args[3] for call in run.call_args_list], native.PRODUCER_TESTS)
+        self.assertEqual(run.call_count, 35)
+
+    def test_focused_generation_runs_only_the_case_for_the_selected_pg_major(self):
+        completed = subprocess.CompletedProcess([], 0, "test result: ok. 1 passed\n")
+        for major, selected, opposite in (
+            ("16", native.PG16_GENERATION_TEST, native.PG18_GENERATION_TEST),
+            ("18", native.PG18_GENERATION_TEST, native.PG16_GENERATION_TEST),
+        ):
+            with self.subTest(major=major):
+                env = {"PBPS_NATIVE_DRIVER": "pg", "PBPS_NATIVE_PG_MAJOR": major}
+                with patch.object(native, "run", return_value=completed) as run:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        native.native_tests("/owned/tests", env, generation_only=True)
+                self.assertEqual([call.args for call in run.call_args_list],
+                                 [("/owned/tests", "--ignored", "--exact", selected, "--nocapture")])
+                self.assertNotIn(opposite, [call.args[3] for call in run.call_args_list])
+                self.assertEqual(run.call_args.kwargs["env"]["PBPS_NATIVE_PG_MAJOR"], major)
+
+    def test_normal_pg_execution_keeps_all_old_cases_and_only_its_generation_case(self):
+        completed = subprocess.CompletedProcess([], 0, "test result: ok. 1 passed\n")
+        self.assertEqual(len(native.NATIVE_TESTS), 51)
+        for major, selected, opposite in (
+            ("16", native.PG16_GENERATION_TEST, native.PG18_GENERATION_TEST),
+            ("18", native.PG18_GENERATION_TEST, native.PG16_GENERATION_TEST),
+        ):
+            with self.subTest(major=major):
+                env = {"PBPS_NATIVE_DRIVER": "pg", "PBPS_NATIVE_PG_MAJOR": major}
+                with patch.object(native, "run", return_value=completed) as run:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        native.native_tests("/owned/tests", env)
+                names = [call.args[3] for call in run.call_args_list]
+                self.assertEqual(names, native.NATIVE_TESTS[:-2] + [selected])
+                self.assertEqual(len(names), 50)
+                self.assertNotIn(opposite, names)
+
+    def test_focused_generation_refuses_missing_or_unknown_major_and_non_pg(self):
+        for env, message in (
+            ({"PBPS_NATIVE_DRIVER": "pg"}, "PBPS_NATIVE_PG_MAJOR"),
+            ({"PBPS_NATIVE_DRIVER": "pg", "PBPS_NATIVE_PG_MAJOR": ""}, "PBPS_NATIVE_PG_MAJOR"),
+            ({"PBPS_NATIVE_DRIVER": "pg", "PBPS_NATIVE_PG_MAJOR": "17"}, "PBPS_NATIVE_PG_MAJOR"),
+            ({"PBPS_NATIVE_DRIVER": "mssql", "PBPS_NATIVE_PG_MAJOR": "16"}, "PBPS_NATIVE_DRIVER"),
+            ({"PBPS_NATIVE_PG_MAJOR": "18"}, "PBPS_NATIVE_DRIVER"),
+        ):
+            with self.subTest(env=env):
+                with patch.object(native, "run") as run:
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        native.native_tests("/owned/tests", env, generation_only=True)
+                run.assert_not_called()
+
+    def test_native_focused_selectors_refuse_overlap_before_execution(self):
+        with patch.object(native, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "mutually exclusive"):
+                native.native_tests("/owned/tests", {"PBPS_NATIVE_DRIVER": "pg"},
+                                    producer_only=True, generation_only=True)
+        run.assert_not_called()
+
+    def test_generation_cli_refuses_non_native_pg_and_overlapping_modes_before_fixture(self):
+        for arguments, message in (
+            (["pg", "--generation-only"], "--generation-only requires --native-host pg"),
+            (["mssql", "--native-host", "--generation-only"], "--generation-only requires --native-host pg"),
+            (["pg", "--native-host", "--producer-only", "--generation-only"], "not allowed with argument"),
+        ):
+            with self.subTest(arguments=arguments):
+                stderr = io.StringIO()
+                with patch.object(native.sys, "argv", ["native-target", *arguments]):
+                    with patch.object(native, "fixture") as fixture, patch.object(native, "test_binary") as binary:
+                        with contextlib.redirect_stderr(stderr):
+                            with self.assertRaises(SystemExit) as error:
+                                native.main()
+                        self.assertEqual(error.exception.code, 2)
+                        fixture.assert_not_called()
+                        binary.assert_not_called()
+                self.assertIn(message, stderr.getvalue())
 
     def test_sql_server_native_runner_keeps_its_original_three_cases(self):
         completed = subprocess.CompletedProcess([], 0, "test result: ok. 1 passed\n")

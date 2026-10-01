@@ -220,7 +220,7 @@
           "scope": "fixture",
           "requires": [
             "if args.native_host:",
-            "native_tests(binary, env, args.producer_only)"
+            "native_tests(binary, env, args.producer_only, args.generation_only)"
           ]
         },
         {
@@ -228,7 +228,7 @@
           "language": "python",
           "scope": "native_tests",
           "requires": [
-            "for test in PRODUCER_TESTS if producer_only else NATIVE_TESTS:",
+            "for test in GENERATION_TESTS if generation_only else PRODUCER_TESTS if producer_only else NATIVE_TESTS:",
             "run(binary, \"--ignored\", \"--exact\", test,"
           ]
         },
@@ -949,7 +949,9 @@
         "resolver::native::target::tests::native_aliases_share_one_instance_and_backend_children_cannot_claim_another",
         "resolver::server::container_tests::sql_recovery::confirmed_workload_removal_finishes_only_its_existing_sql_recovery",
         "resolver::server::container_tests::sql_recovery::interrupted_open_discard_finishes_sql_recovery_only_after_workload_removal",
-        "resolver::server::container_tests::sql_recovery::cancelled_cleanup_keeps_uncertain_owned_sql_names_and_remains_terminal"
+        "resolver::server::container_tests::sql_recovery::cancelled_cleanup_keeps_uncertain_owned_sql_names_and_remains_terminal",
+        "resolver::server::qualified_evidence_tests::the_pg18_producer_projects_the_replaced_generated_attrdef_and_preserves_column_identity",
+        "resolver::server::qualified_evidence_tests::the_pg16_producer_adds_stored_generation_and_retains_existing_generated_bindings"
       ]
     },
     {
