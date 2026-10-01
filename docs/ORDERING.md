@@ -59,7 +59,12 @@ The differ sorts every planned change by, in order:
 Then, in this order:
 
 - **`rename_order::order`** (`crates/pbps-diff/src/rename_order.rs`) puts a
-  rename chain or swap in an order the engine accepts (DEC-536.1).
+  table rename after the drops that release its target name (DECISIONS 496,
+  DEC-496.1, DEC-536.1): a dropped table everywhere, an index on PostgreSQL
+  (indexes share the relation namespace), a named constraint on SQL Server.
+  It orders chains. A table rename cycle is left out of its graph, and the
+  engine refuses it. A column rename cycle is refused at diff time
+  (`ColumnRenameCycle`); a column chain is ordered by `chain_depth`.
 - **On a connected plan, `order_role_drops`** (called from `deploy.rs`, once
   `plan --db` has read the dropped roles' members) ranks the role drops by
   membership again. The differ saw no members when it sorted (DECISIONS 127,
@@ -110,7 +115,10 @@ steps:
 
 ## What each change requires
 
-`P` is PostgreSQL and `S` is SQL Server; no marker means both.
+`P` is PostgreSQL and `S` is SQL Server; no marker means both. Every change
+also requires the names it uses to be the ones in force at its position. That
+requirement is common to all of them, so it is listed once,
+[below](#names-in-force), rather than in every row.
 
 | Change | Class | Requires before it | Creates, removes or rewrites |
 |---|---|---|---|
@@ -159,12 +167,30 @@ other's requirement in the table above. Columns:
 | `DropTable` or a rename away → `RenameTable` into its name | fixed | `rename_order` | ✓ DEC-536.1 |
 | `DropColumn` → `RenameColumn` into its name | fixed | the drop moves to (2, 3), ahead of class 3 | ✓ DECISIONS 474 |
 | `DropColumn` or `RenameColumn` away → `AddColumn` of its name | fixed | class 5 or 3 before 8 | ✓ |
-| A rename chain or swap among columns or tables | fixed | `rename_order`, `chain_depth` | ✓ DEC-536.1 |
+| A column rename chain | fixed | `chain_depth` inside class 3 | ✓ |
+| A column rename cycle (a swap) | — | refused at diff time, `ColumnRenameCycle` | ✓ refused by design |
+| A table rename chain | fixed | `rename_order` | ✓ DEC-536.1 |
+| A table rename cycle | — | left out of `rename_order`'s graph; the engine refuses it | ✓ refused by design |
+| Index (P) or named constraint (S) drop → `RenameTable` into its name | fixed | `rename_order` | ✓ DECISIONS 496, DEC-496.1 |
 | Constraint or index drop → add of the same name | fixed | class 2 before 13 | ✓ DECISIONS 168 (namespaces) |
 | `DropModule` → `CreateModule` of its id | fixed | class 0 before 14 | ✓ |
 | `DropRole` or `RenameRole` away → `CreateRole` of its name | fixed | class 0 or 1 before 15 | ✓ |
 | `DropRole` of a holder → `DropRole` of its member | fixed | `member_depth`, then `order_role_drops` once the members are read | ✓ DECISIONS 127, 139 |
 | Trigger and grants keyed by a table name that passes to another table | fixed | rebuilt as the occupant's | ✓ DEC-1118.1 |
+
+### Names in force
+
+Every change names its objects as they are named at its own position, so a
+rename provides the name every later change uses.
+
+| Pair | Kind | Order now | Verdict |
+|---|---|---|---|
+| `RenameTable` → `RenameColumn` and every later change naming the table | fixed | class 1 before 3 and the rest; `RenameColumn` carries the new table name | ✓ |
+| `RenameTable` → class-2 drops naming the table | fixed | class 1 before 2; the drops use the new name | ✓ |
+| Module drops (class 0) → renames | fixed | class 0 first; the drops use the old names | ✓ |
+| `RenameColumn` → later changes naming the column (classes 4 to 17) | fixed | class 3 before them | ✓ |
+| Constraint and index drops naming a column → its rename | fixed | class 2 before 3; the drops use the old name | ✓ DECISIONS 474 |
+| `RenameRole` → `Revoke` and `Grant` naming the role | fixed | class 1 before 4 and 16. P: performed by hand, and grants follow the role's oid | ✓ ADR-0010 §3 |
 
 ### Something created before what needs it
 
