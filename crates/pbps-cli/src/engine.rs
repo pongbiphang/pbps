@@ -1231,22 +1231,25 @@ pub(crate) fn order_after_releases(
                 taker.change.subject()
             ));
         }
-        // A row this plan writes to the column runs before the release when
-        // the release follows a function the plan creates (rows go before the
-        // modules), and has to see the new type. The retype cannot both follow
-        // the release and precede the row.
+        // A retype never moves past what the differ puts after the column
+        // alterations. A release that follows a function the plan creates
+        // sits after the rows, the constraints and the modules
+        // (`after_the_rebuilds`), and any of those may need the column's new
+        // type: a row writing a value only it accepts, a function whose body
+        // is checked against it. The retype cannot both follow the release and
+        // precede them, so the plan is refused by name (DEC-1316.1).
         if matches!(
             changes.changes[i].change,
             pbps_model::Change::AlterColumnType { .. }
-        ) && let Some(row) = changes.changes[i + 1..release]
+        ) && let Some(past) = changes.changes[i + 1..release]
             .iter()
-            .find(|p| writes(&p.change, &column))
+            .find(|p| after_the_alterations(&p.change))
         {
             return Err(format!(
-                "{column} is retyped after the expression change that releases it, and \
-                 `{}` writes it before that change runs. Apply the expression change in a plan \
-                 of its own first, then this one.",
-                row.change.subject()
+                "{column} is retyped after the expression change that releases it, which \
+                 follows `{}`: that change may need the new type. Apply the expression change \
+                 in a plan of its own first, then this one.",
+                past.change.subject()
             ));
         }
         // A retype takes along what runs after it on the same column and
@@ -1282,28 +1285,29 @@ pub(crate) fn order_after_releases(
     Ok(moved)
 }
 
-/// Whether a row change writes `column`, as the plan names it: a cell it sets,
-/// or its key.
-fn writes(change: &pbps_model::Change, column: &pbps_model::ColumnRef) -> bool {
-    if let pbps_model::Change::InsertRow {
-        table,
-        key_column,
-        row,
-        ..
-    } = change
-    {
-        *table == column.table && (*key_column == column.name || row.get(&column.name).is_some())
-    } else if let pbps_model::Change::UpdateRow {
-        table,
-        key_column,
-        columns,
-        ..
-    } = change
-    {
-        *table == column.table && (*key_column == column.name || columns.contains_key(&column.name))
-    } else {
-        false
-    }
+/// A change the differ puts after the column alterations: rows, keys and
+/// constraints, modules, roles and grants, and the data mode. Any of them may
+/// need a column's new type, so a released retype must not move past one. The
+/// changes ahead of the alterations, a column drop moved after its own release
+/// among them, need nothing of another column's type.
+fn after_the_alterations(change: &pbps_model::Change) -> bool {
+    matches!(
+        change,
+        pbps_model::Change::InsertRow { .. }
+            | pbps_model::Change::UpdateRow { .. }
+            | pbps_model::Change::DeleteRow { .. }
+            | pbps_model::Change::SetPrimaryKey { to: Some(_), .. }
+            | pbps_model::Change::AddUnique { .. }
+            | pbps_model::Change::AddForeignKey { .. }
+            | pbps_model::Change::AddCheck { .. }
+            | pbps_model::Change::AddIndex { .. }
+            | pbps_model::Change::CreateModule { .. }
+            | pbps_model::Change::AlterModule { .. }
+            | pbps_model::Change::CreateRole { .. }
+            | pbps_model::Change::Grant { .. }
+            | pbps_model::Change::PublicExecution { .. }
+            | pbps_model::Change::SetDataMode { .. }
+    )
 }
 
 /// [`order_after_releases`], with the live edges of every table the plan
@@ -2366,8 +2370,7 @@ mod tests {
         );
         // A row writing `a` that runs before the release, as it does when the
         // release follows a function create: the retype cannot both follow the
-        // release and precede the row, so the plan is refused by name. A row
-        // writing another column does not hold it back.
+        // release and precede the row, so the plan is refused by name.
         let update = |column: &str| Change::UpdateRow {
             table: t.clone(),
             key_column: "id".into(),
@@ -2385,11 +2388,17 @@ mod tests {
         };
         let mut cs = plan(vec![retype("a"), update("a"), recompute("b * 2")]);
         let refusal = order_after_releases(&mut cs, &reads_a).unwrap_err();
-        assert!(
-            refusal.contains("writes it before that change runs"),
-            "{refusal}"
-        );
+        assert!(refusal.contains("may need the new type"), "{refusal}");
+        // So does any row in between, of another column as much, and a
+        // module; a moved drop of another input does not hold it back.
         let mut cs = plan(vec![retype("a"), update("b"), recompute("b * 2")]);
+        assert!(order_after_releases(&mut cs, &reads_a).is_err());
+        let mut cs = plan(vec![
+            retype("a"),
+            set_default("c_ffffff", "b"),
+            drop("c"),
+            recompute("b * 2"),
+        ]);
         assert_eq!(order_after_releases(&mut cs, &reads_a), Ok(1));
         // The new text may still read `a`: nothing moves, and the check
         // refuses it.

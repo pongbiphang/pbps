@@ -1301,11 +1301,14 @@ create, and before the checks that read the order (`drop_blockers`,
 A change between the drop and its release that takes the dropped column's
 name, an `AddColumn` or a `RenameColumn` into it, needs the name free, and the
 release needs the column still there. The plan is refused by name, with the
-two-plan remedy. So is a retype whose release follows a function the plan
-creates, when a row the plan writes to the column runs in between: rows go
-before the modules, and need the new type.
-
-This is a narrow rule for one combination, not a general order.
+two-plan remedy. So is a retype that would move past anything the differ puts
+after the column alterations: rows, keys and constraints, modules, roles and
+grants. That happens only when its release follows a function the plan
+creates. The release then sits after those changes (`after_the_rebuilds`), and
+any of them may need the new type: a row may write a value only that type
+accepts, and a function body may be checked against it. The retype cannot both
+follow its release and precede them. A drop of another input, moved after its
+own release, needs nothing of this column's type and does not hold it back.
 
 Pinned by `a_released_input_is_retyped_or_dropped_after_its_release`
 (`crates/pbps-cli/src/engine.rs`), `a_replaced_internal_member_keeps_its_owner`
