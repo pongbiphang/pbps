@@ -88,7 +88,10 @@ steps:
 1. List, for each change kind, what has to hold before it runs, and what it
    creates, removes or rewrites ([the table below](#what-each-change-requires)).
 2. A pair of kinds interacts when one side's effect meets the other side's
-   requirement. Every other pair is **independent**. Each interacting pair falls
+   requirement. Every other pair is **independent**. Each entry of the
+   *Requires before it* column is matched against the *Creates, removes or
+   rewrites* column of every kind, so each requirement has at least one row
+   below, or none of the 33 kinds can affect it. Each interacting pair falls
    into one of four classes:
    - **Fixed direction.** Whenever they interact, one must precede the other,
      whatever the content. Position can express it, and the audit checks that
@@ -174,6 +177,9 @@ other's requirement in the table above. Columns:
 | Referenced key → `AddForeignKey` | fixed | rank inside class 13 | ✓ |
 | Parent row → child row | fixed | data rank inside class 11 | ✓ |
 | `CreateRole` → `Grant` to it | fixed | class 15 before 16 | ✓ |
+| `CreateModule` or `AlterModule` → `Grant` or `PublicExecution` on the routine | fixed | class 14 before 16. P: a rebuild's lost grants and `PUBLIC` execute are restated after it | ✓ ADR-0010 §5 |
+| Tightening → primary key or unique key over the column | fixed | class 9 before 13 | ✓ |
+| Row writes → `SetDataMode` of their table | fixed | class 11 and 12 before 17 | ✓ |
 | Module → module that names it | content, over-approximated | `creation_order_with`, lexed names (DECISIONS 315) | ✓ |
 | Function created or rebuilt → check, filtered index or set default calling it | content, over-approximated | `after_the_rebuilds`: after the last function create | ✓ DEC-942.1 |
 | Function created or rebuilt → `AlterColumnExpression` calling it | content, over-approximated | `after_the_rebuilds` | ✓ DEC-1168.1 |
@@ -205,7 +211,8 @@ other's requirement in the table above. Columns:
 |---|---|---|---|
 | Retype → probes of later keys, checks and deletes | value | the probe projects through the new type, or the probe is unchecked | ✓ DECISIONS 340, 410 |
 | `AddColumn` backfill → probes | value | a literal is projected; an expression, identity or generated column is unchecked | ✓ DECISIONS 336, 339 |
-| Row writes → probes of keys and foreign keys | value | the probe reads the rows after the plan's writes | ✓ DECISIONS 335 |
+| Row writes → probes of keys, foreign keys and checks | value | the probe reads the rows after the plan's writes | ✓ DECISIONS 335 |
+| **Row writes setting a column → tightening it to NOT NULL** | fixed, value | the tightening (class 9) runs before the rows (11), and its probe counts the NULLs stored now | **✗ #1367** |
 | `AlterColumnExpression` → tightening, keys, checks, filtered indexes, deletes | value | the probe is unchecked; the order is tighten and keys after the recomputation | ✓ DEC-1168.1 |
 | Default set → a row that takes it | value | the default goes first; it stays ahead of a rebuild | ✓ #1030 |
 | Row update moving references away → `DeleteRow` | value | class 11 before 12 | ✓ |
@@ -274,6 +281,7 @@ counterpart would make that table the one row a new kind adds.
 | Finding | Kind | Disposition |
 |---|---|---|
 | S: tightening a column an index or a unique constraint covers is refused at apply | fixed, wrong | #1363 |
+| Tightening runs before the reference rows that fill its NULLs, and its probe ignores them | fixed, wrong | #1367 |
 | Content-dependent corners of expression-bearing changes around function creates, rebuilds and drops | content | #1350; the lexical over-approximation above as the structural fix, #1364 |
 | Value-flow guards are per-probe, not one rule | value | recorded above; a refactor when a new value-rewriting kind arrives (#1174) |
 
