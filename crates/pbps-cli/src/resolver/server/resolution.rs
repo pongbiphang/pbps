@@ -14,7 +14,9 @@ fn required(schema: &Schema) -> BTreeSet<Surface> {
     let mut surfaces = BTreeSet::new();
     for (table, definition) in &schema.tables {
         for (column, spec) in &definition.columns {
-            if spec.default.is_some() {
+            // Both declarations bind through pg_attrdef; their expressions
+            // remain distinct model fields (DEC-1168.1).
+            if spec.default.is_some() || spec.generated.is_some() {
                 surfaces.insert(Surface::Default(table.column(column)));
             }
         }

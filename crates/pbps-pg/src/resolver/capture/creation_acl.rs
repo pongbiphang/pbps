@@ -327,6 +327,7 @@ pub(super) fn retained_acl_after_plan(
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -515,6 +516,7 @@ pub(super) fn routine_acl_after_plan(
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }

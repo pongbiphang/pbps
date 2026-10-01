@@ -282,6 +282,7 @@ fn retained_source(
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -325,6 +326,7 @@ fn retained_source(
                 | Change::AlterColumnType { .. }
                 | Change::AlterColumnNullability { .. }
                 | Change::AlterColumnDefault { .. }
+                | Change::AlterColumnExpression { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
                 | Change::AddUnique { .. }
@@ -651,6 +653,7 @@ impl CompiledCapture {
                     | Change::AlterColumnType { .. }
                     | Change::AlterColumnNullability { .. }
                     | Change::AlterColumnDefault { .. }
+                    | Change::AlterColumnExpression { .. }
                     | Change::SetColumnDeprecated { .. }
                     | Change::SetPrimaryKey { .. }
                     | Change::AddUnique { .. }
@@ -850,6 +853,7 @@ impl CompiledCapture {
                 | Change::AlterColumnType { .. }
                 | Change::AlterColumnNullability { .. }
                 | Change::AlterColumnDefault { .. }
+                | Change::AlterColumnExpression { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
                 | Change::AddUnique { .. }
@@ -889,6 +893,7 @@ impl CompiledCapture {
                 | Change::AlterColumnType { .. }
                 | Change::AlterColumnNullability { .. }
                 | Change::AlterColumnDefault { .. }
+                | Change::AlterColumnExpression { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
                 | Change::AddUnique { .. }
@@ -1013,6 +1018,7 @@ impl CompiledCapture {
                 | Change::AlterColumnType { .. }
                 | Change::AlterColumnNullability { .. }
                 | Change::AlterColumnDefault { .. }
+                | Change::AlterColumnExpression { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
                 | Change::AddUnique { .. }
