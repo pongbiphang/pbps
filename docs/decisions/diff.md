@@ -1127,11 +1127,12 @@ Measured on 16.15, 17.11 and 18.6:
   `NOT NULL` over null inputs at `ADD`. The first is refused at validation.
   The rest are the engine's, inside the transaction.
 
-Within their ordering classes a generated column is added after the
-ordinary columns and dropped before them, keyed by uid so a table rename in
-the same plan does not hide it. The engine refuses an expression over a
-column not yet added, and refuses to drop a column a generated column still
-reads. A generated column never reads another, so one layer each way is the
+A generated column is dropped before the ordinary columns of its class,
+keyed by uid so a table rename in the same plan does not hide it. It is added
+after every column addition and every in-place column alteration (type,
+nullability, default, expression). The engine refuses an expression over a
+column not yet added, refuses to drop a column a generated column still
+reads, and refuses to retype one, measured on 17.11. A generated column never reads another, so one layer each way is the
 whole order. That holds in the class a column rename brings all of its
 table's drops into. A recomputed value is checked against the column's
 nullability as it stands, so relaxing it runs before the expression change

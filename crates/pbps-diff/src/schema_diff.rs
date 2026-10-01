@@ -698,11 +698,14 @@ fn diff_partial_rebuilding(
         })
         .collect();
     let sort_class = |c: &Change| -> (u8, usize) {
-        // A generated column is dropped before, and added after, the ordinary
-        // columns of its class. Measured, the engine refuses to drop a column
-        // a generated column reads, and refuses a generation expression over a
-        // column that is not there yet; a generated column never reads another
-        // (DEC-1168.1), so one layer each way is the whole order.
+        // A generated column is dropped before the ordinary columns of its
+        // class, and added after every column change of the class beyond:
+        // the additions, and the in-place alterations of class 9. Measured,
+        // the engine refuses to drop a column a generated column reads,
+        // refuses a generation expression over a column that is not there yet,
+        // and refuses to retype one a generated column reads. A generated
+        // column never reads another, and nothing in class 9 needs one that is
+        // new, so one layer each way is the whole order (DEC-1168.1).
         let drops_generated =
             matches!(c, Change::DropColumn { uid, .. } if generated_in_base.contains(uid));
         if frees_a_renamed_column(c) {
@@ -736,7 +739,7 @@ fn diff_partial_rebuilding(
         if let Change::AddColumn { column, .. } = c
             && column.generated.is_some()
         {
-            return (order_key(c), 2);
+            return (COLUMN_ALTERATIONS, 2);
         }
         if let Change::RenameColumn { table, from, .. } = c {
             let depth = chain_depth
@@ -2508,6 +2511,11 @@ fn diff_modules(
 /// 151, 174 and 237, `docs/PITFALLS.md`, `preflight.rs` and `deploy.rs`. A new
 /// class means renumbering those in the same commit — a stale ordinal there
 /// reads as a statement about the code and is not checked against it.
+/// The class of the changes that alter an existing column in place: its
+/// type, nullability, default or generation expression. Named because a
+/// generated column's addition is placed after it (DEC-1168.1).
+const COLUMN_ALTERATIONS: u8 = 9;
+
 fn order_key(c: &Change) -> u8 {
     match c {
         // Modules go first and last, and both ends are load-bearing. A
@@ -2584,7 +2592,7 @@ fn order_key(c: &Change) -> u8 {
         Change::AlterColumnType { .. }
         | Change::AlterColumnNullability { .. }
         | Change::AlterColumnDefault { .. }
-        | Change::AlterColumnExpression { .. } => 9,
+        | Change::AlterColumnExpression { .. } => COLUMN_ALTERATIONS,
         Change::SetColumnDeprecated { .. } => 10,
         // Rows arrive once every column they name exists and has its final
         // type, and before the constraints below: ADR-0004's "create table ->
@@ -8276,6 +8284,8 @@ mod tests {
                     Some(format!("+{name}"))
                 } else if let Change::DropColumn { column, .. } = &p.change {
                     Some(format!("-{}", column.name))
+                } else if let Change::AlterColumnType { column, .. } = &p.change {
+                    Some(format!("~{}", column.name))
                 } else {
                     None
                 }
@@ -8284,6 +8294,16 @@ mod tests {
         };
         // `a0` sorts before `b` by name, and is added after it.
         assert_eq!(order(&bare, &with("a0", "b"), &[]), ["+b", "+a0"]);
+        // And after a retype of an input it reads, which the engine refuses
+        // once the generated column stands.
+        let narrow = schema_of(
+            "app.t",
+            table(&[
+                ("id", Column::new(ty("int"))),
+                ("b", Column::new(ty("smallint"))),
+            ]),
+        );
+        assert_eq!(order(&narrow, &with("a0", "b"), &[]), ["~b", "+a0"]);
         // `zz` sorts after `a` by name, and is dropped before it.
         let t: TableName = "app.t".parse().unwrap();
         let drops = ["a", "zz"].map(|c| pbps_model::Intent::DropColumn {
