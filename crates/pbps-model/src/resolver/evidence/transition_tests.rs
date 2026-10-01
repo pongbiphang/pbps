@@ -563,11 +563,15 @@ fn table_creation_requires_the_owner_even_with_a_child_transition() {
         Surface::Default(table.column("n")),
         Surface::Column(table.column("n")),
     ] {
+        let mut definition = definition.clone();
+        if matches!(&child, Surface::Column(_)) {
+            definition.columns.get_mut("n").unwrap().default = None;
+        }
         owner_coverage(
             Change::CreateTable {
                 uid: "t_000000".parse().unwrap(),
                 name: table.clone(),
-                table: Box::new(definition.clone()),
+                table: Box::new(definition),
             },
             Surface::Table(table.clone()),
             child,
