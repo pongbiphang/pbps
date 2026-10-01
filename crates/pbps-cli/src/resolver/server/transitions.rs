@@ -173,31 +173,132 @@ pub(super) fn derive(
     compiled: &[BindingRecord],
 ) -> Result<Vec<ObjectTransition>, Error> {
     let mut affected: BTreeMap<Surface, Affected> = BTreeMap::new();
+    let mut final_tables = base.ids.tables.clone();
     for step in &changes.changes {
+        if let Change::CreateTable { uid, name, .. } = &step.change {
+            final_tables.insert(uid.clone(), name.clone());
+        } else if let Change::RenameTable { uid, to, .. } = &step.change {
+            final_tables.insert(uid.clone(), to.clone());
+        }
+    }
+    let mut tables = BTreeMap::new();
+    for (uid, table) in &base.ids.tables {
+        if tables.insert(table.clone(), uid.clone()).is_some() {
+            return Err(Error::Binding(
+                "duplicate recorded opening table identity".into(),
+            ));
+        }
+    }
+    for step in &changes.changes {
+        let parent = if let Change::AddColumn { table, .. }
+        | Change::RenameColumn { table, .. } = &step.change
+        {
+            Some(table)
+        } else if let Change::DropColumn { column, .. } = &step.change {
+            Some(&column.table)
+        } else {
+            None
+        };
+        if let Some(table) = parent {
+            let uid = tables.get(table).ok_or_else(|| {
+                Error::Binding("a column-vector change lacks its recorded table UID".into())
+            })?;
+            let final_table = final_tables.get(uid).ok_or_else(|| {
+                Error::Binding(
+                    "a parent inventory lacks its recorded closing table endpoint".into(),
+                )
+            })?;
+            if desired.ids.tables.get(uid).is_some_and(|recorded| recorded != final_table) {
+                return Err(Error::Binding(
+                    "a parent inventory disagrees with its closing table UID".into(),
+                ));
+            }
+            let prior = base.ids.tables.get(uid).cloned().map(Surface::Table);
+            let entry = affected
+                .entry(Surface::Table(final_table.clone()))
+                .or_default();
+            if entry.dropped_before.is_some() && entry.dropped_before != prior {
+                return Err(Error::Binding(
+                    "a parent inventory mixes recorded table UIDs".into(),
+                ));
+            }
+            // Keep the parent exact: adding it must not grant authority over
+            // other columns, defaults, checks or independent indexes.
+            entry.opening = true;
+            entry.closing = true;
+            entry.dropped_before = prior;
+        }
         let (surface, children, opening, closing, dropped) = match &step.change {
-            Change::CreateTable { name, .. } => {
-                (Surface::Table(name.clone()), true, false, true, None)
+            Change::CreateTable { uid, name, .. } => {
+                if tables.values().any(|known| known == uid)
+                    || tables.insert(name.clone(), uid.clone()).is_some()
+                {
+                    return Err(Error::Binding(
+                        "a table creation reuses a live recorded identity".into(),
+                    ));
+                }
+                let endpoint = final_tables.get(uid).ok_or_else(|| {
+                    Error::Binding("a created table lacks its recorded closing endpoint".into())
+                })?;
+                (Surface::Table(endpoint.clone()), true, false, true, None)
             }
-            Change::DropTable { name, .. } => (
-                Surface::Table(name.clone()),
-                true,
-                true,
-                false,
-                Some(Surface::Table(name.clone())),
-            ),
-            Change::RenameTable { to, .. } => (Surface::Table(to.clone()), true, true, true, None),
-            Change::AddColumn { table, name, .. } => {
-                (Surface::Column(table.column(name)), true, false, true, None)
+            Change::DropTable { uid, name, .. } => {
+                if tables.remove(name).as_ref() != Some(uid) {
+                    return Err(Error::Binding(
+                        "a table drop disagrees with its recorded UID".into(),
+                    ));
+                }
+                (
+                    Surface::Table(name.clone()),
+                    true,
+                    true,
+                    false,
+                    Some(Surface::Table(
+                        base.ids.tables.get(uid).cloned().unwrap_or_else(|| name.clone()),
+                    )),
+                )
             }
-            Change::DropColumn { column, .. } => (
+            Change::RenameTable { uid, from, to, .. } => {
+                if tables.remove(from).as_ref() != Some(uid)
+                    || tables.insert(to.clone(), uid.clone()).is_some()
+                {
+                    return Err(Error::Binding(
+                        "a table rename disagrees with its recorded UID".into(),
+                    ));
+                }
+                let endpoint = final_tables.get(uid).ok_or_else(|| {
+                    Error::Binding("a renamed table lacks its recorded closing endpoint".into())
+                })?;
+                (
+                    Surface::Table(endpoint.clone()),
+                    true,
+                    true,
+                    true,
+                    base.ids.tables.get(uid).cloned().map(Surface::Table),
+                )
+            }
+            Change::AddColumn { uid, table, name, .. } => {
+                let final_column = final_column(uid, &table.column(name), desired);
+                (Surface::Column(final_column), true, false, true, None)
+            }
+            Change::DropColumn { uid, column, .. } => (
                 Surface::Column(column.clone()),
                 true,
                 true,
                 false,
-                Some(Surface::Column(column.clone())),
+                Some(Surface::Column(
+                    base.ids.columns.get(uid).cloned().unwrap_or_else(|| column.clone()),
+                )),
             ),
-            Change::RenameColumn { table, to, .. } => {
-                (Surface::Column(table.column(to)), true, true, true, None)
+            Change::RenameColumn { uid, table, to, .. } => {
+                let final_column = final_column(uid, &table.column(to), desired);
+                (
+                    Surface::Column(final_column),
+                    true,
+                    true,
+                    true,
+                    base.ids.columns.get(uid).cloned().map(Surface::Column),
+                )
             }
             Change::AlterColumnType { uid, column, .. } => (
                 Surface::Column(final_column(uid, column, desired)),

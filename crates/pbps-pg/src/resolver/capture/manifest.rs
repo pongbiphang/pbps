@@ -108,6 +108,234 @@ fn relation_identity(table: &pbps_model::TableName) -> ObjectIdentity {
     }
 }
 
+struct ParentColumnOrder {
+    source: ObjectIdentity,
+    columns: Vec<ObjectIdentity>,
+    separate_table_mutation: bool,
+    key_change: bool,
+}
+
+// A declaration map cannot predict the live order of an existing relation.
+// Replay only approved vector operations against the opening UID-backed order;
+// physical slots and the independently compiled scratch order are not answers.
+fn projected_column_order(
+    opening: &CapturedInputs,
+    compiled: &CapturedInputs,
+    changes: &pbps_model::ChangeSet,
+    base_ids: &pbps_model::IdsFile,
+    desired_ids: &pbps_model::IdsFile,
+    table: &pbps_model::TableName,
+) -> Result<Option<ParentColumnOrder>, pbps_model::resolver::ManifestError> {
+    use pbps_model::Change;
+    use pbps_model::resolver::ManifestError;
+    if !changes.changes.iter().any(|step| {
+        matches!(
+            &step.change,
+            Change::AddColumn { .. } | Change::DropColumn { .. } | Change::RenameColumn { .. }
+        )
+    }) {
+        return Ok(None);
+    }
+    let mut recorded_tables = desired_ids.tables.iter().filter(|(_, name)| *name == table);
+    let (table_uid, _) = recorded_tables.next().ok_or(ManifestError::Invalid)?;
+    if recorded_tables.next().is_some() {
+        return Err(ManifestError::Invalid);
+    }
+    let Some(prior) = base_ids.tables.get(table_uid) else {
+        // Only an explicit CREATE explains the absence of an opening order.
+        if changes.changes.iter().any(|step| {
+            matches!(&step.change, Change::CreateTable { uid, .. } if uid == table_uid)
+        }) {
+            return Ok(None);
+        }
+        return Err(ManifestError::Invalid);
+    };
+    if base_ids
+        .tables
+        .values()
+        .filter(|name| *name == prior)
+        .count()
+        != 1
+    {
+        return Err(ManifestError::Invalid);
+    }
+    let mut current = prior.clone();
+    let mut affected = false;
+    let mut separate = false;
+    let mut key_change = false;
+    for step in &changes.changes {
+        if let Change::RenameTable { uid, from, to, .. } = &step.change
+            && uid == table_uid
+        {
+            if &current != from {
+                return Err(ManifestError::Invalid);
+            }
+            current = to.clone();
+            separate = true;
+        }
+        if let Change::AddColumn { table, .. } | Change::RenameColumn { table, .. } = &step.change {
+            affected |= table == &current;
+        } else if let Change::DropColumn { column, .. } = &step.change {
+            affected |= column.table == current;
+        }
+        if let Change::SetPrimaryKey { table, .. }
+            | Change::AddUnique { table, .. }
+            | Change::DropUnique { table, .. }
+            | Change::AddForeignKey { table, .. }
+            | Change::DropForeignKey { table, .. } = &step.change
+        {
+            separate |= table == &current;
+            key_change |= table == &current;
+        }
+    }
+    if !affected {
+        return Ok(None);
+    }
+    if &current != table {
+        return Err(ManifestError::Invalid);
+    }
+    let source = relation_identity(prior);
+    let read_order = |capture: &CapturedInputs, relation: &ObjectIdentity| {
+        let input = capture
+            .inputs
+            .get(relation)
+            .ok_or(ManifestError::Incomplete)?;
+        if !matches!(
+            input.properties.get("relkind").and_then(Value::as_str),
+            Some("r" | "p")
+        ) {
+            return Err(ManifestError::Invalid);
+        }
+        let order: Vec<ObjectIdentity> = serde_json::from_value(
+            input
+                .properties
+                .get("column_order")
+                .cloned()
+                .ok_or(ManifestError::Incomplete)?,
+        )
+        .map_err(|_| ManifestError::Invalid)?;
+        let mut seen = BTreeSet::new();
+        for column in &order {
+            if column.class != "column"
+                || column.name.len() != 1
+                || column.name[0].is_empty()
+                || column.signature != [relation.clone()]
+                || !seen.insert(column.clone())
+                || !capture.inputs.contains_key(column)
+            {
+                return Err(ManifestError::Invalid);
+            }
+        }
+        let mut live = BTreeMap::new();
+        for (column, number) in &capture.attribute_numbers {
+            if *number > 0
+                && column.signature == [relation.clone()]
+                && live.insert(*number, column.clone()).is_some()
+            {
+                return Err(ManifestError::Invalid);
+            }
+        }
+        if seen != live.values().cloned().collect() {
+            return Err(ManifestError::Incomplete);
+        }
+        if order != live.into_values().collect::<Vec<_>>() {
+            return Err(ManifestError::Invalid);
+        }
+        Ok(order)
+    };
+    let opening_order = read_order(opening, &source)?;
+    let mut order = Vec::new();
+    let mut used = BTreeSet::new();
+    for column in opening_order {
+        let reference = prior.column(&column.name[0]);
+        let mut recorded = base_ids.columns.iter().filter(|(_, name)| *name == &reference);
+        let (uid, _) = recorded.next().ok_or(ManifestError::Invalid)?;
+        if recorded.next().is_some() {
+            return Err(ManifestError::Invalid);
+        }
+        let uid = uid.clone();
+        if !used.insert(uid.clone()) {
+            return Err(ManifestError::Invalid);
+        }
+        order.push((uid, column));
+    }
+    current = prior.clone();
+    for step in &changes.changes {
+        if let Change::RenameTable { uid, from, to, .. } = &step.change
+            && uid == table_uid
+        {
+            if &current != from {
+                return Err(ManifestError::Invalid);
+            }
+            current = to.clone();
+            for (_, column) in &mut order {
+                column.signature = vec![relation_identity(&current)];
+            }
+        } else if let Change::DropTable { uid, .. } | Change::CreateTable { uid, .. } = &step.change
+            && uid == table_uid
+        {
+            return Err(ManifestError::Invalid);
+        } else if let Change::AddColumn { uid, table, name, .. } = &step.change
+            && table == &current
+        {
+            if name.is_empty()
+                || !used.insert(uid.clone())
+                || order.iter().any(|(_, column)| column.name == [name.clone()])
+            {
+                return Err(ManifestError::Invalid);
+            }
+            order.push((
+                uid.clone(),
+                ObjectIdentity {
+                    class: "column".into(),
+                    name: vec![name.clone()],
+                    signature: vec![relation_identity(&current)],
+                },
+            ));
+        } else if let Change::DropColumn { uid, column, .. } = &step.change
+            && column.table == current
+        {
+            let position = order
+                .iter()
+                .position(|(known, object)| known == uid && object.name == [column.name.clone()])
+                .ok_or(ManifestError::Invalid)?;
+            order.remove(position);
+        } else if let Change::RenameColumn { uid, table, from, to, .. } = &step.change
+            && table == &current
+        {
+            if to.is_empty() || order.iter().any(|(_, column)| column.name == [to.clone()]) {
+                return Err(ManifestError::Invalid);
+            }
+            let (_, column) = order
+                .iter_mut()
+                .find(|(known, column)| known == uid && column.name == [from.clone()])
+                .ok_or(ManifestError::Invalid)?;
+            column.name = vec![to.clone()];
+        }
+    }
+    let final_relation = relation_identity(table);
+    let mut projected = Vec::new();
+    for (uid, column) in order {
+        let reference = table.column(&column.name[0]);
+        if desired_ids.columns.get(&uid) != Some(&reference)
+            || desired_ids.columns.values().filter(|name| *name == &reference).count() != 1
+        {
+            return Err(ManifestError::Invalid);
+        }
+        projected.push(column);
+    }
+    let desired_order = read_order(compiled, &final_relation)?;
+    if projected.iter().collect::<BTreeSet<_>>() != desired_order.iter().collect::<BTreeSet<_>>() {
+        return Err(ManifestError::Incomplete);
+    }
+    Ok(Some(ParentColumnOrder {
+        source,
+        columns: projected,
+        separate_table_mutation: separate,
+        key_change,
+    }))
+}
+
 /// Validate explicit index creation against the unmodified scratch capture.
 /// Table-rename projection changes the parent's owner later in the seal, so
 /// comparing an index with that mutable parent would depend on surface order.
@@ -254,11 +482,11 @@ fn target_value(value: &Value) -> Result<Value, pbps_model::resolver::ManifestEr
 fn retained_source(
     object: &ObjectIdentity,
     transition: &pbps_model::resolver::ObjectTransition,
-    changes: &pbps_model::ChangeSet,
     opening: &CapturedInputs,
     compiled: &CapturedInputs,
+    base_ids: &pbps_model::IdsFile,
+    desired_ids: &pbps_model::IdsFile,
 ) -> Option<ObjectIdentity> {
-    use pbps_model::Change;
     use pbps_model::resolver::Surface;
     let final_table = match &transition.surface {
         Surface::Table(table) => table,
@@ -268,95 +496,18 @@ fn retained_source(
         }
         Surface::Default(_) | Surface::Check { .. } | Surface::Index { .. } => return None,
     };
-    let prior_table = changes
-        .changes
-        .iter()
-        .find_map(|step| match &step.change {
-            Change::RenameTable { from, to, .. } if to == final_table => Some(from),
-            Change::CreateTable { .. }
-            | Change::DropTable { .. }
-            | Change::RenameTable { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnType { .. }
-            | Change::AlterColumnNullability { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => None,
-        })
-        .unwrap_or(final_table);
+    let prior_table = desired_ids
+        .table_uid(final_table)
+        .and_then(|uid| base_ids.tables.get(uid))?;
     let before_relation = relation_identity(prior_table);
     let before_column = |name: &str| {
-        let prior = changes
-            .changes
-            .iter()
-            .find_map(|step| match &step.change {
-                Change::RenameColumn {
-                    table, from, to, ..
-                } if table == final_table && to == name => Some(from.as_str()),
-                Change::CreateTable { .. }
-                | Change::DropTable { .. }
-                | Change::RenameTable { .. }
-                | Change::AddColumn { .. }
-                | Change::DropColumn { .. }
-                | Change::RenameColumn { .. }
-                | Change::AlterColumnType { .. }
-                | Change::AlterColumnNullability { .. }
-                | Change::AlterColumnDefault { .. }
-                | Change::AlterColumnExpression { .. }
-                | Change::SetColumnDeprecated { .. }
-                | Change::SetPrimaryKey { .. }
-                | Change::AddUnique { .. }
-                | Change::DropUnique { .. }
-                | Change::AddForeignKey { .. }
-                | Change::DropForeignKey { .. }
-                | Change::AddCheck { .. }
-                | Change::DropCheck { .. }
-                | Change::AddIndex { .. }
-                | Change::DropIndex { .. }
-                | Change::InsertRow { .. }
-                | Change::UpdateRow { .. }
-                | Change::DeleteRow { .. }
-                | Change::SetDataMode { .. }
-                | Change::CreateModule { .. }
-                | Change::AlterModule { .. }
-                | Change::DropModule { .. }
-                | Change::CreateRole { .. }
-                | Change::DropRole { .. }
-                | Change::RenameRole { .. }
-                | Change::Grant { .. }
-                | Change::Revoke { .. }
-                | Change::PublicExecution { .. } => None,
-            })
-            .unwrap_or(name);
-        ObjectIdentity {
+        let uid = desired_ids.column_uid(&final_table.column(name))?;
+        let prior = base_ids.columns.get(uid)?;
+        (prior.table == *prior_table).then(|| ObjectIdentity {
             class: "column".into(),
-            name: vec![prior.into()],
+            name: vec![prior.name.clone()],
             signature: vec![before_relation.clone()],
-        }
+        })
     };
     let reference = |capture: &CapturedInputs, owner: &ObjectIdentity, field: &str| {
         capture
@@ -370,7 +521,7 @@ fn retained_source(
         "pg_class" if object.name == [final_table.schema.clone(), final_table.name.clone()] => {
             before_relation
         }
-        "column" => before_column(object.name.first()?),
+        "column" => before_column(object.name.first()?)?,
         "pg_type" => {
             // PostgreSQL renames a relation's row and array types with the
             // table. Match the qualified type references, never a guessed
@@ -1051,6 +1202,51 @@ impl CompiledCapture {
             .keys()
             .map(|raw| Ok((normalize_identity(raw, Some(&self.roles))?, raw.clone())))
             .collect::<Result<_, ManifestError>>()?;
+        let mut column_names = BTreeMap::new();
+        for (uid, before) in &base_ids.columns {
+            if let Some(after) = desired_ids.columns.get(uid)
+                && before != after
+            {
+                if !changes.changes.iter().any(|step| {
+                    matches!(&step.change,
+                        Change::RenameColumn { uid: renamed, .. } if renamed == uid)
+                        || matches!(&step.change, Change::RenameTable { uid: renamed, .. }
+                            if base_ids.tables.get(renamed) == Some(&before.table))
+                }) {
+                    return Err(ManifestError::Invalid);
+                }
+                let identity = |column: &pbps_model::ColumnRef| ObjectIdentity {
+                    class: "column".into(),
+                    name: vec![column.name.clone()],
+                    signature: vec![relation_identity(&column.table)],
+                };
+                column_names.insert(identity(before), identity(after));
+            }
+        }
+        let mut parent_orders = BTreeMap::new();
+        for transition in transitions {
+            if let Surface::Table(table) = &transition.surface
+                && !transition.after.is_empty()
+                && let Some(parent) = projected_column_order(
+                    opening,
+                    &self.captured,
+                    changes,
+                    base_ids,
+                    desired_ids,
+                    table,
+                )?
+            {
+                let relation = relation_identity(table);
+                if !transition.before.contains(&parent.source)
+                    || !transition.after.contains(&relation)
+                    || self.ownership.get(&relation)
+                        != Some(&ObjectOwnership::Surface(transition.surface.clone()))
+                {
+                    return Err(ManifestError::Incomplete);
+                }
+                parent_orders.insert(transition.surface.clone(), parent);
+            }
+        }
         let mut preserved_dependencies = BTreeSet::new();
         let mut created_dependencies = BTreeSet::new();
         let mut created_owned_subjects = BTreeSet::new();
@@ -1086,9 +1282,39 @@ impl CompiledCapture {
                 // A transition may retain its table while replacing its
                 // constraint or index. Preserve only records with a proved
                 // opening counterpart, never the entire surface inventory.
-                let source = (!created)
-                    .then(|| retained_source(object, transition, changes, opening, &self.captured))
-                    .flatten();
+                let parent = parent_orders.get(&transition.surface);
+                let parent_relation = if let Surface::Table(table) = &transition.surface {
+                    object == &relation_identity(table)
+                } else {
+                    false
+                };
+                let preserve_parent = parent.is_some_and(|parent| {
+                    parent_relation || !parent.separate_table_mutation
+                }) && owner == &ObjectOwnership::Surface(transition.surface.clone());
+                let source = if preserve_parent {
+                    let source = if parent_relation {
+                        parent.ok_or(ManifestError::Invalid)?.source.clone()
+                    } else {
+                        object.clone()
+                    };
+                    if !transition.before.contains(&source) {
+                        return Err(ManifestError::Incomplete);
+                    }
+                    Some(source)
+                } else {
+                    (!created)
+                        .then(|| {
+                            retained_source(
+                                object,
+                                transition,
+                                opening,
+                                &self.captured,
+                                base_ids,
+                                desired_ids,
+                            )
+                        })
+                        .flatten()
+                };
                 if source.is_none() {
                     created_owned_subjects.insert(object.clone());
                 }
@@ -1097,23 +1323,67 @@ impl CompiledCapture {
                         .inputs
                         .get(&source)
                         .ok_or(ManifestError::Incomplete)?;
-                    let fields: &[&str] = match object.class.as_str() {
-                        "pg_class" => &["relowner", "relacl"],
-                        "pg_proc" => &["proowner", "proacl"],
-                        "pg_namespace" => &["nspowner", "nspacl"],
-                        "column" => &["attacl"],
-                        "pg_type" => &["typowner"],
-                        _ => &[],
+                    let mut fields: Vec<&str> = if preserve_parent {
+                        before.properties.keys().map(String::as_str).collect()
+                    } else {
+                        match object.class.as_str() {
+                            "pg_class" => vec!["relowner", "relacl"],
+                            "pg_proc" => vec!["proowner", "proacl"],
+                            "pg_namespace" => vec!["nspowner", "nspacl"],
+                            "column" => vec!["attacl"],
+                            "pg_type" => vec!["typowner"],
+                            _ => Vec::new(),
+                        }
                     };
+                    if parent.is_some() && parent_relation && !fields.contains(&"column_order") {
+                        fields.push("column_order");
+                    }
+                    let references_changed = preserve_parent
+                        && (before.properties.values().any(|value| {
+                            relocated_value(value, &column_names)
+                                .is_ok_and(|mapped| mapped != *value)
+                        }) || before.bindings.iter().any(|binding| {
+                            relocated_identity(&binding.target, &column_names) != binding.target
+                        }));
                     if !fields.is_empty() {
                         let mut values = Vec::new();
                         let mut changed_acl = None;
-                        for field in fields {
+                        for field in &fields {
                             let original = before
                                 .properties
                                 .get(*field)
                                 .ok_or(ManifestError::Incomplete)?;
-                            let projected = if matches!(*field, "relacl" | "proacl" | "nspacl") {
+                            let relocated = if preserve_parent {
+                                relocated_value(original, &column_names)?
+                            } else {
+                                original.clone()
+                            };
+                            // A column operation preserves the existing table;
+                            // only a separately approved rename/key operation
+                            // may replace these other relation properties.
+                            let renamed_relation = parent_relation && source != *object
+                                && matches!(*field, "relname" | "relnamespace" | "reltype");
+                            let changed_key = parent_relation && *field == "relreplident"
+                                && parent.is_some_and(|parent| parent.key_change);
+                            let projected = if renamed_relation || changed_key
+                                || *field == "engine_definition" && references_changed
+                            {
+                                Some(
+                                    self.captured
+                                        .inputs
+                                        .get(raw)
+                                        .and_then(|input| input.properties.get(*field))
+                                        .cloned()
+                                        .ok_or(ManifestError::Incomplete)?,
+                                )
+                            } else if parent_relation && *field == "column_order" {
+                                Some(
+                                    serde_json::to_value(
+                                        &parent.ok_or(ManifestError::Invalid)?.columns,
+                                    )
+                                    .map_err(|_| ManifestError::Invalid)?,
+                                )
+                            } else if matches!(*field, "relacl" | "proacl" | "nspacl") {
                                 super::creation_acl::retained_acl_after_plan(
                                     opening,
                                     &self.captured,
@@ -1126,12 +1396,14 @@ impl CompiledCapture {
                             } else {
                                 None
                             };
-                            if let Some(acl) = &projected {
+                            if let Some(acl) = &projected
+                                && matches!(*field, "relacl" | "proacl" | "nspacl")
+                            {
                                 changed_acl = Some(acl.clone());
                             }
                             values.push((
                                 (*field).to_owned(),
-                                target_value(projected.as_ref().unwrap_or(original))?,
+                                target_value(projected.as_ref().unwrap_or(&relocated))?,
                             ));
                         }
                         if let Some(acl) = changed_acl {
@@ -1179,6 +1451,20 @@ impl CompiledCapture {
                             .ok_or(ManifestError::Incomplete)?;
                         for (field, value) in values {
                             after.properties.insert(field, value);
+                        }
+                        if preserve_parent {
+                            after.bindings = before
+                                .bindings
+                                .iter()
+                                .map(|binding| Binding {
+                                    node: binding.node.clone(),
+                                    path: binding.path.clone(),
+                                    target: target_identity(&relocated_identity(
+                                        &binding.target,
+                                        &column_names,
+                                    )),
+                                })
+                                .collect();
                         }
                         preserved_dependencies.insert(object.clone());
                         dependency_mappings.push((
