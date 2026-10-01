@@ -1471,3 +1471,312 @@ fn a_computed_column_add_or_drop_is_a_projected_column_lifecycle() {
             .expect("a computed column's lifecycle projects");
     }
 }
+
+mod inline_binding_floor {
+    use super::*;
+    use crate::resolver::{BoundSurface, Prerequisite};
+    use crate::{Column, Generated, IdsFile, PlanOrigin, SavedPlan, Table};
+
+    fn construct(
+        changes: &ChangeSet,
+        evidence: &ResolverEvidence,
+    ) -> Result<ResolverEvidence, EvidenceError> {
+        ResolverEvidence::new(
+            changes,
+            evidence.qualification.clone(),
+            evidence.authorization.clone(),
+            evidence.before.clone(),
+            &evidence.after,
+            evidence.surfaces.clone(),
+            evidence.transitions.clone(),
+            evidence.ordering.clone(),
+        )
+    }
+
+    fn roundtrip(changes: &ChangeSet, evidence: &ResolverEvidence) -> SavedPlan {
+        let seed = super::super::tests::plan();
+        let sealed = construct(changes, evidence).expect("complete inline bindings must seal");
+        let plan = SavedPlan::new(
+            PlanOrigin::Database,
+            seed.dialect,
+            seed.created_at,
+            seed.baseline,
+            changes.clone(),
+            IdsFile::default(),
+        )
+        .with_resolution(sealed)
+        .unwrap();
+        plan.validate_analysis().unwrap();
+        let decoded: SavedPlan =
+            serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        assert_eq!(decoded, plan);
+        decoded.validate_analysis().unwrap();
+        decoded
+    }
+
+    fn require_each(changes: &ChangeSet, evidence: &ResolverEvidence, required: &[Surface]) {
+        let plan = roundtrip(changes, evidence);
+        for missing in required {
+            let mut omitted = evidence.clone();
+            let at = omitted
+                .surfaces
+                .iter()
+                .position(|s| &s.surface == missing)
+                .unwrap();
+            omitted.surfaces.remove(at);
+            // Only the resolution is absent. Complete owner inventories,
+            // transitions and the sealed order must not mask this omission.
+            assert_eq!(
+                omitted
+                    .before
+                    .project(changes, &omitted.after, &omitted.transitions)
+                    .unwrap(),
+                evidence.after
+            );
+            assert!(
+                matches!(construct(changes, &omitted), Err(EvidenceError::Incomplete)),
+                "constructor accepted missing inline resolution {missing:?}"
+            );
+            let mut unread = plan.clone();
+            unread.analysis = PlanAnalysis::Resolved(Box::new(omitted));
+            let decoded: SavedPlan =
+                serde_json::from_str(&serde_json::to_string(&unread).unwrap()).unwrap();
+            assert_eq!(
+                decoded.validate_analysis(),
+                Err(EvidenceError::Incomplete),
+                "reader accepted missing inline resolution {missing:?}"
+            );
+        }
+    }
+
+    fn added_column(column: Column) -> (ChangeSet, ResolverEvidence) {
+        let table: TableName = "app.v".parse().unwrap();
+        owner_coverage(
+            Change::AddColumn {
+                uid: "c_000000".parse().unwrap(),
+                table: table.clone(),
+                name: "h".into(),
+                column: Box::new(column),
+            },
+            Surface::Column(table.column("h")),
+            Surface::Default(table.column("h")),
+            true,
+        )
+    }
+
+    #[test]
+    fn generated_and_ordinary_additions_require_their_inline_attrdef_resolution() {
+        for generated in [false, true] {
+            let mut column = Column::new("integer".parse().unwrap());
+            if generated {
+                column.generated = Some(Generated {
+                    expression: "1 + 4".into(),
+                    stored: true,
+                });
+                assert!(column.default.is_none());
+            } else {
+                column.default = Some("7".into());
+            }
+            let (changes, evidence) = added_column(column);
+            require_each(
+                &changes,
+                &evidence,
+                &[Surface::Default("app.v.h".parse().unwrap())],
+            );
+        }
+    }
+
+    fn plain_table() -> (ChangeSet, ResolverEvidence) {
+        let name: TableName = "app.v".parse().unwrap();
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("n".into(), Column::new("integer".parse().unwrap()));
+        owner_coverage(
+            Change::CreateTable {
+                uid: "t_000000".parse().unwrap(),
+                name: name.clone(),
+                table: Box::new(table),
+            },
+            Surface::Table(name.clone()),
+            Surface::Column(name.column("n")),
+            true,
+        )
+    }
+
+    #[test]
+    fn table_creation_requires_every_distinct_inline_binding_resolution() {
+        let name: TableName = "app.v".parse().unwrap();
+        let (mut changes, mut evidence) = plain_table();
+        let Change::CreateTable { table, .. } = &mut changes.changes[0].change else {
+            panic!("create table fixture")
+        };
+        table.columns.get_mut("n").unwrap().default = Some("7".into());
+        let mut generated = Column::new("integer".parse().unwrap());
+        generated.generated = Some(Generated {
+            expression: "1 + 4".into(),
+            stored: true,
+        });
+        table.columns.insert("g".into(), generated);
+        table.checks.insert(
+            "positive".into(),
+            crate::CheckConstraint {
+                expression: "n > 0".into(),
+            },
+        );
+        for (index_name, key, filter) in [
+            (
+                "expression",
+                crate::IndexKey::Expression("n + 1".into()),
+                None,
+            ),
+            (
+                "filtered",
+                crate::IndexKey::Column("n".into()),
+                Some("n > 0".into()),
+            ),
+            ("plain", crate::IndexKey::Column("n".into()), None),
+        ] {
+            table.indexes.insert(
+                index_name.into(),
+                crate::Index {
+                    columns: vec![crate::IndexColumn {
+                        key,
+                        descending: false,
+                        opclass: None,
+                    }],
+                    include: vec![],
+                    unique: false,
+                    filter,
+                    method: Default::default(),
+                },
+            );
+        }
+        let required = [
+            Surface::Default(name.column("n")),
+            Surface::Default(name.column("g")),
+            Surface::Check {
+                table: name.clone(),
+                name: "positive".into(),
+            },
+            Surface::Index {
+                table: name.clone(),
+                name: "expression".into(),
+            },
+            Surface::Index {
+                table: name.clone(),
+                name: "filtered".into(),
+            },
+        ];
+        let root = evidence
+            .after
+            .prerequisites()
+            .iter()
+            .find(|p| p.ownership == ObjectOwnership::Surface(Surface::Table(name.clone())))
+            .unwrap()
+            .object
+            .clone();
+        let mut records = evidence.after.prerequisites().to_vec();
+        evidence.surfaces.clear();
+        // Opaque model addresses carry explicit ownership. These records are
+        // not PostgreSQL catalog facts or runtime qualification.
+        for (ordinal, surface) in required
+            .iter()
+            .cloned()
+            .chain([
+                Surface::Column(name.column("g")),
+                Surface::Index {
+                    table: name,
+                    name: "plain".into(),
+                },
+            ])
+            .enumerate()
+        {
+            let object = ObjectIdentity {
+                class: "fixture-inline-child".into(),
+                name: vec![ordinal.to_string()],
+                signature: vec![root.clone()],
+            };
+            records.push(Prerequisite {
+                object: object.clone(),
+                ownership: ObjectOwnership::Surface(surface.clone()),
+                canonicalization: "fixture-v1".into(),
+                properties: "de".repeat(32),
+                bindings: vec![],
+            });
+            evidence.transitions[0].after.insert(object.clone());
+            if required.contains(&surface) {
+                evidence.surfaces.push(SurfaceResolution {
+                    surface,
+                    current: None,
+                    desired: Some(BoundSurface {
+                        object,
+                        bindings: vec![],
+                        managed_inputs: BTreeSet::new(),
+                    }),
+                });
+            }
+        }
+        records.sort_by(|a, b| a.object.cmp(&b.object));
+        let mut compiled = serde_json::to_value(&evidence.after).unwrap();
+        compiled["prerequisites"] = serde_json::to_value(records).unwrap();
+        let compiled: InputManifest = serde_json::from_value(compiled).unwrap();
+        evidence.after = evidence
+            .before
+            .project(&changes, &compiled, &evidence.transitions)
+            .unwrap();
+        evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
+        evidence.surfaces.sort_by(|a, b| a.surface.cmp(&b.surface));
+        assert_eq!(evidence.surfaces.len(), 5);
+        require_each(&changes, &evidence, &required);
+    }
+
+    #[test]
+    fn nonbinding_and_ordinary_plans_do_not_acquire_inline_resolution_requirements() {
+        let (changes, mut evidence) = plain_table();
+        evidence.surfaces.clear();
+        roundtrip(&changes, &evidence);
+
+        let mut column = Column::new("integer".parse().unwrap());
+        column.default = Some("7".into());
+        let (mut changes, mut evidence) = added_column(column);
+        let seed = super::super::tests::plan();
+        let ordinary = SavedPlan::new(
+            PlanOrigin::Database,
+            seed.dialect,
+            seed.created_at,
+            seed.baseline,
+            changes.clone(),
+            IdsFile::default(),
+        );
+        let ordinary: SavedPlan =
+            serde_json::from_str(&serde_json::to_string(&ordinary).unwrap()).unwrap();
+        assert!(matches!(ordinary.analysis, PlanAnalysis::Ordinary));
+        ordinary.validate_analysis().unwrap();
+
+        let child = evidence.surfaces[0]
+            .desired
+            .as_ref()
+            .unwrap()
+            .object
+            .clone();
+        let Change::AddColumn { column, .. } = &mut changes.changes[0].change else {
+            panic!("add column fixture")
+        };
+        column.default = None;
+        let mut compiled = serde_json::to_value(&evidence.after).unwrap();
+        compiled["prerequisites"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|p| p["object"] != serde_json::to_value(&child).unwrap());
+        let compiled: InputManifest = serde_json::from_value(compiled).unwrap();
+        evidence.transitions[0].after.remove(&child);
+        evidence.surfaces.clear();
+        evidence.after = evidence
+            .before
+            .project(&changes, &compiled, &evidence.transitions)
+            .unwrap();
+        evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
+        roundtrip(&changes, &evidence);
+    }
+}
