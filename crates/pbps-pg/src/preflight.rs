@@ -3607,6 +3607,21 @@ pub(crate) fn probes(changes: &ChangeSet) -> Preflight {
                 );
                 continue;
             };
+            // A recomputed generated column may be a referencing column of a
+            // foreign key the probe finds in the catalog, and its new values
+            // are written at rank 9, before the delete. Which keys read it is
+            // the catalog's to say at run time, so any recomputation in the
+            // plan leaves the delete unchecked rather than counted against
+            // the old expression's values (DEC-1168.1).
+            if !names.recomputed.is_empty() {
+                skip(
+                    &p.change,
+                    "a generated column this plan recomputes may reference the deleted row, \
+                     and its new values cannot be evaluated before apply",
+                    &mut unchecked,
+                );
+                continue;
+            }
             match delete_probe(table, key, &stored, &names) {
                 Ok(probe) => out.push(probe),
                 Err(error) => {
@@ -3807,8 +3822,17 @@ mod tests {
         assert_eq!(report.probes.len(), 3, "{report:#?}");
         assert!(report.unchecked.is_empty(), "{report:#?}");
         // And a key or a tightening over another column of the table is too.
-        let report = super::probes(&set(vec![recompute, tighten("a"), unique("a")]));
+        let report = super::probes(&set(vec![recompute.clone(), tighten("a"), unique("a")]));
         assert_eq!(report.probes.len(), 2, "{report:#?}");
+        assert!(report.unchecked.is_empty(), "{report:#?}");
+        // A reference row deleted in the same plan is counted against foreign
+        // keys the catalog names at run time, which a recomputed column may
+        // be part of: unchecked with a recomputation, probed without one.
+        let report = super::probes(&set(vec![recompute, deleting("app.p", "1")]));
+        assert!(report.probes.is_empty(), "{report:#?}");
+        assert_eq!(report.unchecked.len(), 1, "{report:#?}");
+        let report = super::probes(&set(vec![deleting("app.p", "1")]));
+        assert!(!report.probes.is_empty(), "{report:#?}");
         assert!(report.unchecked.is_empty(), "{report:#?}");
     }
 
