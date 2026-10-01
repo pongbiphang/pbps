@@ -5411,7 +5411,7 @@ mod tests {
     /// to `z.c`, and `z.old` then takes `a.x`. Only `a.x`'s move freeing its
     /// own name orders the two (review of #1346).
     #[test]
-    fn a_dropped_check_is_not_released_again_by_its_tables_move() {
+    fn a_dropped_check_neither_leaves_nor_arrives_with_its_tables_move() {
         let other = table(&[("id", Column::new(ty("int")))]);
         let mut old = table(&[("id", Column::new(ty("int")))]);
         old.checks.insert(
@@ -5452,6 +5452,46 @@ mod tests {
         let at = |what: &str| order.iter().position(|o| o == what).unwrap();
         assert!(at("drop c") < at("a.x"), "{order:?}");
         assert!(at("a.x") < at("z.old"), "{order:?}");
+
+        // Nor does it claim the name in the destination: `z.old` drops `c`
+        // and moves to `z2.x`, then `z2.c` takes `z.old` (review of #1346).
+        let mut old = table(&[("id", Column::new(ty("int")))]);
+        old.checks.insert(
+            "c".into(),
+            pbps_model::schema::CheckConstraint {
+                expression: "id > 0".into(),
+            },
+        );
+        let other = table(&[("id", Column::new(ty("int")))]);
+        let plain_old = table(&[("id", Column::new(ty("int")))]);
+        let cs = across_revisions(
+            &two_tables(("z.old", old), ("z2.c", other.clone())),
+            &[
+                (
+                    two_tables(("z2.x", plain_old.clone()), ("z2.c", other.clone())),
+                    vec![Intent::RenameTable {
+                        from: "z.old".parse().unwrap(),
+                        to: "z2.x".parse().unwrap(),
+                    }],
+                ),
+                (
+                    two_tables(("z2.x", plain_old), ("z.old", other)),
+                    vec![Intent::RenameTable {
+                        from: "z2.c".parse().unwrap(),
+                        to: "z.old".parse().unwrap(),
+                    }],
+                ),
+            ],
+        );
+        let order: Vec<String> = cs
+            .changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::RenameTable { from, .. } => Some(from.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, ["z.old", "z2.c"], "{cs:?}");
     }
 
     #[test]
