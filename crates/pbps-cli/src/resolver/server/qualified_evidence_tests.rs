@@ -4693,6 +4693,7 @@ async fn grantor_route_case(route: GrantorRoute) {
                 | Change::AlterColumnType { .. }
                 | Change::AlterColumnNullability { .. }
                 | Change::AlterColumnDefault { .. }
+                | Change::AlterColumnExpression { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
                 | Change::AddUnique { .. }
