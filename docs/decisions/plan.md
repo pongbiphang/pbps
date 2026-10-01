@@ -492,3 +492,23 @@ Refusing the same-kind module rather than letting `CREATE OR ALTER` replace it
 is DEC-316.1's reasoning. Replacing an object this project never recorded is
 the silent replacement ADR-0002 rules out, and `baseline` is the explicit act
 that adopts it.
+
+<a id="dec-1192-1"></a>
+
+**DEC-1192.1. A SQL Server plan refuses when it cannot prove the occupant read
+saw everything (#1192; extends DEC-1077.1).** `sys.objects` is filtered by
+metadata visibility: an object under an effective `DENY VIEW DEFINITION`
+returns no row, and DEC-1077.1's read took that absence as a free name, so a
+hidden sequence at a new table's name planned and then failed at apply.
+Before the read, `plan --db` asks for `VIEW DEFINITION` on each schema the
+plan reads names in, which answers for a missing grant and a schema `DENY`
+alike, and refuses while any effective object `DENY` of `VIEW DEFINITION` or
+`CONTROL` reaches the login, the proof `key_drop_blockers` uses (DECISIONS
+460).
+
+The object half is not scoped to the plan's schemas, and that is measured,
+not chosen: the `DENY`'s own row stays visible, but `OBJECT_SCHEMA_NAME` of
+the hidden object reads NULL, and `HAS_PERMS_BY_NAME` answers 0 for a hidden
+name and an absent one alike. Nothing this login can read says which schema
+the object is in or whether it holds a planned name. A plan refused by a
+`DENY` elsewhere is the cost; reading a hidden name as free is the bug.
