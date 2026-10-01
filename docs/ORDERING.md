@@ -96,7 +96,10 @@ steps:
    requirement. Every other pair is **independent**. Each entry of the
    *Requires before it* column is matched against the *Creates, removes or
    rewrites* column of every kind, so each requirement has at least one row
-   below, or none of the 33 kinds can affect it. Each interacting pair falls
+   below, or none of the 33 kinds can affect it. Every arm of
+   `dependency_rank` and every exception in `sort_class` that is not zero has
+   a row too, since each one is a pair whose order its class alone does not
+   decide. Each interacting pair falls
    into one of four classes:
    - **Fixed direction.** Whenever they interact, one must precede the other,
      whatever the content. Position can express it, and the audit checks that
@@ -228,6 +231,8 @@ and the expression-bearing changes that need a function.
 | `CreateTable` → rows, keys, foreign keys, modules and grants on it | fixed | class 7 before 11, 13, 14, 16 | ✓ |
 | `AddColumn` → rows, constraints, modules naming it | fixed | class 8 before 11, 13, 14 | ✓ |
 | `AddColumn` (input) → generated `AddColumn` reading it | fixed | (9, 2) after class 8 | ✓ DEC-1168.1 |
+| `AlterColumnType` of an existing input → generated `AddColumn` reading it | fixed | (9, 2) after the in-place alterations: a standing generated reader blocks the retype | ✓ DEC-1168.1 |
+| S: clustered `SetPrimaryKey`, `AddUnique` or `AddIndex` → the table's other added indexes | fixed (cost) | rank inside class 13. Built after them, the clustered layout would rebuild each one; correctness needs nothing here | ✓ DEC-1178.1 |
 | `AddColumn` or `RenameColumn` (input) → `AlterColumnExpression` reading it | fixed | class 8 or 3 before 9 | ✓ DEC-1168.1 |
 | Retype of a generated column → its `AlterColumnExpression` | fixed | rank −1 before 0: the new expression is computed in the final type | ✓ DEC-1168.1 (`a_generated_columns_nullability_relaxes_before_and_tightens_after_its_expression`) |
 | Referenced key → `AddForeignKey` | fixed | rank inside class 13 | ✓ |
@@ -254,6 +259,7 @@ one class and the dependents a class cannot see.
 |---|---|---|---|
 | Dependent module → its table, column or retyped column | fixed | class 0 first. P: rebuilt around a retype from the catalog | ✓ DECISIONS 311; `to_rebuild` |
 | Catalog dependents of a dropped or rebuilt module | engine | `weave` | ✓ DECISIONS 311, DEC-942.1 |
+| `DropModule` → `DropModule` of a module it names | fixed | `drop_rank`, deepest first inside class 0, from the base's lexed names | ✓ DECISIONS 311, 315 |
 | Generated column's release (expression change, column or table drop) → drop of the function it calls | engine | `after_its_release`, after the drops of dependent modules too | ✓ DEC-1168.1 |
 | Function drop moved after its release ← a column its own body reads, dropped or retyped earlier | content | the drop stays after the release | ⧗ #1350 |
 | Foreign key → the key it references | fixed | rank inside class 2 | ✓ |
