@@ -66,6 +66,9 @@ class LiveExecution(unittest.TestCase):
                 native.DEADLINE_TEST,
                 native.ADMIN_RECOVERY_TEST, native.SCRATCH_RECOVERY_TEST,
                 native.JANITOR_RECOVERY_TEST,
+                native.SQL_RECOVERY_CLOSE_TEST,
+                native.SQL_RECOVERY_DISCARD_TEST,
+                native.SQL_RECOVERY_CANCEL_TEST,
             )
         ])
         for call in run.call_args_list:
