@@ -5761,7 +5761,17 @@ async fn a_dropped_columns_name_is_free_before_the_rename_that_reuses_it() {
 struct TestDb {
     name: String,
     conn: Conn,
+    /// Held for the database's whole life: see [`CLUSTER_ROLE_GATE`].
+    _roles: tokio::sync::RwLockReadGuard<'static, ()>,
 }
+
+/// Roles are cluster-wide, and the ledger refuses to write while any login
+/// role could reset its id sequence, whatever database that login was made
+/// for. `recon610_super` gives its run login membership in a reproduced
+/// superuser deployer, which can, so a ledger test that ran beside it was
+/// refused over a role it never made (#1357). That test takes this for
+/// writing; every [`TestDb`] holds it for reading.
+pub(crate) static CLUSTER_ROLE_GATE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
 #[tokio::test]
 #[ignore = "needs live PostgreSQL"]
@@ -5851,6 +5861,7 @@ impl TestDb {
         // The pid keeps two concurrent `cargo test` runs apart; the tag keeps
         // this run's own tests apart.
         let name = format!("pbps_test_{tag}_{}", std::process::id());
+        let roles = CLUSTER_ROLE_GATE.read().await;
         let mut admin = connect().await;
         // `WITH (FORCE)` disconnects whatever is still attached — a previous
         // run killed halfway leaves a database behind, and `DROP DATABASE`
@@ -5866,7 +5877,11 @@ impl TestDb {
         let conn = Conn::connect(Driver::Postgres, &conn_str_for(&name))
             .await
             .expect("connect to the test database");
-        TestDb { name, conn }
+        TestDb {
+            name,
+            conn,
+            _roles: roles,
+        }
     }
 
     /// Opens a second connection to the same database, for the tests that need
@@ -6479,6 +6494,8 @@ async fn two_pipelines_creating_the_ledger_at_once_both_find_it_there() {
 #[tokio::test]
 #[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
 async fn a_row_type_of_the_ledgers_name_without_the_table_is_still_refused() {
+    // Writes the ledger outside a `TestDb` (#1357).
+    let _roles = CLUSTER_ROLE_GATE.read().await;
     let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("the PostgreSQL 16 fixture");
     for connection in [conn_str(), old] {
         let mut admin = Conn::connect(Driver::Postgres, &connection).await.unwrap();
@@ -29092,6 +29109,8 @@ async fn doctor_reports_an_absent_target_of_a_recorded_only_grant() {
 #[tokio::test]
 #[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
 async fn doctor_reports_maintain_on_an_old_server_for_a_reused_table_name() {
+    // Writes the ledger outside a `TestDb` (#1357).
+    let _roles = CLUSTER_ROLE_GATE.read().await;
     let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("the PostgreSQL 16 fixture");
     let name = format!("pbps_test_maint569_{}", std::process::id());
     for connection in [conn_str(), old] {

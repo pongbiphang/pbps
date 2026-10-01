@@ -1408,6 +1408,11 @@ mod recon610_super {
         // Mirrors the root-fixture qualify test: the deployer is a superuser
         // reading the default database's public schema, owned by
         // pg_database_owner.
+        //
+        // Alone, because its run login can act as a superuser cluster-wide
+        // until it is dropped, which every ledger write in the suite would
+        // refuse (#1357).
+        let _alone = crate::CLUSTER_ROLE_GATE.write().await;
         let server = std::env::var("PBPS_TEST_PG_DB").unwrap();
         let pid = std::process::id();
         let scratch_db = format!("pbps_super_s_{pid}");
