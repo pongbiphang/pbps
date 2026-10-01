@@ -1252,10 +1252,14 @@ pub(crate) fn order_after_releases(
                 past.change.subject()
             ));
         }
-        // A retype takes along what runs after it on the same column and
-        // before the release: the default written for the new type, which
-        // the old type may refuse (DEC-1316.1). Matched by uid, which a rename
-        // does not change, in their order.
+        // A retype takes along what runs after it and before the release and
+        // has to follow it (DEC-1316.1), in their order:
+        // - the default written for the new type on the same column, which the
+        //   old type may refuse. Matched by uid, which a rename does not change.
+        // - another generated column's expression change whose new text may
+        //   read the column. Once it reads it, the engine refuses the retype.
+        //   The catalog knows only the old readers, so the new ones are found
+        //   by the same over-approximating scan.
         let uid =
             if let pbps_model::Change::AlterColumnType { uid, .. } = &changes.changes[i].change {
                 Some(uid.clone())
@@ -1269,6 +1273,11 @@ pub(crate) fn order_after_releases(
             let follows = uid.as_ref().is_some_and(|uid| {
                 matches!(&changes.changes[j].change,
                     pbps_model::Change::AlterColumnDefault { uid: u, to: Some(_), .. } if u == uid)
+                    || matches!(&changes.changes[j].change,
+                        pbps_model::Change::AlterColumnExpression { column: c, to, .. }
+                            if names.table(&c.table) == table
+                                && (pbps_pg::generated::may_read(to, &live)
+                                    || pbps_pg::generated::may_read(to, &column.name)))
             });
             if follows {
                 group.push(changes.changes.remove(j));
@@ -2367,6 +2376,24 @@ mod tests {
             unreleased(&cs, &reads_a).is_empty(),
             "{:?}",
             unreleased(&cs, &reads_a)
+        );
+        // Another generated column starting to read `a`, sorted ahead of the
+        // release: it follows the retype, or the retype is refused once it
+        // reads `a`.
+        let start_reading = Change::AlterColumnExpression {
+            uid: uid("c_gggggg"),
+            column: col("h"),
+            from: "b".into(),
+            to: "a + 1".into(),
+        };
+        let mut cs = plan(vec![retype("a"), start_reading, recompute("b * 2")]);
+        assert_eq!(order_after_releases(&mut cs, &reads_a), Ok(2));
+        assert!(
+            matches!(&cs.changes[0].change, Change::AlterColumnExpression { column, .. } if column.name == "g")
+                && matches!(cs.changes[1].change, Change::AlterColumnType { .. })
+                && matches!(&cs.changes[2].change, Change::AlterColumnExpression { column, .. } if column.name == "h"),
+            "{:?}",
+            cs.changes
         );
         // A row writing `a` that runs before the release, as it does when the
         // release follows a function create: the retype cannot both follow the

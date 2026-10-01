@@ -1287,7 +1287,10 @@ On a connected plan, `release_generated_inputs` moves the retype or drop of a
 released column to right after the expression change that releases it. A
 retype takes along the default written for its new type, matched by uid. The
 old type may refuse that default: measured on 18.6, `SET DEFAULT 'abc'` on an
-`integer` is `invalid input syntax`. It
+`integer` is `invalid input syntax`. It also takes along another generated
+column's expression change whose new text may read the column, found by the
+same scan. Once that column reads it, the engine refuses the retype, and the
+catalog knows only the old readers. It
 runs after the module passes, which may move that change past a function's
 create, and before the checks that read the order (`drop_blockers`,
 `generation_support`). Both checks then see the release first:
