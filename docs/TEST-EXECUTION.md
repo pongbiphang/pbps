@@ -117,7 +117,25 @@ imports, imported reflective callables and plain-name alias assignments.
 Bindings are followed in statement order: direct shadows replace aliases,
 class-local bindings do not replace module bindings, and uncalled function
 bodies do not expose namespaces. Unknown conditional writes retain possible
-reflective aliases conservatively. Potential namespace access is tracked
+reflective aliases conservatively. With/AsyncWith keeps the running path's bindings
+separate from the prefixes that an entered manager may preserve by suppressing
+a failure. Calls inside that path see successful shadows; the exit joins the
+retained prefixes before subsequent statements. A guaranteed following shadow
+still replaces the joined aliases. This does not prove that every retained
+prefix actually throws, or that a manager always completes normally.
+
+Exact active shadows require conservative handling of opaque effects that
+could restore an erased reflective alias. A separate, permanently invalidated
+pristine-prefix proof recognizes only narrow native calls: literal-container
+`len`, constant exception construction, a fresh SimpleNamespace with a single
+empty callable member, imported nullcontext/suppress, and a plain async manager
+whose two methods return only None and a boolean. These are AST proofs, never
+fixture imports or executed callbacks. Unproven calls, protocols, mutations and
+manager effects cannot acquire this exception after a possibly reflective alias
+has been erased. Legal async fixtures qualify visitor components separately;
+interpreting arbitrary called async helpers is not a module ownership route
+(DEC-1383.1).
+ Potential namespace access is tracked
 separately from the stricter pristine-binding proof for safe object inspection;
 passing an imported module to an opaque helper cannot make a later reflective
 call harmless. A direct module-level `vars(SimpleNamespace())` call is

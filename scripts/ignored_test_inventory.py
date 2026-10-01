@@ -331,17 +331,109 @@ class NamespaceExposure(ast.NodeVisitor):
         self.exposed = False
         self.harmless = None
         self.conditional = False
+        self.continuations = []
+        self.native_pristine = True
+
+    @classmethod
+    def builtin_value(cls, name):
+        return ({name} if name in cls.reflective else
+                {'native:len'} if name == 'len' else
+                {'native:error'} if name in ('RuntimeError', 'Exception') else set())
+
+    def state(self):
+        return ({name: set(value) for name, value in self.bindings.items()},
+                {name: set(value) for name, value in self.module.items()})
+
+    def join(self, states):
+        # Missing locals fall back to that path's module, not the joined module.
+        def fallback(name):
+            return self.builtin_value(name)
+        module_names = set().union(*(module for _, module in states))
+        local_names = set().union(*(local for local, _ in states))
+        module = {name: set().union(*(values.get(name, fallback(name))
+                  for _, values in states)) for name in module_names}
+        local = {name: set().union(*(values.get(name, globals_.get(name, fallback(name)))
+                 for values, globals_ in states)) for name in local_names}
+        self.module.clear()
+        self.module.update(module)
+        if self.bindings is not self.module:
+            self.bindings.clear()
+            self.bindings.update(local)
+
+    def unknown_execution(self):
+        # Exact active shadows must not turn an opaque callback into permission
+        # to trust selectors. A skipped-path alias was only a conservative guard;
+        # its absence is not evidence that the callback cannot restore it.
+        self.native_pristine = False
+        for capture, erased in self.continuations:
+            if erased():
+                self.exposed = True
+
+    @staticmethod
+    def empty_callable(node):
+        return (isinstance(node, ast.Lambda) and not node.args.posonlyargs
+                and not node.args.args and not node.args.kwonlyargs
+                and node.args.vararg is None and node.args.kwarg is None
+                and isinstance(node.body, ast.Dict) and not node.body.keys)
+
+    def pure_argument(self, node):
+        try:
+            static_value(node, {})
+            return True
+        except (InventoryError, TypeError):
+            pass
+        if isinstance(node, ast.NamedExpr):
+            return self.pure_argument(node.value)
+        if isinstance(node, ast.Call):
+            return self.pure_call(node)
+        return self.value(node) in ({'native:len'}, {'native:error'})
+
+    def pure_call(self, node):
+        if not self.native_pristine:
+            return False
+        function = self.value(node.func)
+        if function == {'native:len'}:
+            return (len(node.args) == 1 and not node.keywords
+                    and self.pure_argument(node.args[0])
+                    and isinstance(node.args[0], (ast.List, ast.Tuple, ast.Dict, ast.Set, ast.Constant)))
+        if function == {'native:error'}:
+            return not node.keywords and all(isinstance(arg, ast.Constant) for arg in node.args)
+        if function == {'native:empty-callable'}:
+            return not node.args and not node.keywords
+        if function == {'native:async-manager-class'}:
+            return not node.args and not node.keywords
+        if function == {'native:namespace'}:
+            return (not node.args and len(node.keywords) <= 1 and all(keyword.arg == 'globals' and self.empty_callable(keyword.value)
+                                         for keyword in node.keywords))
+        if function in ({'native:nullcontext'}, {'native:suppress'}):
+            return not node.keywords and all(self.pure_argument(arg) for arg in node.args)
+        return False
 
     def value(self, node):
         if isinstance(node, ast.Name):
-            fallback = self.module.get(node.id, {node.id} if node.id in self.reflective else set())
+            builtin = self.builtin_value(node.id)
+            fallback = self.module.get(node.id, builtin)
             return fallback if node.id in self.globals else self.bindings.get(node.id, fallback)
-        if (isinstance(node, ast.Attribute) and node.attr in self.reflective
-            and "builtins" in self.value(node.value)):
-            return {node.attr}
+        if isinstance(node, ast.Attribute):
+            owner = self.value(node.value)
+            if 'builtins' in owner:
+                if node.attr in self.reflective:
+                    return {node.attr}
+                if node.attr == 'len':
+                    return {'native:len'}
+            if node.attr == 'globals' and owner == {'native:empty-namespace'}:
+                return {'native:empty-callable'}
+        if isinstance(node, ast.Call) and self.pure_call(node):
+            function = self.value(node.func)
+            if function == {'native:namespace'} and node.keywords:
+                return {'native:empty-namespace'}
+            if function in ({'native:nullcontext'}, {'native:suppress'}, {'native:async-manager-class'}):
+                return {'native:manager'}
         return set()
 
     def bind(self, name, value):
+        for capture, _ in self.continuations:
+            capture()
         value = set(value)
         if self.conditional:
             value |= self.value(ast.Name(id=name, ctx=ast.Load()))
@@ -354,6 +446,12 @@ class NamespaceExposure(ast.NodeVisitor):
         # Unknown control flow cannot prove a previous reflective alias gone.
         # Retain either binding; direct statements still distinguish shadows.
         conditional = self.conditional
+        if self.continuations and isinstance(node, (ast.BinOp, ast.UnaryOp, ast.BoolOp,
+                ast.Compare, ast.Subscript, ast.Await, ast.Yield, ast.YieldFrom, ast.AugAssign)):
+            try:
+                static_value(node, {})
+            except (InventoryError, TypeError):
+                self.unknown_execution()
         if isinstance(node, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.Try,
                              ast.TryStar, ast.Match)):
             self.conditional = True
@@ -363,17 +461,53 @@ class NamespaceExposure(ast.NodeVisitor):
             self.conditional = conditional
 
     def visit_With(self, node):
-        for item in node.items:
-            # The first expression is reached under the incoming state.
-            # An entered manager can suppress a failure before later
-            # contexts or body writes, so none proves an older alias gone.
-            self.visit(item.context_expr)
-            if item.optional_vars is not None:
-                self.visit(item.optional_vars)
-            self.conditional = True
-        for statement in node.body:
-            self.visit(statement)
-        # visit() restores the incoming state for the following statement.
+        incoming = self.state()
+        exits = [incoming] if self.conditional else []
+        def capture():
+            exits.append(self.state())
+        def erased():
+            current = self.state()
+            for local, module in exits:
+                for name in set(local) | set(current[0]):
+                    builtin = self.builtin_value(name)
+                    value = local.get(name, module.get(name, builtin))
+                    now = current[0].get(name, current[1].get(name, builtin))
+                    if value & (self.reflective | {'builtins'}) and not value <= now:
+                        return True
+                for name in set(module) | set(current[1]):
+                    builtin = self.builtin_value(name)
+                    value = module.get(name, builtin)
+                    if value & (self.reflective | {'builtins'}) and not value <= current[1].get(name, builtin):
+                        return True
+            return False
+        entered = False
+        managers = []
+        # DEC-1383.1: a running path's writes are exact; skipped prefixes belong only to
+        # the suppressed continuation. Outer conditional skips still join above.
+        self.conditional = False
+        try:
+            for item in node.items:
+                self.visit(item.context_expr)
+                manager = self.value(item.context_expr)
+                managers.append(manager)
+                if manager != {'native:manager'}:
+                    self.unknown_execution()
+                if not entered:
+                    capture()
+                    self.continuations.append((capture, erased))
+                    entered = True
+                if item.optional_vars is not None:
+                    self.visit(item.optional_vars)
+            for statement in node.body:
+                self.visit(statement)
+                if isinstance(statement, ast.Raise):
+                    break
+            if any(manager != {'native:manager'} for manager in managers):
+                self.unknown_execution()
+            self.join([*exits, self.state()])
+        finally:
+            if entered:
+                self.continuations.pop()
 
     visit_AsyncWith = visit_With
 
@@ -382,7 +516,18 @@ class NamespaceExposure(ast.NodeVisitor):
             return
         if self.value(node.func) & self.reflective:
             self.exposed = True
+        pure = self.pure_call(node)
         self.generic_visit(node)
+        if not pure:
+            self.unknown_execution()
+
+    def visit_Attribute(self, node):
+        owner = self.value(node.value)
+        self.generic_visit(node)
+        if not (self.native_pristine and isinstance(node.ctx, ast.Load)
+                and ('builtins' in owner and node.attr in self.reflective | {'len'}
+                     or owner == {'native:empty-namespace'} and node.attr == 'globals')):
+            self.unknown_execution()
 
     def visit_Assign(self, node):
         value = self.value(node.value)
@@ -391,6 +536,8 @@ class NamespaceExposure(ast.NodeVisitor):
             self.visit(target)
             if isinstance(target, ast.Name):
                 self.bind(target.id, value)
+            else:
+                self.unknown_execution()
 
     def visit_NamedExpr(self, node):
         value = self.value(node.value)
@@ -408,32 +555,46 @@ class NamespaceExposure(ast.NodeVisitor):
         self.visit(node.annotation)
 
     def visit_Import(self, node):
+        if any(alias.name not in ('builtins', 'types', 'contextlib', 'sys') for alias in node.names):
+            self.unknown_execution()
         # Apply each import in order: a repeated spelling has one final binding.
         for alias in node.names:
             self.bind(alias.asname or alias.name.split('.')[0],
                       {'builtins'} if alias.name == 'builtins' else set())
 
     def visit_ImportFrom(self, node):
+        if node.level or node.module not in ('builtins', 'types', 'contextlib'):
+            self.unknown_execution()
+        natives = {('builtins', 'len'): 'len', ('builtins', 'RuntimeError'): 'error',
+                   ('builtins', 'Exception'): 'error', ('types', 'SimpleNamespace'): 'namespace',
+                   ('contextlib', 'nullcontext'): 'nullcontext', ('contextlib', 'suppress'): 'suppress'}
         for alias in node.names:
             if alias.name == '*':
                 continue
-            self.bind(alias.asname or alias.name,
-                      {alias.name} if not node.level and node.module == 'builtins'
-                      and alias.name in self.reflective else set())
+            native = natives.get((node.module, alias.name)) if not node.level else None
+            value = ({alias.name} if not node.level and node.module == 'builtins'
+                     and alias.name in self.reflective else {'native:' + native} if native else set())
+            self.bind(alias.asname or alias.name, value)
 
     def visit_Delete(self, node):
+        for capture, _ in self.continuations:
+            capture()
         for target in node.targets:
             self.visit(target)
             if isinstance(target, ast.Name) and not self.conditional:
                 self.bindings.pop(target.id, None)
                 if target.id in self.globals:
                     self.module.pop(target.id, None)
+            elif not isinstance(target, ast.Name):
+                self.unknown_execution()
 
     def visit_FunctionDef(self, node):
         for expression in [*node.decorator_list, node.args]:
             self.visit(expression)
         if node.returns is not None:
             self.visit(node.returns)
+        if node.decorator_list:
+            self.unknown_execution()
         self.bind(node.name, set())
 
     visit_AsyncFunctionDef = visit_FunctionDef
@@ -441,12 +602,45 @@ class NamespaceExposure(ast.NodeVisitor):
     def visit_Lambda(self, node):
         self.visit(node.args)
 
+    @staticmethod
+    def inert_async_manager(node):
+        if node.bases or node.keywords or node.decorator_list or getattr(node, 'type_params', []):
+            return False
+        methods = {method.name: method for method in node.body
+                   if isinstance(method, ast.AsyncFunctionDef)}
+        if len(node.body) != 2 or set(methods) != {'__aenter__', '__aexit__'}:
+            return False
+        for name, method in methods.items():
+            arguments = [*method.args.posonlyargs, *method.args.args, *method.args.kwonlyargs,
+                         *([method.args.vararg] if method.args.vararg else []),
+                         *([method.args.kwarg] if method.args.kwarg else [])]
+            positional = len(method.args.posonlyargs) + len(method.args.args)
+            if (method.args.kwonlyargs or method.args.kwarg is not None
+                or name == '__aenter__' and (positional != 1 or method.args.vararg is not None)
+                or name == '__aexit__' and not (positional == 4 and method.args.vararg is None
+                                             or positional == 1 and method.args.vararg is not None)):
+                return False
+            if (method.decorator_list or getattr(method, 'type_params', [])
+                or method.returns is not None or method.args.defaults
+                or any(default is not None for default in method.args.kw_defaults)
+                or any(argument.annotation is not None for argument in arguments)
+                or len(method.body) != 1 or not isinstance(method.body[0], ast.Return)
+                or not isinstance(method.body[0].value, ast.Constant)):
+                return False
+            value = method.body[0].value.value
+            if (name == '__aenter__' and value is not None
+                or name == '__aexit__' and type(value) is not bool):
+                return False
+        return True
+
     def visit_ClassDef(self, node):
         for expression in [*node.decorator_list, *node.bases, *node.keywords]:
             self.visit(expression)
         # A nested class does not close over an enclosing class's locals.
         body = NamespaceExposure(self.module)
         body.conditional = self.conditional
+        body.continuations = self.continuations
+        body.native_pristine = self.native_pristine
         def globals_in(statement):
             if isinstance(statement, ast.Global):
                 return set(statement.names)
@@ -457,7 +651,10 @@ class NamespaceExposure(ast.NodeVisitor):
         for statement in node.body:
             body.visit(statement)
         self.exposed |= body.exposed
-        self.bind(node.name, set())
+        self.native_pristine &= body.native_pristine
+        if node.decorator_list or node.bases or node.keywords:
+            self.unknown_execution()
+        self.bind(node.name, {'native:async-manager-class'} if self.inert_async_manager(node) else set())
 
 
 class NamespaceImports:
