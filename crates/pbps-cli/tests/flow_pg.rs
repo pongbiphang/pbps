@@ -6464,7 +6464,22 @@ fn an_expression_change_releases_its_old_input_in_the_same_plan() {
         std::fs::write(&path, edited).unwrap();
     };
     edit("t1", "b * 2", None);
-    edit("t2", "b * 2", Some("bigint"));
+    edit("t2", "b * 2", Some("text"));
+    // And a default written for the new type, which the old one refuses
+    // (`invalid input syntax for type integer`, measured on 18.6): it has to
+    // follow the retype wherever the retype goes.
+    let t2 = d.dir.join("schema/app.t2.yml");
+    let text = std::fs::read_to_string(&t2).unwrap();
+    let defaulted = text.replacen(
+        "  a:\n    type: text\n",
+        "  a:\n    type: text\n    default: \"'abc'\"\n",
+        1,
+    );
+    assert_ne!(
+        defaulted, text,
+        "app.t2's `a` is where this test expects it"
+    );
+    std::fs::write(&t2, defaulted).unwrap();
     succeeds(d.run(&["drop", "app.t1.a", "--reason", "computed from b now"]));
     succeeds(d.run(&["plan"]));
     d.commit();

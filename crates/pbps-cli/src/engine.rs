@@ -1209,10 +1209,35 @@ pub(crate) fn order_after_releases(
                 taker.change.subject()
             ));
         }
-        let p = changes.changes.remove(i);
-        // The release moved up by one with the removal.
-        changes.changes.insert(release, p);
-        moved += 1;
+        // A retype takes along what runs after it on the same column and
+        // before the release: the default written for the new type, which
+        // the old type may refuse (DEC-1316.1). Matched by uid, which a rename
+        // does not change, in their order.
+        let uid =
+            if let pbps_model::Change::AlterColumnType { uid, .. } = &changes.changes[i].change {
+                Some(uid.clone())
+            } else {
+                None
+            };
+        let mut group = vec![changes.changes.remove(i)];
+        let mut release = release - 1;
+        let mut j = i;
+        while j < release {
+            let follows = uid.as_ref().is_some_and(|uid| {
+                matches!(&changes.changes[j].change,
+                    pbps_model::Change::AlterColumnDefault { uid: u, to: Some(_), .. } if u == uid)
+            });
+            if follows {
+                group.push(changes.changes.remove(j));
+                release -= 1;
+            } else {
+                j += 1;
+            }
+        }
+        moved += group.len();
+        for (k, p) in group.into_iter().enumerate() {
+            changes.changes.insert(release + 1 + k, p);
+        }
     }
     Ok(moved)
 }
@@ -2187,6 +2212,7 @@ mod tests {
                     Change::AlterColumnType { .. } => "retype",
                     Change::AlterColumnExpression { .. } => "expression",
                     Change::AddColumn { .. } => "add",
+                    Change::AlterColumnDefault { .. } => "default",
                     other => panic!("unexpected {other:?}"),
                 })
                 .collect()
@@ -2197,6 +2223,29 @@ mod tests {
             assert_eq!(order_after_releases(&mut cs, &reads_a), Ok(1));
             assert_eq!(kinds(&cs)[0], "expression", "{:?}", kinds(&cs));
         }
+        // A retype takes the default written for its new type along, in
+        // order; a default of another column stays.
+        let set_default = |u: &str, name: &str| Change::AlterColumnDefault {
+            uid: uid(u),
+            column: col(name),
+            from: None,
+            to: Some("5000000000".into()),
+        };
+        let mut cs = plan(vec![
+            retype("a"),
+            set_default("c_bbbbbb", "a"),
+            set_default("c_ffffff", "b"),
+            recompute("b * 2"),
+        ]);
+        assert_eq!(order_after_releases(&mut cs, &reads_a), Ok(2));
+        assert_eq!(
+            kinds(&cs),
+            ["default", "expression", "retype", "default"],
+            "{:?}",
+            cs.changes
+        );
+        assert!(matches!(&cs.changes[3].change,
+            Change::AlterColumnDefault { column, .. } if column.name == "a"));
         // The new text may still read `a`: nothing moves, and the check
         // refuses it.
         let mut cs = plan(vec![drop("a"), recompute("a + b")]);

@@ -1278,7 +1278,10 @@ expression change first, then the retype or drop. It is one plan now.
   an apply that rolls back. Only the first is allowed.
 
 On a connected plan, `release_generated_inputs` moves the retype or drop of a
-released column to right after the expression change that releases it. It
+released column to right after the expression change that releases it. A
+retype takes along the default written for its new type, matched by uid. The
+old type may refuse that default: measured on 18.6, `SET DEFAULT 'abc'` on an
+`integer` is `invalid input syntax`. It
 runs after the module passes, which may move that change past a function's
 create, and before the checks that read the order (`drop_blockers`,
 `generation_support`). Both checks then see the release first:
