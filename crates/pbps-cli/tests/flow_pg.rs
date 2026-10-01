@@ -1860,6 +1860,75 @@ fn a_sequence_a_schema_transfer_carries_refuses_a_table_at_its_name() {
     ));
 }
 
+/// #1355: an index takes a name in the relation namespace too. One the plan
+/// adds at the name of a sequence a cross-schema rename carries in first, or
+/// of a sequence the database holds, refuses `plan --db` by name, where the
+/// `CREATE INDEX` used to fail at apply with 42P07; no plan is written.
+/// Control: the same rename with the index at a free name plans and applies.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn an_index_at_a_held_or_carried_name_refuses_the_plan() {
+    let server = server();
+    let table = |header: &str, index: &str| {
+        format!(
+            "{header}\ncolumns:\n  id: {{type: integer, nullable: false}}\n  \
+             n: {{type: integer, nullable: false, identity: [1, 1]}}\n\
+             indexes:\n  {index}: {{columns: [id]}}\n"
+        )
+    };
+    let refuses = |connection: &str, d: &Demo, expected: &str| {
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let plan = d.dir.join("index-plan.json");
+        let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+        assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+        let err = stderr(&o);
+        assert!(err.contains(expected), "{err}");
+        assert!(!plan.exists(), "a refused plan wrote {}", plan.display());
+    };
+    let without_index = "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n  \
+                         n: {type: integer, nullable: false, identity: [1, 1]}\n";
+
+    // Carried: `app.t` moves to `archive` and takes `t_n_seq` with it, then
+    // gains an index of that name there.
+    let moved = |slug: &str, index: &str| {
+        let own = OwnDatabase::new(&server, slug);
+        let connection = own.connection().to_owned();
+        let d = bootstrapped_demo(&connection, slug, without_index);
+        on_server(&connection, "CREATE SCHEMA archive");
+        d.table(&table("table: archive.u\nrenamed_from: app.t", index));
+        (own, connection, d)
+    };
+    let (_own, connection, d) = moved("index-carried", "t_n_seq");
+    refuses(
+        &connection,
+        &d,
+        "`archive.t_n_seq`: this plan moves sequence `app.t_n_seq` on `app.t` there first, \
+         with the rename of `app.t` to `archive.u`",
+    );
+
+    // Held: a sequence the project does not record, at the index's name.
+    let own = OwnDatabase::new(&server, "index-held");
+    let connection = own.connection().to_owned();
+    let d = bootstrapped_demo(&connection, "index-held", without_index);
+    on_server(&connection, "CREATE SEQUENCE app.s");
+    d.table(&table("table: app.t", "s"));
+    refuses(
+        &connection,
+        &d,
+        "`app.s`: the database already has sequence `app.s`",
+    );
+
+    let (_own, connection, d) = moved("index-free", "ix_free");
+    let plan = connected_artifact(&d, &connection, false);
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--allow", "rename"],
+    ));
+}
+
 /// A sequence or an index already at the name of a table this plan creates
 /// refuses the plan by name, and no plan is written (#951). Both share
 /// PostgreSQL's relation namespace with tables, and neither is in the catalog

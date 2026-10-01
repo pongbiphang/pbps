@@ -427,6 +427,15 @@ first. That is an index it drops, or a sequence whose column it drops. A view
 the plan rebuilds in the destination counts as created here: its drop runs
 before the rename, so the carried object takes the name its re-creation needs.
 
+An index takes a relation name too (#1355), so both comparisons also cover the
+index names the plan creates, each in its table's schema: an added index, the
+index behind an added unique constraint or a named primary key, which carries
+the constraint's name, and those a created table declares. An unnamed key is
+left out: PostgreSQL moves its `<table>_pkey` aside when that is held
+(DEC-465.1). Indexes are added after the tables, renames and drops, so every
+name the plan frees counts as free for them, and every name a rename carries
+counts as held.
+
 A name taken after the plan was saved is left to the apply. The `CREATE` fails
 inside the transaction and the ledger records nothing, which is the outcome a
 recheck could only have reported earlier. SQL Server is answered by
