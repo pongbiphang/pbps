@@ -494,7 +494,7 @@ fn owner_coverage(
     }];
     let owned = BTreeSet::from([owner_object.clone(), child_object.clone()]);
     evidence.transitions = vec![ObjectTransition {
-        surface: owner,
+        surface: owner.clone(),
         before: if creating {
             BTreeSet::new()
         } else {
@@ -511,6 +511,9 @@ fn owner_coverage(
             after: BTreeSet::from([table_object]),
         });
     }
+    evidence
+        .transitions
+        .sort_by(|a, b| a.surface.cmp(&b.surface));
     evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
     evidence.after = evidence
         .before
@@ -519,10 +522,18 @@ fn owner_coverage(
     evidence.validate(&changes).unwrap();
     assert_eq!(evidence.after, compiled);
     // A table label alone does not prove its independent parent inventory.
-    if matches!(evidence.transitions[0].surface, Surface::Column(_)) {
+    if matches!(owner, Surface::Column(_)) {
         let mut aggregate = evidence.clone();
-        aggregate.transitions.truncate(1);
-        aggregate.transitions[0].surface = Surface::Table(table);
+        let owner_transition = evidence
+            .transitions
+            .iter()
+            .find(|transition| transition.surface == owner)
+            .unwrap()
+            .clone();
+        aggregate.transitions = vec![ObjectTransition {
+            surface: Surface::Table(table),
+            ..owner_transition
+        }];
         assert!(aggregate.validate(&changes).is_err());
     }
     let valid = evidence.clone();
