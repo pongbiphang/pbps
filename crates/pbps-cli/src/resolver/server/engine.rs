@@ -18,6 +18,16 @@ pub(crate) async fn identity(connection: &mut StreamConn) -> Result<InstanceObse
     }
 }
 
+/// Read only on an already qualified PostgreSQL administrative channel.
+pub(crate) async fn postgres_version_num(connection: &mut StreamConn) -> Result<i64, DbError> {
+    match connection.driver() {
+        Driver::Postgres => pbps_pg::roles::server_version_num(connection).await,
+        Driver::Mssql => Err(DbError::Refused(
+            "a PostgreSQL supplied-server profile cannot read a SQL Server version".into(),
+        )),
+    }
+}
+
 pub(crate) async fn own_session(connection: &mut StreamConn) -> Result<OwnSession, DbError> {
     match connection.driver() {
         Driver::Postgres => pbps_pg::resolver::own_session(connection).await,

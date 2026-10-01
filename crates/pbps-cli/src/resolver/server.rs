@@ -823,11 +823,25 @@ impl DedicatedServer {
         let mut session = Session::open(channel, &runtime, login, &[]).await?;
         let prepared = async {
             // The supplied credentials are the administrative ones, so this is
-            // where the privileged reads belong: the identity, and the inventory
-            // and counter the exclusion strategy compares against.
+            // where the privileged reads belong: the identity, any required
+            // profile version, and the inventory and counter for exclusion.
             let identity = engine::identity(&mut session.connection)
                 .await
                 .map_err(|error| Error::Identity(error.to_string()))?;
+            // The executable's basename cannot prove a version-specific layout.
+            // Read its major only through this qualified channel; legacy profiles
+            // retain their existing admission path without this query (DEC-1302.1).
+            if let Some(major) = profile.postgres_major {
+                let observed = engine::postgres_version_num(&mut session.connection)
+                    .await
+                    .map_err(|error| Error::Identity(error.to_string()))?;
+                if !profile.accepts_postgres_version(observed) {
+                    return Err(Error::Identity(format!(
+                        "profile {} requires PostgreSQL major {major}; the supplied server reported server_version_num {observed}",
+                        profile.name
+                    )));
+                }
+            }
             let inventory = engine::client_sessions(&mut session.connection)
                 .await
                 .map_err(|error| Error::Exclusivity(signal(&error)))?;

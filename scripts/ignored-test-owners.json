@@ -811,6 +811,7 @@
         "resolver::server::live_tests::guard_limits::every_forwarder_guard_requires_effective_descriptor_evidence",
         "resolver::server::live_tests::guard_limits::guard_restoration_distinguishes_process_exit_from_live_cleanup_failure",
         "resolver::server::live_tests::host_files::host_file_loss_refuses_admission_and_discards_live_analysis",
+        "resolver::server::live_tests::pg16_storage::the_supplied_storage_layout_admits_its_observed_major_and_survives_live_checks",
         "resolver::server::live_tests::pseudo::foreign_pseudo_roots_refuse_admission_and_discard_live_analysis",
         "resolver::server::live_tests::replacing_or_dropping_the_target_binding_discards_the_run",
         "resolver::server::live_tests::uts::kernel_name_loss_refuses_admission_and_discards_each_live_view"

@@ -311,16 +311,20 @@ async fn a_server_inside_the_target_instance_is_refused_before_any_scratch_resou
 async fn an_unimplemented_profile_or_an_exposed_runtime_is_refused_by_name() {
     fixture();
     let mut target = native_target().await;
-    let supported = std::env::var("PBPS_SERVER_ENDPOINT").unwrap();
-    let unnamed = supported.replace("linux-dedicated-v1", "linux-dedicated-v2");
-    match DedicatedServer::admit(ScratchEndpoint::parse(&unnamed).unwrap(), &mut target).await {
+    let mut unnamed = endpoint("PBPS_SERVER_ENDPOINT");
+    unnamed.profile = "linux-dedicated-v2".into();
+    match DedicatedServer::admit(unnamed, &mut target).await {
         Err(ServerFailure {
             cause: Error::UnsupportedProfile { name, implemented },
             recovery_names,
         }) => {
             assert!(recovery_names.is_empty());
             assert_eq!(name, "linux-dedicated-v2");
-            assert_eq!(implemented, "linux-dedicated-v1");
+            let expected = match driver() {
+                Driver::Postgres => "linux-dedicated-pg16-v1, linux-dedicated-v1",
+                Driver::Mssql => "linux-dedicated-v1",
+            };
+            assert_eq!(implemented, expected);
         }
         Err(other) => panic!("an unimplemented profile must be refused by name: {other}"),
         Ok(_) => panic!("an unimplemented profile must never admit a server"),
@@ -931,3 +935,6 @@ pub(super) mod admission_recovery;
 
 #[path = "live_tests/forwarder_mqueue.rs"]
 pub(super) mod forwarder_mqueue;
+
+#[path = "live_tests/pg16_storage.rs"]
+mod pg16_storage;

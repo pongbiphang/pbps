@@ -43,7 +43,14 @@ pub fn validate_runtime(runtime: &ResolverRuntime) -> Result<(), &'static str> {
         ResolverRuntime::Container {
             platform, profile, ..
         } if platform == "linux/amd64" && profile == "linux-amd64-v1" => Ok(()),
-        ResolverRuntime::Supplied { profile, .. } if profile == "linux-dedicated-v1" => Ok(()),
+        ResolverRuntime::Supplied { profile, .. }
+            if matches!(
+                profile.as_str(),
+                "linux-dedicated-v1" | "linux-dedicated-pg16-v1"
+            ) =>
+        {
+            Ok(())
+        }
         ResolverRuntime::Container { .. } | ResolverRuntime::Supplied { .. } => {
             Err("this build cannot enforce the recorded resolver runtime profile")
         }
@@ -63,6 +70,23 @@ mod tests {
             })
             .is_ok()
         );
+        assert!(
+            validate_runtime(&ResolverRuntime::Supplied {
+                profile: "linux-dedicated-pg16-v1".into(),
+                identity: "00".repeat(32)
+            })
+            .is_ok()
+        );
+        for profile in ["linux-dedicated-pg16-v2", "linux-dedicated-pg16-v1-extra"] {
+            assert!(
+                validate_runtime(&ResolverRuntime::Supplied {
+                    profile: profile.into(),
+                    identity: "00".repeat(32)
+                })
+                .is_err(),
+                "saved runtimes require an exact implemented profile"
+            );
+        }
         assert!(
             validate_runtime(&ResolverRuntime::Supplied {
                 profile: "linux-dedicated-v2".into(),

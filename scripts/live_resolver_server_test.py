@@ -10,6 +10,8 @@ is tested here is the decision it makes about a failed start, against a fake
 import importlib.util
 import subprocess
 import unittest
+from contextlib import ExitStack
+from unittest import mock
 from pathlib import Path
 
 spec = importlib.util.spec_from_file_location(
@@ -116,6 +118,106 @@ class TheRunningProbe(unittest.TestCase):
             self.assertFalse(server.running("exited"))
         finally:
             server.run = real
+
+
+STORAGE_CASE = "pg16_storage::the_supplied_storage_layout_admits_its_observed_major_and_survives_live_checks"
+LEGACY_CASE = "a_supported_dedicated_server_compiles_declarations_and_removes_only_its_own_resources"
+PG_IMAGES = {
+    16: "postgres@sha256:485935f94cc7165afa896978809c37b592dc07f0a37d2c8f645f12412d0212c8",
+    18: "postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280",
+}
+
+
+class TheFixedStorageRecipe(unittest.TestCase):
+    """Observe maintained command assembly, never create or qualify a container."""
+
+    def commands(self, engine, major=None):
+        commands = []
+
+        def recorded(*args, **kwargs):
+            commands.append((args, kwargs))
+            output = "test result: ok. 1 passed; 0 failed; 0 ignored\n"
+            return subprocess.CompletedProcess(args, 0, output, "")
+
+        argv = ["live-resolver-server.py", engine, "--test-binary", "/unit/pbps-cli"]
+        if major is not None:
+            argv += ["--pg-major", str(major)]
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch("sys.argv", argv))
+            stack.enter_context(mock.patch.object(server.os, "geteuid", return_value=0))
+            stack.enter_context(mock.patch.object(server, "ENGINE", None, create=True))
+            stack.enter_context(mock.patch.object(server, "DOCKER_SOCKET", server.DOCKER_SOCKET))
+            stack.enter_context(mock.patch.object(server, "run", side_effect=recorded))
+            stack.enter_context(mock.patch.object(server.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)))
+            stack.enter_context(mock.patch.object(Path, "mkdir"))
+            stack.enter_context(mock.patch.object(Path, "write_text"))
+            for name in ("certificates", "started", "ready", "describe", "statement"):
+                stack.enter_context(mock.patch.object(server, name))
+            stack.enter_context(mock.patch.object(server, "service_pid", return_value="123"))
+            stack.enter_context(mock.patch.object(server, "TESTS", [LEGACY_CASE, STORAGE_CASE]))
+            server.main()
+        return commands
+
+    def supplied_create(self, commands):
+        selected = [args for args, _ in commands if args[:2] == ("docker", "create")
+                    and args[args.index("--name") + 1].startswith("pbps-dedicated-server-")]
+        self.assertEqual(len(selected), 1, "one actual supplied-create command is expected")
+        return selected[0]
+
+    def test_pg16_and_pg18_route_their_fixed_recipes_to_the_actual_storage_case(self):
+        self.assertIn(STORAGE_CASE, server.TESTS, "the native owner must select this exact case")
+        for major, storage, profile in [
+            (16, "/var/lib/postgresql/data", "linux-dedicated-pg16-v1"),
+            (18, "/var/lib/postgresql", "linux-dedicated-v1"),
+        ]:
+            with self.subTest(major=major):
+                commands = self.commands("pg", major)
+                create = self.supplied_create(commands)
+                self.assertIn(PG_IMAGES[major], create)
+                self.assertEqual(create[create.index("--user") + 1], "999:999")
+                mounts = [create[i + 1] for i, value in enumerate(create) if value == "--tmpfs"]
+                storage_mounts = [value for value in mounts if value.startswith("/var/lib/postgresql")]
+                self.assertEqual(storage_mounts, [storage + ":rw,nosuid,nodev,noexec,size=268435456,uid=999,gid=999,mode=700"])
+                boot = create[-1]
+                self.assertIn(f"/usr/lib/postgresql/{major}/bin/initdb", boot)
+                self.assertIn(f"exec /usr/lib/postgresql/{major}/bin/postgres", boot)
+                self.assertIn(f"-D {storage}/run-data", boot)
+                self.assertIn(f"{storage}/pw", boot)
+                self.assertNotIn(f"/usr/lib/postgresql/{18 if major == 16 else 16}/bin/", boot)
+                selected = [(args, kwargs) for args, kwargs in commands if "--exact" in args]
+                self.assertEqual([args[args.index("--exact") + 1] for args, _ in selected], [
+                    "resolver::server::live_tests::" + LEGACY_CASE,
+                    "resolver::server::live_tests::" + STORAGE_CASE,
+                ])
+                for _, kwargs in selected:
+                    self.assertEqual(kwargs["env"]["PBPS_SERVER_PG_MAJOR"], str(major))
+                    fields = dict(part.split("=", 1) for part in kwargs["env"]["PBPS_SERVER_ENDPOINT"].split())
+                    self.assertEqual(fields["profile"], profile)
+                    self.assertTrue(fields["container"].startswith("pbps-dedicated-server-"))
+
+    def test_pg18_remains_the_default_and_sql_server_keeps_its_old_case(self):
+        default = self.supplied_create(self.commands("pg"))
+        self.assertIn(PG_IMAGES[18], default)
+        self.assertIn("/usr/lib/postgresql/18/bin/initdb", default[-1])
+        commands = self.commands("mssql")
+        create = self.supplied_create(commands)
+        self.assertIn("mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1", create)
+        self.assertIn("/var/opt/mssql:rw,nosuid,nodev,noexec,size=1073741824,uid=10001,gid=0,mode=700", create)
+        self.assertIn("exec /opt/mssql/bin/launch_sqlservr.sh /opt/mssql/bin/sqlservr", create[-1])
+        self.assertNotIn("initdb", create[-1])
+        selected = [(args, kwargs) for args, kwargs in commands if "--exact" in args]
+        self.assertEqual([args[args.index("--exact") + 1] for args, _ in selected], [
+            "resolver::server::live_tests::" + LEGACY_CASE,
+        ])
+        self.assertIn("profile=linux-dedicated-v1 ", selected[0][1]["env"]["PBPS_SERVER_ENDPOINT"])
+
+    def test_unsupported_majors_and_sql_server_pg_overrides_create_nothing(self):
+        for engine, major in [("pg", 17), ("mssql", 16)]:
+            with self.subTest(engine=engine, major=major):
+                with mock.patch.object(server, "fixture") as fixture_call:
+                    with self.assertRaises(SystemExit):
+                        self.commands(engine, major)
+                fixture_call.assert_not_called()
 
 
 if __name__ == "__main__":
