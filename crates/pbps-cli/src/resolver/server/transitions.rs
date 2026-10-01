@@ -134,7 +134,7 @@ fn declared(schema: &Schema, surface: &Surface) -> bool {
             .tables
             .get(&column.table)
             .and_then(|table| table.columns.get(&column.name))
-            .is_some_and(|column| column.default.is_some()),
+            .is_some_and(|column| column.default.is_some() || column.generated.is_some()),
         Surface::Check { table, name } => schema
             .tables
             .get(table)
@@ -235,6 +235,27 @@ pub(super) fn derive(
                     None
                 };
                 (surface, false, from.is_some(), to.is_some(), prior)
+            }
+            Change::AlterColumnExpression { uid, column, .. } => {
+                let prior = base.ids.columns.get(uid).cloned().ok_or_else(|| {
+                    Error::Binding(
+                        "an expression change lacks its recorded opening column UID".into(),
+                    )
+                })?;
+                if desired.ids.columns.get(uid) != Some(column) {
+                    return Err(Error::Binding(
+                        "an expression change disagrees with its recorded desired column UID".into(),
+                    ));
+                }
+                // SET EXPRESSION replaces pg_attrdef, not the column (DEC-1168.1).
+                // The recorded UID selects the opening inventory across renames.
+                (
+                    Surface::Default(column.clone()),
+                    false,
+                    true,
+                    true,
+                    Some(Surface::Default(prior)),
+                )
             }
             Change::SetPrimaryKey { table, .. }
             | Change::AddUnique { table, .. }

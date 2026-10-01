@@ -200,7 +200,11 @@ pub(super) fn classify(
                 )?;
             }
             let default_id = identity("pg_attrdef", Vec::new(), vec![column_id]);
-            if capture.inputs.contains_key(&default_id) && declaration.default.is_some() {
+            // A generated attrdef is an explicit root too (DEC-1168.1).
+            // Its internal column edge must not broaden its exact owner.
+            if capture.inputs.contains_key(&default_id)
+                && (declaration.default.is_some() || declaration.generated.is_some())
+            {
                 assign(&mut owned, default_id, Surface::Default(reference))?;
             }
         }
