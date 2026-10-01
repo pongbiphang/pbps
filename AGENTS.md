@@ -81,8 +81,10 @@ checksum-pinned, and state lives in the database itself.
   design issue for a general solution and write its reasoning there: the
   problem, the root cause, the design and where it belongs, the cases it
   absorbs, and its acceptance tests. Tell the maintainer, then answer the
-  class's findings with that issue. Findings outside the class still follow
-  the three-case rules.
+  class's findings with that issue. A P0 is still always fixed. A class
+  finding that is one of the three fix cases is answered with the design
+  issue only once the maintainer has agreed to it, as #1366 was for #1346.
+  Findings outside the class still follow the three-case rules.
 - In the draft phase, stop after three consecutive completed reviews with no P0
   or P1, or as soon as a completed review reports no findings. A P0 or P1 resets
   the count. Count a review only if its `Reviewed commit:` is the pushed head.
