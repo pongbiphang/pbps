@@ -5758,18 +5758,104 @@ async fn a_dropped_columns_name_is_free_before_the_rename_that_reuses_it() {
     assert_eq!(ours, normalized(&declared));
 }
 
-/// Shared by every [`TestDb`] while it lives, and held exclusively by a test
-/// that creates a login role able to act as a superuser. Roles are
-/// cluster-wide, so while such a role exists it is a login role with reach
-/// over every ledger this binary creates, and the ledger's reach check
-/// (DEC-863.1) rightly refuses it (#1097). Tokio's lock does not poison, so
-/// a failed test never fails every test after it.
-static SUPERUSER_LOGIN: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+/// Keeps a login role able to act as a superuser apart from every live
+/// ledger of this binary. Roles are cluster-wide, so while such a role exists
+/// it reaches every ledger here, and the ledger's reach check (DEC-863.1)
+/// rightly refuses it (#1097).
+///
+/// Ledgers never wait for a test that is only waiting to create the role: a
+/// test may hold two ledgers at once, and a writer-preferring lock deadlocks
+/// it behind a queued writer (review of #1386). The role's test waits instead
+/// until no ledger is live. The state is held only between awaits, and a
+/// poisoned lock still orders, so a failed test never fails the rest.
+struct LedgerGate {
+    live: usize,
+    superuser_login: bool,
+}
+
+static LEDGER_GATE: std::sync::Mutex<LedgerGate> = std::sync::Mutex::new(LedgerGate {
+    live: 0,
+    superuser_login: false,
+});
+
+fn ledger_gate() -> std::sync::MutexGuard<'static, LedgerGate> {
+    LEDGER_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A test holding one ledger can open a second while a superuser login only
+/// waits, and the login runs once no ledger is live: a writer-preferring lock
+/// deadlocked the full suite here (review of #1386). No server needed.
+#[tokio::test]
+async fn a_second_ledger_is_not_queued_behind_a_waiting_superuser_login() {
+    let wait = std::time::Duration::from_secs(2);
+    let first = live_ledger().await;
+    let login = tokio::spawn(superuser_login());
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let second = tokio::time::timeout(wait, live_ledger())
+        .await
+        .expect("a second ledger is not queued behind a waiting login");
+    assert!(
+        !login.is_finished(),
+        "the login waits while a ledger is live"
+    );
+    drop((first, second));
+    let login = tokio::time::timeout(wait, login)
+        .await
+        .expect("the login runs once no ledger is live")
+        .unwrap();
+    drop(login);
+}
+
+/// One live ledger, counted until dropped.
+struct LiveLedger;
+
+impl Drop for LiveLedger {
+    fn drop(&mut self) {
+        ledger_gate().live -= 1;
+    }
+}
+
+async fn live_ledger() -> LiveLedger {
+    loop {
+        {
+            let mut gate = ledger_gate();
+            if !gate.superuser_login {
+                gate.live += 1;
+                return LiveLedger;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// The superuser-reachable login role's span, exclusive of every ledger.
+pub(crate) struct SuperuserLogin;
+
+impl Drop for SuperuserLogin {
+    fn drop(&mut self) {
+        ledger_gate().superuser_login = false;
+    }
+}
+
+pub(crate) async fn superuser_login() -> SuperuserLogin {
+    loop {
+        {
+            let mut gate = ledger_gate();
+            if !gate.superuser_login && gate.live == 0 {
+                gate.superuser_login = true;
+                return SuperuserLogin;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
 
 struct TestDb {
     name: String,
     conn: Conn,
-    _no_superuser_login: tokio::sync::RwLockReadGuard<'static, ()>,
+    _live: LiveLedger,
 }
 
 #[tokio::test]
@@ -5857,7 +5943,7 @@ impl std::ops::DerefMut for TestDb {
 
 impl TestDb {
     async fn create(tag: &str) -> TestDb {
-        let no_superuser_login = SUPERUSER_LOGIN.read().await;
+        let live = live_ledger().await;
         // The pid keeps two concurrent `cargo test` runs apart; the tag keeps
         // this run's own tests apart.
         let name = format!("pbps_test_{tag}_{}", std::process::id());
@@ -5879,7 +5965,7 @@ impl TestDb {
         TestDb {
             name,
             conn,
-            _no_superuser_login: no_superuser_login,
+            _live: live,
         }
     }
 
@@ -6494,7 +6580,7 @@ async fn two_pipelines_creating_the_ledger_at_once_both_find_it_there() {
 #[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
 async fn a_row_type_of_the_ledgers_name_without_the_table_is_still_refused() {
     // Its own database, not a `TestDb`, but a ledger all the same (#1097).
-    let _no_superuser_login = SUPERUSER_LOGIN.read().await;
+    let _live = live_ledger().await;
     let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("the PostgreSQL 16 fixture");
     for connection in [conn_str(), old] {
         let mut admin = Conn::connect(Driver::Postgres, &connection).await.unwrap();
@@ -29109,7 +29195,7 @@ async fn doctor_reports_an_absent_target_of_a_recorded_only_grant() {
 #[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
 async fn doctor_reports_maintain_on_an_old_server_for_a_reused_table_name() {
     // Its own database, not a `TestDb`, but a ledger all the same (#1097).
-    let _no_superuser_login = SUPERUSER_LOGIN.read().await;
+    let _live = live_ledger().await;
     let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("the PostgreSQL 16 fixture");
     let name = format!("pbps_test_maint569_{}", std::process::id());
     for connection in [conn_str(), old] {

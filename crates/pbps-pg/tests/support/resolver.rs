@@ -1410,7 +1410,7 @@ mod recon610_super {
         // pg_database_owner.
         // Its run login can act as the reproduced superuser deployer, so no
         // ledger of this binary may be live while it exists (#1097).
-        let _alone = crate::SUPERUSER_LOGIN.write().await;
+        let _alone = crate::superuser_login().await;
         let server = std::env::var("PBPS_TEST_PG_DB").unwrap();
         let pid = std::process::id();
         let scratch_db = format!("pbps_super_s_{pid}");
