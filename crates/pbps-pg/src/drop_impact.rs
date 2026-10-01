@@ -45,7 +45,12 @@ impl Edge {
 struct Graph(Vec<Edge>);
 
 impl Graph {
-    fn closure(&self, root: Address, automatic: bool) -> BTreeSet<Address> {
+    fn closure(
+        &self,
+        root: Address,
+        automatic: bool,
+        replaced: &BTreeSet<Address>,
+    ) -> BTreeSet<Address> {
         let mut found = BTreeSet::from([root]);
         loop {
             let mut next = found.clone();
@@ -58,9 +63,14 @@ impl Graph {
                 // An indirectly removed internal object promotes removal to
                 // its owner. The explicit root cannot authorize deleting its
                 // owner: DROP of an extension member is still refused.
+                //
+                // A replaced object promotes nothing: `SET EXPRESSION` swaps a
+                // generated column's `pg_attrdef` row and leaves the column,
+                // and what depends on the column, in place (DEC-1316.1).
                 if edge.owner()
                     && found.iter().any(|a| a.contains(edge.dependent))
                     && (!automatic || !root.contains(edge.dependent))
+                    && !replaced.iter().any(|r| r.contains(edge.dependent))
                 {
                     next.insert(edge.referenced);
                 }
@@ -79,10 +89,10 @@ impl Graph {
         removals: &[(usize, Address)],
         replaced: &BTreeSet<Address>,
     ) -> Vec<String> {
-        let reachable = self.closure(root, false);
+        let reachable = self.closure(root, false, replaced);
         let mut removed = BTreeMap::<Address, usize>::new();
         for &(index, address) in removals {
-            for auto in self.closure(address, true) {
+            for auto in self.closure(address, true, replaced) {
                 removed
                     .entry(auto)
                     .and_modify(|old| *old = (*old).min(index))
@@ -725,6 +735,25 @@ mod tests {
         assert_eq!(
             graph.blockers(address(1), 1, &removals, &BTreeSet::new()),
             ["object 3 (internal owner of object 2)"]
+        );
+    }
+
+    /// Nor does it reach, through its owner, what depends on the owner: a view
+    /// over the generated column (4) still stands after `SET EXPRESSION`, and
+    /// is no blocker of the input's drop (DEC-1316.1).
+    #[test]
+    fn a_replaced_internal_member_does_not_reach_its_owners_dependents() {
+        let graph = Graph(vec![edge(2, 1, "n"), edge(2, 3, "i"), edge(4, 3, "n")]);
+        let removals = [(0, address(2)), (1, address(1))];
+        assert!(
+            graph
+                .blockers(address(1), 1, &removals, &BTreeSet::from([address(2)]))
+                .is_empty()
+        );
+        assert!(
+            graph
+                .blockers(address(1), 1, &removals, &BTreeSet::new())
+                .contains(&"object 4".to_owned())
         );
     }
 

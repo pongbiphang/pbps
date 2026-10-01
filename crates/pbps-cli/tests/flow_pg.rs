@@ -6403,7 +6403,8 @@ fn an_expression_change_releases_a_generated_column_from_a_dropped_function() {
 
 /// One revision changes a generated column's expression to stop reading `a`
 /// and drops or retypes `a`: the expression change runs first, releasing `a`,
-/// and the plan applies (DEC-1316.1). An expression that still names `a` is
+/// and the plan applies (DEC-1316.1). A view over the generated column stays:
+/// `SET EXPRESSION` leaves the column it reads in place. An expression that still names `a` is
 /// still refused by name, before anything runs.
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
@@ -6420,6 +6421,7 @@ fn an_expression_change_releases_its_old_input_in_the_same_plan() {
                               g integer GENERATED ALWAYS AS (a * 2) STORED); \
          CREATE TABLE app.t3 (id integer PRIMARY KEY, a integer, b integer, \
                               g integer GENERATED ALWAYS AS (a * 2) STORED); \
+         CREATE VIEW app.v1 AS SELECT id, g FROM app.t1; \
          INSERT INTO app.t1 (id, a, b) VALUES (1, 5, 7); \
          INSERT INTO app.t2 (id, a, b) VALUES (1, 5, 7); \
          INSERT INTO app.t3 (id, a, b) VALUES (1, 5, 7)",

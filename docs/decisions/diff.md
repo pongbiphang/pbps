@@ -1295,12 +1295,17 @@ create, and before the checks that read the order (`drop_blockers`,
 - `drop_blockers` counts `SET EXPRESSION` as replacing the `pg_attrdef` row, so
   the old row's edges go with it. Its internal owner, the column, stays. A
   replaced row does not ask for its owner to be dropped, which a removed one
-  would.
+  would. Nor does it reach through the owner to what depends on it: a view over
+  the generated column still stands, and is no blocker.
 
 A change between the drop and its release that takes the dropped column's
 name, an `AddColumn` or a `RenameColumn` into it, needs the name free, and the
 release needs the column still there. The plan is refused by name, with the
-two-plan remedy.
+two-plan remedy. So is a retype whose release follows a function the plan
+creates, when a row the plan writes to the column runs in between: rows go
+before the modules, and need the new type.
+
+This is a narrow rule for one combination, not a general order.
 
 Pinned by `a_released_input_is_retyped_or_dropped_after_its_release`
 (`crates/pbps-cli/src/engine.rs`), `a_replaced_internal_member_keeps_its_owner`
