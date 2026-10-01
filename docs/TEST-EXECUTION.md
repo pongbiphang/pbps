@@ -32,7 +32,8 @@ a substring otherwise. Package, target and profile option values are not test
 names. Unsupported Cargo options, multiple TESTNAME arguments and ambiguous
 target selectors are refused rather than silently discarded. A step's `if:`
 counts as executing only when it is a literal truth value or a conjunction of
-`matrix.<axis> == '<value>'` whose every value is on its axis. Without
+`matrix.<axis> == '<value>'` that asks one value of each axis it names, and
+that value is on the axis. Without
 `include`/`exclude`, which are refused, every combination of the axes runs. A
 suite split across matrix variants is therefore owned only while the
 variants' filters together select each case (DEC-1370.1). Dedicated

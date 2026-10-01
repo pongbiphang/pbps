@@ -1054,7 +1054,12 @@ def workflow_runs(source, job, platform=None):
             clauses = [re.fullmatch(r"matrix\.([\w-]+) == '([^']+)'", c.strip()) for c in value.split("&&")]
             if value in ("false", "${{ false }}"): active = False
             elif value in ("true", "${{ true }}"): pass
-            elif all(clauses): active = all(c[2] in axes.get(c[1], ()) for c in clauses)
+            elif all(clauses):
+                # One combination holds one value per axis, so two different
+                # values asked of the same axis select nothing.
+                wanted = {}
+                for clause in clauses: wanted.setdefault(clause[1], set()).add(clause[2])
+                active = all(len(values) == 1 and values <= axes.get(axis, set()) for axis, values in wanted.items())
             else: active = False
         if not active: continue
         run = re.search(r"(?:^|\n)(?:        )?run: (.*)", step)

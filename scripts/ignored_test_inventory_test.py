@@ -137,13 +137,15 @@ class Ownership(unittest.TestCase):
     def test_any_matrix_axis_and_conjunctions_execute_only_with_every_value_present(self):
         workflow = WORKFLOW.replace("    steps:", "    strategy:\n      fail-fast: false\n      matrix:\n"
                                     "        engine: [pg, mssql]\n        half: [first, second]\n    steps:")
-        for condition in ("matrix.half == 'second'", "matrix.engine == 'pg' && matrix.half == 'second'"):
+        for condition in ("matrix.half == 'second'", "matrix.engine == 'pg' && matrix.half == 'second'",
+                          "matrix.engine == 'pg' && matrix.engine == 'pg'"):
             with self.subTest(condition=condition):
                 self.workflow.write_text(workflow.replace(
                     "      - run:", f"      - name: selected\n        if: {condition}\n        run:"))
                 self.assertEqual(self.check(), 1)
         for condition in ("matrix.half == 'third'", "matrix.engine == 'pg' && matrix.half == 'third'",
-                          "matrix.suite == 'second'", "matrix.engine == 'pg' || matrix.half == 'second'"):
+                          "matrix.suite == 'second'", "matrix.engine == 'pg' || matrix.half == 'second'",
+                          "matrix.engine == 'pg' && matrix.engine == 'mssql'"):
             with self.subTest(condition=condition):
                 self.workflow.write_text(workflow.replace(
                     "      - run:", f"      - name: selected\n        if: {condition}\n        run:"))
