@@ -103,10 +103,14 @@ async fn an_inherited_listener_is_bound_to_the_acceptor_and_lost_ownership_is_te
         .spawn().unwrap();
     let mut stream = UnixStream::connect(&path).await.unwrap();
     let mut ready = [0];
-    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut ready))
+    // A readiness wait, not the property under test: a python interpreter
+    // starting while the whole workspace suite runs in parallel took longer
+    // than the 5 seconds this used to allow (#1123). The deadline only has
+    // to be one a start-up does not reach.
+    tokio::time::timeout(Duration::from_secs(30), stream.read_exact(&mut ready))
         .await
-        .unwrap()
-        .unwrap();
+        .expect("the python child never accepted the inherited listener and signalled ready")
+        .expect("reading the python child's ready byte");
     let process = ProcessLease::capture(child.id()).unwrap();
     let creator = stream.peer_cred().unwrap().pid().unwrap() as u32;
     let observed = UnixPeer::capture(&stream, &process).await;
