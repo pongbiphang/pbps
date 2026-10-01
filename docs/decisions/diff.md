@@ -1290,7 +1290,15 @@ old type may refuse that default: measured on 18.6, `SET DEFAULT 'abc'` on an
 `integer` is `invalid input syntax`. It also takes along another generated
 column's expression change whose new text may read the column, found by the
 same scan. Once that column reads it, the engine refuses the retype, and the
-catalog knows only the old readers. It
+catalog knows only the old readers.
+
+Those two rules can cycle. A generated column may release one retyped input
+and start reading another while a second column does the reverse. Each must
+then follow one retype and precede the other, and no order runs. The pass is a
+pure function of the order and its cursor, so an arrangement it has already
+moved from, at the same cursor, is one it would loop through forever. It
+refuses there, and names the remedy: a plan of its own that first changes
+those columns to expressions reading neither input. It
 runs after the module passes, which may move that change past a function's
 create, and before the checks that read the order (`drop_blockers`,
 `generation_support`). Both checks then see the release first:

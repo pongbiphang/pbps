@@ -1193,13 +1193,20 @@ fn release_of(
 /// `dependences` is each table's live edges, by catalog name. Returns how many
 /// changes moved, or a refusal when the input's name is taken by a change
 /// between its drop and the release: that change needs the name free, and the
-/// release needs the column still there.
+/// release needs the column still there. Also a refusal when the moves would
+/// cycle: a generated column that releases one retyped input and starts
+/// reading another, and a second doing the reverse, leave no order at all.
 pub(crate) fn order_after_releases(
     changes: &mut ChangeSet,
     dependences: &BTreeMap<TableName, Vec<pbps_pg::generated::Dependence>>,
 ) -> Result<usize, String> {
     let names = LiveNames::of(changes);
     let mut moved = 0;
+    // Each change's original position, moved with it. The pass is a pure
+    // function of the order and the cursor, so an arrangement it has moved
+    // from before at the same cursor is one it would loop through forever.
+    let mut ids: Vec<usize> = (0..changes.changes.len()).collect();
+    let mut seen = std::collections::BTreeSet::new();
     let mut i = 0;
     while i < changes.changes.len() {
         let Some((table, live, column, _)) = names.changed(&changes.changes[i].change) else {
@@ -1260,6 +1267,14 @@ pub(crate) fn order_after_releases(
         //   read the column. Once it reads it, the engine refuses the retype.
         //   The catalog knows only the old readers, so the new ones are found
         //   by the same over-approximating scan.
+        if !seen.insert((i, ids.clone())) {
+            return Err(format!(
+                "{column} cannot be retyped in this plan: a generated column it releases waits \
+                 for another input's retype, and that input is released by a column that \
+                 starts reading {column}. Change those generated columns to expressions that \
+                 read neither input in a plan of its own first, then this one."
+            ));
+        }
         let uid =
             if let pbps_model::Change::AlterColumnType { uid, .. } = &changes.changes[i].change {
                 Some(uid.clone())
@@ -1267,6 +1282,7 @@ pub(crate) fn order_after_releases(
                 None
             };
         let mut group = vec![changes.changes.remove(i)];
+        let mut group_ids = vec![ids.remove(i)];
         let mut release = release - 1;
         let mut j = i;
         while j < release {
@@ -1281,14 +1297,16 @@ pub(crate) fn order_after_releases(
             });
             if follows {
                 group.push(changes.changes.remove(j));
+                group_ids.push(ids.remove(j));
                 release -= 1;
             } else {
                 j += 1;
             }
         }
         moved += group.len();
-        for (k, p) in group.into_iter().enumerate() {
+        for (k, (p, id)) in group.into_iter().zip(group_ids).enumerate() {
             changes.changes.insert(release + 1 + k, p);
+            ids.insert(release + 1 + k, id);
         }
     }
     Ok(moved)
@@ -2395,6 +2413,44 @@ mod tests {
             "{:?}",
             cs.changes
         );
+        // Two generated columns swapping retyped inputs: `g` releases `a` and
+        // starts reading `b`, `h` releases `b` and starts reading `a`. Each
+        // must follow one retype and precede the other; no order exists, and
+        // the pass refuses rather than loop.
+        let reads_both = BTreeMap::from([(
+            t.clone(),
+            vec![
+                pbps_pg::generated::Dependence {
+                    generated: "g".into(),
+                    base: "a".into(),
+                },
+                pbps_pg::generated::Dependence {
+                    generated: "h".into(),
+                    base: "b".into(),
+                },
+            ],
+        )]);
+        let swap = |g: &str, to: &str| Change::AlterColumnExpression {
+            uid: uid(if g == "g" { "c_gggggg" } else { "c_hhhhhh" }),
+            column: col(g),
+            from: String::new(),
+            to: to.into(),
+        };
+        let mut cs = plan(vec![
+            retype("a"),
+            retype("b"),
+            swap("g", "b * 2"),
+            swap("h", "a * 2"),
+        ]);
+        let refusal = order_after_releases(&mut cs, &reads_both).unwrap_err();
+        assert!(
+            refusal.contains("cannot be retyped in this plan"),
+            "{refusal}"
+        );
+        // A chain is no cycle: `g` releases `a` and starts reading `b`, which
+        // nothing generated reads. `a`'s retype follows `g`, `b`'s precedes it.
+        let mut cs = plan(vec![retype("a"), retype("b"), swap("g", "b * 2")]);
+        assert_eq!(order_after_releases(&mut cs, &reads_a), Ok(1));
         // A row writing `a` that runs before the release, as it does when the
         // release follows a function create: the retype cannot both follow the
         // release and precede the row, so the plan is refused by name.
