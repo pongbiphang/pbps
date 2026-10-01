@@ -571,12 +571,11 @@ pub async fn refuse_created_name_occupants(
         Driver::Mssql => {
             let (names, parents) = crate::deploy::object_reads(cs);
             // An absent row is a free name only where nothing can be hidden
-            // from this login (#1192).
-            let mut schemas: Vec<String> = names
-                .iter()
-                .chain(&parents)
-                .map(|n| n.schema.clone())
-                .collect();
+            // from this login (#1192). Only `names` are claimed: `parents`
+            // are read for what the walk moves or removes with a table, and
+            // a drop-only plan claims nothing, so it is not asked to prove
+            // anything (review of #1360).
+            let mut schemas: Vec<String> = names.iter().map(|n| n.schema.clone()).collect();
             schemas.sort();
             schemas.dedup();
             pbps_mssql::catalog::prove_schemas_visible(conn, &schemas).await?;

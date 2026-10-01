@@ -2589,7 +2589,8 @@ fn two_added_checks_one_name_under_the_collation_refuse_the_plan() {
 /// `DENY` lifted, the same login sees the sequence and gets the ordinary
 /// occupied-name refusal, so the read itself was never what failed; and a
 /// schema `DENY` on `other`, which the plan creates nothing in, refuses
-/// nothing.
+/// nothing. A plan that only drops a column claims no name and is not asked
+/// to prove anything, even under the `DENY`.
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
 fn a_name_metadata_visibility_hides_is_not_read_as_free() {
@@ -2608,7 +2609,7 @@ fn a_name_metadata_visibility_hides_is_not_read_as_free() {
     on_server(
         own.connection(),
         &format!(
-            "EXEC(N'CREATE SCHEMA other;'); CREATE TABLE dbo.keep (id int); \
+            "EXEC(N'CREATE SCHEMA other;'); CREATE TABLE dbo.keep (id int, old int); \
              CREATE SEQUENCE dbo.s; \
              CREATE USER [{login}] FOR LOGIN [{login}]; \
              GRANT VIEW DEFINITION, SELECT, INSERT, UPDATE, DELETE, ALTER, REFERENCES \
@@ -2625,6 +2626,29 @@ fn a_name_metadata_visibility_hides_is_not_read_as_free() {
     d.commit();
     let o = d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let as_login = with_key(
+        &with_key(own.connection(), "User Id", &login),
+        "Password",
+        password,
+    );
+    let plan = d.dir.join("plan.json");
+
+    // A plan that claims no name reads no occupant it could miss, so the
+    // DENY on `dbo.s` does not refuse dropping `dbo.keep.old` (review of
+    // #1360).
+    std::fs::write(
+        d.dir.join("schema/dbo.keep.yml"),
+        "table: dbo.keep\ncolumns:\n  id:\n    type: int\n",
+    )
+    .unwrap();
+    let o = d.run(&["drop", "dbo.keep.old", "--reason", "retired"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    d.commit();
+    let o = d.run(&["plan", "--db", &as_login, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(plan.exists(), "{}", stderr(&o));
+    std::fs::remove_file(&plan).unwrap();
+
     std::fs::write(
         d.dir.join("schema/dbo.s.yml"),
         "table: dbo.s\ncolumns:\n  id: {type: int}\n",
@@ -2632,12 +2656,6 @@ fn a_name_metadata_visibility_hides_is_not_read_as_free() {
     .unwrap();
     assert_eq!(code(&d.run(&["plan"])), 0);
     d.commit();
-    let as_login = with_key(
-        &with_key(own.connection(), "User Id", &login),
-        "Password",
-        password,
-    );
-    let plan = d.dir.join("plan.json");
 
     let o = d.run(&["plan", "--db", &as_login, "--out", plan.to_str().unwrap()]);
     assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
