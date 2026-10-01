@@ -5843,6 +5843,119 @@ async fn generation_producer_case(case: GenerationCase) {
         }
     }
     let expected = evidence.after().prerequisites();
+    // A net count cannot distinguish missing identities from new arrivals.
+    // Diagnose only held snapshots so a mismatch cannot change the observation.
+    let expected_records: BTreeMap<_, _> = expected
+        .iter()
+        .map(|record| (record.object.clone(), record))
+        .collect();
+    let observed_records: BTreeMap<_, _> = observed
+        .prerequisites()
+        .iter()
+        .map(|record| (record.object.clone(), record))
+        .collect();
+    let missing: Vec<_> = expected_records
+        .keys()
+        .filter(|object| !observed_records.contains_key(*object))
+        .collect();
+    let unexpected: Vec<_> = observed_records
+        .keys()
+        .filter(|object| !expected_records.contains_key(*object))
+        .collect();
+    let common: Vec<_> = expected_records
+        .keys()
+        .filter(|object| observed_records.contains_key(*object))
+        .collect();
+    let properties_mismatches: Vec<_> = common
+        .iter()
+        .copied()
+        .filter(|object| expected_records[*object].properties != observed_records[*object].properties)
+        .collect();
+    let bindings_mismatches: Vec<_> = common
+        .iter()
+        .copied()
+        .filter(|object| expected_records[*object].bindings != observed_records[*object].bindings)
+        .collect();
+    if !missing.is_empty()
+        || !unexpected.is_empty()
+        || !properties_mismatches.is_empty()
+        || !bindings_mismatches.is_empty()
+    {
+        let describe = |object: &pbps_model::resolver::ObjectIdentity| {
+            let opening = evidence
+                .before()
+                .prerequisites()
+                .iter()
+                .find(|record| &record.object == object);
+            serde_json::json!({
+                "object": object,
+                "expected_ownership": expected_records.get(object).map(|record| &record.ownership),
+                "observed_ownership": observed_records.get(object).map(|record| &record.ownership),
+                "opening_present": opening.is_some(),
+                "opening_ownership": opening.map(|record| &record.ownership),
+                "retained_root_present": {
+                    "opening": evidence.before().scope().retained.contains(object),
+                    "desired": evidence.after().scope().retained.contains(object),
+                    "fresh": observed.scope().retained.contains(object),
+                },
+                "candidate_membership_present": {
+                    "opening": evidence.before().membership().iter().any(|row| row.members.contains(object)),
+                    "desired": evidence.after().membership().iter().any(|row| row.members.contains(object)),
+                    "fresh": observed.membership().iter().any(|row| row.members.contains(object)),
+                },
+            })
+        };
+        let summarize = |identities: &[&pbps_model::resolver::ObjectIdentity]| {
+            serde_json::json!({
+                "count": identities.len(),
+                "truncated": identities.len() > 8,
+                "identities": identities.iter().copied().take(8).map(&describe).collect::<Vec<_>>(),
+            })
+        };
+        let generated_object = generation_objects(&table, "g")[1].clone();
+        let generated_bindings: Vec<_> = [
+            ("opening", evidence.before()),
+            ("desired", evidence.after()),
+            ("fresh", &observed),
+        ]
+        .into_iter()
+        .map(|(side, manifest)| {
+            let record = manifest
+                .prerequisites()
+                .iter()
+                .find(|row| row.object == generated_object);
+            let count = record.map_or(0, |row| row.bindings.len());
+            serde_json::json!({
+                "side": side,
+                "surface": Surface::Default(table.column("g")),
+                "object": generated_object,
+                "present": record.is_some(),
+                "ownership": record.map(|row| &row.ownership),
+                "count": count,
+                "truncated": count > 8,
+                "bindings": record.into_iter().flat_map(|row| &row.bindings).take(8).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+        eprintln!(
+            "PBPS1274_GENERATION_INVENTORY {}",
+            serde_json::json!({
+                "diagnostic": "pbps-generated-inventory",
+                "case": case_name,
+                "phase": "closing-inventory",
+                "expected_records": expected.len(),
+                "observed_records": observed.prerequisites().len(),
+                "expected_identities": expected_records.len(),
+                "observed_identities": observed_records.len(),
+                "common_identities": common.len(),
+                "expected_minus_observed": summarize(&missing),
+                "observed_minus_expected": summarize(&unexpected),
+                "properties_mismatches": summarize(&properties_mismatches),
+                "bindings_mismatches": summarize(&bindings_mismatches),
+                "generated_default_bindings": generated_bindings,
+            })
+        );
+    }
     assert_eq!(
         expected.len(),
         observed.prerequisites().len(),
