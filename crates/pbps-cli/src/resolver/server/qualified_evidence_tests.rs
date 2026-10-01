@@ -2697,10 +2697,19 @@ fn create_and_add_stored_generation_keep_the_attrdef_child_inventory() {
 
     let table = pbps_model::TableName::new("app", "t");
     let desired = generation_schema(&table);
-    let desired_ids = ids(&desired, &IdsFile::default());
     let compiled = generation_records(&table, "g");
     for create in [true, false] {
         let mut base = Schema::default();
+        if !create {
+            base = desired.clone();
+            base.tables
+                .get_mut(&table)
+                .unwrap()
+                .columns
+                .shift_remove("g");
+        }
+        let base_ids = ids(&base, &IdsFile::default());
+        let desired_ids = ids(&desired, &base_ids);
         let (surface, change, expected) = if create {
             (
                 Surface::Table(table.clone()),
@@ -2715,12 +2724,6 @@ fn create_and_add_stored_generation_keep_the_attrdef_child_inventory() {
                     .collect(),
             )
         } else {
-            base = desired.clone();
-            base.tables
-                .get_mut(&table)
-                .unwrap()
-                .columns
-                .shift_remove("g");
             let [column, attrdef, owner, reference] = generation_objects(&table, "g");
             (
                 Surface::Column(table.column("g")),
@@ -2733,7 +2736,6 @@ fn create_and_add_stored_generation_keep_the_attrdef_child_inventory() {
                 BTreeSet::from([column, attrdef, owner, reference]),
             )
         };
-        let base_ids = ids(&base, &desired_ids);
         let transitions = super::transitions::derive(
             &ChangeSet {
                 changes: vec![PlannedChange::new(change)],
