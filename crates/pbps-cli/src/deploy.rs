@@ -277,6 +277,14 @@ fn refuse_occupied_names(
             taken.push(format!("{declared}: the database already has {occupant}"));
         }
     }
+    // An index shares the relation namespace with all of these (#1355).
+    for name in created_index_names(cs) {
+        if let Some(occupant) = relation(&name) {
+            taken.push(format!(
+                "index `{name}`: the database already has {occupant}"
+            ));
+        }
+    }
     if taken.is_empty() {
         return Ok(());
     }
@@ -292,9 +300,10 @@ fn refuse_occupied_names(
     );
 }
 
-/// The relation names this plan creates: its tables and the views it creates
-/// that it does not also drop. A view dropped and created in one plan is a
-/// rebuild, and its name is already its own.
+/// The relation names this plan creates: its tables, the views it creates
+/// that it does not also drop, and the indexes it creates by name. A view
+/// dropped and created in one plan is a rebuild, and its name is already its
+/// own.
 // The complement is every change that creates or frees no relation name.
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(crate) fn created_relation_names(cs: &pbps_model::ChangeSet) -> Vec<TableName> {
@@ -319,7 +328,51 @@ pub(crate) fn created_relation_names(cs: &pbps_model::ChangeSet) -> Vec<TableNam
             }
             _ => None,
         })
+        .chain(created_index_names(cs))
         .collect()
+}
+
+/// The index names this plan creates, each in its table's schema (#1355):
+/// an added index, the index behind an added unique constraint or a named
+/// primary key, which PostgreSQL names after the constraint, and those a
+/// created table declares. An index shares the relation namespace with
+/// tables, views and sequences, so `CREATE INDEX` at a held name fails with
+/// 42P07. An unnamed key's `<table>_pkey` is not here: PostgreSQL gives it a
+/// fallback when that is held (DEC-465.1). Changes on a renamed table carry
+/// its new name, which is the schema the index is created in.
+// The complement is every change that creates no index.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn created_index_names(cs: &pbps_model::ChangeSet) -> Vec<TableName> {
+    use pbps_model::Change;
+    let in_schema = |t: &TableName, name: &str| TableName::new(t.schema.clone(), name);
+    let mut out = Vec::new();
+    for p in &cs.changes {
+        match &p.change {
+            Change::AddIndex { table, name, .. } | Change::AddUnique { table, name, .. } => {
+                out.push(in_schema(table, name));
+            }
+            Change::SetPrimaryKey {
+                table,
+                to: Some(key),
+                ..
+            } => {
+                if let Some(name) = &key.name {
+                    out.push(in_schema(table, name));
+                }
+            }
+            Change::CreateTable { name, table, .. } => {
+                let named = table
+                    .primary_key
+                    .iter()
+                    .filter_map(|k| k.name.as_deref())
+                    .chain(table.unique.keys().map(String::as_str))
+                    .chain(table.indexes.keys().map(String::as_str));
+                out.extend(named.map(|n| in_schema(name, n)));
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Refuses a name this plan creates that a sequence, an index or a composite
@@ -435,6 +488,7 @@ pub(crate) fn refuse_uninventoried_occupants(
             } if module.kind == pbps_model::ModuleKind::View => Some(name.clone()),
             _ => None,
         })
+        .chain(created_index_names(cs))
         .collect();
     let still_owned = |o: &pbps_pg::catalog::NameOccupant| {
         !freed.contains(&o.name)
@@ -8425,6 +8479,122 @@ mod tests {
         );
     }
 
+    /// An index the plan creates takes a relation name too (#1355): one at
+    /// the name of a sequence the database holds, or of one a cross-schema
+    /// rename carries in first, is refused like a table there. A unique
+    /// constraint's and a named key's index are named after them. Not
+    /// occupants: an index the plan drops first, and an unnamed key, whose
+    /// `<table>_pkey` PostgreSQL moves aside when taken (DEC-465.1).
+    #[test]
+    fn an_index_the_plan_creates_meets_held_and_carried_names() {
+        use pbps_model::{Change, ChangeSet, PlannedChange, PrimaryKey, UniqueConstraint};
+        use pbps_pg::catalog::NameOccupant;
+        let t = TableName::new("archive", "t");
+        let index: Box<pbps_model::Index> =
+            Box::new(serde_json::from_str(r#"{"columns": [{"name": "n"}]}"#).unwrap());
+        let add_index = |name: &str| {
+            PlannedChange::new(Change::AddIndex {
+                table: t.clone(),
+                name: name.into(),
+                index: index.clone(),
+                clustered: false,
+            })
+        };
+        let add_unique = |name: &str| {
+            PlannedChange::new(Change::AddUnique {
+                table: t.clone(),
+                name: name.into(),
+                constraint: UniqueConstraint {
+                    columns: vec!["n".into()],
+                },
+                clustered: false,
+            })
+        };
+        let set_key = |name: Option<&str>| {
+            PlannedChange::new(Change::SetPrimaryKey {
+                table: t.clone(),
+                from: None,
+                to: Some(PrimaryKey {
+                    name: name.map(str::to_owned),
+                    columns: vec!["n".into()],
+                }),
+                nonclustered: false,
+            })
+        };
+        let held = NameOccupant {
+            name: TableName::new("archive", "s"),
+            kind: "sequence",
+            owner: None,
+            owner_column: None,
+        };
+        let plan = |changes: Vec<PlannedChange>| ChangeSet { changes };
+        let refused = |changes: Vec<PlannedChange>, occupant: &NameOccupant| {
+            refuse_uninventoried_occupants(&plan(changes), std::slice::from_ref(occupant), "prod")
+                .map_err(|e| e.to_string())
+        };
+
+        for change in [add_index("s"), add_unique("s"), set_key(Some("s"))] {
+            let e = refused(vec![change], &held).unwrap_err();
+            assert!(
+                e.contains("`archive.s`: the database already has sequence `archive.s`"),
+                "{e}"
+            );
+        }
+        let mut declared = pbps_model::Table::default();
+        declared.indexes.insert("s".into(), (*index).clone());
+        let created = PlannedChange::new(Change::CreateTable {
+            uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "archive.u", 0),
+            name: TableName::new("archive", "u"),
+            table: Box::new(declared),
+        });
+        assert!(
+            refused(vec![created], &held).is_err(),
+            "a created table's own index is created too"
+        );
+
+        // Carried in first: `app.old` moves to `archive` with its sequence.
+        let old = TableName::new("app", "old");
+        let carried = NameOccupant {
+            name: TableName::new("app", "old_n_seq"),
+            kind: "sequence",
+            owner: Some(old.clone()),
+            owner_column: Some("n".into()),
+        };
+        let to_archive = PlannedChange::new(Change::RenameTable {
+            uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "app.old", 0),
+            from: old,
+            to: TableName::new("archive", "new"),
+            defaults: Vec::new(),
+        });
+        let e = refused(vec![to_archive.clone(), add_index("old_n_seq")], &carried).unwrap_err();
+        assert!(
+            e.contains("`archive.old_n_seq`: this plan moves sequence `app.old_n_seq`"),
+            "{e}"
+        );
+
+        // Negatives: a free name, an index dropped first, an unnamed key.
+        refused(vec![add_index("free")], &held).unwrap();
+        refused(vec![to_archive, add_index("free")], &carried).unwrap();
+        let own = NameOccupant {
+            name: TableName::new("archive", "ix"),
+            kind: "index",
+            owner: Some(t.clone()),
+            owner_column: None,
+        };
+        let drop = PlannedChange::new(Change::DropIndex {
+            table: t.clone(),
+            name: "ix".into(),
+        });
+        refused(vec![drop, add_index("ix")], &own).unwrap();
+        let pkey = NameOccupant {
+            name: TableName::new("archive", "t_pkey"),
+            kind: "sequence",
+            owner: None,
+            owner_column: None,
+        };
+        refused(vec![set_key(None)], &pkey).unwrap();
+    }
+
     /// #1084: a cross-schema rename carries its table's indexes and owned
     /// sequences into the destination schema under their own names, before
     /// any table is created. A created name there that meets one refuses the
@@ -8817,6 +8987,63 @@ mod tests {
     /// occupies a new table's or view's name; an unreadable routine of the
     /// same bare name does not, because routines are not in the relation
     /// namespace — refusing it would refuse a plan the engine takes.
+    /// An index the plan adds is refused at the name of a table, view or
+    /// unreadable relation outside the recorded scope, like a table there
+    /// (#1355); a free name is not.
+    #[test]
+    fn an_added_index_meets_unrecorded_relations() {
+        use pbps_db::catalog::LimitationTarget;
+        use pbps_model::{Change, ChangeSet, PlannedChange};
+        let x = TableName::new("app", "x");
+        let add = |name: &str| ChangeSet {
+            changes: vec![PlannedChange::new(Change::AddIndex {
+                table: TableName::new("app", "t"),
+                name: name.into(),
+                index: Box::new(serde_json::from_str(r#"{"columns": [{"name": "n"}]}"#).unwrap()),
+                clustered: false,
+            })],
+        };
+        let empty = pbps_diff::Scoped {
+            schema: Schema::default(),
+            unmanaged: Vec::new(),
+            missing: Vec::new(),
+            unmanaged_modules: Vec::new(),
+            unmanaged_roles: Vec::new(),
+            unexpressible: Vec::new(),
+            missing_roles: Vec::new(),
+            public_execute: Default::default(),
+            owners: Default::default(),
+            session_role: String::new(),
+        };
+        let mut table = empty.clone();
+        table.unmanaged.push(x.clone());
+        let mut view = empty.clone();
+        view.unmanaged_modules.push(ModuleId::Named(x.clone()));
+        let unreadable = [(
+            LimitationTarget::Relation(x.clone()),
+            "partitioned".to_owned(),
+        )];
+        for (scoped, unreadable, expected) in [
+            (
+                &table,
+                &[][..],
+                "index `app.x`: the database already has table `app.x`",
+            ),
+            (
+                &view,
+                &[][..],
+                "index `app.x`: the database already has view `app.x`",
+            ),
+            (&empty, &unreadable[..], "`app.x`, which pbps cannot read"),
+        ] {
+            let e = refuse_occupied_names(&add("x"), scoped, unreadable, &[], "prod")
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(expected), "{e}");
+        }
+        refuse_occupied_names(&add("free"), &table, &[], &[], "prod").expect("a free name");
+    }
+
     #[test]
     fn a_new_name_is_occupied_only_by_what_shares_its_namespace() {
         use pbps_db::catalog::LimitationTarget;
