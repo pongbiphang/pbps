@@ -423,7 +423,9 @@ moves the table's indexes and owned sequences into the destination schema under
 their own names, before any table or view is created. So the read also asks
 what each transferred table owns. A created name in the destination that meets
 one is refused, naming the object and the rename, unless the plan drops it
-first. That is an index it drops, or a sequence whose column it drops.
+first. That is an index it drops, or a sequence whose column it drops. A view
+the plan rebuilds in the destination counts as created here: its drop runs
+before the rename, so the carried object takes the name its re-creation needs.
 
 A name taken after the plan was saved is left to the apply. The `CREATE` fails
 inside the transaction and the ledger records nothing, which is the outcome a

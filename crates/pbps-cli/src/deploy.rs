@@ -421,8 +421,21 @@ pub(crate) fn refuse_uninventoried_occupants(
     // And what a cross-schema rename carries into its destination (#1084):
     // `SET SCHEMA` moves a table's indexes and owned sequences along under
     // their own names, before any table or view is created. One the plan
-    // drops first stays behind, as above.
-    let created: BTreeSet<TableName> = created_relation_names(cs).into_iter().collect();
+    // drops first stays behind, as above. A view the plan rebuilds counts
+    // here, unlike above: its drop runs before the rename, so a carried
+    // object takes the name its re-creation then needs.
+    let created: BTreeSet<TableName> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::CreateTable { name, .. } => Some(name.clone()),
+            Change::CreateModule {
+                id: ModuleId::Named(name),
+                module,
+            } if module.kind == pbps_model::ModuleKind::View => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
     let still_owned = |o: &pbps_pg::catalog::NameOccupant| {
         !freed.contains(&o.name)
             && !matches!((&o.owner, &o.owner_column), (Some(t), Some(c)) if dropped_columns.contains(&(t.clone(), c.as_str())))
@@ -8363,6 +8376,32 @@ mod tests {
             "prod",
         )
         .expect("the index is dropped before the table is created");
+        // A view the plan rebuilds in the destination: its drop frees the
+        // name before the rename, and the carried sequence takes it.
+        let view = TableName::new("archive", "old_n_seq");
+        let rebuild = vec![
+            PlannedChange::new(Change::DropModule {
+                id: ModuleId::Named(view.clone()),
+                kind: pbps_model::ModuleKind::View,
+            }),
+            to_archive(),
+            PlannedChange::new(Change::CreateModule {
+                id: ModuleId::Named(view.clone()),
+                module: Box::new(pbps_model::Module {
+                    kind: pbps_model::ModuleKind::View,
+                    description: None,
+                    definition: "SELECT 1".into(),
+                }),
+            }),
+        ];
+        let e =
+            refuse_uninventoried_occupants(&plan(rebuild), std::slice::from_ref(&sequence), "prod")
+                .unwrap_err()
+                .to_string();
+        assert!(
+            e.contains("`archive.old_n_seq`: this plan moves sequence"),
+            "{e}"
+        );
         refuse_uninventoried_occupants(
             &plan(vec![
                 to_archive(),
