@@ -6227,6 +6227,7 @@ async fn doctor_requires_alter_only_until_the_existing_ledger_is_migrated() {
     db.conn.execute("ALTER TABLE dbo.__pbps_state DROP COLUMN state_version, tables_count, modules_count, staged_completed, staged_total;
         CREATE USER migration_deployer WITHOUT LOGIN;
         GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO migration_deployer;
+        GRANT SELECT ON sys.sql_expression_dependencies TO migration_deployer;
         GRANT SELECT, INSERT, DELETE ON dbo.__pbps_state TO migration_deployer;
         GRANT SELECT, INSERT, DELETE ON dbo.__pbps_lock TO migration_deployer;").await.unwrap();
     db.conn.execute("REVOKE SELECT, INSERT, DELETE ON dbo.__pbps_state FROM migration_deployer; EXECUTE AS USER = 'migration_deployer';").await.unwrap();
@@ -6339,7 +6340,8 @@ async fn a_schema_scoped_grant_satisfies_the_readiness_check() {
              CREATE USER [{login}] FOR LOGIN [{login}]; \
              GRANT VIEW DEFINITION, SELECT, INSERT, DELETE, ALTER, REFERENCES \
              ON SCHEMA::dbo TO [{login}]; \
-             GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}];",
+             GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}]; \
+             GRANT SELECT ON sys.sql_expression_dependencies TO [{login}];",
             db.name
         ))
         .await
@@ -6824,6 +6826,7 @@ async fn declared_rows_need_dml_that_alter_on_the_schema_does_not_confer() {
              GRANT VIEW DEFINITION, SELECT, ALTER, REFERENCES ON SCHEMA::app TO [{login}]; \
              GRANT SELECT, INSERT, DELETE, ALTER ON SCHEMA::dbo TO [{login}]; \
              GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}]; \
+             GRANT SELECT ON sys.sql_expression_dependencies TO [{login}]; \
              GRANT VIEW DEFINITION TO [{login}];",
             db.name
         ))
@@ -8071,6 +8074,7 @@ async fn least_privilege_login(db: &mut TestDb, login: &str, password: &str) -> 
              GRANT VIEW DEFINITION, SELECT, ALTER, REFERENCES ON SCHEMA::app TO [{login}]; \
              GRANT SELECT, INSERT, DELETE, ALTER ON SCHEMA::dbo TO [{login}]; \
              GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}]; \
+             GRANT SELECT ON sys.sql_expression_dependencies TO [{login}]; \
              GRANT VIEW DEFINITION TO [{login}];",
             db.name
         ))
@@ -8951,7 +8955,8 @@ async fn a_foreign_key_into_an_unmanaged_schema_needs_permission_on_its_target()
              ON SCHEMA::app TO [{login}]; \
              GRANT VIEW DEFINITION, SELECT, INSERT, DELETE, ALTER, REFERENCES \
              ON SCHEMA::dbo TO [{login}]; \
-             GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}];"
+             GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}]; \
+             GRANT SELECT ON sys.sql_expression_dependencies TO [{login}];"
         ))
         .await
         .expect("grant");
@@ -12296,7 +12301,8 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
              CREATE USER [{login}] FOR LOGIN [{login}]; \
              GRANT VIEW DEFINITION, SELECT, INSERT, DELETE, ALTER, REFERENCES \
              ON SCHEMA::dbo TO [{login}]; \
-             GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}];",
+             GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}]; \
+             GRANT SELECT ON sys.sql_expression_dependencies TO [{login}];",
             db.name
         ))
         .await

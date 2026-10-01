@@ -5400,7 +5400,8 @@ fn doctor_accepts_complete_managed_column_select_and_names_the_missing_scope() {
              CREATE USER [{login}] FOR LOGIN [{login}];
              GRANT VIEW DEFINITION, ALTER, REFERENCES ON SCHEMA::app TO [{login}];
              GRANT SELECT, INSERT, DELETE, ALTER ON SCHEMA::dbo TO [{login}];
-             GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}];"
+             GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}]; \
+             GRANT SELECT ON sys.sql_expression_dependencies TO [{login}];"
         ),
     );
     let base = db
@@ -5573,6 +5574,7 @@ fn doctor_asks_for_the_dml_a_declared_data_block_needs() {
              GRANT VIEW DEFINITION, SELECT, ALTER, REFERENCES ON SCHEMA::app TO [{login}]; \
              GRANT SELECT, INSERT, DELETE, ALTER ON SCHEMA::dbo TO [{login}]; \
              GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{login}]; \
+             GRANT SELECT ON sys.sql_expression_dependencies TO [{login}]; \
              GRANT VIEW DEFINITION TO [{login}];"
         ),
     );
@@ -5703,6 +5705,22 @@ fn doctor_asks_for_the_dml_a_declared_data_block_needs() {
         "a project declaring no row must not be asked for DML: {v}"
     );
 
+    // Reading the catalog also reads `sys.sql_expression_dependencies`,
+    // which the engine gives only to `db_owner`: without it every connected
+    // command fails with Msg 229, so `doctor` names it, on that object
+    // (#1359).
+    on_server(
+        db.connection(),
+        &format!("REVOKE SELECT ON sys.sql_expression_dependencies FROM [{login}];"),
+    );
+    let (named, exit, v) = gaps();
+    assert_eq!(named.len(), 1, "{v}");
+    assert!(
+        named[0].starts_with("SELECT on OBJECT::[sys].[sql_expression_dependencies] — "),
+        "{v}"
+    );
+    assert_ne!(exit, 0, "{v}");
+
     after_test_on_server(
         &server,
         &format!("IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"),
@@ -5743,6 +5761,7 @@ fn doctor_unions_only_the_columns_external_foreign_keys_reference() {
          GRANT VIEW DEFINITION, SELECT, ALTER, REFERENCES ON SCHEMA::app TO [{0}]; \
          GRANT SELECT, INSERT, DELETE, ALTER ON SCHEMA::dbo TO [{0}]; \
          GRANT CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION TO [{0}]; \
+         GRANT SELECT ON sys.sql_expression_dependencies TO [{0}]; \
          GRANT SELECT, REFERENCES ON OBJECT::shared.parent(code) TO [{0}];",
             login.1
         ),
