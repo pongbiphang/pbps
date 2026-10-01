@@ -43,6 +43,21 @@ fn requires_table() -> String {
     rest[..rest.find("\n## ").unwrap_or(rest.len())].to_owned()
 }
 
+/// The kinds named in the first cell of each row, alone or with a field
+/// pattern (`SetPrimaryKey { to: None }`). A kind mentioned only in another
+/// cell, or in prose, has no row.
+fn row_kinds(table: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in table.lines().filter(|l| l.starts_with("| `")) {
+        let first = line.split('|').nth(1).unwrap_or("");
+        for named in first.split('`').skip(1).step_by(2) {
+            let kind = named.split([' ', '{']).next().unwrap_or("");
+            out.push(kind.to_owned());
+        }
+    }
+    out
+}
+
 #[test]
 fn every_change_kind_has_a_row_in_the_ordering_audit() {
     let kinds = change_kinds();
@@ -50,12 +65,8 @@ fn every_change_kind_has_a_row_in_the_ordering_audit() {
         kinds.len() > 30,
         "the sweep must reach the whole enum: {kinds:?}"
     );
-    let table = requires_table();
-    let missing: Vec<&String> = kinds
-        .iter()
-        // Named alone, or with a field pattern: `SetPrimaryKey { to: None }`.
-        .filter(|k| !table.contains(&format!("`{k}`")) && !table.contains(&format!("`{k} {{")))
-        .collect();
+    let named = row_kinds(&requires_table());
+    let missing: Vec<&String> = kinds.iter().filter(|k| !named.contains(*k)).collect();
     assert!(
         missing.is_empty(),
         "docs/ORDERING.md has no row for {missing:?}: classify the new kind's \
@@ -63,11 +74,15 @@ fn every_change_kind_has_a_row_in_the_ordering_audit() {
     );
 }
 
-/// Negative: a name the enum does not have is not found, so the check is not
-/// passing on any text at all.
+/// Negative: a kind named only in another row's cells, or in prose, is not a
+/// row of its own.
 #[test]
-fn a_kind_the_audit_does_not_name_is_reported() {
-    let table = requires_table();
-    assert!(!table.contains("`NoSuchChange`"));
-    assert!(table.contains("`AlterColumnExpression`"));
+fn a_kind_named_outside_the_first_cell_has_no_row() {
+    let table = "| Change | Class | Requires |\n\
+                 |---|---|---|\n\
+                 | `AddColumn` | 8 | `CreateTable` first |\n\
+                 Prose naming `DropTable`.\n";
+    let named = row_kinds(table);
+    assert_eq!(named, ["AddColumn"]);
+    assert!(row_kinds(&requires_table()).contains(&"AlterColumnExpression".to_owned()));
 }

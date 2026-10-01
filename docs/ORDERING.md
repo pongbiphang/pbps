@@ -150,7 +150,16 @@ requirement is common to all of them, so it is listed once,
 
 ## Pairs that interact
 
-Every pair not listed here is independent: neither side's effect meets the
+Interacting pairs fall into the categories below. Each category has one rule
+that the classes satisfy by construction, stated at its head. A pair of
+kinds in a category follows that rule unless its table says otherwise. The
+tables list:
+- every pair whose order something other than its classes decides (a rank,
+  a pass, a refusal);
+- every pair the classes get wrong;
+- the pairs a reviewer is likely to ask about.
+
+A pair in no category is independent: neither side's effect meets the
 other's requirement in the table above. Columns:
 - **Kind:** *fixed*, *content*, *value* or *engine*, as defined under
   [Method](#method).
@@ -161,9 +170,20 @@ other's requirement in the table above. Columns:
 
 ### Names changing hands
 
+**Rule:** a change that frees a name runs in a lower class than any change that
+takes it. Drops and renames away (classes 0 to 6) run before creates and adds
+(7, 8, 13, 14, 15). The rule is by class, not by kind, so it holds across the
+namespaces kinds share: on SQL Server tables and modules share one object
+namespace, and on PostgreSQL views, tables and indexes share the relation
+namespace. Renames *into* a name (classes 1 and 3) are the exception, and
+`rename_order` and `frees_a_renamed_column` order them.
+
 | Pair | Kind | Order now | Verdict |
 |---|---|---|---|
 | `DropTable` → `CreateTable` of its name | fixed | class 6 before 7 | ✓ |
+| `RenameTable` away → `CreateTable` of the vacated name | fixed | class 1 before 7 | ✓ |
+| `DropModule` (a view) → `CreateTable` of its name | fixed | class 0 before 7 | ✓ |
+| `DropTable` → `CreateModule` of its name | fixed | class 6 before 14 | ✓ |
 | `DropTable` or a rename away → `RenameTable` into its name | fixed | `rename_order` | ✓ DEC-536.1 |
 | `DropColumn` → `RenameColumn` into its name | fixed | the drop moves to (2, 3), ahead of class 3 | ✓ DECISIONS 474 |
 | `DropColumn` or `RenameColumn` away → `AddColumn` of its name | fixed | class 5 or 3 before 8 | ✓ |
@@ -183,6 +203,9 @@ other's requirement in the table above. Columns:
 Every change names its objects as they are named at its own position, so a
 rename provides the name every later change uses.
 
+**Rule:** a rename (class 1 or 3) runs after the module drops (class 0) that
+name the old name. It runs before every change that names the new one.
+
 | Pair | Kind | Order now | Verdict |
 |---|---|---|---|
 | `RenameTable` → `RenameColumn` and every later change naming the table | fixed | class 1 before 3 and the rest; `RenameColumn` carries the new table name | ✓ |
@@ -194,14 +217,20 @@ rename provides the name every later change uses.
 
 ### Something created before what needs it
 
+**Rule:** a change that creates an object runs in a lower class than every
+change that needs it. Tables (7) and columns (8) come before alterations (9),
+rows (11), constraints (13), modules (14) and grants (16). Roles (15) come
+before grants (16). The exceptions, listed here, are the pairs inside one class
+and the expression-bearing changes that need a function.
+
 | Pair | Kind | Order now | Verdict |
 |---|---|---|---|
 | `CreateTable` → rows, keys, foreign keys, modules and grants on it | fixed | class 7 before 11, 13, 14, 16 | ✓ |
 | `AddColumn` → rows, constraints, modules naming it | fixed | class 8 before 11, 13, 14 | ✓ |
 | `AddColumn` (input) → generated `AddColumn` reading it | fixed | (9, 2) after class 8 | ✓ DEC-1168.1 |
 | `AddColumn` or `RenameColumn` (input) → `AlterColumnExpression` reading it | fixed | class 8 or 3 before 9 | ✓ DEC-1168.1 |
+| Retype of a generated column → its `AlterColumnExpression` | fixed | rank −1 before 0: the new expression is computed in the final type | ✓ DEC-1168.1 (`a_generated_columns_nullability_relaxes_before_and_tightens_after_its_expression`) |
 | Referenced key → `AddForeignKey` | fixed | rank inside class 13 | ✓ |
-| Parent row → child row | fixed | data rank inside class 11 | ✓ |
 | `CreateRole` → `Grant` to it | fixed | class 15 before 16 | ✓ |
 | `CreateModule` or `AlterModule` → `Grant` or `PublicExecution` on the routine | fixed | class 14 before 16. P: a rebuild's lost grants and `PUBLIC` execute are restated after it | ✓ ADR-0010 §5 |
 | Tightening → primary key or unique key over the column | fixed | class 9 before 13 | ✓ |
@@ -215,6 +244,12 @@ rename provides the name every later change uses.
 
 ### Something removed before what it blocks
 
+**Rule:** a change that removes a dependent runs in a lower class than the
+drop, rename or alteration it would block. Module drops (0) and constraint,
+index and key drops (2) come before renames (1, 3), column and table drops
+(5, 6) and alterations (9). The exceptions, listed here, are the pairs inside
+one class and the dependents a class cannot see.
+
 | Pair | Kind | Order now | Verdict |
 |---|---|---|---|
 | Dependent module → its table, column or retyped column | fixed | class 0 first. P: rebuilt around a retype from the catalog | ✓ DECISIONS 311; `to_rebuild` |
@@ -224,6 +259,7 @@ rename provides the name every later change uses.
 | Foreign key → the key it references | fixed | rank inside class 2 | ✓ |
 | Constraint, index or key drop → `DropColumn`, `RenameColumn` (S) | fixed | class 2 before 3 and 5 | ✓ DECISIONS 474 |
 | Inbound foreign key → `DropTable` | fixed | class 2 before 6 | ✓ |
+| `SetPrimaryKey { to: None }` → relaxing a key column's nullability | fixed | class 2 before 9 | ✓ DECISIONS 269 |
 | Generated column → its input's drop | fixed | (5, 0); (2, 2) beside a rename | ✓ DEC-1168.1 |
 | S: key, index, check or foreign key over a column → its retype or recollation | fixed | dropped in class 2, re-added in 13 (`retype_dependents`) | ✓ #1175, DECISIONS 515 |
 | **S: index key, `INCLUDE` column, filtered predicate or unique constraint over a column → tightening its nullability** | fixed | nothing is dropped: the `ALTER COLUMN … NOT NULL` is refused (5074, 4922), measured on 17.0 (`tightening_nullability_is_refused_by_what_indexes_the_column`) | **✗ #1363** |
@@ -238,12 +274,24 @@ rename provides the name every later change uses.
 | Retype → probes of later keys, checks and deletes | value | the probe projects through the new type, or the probe is unchecked | ✓ DECISIONS 340, 410 |
 | `AddColumn` backfill → probes | value | a literal is projected; an expression, identity or generated column is unchecked | ✓ DECISIONS 336, 339 |
 | Row writes → probes of keys, foreign keys and checks | value | the probe reads the rows after the plan's writes | ✓ DECISIONS 335 |
-| **Row writes setting a column → tightening it to NOT NULL** | fixed, value | the tightening (class 9) runs before the rows (11), and its probe counts the NULLs stored now | **✗ #1367** |
+| **Row writes setting a column, or deleting the rows that hold its NULLs → tightening it to NOT NULL** | fixed, value | the tightening (class 9) runs before the rows (11, 12), and its probe counts the NULLs stored now | **✗ #1367** |
 | `AlterColumnExpression` → tightening, keys, checks, filtered indexes, deletes | value | the probe is unchecked; the order is tighten and keys after the recomputation | ✓ DEC-1168.1 |
 | Default set → a row that takes it | value | the default goes first; it stays ahead of a rebuild | ✓ #1030 |
-| Row update moving references away → `DeleteRow` | value | class 11 before 12 | ✓ |
 | Nullability relaxed → expression recomputing a NULL | value | rank −1 before 0 | ✓ DEC-1168.1 |
 | Expression recomputed → nullability tightened | value | rank 0 before +1; split from a retype | ✓ DEC-1168.1 |
+
+### Rows among themselves
+
+**Rule:** rows follow the foreign keys between their tables. A referenced
+table's rows go in first and come out last. Deletes run after every insert
+and update (SPEC §4.6).
+
+| Pair | Kind | Order now | Verdict |
+|---|---|---|---|
+| Parent row → child row (insert, update) | fixed | data rank inside class 11 | ✓ |
+| Child `DeleteRow` → parent `DeleteRow` | fixed | the data rank, negated inside class 12 | ✓ |
+| Row update moving a reference away → `DeleteRow` of the old parent | fixed | class 11 before 12 | ✓ |
+| `InsertRow` reusing a value another row holds under a UNIQUE elsewhere → `DeleteRow` of that row | content | insert first (class 11 before 12): the insert is refused inside the transaction, loudly. Deleting first could cascade a moving child away silently | ✓ by design, SPEC §4.6 |
 
 ## Content-dependent pairs
 
