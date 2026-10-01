@@ -1055,6 +1055,23 @@ mod column_vector_parent {
             };
             let roles = RoleMap::generate(&context, &[], "deployer", "vectorparent");
             let run_owner = identity("pg_authid", &[&roles.deployer(&context).unwrap()], vec![]);
+            // Existing ordinary owner/ACL edges require their target role records;
+            // keep those prerequisites distinct from the mapped scratch owner.
+            for (target, scratch) in [
+                (deployer.clone(), run_owner.clone()),
+                (reader.clone(), target_identity(&reader)),
+            ] {
+                let principal = input(BTreeMap::from([
+                    ("rolinherit".into(), json!(true)),
+                    ("rolsuper".into(), json!(false)),
+                ]));
+                fixture
+                    .opening
+                    .inputs
+                    .insert(target.clone(), principal.clone());
+                fixture.opening.role_pinned.insert(target, false);
+                fixture.compiled.inputs.insert(scratch, principal);
+            }
             let acl = json!([{"grantor": deployer, "grantee": reader, "privilege": "SELECT", "grant_option": false}]);
             let before = fixture.opening.inputs.get_mut(&relation).unwrap();
             before.properties.extend(BTreeMap::from([
