@@ -62,7 +62,7 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  # Every other job waits on this one, through `quick`. On a pull request it
+  # Every other job waits on this one, through `lint`. On a pull request it
   # is held by the `ci-approval` environment until approved; everywhere else
   # the expression yields no environment and it passes at once. A rejected
   # approval fails it, which skips everything after it and shuts `ci-gate`.
@@ -73,12 +73,14 @@ jobs:
     steps:
       - run: echo "approved to run $GITHUB_EVENT_NAME"
 
-  # Keep the short checks in one job: one toolchain and one cache restore
-  # rather than three. Every other job waits on this one, so nothing expensive
-  # starts for a commit that does not even compile — a fan-in the engine-backed
-  # jobs below want for their own sake, not only for the minutes it once saved.
-  quick:
-    name: test and lint (ubuntu-latest)
+  # The fan-in every other job waits on: the short checks, in one job for one
+  # toolchain and one cache restore. What it is kept for is that nothing
+  # expensive starts for a commit that does not even compile (DECISIONS 501),
+  # and clippy over `--all-targets` answers that in a fraction of the time the
+  # tests take. The tests are in `quick`, beside the engine jobs rather than in
+  # front of them (DEC-1370.1).
+  lint:
+    name: lint (ubuntu-latest)
     needs: approve
     runs-on: ubuntu-latest
     steps:
@@ -95,9 +97,6 @@ jobs:
       # The dedicated-server fixture's retry decision runs only in the resolver
       # job, as root; this is the one place its logic is tested (DEC-958.1).
       - run: python3 scripts/live_resolver_server_test.py
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -105,6 +104,21 @@ jobs:
       - run: python3 scripts/live_transport_test.py
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
+
+  quick:
+    name: test (ubuntu-latest)
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       # Terminal integration tests must fail when their fixture is unavailable.
       - name: Required Linux PTY fixtures (util-linux and coreutils)
         run: |
@@ -124,7 +138,7 @@ jobs:
   # platform difference that only show up here.
   windows:
     name: test (windows-latest)
-    needs: quick
+    needs: lint
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -144,7 +158,7 @@ jobs:
   # apply(plan(A->B)) converges on B). Linux only: the service container needs a
   # Linux docker host.
   live:
-    needs: quick
+    needs: lint
     runs-on: ubuntu-latest
     services:
       mssql:
@@ -242,7 +256,7 @@ jobs:
   # Here the second starts only once the first answers, and a crash costs this
   # job alone rather than every SQL Server suite.
   live-editions:
-    needs: quick
+    needs: lint
     runs-on: ubuntu-latest
     env:
       IMAGE: mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1
@@ -294,9 +308,21 @@ jobs:
   # Its own job rather than a step in `live`: that one already runs a SQL
   # Server, and a second engine on the same runner is the pressure the startup
   # crashes in docs/PITFALLS.md suggest is worth not adding.
+  #
+  # Four runners, each with its own pair of servers. Run in sequence the suites
+  # took close to forty minutes, most of it in two that must stay serial
+  # against one server, and nothing else in the run takes half that
+  # (DEC-1370.1). Each variant runs its share exactly as the single job did;
+  # `scripts/ignored_test_inventory.py` refuses a split that leaves an ignored
+  # case in no variant, so a filter that drifts fails `quick` instead of
+  # dropping tests.
   live-pg:
-    needs: quick
+    needs: lint
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [dialect, capture, flow-programs, flow-rest]
     services:
       postgres:
         # Pinned by digest, for the reason the SQL Server one is: PostgreSQL
@@ -343,26 +369,47 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Keyed by variant: each builds different targets, and under one key
+      # the first to finish would save a cache the other three cannot use.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.suite }}
       # Thirty seconds of this is one test waiting out `CONNECT_TIMEOUT` on
       # purpose: a firewall that drops rather than refuses is a category of its
       # own, and what proves the wait is bounded is waiting it out.
       - run: cargo test -p pbps-pg --test live -- --ignored
-      # Private capture internals have live snapshot/rendering regressions.
-      - run: cargo test --profile live-test -p pbps-pg --lib -- --ignored --test-threads=1
+        if: matrix.suite == 'dialect'
       - run: cargo test -p pbps-db --test live_pg -- --ignored
+        if: matrix.suite == 'dialect'
       - run: python3 scripts/live-transport.py pg
+        if: matrix.suite == 'dialect'
       # The CLI's own PostgreSQL-dependent test, in the bin target rather than
       # in `tests/` because `deploy::run_probes` is private and what it asserts
       # is that the probes are answered under the settings the statements they
       # clear will run under (DECISIONS 415). `cargo test --workspace` in
       # `quick` builds it and does not run it: it is `#[ignore]`d.
       - run: cargo test -p pbps-cli --bin pbps -- --ignored --test-threads=1
+        if: matrix.suite == 'dialect'
+      # Private capture internals have live snapshot/rendering regressions.
+      # Split by module: the binding half rides with the short suites above.
+      - run: cargo test --profile live-test -p pbps-pg --lib -- --ignored --test-threads=1 resolver::binding_tests
+        if: matrix.suite == 'dialect'
+      - run: cargo test --profile live-test -p pbps-pg --lib -- --ignored --test-threads=1 --skip resolver::binding_tests
+        if: matrix.suite == 'capture'
       # The CLI end to end on this engine (issue #85): `bootstrap`, `verify`,
       # `plan --db`, `apply`, `state list`, `pull`, `doctor`, each through the
       # seam in `engine.rs`. Serial, because each test creates and drops a
       # database of its own.
-      - run: cargo test -p pbps-cli --test flow_pg -- --ignored --test-threads=1
+      #
+      # Split by name, into the cases about programmable objects and grants
+      # and everything else; the second is the first's exact complement, so a
+      # new case lands in one of them whatever it is called.
+      - run: cargo test -p pbps-cli --test flow_pg -- --ignored --test-threads=1 trigger routine function grant
+        if: matrix.suite == 'flow-programs'
+        env:
+          PBPS_TEST_PG_CONTAINER: ${{ job.services.postgres.id }}
+      - run: cargo test -p pbps-cli --test flow_pg -- --ignored --test-threads=1 --skip trigger --skip routine --skip function --skip grant
+        if: matrix.suite == 'flow-rest'
         env:
           PBPS_TEST_PG_CONTAINER: ${{ job.services.postgres.id }}
 
@@ -376,7 +423,7 @@ jobs:
   # as a service container, and a second engine on the same runner is the
   # pressure the startup crashes suggest is worth not adding.
   dev-rehearsal:
-    needs: quick
+    needs: lint
     runs-on: ubuntu-latest
     env:
       PBPS_TEST_DEV_IMAGE: mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1
@@ -400,17 +447,27 @@ jobs:
   # Native admission needs one disposable Linux host per engine. Keep these
   # away from the shared live services: the full factory owns both a target
   # and scratch instance, and its root inspector reads their actual processes.
+  #
+  # Each engine's fixtures are split across two hosts, in their original
+  # order, where the time halves (DEC-1370.1). Every script owns and removes
+  # its own containers and scratch root, so none relies on one before it;
+  # what they share is the test binary, which each half builds for itself.
   resolver:
-    needs: quick
+    needs: lint
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         engine: [pg, mssql]
+        half: [first, second]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Keyed by half: the first also builds the test profile its container
+      # fixtures run under, and the second does not.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.half }}
       - name: Preload explicitly trusted fixture images
         run: |
           docker pull postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
@@ -423,45 +480,51 @@ jobs:
         env:
           FIXTURE_ENGINE: ${{ matrix.engine }}
       - name: Docker ownership, containment and private channel
+        if: matrix.half == 'first'
         run: python3 scripts/live-resolver.py "$FIXTURE_ENGINE"
         env:
           FIXTURE_ENGINE: ${{ matrix.engine }}
       - name: Native target aliases and unprotected proxy backend
+        if: matrix.half == 'first'
         run: python3 scripts/live-resolver-target.py "$FIXTURE_ENGINE"
         env:
           FIXTURE_ENGINE: ${{ matrix.engine }}
-      - name: Complete factory on the disposable native host
+      - name: Build the native fixture test binary
         run: |
           cargo test --profile live-test -p pbps-cli --lib --no-run --message-format=json > /tmp/pbps-resolver-artifacts.jsonl
           PBPS_FIXTURE_BINARY=$(python3 -c 'import json; rows = [json.loads(line) for line in open("/tmp/pbps-resolver-artifacts.jsonl")]; print(next(row["executable"] for row in rows if row.get("executable") and row.get("target", {}).get("name") == "pbps_cli"))')
           echo "PBPS_FIXTURE_BINARY=$PBPS_FIXTURE_BINARY" >> "$GITHUB_ENV"
-          sudo python3 scripts/live-resolver-target.py "$FIXTURE_ENGINE" --native-host --test-binary "$PBPS_FIXTURE_BINARY"
+      - name: Complete factory on the disposable native host
+        if: matrix.half == 'first'
+        run: sudo python3 scripts/live-resolver-target.py "$FIXTURE_ENGINE" --native-host --test-binary "$PBPS_FIXTURE_BINARY"
         env:
           FIXTURE_ENGINE: ${{ matrix.engine }}
-      - name: PG16 complete factory on the disposable native host
-        if: matrix.engine == 'pg'
-        run: sudo python3 scripts/live-resolver-target.py pg --pg-major 16 --native-host --test-binary "$PBPS_FIXTURE_BINARY"
       - name: Verified launch privileges before engine initialization
+        if: matrix.half == 'first'
         run: sudo python3 scripts/live-resolver-launch.py "$FIXTURE_ENGINE" --test-binary "$PBPS_FIXTURE_BINARY"
         env:
           FIXTURE_ENGINE: ${{ matrix.engine }}
+      - name: PG16 complete factory on the disposable native host
+        if: matrix.engine == 'pg' && matrix.half == 'second'
+        run: sudo python3 scripts/live-resolver-target.py pg --pg-major 16 --native-host --test-binary "$PBPS_FIXTURE_BINARY"
       # A supplied server pbps did not provision. It runs a target and a
       # dedicated server at once, so it keeps the same disposable host.
       - name: Dedicated scratch server lifecycle and exclusivity
+        if: matrix.half == 'second'
         run: sudo python3 scripts/live-resolver-server.py "$FIXTURE_ENGINE" --test-binary "$PBPS_FIXTURE_BINARY"
         env:
           FIXTURE_ENGINE: ${{ matrix.engine }}
       - name: Namespace procfs identity and task observation
-        if: matrix.engine == 'pg'
+        if: matrix.engine == 'pg' && matrix.half == 'second'
         run: sudo python3 scripts/live-resolver-namespace.py --test-binary "$PBPS_FIXTURE_BINARY"
       - name: Socket observation limits and native service binding
-        if: matrix.engine == 'pg'
+        if: matrix.engine == 'pg' && matrix.half == 'second'
         run: sudo python3 scripts/live-resolver-sockets.py --test-binary "$PBPS_FIXTURE_BINARY"
 
   # The MSRV is set by serde-saphyr (see docs/ADR-0001). It gets its own job so
   # that accidentally using newer syntax is caught here rather than by a user.
   msrv:
-    needs: quick
+    needs: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -501,7 +564,7 @@ jobs:
   # quietly qualify a pull request that nothing ran on.
   gate:
     name: ci-gate
-    needs: [approve, quick, windows, live, live-editions, live-pg, dev-rehearsal, resolver, msrv]
+    needs: [approve, lint, quick, windows, live, live-editions, live-pg, dev-rehearsal, resolver, msrv]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:

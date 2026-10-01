@@ -461,7 +461,7 @@ The cause is still unproven, as docs/PITFALLS.md records for the `live` job.
 This makes the crash cost one start instead of a queue ejection, and makes its
 next occurrence readable. It is not a fix for the crash itself.
 
-Pinned by `scripts/live_resolver_server_test.py`, which runs in the `quick`
+Pinned by `scripts/live_resolver_server_test.py`, which runs in the `lint`
 job.
 
 <a id="dec-1208-1"></a>
@@ -495,3 +495,45 @@ compile; conditionally ignored cases can be owned by ordinary tests on another
 platform when that relationship is explicit. The inventory establishes a
 scheduling contract, not dynamic branch coverage or permission to weaken the
 fixture's execution assertions. See [test execution](../TEST-EXECUTION.md).
+
+<a id="dec-1370-1"></a>
+
+**DEC-1370.1. Every job waits for compilation only, and each engine suite is
+spread over as many runners as it takes to stay level with the rest of the
+run.** A run took about 45 minutes. Two thirds of that was one job, `live-pg`,
+running suites that must be serial against one server: `flow_pg` for 20
+minutes and the private `pbps-pg` regressions for 13. No other job ran half as
+long (runs 36841115280, 36830024040, 36817575465). Compilation took one to
+three minutes per job and the cache hit in full, so build tuning had little
+to offer.
+
+The obvious alternatives each weaken something. Running those suites with
+more threads against one server reintroduces the races they were made serial
+for (#437). A sampled or nightly subset would drop cases from the gate. A
+`paths` filter is refused for the reason DECISIONS 501 gives. So the
+suites keep their exact commands, filters and serial schedules, and are cut
+across runners instead. Each variant runs a share against its own pinned pair
+of servers, and the shares are a filter and its exact `--skip` complement. A
+new case lands in one of them whatever it is called. `resolver` is cut the
+same way, at the point where each engine's sequence of fixture scripts
+halves. Each script already owns and removes its own containers and scratch
+root, so none depended on one before it, and each half builds the test binary
+for itself.
+
+`scripts/ignored_test_inventory.py` already proved that every ignored case had
+an owner whose CI command selects it. Its matrix reading now covers any axis
+and conjunctions of equalities. Without `include` or `exclude` every
+combination runs, so that reading is exact. A split that leaves a case in no
+variant therefore fails `quick`, rather than merging with that case silently
+unrun.
+
+The fan-in DECISIONS 501 kept "for fail-fast alone — nothing expensive should
+start for a commit that does not compile" stays, but it waits only for that.
+Fmt and clippy over `--all-targets` moved to `lint`, which every other job
+`needs`. The workspace tests stay in `quick`, which now runs beside the
+engine jobs. A unit-test failure no longer skips the engine jobs; they report
+their own results beside it, and `ci-gate` still requires every job.
+
+The price is runners: about fifteen jobs at once instead of nine. The
+organisation's concurrency limit can queue a few of them when two runs
+overlap. Standard runners bill nothing on a public repository.

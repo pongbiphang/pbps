@@ -134,6 +134,53 @@ class Ownership(unittest.TestCase):
         with self.assertRaisesRegex(audit.InventoryError, "no longer executes"):
             self.check()
 
+    def test_any_matrix_axis_and_conjunctions_execute_only_with_every_value_present(self):
+        workflow = WORKFLOW.replace("    steps:", "    strategy:\n      fail-fast: false\n      matrix:\n"
+                                    "        engine: [pg, mssql]\n        half: [first, second]\n    steps:")
+        for condition in ("matrix.half == 'second'", "matrix.engine == 'pg' && matrix.half == 'second'"):
+            with self.subTest(condition=condition):
+                self.workflow.write_text(workflow.replace(
+                    "      - run:", f"      - name: selected\n        if: {condition}\n        run:"))
+                self.assertEqual(self.check(), 1)
+        for condition in ("matrix.half == 'third'", "matrix.engine == 'pg' && matrix.half == 'third'",
+                          "matrix.suite == 'second'", "matrix.engine == 'pg' || matrix.half == 'second'"):
+            with self.subTest(condition=condition):
+                self.workflow.write_text(workflow.replace(
+                    "      - run:", f"      - name: selected\n        if: {condition}\n        run:"))
+                with self.assertRaisesRegex(audit.InventoryError, "no longer executes"):
+                    self.check()
+
+    def test_a_matrix_axis_the_audit_cannot_read_is_refused(self):
+        for axis in ("suite: ${{ fromJSON(needs.plan.outputs.suites) }}", "suite:\n          - a"):
+            with self.subTest(axis=axis):
+                self.workflow.write_text(WORKFLOW.replace(
+                    "    steps:", "    strategy:\n      matrix:\n        " + axis + "\n    steps:"))
+                with self.assertRaisesRegex(audit.InventoryError, "matrix"):
+                    self.check()
+
+    def test_shards_must_together_select_every_case(self):
+        self.targets[KEY]["all"].add("owned_trigger")
+        self.targets[KEY]["ignored"].add("owned_trigger")
+        self.inventory["groups"][0]["cases"] = ["owned", "owned_trigger"]
+        shards = ("      - run: cargo test -p demo --lib -- --ignored {}\n"
+                  "        if: matrix.suite == 'a'\n"
+                  "      - run: cargo test -p demo --lib -- --ignored {}\n"
+                  "        if: matrix.suite == 'b'\n")
+        workflow = WORKFLOW.replace("    steps:", "    strategy:\n      matrix:\n        suite: [a, b]\n    steps:")
+        single = "      - run: cargo test -p demo --lib -- --ignored\n"
+        self.workflow.write_text(workflow.replace(single, shards.format("trigger", "--skip trigger")))
+        self.assertEqual(self.check(), 2)
+        for first, second in (("trigger", "--skip own"), ("trigger", "--skip trigger --skip owned"),
+                              ("routine", "--skip trigger")):
+            with self.subTest(first=first, second=second):
+                self.workflow.write_text(workflow.replace(single, shards.format(first, second)))
+                with self.assertRaisesRegex(audit.InventoryError, "no longer executes"):
+                    self.check()
+        self.workflow.write_text(workflow.replace("[a, b]", "[a]").replace(
+            single, shards.format("trigger", "--skip trigger")))
+        with self.assertRaisesRegex(audit.InventoryError, "no longer executes"):
+            self.check()
+
     def test_excluded_or_empty_matrix_is_not_assumed_to_execute(self):
         for matrix in ('engine: []', 'engine: [pg]\n        exclude: [{engine: pg}]'):
             self.workflow.write_text(WORKFLOW.replace(

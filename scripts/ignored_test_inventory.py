@@ -1032,21 +1032,29 @@ def workflow_runs(source, job, platform=None):
     job_conditions = re.findall(r"^    if: (.+)$", body, re.M)
     require(not job_conditions, f"conditional owner job needs an explicit audit: {job}")
     steps = re.split(r"^      - ", body, flags=re.M)[1:]
-    matrix = re.search(r"^        engine: \[([^\]]+)\]", body, re.M)
-    engines = set(x.strip().strip("'\"") for x in matrix[1].split(",")) if matrix else set()
     require(not re.search(r"^        (include|exclude):", body, re.M),
             f"matrix include/exclude needs an explicit execution audit: {job}")
-    if re.search(r"^      matrix:", body, re.M):
-        require(matrix is not None and engines and "" not in engines,
-                f"owner matrix has no known executed variant: {job}")
+    # Without include/exclude every combination of the axes runs, so a
+    # conjunction of equalities executes exactly when each value is on its axis.
+    axes = {}
+    block = re.search(r"^      matrix:\n((?:        .*\n?)*)", body, re.M)
+    if block:
+        for line in block[1].splitlines():
+            axis = re.fullmatch(r"        ([\w-]+): \[([^\]]*)\]\s*", line)
+            require(axis is not None, f"unsupported matrix line needs an explicit audit: {job}: {line.strip()}")
+            values = {x.strip().strip("'\"") for x in axis[2].split(",")}
+            require(values and "" not in values, f"owner matrix has no known executed variant: {job}")
+            axes[axis[1]] = values
+        require(axes, f"owner matrix has no known executed variant: {job}")
     for step in steps:
         condition = re.search(r"^        if: (.+)$", step, re.M)
         active = True
         if condition:
             value = condition[1].strip()
+            clauses = [re.fullmatch(r"matrix\.([\w-]+) == '([^']+)'", c.strip()) for c in value.split("&&")]
             if value in ("false", "${{ false }}"): active = False
             elif value in ("true", "${{ true }}"): pass
-            elif re.fullmatch(r"matrix.engine == '[^']+'", value): active = value.split("'")[1] in engines
+            elif all(clauses): active = all(c[2] in axes.get(c[1], ()) for c in clauses)
             else: active = False
         if not active: continue
         run = re.search(r"(?:^|\n)(?:        )?run: (.*)", step)
