@@ -5758,9 +5758,18 @@ async fn a_dropped_columns_name_is_free_before_the_rename_that_reuses_it() {
     assert_eq!(ours, normalized(&declared));
 }
 
+/// Shared by every [`TestDb`] while it lives, and held exclusively by a test
+/// that creates a login role able to act as a superuser. Roles are
+/// cluster-wide, so while such a role exists it is a login role with reach
+/// over every ledger this binary creates, and the ledger's reach check
+/// (DEC-863.1) rightly refuses it (#1097). Tokio's lock does not poison, so
+/// a failed test never fails every test after it.
+static SUPERUSER_LOGIN: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
 struct TestDb {
     name: String,
     conn: Conn,
+    _no_superuser_login: tokio::sync::RwLockReadGuard<'static, ()>,
 }
 
 #[tokio::test]
@@ -5848,6 +5857,7 @@ impl std::ops::DerefMut for TestDb {
 
 impl TestDb {
     async fn create(tag: &str) -> TestDb {
+        let no_superuser_login = SUPERUSER_LOGIN.read().await;
         // The pid keeps two concurrent `cargo test` runs apart; the tag keeps
         // this run's own tests apart.
         let name = format!("pbps_test_{tag}_{}", std::process::id());
@@ -5866,7 +5876,11 @@ impl TestDb {
         let conn = Conn::connect(Driver::Postgres, &conn_str_for(&name))
             .await
             .expect("connect to the test database");
-        TestDb { name, conn }
+        TestDb {
+            name,
+            conn,
+            _no_superuser_login: no_superuser_login,
+        }
     }
 
     /// Opens a second connection to the same database, for the tests that need
