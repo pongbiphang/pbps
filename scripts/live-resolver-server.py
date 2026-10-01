@@ -49,6 +49,7 @@ TESTS = [
     "uts::kernel_name_loss_refuses_admission_and_discards_each_live_view",
     "pseudo::foreign_pseudo_roots_refuse_admission_and_discard_live_analysis",
     "a_supported_dedicated_server_compiles_declarations_and_removes_only_its_own_resources",
+    "pg16_storage::the_supplied_storage_layout_admits_its_observed_major_and_survives_live_checks",
     "guard_limits::guard_restoration_distinguishes_process_exit_from_live_cleanup_failure",
     "guard_limits::every_forwarder_guard_requires_effective_descriptor_evidence",
     # PostgreSQL analysis-scope qualification (#610); no-ops on SQL Server (#611).
@@ -438,7 +439,9 @@ def fixture(args, binary, root, owned):
     intruding = "a_process_the_engine_did_not_start_refuses_its_namespaces"
     joining = "a_container_joined_to_the_engines_network_refuses_the_run"
     uts = "uts::kernel_name_loss_refuses_admission_and_discards_each_live_view"
-    cases = [(test, empty) for test in TESTS for empty in ([False, True] if test == uts else [False])]
+    selected_tests = [test for test in TESTS if engine == "pg" or test !=
+                      "pg16_storage::the_supplied_storage_layout_admits_its_observed_major_and_survives_live_checks"]
+    cases = [(test, empty) for test in selected_tests for empty in ([False, True] if test == uts else [False])]
     for test, empty in cases:
         empty_server = f"pbps-dedicated-empty-{unique}"
         if empty:

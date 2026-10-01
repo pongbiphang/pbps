@@ -407,6 +407,8 @@ pub(crate) fn contained(rows: &[MountEntry], profile: &ServerProfile) -> Result<
 mod tests {
     use super::*;
 
+    mod pg16_storage;
+
     fn postgres() -> &'static ServerProfile {
         supported("linux-dedicated-v1", Driver::Postgres).unwrap()
     }

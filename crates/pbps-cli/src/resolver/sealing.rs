@@ -72,6 +72,23 @@ mod tests {
         );
         assert!(
             validate_runtime(&ResolverRuntime::Supplied {
+                profile: "linux-dedicated-pg16-v1".into(),
+                identity: "00".repeat(32)
+            })
+            .is_ok()
+        );
+        for profile in ["linux-dedicated-pg16-v2", "linux-dedicated-pg16-v1-extra"] {
+            assert!(
+                validate_runtime(&ResolverRuntime::Supplied {
+                    profile: profile.into(),
+                    identity: "00".repeat(32)
+                })
+                .is_err(),
+                "saved runtimes require an exact implemented profile"
+            );
+        }
+        assert!(
+            validate_runtime(&ResolverRuntime::Supplied {
                 profile: "linux-dedicated-v2".into(),
                 identity: "00".repeat(32)
             })
