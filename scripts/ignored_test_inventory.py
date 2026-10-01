@@ -343,15 +343,14 @@ class NamespaceContinuation:
         reflective = self.scope.reflective | {'builtins'}
         for local, module in self.states:
             for name in set(local) | set(current[0]):
-                builtin = self.scope.builtin_value(name)
-                value = local.get(name, module.get(name, builtin))
-                now = current[0].get(name, current[1].get(name, builtin))
+                value = self.scope.binding_value(name, local, module)
+                now = self.scope.binding_value(name, *current)
                 if value & reflective and not value <= now:
                     return True
             for name in set(module) | set(current[1]):
-                builtin = self.scope.builtin_value(name)
-                value = module.get(name, builtin)
-                if value & reflective and not value <= current[1].get(name, builtin):
+                value = self.scope.binding_value(name, module, module)
+                now = self.scope.binding_value(name, current[1], current[1])
+                if value & reflective and not value <= now:
                     return True
         return False
 
@@ -359,6 +358,7 @@ class NamespaceContinuation:
 class NamespaceExposure(ast.NodeVisitor):
     """Potential builtin aliases, independent of pristine object-inspection proof."""
     reflective = frozenset({"globals", "locals", "vars", "exec", "eval"})
+    missing = object()
 
     def __init__(self, module=None):
         self.bindings = {}
@@ -376,6 +376,15 @@ class NamespaceExposure(ast.NodeVisitor):
         return ({name} if name in cls.reflective else
                 {'native:len'} if name == 'len' else
                 {'native:error'} if name in ('RuntimeError', 'Exception') else set())
+
+    def binding_value(self, name, local, module):
+        # DEC-1300.1: deletion is absence, not an empty non-reflective value or
+        # a snapshot of the module binding that can change before the next read.
+        fallback = module.get(name, {self.missing})
+        if self.missing in fallback:
+            fallback = (fallback - {self.missing}) | self.builtin_value(name)
+        value = fallback if name in self.globals else local.get(name, {self.missing})
+        return (value - {self.missing}) | (fallback if self.missing in value else set())
 
     def state(self):
         return ({name: set(value) for name, value in self.bindings.items()},
@@ -481,9 +490,7 @@ class NamespaceExposure(ast.NodeVisitor):
             # A real following shadow must stay usable after a proven restore.
             return {'native:empty-callable'}
         if isinstance(node, ast.Name):
-            builtin = self.builtin_value(node.id)
-            fallback = self.module.get(node.id, builtin)
-            return fallback if node.id in self.globals else self.bindings.get(node.id, fallback)
+            return self.binding_value(node.id, self.bindings, self.module)
         if isinstance(node, ast.Attribute):
             owner = self.value(node.value)
             if 'builtins' in owner:
@@ -507,6 +514,9 @@ class NamespaceExposure(ast.NodeVisitor):
         value = set(value)
         if self.conditional:
             value |= self.value(ast.Name(id=name, ctx=ast.Load()))
+            bindings = self.module if name in self.globals else self.bindings
+            if self.missing in bindings.get(name, set()):
+                value.add(self.missing)
         if name in self.globals:
             self.module[name] = value
         else:
@@ -703,11 +713,20 @@ class NamespaceExposure(ast.NodeVisitor):
             continuation.capture()
         for target in node.targets:
             self.visit(target)
-            if isinstance(target, ast.Name) and not self.conditional:
-                self.bindings.pop(target.id, None)
-                if target.id in self.globals:
-                    self.module.pop(target.id, None)
-            elif not isinstance(target, ast.Name):
+            if isinstance(target, ast.Name):
+                # DEC-1300.1: a skipped delete keeps the shadow, while a taken
+                # delete reads through this scope's module/builtin fallback.
+                retained = self.state() if self.conditional else None
+                bindings = self.module if target.id in self.globals else self.bindings
+                if target.id not in bindings:
+                    # A readable fallback is not a deletable local binding.
+                    self.exposed = True
+                    self.unknown_execution()
+                bindings.pop(target.id, None)
+                if retained is not None:
+                    bindings[target.id] = {self.missing}
+                    self.join([retained, self.state()])
+            else:
                 self.unknown_execution()
 
     def visit_FunctionDef(self, node):

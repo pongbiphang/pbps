@@ -128,7 +128,15 @@ stored-container and general expression provenance remain separate proofs
 Bindings are followed in statement order: direct shadows replace aliases,
 class-local bindings do not replace module bindings, and uncalled function
 bodies do not expose namespaces. Unknown conditional writes retain possible
-reflective aliases conservatively. With/AsyncWith keeps the running path's bindings
+reflective aliases conservatively. A conditional name deletion retains both the
+shadow and an explicit absence possibility. Reads resolve that absence through
+the live module binding or the builtin fallback; class globals delete the module
+binding, while class locals delete only their own entry. Conditional writes retain
+the absence possibility, and a guaranteed following shadow replaces it. A readable
+module/builtin fallback is not proof that a local entry exists to delete: an
+absent target supplies no completed-execution evidence. Retained continuations
+resolve each captured absence through that capture's module state (DEC-1300.1).
+With/AsyncWith keeps the running path's bindings
 separate from the prefixes that an entered manager may preserve by suppressing
 a failure. Calls inside that path see successful shadows; the exit joins the
 retained prefixes before subsequent statements. A guaranteed following shadow

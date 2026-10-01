@@ -25,6 +25,65 @@ WORKFLOW = """jobs:
 """
 
 
+def conditional_deletion_cases():
+    result=[]
+    controls=[('if','if bool("yes"):\n    del {name}\n'),('nested','if bool("yes"):\n    if bool("yes"):\n        del {name}\n'),('loop','for item in [0]:\n    del {name}\n'),('try','try:\n    del {name}\nfinally:\n    pass\n')]
+    for name in ('globals','locals','vars'):
+        for label,control in controls:
+            setup=name+' = len\n'+control.format(name=name)+'inspect = '+name+'\nnamespace = inspect()\n'
+            result.append(('unsafe_module_builtin/'+name+'/'+label,'',setup,'namespace["TESTS"] = []\n',[],False))
+    for label,control in controls:
+        for name,initial,post in [('defaults','None','defaults.globals()'),('inspect','lambda: {}','inspect()')]:
+            prefix='import builtins as defaults\n'+('inspect = defaults.globals\n' if name=='inspect' else '')
+            local=name+' = '+initial+'\n'+control.format(name=name)+'namespace = '+post+'\n'
+            result.append(('unsafe_class_module_fallback/'+name+'/'+label,prefix,'class Holder:\n'+indent(local,'    '),'Holder.namespace["TESTS"] = []\n',[],False))
+    for label,control in controls:
+        prefix='globals = len\n';local='global globals\n'+control.format(name='globals')+'inspect = globals\nnamespace = inspect()\n'
+        result.append(('unsafe_class_explicit_global/'+label,prefix,'class Holder:\n'+indent(local,'    '),'Holder.namespace["TESTS"] = []\n',[],False))
+    # A guaranteed deletion still exposes the same fallback; conditional deletion
+    # must also keep the reflective pre-state when the branch is skipped.
+    for label,local in [('definite-module','globals = len\ndel globals\ninspect = globals\nnamespace = inspect()\n'),('retained-class','class Holder:\n    inspect = defaults.globals\n    if bool(""):\n        del inspect\n    namespace = inspect()\n')]:
+        prefix='import builtins as defaults\n';effect=('Holder.namespace' if label=='retained-class' else 'namespace')+'["TESTS"] = []\n'
+        result.append(('unsafe_retained_or_definite/'+label,prefix,local,effect,[],False))
+    # Definite and conditional deletes preserve genuinely harmless fallbacks;
+    # guaranteed following shadows replace both possible predecessor values.
+    safe=[('module-following-shadow','globals = len\nif bool("yes"):\n    del globals\nglobals = len\ninspect = globals\nvalue = inspect([])\n'),('class-native-module','inspect = len\nclass Holder:\n    inspect = lambda: {}\n    if bool("yes"):\n        del inspect\n    value = inspect([])\n'),('class-following-shadow','import builtins as defaults\nclass Holder:\n    defaults = None\n    if bool("yes"):\n        del defaults\n    defaults = None\n'),('definite-class-native','inspect = len\nclass Holder:\n    inspect = lambda: {}\n    del inspect\n    value = inspect([])\n'),('unread-module-fallback','globals = len\nif bool("yes"):\n    del globals\n'),('unread-class-fallback','import builtins as defaults\nclass Holder:\n    defaults = None\n    if bool("yes"):\n        del defaults\n'),('uncalled-function','globals = len\ndef unused():\n    del globals\n'),('module-untaken-native-fallback','inspect = len\nif bool(""):\n    del inspect\nvalue = inspect([])\n')]
+    for label,body in safe:result.append(('safe_control/'+label,'',body,'',['owned'],True))
+    # Untaken deletion of a shadow has a real safe execution, but the retained /
+    # deleted join intentionally refuses the unproved reflective alternative.
+    result.append(('safe_unproved_reflective_fallback/untaken','', 'globals = len\nif bool(""):\n    del globals\ninspect = globals\nvalue = inspect([])\n','',['owned'],False))
+    # Module fallbacks remain live after a conditional local delete, including
+    # a later conditional native write whose skipped path still lacks the name.
+    for name in ('inspect','defaults','globals'):
+        local=(name+' = '+('None' if name=='defaults' else 'len')+'\nif bool("yes"):\n    del '+name+'\n')
+        update=('import builtins as defaults\n' if name=='defaults' else name+' = defaults.globals\n')
+        call=('defaults.globals()' if name=='defaults' else name+'()')
+        if name=='globals':call='reader()';after='reader = globals\nnamespace = '+call+'\n'
+        else:after='namespace = '+call+'\n'
+        local+='class Update:\n    global '+name+'\n'+indent(update,'    ')+after
+        prefix='import builtins as defaults\n'+('defaults = None\n' if name=='defaults' else name+' = len\n')
+        result.append(('unsafe_live_module_fallback/'+name,prefix,'class Holder:\n'+indent(local,'    '),'Holder.namespace["TESTS"] = []\n',[],False))
+        if name=='inspect':
+            conditional=local.replace('class Update:', 'if bool(""):\n    inspect = len\nclass Update:')
+            result.append(('unsafe_live_module_fallback/conditional-shadow',prefix,'class Holder:\n'+indent(conditional,'    '),'Holder.namespace["TESTS"] = []\n',[],False))
+            managed='from contextlib import nullcontext\nwith nullcontext():\n'+indent('class Holder:\n'+indent(local,'    '),'    ')
+            result.append(('unsafe_live_module_fallback/managed-class',prefix,managed,'Holder.namespace["TESTS"] = []\n',[],False))
+            nested='class Outer:\n    inspect = None\n'+indent('class Holder:\n'+indent(local,'    '),'    ')
+            result.append(('unsafe_live_module_fallback/nested-class',prefix,nested,'Outer.Holder.namespace["TESTS"] = []\n',[],False))
+    for label,shadow in [('lambda','inspect = lambda: {}\nnamespace = inspect()\n'),('native','inspect = len\nvalue = inspect([])\n')]:
+        local='inspect = len\nif bool("yes"):\n    del inspect\nclass Update:\n    global inspect\n    inspect = defaults.globals\n'+shadow
+        result.append(('safe_live_fallback_shadow/'+label,'import builtins as defaults\ninspect = len\n','class Holder:\n'+indent(local,'    '),'',['owned'],True))
+    for helper_label,helper in [('update','def restore():\n    sys._getframe(1).f_locals.update({"inspect": defaults.globals})\n'),('two-statements','def restore():\n    frame = sys._getframe(1)\n    frame.f_locals["inspect"] = defaults.globals\n')]:
+        prefix='import builtins as defaults\nimport sys\nfrom contextlib import nullcontext\ninspect = len\n'+helper
+        local='inspect = len\nif bool("yes"):\n    del inspect\nclass Update:\n    global inspect\n    inspect = defaults.globals\ninspect = lambda: {}\nrestore()\nnamespace = inspect()\n'
+        body='with nullcontext():\n'+indent('class Holder:\n'+indent(local,'    '),'    ')
+        result.append(('unsafe_scope_continuation/'+helper_label,prefix,body,'Holder.namespace["TESTS"] = []\n',[],False))
+    for taken in (True,False):
+        local='global globals\nif bool('+repr('yes' if taken else '')+'):\n    del globals\nglobals = len\ninspect = globals\nvalue = inspect([])\n'
+        result.append(('safe_explicit_global_shadow/'+str(taken),'globals = len\n','class Holder:\n'+indent(local,'    '),'',['owned'],True))
+    return result
+
+
 class Ownership(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -402,6 +461,94 @@ class Ownership(unittest.TestCase):
                 self.assertEqual(actual.stdout, "['owned']\n")
                 (self.root / "runner.py").write_text(source, encoding="utf-8")
                 self.assertEqual(self.check(), 1)
+
+    def assert_deleted_selector_case(self, prefix, body, effect, *, owned, accepted):
+        for before in (True, False):
+            with self.subTest(selector_before=before):
+                source = (prefix + ('TESTS = ["owned"]\n' if before else '') + body
+                          + ('' if before else 'TESTS = ["owned"]\n') + effect)
+                self.assert_runner_selector(source, owned=owned, accepted=accepted)
+
+    def test_conditional_deletion_keeps_reflective_builtin_fallbacks(self):
+        cases = [case for case in conditional_deletion_cases()
+                 if case[0].startswith('unsafe_module_builtin/')]
+        self.assertTrue(cases)
+        for label, prefix, body, effect, actual, accepted in cases:
+            with self.subTest(case=label):
+                self.assert_deleted_selector_case(prefix, body, effect,
+                                                  owned=actual == ["owned"], accepted=accepted)
+
+    def test_deleted_class_shadows_keep_module_namespace_fallbacks(self):
+        cases = [case for case in conditional_deletion_cases()
+                 if case[0].startswith('unsafe_class_module_fallback/')]
+        self.assertTrue(cases)
+        for label, prefix, body, effect, actual, accepted in cases:
+            with self.subTest(case=label):
+                self.assert_deleted_selector_case(prefix, body, effect,
+                                                  owned=actual == ["owned"], accepted=accepted)
+
+    def test_class_global_deletion_uses_the_module_binding(self):
+        cases = [case for case in conditional_deletion_cases()
+                 if case[0].startswith('unsafe_class_explicit_global/')]
+        self.assertTrue(cases)
+        for label, prefix, body, effect, actual, accepted in cases:
+            with self.subTest(case=label):
+                self.assert_deleted_selector_case(prefix, body, effect,
+                                                  owned=actual == ["owned"], accepted=accepted)
+
+    def test_deleted_class_fallbacks_follow_later_module_writes(self):
+        cases = [case for case in conditional_deletion_cases()
+                 if case[0].startswith('unsafe_live_module_fallback/')]
+        self.assertTrue(cases)
+        for label, prefix, body, effect, actual, accepted in cases:
+            with self.subTest(case=label):
+                self.assert_deleted_selector_case(prefix, body, effect,
+                                                  owned=actual == ["owned"], accepted=accepted)
+
+    def test_deleted_fallbacks_remain_visible_to_scope_owned_continuations(self):
+        cases = [case for case in conditional_deletion_cases()
+                 if case[0].startswith('unsafe_scope_continuation/')]
+        self.assertTrue(cases)
+        for label, prefix, body, effect, actual, accepted in cases:
+            with self.subTest(case=label):
+                self.assert_deleted_selector_case(prefix, body, effect,
+                                                  owned=actual == ["owned"], accepted=accepted)
+
+    def test_harmless_following_shadows_and_unread_deletions_remain_usable(self):
+        cases = [case for case in conditional_deletion_cases()
+                 if case[0].startswith(('safe_', 'unsafe_retained_or_definite/'))]
+        self.assertTrue(cases)
+        for label, prefix, body, effect, actual, accepted in cases:
+            with self.subTest(case=label):
+                self.assert_deleted_selector_case(prefix, body, effect,
+                                                  owned=actual == ["owned"], accepted=accepted)
+
+    def test_absent_delete_targets_supply_no_completed_execution_evidence(self):
+        bodies = [
+            ('', 'if bool("yes"):\n    del missing\n'),
+            ('inspect = len\n', 'class Holder:\n    if bool("yes"):\n        del inspect\n'),
+            ('', 'class Holder:\n    global globals\n    if bool("yes"):\n        del globals\n'),
+            ('', 'del missing\n'),
+        ]
+        self.inventory['owners']['live']['selection'] = {
+            'kind': 'data', 'file': 'runner.py', 'expression': 'TESTS'}
+        for prefix, body in bodies:
+            for before in (True, False):
+                with self.subTest(body=body, selector_before=before):
+                    source = (prefix + ('TESTS = ["owned"]\n' if before else '') + body
+                              + ('' if before else 'TESTS = ["owned"]\n'))
+                    actual = subprocess.run([sys.executable, '-B', '-c', source + 'print(TESTS)'],
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertNotEqual(actual.returncode, 0)
+                    self.assertIn('NameError', actual.stderr)
+                    self.assertEqual(actual.stdout, '')
+                    (self.root / 'runner.py').write_text(source, encoding='utf-8')
+                    with self.assertRaises(audit.InventoryError):
+                        self.check()
+        # A skipped missing delete runs safely, but neither unknown control flow
+        # nor a readable builtin/module fallback proves a deletable binding.
+        self.assert_deleted_selector_case('', 'if bool(""):\n    del missing\n', '',
+                                          owned=True, accepted=False)
 
     def test_escaped_namespaces_can_change_selectors_assigned_later(self):
         captures = [
