@@ -307,39 +307,6 @@ fn split_in_place_edit(changes: &mut Vec<PlannedChange>, holds: &Holds, dialect:
     );
 }
 
-/// The changes at or after `from` that must run before `expression` on the
-/// same column, removed from `changes` in their order: a retype, and a
-/// relaxation of its nullability. Empty for anything but an expression change.
-#[allow(clippy::wildcard_enum_match_arm)]
-fn expression_prerequisites(
-    changes: &mut Vec<PlannedChange>,
-    expression: &PlannedChange,
-    from: usize,
-) -> Vec<PlannedChange> {
-    let Change::AlterColumnExpression { uid, .. } = &expression.change else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    let mut i = from;
-    while i < changes.len() {
-        let before_it = match &changes[i].change {
-            Change::AlterColumnType { uid: u, .. }
-            | Change::AlterColumnNullability {
-                uid: u,
-                to_nullable: true,
-                ..
-            } => u == uid,
-            _ => false,
-        };
-        if before_it {
-            out.push(changes.remove(i));
-        } else {
-            i += 1;
-        }
-    }
-    out
-}
-
 fn planned(change: Change, dialect: &dyn Dialect) -> PlannedChange {
     let mut p = PlannedChange::new(change);
     p.risks = dialect.change_risks(&p.change);
@@ -394,13 +361,7 @@ fn respell(p: &mut PlannedChange, holds: &Holds, dialect: &dyn Dialect) {
             | Change::AddIndex { table: t, .. },
             _,
         ) => *t = table.clone(),
-        (Change::AlterColumnDefault { column, .. }, Part::Default(c))
-        | (
-            Change::AlterColumnExpression { column, .. }
-            | Change::AlterColumnType { column, .. }
-            | Change::AlterColumnNullability { column, .. },
-            Part::Generated(c),
-        ) => {
+        (Change::AlterColumnDefault { column, .. }, Part::Default(c)) => {
             *column = ColumnRef::new(table.clone(), c.clone());
         }
         _ => return,
@@ -580,6 +541,10 @@ pub(crate) fn weave(
             continue;
         };
         for d in deps {
+            // Placed by the drop, after this loop: see `after_its_release`.
+            if is_generated(&d.holds) {
+                continue;
+            }
             split_in_place_edit(&mut cs.changes, &d.holds, dialect);
             let Some(at) = span(&cs.changes, root) else {
                 continue;
@@ -598,22 +563,13 @@ pub(crate) fn weave(
                 Some(i) if i < at.drop_at => i,
                 Some(i) => {
                     let mut moved = cs.changes.remove(i);
-                    let named = named_at(&cs.changes, at.drop_at, &d.holds);
-                    respell(&mut moved, &named, dialect);
-                    // A released expression takes along what has to run
-                    // before it on its own column: a retype, so the values are
-                    // computed in the final type, and a relaxation, so a NULL
-                    // it computes is not refused (DEC-1168.1). Matched by uid,
-                    // which a rename does not change, in their own order.
-                    let prerequisites =
-                        expression_prerequisites(&mut cs.changes, &moved, at.drop_at);
-                    let count = prerequisites.len();
-                    for (k, mut p) in prerequisites.into_iter().enumerate() {
-                        respell(&mut p, &named, dialect);
-                        cs.changes.insert(at.drop_at + k, p);
-                    }
-                    cs.changes.insert(at.drop_at + count, moved);
-                    at.drop_at + count
+                    respell(
+                        &mut moved,
+                        &named_at(&cs.changes, at.drop_at, &d.holds),
+                        dialect,
+                    );
+                    cs.changes.insert(at.drop_at, moved);
+                    at.drop_at
                 }
                 None => {
                     // Named as it is where it goes: before the module's drop,
@@ -679,7 +635,52 @@ pub(crate) fn weave(
             }
         }
     }
+    for (root, _) in &roots {
+        after_its_release(cs, root, found.get(root).map_or(&[][..], Vec::as_slice));
+    }
     Ok(cs.changes.len() - before)
+}
+
+fn is_generated(holds: &Holds) -> bool {
+    matches!(
+        holds,
+        Holds::TablePart {
+            part: Part::Generated(_),
+            ..
+        }
+    )
+}
+
+/// Moves a module's drop after what releases its generated-column dependents:
+/// the expression change that stops calling it, or the drop of the column or
+/// its table (DEC-1168.1).
+///
+/// The drop moves, not the release. A release keeps the place the differ gave
+/// it, after the column additions, renames, retypes and relaxations its new
+/// expression may need, which a release moved up to the module's drop would
+/// run ahead of. What the drop leaves behind is a function whose own body
+/// reads a column the plan drops or retypes before the release, which only
+/// the engine can tell and refuses inside the transaction. A module rebuilt in
+/// place is already after both.
+fn after_its_release(cs: &mut ChangeSet, root: &ModuleId, deps: &[Dependent]) {
+    let Some(at) = span(&cs.changes, root) else {
+        return;
+    };
+    let latest = deps
+        .iter()
+        .filter(|d| is_generated(&d.holds))
+        .filter_map(|d| {
+            find(&cs.changes, &d.holds, removes)
+                .or_else(|| find(&cs.changes, &d.holds, removes_with_its_owner))
+        })
+        .filter(|i| *i > at.drop_at)
+        .max();
+    if let Some(i) = latest {
+        // Removing the drop shifts the release up by one, so inserting at
+        // its old index puts the drop right after it.
+        let drop = cs.changes.remove(at.drop_at);
+        cs.changes.insert(i, drop);
+    }
 }
 
 /// The columns whose default a row this plan writes takes: an insert that
@@ -914,7 +915,7 @@ pub(crate) fn after_the_rebuilds(cs: &mut ChangeSet, released: &BTreeSet<ColumnR
             // stays, as a column added with a default does: a function the
             // plan creates may read it.
             // One that releases a generated column from a module the plan
-            // drops stays ahead of that drop, where `weave` put it.
+            // drops stays ahead of that drop, which `weave` put after it.
             Change::AlterColumnExpression { column, .. } => !released.contains(column),
             // A `NOT NULL` over a recomputed column stays behind its new
             // expression, which the order kept among the moved preserves.
@@ -949,8 +950,8 @@ pub(crate) fn after_the_rebuilds(cs: &mut ChangeSet, released: &BTreeSet<ColumnR
 /// [`weave`] leaves it in.
 /// The generated columns whose expression change releases them from a module
 /// this plan drops, named as that change names them (DEC-1168.1). `weave`
-/// puts each such change ahead of the drop; this is how
-/// [`after_the_rebuilds`] knows to leave it there.
+/// puts the module's drop after each such change; this is how
+/// [`after_the_rebuilds`] knows not to move it past that drop.
 pub(crate) fn released(
     cs: &ChangeSet,
     found: &BTreeMap<ModuleId, Vec<Dependent>>,
@@ -1259,8 +1260,8 @@ mod tests {
     }
 
     /// An expression change that releases a generated column from a module
-    /// this plan drops stays ahead of that drop, where `weave` put it, even
-    /// with a function created after: moved past the creates, it would follow
+    /// this plan drops keeps its place, which `weave` put the drop after, even
+    /// with a function created later: moved past the creates, it would follow
     /// the drop the engine refuses without it (DEC-1168.1). One that releases
     /// nothing still follows the rebuilt function.
     #[test]

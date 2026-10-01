@@ -5991,6 +5991,129 @@ fn a_generated_columns_expression_change_is_refused_by_name_before_postgres_17()
     generated_column_flow(&server, "generated-1168-old", false);
 }
 
+/// The drop of a function generated columns call follows what releases them,
+/// wherever the differ put that (DEC-1168.1): an expression change that reads
+/// a column the same revision adds, after that addition, and the drop of a
+/// generated column, in the column-drop class. Moving either up to the
+/// function's drop ran it ahead of what it needs, or was refused outright.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_dropped_function_follows_what_releases_its_generated_columns() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "generated-release-later");
+    let connection = own.connection().to_owned();
+    on_server(
+        &connection,
+        "CREATE SCHEMA app; \
+         CREATE FUNCTION app.f1(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE FUNCTION app.f2(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE TABLE app.t1 (id integer PRIMARY KEY, a integer, \
+                              g1 integer GENERATED ALWAYS AS (app.f1(a)) STORED); \
+         CREATE TABLE app.t2 (id integer PRIMARY KEY, a integer, \
+                              g2 integer GENERATED ALWAYS AS (app.f2(a)) STORED); \
+         INSERT INTO app.t1 (id, a) VALUES (1, 5); INSERT INTO app.t2 (id, a) VALUES (1, 5)",
+    );
+    let d = Demo::new("generated-release-later");
+    succeeds(d.run(&["pull", "--db", &connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    for f in ["f1", "f2"] {
+        std::fs::remove_file(
+            d.dir
+                .join(format!("schema/app.{f}%28integer%29.function.yml")),
+        )
+        .unwrap();
+    }
+    // `t1.g1` reads a new column `b` instead of calling `f1`.
+    let t1 = d.dir.join("schema/app.t1.yml");
+    let text = std::fs::read_to_string(&t1).unwrap();
+    let edited: String = text
+        .lines()
+        .flat_map(|l| {
+            if l == "  g1:" {
+                vec![
+                    "  b:".to_owned(),
+                    "    type: integer".to_owned(),
+                    l.to_owned(),
+                ]
+            } else if l.trim_start().starts_with("generated:") {
+                vec!["    generated: {expression: 'b * 3', stored: true}".to_owned()]
+            } else {
+                vec![l.to_owned()]
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert!(
+        edited.contains("  b:\n    type: integer\n  g1:"),
+        "{edited}"
+    );
+    std::fs::write(&t1, edited).unwrap();
+    // `t2.g2` goes, with the function it calls.
+    let t2 = d.dir.join("schema/app.t2.yml");
+    let text = std::fs::read_to_string(&t2).unwrap();
+    let mut in_g2 = false;
+    let edited: String = text
+        .lines()
+        .filter(|l| {
+            if !l.starts_with("   ") {
+                in_g2 = *l == "  g2:";
+            }
+            !in_g2
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert!(!edited.contains("g2"), "{edited}");
+    std::fs::write(&t2, edited).unwrap();
+    succeeds(d.run(&["drop", "app.t2.g2", "--reason", "computed elsewhere now"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        &connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    assert!(
+        at("ADD COLUMN \"b\"") < at("SET EXPRESSION")
+            && at("SET EXPRESSION") < at("DROP FUNCTION \"app\".\"f1\""),
+        "{script}"
+    );
+    assert!(
+        at("DROP COLUMN \"g2\"") < at("DROP FUNCTION \"app\".\"f2\""),
+        "{script}"
+    );
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &[
+            "--allow",
+            "narrowing",
+            "--allow",
+            "destructive",
+            "--allow",
+            "revoke",
+        ],
+    ));
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
 /// A function a generated column calls, dropped for good in the revision that
 /// changes the column's expression to stop calling it: the expression change
 /// releases the dependency, so it runs before `DROP FUNCTION` and the plan

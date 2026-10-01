@@ -1100,6 +1100,7 @@
         "a_default_follows_a_rebuilt_function_past_an_update_that_does_not_take_it",
         "a_definer_routine_a_plan_writes_must_pin_search_path_with_pg_temp_last",
         "a_deployers_own_onward_grant_is_one_it_can_still_narrow",
+        "a_dropped_function_follows_what_releases_its_generated_columns",
         "a_generated_columns_expression_change_is_refused_by_name_before_postgres_17",
         "a_generated_columns_expression_changes_through_the_cli_and_its_inputs_are_held",
         "a_grant_a_third_role_made_is_kept_and_only_its_removal_is_refused",
