@@ -500,11 +500,15 @@ saw everything (#1192; extends DEC-1077.1).** `sys.objects` is filtered by
 metadata visibility: an object under an effective `DENY VIEW DEFINITION`
 returns no row, and DEC-1077.1's read took that absence as a free name, so a
 hidden sequence at a new table's name planned and then failed at apply.
-Before the read, `plan --db` asks for `VIEW DEFINITION` on each schema the
-plan reads names in, which answers for a missing grant and a schema `DENY`
-alike, and refuses while any effective object `DENY` of `VIEW DEFINITION` or
-`CONTROL` reaches the login, the proof `key_drop_blockers` uses (DECISIONS
-460).
+For each name the plan claims that the read found no object at, `plan --db`
+now asks for `VIEW DEFINITION` on its schema, which answers for a missing
+grant and a schema `DENY` alike, and refuses while any effective object
+`DENY` of `VIEW DEFINITION` or `CONTROL` reaches the login, the proof
+`key_drop_blockers` uses (DECISIONS 460). A name the read found an object at
+needs no proof: a schema holds one object per name, so one this login sees
+leaves no room for a hidden one, and a plan that vacates and reclaims it is
+not refused. The tables read only for what the walk moves or removes with
+them claim nothing, and a drop-only plan proves nothing.
 
 The object half is not scoped to the plan's schemas, and that is measured,
 not chosen: the `DENY`'s own row stays visible, but `OBJECT_SCHEMA_NAME` of
