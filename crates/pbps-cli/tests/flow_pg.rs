@@ -6007,7 +6007,7 @@ fn an_expression_change_releases_a_generated_column_from_a_dropped_function() {
         "CREATE SCHEMA app; \
          CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x * 2 $$; \
          CREATE TABLE app.t (id integer PRIMARY KEY, a integer, \
-                             g integer GENERATED ALWAYS AS (app.f(a)) STORED); \
+                             g integer NOT NULL GENERATED ALWAYS AS (app.f(a)) STORED); \
          INSERT INTO app.t (id, a) VALUES (1, 5)",
     );
     let d = Demo::new("generated-release");
@@ -6027,16 +6027,25 @@ fn an_expression_change_releases_a_generated_column_from_a_dropped_function() {
         stderr(&o)
     );
 
-    // With the expression changed off the function: it runs first.
+    // With the expression changed off the function, to one that yields a
+    // NULL, and the column made nullable: the relaxation goes ahead of the
+    // drop with the expression change, or `SET EXPRESSION` is refused under
+    // the old NOT NULL.
     let path = d.dir.join("schema/app.t.yml");
     let table = std::fs::read_to_string(&path).unwrap();
+    let mut in_g = false;
     let released: String = table
         .lines()
-        .map(|l| {
-            if l.trim_start().starts_with("generated:") {
-                "    generated: {expression: 'a * 3', stored: true}".to_owned()
+        .filter_map(|l| {
+            if l.starts_with("  ") && !l.starts_with("   ") {
+                in_g = l == "  g:";
+            }
+            if in_g && l.trim() == "nullable: false" {
+                None
+            } else if l.trim_start().starts_with("generated:") {
+                Some("    generated: {expression: 'nullif(a, 5) * 3', stored: true}".to_owned())
             } else {
-                l.to_owned()
+                Some(l.to_owned())
             }
         })
         .collect::<Vec<_>>()
@@ -6081,8 +6090,11 @@ fn an_expression_change_releases_a_generated_column_from_a_dropped_function() {
         ],
     ));
     assert_eq!(
-        scalar(&connection, "SELECT g::int8 FROM app.t WHERE id = 1"),
-        15
+        scalar(
+            &connection,
+            "SELECT count(*)::int8 FROM app.t WHERE id = 1 AND g IS NULL"
+        ),
+        1
     );
     succeeds(d.run(&["verify", "--db", &connection]));
     let next = succeeds(d.run(&["plan", "--db", &connection]));

@@ -1172,7 +1172,8 @@ around it. No statement takes its expression off and puts it back:
 `DROP EXPRESSION` leaves an ordinary column, and `SET EXPRESSION` is refused
 on one. Such a plan is refused, naming the column, unless it also changes that
 expression. The catalog's edge then has a release: the expression change runs
-before the function's drop and stays there. If the new expression calls the
+before the function's drop and stays there, taking along the changes to the
+same column that must precede it, a retype and a relaxation. If the new expression calls the
 function again, the drop is refused inside the transaction and the apply
 rolls back. Telling the two apart would mean parsing the expression. A changed expression faces the gate as `narrowing` (SPEC §7.2): the
 engine recomputes every stored row, and a `NOT NULL`, check or unique index

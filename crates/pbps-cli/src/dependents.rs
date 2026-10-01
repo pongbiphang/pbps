@@ -307,6 +307,39 @@ fn split_in_place_edit(changes: &mut Vec<PlannedChange>, holds: &Holds, dialect:
     );
 }
 
+/// The changes at or after `from` that must run before `expression` on the
+/// same column, removed from `changes` in their order: a retype, and a
+/// relaxation of its nullability. Empty for anything but an expression change.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn expression_prerequisites(
+    changes: &mut Vec<PlannedChange>,
+    expression: &PlannedChange,
+    from: usize,
+) -> Vec<PlannedChange> {
+    let Change::AlterColumnExpression { uid, .. } = &expression.change else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut i = from;
+    while i < changes.len() {
+        let before_it = match &changes[i].change {
+            Change::AlterColumnType { uid: u, .. }
+            | Change::AlterColumnNullability {
+                uid: u,
+                to_nullable: true,
+                ..
+            } => u == uid,
+            _ => false,
+        };
+        if before_it {
+            out.push(changes.remove(i));
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 fn planned(change: Change, dialect: &dyn Dialect) -> PlannedChange {
     let mut p = PlannedChange::new(change);
     p.risks = dialect.change_risks(&p.change);
@@ -362,7 +395,12 @@ fn respell(p: &mut PlannedChange, holds: &Holds, dialect: &dyn Dialect) {
             _,
         ) => *t = table.clone(),
         (Change::AlterColumnDefault { column, .. }, Part::Default(c))
-        | (Change::AlterColumnExpression { column, .. }, Part::Generated(c)) => {
+        | (
+            Change::AlterColumnExpression { column, .. }
+            | Change::AlterColumnType { column, .. }
+            | Change::AlterColumnNullability { column, .. },
+            Part::Generated(c),
+        ) => {
             *column = ColumnRef::new(table.clone(), c.clone());
         }
         _ => return,
@@ -560,13 +598,22 @@ pub(crate) fn weave(
                 Some(i) if i < at.drop_at => i,
                 Some(i) => {
                     let mut moved = cs.changes.remove(i);
-                    respell(
-                        &mut moved,
-                        &named_at(&cs.changes, at.drop_at, &d.holds),
-                        dialect,
-                    );
-                    cs.changes.insert(at.drop_at, moved);
-                    at.drop_at
+                    let named = named_at(&cs.changes, at.drop_at, &d.holds);
+                    respell(&mut moved, &named, dialect);
+                    // A released expression takes along what has to run
+                    // before it on its own column: a retype, so the values are
+                    // computed in the final type, and a relaxation, so a NULL
+                    // it computes is not refused (DEC-1168.1). Matched by uid,
+                    // which a rename does not change, in their own order.
+                    let prerequisites =
+                        expression_prerequisites(&mut cs.changes, &moved, at.drop_at);
+                    let count = prerequisites.len();
+                    for (k, mut p) in prerequisites.into_iter().enumerate() {
+                        respell(&mut p, &named, dialect);
+                        cs.changes.insert(at.drop_at + k, p);
+                    }
+                    cs.changes.insert(at.drop_at + count, moved);
+                    at.drop_at + count
                 }
                 None => {
                     // Named as it is where it goes: before the module's drop,
