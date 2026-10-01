@@ -427,8 +427,10 @@ first. That is an index it drops, or a sequence whose column it drops. A view
 the plan rebuilds in the destination counts as created here: its drop runs
 before the rename, so the carried object takes the name its re-creation needs.
 
-An index takes a relation name too (#1355), so both comparisons also cover the
-index names the plan creates, each in its table's schema: an added index, the
+An index takes a relation name too (#1355), so all three comparisons (the
+unrecorded tables, views and unreadable relations above, the `pg_class` read,
+and what a rename carries) also cover the index names the plan creates, each
+in its table's schema: an added index, the
 index behind an added unique constraint or a named primary key, which carries
 the constraint's name, and those a created table declares. An unnamed key is
 left out: PostgreSQL moves its `<table>_pkey` aside when that is held

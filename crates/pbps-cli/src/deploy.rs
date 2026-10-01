@@ -277,6 +277,14 @@ fn refuse_occupied_names(
             taken.push(format!("{declared}: the database already has {occupant}"));
         }
     }
+    // An index shares the relation namespace with all of these (#1355).
+    for name in created_index_names(cs) {
+        if let Some(occupant) = relation(&name) {
+            taken.push(format!(
+                "index `{name}`: the database already has {occupant}"
+            ));
+        }
+    }
     if taken.is_empty() {
         return Ok(());
     }
@@ -8849,6 +8857,63 @@ mod tests {
     /// occupies a new table's or view's name; an unreadable routine of the
     /// same bare name does not, because routines are not in the relation
     /// namespace — refusing it would refuse a plan the engine takes.
+    /// An index the plan adds is refused at the name of a table, view or
+    /// unreadable relation outside the recorded scope, like a table there
+    /// (#1355); a free name is not.
+    #[test]
+    fn an_added_index_meets_unrecorded_relations() {
+        use pbps_db::catalog::LimitationTarget;
+        use pbps_model::{Change, ChangeSet, PlannedChange};
+        let x = TableName::new("app", "x");
+        let add = |name: &str| ChangeSet {
+            changes: vec![PlannedChange::new(Change::AddIndex {
+                table: TableName::new("app", "t"),
+                name: name.into(),
+                index: Box::new(serde_json::from_str(r#"{"columns": [{"name": "n"}]}"#).unwrap()),
+                clustered: false,
+            })],
+        };
+        let empty = pbps_diff::Scoped {
+            schema: Schema::default(),
+            unmanaged: Vec::new(),
+            missing: Vec::new(),
+            unmanaged_modules: Vec::new(),
+            unmanaged_roles: Vec::new(),
+            unexpressible: Vec::new(),
+            missing_roles: Vec::new(),
+            public_execute: Default::default(),
+            owners: Default::default(),
+            session_role: String::new(),
+        };
+        let mut table = empty.clone();
+        table.unmanaged.push(x.clone());
+        let mut view = empty.clone();
+        view.unmanaged_modules.push(ModuleId::Named(x.clone()));
+        let unreadable = [(
+            LimitationTarget::Relation(x.clone()),
+            "partitioned".to_owned(),
+        )];
+        for (scoped, unreadable, expected) in [
+            (
+                &table,
+                &[][..],
+                "index `app.x`: the database already has table `app.x`",
+            ),
+            (
+                &view,
+                &[][..],
+                "index `app.x`: the database already has view `app.x`",
+            ),
+            (&empty, &unreadable[..], "`app.x`, which pbps cannot read"),
+        ] {
+            let e = refuse_occupied_names(&add("x"), scoped, unreadable, &[], "prod")
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(expected), "{e}");
+        }
+        refuse_occupied_names(&add("free"), &table, &[], &[], "prod").expect("a free name");
+    }
+
     #[test]
     fn a_new_name_is_occupied_only_by_what_shares_its_namespace() {
         use pbps_db::catalog::LimitationTarget;

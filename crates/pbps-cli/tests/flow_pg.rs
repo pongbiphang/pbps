@@ -1861,8 +1861,9 @@ fn a_sequence_a_schema_transfer_carries_refuses_a_table_at_its_name() {
 }
 
 /// #1355: an index takes a name in the relation namespace too. One the plan
-/// adds at the name of a sequence a cross-schema rename carries in first, or
-/// of a sequence the database holds, refuses `plan --db` by name, where the
+/// adds at the name of a sequence a cross-schema rename carries in first, of
+/// a sequence the database holds, or of a table the project does not record,
+/// refuses `plan --db` by name, where the
 /// `CREATE INDEX` used to fail at apply with 42P07; no plan is written.
 /// Control: the same rename with the index at a free name plans and applies.
 #[test]
@@ -1917,6 +1918,18 @@ fn an_index_at_a_held_or_carried_name_refuses_the_plan() {
         &connection,
         &d,
         "`app.s`: the database already has sequence `app.s`",
+    );
+
+    // And a table the project does not record (review of #1385).
+    let own = OwnDatabase::new(&server, "index-unrecorded");
+    let connection = own.connection().to_owned();
+    let d = bootstrapped_demo(&connection, "index-unrecorded", without_index);
+    on_server(&connection, "CREATE TABLE app.other (id integer)");
+    d.table(&table("table: app.t", "other"));
+    refuses(
+        &connection,
+        &d,
+        "index `app.other`: the database already has table `app.other`",
     );
 
     let (_own, connection, d) = moved("index-free", "ix_free");
