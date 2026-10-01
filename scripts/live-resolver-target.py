@@ -43,6 +43,10 @@ DAEMON_TEST = "resolver::docker::tests::direct_native_daemon_is_accepted_but_a_r
 SQL_RECOVERY_CLOSE_TEST = "resolver::server::container_tests::sql_recovery::confirmed_workload_removal_finishes_only_its_existing_sql_recovery"
 SQL_RECOVERY_DISCARD_TEST = "resolver::server::container_tests::sql_recovery::interrupted_open_discard_finishes_sql_recovery_only_after_workload_removal"
 SQL_RECOVERY_CANCEL_TEST = "resolver::server::container_tests::sql_recovery::cancelled_cleanup_keeps_uncertain_owned_sql_names_and_remains_terminal"
+PG18_GENERATION_TEST = "resolver::server::qualified_evidence_tests::the_pg18_producer_projects_the_replaced_generated_attrdef_and_preserves_column_identity"
+PG16_GENERATION_TEST = "resolver::server::qualified_evidence_tests::the_pg16_producer_adds_stored_generation_and_retains_existing_generated_bindings"
+# Major-specific cases stay separate from the existing producer-only suite.
+GENERATION_TESTS = [PG18_GENERATION_TEST, PG16_GENERATION_TEST]
 PRODUCER_TESTS = [
     "resolver::server::qualified_evidence_tests::the_container_producer_seals_the_overload_and_default_from_one_fresh_read",
     "resolver::server::qualified_evidence_tests::only_recorded_table_and_index_roots_own_their_catalog_columns",
@@ -84,7 +88,7 @@ NATIVE_TESTS = [DAEMON_TEST, TARGET_TEST, FACTORY_TEST, RECIPE_TEST, ANALYSIS_TE
                 INVALIDATION_TEST, CANCELLATION_TEST, DEADLINE_TEST,
                 ADMIN_RECOVERY_TEST, SCRATCH_RECOVERY_TEST, JANITOR_RECOVERY_TEST,
                 SQL_RECOVERY_CLOSE_TEST, SQL_RECOVERY_DISCARD_TEST,
-                SQL_RECOVERY_CANCEL_TEST] + PRODUCER_TESTS
+                SQL_RECOVERY_CANCEL_TEST] + PRODUCER_TESTS + GENERATION_TESTS
 QUIET = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
 DOCKER_SOCKET = "/var/run/docker.sock"
 
@@ -104,16 +108,28 @@ def interrupted(signum, _frame):
     raise SystemExit(128 + signum)
 
 
-def native_tests(binary, env, producer_only=False):
+def native_tests(binary, env, producer_only=False, generation_only=False):
+    if producer_only and generation_only:
+        raise RuntimeError("producer-only and generation-only are mutually exclusive")
+    if generation_only:
+        if env.get("PBPS_NATIVE_DRIVER") != "pg":
+            raise RuntimeError("generation-only requires PBPS_NATIVE_DRIVER=pg")
+        if env.get("PBPS_NATIVE_PG_MAJOR") not in ("16", "18"):
+            raise RuntimeError("generation-only requires PBPS_NATIVE_PG_MAJOR=16 or 18")
     # The daemon/proxy case needs the same disposable root host as the factory;
     # the ordinary library run only compiles it and leaves it ignored.
-    for test in PRODUCER_TESTS if producer_only else NATIVE_TESTS:
+    for test in GENERATION_TESTS if generation_only else PRODUCER_TESTS if producer_only else NATIVE_TESTS:
         if test in (RECIPE_TEST, ANALYSIS_TEST, INVALIDATION_TEST, CANCELLATION_TEST,
                     DEADLINE_TEST, ADMIN_RECOVERY_TEST, SCRATCH_RECOVERY_TEST,
                     JANITOR_RECOVERY_TEST, SQL_RECOVERY_CLOSE_TEST,
                     SQL_RECOVERY_DISCARD_TEST, SQL_RECOVERY_CANCEL_TEST,
                     *PRODUCER_TESTS) and env.get("PBPS_NATIVE_DRIVER") != "pg":
             continue
+        if test in GENERATION_TESTS:
+            major = "18" if test == PG18_GENERATION_TEST else "16"
+            # Each case verifies the actual major; selection alone is not proof.
+            if env.get("PBPS_NATIVE_DRIVER") != "pg" or env.get("PBPS_NATIVE_PG_MAJOR") != major:
+                continue
         result = run(binary, "--ignored", "--exact", test, "--nocapture",
                      env=dict(os.environ, **env), stdout=subprocess.PIPE,
                      stderr=subprocess.STDOUT, check=False)
@@ -241,7 +257,7 @@ def fixture(args, binary, root, owned):
         if engine == "pg":
             env["PBPS_NATIVE_PG_MAJOR"] = str(args.pg_major)
             env["PBPS_NATIVE_DOCKER"] = str(Path(shutil.which("docker")).resolve())
-        native_tests(binary, env, args.producer_only)
+        native_tests(binary, env, args.producer_only, args.generation_only)
         return
     reader = "pbps-native-reader-" + uuid.uuid4().hex
     owned.append(reader)
@@ -272,8 +288,11 @@ def main():
     parser.add_argument("--pg-major", type=int, choices=PG_IMAGES, default=18,
                         help="pinned PostgreSQL fixture image; default: 18")
     parser.add_argument("--native-host", action="store_true")
-    parser.add_argument("--producer-only", action="store_true",
-                        help="run only the focused #1274 producer cases")
+    focused = parser.add_mutually_exclusive_group()
+    focused.add_argument("--producer-only", action="store_true",
+                         help="run only the focused #1274 producer cases")
+    focused.add_argument("--generation-only", action="store_true",
+                         help="run only the connected generated-expression case for this PG major")
     parser.add_argument("--socket", default="/var/run/docker.sock")
     parser.add_argument("--test-binary", type=Path, help="prebuilt CLI library test executable")
     args = parser.parse_args()
@@ -281,6 +300,8 @@ def main():
         parser.error("--pg-major applies only to pg")
     if args.producer_only and (not args.native_host or args.engine != "pg"):
         parser.error("--producer-only requires --native-host pg")
+    if args.generation_only and (not args.native_host or args.engine != "pg"):
+        parser.error("--generation-only requires --native-host pg")
     if sys.platform != "linux":
         parser.error("native process qualification requires Linux")
     if not Path(args.socket).is_absolute():
