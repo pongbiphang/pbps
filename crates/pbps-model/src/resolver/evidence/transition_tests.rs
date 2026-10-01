@@ -33,6 +33,34 @@ fn drop_fixture(change: Change, surface: Surface) -> (ChangeSet, ResolverEvidenc
     transition.surface = surface.clone();
     let object = transition.before.iter().next().unwrap().clone();
     own(&mut evidence.before, &object, surface);
+    if let Change::DropColumn { column, .. } = &changes.changes[0].change {
+        // A removed column still changes its surviving parent's vector. Keep
+        // that obligation separate from the existing opaque column fixture.
+        let parent = crate::resolver::Prerequisite {
+            object: ObjectIdentity {
+                class: "table-fixture".into(),
+                name: vec![column.table.schema.clone(), column.table.name.clone()],
+                signature: vec![],
+            },
+            ownership: ObjectOwnership::Surface(Surface::Table(column.table.clone())),
+            canonicalization: "fixture-v1".into(),
+            properties: "bc".repeat(32),
+            bindings: vec![],
+        };
+        for manifest in [&mut evidence.before, &mut evidence.after] {
+            let mut json = serde_json::to_value(&*manifest).unwrap();
+            let mut records = manifest.prerequisites().to_vec();
+            records.push(parent.clone());
+            records.sort_by(|a, b| a.object.cmp(&b.object));
+            json["prerequisites"] = serde_json::to_value(records).unwrap();
+            *manifest = serde_json::from_value(json).unwrap();
+        }
+        evidence.transitions.push(ObjectTransition {
+            surface: Surface::Table(column.table.clone()),
+            before: BTreeSet::from([parent.object.clone()]),
+            after: BTreeSet::from([parent.object]),
+        });
+    }
     // Compilation's external hash differs from the target. Projection must
     // preserve the target's untouched record, even on an otherwise empty drop.
     evidence.after = evidence
@@ -113,10 +141,19 @@ fn dropped_surfaces_cannot_omit_their_closing_transitions() {
             "projection accepted missing {surface:?}"
         );
         assert!(evidence.after.membership()[0].members.is_empty());
-        assert_eq!(evidence.after.prerequisites().len(), 1);
+        let parent = usize::from(matches!(
+            changes.changes[0].change,
+            Change::DropColumn { .. }
+        ));
+        assert_eq!(evidence.after.prerequisites().len(), 1 + parent);
         assert_eq!(
-            evidence.after.prerequisites()[0],
-            evidence.before.prerequisites()[1]
+            evidence
+                .after
+                .prerequisites()
+                .iter()
+                .find(|p| p.object == evidence.before.prerequisites()[1].object)
+                .unwrap(),
+            &evidence.before.prerequisites()[1]
         );
         assert!(
             ResolverEvidence::new(
@@ -366,6 +403,10 @@ fn owner_coverage(
     creating: bool,
 ) -> (ChangeSet, ResolverEvidence) {
     use crate::resolver::{BoundSurface, Prerequisite};
+    let vector_edit = matches!(
+        &change,
+        Change::AddColumn { .. } | Change::DropColumn { .. }
+    );
     let table: TableName = "app.v".parse().unwrap();
     let (_, mut evidence) = drop_fixture(
         Change::DropTable {
@@ -396,7 +437,7 @@ fn owner_coverage(
         ObjectIdentity {
             class: "default".into(),
             name: vec!["n".into()],
-            signature: vec![table_object],
+            signature: vec![table_object.clone()],
         }
     };
     let mut records = evidence.before.prerequisites().to_vec();
@@ -461,6 +502,15 @@ fn owner_coverage(
         },
         after: if creating { owned } else { BTreeSet::new() },
     }];
+    if vector_edit {
+        // The table already exists on both sides of this fixture. Its exact
+        // inventory supplements, and never replaces, the column inventory.
+        evidence.transitions.push(ObjectTransition {
+            surface: Surface::Table(table.clone()),
+            before: BTreeSet::from([table_object.clone()]),
+            after: BTreeSet::from([table_object]),
+        });
+    }
     evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
     evidence.after = evidence
         .before
@@ -468,11 +518,11 @@ fn owner_coverage(
         .unwrap();
     evidence.validate(&changes).unwrap();
     assert_eq!(evidence.after, compiled);
-    // Aggregate table ownership remains valid for ADD COLUMN plus its default.
+    // A parent vector transition cannot substitute for the column owner.
     if matches!(evidence.transitions[0].surface, Surface::Column(_)) {
         let mut aggregate = evidence.clone();
         aggregate.transitions[0].surface = Surface::Table(table);
-        aggregate.validate(&changes).unwrap();
+        assert!(aggregate.validate(&changes).is_err());
     }
     let valid = evidence.clone();
     // A surface that is its own only record, as a computed column is (it has
@@ -613,7 +663,17 @@ pub(super) fn rename_endpoints(column: bool) -> (ChangeSet, ResolverEvidence) {
         let mut new_object = old_object.clone();
         new_object.name[0] = "m".into();
         let mut before = serde_json::to_value(&evidence.before).unwrap();
+        let mut parent = before["prerequisites"][0].clone();
+        parent["ownership"] =
+            serde_json::to_value(ObjectOwnership::Surface(Surface::Table(table.clone()))).unwrap();
         before["prerequisites"][0]["object"] = serde_json::to_value(&old_object).unwrap();
+        before["prerequisites"].as_array_mut().unwrap().push(parent);
+        before["prerequisites"]
+            .as_array_mut()
+            .unwrap()
+            .sort_by_key(|p| {
+                serde_json::from_value::<ObjectIdentity>(p["object"].clone()).unwrap()
+            });
         // Columns are prerequisites, not relation-name candidates.
         before["membership"][0]["members"] = serde_json::json!([]);
         evidence.before = serde_json::from_value(before).unwrap();
@@ -664,6 +724,23 @@ pub(super) fn rename_endpoints(column: bool) -> (ChangeSet, ResolverEvidence) {
         before: BTreeSet::from([old_object.clone()]),
         after: BTreeSet::from([new_object.clone()]),
     }];
+    if column {
+        let parent = evidence
+            .before
+            .prerequisites()
+            .iter()
+            .find(|p| {
+                p.ownership == ObjectOwnership::Surface(Surface::Table(table.clone()))
+            })
+            .unwrap()
+            .object
+            .clone();
+        evidence.transitions.push(ObjectTransition {
+            surface: Surface::Table(table.clone()),
+            before: BTreeSet::from([parent.clone()]),
+            after: BTreeSet::from([parent]),
+        });
+    }
     evidence.after = evidence
         .before
         .project(&changes, &compiled, &evidence.transitions)
@@ -671,8 +748,8 @@ pub(super) fn rename_endpoints(column: bool) -> (ChangeSet, ResolverEvidence) {
     evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
     evidence.validate(&changes).unwrap();
     assert_eq!(evidence.after, compiled);
-    // A producer may split the inventory by the old/new surface, or aggregate
-    // a column rename under its owning table. Both endpoints still matter.
+    // A producer may split the old/new column inventory. The independent
+    // parent inventory cannot stand in for either column endpoint.
     let mut split = evidence.clone();
     split.transitions[0].after.clear();
     split.transitions.push(ObjectTransition {
@@ -685,7 +762,7 @@ pub(super) fn rename_endpoints(column: bool) -> (ChangeSet, ResolverEvidence) {
     if column {
         let mut aggregate = evidence.clone();
         aggregate.transitions[0].surface = Surface::Table(table);
-        aggregate.validate(&changes).unwrap();
+        assert!(aggregate.validate(&changes).is_err());
     }
     for omit_before in [false, true] {
         let mut omitted = evidence.clone();
@@ -1782,5 +1859,269 @@ mod inline_binding_floor {
             .unwrap();
         evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
         roundtrip(&changes, &evidence);
+    }
+}
+
+mod column_vector_parent {
+    use super::*;
+    use crate::{Column, Generated, IdsFile, PlanOrigin, SavedPlan};
+
+    fn fixtures() -> Vec<(ChangeSet, ResolverEvidence)> {
+        let table: TableName = "app.v".parse().unwrap();
+        let mut fixtures = Vec::new();
+        for kind in ["plain", "default", "generated"] {
+            let mut column = Column::new("integer".parse().unwrap());
+            let child = if kind == "plain" {
+                Surface::Column(table.column("n"))
+            } else {
+                if kind == "default" {
+                    column.default = Some("7".into());
+                } else {
+                    column.generated = Some(Generated {
+                        expression: "1 + 4".into(),
+                        stored: true,
+                    });
+                }
+                Surface::Default(table.column("n"))
+            };
+            let (changes, mut evidence) = owner_coverage(
+                Change::AddColumn {
+                    uid: "c_000000".parse().unwrap(),
+                    table: table.clone(),
+                    name: "n".into(),
+                    column: Box::new(column),
+                },
+                Surface::Column(table.column("n")),
+                child,
+                true,
+            );
+            if kind == "plain" {
+                evidence.surfaces.clear();
+            }
+            fixtures.push((changes, evidence));
+        }
+        fixtures.push(owner_coverage(
+            Change::DropColumn {
+                uid: "c_000000".parse().unwrap(),
+                column: table.column("n"),
+            },
+            Surface::Column(table.column("n")),
+            Surface::Default(table.column("n")),
+            false,
+        ));
+        fixtures.push(rename_endpoints(true));
+        fixtures
+    }
+
+    fn construct(
+        changes: &ChangeSet,
+        evidence: &ResolverEvidence,
+    ) -> Result<ResolverEvidence, EvidenceError> {
+        ResolverEvidence::new(
+            changes,
+            evidence.qualification.clone(),
+            evidence.authorization.clone(),
+            evidence.before.clone(),
+            &evidence.after,
+            evidence.surfaces.clone(),
+            evidence.transitions.clone(),
+            evidence.ordering.clone(),
+        )
+    }
+
+    fn refuse(changes: &ChangeSet, evidence: &ResolverEvidence, reason: &str) {
+        assert!(
+            evidence.before.project(changes, &evidence.after, &evidence.transitions).is_err(),
+            "projection accepted {reason}"
+        );
+        assert!(construct(changes, evidence).is_err(), "constructor accepted {reason}");
+        let decoded: ResolverEvidence =
+            serde_json::from_value(serde_json::to_value(evidence).unwrap()).unwrap();
+        assert!(decoded.validate(changes).is_err(), "reader accepted {reason}");
+    }
+
+    #[test]
+    fn column_vector_edits_require_independent_parent_and_column_inventories() {
+        for (changes, evidence) in fixtures() {
+            let seed = super::super::tests::plan();
+            let plan = SavedPlan::new(
+                PlanOrigin::Database,
+                seed.dialect,
+                seed.created_at,
+                seed.baseline,
+                changes.clone(),
+                IdsFile::default(),
+            )
+            .with_resolution(construct(&changes, &evidence).unwrap())
+            .unwrap();
+            let decoded: SavedPlan =
+                serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+            assert_eq!(decoded, plan);
+            decoded.validate_analysis().unwrap();
+            let parent = evidence.transitions.iter().position(|t| {
+                matches!(t.surface, Surface::Table(_))
+            }).unwrap();
+            let column = evidence.transitions.iter().position(|t| {
+                matches!(t.surface, Surface::Column(_))
+            }).unwrap();
+            assert_eq!(evidence.transitions[parent].before.len(), 1);
+            assert_eq!(evidence.transitions[parent].after.len(), 1);
+            // Identical parent fingerprints are deliberate: neither a hash
+            // mismatch nor a binding failure can explain these refusals.
+            for missing in [parent, column] {
+                let mut omitted = evidence.clone();
+                omitted.transitions.remove(missing);
+                refuse(&changes, &omitted, "one independent inventory omitted");
+            }
+            for before in [true, false] {
+                let mut omitted = evidence.clone();
+                if before {
+                    omitted.transitions[parent].before.clear();
+                } else {
+                    omitted.transitions[parent].after.clear();
+                }
+                refuse(&changes, &omitted, "one surviving parent endpoint omitted");
+            }
+            let mut duplicate = evidence.clone();
+            duplicate.transitions.push(evidence.transitions[parent].clone());
+            refuse(&changes, &duplicate, "duplicate parent transition");
+        }
+    }
+
+    #[test]
+    fn a_column_vector_parent_cannot_authorize_unrelated_records() {
+        let (changes, evidence) = fixtures().remove(0);
+        let parent = evidence.transitions.iter().position(|t| {
+            matches!(t.surface, Surface::Table(_))
+        }).unwrap();
+        let table: TableName = "app.v".parse().unwrap();
+        for ownership in [
+            ObjectOwnership::Surface(Surface::Column(table.column("unrelated"))),
+            ObjectOwnership::Surface(Surface::Table("app.other".parse().unwrap())),
+            ObjectOwnership::Unqualified,
+        ] {
+            let mut excessive = evidence.clone();
+            let object = ObjectIdentity {
+                class: "unrelated-fixture".into(),
+                name: vec!["untouched".into()],
+                signature: vec![],
+            };
+            for manifest in [&mut excessive.before, &mut excessive.after] {
+                let mut records = manifest.prerequisites().to_vec();
+                records.push(crate::resolver::Prerequisite {
+                    object: object.clone(),
+                    ownership: ownership.clone(),
+                    canonicalization: "fixture-v1".into(),
+                    properties: "cf".repeat(32),
+                    bindings: vec![],
+                });
+                records.sort_by(|a, b| a.object.cmp(&b.object));
+                let mut json = serde_json::to_value(&*manifest).unwrap();
+                json["prerequisites"] = serde_json::to_value(records).unwrap();
+                *manifest = serde_json::from_value(json).unwrap();
+            }
+            excessive.validate(&changes).unwrap();
+            excessive.transitions[parent].before.insert(object.clone());
+            excessive.transitions[parent].after.insert(object);
+            refuse(&changes, &excessive, "parent escalation to unrelated authority");
+        }
+    }
+
+    #[test]
+    fn a_missing_vector_parent_endpoint_needs_its_own_table_lifecycle_change() {
+        let table: TableName = "app.v".parse().unwrap();
+        for creating in [true, false] {
+            let (mut changes, mut evidence) = if creating {
+                fixtures().remove(0)
+            } else {
+                fixtures().remove(3)
+            };
+            let parent = evidence.transitions.iter().position(|t| {
+                matches!(t.surface, Surface::Table(_))
+            }).unwrap();
+            let manifest = if creating { &mut evidence.before } else { &mut evidence.after };
+            let object = evidence.transitions[parent].after.iter().next().unwrap().clone();
+            let mut json = serde_json::to_value(&*manifest).unwrap();
+            json["prerequisites"].as_array_mut().unwrap().retain(|p| {
+                p["object"] != serde_json::to_value(&object).unwrap()
+            });
+            for membership in json["membership"].as_array_mut().unwrap() {
+                membership["members"].as_array_mut().unwrap().retain(|member| {
+                    member != &serde_json::to_value(&object).unwrap()
+                });
+            }
+            *manifest = serde_json::from_value(json).unwrap();
+            if creating {
+                evidence.transitions[parent].before.clear();
+            } else {
+                evidence.transitions[parent].after.clear();
+            }
+            refuse(&changes, &evidence, "absent parent without its lifecycle change");
+            let lifecycle = if creating {
+                Change::CreateTable {
+                    uid: "t_000000".parse().unwrap(),
+                    name: table.clone(),
+                    table: Box::default(),
+                }
+            } else {
+                Change::DropTable {
+                    uid: "t_000000".parse().unwrap(),
+                    name: table.clone(),
+                }
+            };
+            if creating {
+                changes.changes.insert(0, PlannedChange::new(lifecycle));
+            } else {
+                changes.changes.push(PlannedChange::new(lifecycle));
+            }
+            evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
+            construct(&changes, &evidence).unwrap().validate(&changes).unwrap();
+        }
+    }
+
+    #[test]
+    fn nonvector_edits_cannot_borrow_a_parent_transition() {
+        let table: TableName = "app.v".parse().unwrap();
+        let (_, fixture) = fixtures().remove(3);
+        let parent = fixture.transitions.iter().find(|t| {
+            matches!(t.surface, Surface::Table(_))
+        }).unwrap().clone();
+        let column = fixture.before.prerequisites().iter().find(|p| {
+            p.ownership == ObjectOwnership::Surface(Surface::Column(table.column("n")))
+        }).unwrap().object.clone();
+        let default = fixture.before.prerequisites().iter().find(|p| {
+            p.ownership == ObjectOwnership::Surface(Surface::Default(table.column("n")))
+        }).unwrap().object.clone();
+        let uid: crate::Uid = "c_000000".parse().unwrap();
+        for (change, surface, inventory) in [
+            (Change::AlterColumnType {
+                uid: uid.clone(), column: table.column("n"),
+                from: "integer".parse().unwrap(), to: "bigint".parse().unwrap(),
+                from_nullable: true, to_nullable: true, from_collation: None, to_collation: None,
+            }, Surface::Column(table.column("n")), BTreeSet::from([column.clone(), default.clone()])),
+            (Change::AlterColumnNullability {
+                uid: uid.clone(), column: table.column("n"), ty: "integer".parse().unwrap(),
+                to_nullable: false, collation: None,
+            }, Surface::Column(table.column("n")), BTreeSet::from([column.clone()])),
+            (Change::AlterColumnDefault {
+                uid: uid.clone(), column: table.column("n"),
+                from: Some("7".into()), to: Some("8".into()),
+            }, Surface::Default(table.column("n")), BTreeSet::from([default.clone()])),
+            (Change::AlterColumnExpression {
+                uid, column: table.column("n"), from: "1 + 4".into(), to: "1 + 5".into(),
+            }, Surface::Default(table.column("n")), BTreeSet::from([default.clone()])),
+        ] {
+            let mut evidence = fixture.clone();
+            evidence.after = evidence.before.clone();
+            evidence.surfaces[0].desired = evidence.surfaces[0].current.clone();
+            evidence.transitions = vec![ObjectTransition {
+                surface, before: inventory.clone(), after: inventory,
+            }];
+            let changes = ChangeSet { changes: vec![PlannedChange::new(change)] };
+            evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
+            construct(&changes, &evidence).unwrap().validate(&changes).unwrap();
+            evidence.transitions.push(parent.clone());
+            refuse(&changes, &evidence, "parent authority for a nonvector edit");
+        }
     }
 }

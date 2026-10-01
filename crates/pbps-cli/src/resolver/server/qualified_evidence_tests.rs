@@ -2710,6 +2710,22 @@ fn create_and_add_stored_generation_keep_the_attrdef_child_inventory() {
         }
         let base_ids = ids(&base, &IdsFile::default());
         let desired_ids = ids(&desired, &base_ids);
+        // ADD preserves a live parent on both sides. CREATE has no opening
+        // parent; neither premise changes the generated child's inventory.
+        let opening = if create {
+            vec![]
+        } else {
+            generation_records(&table, "g")
+                .into_iter()
+                .filter(|record| {
+                    !matches!(
+                        &record.ownership,
+                        ObjectOwnership::Surface(Surface::Column(c) | Surface::Default(c))
+                            if c.name == "g"
+                    )
+                })
+                .collect()
+        };
         let (surface, change, expected) = if create {
             (
                 Surface::Table(table.clone()),
@@ -2748,14 +2764,23 @@ fn create_and_add_stored_generation_keep_the_attrdef_child_inventory() {
                 schema: &desired,
                 ids: &desired_ids,
             },
-            &[],
+            &opening,
             &compiled,
         )
         .unwrap();
-        assert_eq!(transitions.len(), 1);
-        assert_eq!(transitions[0].surface, surface);
-        assert!(transitions[0].before.is_empty());
-        assert_eq!(transitions[0].after, expected);
+        assert_eq!(transitions.len(), if create { 1 } else { 2 });
+        let child = transitions.iter().find(|t| t.surface == surface).unwrap();
+        assert!(child.before.is_empty());
+        assert_eq!(child.after, expected);
+        if !create {
+            let parent = transitions
+                .iter()
+                .find(|t| t.surface == Surface::Table(table.clone()))
+                .unwrap();
+            let relation = generation_objects(&table, "g")[0].signature[0].clone();
+            assert_eq!(parent.before, BTreeSet::from([relation.clone()]));
+            assert_eq!(parent.after, BTreeSet::from([relation]));
+        }
     }
 }
 
@@ -6070,4 +6095,251 @@ async fn the_pg18_producer_projects_the_replaced_generated_attrdef_and_preserves
 #[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
 async fn the_pg16_producer_adds_stored_generation_and_retains_existing_generated_bindings() {
     generation_producer_case(GenerationCase::AddStored).await;
+}
+
+mod column_vector_parent {
+    use super::*;
+    use pbps_model::{Column, Generated, PlannedChange, TableName};
+    use pbps_pg::resolver::capture::BindingRecord;
+
+    fn derive(
+        changes: &ChangeSet,
+        base: &Schema,
+        base_ids: &IdsFile,
+        desired: &Schema,
+        desired_ids: &IdsFile,
+        opening: &[BindingRecord],
+        compiled: &[BindingRecord],
+    ) -> Vec<pbps_model::resolver::ObjectTransition> {
+        super::super::transitions::derive(
+            changes,
+            pbps_diff::Side { schema: base, ids: base_ids },
+            pbps_diff::Side { schema: desired, ids: desired_ids },
+            opening,
+            compiled,
+        ).unwrap()
+    }
+
+    fn without_generated(table: &TableName, name: &str) -> Vec<BindingRecord> {
+        generation_records(table, "g").into_iter().filter(|record| {
+            !matches!(
+                &record.ownership,
+                ObjectOwnership::Surface(Surface::Column(c) | Surface::Default(c))
+                    if c.name == name
+            )
+        }).collect()
+    }
+
+    #[test]
+    fn vector_changes_account_for_the_exact_parent_and_only_the_changed_column() {
+        let table = TableName::new("app", "t");
+        let base = generation_schema(&table);
+        let base_ids = ids(&base, &IdsFile::default());
+        let opening = generation_records(&table, "g");
+        let relation = generation_objects(&table, "g")[0].signature[0].clone();
+        for kind in ["plain", "default", "generated", "drop", "rename"] {
+            let mut desired = base.clone();
+            let (change, surface, before, after, compiled, desired_ids) = match kind {
+                "drop" => {
+                    desired.tables.get_mut(&table).unwrap().columns.shift_remove("g");
+                    let desired_ids = ids(&desired, &base_ids);
+                    let objects = generation_objects(&table, "g");
+                    (
+                        Change::DropColumn {
+                            uid: base_ids.column_uid(&table.column("g")).unwrap().clone(),
+                            column: table.column("g"),
+                        },
+                        Surface::Column(table.column("g")),
+                        BTreeSet::from(objects),
+                        BTreeSet::new(),
+                        without_generated(&table, "g"),
+                        desired_ids,
+                    )
+                }
+                "rename" => {
+                    let definition = desired.tables.get_mut(&table).unwrap();
+                    let column = definition.columns.shift_remove("g").unwrap();
+                    definition.columns.insert("h".into(), column);
+                    let uid = base_ids.column_uid(&table.column("g")).unwrap().clone();
+                    let mut desired_ids = base_ids.clone();
+                    desired_ids.columns.get_mut(&uid).unwrap().name = "h".into();
+                    (
+                        Change::RenameColumn {
+                            uid,
+                            table: table.clone(),
+                            from: "g".into(),
+                            to: "h".into(),
+                            table_was: None,
+                        },
+                        Surface::Column(table.column("h")),
+                        BTreeSet::from(generation_objects(&table, "g")),
+                        BTreeSet::from(generation_objects(&table, "h")),
+                        generation_records(&table, "h"),
+                        desired_ids,
+                    )
+                }
+                _ => {
+                    let mut column = Column::new("integer".parse().unwrap());
+                    if kind == "default" {
+                        column.default = Some("7".into());
+                    } else if kind == "generated" {
+                        column.generated = Some(Generated {
+                            expression: "a + 4".into(),
+                            stored: true,
+                        });
+                    }
+                    desired.tables.get_mut(&table).unwrap().columns.insert("h".into(), column.clone());
+                    let desired_ids = ids(&desired, &base_ids);
+                    let [child, attrdef, mut owner, reference] = generation_objects(&table, "h");
+                    let mut additions = vec![BindingRecord {
+                        object: child.clone(),
+                        ownership: ObjectOwnership::Surface(Surface::Column(table.column("h"))),
+                        bindings: vec![],
+                    }];
+                    if kind != "plain" {
+                        if kind == "default" {
+                            owner.name = vec!["a".into()];
+                        }
+                        for object in [attrdef, owner] {
+                            additions.push(BindingRecord {
+                                object,
+                                ownership: ObjectOwnership::Surface(Surface::Default(table.column("h"))),
+                                bindings: vec![],
+                            });
+                        }
+                        if kind == "generated" {
+                            additions.push(BindingRecord {
+                                object: reference,
+                                ownership: ObjectOwnership::Surface(Surface::Default(table.column("h"))),
+                                bindings: vec![],
+                            });
+                        }
+                    }
+                    let after = additions.iter().map(|r| r.object.clone()).collect();
+                    let mut compiled = opening.clone();
+                    compiled.extend(additions);
+                    (
+                        Change::AddColumn {
+                            uid: desired_ids.column_uid(&table.column("h")).unwrap().clone(),
+                            table: table.clone(),
+                            name: "h".into(),
+                            column: Box::new(column),
+                        },
+                        Surface::Column(table.column("h")),
+                        BTreeSet::new(),
+                        after,
+                        compiled,
+                        desired_ids,
+                    )
+                }
+            };
+            let transitions = derive(
+                &ChangeSet { changes: vec![PlannedChange::new(change)] },
+                &base, &base_ids, &desired, &desired_ids, &opening, &compiled,
+            );
+            assert_eq!(transitions.len(), 2, "{kind}");
+            let parent = transitions.iter().find(|t| t.surface == Surface::Table(table.clone())).unwrap();
+            assert_eq!(parent.before, BTreeSet::from([relation.clone()]), "{kind}");
+            assert_eq!(parent.after, BTreeSet::from([relation.clone()]), "{kind}");
+            let column = transitions.iter().find(|t| t.surface == surface).unwrap();
+            assert_eq!(column.before, before, "{kind}");
+            assert_eq!(column.after, after, "{kind}");
+            for inventory in [transitions.iter().flat_map(|t| &t.before).collect::<Vec<_>>(),
+                transitions.iter().flat_map(|t| &t.after).collect::<Vec<_>>()]
+            {
+                assert_eq!(inventory.len(), inventory.iter().collect::<BTreeSet<_>>().len(), "{kind}");
+            }
+        }
+    }
+
+    #[test]
+    fn vector_parent_endpoints_follow_table_uids_when_an_opening_name_is_reused() {
+        let old = TableName::new("app", "a");
+        let renamed = TableName::new("app", "b");
+        let other = TableName::new("app", "c");
+        let mut base = generation_schema(&old);
+        base.tables.extend(generation_schema(&other).tables);
+        let base_ids = ids(&base, &IdsFile::default());
+        let mut desired = Schema::default();
+        let mut first = base.tables[&old].clone();
+        first.columns.shift_remove("g");
+        desired.tables.insert(renamed.clone(), first);
+        desired.tables.insert(old.clone(), base.tables[&other].clone());
+        let mut desired_ids = base_ids.clone();
+        desired_ids.rename_table(&old, &renamed);
+        desired_ids.rename_table(&other, &old);
+        desired_ids.columns.remove(base_ids.column_uid(&old.column("g")).unwrap());
+        let changes = ChangeSet { changes: vec![
+            PlannedChange::new(Change::DropColumn {
+                uid: base_ids.column_uid(&old.column("g")).unwrap().clone(),
+                column: old.column("g"),
+            }),
+            PlannedChange::new(Change::RenameTable {
+                uid: base_ids.table_uid(&old).unwrap().clone(),
+                from: old.clone(), to: renamed.clone(), defaults: vec!["d".into()],
+            }),
+            PlannedChange::new(Change::RenameTable {
+                uid: base_ids.table_uid(&other).unwrap().clone(),
+                from: other.clone(), to: old.clone(), defaults: vec!["d".into(), "g".into()],
+            }),
+        ] };
+        let mut opening = generation_records(&old, "g");
+        opening.extend(generation_records(&other, "g"));
+        let mut compiled = without_generated(&renamed, "g");
+        compiled.extend(generation_records(&old, "g"));
+        let transitions = derive(&changes, &base, &base_ids, &desired, &desired_ids, &opening, &compiled);
+        let dropped = transitions.iter().find(|t| t.surface == Surface::Column(old.column("g"))).unwrap();
+        assert_eq!(dropped.before, BTreeSet::from(generation_objects(&old, "g")));
+        assert!(dropped.after.is_empty());
+        for (final_table, opening_table) in [(&renamed, &old), (&old, &other)] {
+            let parent = transitions.iter().find(|t| t.surface == Surface::Table(final_table.clone())).unwrap();
+            let relation = generation_objects(opening_table, "g")[0].signature[0].clone();
+            assert!(parent.before.contains(&relation));
+            let wrong = generation_objects(if opening_table == &old { &other } else { &old }, "g")[0].signature[0].clone();
+            assert!(!parent.before.contains(&wrong));
+        }
+        for (actual, expected) in [
+            (transitions.iter().flat_map(|t| &t.before).collect::<Vec<_>>(), &opening),
+            (transitions.iter().flat_map(|t| &t.after).collect::<Vec<_>>(), &compiled),
+        ] {
+            let unique = actual.iter().copied().collect::<BTreeSet<_>>();
+            assert_eq!(actual.len(), unique.len());
+            assert_eq!(unique, expected.iter().map(|r| &r.object).collect());
+        }
+    }
+
+    #[test]
+    fn nonvector_column_edits_do_not_acquire_parent_inventory() {
+        let table = TableName::new("app", "t");
+        let base = generation_schema(&table);
+        let ids = ids(&base, &IdsFile::default());
+        let uid = ids.column_uid(&table.column("g")).unwrap().clone();
+        let records = generation_records(&table, "g");
+        for change in [
+            Change::AlterColumnType {
+                uid: uid.clone(), column: table.column("g"),
+                from: "integer".parse().unwrap(), to: "bigint".parse().unwrap(),
+                from_nullable: true, to_nullable: true, from_collation: None, to_collation: None,
+            },
+            Change::AlterColumnNullability {
+                uid: uid.clone(), column: table.column("g"), ty: "integer".parse().unwrap(),
+                to_nullable: false, collation: None,
+            },
+            Change::AlterColumnExpression {
+                uid, column: table.column("g"), from: "a * 2 + 1".into(), to: "a * 3".into(),
+            },
+            Change::AlterColumnDefault {
+                uid: ids.column_uid(&table.column("d")).unwrap().clone(), column: table.column("d"),
+                from: Some("7".into()), to: Some("8".into()),
+            },
+        ] {
+            let changes = ChangeSet { changes: vec![PlannedChange::new(change)] };
+            let transitions = derive(&changes, &base, &ids, &base, &ids, &records, &records);
+            assert_eq!(transitions.len(), 1);
+            assert!(!matches!(transitions[0].surface, Surface::Table(_)));
+            let relation = generation_objects(&table, "g")[0].signature[0].clone();
+            assert!(!transitions[0].before.contains(&relation));
+            assert!(!transitions[0].after.contains(&relation));
+        }
+    }
 }
