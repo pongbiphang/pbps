@@ -163,6 +163,17 @@ class Ownership(unittest.TestCase):
                 with self.assertRaisesRegex(audit.InventoryError, "matrix"):
                     self.check()
 
+    def test_a_matrix_definition_the_audit_cannot_consume_is_refused(self):
+        for strategy in ("    strategy:\n      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}\n",
+                         "    strategy:\n      matrix: {suite: []}\n",
+                         "    strategy:\n      fail-fast: false\n",
+                         "    strategy: {matrix: {suite: []}}\n",
+                         "    strategy: ${{ fromJSON(needs.plan.outputs.strategy) }}\n"):
+            with self.subTest(strategy=strategy):
+                self.workflow.write_text(WORKFLOW.replace("    steps:", strategy + "    steps:"))
+                with self.assertRaisesRegex(audit.InventoryError, "matrix"):
+                    self.check()
+
     def test_shards_must_together_select_every_case(self):
         self.targets[KEY]["all"].add("owned_trigger")
         self.targets[KEY]["ignored"].add("owned_trigger")

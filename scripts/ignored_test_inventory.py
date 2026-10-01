@@ -1042,8 +1042,14 @@ def workflow_runs(source, job, platform=None):
     # Without include/exclude every combination of the axes runs, so a
     # conjunction of equalities executes exactly when each value is on its axis.
     axes = {}
-    block = re.search(r"^      matrix:\n((?:        .*\n?)*)", body, re.M)
-    if block:
+    # Any strategy must be the block form read below. A flow or expression
+    # matrix on one line would otherwise skip this reading altogether, and
+    # its unconditional steps would count although it may yield no variant.
+    strategy = re.search(r"^    strategy:(.*)$", body, re.M)
+    if strategy:
+        block = re.search(r"^      matrix:[ \t]*\n((?:        .*\n?)*)", body, re.M)
+        require(not strategy[1].strip() and block is not None,
+                f"unsupported matrix definition needs an explicit audit: {job}")
         for line in block[1].splitlines():
             axis = re.fullmatch(r"        ([\w-]+): \[([^\]]*)\]\s*", line)
             require(axis is not None, f"unsupported matrix line needs an explicit audit: {job}: {line.strip()}")

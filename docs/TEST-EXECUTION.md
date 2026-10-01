@@ -33,7 +33,9 @@ names. Unsupported Cargo options, multiple TESTNAME arguments and ambiguous
 target selectors are refused rather than silently discarded. A step's `if:`
 counts as executing only when it is a literal truth value or a conjunction of
 `matrix.<axis> == '<value>'` that asks one value of each axis it names, and
-that value is on the axis. Axis values must be tokens YAML reads only as
+that value is on the axis. A `strategy` must be a block whose `matrix` lists
+each axis on its own line as `name: [a, b]`. A one-line flow or expression
+matrix is refused, because no variant it yields can be read. Axis values must be tokens YAML reads only as
 strings: a letter first, no dot, and not a boolean or null word. A quoted
 value could hold a comma. A boolean, null or number keeps its type, so the
 string comparison never holds. Both are refused. GitHub compares strings
