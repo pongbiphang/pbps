@@ -1995,6 +1995,16 @@ pub trait Dialect {
         true
     }
 
+    /// The names this engine gives `table`'s constraints itself, which no
+    /// declaration spells and which still take a name where constraints share
+    /// the schema's namespace: SQL Server's generated default constraints. A
+    /// table moved to another schema carries them out of its source schema
+    /// (review of #1346). The default, none, is right for an engine that names
+    /// nothing on its own there.
+    fn generated_constraint_names(&self, _name: &TableName, _table: &Table) -> Vec<String> {
+        Vec::new()
+    }
+
     /// The relations this engine creates with `table` under names it
     /// generates itself, as `(name, what it is)`: no declaration names them,
     /// yet each takes a name in the schema's relation namespace (#465,

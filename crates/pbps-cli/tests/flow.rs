@@ -17519,3 +17519,366 @@ fn a_trigger_and_grants_on_a_name_that_changes_hands_follow_the_occupant() {
     let o = d.run(&["plan", "--db", connection]);
     assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
 }
+
+/// #981's collation shapes on SQL Server, where the database's collation says
+/// which spellings are one name. On a case-insensitive database:
+/// - dropping `dbo.Target` and renaming `dbo.old` to `dbo.target` across
+///   skipped revisions applies, the drop first (DEC-981.3);
+/// - the column chain `b -> c`, then `a -> B`, applies, `b -> c` first;
+/// - two renames into `dbo.Ck_Name` and `dbo.ck_name` are refused at
+///   `plan --db`, which asks the database (DEC-981.2).
+///
+/// On a case-sensitive database the last pair is two names, and applies.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn names_one_under_the_collation_are_ordered_or_refused_at_plan() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let table = |name: &str, columns: &str| {
+        format!(
+            "table: {name}\ncolumns:\n  id: {{type: int, nullable: false}}\n{columns}\
+             primary_key: {{name: pk_{}, columns: [id]}}\n",
+            name.rsplit('.').next().unwrap().to_lowercase()
+        )
+    };
+    let write = |d: &Demo, name: &str, body: Option<String>| {
+        let path = d.dir.join(format!("schema/{name}.yml"));
+        match body {
+            Some(body) => std::fs::write(path, body).unwrap(),
+            None => std::fs::remove_file(path).unwrap(),
+        }
+    };
+    let step = |d: &Demo| {
+        let o = d.run(&["plan"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        d.commit();
+    };
+    let apply = |d: &Demo, connection: &str, what: &str| {
+        let plan = d.dir.join("plan.json");
+        let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+        assert_eq!(code(&o), 0, "{what}: {}{}", stdout(&o), stderr(&o));
+        let checksum = plan_checksum(&plan);
+        let o = d.run(&[
+            "apply",
+            "--db",
+            connection,
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+            "--allow",
+            "rename,destructive",
+        ]);
+        assert_eq!(code(&o), 0, "{what}: {}{}", stdout(&o), stderr(&o));
+        let o = d.run(&["verify", "--db", connection]);
+        assert_eq!(code(&o), 0, "{what}: {}{}", stdout(&o), stderr(&o));
+    };
+    let ci = "Latin1_General_100_CI_AS";
+
+    // A dropped table freeing a name spelled differently in case.
+    {
+        let own = OwnDatabase::collated(&server, "fold981_table", ci);
+        let d = Demo::new("fold981-table");
+        write(
+            &d,
+            "dbo.Target",
+            Some(table("dbo.Target", "  doomed: {type: int}\n")),
+        );
+        write(
+            &d,
+            "dbo.old",
+            Some(table("dbo.old", "  kept: {type: int}\n")),
+        );
+        step(&d);
+        let o = d.run(&["bootstrap", "--db", own.connection()]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        write(&d, "dbo.Target", None);
+        let o = d.run(&["drop-table", "dbo.Target", "--reason", "gone"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        step(&d);
+        write(&d, "dbo.old", None);
+        write(
+            &d,
+            "dbo.target",
+            Some(table("dbo.target", "  kept: {type: int}\n").replace("pk_target", "pk_old")),
+        );
+        let o = d.run(&["rename-table", "dbo.old", "dbo.target"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        step(&d);
+        apply(&d, own.connection(), "table");
+    }
+
+    // A column chain linked only by case. The order came from minted uids,
+    // so four fresh projects rather than one.
+    for round in 0..4 {
+        let own = OwnDatabase::collated(&server, &format!("fold981_col{round}"), ci);
+        let d = Demo::new(&format!("fold981-col{round}"));
+        write(
+            &d,
+            "dbo.t",
+            Some(table("dbo.t", "  a: {type: int}\n  b: {type: bigint}\n")),
+        );
+        step(&d);
+        let o = d.run(&["bootstrap", "--db", own.connection()]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        write(
+            &d,
+            "dbo.t",
+            Some(table("dbo.t", "  a: {type: int}\n  c: {type: bigint}\n")),
+        );
+        let o = d.run(&["rename", "dbo.t.b", "c"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        step(&d);
+        write(
+            &d,
+            "dbo.t",
+            Some(table("dbo.t", "  B: {type: int}\n  c: {type: bigint}\n")),
+        );
+        let o = d.run(&["rename", "dbo.t.a", "B"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        step(&d);
+        apply(&d, own.connection(), "column chain");
+    }
+
+    // Two renames into names alike under the collation.
+    for (collation, one_name) in [(ci, true), ("Latin1_General_100_CS_AS", false)] {
+        let slug = if one_name { "fold981_ci" } else { "fold981_cs" };
+        let own = OwnDatabase::collated(&server, slug, collation);
+        let d = Demo::new(&slug.replace('_', "-"));
+        write(&d, "dbo.a", Some(table("dbo.a", "")));
+        write(&d, "dbo.b", Some(table("dbo.b", "")));
+        step(&d);
+        let o = d.run(&["bootstrap", "--db", own.connection()]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        write(&d, "dbo.a", None);
+        write(&d, "dbo.b", None);
+        // Both renames at once, as annotations: a command for one would find
+        // the other table's disappearance undecided.
+        for (to, from, pk) in [
+            ("dbo.Ck_Name", "dbo.a", "pk_a"),
+            ("dbo.ck_name", "dbo.b", "pk_b"),
+        ] {
+            write(
+                &d,
+                to,
+                Some(table(to, "").replace("pk_ck_name", pk).replacen(
+                    "columns:",
+                    &format!("renamed_from: {from}\ncolumns:"),
+                    1,
+                )),
+            );
+        }
+        step(&d);
+        if one_name {
+            let o = d.run(&["plan", "--db", own.connection()]);
+            assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+            assert!(
+                stderr(&o).contains("this plan puts user table `dbo.Ck_Name` there first"),
+                "{}",
+                stderr(&o)
+            );
+        } else {
+            apply(&d, own.connection(), "case-sensitive pair");
+        }
+    }
+
+    // A rename target held by an object the project does not record, which
+    // no other change names: the catalog read includes the target, so
+    // `plan --db` refuses instead of `sp_rename` at apply.
+    {
+        let own = OwnDatabase::collated(&server, "fold981_seq", ci);
+        let d = Demo::new("fold981-seq");
+        write(&d, "dbo.old", Some(table("dbo.old", "")));
+        step(&d);
+        let o = d.run(&["bootstrap", "--db", own.connection()]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        on_server(own.connection(), "CREATE SEQUENCE dbo.fresh START WITH 1");
+        write(&d, "dbo.old", None);
+        write(
+            &d,
+            "dbo.fresh",
+            Some(table("dbo.fresh", "").replace("pk_fresh", "pk_old")),
+        );
+        let o = d.run(&["rename-table", "dbo.old", "dbo.fresh"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        step(&d);
+        let o = d.run(&["plan", "--db", own.connection()]);
+        assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        assert!(
+            stderr(&o).contains("the database already has sequence object `dbo.fresh`"),
+            "{}",
+            stderr(&o)
+        );
+    }
+
+    // A check the table carries into the target schema, whose name there the
+    // collation reads as the target's: the transfer runs before `sp_rename`,
+    // so the check already holds the name.
+    {
+        let own = OwnDatabase::collated(&server, "fold981_carried", ci);
+        on_server(
+            own.connection(),
+            "EXEC(N'CREATE SCHEMA s1;'); EXEC(N'CREATE SCHEMA s2;');",
+        );
+        let d = Demo::new("fold981-carried");
+        let checked = |name: &str, renamed_from: &str| {
+            format!(
+                "table: {name}\n{renamed_from}columns:\n  id: {{type: int, nullable: false}}\n  \
+                 n: {{type: int}}\nprimary_key: {{name: pk_old, columns: [id]}}\n\
+                 checks:\n  New: n > 0\n"
+            )
+        };
+        write(&d, "s1.old", Some(checked("s1.old", "")));
+        step(&d);
+        let o = d.run(&["bootstrap", "--db", own.connection()]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        write(&d, "s1.old", None);
+        write(
+            &d,
+            "s2.new",
+            Some(checked("s2.new", "renamed_from: s1.old\n")),
+        );
+        step(&d);
+        let o = d.run(&["plan", "--db", own.connection()]);
+        assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        assert!(
+            stderr(&o).contains("check constraint `s2.New` on `s2.new`"),
+            "{}",
+            stderr(&o)
+        );
+    }
+}
+
+/// #981's original case on SQL Server: `s1.old` carries a check `c` into
+/// `s2` while the plan drops the table `s2.c`. The drop runs first
+/// (DEC-536.1), so the transfer is not refused (Msg 15530).
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_dropped_table_frees_a_name_a_moved_table_carries_in_applies() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let own = OwnDatabase::new(&server, "carried981");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "EXEC(N'CREATE SCHEMA s1;'); EXEC(N'CREATE SCHEMA s2;');",
+    );
+    let d = Demo::new("carried981");
+    let write = |name: &str, body: Option<&str>| {
+        let path = d.dir.join(format!("schema/{name}.yml"));
+        match body {
+            Some(body) => std::fs::write(path, body).unwrap(),
+            None => std::fs::remove_file(path).unwrap(),
+        }
+    };
+    let moving = |name: &str| {
+        format!(
+            "table: {name}\ncolumns:\n  id: {{type: int, nullable: false}}\n  n: {{type: int}}\n  \
+             x: {{type: int, default: \"0\"}}\n\
+             primary_key: {{name: pk_old, columns: [id]}}\nchecks:\n  c: n > 0\n"
+        )
+    };
+    write("s1.old", Some(&moving("s1.old")));
+    // Within `dbo`: `dbo.keep` renamed to `dbo.kept` renames its generated
+    // default too, so `dbo.d` can take the old default's name after it
+    // (review of #1346).
+    write(
+        "dbo.keep",
+        Some(
+            "table: dbo.keep\ncolumns:\n  id: {type: int, nullable: false}\n  x: {type: int, default: \"0\"}\nprimary_key: {name: pk_keep, columns: [id]}\n",
+        ),
+    );
+    write(
+        "dbo.d",
+        Some(
+            "table: dbo.d\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: {name: pk_d, columns: [id]}\n",
+        ),
+    );
+    write(
+        "s1.b",
+        Some(
+            "table: s1.b\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: {name: pk_b, columns: [id]}\n",
+        ),
+    );
+    write(
+        "s1.a",
+        Some(
+            "table: s1.a\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: {name: pk_a, columns: [id]}\n",
+        ),
+    );
+    write(
+        "s2.c",
+        Some(
+            "table: s2.c\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: {name: pk_c, columns: [id]}\n",
+        ),
+    );
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["bootstrap", "--db", connection]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    write("s1.old", None);
+    write("s2.c", None);
+    // And `s1.a` renamed into `s1.c`, the name the move carries out of `s1`:
+    // it runs after the move (review of #1346).
+    write("s1.a", None);
+    write(
+        "s1.c",
+        Some(
+            "table: s1.c\nrenamed_from: s1.a\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: {name: pk_a, columns: [id]}\n",
+        ),
+    );
+    write("dbo.keep", None);
+    write(
+        "dbo.kept",
+        Some(
+            "table: dbo.kept\nrenamed_from: dbo.keep\ncolumns:\n  id: {type: int, nullable: false}\n  x: {type: int, default: \"0\"}\nprimary_key: {name: pk_keep, columns: [id]}\n",
+        ),
+    );
+    write("dbo.d", None);
+    write(
+        "dbo.DF_pbps_keep_x",
+        Some(
+            "table: dbo.DF_pbps_keep_x\nrenamed_from: dbo.d\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: {name: pk_d, columns: [id]}\n",
+        ),
+    );
+    // And `s1.b` into the generated name of `x`'s default, which the move
+    // also carries out of `s1` (review of #1346).
+    write("s1.b", None);
+    write(
+        "s1.DF_pbps_old_x",
+        Some(
+            "table: s1.DF_pbps_old_x\nrenamed_from: s1.b\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: {name: pk_b, columns: [id]}\n",
+        ),
+    );
+    // The move as an annotation: a command would find `s2.c` undecided.
+    write(
+        "s2.new",
+        Some(&moving("s2.new").replacen("columns:", "renamed_from: s1.old\ncolumns:", 1)),
+    );
+    let o = d.run(&["drop-table", "s2.c", "--reason", "gone"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    let plan = d.dir.join("plan.json");
+    let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let checksum = plan_checksum(&plan);
+    let o = d.run(&[
+        "apply",
+        "--db",
+        connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+        "--allow",
+        "rename,destructive",
+    ]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let o = d.run(&["verify", "--db", connection]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+}

@@ -35,6 +35,22 @@ pub(crate) fn order(
     // its own name regardless of what else shares the namespace.
     let mut owners = BTreeMap::new();
     let mut claims: BTreeMap<TableName, BTreeSet<usize>> = BTreeMap::new();
+    // A child the plan drops is gone before its table moves: the move neither
+    // carries it into the destination nor releases it from the source; its
+    // drop does that (review of #1346). The drop may name the table by either
+    // name, so both are asked.
+    let dropped_children: BTreeSet<(&TableName, &str)> = planned
+        .iter()
+        .filter_map(|p| dropped_relation(&p.change, indexes, constraints))
+        .collect();
+    let dropped_from = |from: &TableName, to: &TableName, name: &str| {
+        dropped_children.contains(&(from, name)) || dropped_children.contains(&(to, name))
+    };
+    // Names the engine generates, of which a table holds one of several
+    // alternatives: they order only as weakly as a case-folded name, so an
+    // alternative the table does not hold never displaces a real edge
+    // (review of #1346).
+    let mut weak_claims: BTreeMap<TableName, BTreeSet<usize>> = BTreeMap::new();
     for (i, p) in planned.iter().enumerate() {
         if let Change::RenameTable { from, to, .. } = &p.change {
             owners.insert(to.clone(), (i, from.clone()));
@@ -49,12 +65,31 @@ pub(crate) fn order(
                 // constraints into the destination, where a same-named one on
                 // another table has to be dropped first (review of #969).
                 if let Some(moving) = base.schema.tables.get(from) {
-                    for carried in carried_names(moving, indexes, constraints) {
+                    for carried in carried_names(moving, indexes, constraints)
+                        .into_iter()
+                        .filter(|carried| !dropped_from(from, to, carried))
+                    {
                         claims
                             .entry(TableName::new(to.schema.clone(), carried))
                             .or_default()
                             .insert(i);
                     }
+                    for generated in generated_names(dialect, from, moving, constraints) {
+                        weak_claims
+                            .entry(TableName::new(to.schema.clone(), generated))
+                            .or_default()
+                            .insert(i);
+                    }
+                }
+            }
+            // Any rename then gives the generated defaults the names its new
+            // table name generates, as SQL Server's emitter does.
+            if let Some(moving) = base.schema.tables.get(from) {
+                for generated in generated_names(dialect, to, moving, constraints) {
+                    weak_claims
+                        .entry(TableName::new(to.schema.clone(), generated))
+                        .or_default()
+                        .insert(i);
                 }
             }
         }
@@ -99,16 +134,60 @@ pub(crate) fn order(
         }
     }
     let mut doomed = Vec::new();
+    let fold = |claims: &BTreeMap<TableName, BTreeSet<usize>>| {
+        let mut folded: Folded = BTreeMap::new();
+        for (claimed, waiting) in claims {
+            folded
+                .entry((case_folded(&claimed.schema), case_folded(&claimed.name)))
+                .or_default()
+                .extend(waiting);
+        }
+        folded
+    };
+    let claims_folded = fold(&claims);
+    let weak_folded = fold(&weak_claims);
+    // Two tiers below the exact edges, each placed only where it closes no
+    // cycle: a case-folded match of a declared name, then anything through a
+    // generated name, one alternative of several (DEC-981.3).
+    let mut folded_edges: Vec<(usize, usize)> = Vec::new();
+    let mut generated_edges: Vec<(usize, usize)> = Vec::new();
     for (i, p) in planned.iter().enumerate() {
         if let Change::DropTable { name, .. } = &p.change {
-            let mut released = vec![name.name.clone()];
+            let mut released = vec![(name.name.clone(), true)];
             if let Some(t) = base.schema.tables.get(name) {
-                released.extend(carried_names(t, indexes, constraints));
+                released.extend(
+                    carried_names(t, indexes, constraints)
+                        .into_iter()
+                        .map(|n| (n, true)),
+                );
+                released.extend(
+                    generated_names(dialect, name, t, constraints)
+                        .into_iter()
+                        .map(|n| (n, false)),
+                );
             }
-            for one in released {
-                if let Some(waiting) = claims.get(&TableName::new(name.schema.clone(), one)) {
+            for (one, strong) in released {
+                let exact = claims
+                    .get(&TableName::new(name.schema.clone(), one.clone()))
+                    .filter(|_| strong);
+                if let Some(waiting) = exact {
                     drops.insert(i);
                     edges[i].extend(waiting);
+                }
+                // A claim spelled only differently in case: one name to a
+                // case-insensitive collation, so the drop goes first there
+                // too. Added last, and only where it closes no cycle
+                // (DEC-981.3).
+                let folded = (case_folded(&name.schema), case_folded(&one));
+                let (declared, generated) =
+                    weak_claimants(&folded, strong, exact, &claims_folded, &weak_folded);
+                for claimant in declared {
+                    drops.insert(i);
+                    folded_edges.push((i, claimant));
+                }
+                for claimant in generated {
+                    drops.insert(i);
+                    generated_edges.push((i, claimant));
                 }
             }
             if drops.contains(&i) {
@@ -126,9 +205,26 @@ pub(crate) fn order(
         // schema after its owner's rename. Either can block a claimant.
         let source = original_name(table);
         for schema in [&table.schema, &source.schema] {
-            if let Some(waiting) = claims.get(&TableName::new(schema.clone(), name)) {
+            let exact = claims.get(&TableName::new(schema.clone(), name));
+            if let Some(waiting) = exact {
                 drops.insert(i);
                 edges[i].extend(waiting);
+            }
+            // A claim differing only in case, as for a dropped table (DEC-981.3).
+            let (declared, generated) = weak_claimants(
+                &(case_folded(schema), case_folded(name)),
+                true,
+                exact,
+                &claims_folded,
+                &weak_folded,
+            );
+            for claimant in declared {
+                drops.insert(i);
+                folded_edges.push((i, claimant));
+            }
+            for claimant in generated {
+                drops.insert(i);
+                generated_edges.push((i, claimant));
             }
         }
         // A table moved to another schema carries its indexes (PostgreSQL's
@@ -176,21 +272,57 @@ pub(crate) fn order(
     // a third name; its edge is left out and the engine refuses it as before.
     // A move to another schema also passes through an intermediate name, its
     // source name in the destination schema, which it takes and then gives
-    // up; a rename into that name waits for it too.
+    // up; a rename into that name waits for it too. And it takes the indexes
+    // or constraints it carries out of the source schema, so a rename into
+    // one of their names there waits for it as well (review of #1346).
     let mut chained = false;
     for (to, (rename, from)) in &owners {
-        let intermediate = TableName::new(to.schema.clone(), from.name.clone());
-        let released = if from.schema == to.schema {
-            vec![from]
-        } else {
-            vec![from, &intermediate]
-        };
-        for name in released {
-            for &claimant in claims.get(name).into_iter().flatten() {
+        let mut released = vec![(from.clone(), true)];
+        if from.schema != to.schema {
+            released.push((TableName::new(to.schema.clone(), from.name.clone()), true));
+            if let Some(moving) = base.schema.tables.get(from) {
+                released.extend(
+                    carried_names(moving, indexes, constraints)
+                        .into_iter()
+                        .filter(|carried| !dropped_from(from, to, carried))
+                        .map(|carried| (TableName::new(from.schema.clone(), carried), true)),
+                );
+            }
+        }
+        // A generated default leaves its name in the source schema on any
+        // rename: it is carried away, renamed for the new table name, or both.
+        if let Some(moving) = base.schema.tables.get(from) {
+            released.extend(
+                generated_names(dialect, from, moving, constraints)
+                    .into_iter()
+                    .map(|generated| (TableName::new(from.schema.clone(), generated), false)),
+            );
+        }
+        for (name, strong) in &released {
+            let exact = claims.get(name).filter(|_| *strong);
+            for &claimant in exact.into_iter().flatten() {
                 if claimant != *rename && !reaches(&edges, claimant, *rename) {
                     edges[*rename].insert(claimant);
                     chained = true;
                 }
+            }
+            // And a rename into the name spelled differently in case, which a
+            // case-insensitive collation reads as the one this rename vacates
+            // (DEC-981.3): `b -> c`, then `a -> B`.
+            let (declared, generated) = weak_claimants(
+                &(case_folded(&name.schema), case_folded(&name.name)),
+                *strong,
+                exact,
+                &claims_folded,
+                &weak_folded,
+            );
+            for claimant in declared.into_iter().filter(|c| c != rename) {
+                folded_edges.push((*rename, claimant));
+                chained = true;
+            }
+            for claimant in generated.into_iter().filter(|c| c != rename) {
+                generated_edges.push((*rename, claimant));
+                chained = true;
             }
         }
     }
@@ -289,6 +421,11 @@ pub(crate) fn order(
             }
         }
     }
+    for (drop, claimant) in folded_edges.into_iter().chain(generated_edges) {
+        if !reaches(&edges, claimant, drop) {
+            edges[drop].insert(claimant);
+        }
+    }
     let mut remaining = selected.clone();
     let mut ordered = Vec::new();
     while !remaining.is_empty() {
@@ -340,6 +477,43 @@ pub(crate) fn order(
 
 /// The names a table takes into its schema's table namespace besides its own:
 /// the same kinds [`dropped_relation`] releases, by the dialect's two answers.
+/// Claims keyed by their case-folded schema and name.
+type Folded = BTreeMap<(String, String), BTreeSet<usize>>;
+
+/// The claimants of a released name beyond its exact claims, split by how
+/// weakly they order (DEC-981.3): a case-folded match of a declared name, and
+/// anything through a generated name, which is one alternative of several.
+/// A generated release (`strong` false) puts every claimant in the second.
+fn weak_claimants(
+    key: &(String, String),
+    strong: bool,
+    exact: Option<&BTreeSet<usize>>,
+    declared: &Folded,
+    generated: &Folded,
+) -> (Vec<usize>, Vec<usize>) {
+    let not_exact = |c: &usize| !exact.is_some_and(|w| w.contains(c));
+    let by_declared: Vec<usize> = declared
+        .get(key)
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(not_exact)
+        .collect();
+    let mut by_generated: Vec<usize> = generated
+        .get(key)
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(|c| not_exact(c) && !by_declared.contains(c))
+        .collect();
+    if strong {
+        (by_declared, by_generated)
+    } else {
+        by_generated.extend(by_declared);
+        (Vec::new(), by_generated)
+    }
+}
+
 fn carried_names(
     table: &pbps_model::schema::Table,
     indexes: bool,
@@ -355,6 +529,22 @@ fn carried_names(
         names.extend(table.foreign_keys.keys().cloned());
     }
     names
+}
+
+/// The constraint names the engine generates for `table`, where constraints
+/// share the namespace. Each is one of the alternatives the table may hold,
+/// so an edge through one is weak (review of #1346).
+fn generated_names(
+    dialect: &dyn Dialect,
+    name: &TableName,
+    table: &pbps_model::schema::Table,
+    constraints: bool,
+) -> Vec<String> {
+    if constraints {
+        dialect.generated_constraint_names(name, table)
+    } else {
+        Vec::new()
+    }
 }
 
 /// The table and name a change releases in its schema's table namespace, if
@@ -389,6 +579,25 @@ fn dropped_relation(
         return pk.name.as_deref().map(|name| (table, name));
     }
     None
+}
+
+/// A name as a case-insensitive collation may read it: each character
+/// lower-cased where that is one character, as `pbps_model::module` folds for
+/// its scans. Used only to *add* an ordering edge that cannot close a cycle,
+/// never to refuse or to merge names (DEC-981.3): which spellings are one name
+/// is the target database's to say, and a plan is computed offline (SPEC 7.3),
+/// so a fold that is wrong for a case-sensitive database costs an order the
+/// plan did not need and nothing else.
+pub(crate) fn case_folded(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            let mut lower = c.to_lowercase();
+            match (lower.next(), lower.next()) {
+                (Some(one), None) => one,
+                _ => c,
+            }
+        })
+        .collect()
 }
 
 fn reaches(edges: &[BTreeSet<usize>], from: usize, target: usize) -> bool {

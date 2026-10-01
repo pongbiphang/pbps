@@ -15285,3 +15285,86 @@ fn a_trigger_and_grants_on_a_name_that_changes_hands_follow_the_occupant() {
     let o = d.run(&["plan", "--db", connection]);
     assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
 }
+
+/// #981's original case on PostgreSQL, where an index shares its schema's
+/// relation namespace: `s1.old` carries an index `c` into `s2` while the plan
+/// drops the table `s2.c`. The drop runs first (DEC-536.1), so the
+/// `SET SCHEMA` is not refused (`42P07`).
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn a_dropped_table_frees_a_name_a_moved_table_carries_in_applies() {
+    let own = OwnDatabase::new(&server(), "carried981");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA s1; CREATE SCHEMA s2");
+    let d = Demo::new("carried981");
+    let write = |name: &str, body: Option<&str>| {
+        let path = d.dir.join(format!("schema/{name}.yml"));
+        match body {
+            Some(body) => std::fs::write(path, body).unwrap(),
+            None => std::fs::remove_file(path).unwrap(),
+        }
+    };
+    let moving = |name: &str, renamed_from: &str| {
+        format!(
+            "table: {name}\n{renamed_from}columns:\n  id: {{type: integer, nullable: false}}\n  \
+             n: {{type: integer}}\nprimary_key: {{name: pk_old, columns: [id]}}\n\
+             indexes:\n  c: {{columns: [n]}}\n"
+        )
+    };
+    write("s1.old", Some(&moving("s1.old", "")));
+    write(
+        "s1.a",
+        Some(
+            "table: s1.a\ncolumns:\n  id: {type: integer, nullable: false}\nprimary_key: {name: pk_a, columns: [id]}\n",
+        ),
+    );
+    write(
+        "s2.c",
+        Some(
+            "table: s2.c\ncolumns:\n  id: {type: integer, nullable: false}\nprimary_key: {name: pk_c, columns: [id]}\n",
+        ),
+    );
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+
+    write("s1.old", None);
+    write("s2.c", None);
+    // And `s1.a` renamed into `s1.c`, the name the move carries out of `s1`:
+    // it runs after the move (review of #1346).
+    write("s1.a", None);
+    write(
+        "s1.c",
+        Some(
+            "table: s1.c\nrenamed_from: s1.a\ncolumns:\n  id: {type: integer, nullable: false}\nprimary_key: {name: pk_a, columns: [id]}\n",
+        ),
+    );
+    write("s2.new", Some(&moving("s2.new", "renamed_from: s1.old\n")));
+    succeeds(d.run(&["drop-table", "s2.c", "--reason", "gone"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    let checksum = plan_checksum(&plan);
+    succeeds(d.run(&[
+        "apply",
+        "--db",
+        connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+        "--allow",
+        "rename,destructive",
+    ]));
+    succeeds(d.run(&["verify", "--db", connection]));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_class WHERE oid = 's2.c'::regclass AND relkind = 'i'"
+        ),
+        1,
+        "the carried index holds the name the dropped table gave up"
+    );
+}
