@@ -5627,9 +5627,26 @@ async fn generation_producer_case(case: GenerationCase) {
         drop(writer);
         let selected = EnvironmentFingerprintKey::from_file(&key.root.join("key"))
             .map_err(|error| error.to_string())?;
+        // Reread every projected prerequisite, including inputs no longer reached
+        // by the closing bindings. Address rows come from rooted subjects because
+        // the capture index excludes these address-only catalog classes.
+        let mut closing_scope = catalog_scope(evidence.after().scope());
+        closing_scope.retained.extend(
+            evidence
+                .after()
+                .prerequisites()
+                .iter()
+                .filter(|record| {
+                    !matches!(
+                        record.object.class.as_str(),
+                        "pg_depend" | "pg_shdepend" | "pg_init_privs"
+                    )
+                })
+                .map(|record| record.object.clone()),
+        );
         let (_, observed) = target
             .capture_postgres_sealed(
-                &catalog_scope(evidence.after().scope()),
+                &closing_scope,
                 &Default::default(),
                 &selected,
             )
