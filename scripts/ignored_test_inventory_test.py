@@ -582,6 +582,143 @@ class Ownership(unittest.TestCase):
             with self.assertRaises(audit.InventoryError):
                 self.check()
 
+    def test_unpacking_keeps_corresponding_reflective_aliases_visible(self):
+        forms = [
+            ('tuple', '(inspect,) = (defaults.globals,)\n', 'inspect()'),
+            ('list', '[inspect] = [defaults.globals]\n', 'inspect()'),
+            ('nested', '((inspect,),) = ((defaults.globals,),)\n', 'inspect()'),
+            ('mixed', '[(inspect,)] = [(defaults.globals,)]\n', 'inspect()'),
+            ('starred-prefix', 'inspect, *rest = (defaults.globals, len)\n', 'inspect()'),
+            ('starred-suffix', '*rest, inspect = (len, defaults.globals)\n', 'inspect()'),
+            ('starred-middle', 'head, *rest, inspect = (0, len, defaults.globals)\n', 'inspect()'),
+            ('empty-remainder', 'inspect, *rest = (defaults.globals,)\n', 'inspect()'),
+            ('nested-starred-target', '(*[inspect],) = (defaults.globals,)\n', 'inspect()'),
+            ('module', '(copy,) = (defaults,)\n', 'copy.globals()'),
+        ]
+        for label, assignment, call in forms:
+            for before in (True, False):
+                with self.subTest(form=label, selector_before=before):
+                    source = 'import builtins as defaults\n'
+                    source += 'TESTS = ["owned"]\n' if before else ''
+                    source += assignment + 'namespace = ' + call + '\n'
+                    source += '' if before else 'TESTS = ["owned"]\n'
+                    self.assert_runner_selector(source + 'namespace["TESTS"] = []\n',
+                                                owned=False, accepted=False)
+
+    def test_unused_unpacked_aliases_and_real_unpacked_shadows_keep_ownership(self):
+        forms = [
+            ('tuple', '(inspect,) = (defaults.globals,)\n', '(inspect,) = (len,)\nvalue = inspect([])\n'),
+            ('list', '[inspect] = [defaults.globals]\n', '[inspect] = [len]\nvalue = inspect([])\n'),
+            ('nested', '((inspect,),) = ((defaults.globals,),)\n',
+             '((inspect,),) = ((len,),)\nvalue = inspect([])\n'),
+            ('starred', 'inspect, *rest = (defaults.globals, len)\n',
+             'inspect, *rest = (len,)\nvalue = inspect([])\n'),
+            ('module', '(copy,) = (defaults,)\n',
+             '(copy,) = (SimpleNamespace(globals=lambda: {}),)\nnamespace = copy.globals()\n'),
+        ]
+        for label, assignment, shadow in forms:
+            for before in (True, False):
+                for used in (False, True):
+                    with self.subTest(form=label, selector_before=before, shadow=used):
+                        source = 'import builtins as defaults\nfrom types import SimpleNamespace\n'
+                        source += 'TESTS = ["owned"]\n' if before else ''
+                        source += assignment + (shadow if used else '')
+                        source += '' if before else 'TESTS = ["owned"]\n'
+                        if used and label == 'module':
+                            source += 'namespace["TESTS"] = []\n'
+                        self.assert_runner_selector(source, owned=True, accepted=True)
+
+    def test_unpacking_snapshots_rhs_before_chained_and_ordered_target_writes(self):
+        bodies = [
+            ('chained-module-shadow', 'defaults = (inspect,) = (defaults.globals,)\nnamespace = inspect()\n', False),
+            ('chained-unpack', '(inspect,) = (other,) = (defaults.globals,)\nnamespace = other()\n', False),
+            ('earlier-target-shadow', '(defaults, inspect) = (0, defaults.globals)\nnamespace = inspect()\n', False),
+            ('last-reflective', '(inspect, inspect) = (len, defaults.globals)\nnamespace = inspect()\n', False),
+            ('last-native', '(inspect, inspect) = (defaults.globals, len)\nvalue = inspect([])\n', True),
+            ('chained-native-snapshot', 'inspect = len\ninspect = (inspect,) = (inspect,)\nvalue = inspect([])\n', True),
+            ('empty-targets', '() = ()\n[] = []\n', True),
+        ]
+        for label, body, safe in bodies:
+            for before in (True, False):
+                with self.subTest(form=label, selector_before=before):
+                    source = 'import builtins as defaults\n'
+                    source += 'TESTS = ["owned"]\n' if before else ''
+                    source += body
+                    source += '' if before else 'TESTS = ["owned"]\n'
+                    source += '' if safe else 'namespace["TESTS"] = []\n'
+                    self.assert_runner_selector(source, owned=safe, accepted=safe)
+
+    def test_unknown_unpacking_shapes_cannot_establish_execution_ownership(self):
+        bodies = [
+            ('called-sequence', 'def values(): return (defaults.globals,)\n(inspect,) = values()\nnamespace = inspect()\n'),
+            ('called-leaf', 'def value(): return defaults.globals\n(inspect,) = (value(),)\nnamespace = inspect()\n'),
+            ('stored-container', 'values = (defaults.globals,)\n(inspect,) = values\nnamespace = inspect()\n'),
+            ('generator', '(inspect,) = (value for value in (defaults.globals,))\nnamespace = inspect()\n'),
+            ('starred-rhs', '(inspect,) = (*(defaults.globals,),)\nnamespace = inspect()\n'),
+            ('starred-unknown-leaf', 'def value(): return defaults.globals\n*rest, = (value(),)\nnamespace = rest[0]()\n'),
+            ('nested-starred-unknown', 'def value(): return defaults.globals\n*rest, = ((value(),),)\nnamespace = rest[0][0]()\n'),
+        ]
+        for label, body in bodies:
+            for before in (True, False):
+                with self.subTest(form=label, selector_before=before):
+                    source = 'import builtins as defaults\n'
+                    source += 'TESTS = ["owned"]\n' if before else ''
+                    source += body
+                    source += '' if before else 'TESTS = ["owned"]\n'
+                    self.assert_runner_selector(source + 'namespace["TESTS"] = []\n',
+                                                owned=False, accepted=False)
+
+    def test_unpacking_failures_cannot_erase_suppressed_prefix_bindings(self):
+        bodies = [
+            ('outer-arity', 'inspect = defaults.globals\nwith suppress(ValueError):\n    (inspect, other) = (len,)\nnamespace = inspect()\n', False),
+            ('nested-arity', 'inspect = defaults.globals\nwith suppress(ValueError):\n    ((inspect, other),) = ((len,),)\nnamespace = inspect()\n', False),
+            ('partial-write', 'inspect = defaults.globals\nwith suppress(ValueError):\n    (inspect, (other, third)) = (len, (len,))\nvalue = inspect([])\n', True),
+            ('non-sequence', 'inspect = defaults.globals\nwith suppress(TypeError):\n    (inspect,) = 0\nnamespace = inspect()\n', False),
+            ('unused-arity-failure', 'with suppress(ValueError):\n    (inspect, other) = (len,)\n', True),
+        ]
+        for label, body, safe in bodies:
+            for before in (True, False):
+                with self.subTest(form=label, selector_before=before):
+                    source = 'import builtins as defaults\nfrom contextlib import suppress\n'
+                    source += 'TESTS = ["owned"]\n' if before else ''
+                    source += body
+                    source += '' if before else 'TESTS = ["owned"]\n'
+                    source += '' if safe else 'namespace["TESTS"] = []\n'
+                    # The partial native write executes, but the unknown arity
+                    # cannot qualify a scheduling owner even when this run is safe.
+                    self.assert_runner_selector(source, owned=safe, accepted=False)
+
+    def test_unpacking_target_protocols_cannot_hide_module_namespace_escapes(self):
+        for subscript in (False, True):
+            for before in (True, False):
+                with self.subTest(subscript=subscript, selector_before=before):
+                    method = '__setitem__' if subscript else '__setattr__'
+                    target = 'holder[0]' if subscript else 'holder.value'
+                    source = ('import sys\nclass Holder:\n    def ' + method + '(self, key, value):\n'
+                              '        global namespace\n        namespace = sys._getframe(1).f_globals\n'
+                              'holder = Holder()\n')
+                    source += 'TESTS = ["owned"]\n' if before else ''
+                    source += '(' + target + ', inspect) = (len, len)\n'
+                    source += '' if before else 'TESTS = ["owned"]\n'
+                    self.assert_runner_selector(source + 'namespace["TESTS"] = []\n',
+                                                owned=False, accepted=False)
+
+    def test_known_starred_contents_do_not_grant_native_callable_exemptions(self):
+        # Actual Python produces a list, whose elements cannot supply its call
+        # protocol. Reusing an element's native tag would skip opaque-call checks.
+        actual = subprocess.run([sys.executable, '-B', '-c',
+                                 '*rest, = (len,)\nprint(type(rest).__name__)\n'],
+                                check=True, capture_output=True, text=True, timeout=10)
+        self.assertEqual(actual.stdout, 'list\n')
+        observer = audit.NamespaceExposure()
+        observer.visit(audit.ast.parse('*rest, = (len,)'))
+        self.assertFalse(observer.pure_call(audit.ast.parse('rest([])').body[0].value))
+        # Reflective contents remain a possible exposure when the stored shape
+        # is later consumed by unsupported syntax; they are not a native proof.
+        observer.visit(audit.ast.parse('*rest, = (globals,)'))
+        observer.visit(audit.ast.parse('rest()'))
+        self.assertTrue(observer.exposed)
+
     def test_suppressed_body_writes_cannot_erase_earlier_reflective_aliases(self):
         aliases = [
             ('bare', 'inspect = globals', 'inspect()', 'inspect = len'),

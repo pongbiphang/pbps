@@ -595,3 +595,31 @@ refusal, suppressed-prefix joining and the two bounded helper proofs must break
 their corresponding properties before the exact source is restored. General
 helper effects, context-result targets and direct reflective-spelling precision
 remain separate issues. See [test execution](../TEST-EXECUTION.md).
+
+<a id="dec-1299-1"></a>
+
+**DEC-1299.1. Unpacking assignments retain corresponding namespace aliases.**
+A tuple or list target does not make its reflective RHS harmless. Assignment-only
+immutable snapshots preserve the values of supported literal elements before any
+target writes; chained assignments reuse that snapshot and nested/starred targets
+bind in Python's left-to-right order. A following proven native binding replaces
+the alias, while merely retaining an unused reflective value does not expose the
+module namespace.
+
+Unknown shape or iteration, unsupported scalar results, arity failures and
+unproved attribute/subscript target protocols cannot establish execution ownership.
+They retain conservative exposure instead of empty alias facts. A starred
+remainder is a list, not its contained native callable or module, so contained
+native facts never grant its calls a native exemption. Recursive unknown elements
+also remain unknown when captured by a starred name.
+
+The snapshots are private to one assignment; this does not cache mutable container
+structure, execute fixture code or duplicate the general NamedExpr/IfExp/BoolOp
+provenance work. Loop targets, context-result targets, class exports and selector
+literal extraction retain their separate boundaries. Acceptance requires actual
+Python plus complete ownership for callable/module aliases, nested/starred targets,
+RHS and target ordering, unused/shadow controls, unknown shapes, suppressed arity
+failures and opaque target escapes. Independent counterfactuals pin transfer,
+snapshot reuse, target order, nested/starred precision and fail-closed unknown
+handling; native-container exemption evidence is explicitly component-scoped.
+See [test execution](../TEST-EXECUTION.md).
