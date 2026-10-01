@@ -661,8 +661,10 @@ mod column_vector_parent {
             for (name, recorded) in [("a", "c_000000"), ("g", "c_000001"), ("d", "c_000002")] {
                 base_ids.columns.insert(uid(recorded), table.column(name));
             }
-            let mut desired_ids = IdsFile::default();
-            desired_ids.tables = base_ids.tables.clone();
+            let mut desired_ids = IdsFile {
+                tables: base_ids.tables.clone(),
+                ..IdsFile::default()
+            };
             for (name, recorded) in scratch {
                 desired_ids
                     .columns
