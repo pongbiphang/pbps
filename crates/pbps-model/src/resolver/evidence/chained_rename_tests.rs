@@ -4,7 +4,7 @@ use crate::resolver::{ObjectOwnership, Surface};
 use crate::{PlannedChange, TableName};
 
 fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, ResolverEvidence) {
-    let (_, mut evidence) = super::transition_tests::rename_endpoints(column);
+    let (fixture_changes, mut evidence) = super::transition_tests::rename_endpoints(column);
     let fixture_parent = column.then(|| {
         evidence
             .transitions
@@ -17,15 +17,25 @@ fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, Re
             .unwrap()
             .clone()
     });
+    let source = match &fixture_changes.changes[0].change {
+        Change::RenameColumn { table, from, .. } => Surface::Column(table.column(from)),
+        Change::RenameTable { from, .. } => Surface::Table(from.clone()),
+        _ => panic!("rename fixture"),
+    };
+    let rename_transition = evidence
+        .transitions
+        .iter()
+        .find(|transition| transition.surface == source)
+        .unwrap();
     let template = evidence
         .before
         .prerequisites()
         .iter()
-        .find(|p| evidence.transitions[0].before.contains(&p.object))
+        .find(|p| rename_transition.before.contains(&p.object))
         .unwrap()
         .clone();
     let old_object = template.object.clone();
-    let new_object = evidence.transitions[0].after.iter().next().unwrap().clone();
+    let new_object = rename_transition.after.iter().next().unwrap().clone();
     let old_table: TableName = "app.old".parse().unwrap();
     let table: TableName = "app.t".parse().unwrap();
     let mut changes = ChangeSet::default();
