@@ -229,40 +229,67 @@ impl ResolverEvidence {
         // surface. Unchanged managed surfaces come from the producer's complete
         // schema inventory; their required membership is pinned by the seal.
         for step in &changes.changes {
-            let surface = match &step.change {
+            let required = match &step.change {
+                Change::CreateTable { name, table, .. } => {
+                    // Owner transitions cover catalog records, not resolution
+                    // membership: every inline binding needs its own observation.
+                    let mut surfaces = Vec::new();
+                    for (column, spec) in &table.columns {
+                        if spec.default.is_some() || spec.generated.is_some() {
+                            surfaces.push(super::Surface::Default(name.column(column)));
+                        }
+                    }
+                    for check in table.checks.keys() {
+                        surfaces.push(super::Surface::Check {
+                            table: name.clone(),
+                            name: check.clone(),
+                        });
+                    }
+                    for (index, spec) in &table.indexes {
+                        if spec.holds_expression() {
+                            surfaces.push(super::Surface::Index {
+                                table: name.clone(),
+                                name: index.clone(),
+                            });
+                        }
+                    }
+                    surfaces
+                }
                 Change::CreateModule { id, .. }
                 | Change::AlterModule { id, .. }
-                | Change::DropModule { id, .. } => Some(super::Surface::Module(id.clone())),
+                | Change::DropModule { id, .. } => vec![super::Surface::Module(id.clone())],
                 // A generation expression is the column's `pg_attrdef` row,
                 // as a default is (DEC-1168.1).
                 Change::AlterColumnDefault { column, .. }
                 | Change::AlterColumnExpression { column, .. } => {
-                    Some(super::Surface::Default(column.clone()))
+                    vec![super::Surface::Default(column.clone())]
                 }
                 Change::AddColumn {
                     table,
                     name,
                     column,
                     ..
-                } if column.default.is_some() => Some(super::Surface::Default(table.column(name))),
+                } if column.default.is_some() || column.generated.is_some() => {
+                    vec![super::Surface::Default(table.column(name))]
+                }
                 Change::AddCheck { table, name, .. } | Change::DropCheck { table, name } => {
-                    Some(super::Surface::Check {
+                    vec![super::Surface::Check {
                         table: table.clone(),
                         name: name.clone(),
-                    })
+                    }]
                 }
                 Change::AddIndex {
                     table, name, index, ..
-                } if index.holds_expression() => Some(super::Surface::Index {
+                } if index.holds_expression() => vec![super::Surface::Index {
                     table: table.clone(),
                     name: name.clone(),
-                }),
-                _ => None,
+                }],
+                _ => Vec::new(),
             };
-            if let Some(surface) = surface
-                && !self.surfaces.iter().any(|s| s.surface == surface)
-            {
-                return Err(EvidenceError::Incomplete);
+            for surface in required {
+                if !self.surfaces.iter().any(|s| s.surface == surface) {
+                    return Err(EvidenceError::Incomplete);
+                }
             }
         }
 
