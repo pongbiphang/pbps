@@ -1186,6 +1186,7 @@
         "drift_and_pull_are_read_from_the_postgres_catalog",
         "drop_blockers_are_named_in_planning_and_rechecked_before_apply_writes",
         "drop_blockers_do_not_refuse_a_closing_resume_after_the_drop_completed",
+        "dropped_functions_keep_their_order_after_their_releases",
         "effective_function_ownership_decides_trigger_trust_before_postgres_17",
         "effective_function_ownership_not_the_direct_owner_decides_trigger_trust",
         "every_sql_output_pins_the_parser_before_the_generated_definitions",

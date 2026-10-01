@@ -5991,6 +5991,101 @@ fn a_generated_columns_expression_change_is_refused_by_name_before_postgres_17()
     generated_column_flow(&server, "generated-1168-old", false);
 }
 
+/// Two functions dropped together, `g` calling `f`, each released from a
+/// generated column by an expression change, and `f`'s release ordered first:
+/// `g` is still dropped before `f`. Each drop moves after its own release and
+/// after the drops of what depends on it (DEC-1168.1).
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn dropped_functions_keep_their_order_after_their_releases() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "generated-release-chain");
+    let connection = own.connection().to_owned();
+    on_server(
+        &connection,
+        "CREATE SCHEMA app; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE FUNCTION app.g(x integer) RETURNS integer LANGUAGE sql IMMUTABLE \
+           BEGIN ATOMIC SELECT app.f(x); END; \
+         CREATE TABLE app.a (id integer PRIMARY KEY, v integer, \
+                             c integer GENERATED ALWAYS AS (app.f(v)) STORED); \
+         CREATE TABLE app.z (id integer PRIMARY KEY, v integer, \
+                             c integer GENERATED ALWAYS AS (app.g(v)) STORED); \
+         INSERT INTO app.a (id, v) VALUES (1, 5); INSERT INTO app.z (id, v) VALUES (1, 5)",
+    );
+    let d = Demo::new("generated-release-chain");
+    succeeds(d.run(&["pull", "--db", &connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    for f in ["f", "g"] {
+        std::fs::remove_file(
+            d.dir
+                .join(format!("schema/app.{f}%28integer%29.function.yml")),
+        )
+        .unwrap();
+    }
+    for table in ["a", "z"] {
+        let path = d.dir.join(format!("schema/app.{table}.yml"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let edited: String = text
+            .lines()
+            .map(|l| {
+                if l.trim_start().starts_with("generated:") {
+                    "    generated: {expression: 'v * 2', stored: true}".to_owned()
+                } else {
+                    l.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert_ne!(
+            edited, text,
+            "app.{table}'s generated column is where this test expects it"
+        );
+        std::fs::write(&path, edited).unwrap();
+    }
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        &connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    assert!(
+        at("DROP FUNCTION \"app\".\"g\"") < at("DROP FUNCTION \"app\".\"f\""),
+        "{script}"
+    );
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &[
+            "--allow",
+            "narrowing",
+            "--allow",
+            "destructive",
+            "--allow",
+            "revoke",
+        ],
+    ));
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
 /// The drop of a function generated columns call follows what releases them,
 /// wherever the differ put that (DEC-1168.1): an expression change that reads
 /// a column the same revision adds, after that addition, and the drop of a

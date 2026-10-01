@@ -1173,7 +1173,8 @@ around it. No statement takes its expression off and puts it back:
 `DROP EXPRESSION` leaves an ordinary column, and `SET EXPRESSION` is refused
 on one. Such a plan is refused, naming the column, unless it also changes that
 expression or drops the column or its table. The catalog's edge then has a
-release, and the function's drop moves after it. The release keeps the place
+release, and the function's drop moves after it, and after the drops of the
+modules that depend on it, which may have moved after their own releases. The release keeps the place
 the differ gave it, after the additions, renames, retypes and relaxations its
 new expression may need. What the moved drop leaves to the engine is a
 function whose own body reads a column the plan drops or retypes before the

@@ -635,8 +635,17 @@ pub(crate) fn weave(
             }
         }
     }
-    for (root, _) in &roots {
-        after_its_release(cs, root, found.get(root).map_or(&[][..], Vec::as_slice));
+    // A dependent module's drop can itself move after its own releases, so
+    // repeated until nothing moves: each pass only moves a drop later, after
+    // something it depends on, and the drops form no cycle, so the passes end.
+    for _ in 0..=roots.len() {
+        let mut moved = false;
+        for (root, _) in &roots {
+            moved |= after_its_release(cs, root, found.get(root).map_or(&[][..], Vec::as_slice));
+        }
+        if !moved {
+            break;
+        }
     }
     Ok(cs.changes.len() - before)
 }
@@ -662,25 +671,35 @@ fn is_generated(holds: &Holds) -> bool {
 /// reads a column the plan drops or retypes before the release, which only
 /// the engine can tell and refuses inside the transaction. A module rebuilt in
 /// place is already after both.
-fn after_its_release(cs: &mut ChangeSet, root: &ModuleId, deps: &[Dependent]) {
+///
+/// A module that depends on this one, dropped by the plan, counts as well:
+/// its own drop may have moved after its own releases, and this drop has to
+/// stay behind it. Returns whether the drop moved.
+fn after_its_release(cs: &mut ChangeSet, root: &ModuleId, deps: &[Dependent]) -> bool {
     let Some(at) = span(&cs.changes, root) else {
-        return;
+        return false;
     };
     let latest = deps
         .iter()
-        .filter(|d| is_generated(&d.holds))
-        .filter_map(|d| {
-            find(&cs.changes, &d.holds, removes)
-                .or_else(|| find(&cs.changes, &d.holds, removes_with_its_owner))
+        .filter_map(|d| match &d.holds {
+            Holds::TablePart {
+                part: Part::Generated(_),
+                ..
+            } => find(&cs.changes, &d.holds, removes)
+                .or_else(|| find(&cs.changes, &d.holds, removes_with_its_owner)),
+            Holds::Module(_) => find(&cs.changes, &d.holds, removes),
+            Holds::TablePart { .. } | Holds::Unrepresentable(_) => None,
         })
         .filter(|i| *i > at.drop_at)
         .max();
-    if let Some(i) = latest {
-        // Removing the drop shifts the release up by one, so inserting at
-        // its old index puts the drop right after it.
-        let drop = cs.changes.remove(at.drop_at);
-        cs.changes.insert(i, drop);
-    }
+    let Some(i) = latest else {
+        return false;
+    };
+    // Removing the drop shifts what it follows up by one, so inserting at its
+    // old index puts the drop right after it.
+    let drop = cs.changes.remove(at.drop_at);
+    cs.changes.insert(i, drop);
+    true
 }
 
 /// The columns whose default a row this plan writes takes: an insert that
