@@ -2591,7 +2591,8 @@ fn two_added_checks_one_name_under_the_collation_refuse_the_plan() {
 /// schema `DENY` on `other`, which the plan creates nothing in, refuses
 /// nothing. Under the `DENY`, a plan that drops a column and replaces a
 /// check under the name this login sees it at plans: neither needs the read
-/// to have missed nothing.
+/// to have missed nothing. A table in a schema whose name needs quoting,
+/// `x]y`, plans.
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
 fn a_name_metadata_visibility_hides_is_not_read_as_free() {
@@ -2610,14 +2611,13 @@ fn a_name_metadata_visibility_hides_is_not_read_as_free() {
     on_server(
         own.connection(),
         &format!(
-            "EXEC(N'CREATE SCHEMA other;'); CREATE TABLE dbo.keep (id int, old int, CONSTRAINT ck_keep CHECK (id > 0)); \
+            "EXEC(N'CREATE SCHEMA other;'); EXEC(N'CREATE SCHEMA [x]]y];'); CREATE TABLE dbo.keep (id int, old int, CONSTRAINT ck_keep CHECK (id > 0)); \
              CREATE SEQUENCE dbo.s; \
              CREATE USER [{login}] FOR LOGIN [{login}]; \
              GRANT VIEW DEFINITION, SELECT, INSERT, UPDATE, DELETE, ALTER, REFERENCES \
                  ON SCHEMA::dbo TO [{login}]; \
              GRANT CREATE TABLE, VIEW DEFINITION TO [{login}]; \
              GRANT SELECT ON sys.sql_expression_dependencies TO [{login}]; \
-             DENY VIEW DEFINITION ON OBJECT::dbo.s TO [{login}]; \
              DENY VIEW DEFINITION ON SCHEMA::other TO [{login}];"
         ),
     );
@@ -2633,6 +2633,36 @@ fn a_name_metadata_visibility_hides_is_not_read_as_free() {
         password,
     );
     let plan = d.dir.join("plan.json");
+
+    // `HAS_PERMS_BY_NAME` parses the schema it is given, so `x]y` has to be
+    // asked for quoted (review of #1360). Applied, so the plans below do not
+    // carry it.
+    std::fs::write(
+        d.dir.join("schema/x_y.yml"),
+        "table: \"x]y.t\"\ncolumns:\n  id: {type: int}\n",
+    )
+    .unwrap();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = d.run(&["plan", "--db", &as_login, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let checksum = plan_checksum(&plan);
+    let o = d.run(&[
+        "apply",
+        "--db",
+        own.connection(),
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+    ]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    std::fs::remove_file(&plan).unwrap();
+
+    on_server(
+        own.connection(),
+        &format!("DENY VIEW DEFINITION ON OBJECT::dbo.s TO [{login}];"),
+    );
 
     // Neither dropping `dbo.keep.old`, which claims no name, nor replacing
     // `ck_keep` under its own name, which this login sees there, needs the

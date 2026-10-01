@@ -734,10 +734,17 @@ pub async fn prove_schemas_visible(conn: &mut Conn, schemas: &[String]) -> Resul
         .map(|s| format!("({})", crate::ident::literal(s)))
         .collect::<Vec<_>>()
         .join(", ");
+    // Resolved through `sys.schemas` and quoted: `HAS_PERMS_BY_NAME` parses
+    // its argument, so a raw `a.b` answers 0 and `x]y` NULL (measured;
+    // review of #1360). A schema the database does not hold has nothing in
+    // it to hide, and `HAS_PERMS_BY_NAME` answers 0 for it even to sysadmin,
+    // so it is left out rather than reported as a missing grant; a table
+    // planned into it fails at apply naming the schema, as it did before.
     let hidden: Vec<String> = conn
         .query(&format!(
-            "SELECT w.schema_name FROM (VALUES {rows}) AS w(schema_name)
-              WHERE COALESCE(HAS_PERMS_BY_NAME(w.schema_name, 'SCHEMA', 'VIEW DEFINITION'), 0) <> 1;"
+            "SELECT s.name AS schema_name FROM (VALUES {rows}) AS w(schema_name)
+               JOIN sys.schemas s ON s.name = w.schema_name COLLATE CATALOG_DEFAULT
+              WHERE COALESCE(HAS_PERMS_BY_NAME(QUOTENAME(s.name), 'SCHEMA', 'VIEW DEFINITION'), 0) <> 1;"
         ))
         .await?
         .iter()
