@@ -562,3 +562,36 @@ Acceptance requires actual Python plus complete ownership for synchronous
 cases, explicitly component-scoped legal async evidence, and independent
 counterfactual failures for active transfer, suppression joining and opaque-effect
 refusal. See [test execution](../TEST-EXECUTION.md).
+
+<a id="dec-1389-1"></a>
+
+**DEC-1389.1. Namespace continuations carry their scope owner.** An enclosing
+manager's retained module bindings cannot describe an erased class-local alias.
+Each continuation therefore captures and compares state through its owning
+observer; an inherited class adds its own local capture and copies the stack.
+Enclosing captures still observe their own state and the shared module, while
+class-local state never becomes an enclosing lookup scope. This also prevents a
+finished class's captures from refusing an unrelated later enclosing call.
+Suppressed exits retain the prefix join from DEC-1383.1.
+
+Treating every class helper as opaque would lose the issue's measured safe
+controls. Two bounded AST facts preserve them: a plain zero-argument function
+consisting only of `return None`, and a single native class-frame assignment
+through `sys._getframe(1).f_locals` under a literal string key. The latter resolves
+sys and its reflective builtin or builtins-module RHS from module bindings at
+call time, then records the proven local write. A subsequent real shadow may
+replace it. Decorators, defaults, annotations, extra statements, nonlocal target
+semantics, custom class namespaces, modified frame access and unproved RHS effects
+cannot use this proof. A zero-argument lambda returning a fresh empty dictionary
+is a proven following shadow; it does not erase exposure from an opaque helper.
+This is neither fixture execution nor general source-helper interpretation.
+
+Acceptance requires actual Python and complete ownership validation for class
+restoration, nested classes and managers, deleted-local fallback, enclosing-class
+effects, shared module suppression and real following shadows, with both selector
+orders. Legal async execution qualifies only the separately replayed visitor
+component. Independently removing class capture, stack isolation, opaque-effect
+refusal, suppressed-prefix joining and the two bounded helper proofs must break
+their corresponding properties before the exact source is restored. General
+helper effects, context-result targets and direct reflective-spelling precision
+remain separate issues. See [test execution](../TEST-EXECUTION.md).

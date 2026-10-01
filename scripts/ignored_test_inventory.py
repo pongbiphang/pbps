@@ -1,6 +1,7 @@
 """Compiled-test discovery and bounded scheduling witnesses (DEC-1130.1)."""
 
 import ast
+from dataclasses import dataclass
 import io
 import json
 from pathlib import Path
@@ -320,6 +321,41 @@ def mutable_ids(value):
     return set()
 
 
+@dataclass(frozen=True)
+class ClassLocalRestorer:
+    """A single native caller-class write, with RHS resolved at call time."""
+    key: str
+    frame_module: str
+    value: ast.expr
+
+
+class NamespaceContinuation:
+    """Retained bindings belong to the scope that captures and compares them."""
+    def __init__(self, scope):
+        self.scope = scope
+        self.states = []
+
+    def capture(self):
+        self.states.append(self.scope.state())
+
+    def erased(self):
+        current = self.scope.state()
+        reflective = self.scope.reflective | {'builtins'}
+        for local, module in self.states:
+            for name in set(local) | set(current[0]):
+                builtin = self.scope.builtin_value(name)
+                value = local.get(name, module.get(name, builtin))
+                now = current[0].get(name, current[1].get(name, builtin))
+                if value & reflective and not value <= now:
+                    return True
+            for name in set(module) | set(current[1]):
+                builtin = self.scope.builtin_value(name)
+                value = module.get(name, builtin)
+                if value & reflective and not value <= current[1].get(name, builtin):
+                    return True
+        return False
+
+
 class NamespaceExposure(ast.NodeVisitor):
     """Potential builtin aliases, independent of pristine object-inspection proof."""
     reflective = frozenset({"globals", "locals", "vars", "exec", "eval"})
@@ -333,6 +369,7 @@ class NamespaceExposure(ast.NodeVisitor):
         self.conditional = False
         self.continuations = []
         self.native_pristine = True
+        self.native_class = False
 
     @classmethod
     def builtin_value(cls, name):
@@ -365,8 +402,8 @@ class NamespaceExposure(ast.NodeVisitor):
         # to trust selectors. A skipped-path alias was only a conservative guard;
         # its absence is not evidence that the callback cannot restore it.
         self.native_pristine = False
-        for capture, erased in self.continuations:
-            if erased():
+        for continuation in self.continuations:
+            if continuation.erased():
                 self.exposed = True
 
     @staticmethod
@@ -400,6 +437,10 @@ class NamespaceExposure(ast.NodeVisitor):
             return not node.keywords and all(isinstance(arg, ast.Constant) for arg in node.args)
         if function == {'native:empty-callable'}:
             return not node.args and not node.keywords
+        if function == {'native:noop-function'}:
+            return not node.args and not node.keywords
+        if self.local_restoration(node) is not None:
+            return True
         if function == {'native:async-manager-class'}:
             return not node.args and not node.keywords
         if function == {'native:namespace'}:
@@ -409,7 +450,36 @@ class NamespaceExposure(ast.NodeVisitor):
             return not node.keywords and all(self.pure_argument(arg) for arg in node.args)
         return False
 
+    def local_restoration(self, node):
+        # DEC-1389.1: only the measured native class-frame assignment is proved.
+        # A class global reads the module, not the mapping this helper writes.
+        if not self.native_pristine or not self.native_class or node.args or node.keywords:
+            return None
+        function = self.value(node.func)
+        if len(function) != 1:
+            return None
+        helper = next(iter(function))
+        if not isinstance(helper, ClassLocalRestorer) or helper.key in self.globals:
+            return None
+        if self.module.get(helper.frame_module) != {'native:sys'}:
+            return None
+        if isinstance(helper.value, ast.Name):
+            value = self.module.get(helper.value.id, self.builtin_value(helper.value.id))
+        elif (isinstance(helper.value, ast.Attribute)
+              and isinstance(helper.value.value, ast.Name)
+              and self.module.get(helper.value.value.id) == {'builtins'}
+              and helper.value.attr in self.reflective):
+            value = {helper.value.attr}
+        else:
+            return None
+        if len(value) != 1 or not value <= self.reflective | {'builtins'}:
+            return None
+        return helper.key, value
+
     def value(self, node):
+        if self.empty_callable(node):
+            # A real following shadow must stay usable after a proven restore.
+            return {'native:empty-callable'}
         if isinstance(node, ast.Name):
             builtin = self.builtin_value(node.id)
             fallback = self.module.get(node.id, builtin)
@@ -432,8 +502,8 @@ class NamespaceExposure(ast.NodeVisitor):
         return set()
 
     def bind(self, name, value):
-        for capture, _ in self.continuations:
-            capture()
+        for continuation in self.continuations:
+            continuation.capture()
         value = set(value)
         if self.conditional:
             value |= self.value(ast.Name(id=name, ctx=ast.Load()))
@@ -461,25 +531,9 @@ class NamespaceExposure(ast.NodeVisitor):
             self.conditional = conditional
 
     def visit_With(self, node):
-        incoming = self.state()
-        exits = [incoming] if self.conditional else []
-        def capture():
-            exits.append(self.state())
-        def erased():
-            current = self.state()
-            for local, module in exits:
-                for name in set(local) | set(current[0]):
-                    builtin = self.builtin_value(name)
-                    value = local.get(name, module.get(name, builtin))
-                    now = current[0].get(name, current[1].get(name, builtin))
-                    if value & (self.reflective | {'builtins'}) and not value <= now:
-                        return True
-                for name in set(module) | set(current[1]):
-                    builtin = self.builtin_value(name)
-                    value = module.get(name, builtin)
-                    if value & (self.reflective | {'builtins'}) and not value <= current[1].get(name, builtin):
-                        return True
-            return False
+        continuation = NamespaceContinuation(self)
+        if self.conditional:
+            continuation.capture()
         entered = False
         managers = []
         # DEC-1383.1: a running path's writes are exact; skipped prefixes belong only to
@@ -493,8 +547,8 @@ class NamespaceExposure(ast.NodeVisitor):
                 if manager != {'native:manager'}:
                     self.unknown_execution()
                 if not entered:
-                    capture()
-                    self.continuations.append((capture, erased))
+                    continuation.capture()
+                    self.continuations.append(continuation)
                     entered = True
                 if item.optional_vars is not None:
                     self.visit(item.optional_vars)
@@ -504,7 +558,7 @@ class NamespaceExposure(ast.NodeVisitor):
                     break
             if any(manager != {'native:manager'} for manager in managers):
                 self.unknown_execution()
-            self.join([*exits, self.state()])
+            self.join([*continuation.states, self.state()])
         finally:
             if entered:
                 self.continuations.pop()
@@ -516,9 +570,12 @@ class NamespaceExposure(ast.NodeVisitor):
             return
         if self.value(node.func) & self.reflective:
             self.exposed = True
+        restoration = self.local_restoration(node)
         pure = self.pure_call(node)
         self.generic_visit(node)
-        if not pure:
+        if restoration is not None:
+            self.bind(*restoration)
+        elif not pure:
             self.unknown_execution()
 
     def visit_Attribute(self, node):
@@ -560,7 +617,8 @@ class NamespaceExposure(ast.NodeVisitor):
         # Apply each import in order: a repeated spelling has one final binding.
         for alias in node.names:
             self.bind(alias.asname or alias.name.split('.')[0],
-                      {'builtins'} if alias.name == 'builtins' else set())
+                      {'builtins'} if alias.name == 'builtins' else
+                      {'native:sys'} if alias.name == 'sys' else set())
 
     def visit_ImportFrom(self, node):
         if node.level or node.module not in ('builtins', 'types', 'contextlib'):
@@ -577,8 +635,8 @@ class NamespaceExposure(ast.NodeVisitor):
             self.bind(alias.asname or alias.name, value)
 
     def visit_Delete(self, node):
-        for capture, _ in self.continuations:
-            capture()
+        for continuation in self.continuations:
+            continuation.capture()
         for target in node.targets:
             self.visit(target)
             if isinstance(target, ast.Name) and not self.conditional:
@@ -595,12 +653,52 @@ class NamespaceExposure(ast.NodeVisitor):
             self.visit(node.returns)
         if node.decorator_list:
             self.unknown_execution()
-        self.bind(node.name, set())
+        restorer = self.class_local_restorer(node)
+        self.bind(node.name, {'native:noop-function'} if self.noop_function(node)
+                  else {restorer} if restorer is not None else set())
 
     visit_AsyncFunctionDef = visit_FunctionDef
 
     def visit_Lambda(self, node):
         self.visit(node.args)
+
+    @staticmethod
+    def noop_function(node):
+        # DEC-1389.1: the required inert-helper control needs no body interpreter.
+        # Even a default, decorator or annotation can replace this narrow proof.
+        args = node.args
+        return (isinstance(node, ast.FunctionDef) and not node.decorator_list
+                and not getattr(node, 'type_params', []) and node.returns is None
+                and not (args.posonlyargs or args.args or args.kwonlyargs
+                         or args.vararg or args.kwarg or args.defaults or args.kw_defaults)
+                and len(node.body) == 1 and isinstance(node.body[0], ast.Return)
+                and isinstance(node.body[0].value, ast.Constant)
+                and node.body[0].value.value is None)
+
+    @staticmethod
+    def class_local_restorer(node):
+        args = node.args
+        if (not isinstance(node, ast.FunctionDef) or node.decorator_list
+                or getattr(node, 'type_params', []) or node.returns is not None
+                or args.posonlyargs or args.args or args.kwonlyargs or args.vararg
+                or args.kwarg or args.defaults or args.kw_defaults
+                or len(node.body) != 1 or not isinstance(node.body[0], ast.Assign)):
+            return None
+        statement = node.body[0]
+        if len(statement.targets) != 1:
+            return None
+        target = statement.targets[0]
+        if not (isinstance(target, ast.Subscript) and isinstance(target.slice, ast.Constant)
+                and type(target.slice.value) is str and isinstance(target.value, ast.Attribute)
+                and target.value.attr == 'f_locals' and isinstance(target.value.value, ast.Call)):
+            return None
+        frame = target.value.value
+        if not (isinstance(frame.func, ast.Attribute) and frame.func.attr == '_getframe'
+                and isinstance(frame.func.value, ast.Name) and not frame.keywords
+                and len(frame.args) == 1 and isinstance(frame.args[0], ast.Constant)
+                and type(frame.args[0].value) is int and frame.args[0].value == 1):
+            return None
+        return ClassLocalRestorer(target.slice.value, frame.func.value.id, statement.value)
 
     @staticmethod
     def inert_async_manager(node):
@@ -639,8 +737,16 @@ class NamespaceExposure(ast.NodeVisitor):
         # A nested class does not close over an enclosing class's locals.
         body = NamespaceExposure(self.module)
         body.conditional = self.conditional
-        body.continuations = self.continuations
+        body.continuations = list(self.continuations)
+        if body.continuations:
+            # DEC-1389.1: an inherited manager can suppress class execution, but
+            # its enclosing scope's snapshots cannot describe class-local erasure.
+            local = NamespaceContinuation(body)
+            local.capture()
+            body.continuations.append(local)
         body.native_pristine = self.native_pristine
+        body.native_class = not (node.bases or node.keywords or node.decorator_list
+                                 or getattr(node, 'type_params', []))
         def globals_in(statement):
             if isinstance(statement, ast.Global):
                 return set(statement.names)

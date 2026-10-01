@@ -749,6 +749,209 @@ class Ownership(unittest.TestCase):
         observer.visit(audit.ast.parse('namespace = globals()').body[0])
         self.assertTrue(observer.exposed)
 
+    def test_inherited_continuations_keep_class_local_restoration_visible(self):
+        prefix = ('import sys\nimport builtins\nfrom types import SimpleNamespace\n'
+                  'from contextlib import nullcontext\n')
+        forms = [
+            ('callable', 'inspect = globals\ninspect = len\nrestore()\nnamespace = inspect()\n',
+             'sys._getframe(1).f_locals["inspect"] = globals', 'Holder'),
+            ('imported', 'from builtins import globals as inspect\ninspect = len\n'
+             'restore()\nnamespace = inspect()\n',
+             'sys._getframe(1).f_locals["inspect"] = globals', 'Holder'),
+            ('module', 'defaults = builtins\ndefaults = SimpleNamespace(globals=lambda: {})\n'
+             'restore()\nnamespace = defaults.globals()\n',
+             'sys._getframe(1).f_locals["defaults"] = builtins', 'Holder'),
+            ('nested-class', 'class Inner:\n' + indent('inspect = globals\ninspect = len\n'
+             'restore()\nnamespace = inspect()\n', '    '),
+             'sys._getframe(1).f_locals["inspect"] = globals', 'Holder.Inner'),
+            ('nested-with', 'inspect = globals\nwith nullcontext():\n' + indent(
+             'inspect = len\nrestore()\nnamespace = inspect()\n', '    '),
+             'sys._getframe(1).f_locals["inspect"] = globals', 'Holder'),
+            ('deleted-local', 'inspect = globals\ninspect = len\ndel inspect\n'
+             'restore()\nnamespace = inspect()\n',
+             'sys._getframe(1).f_locals["inspect"] = globals', 'Holder'),
+            ('same-module-name', 'inspect = globals\ninspect = len\nrestore()\nnamespace = inspect()\n',
+             'sys._getframe(1).f_locals["inspect"] = globals', 'Holder'),
+            ('enclosing-class', 'inspect = globals\ninspect = len\nclass Inner:\n'
+             '    restore()\nnamespace = inspect()\n',
+             'sys._getframe(2).f_locals["inspect"] = globals', 'Holder'),
+            ('escaped-enclosing-class', 'inspect = globals\ninspect = len\nclass Inner:\n'
+             '    restore()\n',
+             'frame = sys._getframe(2)\nframe.f_locals["inspect"] = globals\n'
+             'frame.f_locals["namespace"] = frame.f_locals["inspect"]()', 'Holder'),
+        ]
+        for label, body, restore, receiver in forms:
+            for opaque in (False, True):
+                for before in (True, False):
+                    with self.subTest(form=label, opaque=opaque, selector_before=before):
+                        # A second statement prevents the narrow single-write proof.
+                        helper = restore + ('\nreturn None' if opaque else '')
+                        source = prefix + 'def restore():\n' + indent(helper, '    ') + '\n'
+                        source += 'inspect = len\n' if label == 'same-module-name' else ''
+                        source += 'TESTS = ["owned"]\n' if before else ''
+                        source += 'with nullcontext(), nullcontext():\n    class Holder:\n' + indent(body, '        ')
+                        source += '' if before else 'TESTS = ["owned"]\n'
+                        source += receiver + '.namespace["TESTS"] = []\n'
+                        self.assert_runner_selector(source, owned=False, accepted=False)
+
+    def test_proven_class_restoration_allows_a_real_following_shadow(self):
+        prefix = ('import sys\nimport builtins\nfrom types import SimpleNamespace\n'
+                  'from contextlib import nullcontext\n')
+        for module in (False, True):
+            for before in (True, False):
+                with self.subTest(module=module, selector_before=before):
+                    key = 'defaults' if module else 'inspect'
+                    rhs = 'builtins' if module else 'globals'
+                    body = (key + ' = ' + rhs + '\n' + key + ' = len\nrestore()\n'
+                            + (key + ' = SimpleNamespace(globals=lambda: {})\nnamespace = defaults.globals()\n'
+                               if module else 'inspect = lambda: {}\nnamespace = inspect()\n'))
+                    source = prefix + 'def restore():\n    sys._getframe(1).f_locals["' + key + '"] = ' + rhs + '\n'
+                    source += 'TESTS = ["owned"]\n' if before else ''
+                    source += 'with nullcontext():\n    class Holder:\n' + indent(body, '        ')
+                    source += '' if before else 'TESTS = ["owned"]\n'
+                    source += 'Holder.namespace["TESTS"] = []\n'
+                    self.assert_runner_selector(source, owned=True, accepted=True)
+
+    def test_only_proven_noop_helpers_preserve_an_active_class_shadow(self):
+        prefix = 'from contextlib import nullcontext\n'
+        for form in ('module', 'alias', 'class-local'):
+            for before in (True, False):
+                with self.subTest(form=form, selector_before=before):
+                    source = prefix + 'def restore(): return None\n'
+                    if form == 'alias':
+                        source += 'invoke = restore\n'
+                    source += 'TESTS = ["owned"]\n' if before else ''
+                    body = 'inspect = globals\ninspect = len\n'
+                    if form == 'class-local':
+                        body += 'def restore(): return None\n'
+                    body += ('invoke()\n' if form == 'alias' else 'restore()\n') + 'value = inspect([])\n'
+                    source += 'with nullcontext():\n    class Holder:\n' + indent(body, '        ')
+                    source += '' if before else 'TESTS = ["owned"]\n'
+                    self.assert_runner_selector(source, owned=True, accepted=True)
+        # Returning None does not erase a preceding real namespace escape.
+        for before in (True, False):
+            source = ('import sys\n' + prefix + 'def restore():\n    global hidden\n'
+                      '    hidden = sys._getframe(1).f_globals\n    return None\n')
+            source += 'TESTS = ["owned"]\n' if before else ''
+            source += ('with nullcontext():\n    class Holder:\n        inspect = globals\n'
+                       '        inspect = len\n        restore()\n        inspect = lambda: {}\n'
+                       '        namespace = inspect()\n')
+            source += '' if before else 'TESTS = ["owned"]\n'
+            self.assert_runner_selector(source + 'hidden["TESTS"] = []\n', owned=False, accepted=False)
+
+    def test_class_continuations_do_not_leak_into_the_enclosing_stack(self):
+        for before in (True, False):
+            source = ('from contextlib import nullcontext\ndef unrelated(): return {}\n'
+                      'inspect = len\n' + ('TESTS = ["owned"]\n' if before else '')
+                      + 'with nullcontext():\n    class Holder:\n        inspect = globals\n'
+                      '        inspect = len\n    unrelated()\n    value = inspect([])\n')
+            source += '' if before else 'TESTS = ["owned"]\n'
+            self.assert_runner_selector(source, owned=True, accepted=True)
+        for body in (
+                'global inspect\nwith suppress(RuntimeError):\n    fail()\n    inspect = len\n',
+                'global inspect\ninspect = globals\ninspect = len\nrestore()\n'):
+            for before in (True, False):
+                source = ('from contextlib import nullcontext, suppress\n'
+                          'def fail(): raise RuntimeError("stop")\n'
+                          'def restore():\n    global inspect\n    inspect = globals\n'
+                          'inspect = globals\n' + ('TESTS = ["owned"]\n' if before else '')
+                          + 'with nullcontext():\n    class Holder:\n' + indent(body, '        ')
+                          + 'namespace = inspect()\n')
+                source += '' if before else 'TESTS = ["owned"]\n'
+                self.assert_runner_selector(source + 'namespace["TESTS"] = []\n', owned=False, accepted=False)
+
+    def test_native_class_restoration_proof_resolves_helper_globals_at_call_time(self):
+        for before in (True, False):
+            source = ('import sys as frames\nfrom builtins import globals as original\n'
+                      'from contextlib import nullcontext\n'
+                      'def restore():\n    frames._getframe(1).f_locals["inspect"] = original\n')
+            source += 'TESTS = ["owned"]\n' if before else ''
+            source += ('with nullcontext():\n    class Holder:\n        original = len\n'
+                       '        inspect = original\n        restore()\n        namespace = inspect()\n')
+            source += '' if before else 'TESTS = ["owned"]\n'
+            self.assert_runner_selector(source + 'Holder.namespace["TESTS"] = []\n', owned=False, accepted=False)
+        source = ('import sys\nfrom contextlib import nullcontext\ndef restore():\n'
+                  '    sys._getframe(1).f_locals["inspect"] = globals\n'
+                  'globals = len\nwith nullcontext():\n    class Holder:\n'
+                  '        inspect = len\n        restore()\n        value = inspect([])\nTESTS = ["owned"]\n')
+        # This RHS is outside the narrow reflective restoration proof; refusal
+        # is permitted, but it cannot fabricate the class's local globals value.
+        actual = subprocess.run([sys.executable, '-B', '-c', source + 'print(TESTS)'],
+                                check=True, capture_output=True, text=True, timeout=10)
+        self.assertEqual(actual.stdout, "['owned']\n")
+        observer = audit.NamespaceExposure()
+        observer.visit(audit.ast.parse(source))
+        self.assertFalse(observer.exposed)
+
+    def test_unproved_class_helper_effects_stay_exposed_after_a_following_shadow(self):
+        prefix = ('import sys\nfrom types import SimpleNamespace\n'
+                  'from contextlib import nullcontext\n')
+        write = 'sys._getframe(1).f_locals["inspect"] = globals'
+        shapes = [
+            ('decorated', 'def decorate(original):\n'
+             '    def replaced():\n        global hidden\n'
+             '        hidden = sys._getframe(1).f_globals\n'
+             '    return replaced\n@decorate\ndef restore():\n    ' + write + '\n', ''),
+            ('changed-frame-attribute', 'native_frame = sys._getframe\n'
+             'def redirect(depth):\n    global hidden\n    hidden = globals()\n'
+             '    return native_frame(depth + 1)\nsys._getframe = redirect\n'
+             'def restore():\n    ' + write + '\n', ''),
+            ('changed-frame-module', 'native_frame = sys._getframe\n'
+             'def redirect(depth):\n    global hidden\n    hidden = globals()\n'
+             '    return native_frame(depth + 1)\nsys = SimpleNamespace(_getframe=redirect)\n'
+             'def restore():\n    ' + write + '\n', ''),
+            ('effectful-rhs', 'def value():\n    global hidden\n'
+             '    hidden = sys._getframe(1).f_globals\n    return globals\n'
+             'def restore():\n    sys._getframe(1).f_locals["inspect"] = value()\n', ''),
+            ('custom-namespace', 'class Namespace(dict):\n'
+             '    def __setitem__(self, key, value):\n        global hidden\n'
+             '        hidden = globals()\n        super().__setitem__(key, value)\n'
+             'class Meta(type):\n    @classmethod\n'
+             '    def __prepare__(cls, name, bases): return Namespace()\n'
+             'def restore():\n    ' + write + '\n', '(metaclass=Meta)'),
+        ]
+        for label, setup, header in shapes:
+            for before in (True, False):
+                with self.subTest(effect=label, selector_before=before):
+                    source = prefix + setup + ('TESTS = ["owned"]\n' if before else '')
+                    source += ('with nullcontext():\n    class Holder' + header + ':\n'
+                               '        inspect = globals\n        inspect = len\n'
+                               '        restore()\n        inspect = lambda: {}\n'
+                               '        namespace = inspect()\n')
+                    source += '' if before else 'TESTS = ["owned"]\n'
+                    self.assert_runner_selector(source + 'hidden["TESTS"] = []\n',
+                                                owned=False, accepted=False)
+
+    def test_legal_async_class_continuations_keep_the_same_scope_ownership(self):
+        # Child execution plus a pristine-prefix component proof, not complete
+        # ownership of an arbitrary called async scenario or asyncio import.
+        prefix = ('import sys\nclass Manager:\n'
+                  '    async def __aenter__(self): return None\n'
+                  '    async def __aexit__(self, *args): return True\n')
+        for opaque in (False, True):
+            for following in (False, True):
+                helper = ('def restore():\n    sys._getframe(1).f_locals["inspect"] = globals\n'
+                          + ('    return None\n' if opaque else ''))
+                body = ('async with Manager():\n    class Holder:\n        inspect = globals\n'
+                        '        inspect = len\n        restore()\n'
+                        + ('        inspect = lambda: {}\n' if following else '')
+                        + '        namespace = inspect()\nreturn Holder.namespace\n')
+                source = ('import asyncio\n' + prefix + helper + 'async def scenario():\n'
+                          + indent(body, '    ') + '\nnamespace = asyncio.run(scenario())\n'
+                          'TESTS = ["owned"]\nnamespace["TESTS"] = []\n')
+                with self.subTest(opaque=opaque, following=following):
+                    actual = subprocess.run([sys.executable, '-B', '-c', source + 'print(TESTS)'],
+                                            check=True, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(actual.stdout, "['owned']\n" if following else '[]\n')
+                    observer = audit.NamespaceExposure()
+                    for statement in audit.ast.parse(prefix + helper).body:
+                        observer.visit(statement)
+                    for statement in audit.ast.parse('async def scenario():\n' + indent(body, '    ')).body[0].body:
+                        observer.visit(statement)
+                    # Unproved callbacks remain conservative even when this
+                    # particular opaque helper happens not to expose a namespace.
+                    self.assertEqual(observer.exposed, opaque or not following)
+
     def test_suppressed_prefixes_and_opaque_callbacks_keep_namespace_exposure(self):
         prefix = ('import builtins as defaults\nfrom contextlib import nullcontext, suppress\n'
                   'def fail(): raise RuntimeError("stop")\n')
