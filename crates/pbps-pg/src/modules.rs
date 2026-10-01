@@ -1540,6 +1540,11 @@ pub enum Part {
     Check(String),
     Default(String),
     Index(String),
+    /// A generated column's expression. Never restorable: no statement takes
+    /// the expression off and puts it back. A plan that changes the
+    /// expression releases the dependency instead, when that change runs
+    /// before the module's drop (DEC-1168.1).
+    Generated(String),
 }
 
 /// One object that depends on a module, established by the catalog.
@@ -1568,6 +1573,9 @@ impl Dependent {
                     Part::Default(column) => {
                         t.columns.get(column).is_some_and(|c| c.default.is_some())
                     }
+                    // Nothing can put it back, so it is never kept across a
+                    // rebuild; only an expression change releases it.
+                    Part::Generated(_) => false,
                 }
             }),
             Holds::Unrepresentable(_) => false,
@@ -1838,6 +1846,10 @@ async fn direct_dependents(
                     table: TableName::new(&dep_schema, &dep_name),
                     part: Part::Default(part.clone()),
                 },
+                "generated" => Holds::TablePart {
+                    table: TableName::new(&dep_schema, &dep_name),
+                    part: Part::Generated(part.clone()),
+                },
                 "index" => Holds::TablePart {
                     table: TableName::new(&dep_schema, &dep_name),
                     part: Part::Index(part.clone()),
@@ -1984,10 +1996,8 @@ fn dependents_query(refclass: &str) -> String {
            LEFT JOIN pg_catalog.pg_namespace n2 ON n2.oid = c2.relnamespace
           WHERE {edge} AND d.classid = 'pg_catalog.pg_constraint'::regclass
           UNION ALL
-         SELECT 'default', {described}, n2.nspname, c2.relname, a.attname, 0::int8,
-                CASE WHEN a.attgenerated <> ''
-                     THEN 'a generated column, whose expression no statement can take off and put back around the rebuild'
-                     ELSE '' END
+         SELECT CASE WHEN a.attgenerated <> '' THEN 'generated' ELSE 'default' END,
+                {described}, n2.nspname, c2.relname, a.attname, 0::int8, ''
            FROM pg_catalog.pg_depend d
            JOIN pg_catalog.pg_attrdef ad ON ad.oid = d.objid
            JOIN pg_catalog.pg_class c2 ON c2.oid = ad.adrelid
@@ -2132,6 +2142,15 @@ pub fn unmanaged_refusal(
         .filter(|d| !d.managed(declared))
         .map(|d| match &d.holds {
             Holds::Unrepresentable(why) => format!("- {} — {why}", d.described),
+            Holds::TablePart {
+                part: Part::Generated(_),
+                ..
+            } => format!(
+                "- {} — a generated column, whose expression no statement can take off and put \
+                 back around the rebuild; a plan that changes the expression so it no longer \
+                 calls `{id}` releases it",
+                d.described
+            ),
             Holds::Module(_) | Holds::TablePart { .. } => {
                 format!("- {} — this project does not declare it", d.described)
             }

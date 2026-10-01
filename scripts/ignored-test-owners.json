@@ -1147,6 +1147,7 @@
         "a_view_rebuild_restates_a_declared_roles_grant_and_the_role_still_reads_it",
         "additions_calling_a_rebuilt_function_are_created_after_it",
         "an_action_that_cannot_write_is_not_in_the_closure",
+        "an_expression_change_releases_a_generated_column_from_a_dropped_function",
         "an_inherited_trigger_function_owner_cannot_use_the_deployers_privileges",
         "an_operator_wider_than_the_ledger_column_is_recorded_cut_to_it",
         "an_owners_grant_a_least_privilege_deployer_cannot_revoke_is_refused_before_it_runs",

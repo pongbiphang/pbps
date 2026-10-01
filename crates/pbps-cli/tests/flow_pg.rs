@@ -5991,6 +5991,104 @@ fn a_generated_columns_expression_change_is_refused_by_name_before_postgres_17()
     generated_column_flow(&server, "generated-1168-old", false);
 }
 
+/// A function a generated column calls, dropped for good in the revision that
+/// changes the column's expression to stop calling it: the expression change
+/// releases the dependency, so it runs before `DROP FUNCTION` and the plan
+/// applies. The same drop without the expression change is still refused by
+/// name, since nothing else can take the expression off (DEC-1168.1).
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn an_expression_change_releases_a_generated_column_from_a_dropped_function() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "generated-release");
+    let connection = own.connection().to_owned();
+    on_server(
+        &connection,
+        "CREATE SCHEMA app; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x * 2 $$; \
+         CREATE TABLE app.t (id integer PRIMARY KEY, a integer, \
+                             g integer GENERATED ALWAYS AS (app.f(a)) STORED); \
+         INSERT INTO app.t (id, a) VALUES (1, 5)",
+    );
+    let d = Demo::new("generated-release");
+    succeeds(d.run(&["pull", "--db", &connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    std::fs::remove_file(d.dir.join("schema/app.f%28integer%29.function.yml")).unwrap();
+
+    // The drop alone: refused, naming the generated column.
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("a generated column") && stderr(&o).contains("releases it"),
+        "{}",
+        stderr(&o)
+    );
+
+    // With the expression changed off the function: it runs first.
+    let path = d.dir.join("schema/app.t.yml");
+    let table = std::fs::read_to_string(&path).unwrap();
+    let released: String = table
+        .lines()
+        .map(|l| {
+            if l.trim_start().starts_with("generated:") {
+                "    generated: {expression: 'a * 3', stored: true}".to_owned()
+            } else {
+                l.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert_ne!(
+        released, table,
+        "the fixture's `g` is where this test expects it"
+    );
+    std::fs::write(&path, released).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        &connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    assert!(at("SET EXPRESSION") < at("DROP FUNCTION"), "{script}");
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &[
+            "--allow",
+            "narrowing",
+            "--allow",
+            "destructive",
+            "--allow",
+            "revoke",
+        ],
+    ));
+    assert_eq!(
+        scalar(&connection, "SELECT g::int8 FROM app.t WHERE id = 1"),
+        15
+    );
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
 #[test]
 #[ignore = "needs PostgreSQL 16; set PBPS_TEST_PG_OLD_DB"]
 fn the_deployment_loop_reads_constraints_before_postgres_18() {

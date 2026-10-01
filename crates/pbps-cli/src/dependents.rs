@@ -184,6 +184,14 @@ fn removes(change: &Change, holds: &Holds) -> bool {
                     column, to: None, ..
                 },
             ) => column.table == *table && column.name == *c,
+            // A changed expression takes the old one's dependency away
+            // (DEC-1168.1). If the new one calls the module again, its
+            // `SET EXPRESSION` binds the old module and the drop is refused
+            // inside the transaction: the loud outcome, where telling the two
+            // apart would mean parsing the expression (DECISIONS 174).
+            (Part::Generated(c), Change::AlterColumnExpression { column, .. }) => {
+                column.table == *table && column.name == *c
+            }
             _ => false,
         },
         _ => false,
@@ -224,7 +232,7 @@ fn removes_with_its_owner(change: &Change, holds: &Holds) -> bool {
         (
             Holds::TablePart {
                 table,
-                part: Part::Default(c),
+                part: Part::Default(c) | Part::Generated(c),
             },
             Change::DropColumn { column, .. },
         ) => column.table == *table && column.name == *c,
@@ -324,7 +332,7 @@ fn named_at(changes: &[PlannedChange], i: usize, holds: &Holds) -> Holds {
             Change::RenameColumn {
                 table: t, from, to, ..
             } if *t == table => {
-                if let Part::Default(c) = &mut part
+                if let Part::Default(c) | Part::Generated(c) = &mut part
                     && c == from
                 {
                     *c = to.clone();
@@ -353,7 +361,8 @@ fn respell(p: &mut PlannedChange, holds: &Holds, dialect: &dyn Dialect) {
             | Change::AddIndex { table: t, .. },
             _,
         ) => *t = table.clone(),
-        (Change::AlterColumnDefault { column, .. }, Part::Default(c)) => {
+        (Change::AlterColumnDefault { column, .. }, Part::Default(c))
+        | (Change::AlterColumnExpression { column, .. }, Part::Generated(c)) => {
             *column = ColumnRef::new(table.clone(), c.clone());
         }
         _ => return,
@@ -426,6 +435,14 @@ fn removal_of(d: &Dependent, declared: &Schema, ids: &[&IdsFile]) -> Result<Chan
                     to: None,
                 }
             }
+            // No statement takes a generation expression off; only the
+            // plan's own expression change can, and `weave` looks for that.
+            Part::Generated(_) => {
+                return Err(format!(
+                    "{}: a generated column's expression cannot be taken off around the module",
+                    d.described
+                ));
+            }
         }),
         Holds::Unrepresentable(why) => Err(format!("{} — {why}", d.described)),
     }
@@ -452,6 +469,7 @@ fn restoration_of(d: &Dependent, declared: &Schema, ids: &[&IdsFile]) -> Option<
                     index: Box::new(i.clone()),
                     clustered: false,
                 }),
+                Part::Generated(_) => None,
                 Part::Default(column) => {
                     let to = t.columns.get(column)?.default.clone()?;
                     let column = ColumnRef::new(table.clone(), column.clone());
@@ -819,7 +837,7 @@ pub(crate) fn split_new_tables(
 /// added with a default calling the function is the same case: the column
 /// has to exist before the modules that may read it.
 #[allow(clippy::wildcard_enum_match_arm)]
-pub(crate) fn after_the_rebuilds(cs: &mut ChangeSet) -> usize {
+pub(crate) fn after_the_rebuilds(cs: &mut ChangeSet, released: &BTreeSet<ColumnRef>) -> usize {
     let Some(last) = last_function_create(cs) else {
         return 0;
     };
@@ -827,7 +845,9 @@ pub(crate) fn after_the_rebuilds(cs: &mut ChangeSet) -> usize {
     let recomputed: BTreeSet<&ColumnRef> = cs.changes[..last]
         .iter()
         .filter_map(|p| match &p.change {
-            Change::AlterColumnExpression { column, .. } => Some(column),
+            Change::AlterColumnExpression { column, .. } if !released.contains(column) => {
+                Some(column)
+            }
             _ => None,
         })
         .collect();
@@ -846,7 +866,9 @@ pub(crate) fn after_the_rebuilds(cs: &mut ChangeSet) -> usize {
             // column, so none is taken ahead of it. A column added with one
             // stays, as a column added with a default does: a function the
             // plan creates may read it.
-            Change::AlterColumnExpression { .. } => true,
+            // One that releases a generated column from a module the plan
+            // drops stays ahead of that drop, where `weave` put it.
+            Change::AlterColumnExpression { column, .. } => !released.contains(column),
             // A `NOT NULL` over a recomputed column stays behind its new
             // expression, which the order kept among the moved preserves.
             Change::AlterColumnNullability {
@@ -878,6 +900,36 @@ pub(crate) fn after_the_rebuilds(cs: &mut ChangeSet) -> usize {
 /// before that drop, named: the apply's question, asked of the saved plan as
 /// it stands. Empty when the plan accounts for everything — which is what
 /// [`weave`] leaves it in.
+/// The generated columns whose expression change releases them from a module
+/// this plan drops, named as that change names them (DEC-1168.1). `weave`
+/// puts each such change ahead of the drop; this is how
+/// [`after_the_rebuilds`] knows to leave it there.
+pub(crate) fn released(
+    cs: &ChangeSet,
+    found: &BTreeMap<ModuleId, Vec<Dependent>>,
+) -> BTreeSet<ColumnRef> {
+    let mut out = BTreeSet::new();
+    for (root, _) in dropped_modules(cs) {
+        for d in found.get(&root).into_iter().flatten() {
+            if !matches!(
+                d.holds,
+                Holds::TablePart {
+                    part: Part::Generated(_),
+                    ..
+                }
+            ) {
+                continue;
+            }
+            if let Some(i) = find(&cs.changes, &d.holds, removes)
+                && let Change::AlterColumnExpression { column, .. } = &cs.changes[i].change
+            {
+                out.insert(column.clone());
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn unaccounted(
     cs: &ChangeSet,
     found: &BTreeMap<ModuleId, Vec<Dependent>>,
@@ -1082,7 +1134,7 @@ mod tests {
             alter(&s, "app.f(integer)"),
             alter(&s, "app.v0"),
         ]);
-        assert_eq!(after_the_rebuilds(&mut cs), 4);
+        assert_eq!(after_the_rebuilds(&mut cs, &BTreeSet::new()), 4);
         assert_eq!(
             names(&cs),
             [
@@ -1137,7 +1189,7 @@ mod tests {
             add("plain", pbps_model::Column::new("integer".parse().unwrap())),
             alter(&s, "app.f(integer)"),
         ]);
-        assert_eq!(after_the_rebuilds(&mut cs), 2);
+        assert_eq!(after_the_rebuilds(&mut cs, &BTreeSet::new()), 2);
         let at =
             |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
         let rebuilt = at(&|c| matches!(c, Change::AlterModule { .. }));
@@ -1157,6 +1209,46 @@ mod tests {
         };
         assert!(expression < tightened("n"), "{:?}", names(&cs));
         assert!(tightened("other") < rebuilt, "{:?}", names(&cs));
+    }
+
+    /// An expression change that releases a generated column from a module
+    /// this plan drops stays ahead of that drop, where `weave` put it, even
+    /// with a function created after: moved past the creates, it would follow
+    /// the drop the engine refuses without it (DEC-1168.1). One that releases
+    /// nothing still follows the rebuilt function.
+    #[test]
+    fn a_releasing_expression_change_stays_ahead_of_the_drop() {
+        let (s, _) = declared();
+        let t = TableName::new("app", "t");
+        let recompute = |column: &str| Change::AlterColumnExpression {
+            uid: "c_d4e5f6".parse().unwrap(),
+            column: t.column(column),
+            from: "app.f(id)".into(),
+            to: "id * 2".into(),
+        };
+        let mut cs = plan(vec![
+            recompute("n"),
+            recompute("other"),
+            alter(&s, "app.f(integer)"),
+        ]);
+        let released = BTreeSet::from([t.column("n")]);
+        assert_eq!(after_the_rebuilds(&mut cs, &released), 1);
+        let at = |name: &str| {
+            cs.changes
+                .iter()
+                .position(|p| matches!(&p.change, Change::AlterColumnExpression { column, .. } if column.name == name))
+                .unwrap()
+        };
+        let rebuilt = cs
+            .changes
+            .iter()
+            .position(|p| matches!(p.change, Change::AlterModule { .. }))
+            .unwrap();
+        assert!(
+            at("n") < rebuilt && rebuilt < at("other"),
+            "{:?}",
+            names(&cs)
+        );
     }
 
     /// #1024: a procedure that becomes a function is dropped as a procedure
@@ -1183,7 +1275,7 @@ mod tests {
                 module: as_kind(ModuleKind::Function),
             },
         ]);
-        assert_eq!(after_the_rebuilds(&mut cs), 1);
+        assert_eq!(after_the_rebuilds(&mut cs, &BTreeSet::new()), 1);
         assert_eq!(
             names(&cs),
             [
@@ -1210,7 +1302,7 @@ mod tests {
                 module: as_kind(ModuleKind::Function),
             },
         ]);
-        assert_eq!(after_the_rebuilds(&mut cs), 1);
+        assert_eq!(after_the_rebuilds(&mut cs, &BTreeSet::new()), 1);
         assert_eq!(
             names(&cs),
             [
@@ -1235,7 +1327,7 @@ mod tests {
             },
         ]);
         let before = names(&cs);
-        assert_eq!(after_the_rebuilds(&mut cs), 0);
+        assert_eq!(after_the_rebuilds(&mut cs, &BTreeSet::new()), 0);
         assert_eq!(names(&cs), before);
     }
 
@@ -1299,7 +1391,7 @@ mod tests {
         assert!(left.checks.is_empty());
         assert_eq!(left.indexes.keys().collect::<Vec<_>>(), ["ix_u"]);
         assert_eq!(left.columns["v"].default, None);
-        assert_eq!(after_the_rebuilds(&mut cs), 3);
+        assert_eq!(after_the_rebuilds(&mut cs, &BTreeSet::new()), 3);
         assert_eq!(
             names(&cs)[1..],
             [
@@ -1370,7 +1462,7 @@ mod tests {
             },
             new_routine(ModuleKind::Function),
         ]);
-        assert_eq!(after_the_rebuilds(&mut cs), 3);
+        assert_eq!(after_the_rebuilds(&mut cs, &BTreeSet::new()), 3);
         assert!(
             matches!(cs.changes[0].change, Change::AddColumn { .. })
                 && matches!(cs.changes[1].change, Change::CreateModule { .. }),
@@ -1383,7 +1475,7 @@ mod tests {
             new_routine(ModuleKind::Procedure),
         ]);
         let before = names(&cs);
-        assert_eq!(after_the_rebuilds(&mut cs), 0);
+        assert_eq!(after_the_rebuilds(&mut cs, &BTreeSet::new()), 0);
         assert_eq!(names(&cs), before);
     }
 
@@ -1399,7 +1491,7 @@ mod tests {
         ] {
             let mut cs = plan(changes);
             let before = names(&cs);
-            assert_eq!(after_the_rebuilds(&mut cs), 0);
+            assert_eq!(after_the_rebuilds(&mut cs, &BTreeSet::new()), 0);
             assert_eq!(names(&cs), before);
         }
         let mut cs = plan(vec![
@@ -1416,7 +1508,7 @@ mod tests {
             add_check("ck"),
             alter(&s, "app.f(integer)"),
         ]);
-        assert_eq!(after_the_rebuilds(&mut cs), 1);
+        assert_eq!(after_the_rebuilds(&mut cs, &BTreeSet::new()), 1);
         assert_eq!(
             names(&cs),
             [
@@ -1461,7 +1553,7 @@ mod tests {
         };
         let moved = |write: Change| {
             let mut cs = plan(vec![set_default("u"), write, alter(&s, "app.f(integer)")]);
-            after_the_rebuilds(&mut cs) == 1
+            after_the_rebuilds(&mut cs, &BTreeSet::new()) == 1
         };
         assert!(moved(insert(&[])), "an insert that spells `n`");
         assert!(
