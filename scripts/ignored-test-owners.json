@@ -1499,6 +1499,7 @@
         "the_readiness_check_asks_for_role_permissions_only_where_a_role_is_granted",
         "the_widest_rendered_holder_fits_the_lock_column",
         "throwing_signed_defaults_do_not_break_explicit_row_reads",
+        "tightening_nullability_is_refused_by_what_indexes_the_column",
         "timeline_answers_a_never_migrated_ledger_without_ever_calling_ensure_tables",
         "trailing_default_comments_preserve_insert_guards",
         "trailing_default_comments_preserve_row_default_answers",
