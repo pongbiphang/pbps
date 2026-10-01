@@ -45,6 +45,13 @@ pub use pbps_db::doctor::{DataDemand, DataTables, DeclaredKeys, GrantTargets, Re
 pub enum Needed {
     /// Grantable only at the database, so that is the only place to ask.
     Database,
+    /// `SELECT` on `sys.sql_expression_dependencies`, which reading the
+    /// catalog needs on top of `VIEW DEFINITION` (#1359). The engine grants
+    /// it only to `db_owner` by default, so a least-privilege account holding
+    /// every other entry passed readiness and then met Msg 229 at the first
+    /// `pull`, `plan --db` or `verify`. Asked of that one object, where the
+    /// grant goes.
+    CatalogView,
     /// Needed on every schema pbps manages.
     Managed,
     /// Probe reads on each managed table, including recorded tables awaiting
@@ -335,7 +342,7 @@ pub use crate::state::LEDGER_SCHEMA;
 /// absence still requires the create-time permission.
 pub const LEDGER_TABLES: [&str; 2] = [crate::state::STATE_TABLE, crate::state::LOCK_TABLE];
 
-pub const REQUIRED: [Requirement; 25] = [
+pub const REQUIRED: [Requirement; 26] = [
     req(
         "ALTER",
         "adding the timeline columns to an existing pre-migration state ledger",
@@ -345,6 +352,11 @@ pub const REQUIRED: [Requirement; 25] = [
         "VIEW DEFINITION",
         "reading the catalog: pull, plan --db, verify",
         Needed::Managed,
+    ),
+    req(
+        "SELECT",
+        "reading what views and routines depend on: pull, plan --db, verify",
+        Needed::CatalogView,
     ),
     // `SELECT` twice, because it is needed in two places for two reasons and a
     // single entry made the wrong demand in both directions. The probes count
@@ -570,6 +582,10 @@ pub struct Held {
     /// question, since there is no securable to ask about) let `doctor` exit 0
     /// immediately before the deployment failed.
     pub absent_schemas: BTreeSet<String>,
+
+    /// The permissions effective on `sys.sql_expression_dependencies`
+    /// ([`Needed::CatalogView`]).
+    pub catalog_view: BTreeSet<String>,
 
     /// The schema-scoped permissions effective on the ledger's schema.
     ///
@@ -2157,6 +2173,19 @@ pub async fn permissions(
         }
     }
 
+    let mut catalog_view = BTreeSet::new();
+    let sql = "SELECT HAS_PERMS_BY_NAME(N'sys.sql_expression_dependencies', N'OBJECT', N'SELECT') \
+               AS held;";
+    if conn
+        .query(sql)
+        .await?
+        .first()
+        .and_then(|row| row.try_get::<i32>("held").ok().flatten())
+        == Some(1)
+    {
+        catalog_view.insert("SELECT".to_owned());
+    }
+
     let ledger_schema = per_schema.get(LEDGER_SCHEMA).cloned().unwrap_or_default();
     // Asked for and not returned by `sys.schemas` means the database does not
     // have it. The ledger's schema is excluded: `dbo` always exists, and if it
@@ -2175,6 +2204,7 @@ pub async fn permissions(
         schemas: per_schema,
         managed_tables,
         absent_schemas,
+        catalog_view,
         ledger_schema,
         ledger_objects,
         ledger_migration_needed,
@@ -2353,6 +2383,18 @@ pub fn missing(held: &Held) -> Vec<Gap> {
                         permission: r.name,
                         why: r.why,
                         securable: Securable::Database,
+                    });
+                }
+            }
+            Needed::CatalogView => {
+                if !held.catalog_view.contains(r.name) {
+                    out.push(Gap {
+                        permission: r.name,
+                        why: r.why,
+                        securable: Securable::Object(ObjectName::new(
+                            "sys",
+                            "sql_expression_dependencies",
+                        )),
                     });
                 }
             }
@@ -2691,6 +2733,7 @@ mod tests {
             // Everything asked about exists in this helper; the absent case has
             // its own test below.
             absent_schemas: BTreeSet::new(),
+            catalog_view: ["SELECT".to_owned()].into(),
             // The ledger not existing yet is the default here, so `missing`
             // falls back to the ledger *schema*, which therefore carries the
             // ledger permissions. `ledger_granted_on_the_objects_only` below is
@@ -3889,6 +3932,30 @@ mod tests {
         held
     }
 
+    /// `SELECT` on `sys.sql_expression_dependencies` is asked of that object,
+    /// where the grant goes, and only when it is not held (#1359): the engine
+    /// gives it to `db_owner` alone, and database `VIEW DEFINITION` does not
+    /// carry it.
+    #[test]
+    fn the_dependency_view_is_asked_for_on_its_own_object() {
+        let mut held = everything(&["dbo"]);
+        held.catalog_view.clear();
+        let gaps = missing(&held);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].permission, "SELECT");
+        assert_eq!(
+            gaps[0].securable,
+            Securable::Object(ObjectName::new("sys", "sql_expression_dependencies"))
+        );
+        held.database.insert("VIEW DEFINITION".to_owned());
+        assert_eq!(
+            missing(&held).len(),
+            1,
+            "database VIEW DEFINITION is not it"
+        );
+        assert!(missing(&everything(&["dbo"])).is_empty());
+    }
+
     #[test]
     fn an_account_holding_everything_is_missing_nothing() {
         assert!(missing(&everything(&["dbo", "app"])).is_empty());
@@ -4316,6 +4383,7 @@ mod tests {
     fn holding_nothing_is_reported_as_missing_everything() {
         let held = Held {
             database: BTreeSet::new(),
+            catalog_view: BTreeSet::new(),
             schemas: [("dbo".to_owned(), BTreeSet::new())].into_iter().collect(),
             managed_tables: BTreeMap::new(),
             absent_schemas: BTreeSet::new(),

@@ -1724,7 +1724,10 @@ organization say no to the tool.
 **Each is asked for at the securable where it is actually needed**, and the
 report names that securable. The four `CREATE` permissions cannot be granted
 below the database, so they are asked for there; `ALTER` and `VIEW DEFINITION`
-are asked for on each **managed** schema. The probes' `SELECT` is asked for on
+are asked for on each **managed** schema. Reading the catalog also reads
+`sys.sql_expression_dependencies`, whose `SELECT` the engine gives only to
+`db_owner` and database `VIEW DEFINITION` does not carry, so it is asked for on
+that object (#1359). The probes' `SELECT` is asked for on
 each **managed table**, accepting an object grant or grants on every catalog
 column. Its schema is the fallback only while the table does not exist yet.
 Declared tables are resolved to their current names in each environment, and
@@ -1733,8 +1736,8 @@ recorded tables remain managed until their removal is applied. `INSERT`,
 themselves, falling back to their schema only while those tables do not exist
 yet — plus `ALTER` on that schema while the ledger has still to be created,
 because `CREATE TABLE` at the database does not by itself authorize creating a
-table in a given schema. `SELECT` appears twice because it is needed in two
-places for two reasons:
+table in a given schema. `SELECT` appears twice more because it is needed in
+two more places for two more reasons:
 the probes count rows in managed tables, and reading the recorded state is a
 read of two tables in `dbo`. `INSERT`, `UPDATE` and `DELETE` are asked for on
 each **table** that declares rows, and on no other: `ALTER ON SCHEMA` confers
