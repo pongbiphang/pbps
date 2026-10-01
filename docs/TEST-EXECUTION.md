@@ -135,7 +135,26 @@ manager effects cannot acquire this exception after a possibly reflective alias
 has been erased. Legal async fixtures qualify visitor components separately;
 interpreting arbitrary called async helpers is not a module ownership route
 (DEC-1383.1).
- Potential namespace access is tracked
+Each retained continuation captures bindings through its owning scope. A class
+entered beneath a manager adds its own local continuation while inheriting the
+enclosing continuations and shared module state. Its stack is copied, so leaving
+the class cannot retain stale class locals in later enclosing statements. Nested
+classes retain enclosing captures for opaque effects but resolve names against
+their own locals and the module, not an enclosing class's locals.
+
+To preserve the measured inert-helper and real following-shadow controls, the
+pristine-prefix proof also recognizes zero-argument plain functions whose only
+statement returns None, and one narrowly proven class-frame write. That helper
+must consist solely of `sys._getframe(1).f_locals[<literal string>] = <value>`;
+its native sys binding and reflective builtin or builtins-module RHS are resolved
+from the module at call time. Only a plain native class namespace and a local
+target qualify. Other helper bodies, replaced frame access, class namespace hooks,
+and unknown RHS effects stay opaque; an actual namespace escape remains sticky
+after later shadows. These proofs do not interpret arbitrary helpers or import
+fixture code. Actual async execution remains separate from component proof and
+complete ownership validation (DEC-1389.1).
+
+Potential namespace access is tracked
 separately from the stricter pristine-binding proof for safe object inspection;
 passing an imported module to an opaque helper cannot make a later reflective
 call harmless. A direct module-level `vars(SimpleNamespace())` call is
