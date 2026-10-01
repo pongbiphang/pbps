@@ -587,6 +587,12 @@ class NamespaceExposure(ast.NodeVisitor):
             self.unknown_execution()
 
     def visit_Assign(self, node):
+        if any(isinstance(target, (ast.Tuple, ast.List)) for target in node.targets):
+            # DEC-1299.1: evaluate the RHS once before any chained target writes.
+            value = self.unpacking_value(node.value)
+            for target in node.targets:
+                self.bind_unpacking_target(target, value)
+            return
         value = self.value(node.value)
         self.visit(node.value)
         for target in node.targets:
@@ -595,6 +601,64 @@ class NamespaceExposure(ast.NodeVisitor):
                 self.bind(target.id, value)
             else:
                 self.unknown_execution()
+
+    def unpacking_value(self, node):
+        # These immutable snapshots live only through this assignment. Stored
+        # mutable containers and expression-result provenance need other proofs.
+        if isinstance(node, (ast.Tuple, ast.List)):
+            values = tuple(self.unpacking_value(item) for item in node.elts)
+            return None if any(isinstance(item, ast.Starred) for item in node.elts) else values
+        value = frozenset(self.value(node))
+        known = (bool(value) or isinstance(node, ast.Constant) or self.empty_callable(node)
+                 or isinstance(node, ast.Call) and self.pure_call(node))
+        self.visit(node)
+        return value if known else None
+
+    def unpacking_aliases(self, value):
+        if value is None:
+            return self.reflective | {'builtins'}
+        if isinstance(value, tuple):
+            aliases = set().union(*(self.unpacking_aliases(item) for item in value))
+            # A container is not the native callable/module it contains. Keep
+            # possible reflection without granting a native-call exemption.
+            return ((aliases & self.reflective)
+                    | (self.reflective if 'builtins' in aliases else set()))
+        return value
+
+    def unknown_unpacking(self, target):
+        # Unknown iteration, arity or target protocols cannot establish an owner.
+        self.exposed = True
+        self.unknown_execution()
+        self.visit(target)
+
+    def known_unpacking(self, value):
+        return (value is not None and (not isinstance(value, tuple)
+                or all(self.known_unpacking(item) for item in value)))
+
+    def bind_unpacking_target(self, target, value):
+        if isinstance(target, ast.Name):
+            if not self.known_unpacking(value):
+                self.unknown_unpacking(target)
+            self.bind(target.id, self.unpacking_aliases(value))
+            return
+        if not isinstance(target, (ast.Tuple, ast.List)) or not isinstance(value, tuple):
+            self.unknown_unpacking(target)
+            return
+        stars = [i for i, item in enumerate(target.elts) if isinstance(item, ast.Starred)]
+        if (len(stars) > 1 or not stars and len(target.elts) != len(value)
+                or stars and len(value) < len(target.elts) - 1):
+            self.unknown_unpacking(target)
+            return
+        if stars:
+            start = stars[0]
+            end = len(value) - (len(target.elts) - start - 1)
+            bindings = [*zip(target.elts[:start], value[:start]),
+                        (target.elts[start].value, value[start:end]),
+                        *zip(target.elts[start + 1:], value[end:])]
+        else:
+            bindings = zip(target.elts, value)
+        for child, item in bindings:
+            self.bind_unpacking_target(child, item)
 
     def visit_NamedExpr(self, node):
         value = self.value(node.value)

@@ -114,6 +114,17 @@ Visible `globals()`, `locals()`, `vars()` and unknown dynamic execution can
 retain the module namespace: later literal assignments cannot restore evidence
 after that exposure. This includes calls through direct `builtins` module
 imports, imported reflective callables and plain-name alias assignments.
+Tuple/list assignment targets also retain corresponding aliases through nested
+and starred targets. Literal RHS elements are snapshotted once in Python order,
+before any chained target writes, and targets bind from left to right. A real
+later native shadow replaces the alias; an unused reflective alias is not an
+exposure. The snapshots last only for that assignment. Unknown iteration,
+unsupported expression results, mismatched arity and target protocols refuse
+ownership rather than manufacture harmless bindings. Container contents retain
+possible reflection without acquiring a contained callable's native exemption;
+stored-container and general expression provenance remain separate proofs
+(DEC-1299.1).
+
 Bindings are followed in statement order: direct shadows replace aliases,
 class-local bindings do not replace module bindings, and uncalled function
 bodies do not expose namespaces. Unknown conditional writes retain possible
