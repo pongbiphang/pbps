@@ -418,6 +418,13 @@ plan can clear a name first, and an occupant it clears is not one:
   since `SET SCHEMA` takes them along;
 - a sequence whose owning column it drops.
 
+What a cross-schema rename carries counts the other way (#1084). `SET SCHEMA`
+moves the table's indexes and owned sequences into the destination schema under
+their own names, before any table or view is created. So the read also asks
+what each transferred table owns. A created name in the destination that meets
+one is refused, naming the object and the rename, unless the plan drops it
+first. That is an index it drops, or a sequence whose column it drops.
+
 A name taken after the plan was saved is left to the apply. The `CREATE` fails
 inside the transaction and the ledger records nothing, which is the outcome a
 recheck could only have reported earlier. SQL Server is answered by

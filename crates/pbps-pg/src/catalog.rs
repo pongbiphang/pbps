@@ -2370,31 +2370,41 @@ pub struct NameOccupant {
     pub owner_column: Option<String>,
 }
 
-/// The [`NameOccupant`]s at `names`, read in the caller's transaction.
+/// The [`NameOccupant`]s at `names`, and those `owners` own (their indexes
+/// and owned sequences), read in the caller's transaction. The owners' are
+/// what a cross-schema rename carries into its destination (#1084).
 pub async fn relation_name_occupants(
     conn: &mut Conn,
     names: &[TableName],
+    owners: &[TableName],
 ) -> Result<Vec<NameOccupant>, DbError> {
-    if names.is_empty() {
+    if names.is_empty() && owners.is_empty() {
         return Ok(Vec::new());
     }
     let params: Vec<Param<'_>> = names
         .iter()
+        .chain(owners)
         .flat_map(|n| [Param::Str(n.schema.as_str()), Param::Str(n.name.as_str())])
         .collect();
-    let values: Vec<String> = (0..names.len())
-        .map(|i| format!("(${}::text, ${}::text)", 2 * i + 1, 2 * i + 2))
-        .collect();
+    // `VALUES` cannot be empty: an empty list is a query of no rows.
+    let values = |from: usize, count: usize| {
+        if count == 0 {
+            return "SELECT NULL::text, NULL::text WHERE false".to_owned();
+        }
+        let rows: Vec<String> = (from..from + count)
+            .map(|i| format!("(${}::text, ${}::text)", 2 * i + 1, 2 * i + 2))
+            .collect();
+        format!("VALUES {}", rows.join(", "))
+    };
     let sql = format!(
-        "WITH wanted(schema_name, relation_name) AS (VALUES {})\n\
+        "WITH wanted(schema_name, relation_name) AS ({}),\n     \
+              owners(schema_name, table_name) AS ({})\n\
          SELECT n.nspname AS schema_name, c.relname AS relation_name,\n       \
                 c.relkind::text AS relkind,\n       \
                 ownns.nspname AS owner_schema, own.relname AS owner_name,\n       \
                 att.attname AS owner_column\n  \
-           FROM wanted w\n  \
-           JOIN pg_catalog.pg_namespace n ON n.nspname = w.schema_name\n  \
-           JOIN pg_catalog.pg_class c\n    \
-             ON c.relnamespace = n.oid AND c.relname = w.relation_name\n  \
+           FROM pg_catalog.pg_class c\n  \
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n  \
            LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid\n  \
            LEFT JOIN pg_catalog.pg_depend d\n    \
              ON c.relkind = 'S'\n   \
@@ -2407,8 +2417,13 @@ pub async fn relation_name_occupants(
            LEFT JOIN pg_catalog.pg_namespace ownns ON ownns.oid = own.relnamespace\n  \
            LEFT JOIN pg_catalog.pg_attribute att\n    \
              ON att.attrelid = d.refobjid AND att.attnum = d.refobjsubid AND d.refobjsubid > 0\n \
-          WHERE c.relkind IN ('S', 'i', 'I', 'c')",
-        values.join(", ")
+          WHERE c.relkind IN ('S', 'i', 'I', 'c')\n   \
+            AND (EXISTS (SELECT 1 FROM wanted w\n                  \
+                          WHERE w.schema_name = n.nspname AND w.relation_name = c.relname)\n        \
+                 OR EXISTS (SELECT 1 FROM owners o\n                     \
+                             WHERE o.schema_name = ownns.nspname AND o.table_name = own.relname))",
+        values(0, names.len()),
+        values(names.len(), owners.len())
     );
     let mut out = Vec::new();
     for row in &conn.query_with(&sql, &params).await? {

@@ -402,7 +402,7 @@ pub(crate) fn refuse_uninventoried_occupants(
             || o.owner.as_ref().is_some_and(|t| released.contains(t))
             || matches!((&o.owner, &o.owner_column), (Some(t), Some(c)) if dropped_columns.contains(&(t.clone(), c.as_str())))
     };
-    let taken: Vec<String> = created_relation_names(cs)
+    let mut taken: Vec<String> = created_relation_names(cs)
         .iter()
         .flat_map(|name| {
             occupants
@@ -418,6 +418,36 @@ pub(crate) fn refuse_uninventoried_occupants(
                 })
         })
         .collect();
+    // And what a cross-schema rename carries into its destination (#1084):
+    // `SET SCHEMA` moves a table's indexes and owned sequences along under
+    // their own names, before any table or view is created. One the plan
+    // drops first stays behind, as above.
+    let created: BTreeSet<TableName> = created_relation_names(cs).into_iter().collect();
+    let still_owned = |o: &pbps_pg::catalog::NameOccupant| {
+        !freed.contains(&o.name)
+            && !matches!((&o.owner, &o.owner_column), (Some(t), Some(c)) if dropped_columns.contains(&(t.clone(), c.as_str())))
+    };
+    for p in &cs.changes {
+        let Change::RenameTable { from, to, .. } = &p.change else {
+            continue;
+        };
+        if from.schema == to.schema {
+            continue;
+        }
+        for o in occupants
+            .iter()
+            .filter(|o| o.owner.as_ref() == Some(from) && still_owned(o))
+        {
+            let carried = TableName::new(to.schema.clone(), o.name.name.clone());
+            if created.contains(&carried) {
+                taken.push(format!(
+                    "`{carried}`: this plan moves {} `{}` on `{from}` there first, with the \
+                     rename of `{from}` to `{to}`",
+                    o.kind, o.name
+                ));
+            }
+        }
+    }
     if taken.is_empty() {
         return Ok(());
     }
@@ -428,6 +458,22 @@ pub(crate) fn refuse_uninventoried_occupants(
         taken.len(),
         taken.join("\n  ")
     );
+}
+
+/// The tables this plan moves to another schema, by the catalog's names for
+/// them: `SET SCHEMA` carries their indexes and owned sequences along
+/// (#1084), so the occupant read asks what each of them owns.
+// The complement is every change that moves no table between schemas.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub(crate) fn transferred_tables(cs: &pbps_model::ChangeSet) -> Vec<TableName> {
+    use pbps_model::Change;
+    cs.changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::RenameTable { from, to, .. } if from.schema != to.schema => Some(from.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The `sys.objects` names this plan creates on SQL Server: its tables, and
@@ -8210,6 +8256,128 @@ mod tests {
         assert_eq!(
             created_object_names(&trigger),
             [TableName::new("sales", "tr")]
+        );
+    }
+
+    /// #1084: a cross-schema rename carries its table's indexes and owned
+    /// sequences into the destination schema under their own names, before
+    /// any table is created. A created name there that meets one refuses the
+    /// plan, naming the object and the rename. Negatives: a rename within
+    /// the schema carries nothing out; a sequence whose column the plan
+    /// drops, and an index it drops, stay behind; and a name nothing lands
+    /// on is free.
+    #[test]
+    fn a_cross_schema_rename_carries_what_its_table_owns() {
+        use pbps_model::{Change, ChangeSet, ColumnRef, PlannedChange};
+        use pbps_pg::catalog::NameOccupant;
+        let old = TableName::new("app", "old");
+        let carried = TableName::new("archive", "old_n_seq");
+        let rename = |to: TableName| {
+            PlannedChange::new(Change::RenameTable {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "app.old", 0),
+                from: old.clone(),
+                to,
+                defaults: Vec::new(),
+            })
+        };
+        let create = |name: &TableName| {
+            PlannedChange::new(Change::CreateTable {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "archive.x", 0),
+                name: name.clone(),
+                table: Box::default(),
+            })
+        };
+        let sequence = NameOccupant {
+            name: TableName::new("app", "old_n_seq"),
+            kind: "sequence",
+            owner: Some(old.clone()),
+            owner_column: Some("n".into()),
+        };
+        let index = NameOccupant {
+            name: TableName::new("app", "old_n_seq"),
+            kind: "index",
+            owner: Some(old.clone()),
+            owner_column: None,
+        };
+        let plan = |changes: Vec<PlannedChange>| ChangeSet { changes };
+        let to_archive = || rename(TableName::new("archive", "new"));
+
+        let e = refuse_uninventoried_occupants(
+            &plan(vec![to_archive(), create(&carried)]),
+            std::slice::from_ref(&sequence),
+            "prod",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains(
+                "`archive.old_n_seq`: this plan moves sequence `app.old_n_seq` on `app.old` \
+                 there first, with the rename of `app.old` to `archive.new`"
+            ),
+            "{e}"
+        );
+        assert!(
+            refuse_uninventoried_occupants(
+                &plan(vec![to_archive(), create(&carried)]),
+                std::slice::from_ref(&index),
+                "prod"
+            )
+            .is_err(),
+            "an index is carried too"
+        );
+
+        // Within the schema: nothing leaves `app`.
+        refuse_uninventoried_occupants(
+            &plan(vec![rename(TableName::new("app", "new")), create(&carried)]),
+            std::slice::from_ref(&sequence),
+            "prod",
+        )
+        .expect("a same-schema rename carries nothing into archive");
+        // Dropped first: the column takes its sequence, the drop its index.
+        refuse_uninventoried_occupants(
+            &plan(vec![
+                to_archive(),
+                PlannedChange::new(Change::DropColumn {
+                    uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "app.old.n", 0),
+                    column: ColumnRef {
+                        table: TableName::new("archive", "new"),
+                        name: "n".into(),
+                    },
+                }),
+                create(&carried),
+            ]),
+            std::slice::from_ref(&sequence),
+            "prod",
+        )
+        .expect("the column's drop takes its sequence");
+        refuse_uninventoried_occupants(
+            &plan(vec![
+                to_archive(),
+                PlannedChange::new(Change::DropIndex {
+                    table: TableName::new("archive", "new"),
+                    name: "old_n_seq".into(),
+                }),
+                create(&carried),
+            ]),
+            std::slice::from_ref(&index),
+            "prod",
+        )
+        .expect("the index is dropped before the table is created");
+        refuse_uninventoried_occupants(
+            &plan(vec![
+                to_archive(),
+                create(&TableName::new("archive", "free")),
+            ]),
+            std::slice::from_ref(&sequence),
+            "prod",
+        )
+        .expect("a name nothing lands on is free");
+        assert_eq!(
+            transferred_tables(&plan(vec![
+                to_archive(),
+                rename(TableName::new("app", "x"))
+            ])),
+            std::slice::from_ref(&old)
         );
     }
 

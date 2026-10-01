@@ -563,6 +563,7 @@ pub async fn refuse_created_name_occupants(
             let occupants = pbps_pg::catalog::relation_name_occupants(
                 conn,
                 &crate::deploy::created_relation_names(cs),
+                &crate::deploy::transferred_tables(cs),
             )
             .await?;
             crate::deploy::refuse_uninventoried_occupants(cs, &occupants, label)
