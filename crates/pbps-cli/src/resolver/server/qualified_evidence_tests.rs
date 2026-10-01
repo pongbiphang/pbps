@@ -5395,3 +5395,536 @@ async fn direct_schema_option_beats_inherited_owner_for_the_typed_grant() {
 async fn combined_schema_grant_uses_one_inherited_grantor_for_its_whole_mask() {
     schema_grantor_case(SchemaGrantorRoute::WholeStatementInheritedDelegate).await;
 }
+
+#[derive(Clone, Copy)]
+enum GenerationCase {
+    SetExpression,
+    AddStored,
+}
+
+async fn generation_producer_case(case: GenerationCase) {
+    use pbps_db::fingerprint::EnvironmentFingerprintKey;
+    use pbps_model::{Column, Generated};
+
+    let set_expression = matches!(case, GenerationCase::SetExpression);
+    let expected_major = if set_expression { 18 } else { 16 };
+    let case_name = if set_expression {
+        "pg18-set-expression"
+    } else {
+        "pg16-add-stored"
+    };
+    let table = pbps_model::TableName::new(cases::SCHEMA, "t");
+    let base = generation_schema(&table);
+    let mut desired = base.clone();
+    let columns = &mut desired.tables.get_mut(&table).unwrap().columns;
+    if set_expression {
+        columns["g"].generated.as_mut().unwrap().expression = "a * 3".into();
+    } else {
+        let mut h = Column::new("integer".parse().unwrap());
+        h.generated = Some(Generated {
+            expression: "a + 4".into(),
+            stored: true,
+        });
+        columns.insert("h".into(), h);
+    }
+    let inputs = Inputs::from_pair((base, desired));
+    let key = ProjectKey::new(true);
+    setup(&[
+        "CREATE SCHEMA pbps_evidence1274",
+        "GRANT USAGE, CREATE ON SCHEMA pbps_evidence1274 TO pbps_native_alt",
+        "CREATE TABLE pbps_evidence1274.t (a integer, \
+         g integer GENERATED ALWAYS AS (a * 2 + 1) STORED, d integer DEFAULT 7)",
+        "ALTER TABLE pbps_evidence1274.t OWNER TO pbps_native_alt",
+        "INSERT INTO pbps_evidence1274.t (a) VALUES (5)",
+    ])
+    .await;
+    const MEMBERSHIP: &str = "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members m \
+        JOIN pg_catalog.pg_roles granted ON granted.oid = m.roleid \
+        JOIN pg_catalog.pg_roles member ON member.oid = m.member \
+        WHERE granted.rolname = 'pg_read_all_settings' \
+          AND member.rolname = 'pbps_native_alt') AS member";
+    const PRINCIPAL: &str = "SELECT current_user::text AS effective, \
+        session_user::text AS login, pg_catalog.current_setting('is_superuser') AS superuser, \
+        r.rolsuper, r.rolcreatedb, r.rolcreaterole \
+        FROM pg_catalog.pg_roles r WHERE r.rolname = current_user";
+    // Raw addresses are observed only to distinguish replacement from retention;
+    // the saved evidence must use logical objects and recorded UIDs instead.
+    const INVENTORY: &str = "SELECT json_agg(row_to_json(x) ORDER BY x.name)::text AS inventory \
+        FROM (SELECT c.oid::int8 AS table_oid, a.attname::text AS name, \
+        a.attnum::int8 AS column_number, a.attgenerated::text AS generated, \
+        ad.oid::int8 AS attrdef_oid, \
+        (SELECT count(*) FROM pg_catalog.pg_depend p \
+         WHERE p.classid = 'pg_catalog.pg_attrdef'::regclass AND p.objid = ad.oid \
+           AND p.refclassid = 'pg_catalog.pg_class'::regclass AND p.refobjid = c.oid \
+           AND p.refobjsubid = a.attnum AND p.deptype = 'i') AS internal_owner, \
+        (SELECT count(*) FROM pg_catalog.pg_depend p \
+         JOIN pg_catalog.pg_attribute input ON input.attrelid = c.oid \
+          AND input.attname = 'a' AND input.attnum = p.refobjsubid \
+         WHERE p.classid = 'pg_catalog.pg_attrdef'::regclass AND p.objid = ad.oid \
+           AND p.refclassid = 'pg_catalog.pg_class'::regclass AND p.refobjid = c.oid \
+           AND p.deptype = 'n') AS input_reference \
+        FROM pg_catalog.pg_class c JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid \
+        LEFT JOIN pg_catalog.pg_attrdef ad ON ad.adrelid = c.oid AND ad.adnum = a.attnum \
+        WHERE c.oid = 'pbps_evidence1274.t'::regclass \
+          AND a.attnum > 0 AND NOT a.attisdropped) x";
+    let mut peer = PeerVerifiedConn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    let membership = peer.query(MEMBERSHIP).await.unwrap();
+    let had_settings = membership[0].try_get::<bool>("member").unwrap().unwrap();
+    if !had_settings {
+        peer.query("GRANT pg_read_all_settings TO pbps_native_alt")
+            .await
+            .unwrap();
+    }
+    peer.query("SET ROLE pbps_native_alt").await.unwrap();
+    let target_principal = peer.query(PRINCIPAL).await.unwrap();
+    let before_catalog = peer.query(INVENTORY).await.unwrap();
+    let before_catalog = before_catalog[0]
+        .try_get::<&str>("inventory")
+        .unwrap()
+        .unwrap()
+        .to_owned();
+    let before_values = peer
+        .query("SELECT json_build_array(a, g, d)::text AS values FROM pbps_evidence1274.t")
+        .await
+        .unwrap();
+    let before_values = before_values[0]
+        .try_get::<&str>("values")
+        .unwrap()
+        .unwrap()
+        .to_owned();
+    let mut target = NativeTarget::establish(
+        peer,
+        std::env::var("PBPS_NATIVE_SERVICE_PID")
+            .unwrap()
+            .parse()
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let mut owned = Some(ObservedContainers::begin());
+    let mut run = open(Profile::Container, &mut target).await;
+    let result = run
+        .plan_resolved(
+            &mut target,
+            &inputs.binding(),
+            inputs.base(),
+            inputs.desired(),
+            &inputs.hints,
+            &[],
+            &key.project,
+            Some(ENVIRONMENT),
+        )
+        .await;
+    // Read the retained qualification and that very scratch connection; the
+    // fixture's major selector is not evidence of either running engine.
+    let observations = async {
+        run.check(&mut target).await?;
+        let sealed = run.scope.as_ref().ok_or(Error::Cancelled)?;
+        let versions = [
+            sealed
+                .target
+                .catalog
+                .observations
+                .get("server_version_num")
+                .cloned()
+                .ok_or_else(|| Error::Scope("target version was not reported".into()))?,
+            sealed
+                .scratch_facts
+                .catalog
+                .observations
+                .get("server_version_num")
+                .cloned()
+                .ok_or_else(|| Error::Scope("scratch version was not reported".into()))?,
+        ];
+        let deployer = sealed
+            .map
+            .deployer(&sealed.authorization_context)
+            .map_err(|reason| Error::Scope(reason.into()))?;
+        let scratch_login = run.names.login().to_owned();
+        let scratch = run.scratch.as_mut().ok_or(Error::Cancelled)?;
+        if scratch.connection().id() != sealed.scratch_connection {
+            return Err(Error::Scope(
+                "generation observation changed its connection".into(),
+            ));
+        }
+        let principal = scratch
+            .connection_mut()
+            .query(PRINCIPAL)
+            .await
+            .map_err(|error| Error::Scope(error.to_string()))?;
+        Ok((versions, deployer, scratch_login, principal))
+    }
+    .await;
+    close(&mut run, &mut owned).await;
+    // Even a producer/reader refusal must restore the temporary target grant
+    // before the intended property failure is reported.
+    let outcome = async {
+        let result = result.map_err(|error| error.to_string())?;
+        let observations = observations.map_err(|error| error.to_string())?;
+        result
+            .evidence
+            .validate(&result.changes)
+            .map_err(|error| error.to_string())?;
+        pbps_pg::resolver::validate_evidence(&result.evidence)
+            .map_err(|error| error.to_string())?;
+        let artifact = SavedPlan::new(
+            PlanOrigin::Database,
+            "postgres",
+            "1274 native generated column",
+            PlanBaseline {
+                description: "independent generated-column target".into(),
+                checksum: "00".repeat(32),
+                database_collation: None,
+            },
+            result.changes,
+            inputs.desired_ids.clone(),
+        )
+        .with_resolution(result.evidence)
+        .map_err(|error| error.to_string())?;
+        let serialized = serde_json::to_string(&artifact).map_err(|error| error.to_string())?;
+        let restored: SavedPlan =
+            serde_json::from_str(&serialized).map_err(|error| error.to_string())?;
+        restored
+            .validate_analysis()
+            .map_err(|error| error.to_string())?;
+        let PlanAnalysis::Resolved(evidence) = &restored.analysis else {
+            return Err("roundtrip lost the generated-column evidence".into());
+        };
+        pbps_pg::resolver::validate_evidence(evidence).map_err(|error| error.to_string())?;
+        let mut writer = pbps_db::Conn::connect(
+            Driver::Postgres,
+            &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        writer
+            .execute("SET ROLE pbps_native_alt")
+            .await
+            .map_err(|error| error.to_string())?;
+        let writer_principal = writer
+            .query(PRINCIPAL)
+            .await
+            .map_err(|error| error.to_string())?;
+        execute_plan(&mut writer, &restored.changes).await;
+        let after_catalog = writer
+            .query(INVENTORY)
+            .await
+            .map_err(|error| error.to_string())?;
+        let values_sql = if set_expression {
+            "SELECT json_build_array(a, g, d)::text AS values FROM pbps_evidence1274.t"
+        } else {
+            "SELECT json_build_array(a, g, d, h)::text AS values FROM pbps_evidence1274.t"
+        };
+        let after_values = writer
+            .query(values_sql)
+            .await
+            .map_err(|error| error.to_string())?;
+        drop(writer);
+        let selected = EnvironmentFingerprintKey::from_file(&key.root.join("key"))
+            .map_err(|error| error.to_string())?;
+        let (_, observed) = target
+            .capture_postgres_sealed(
+                &catalog_scope(evidence.after().scope()),
+                &Default::default(),
+                &selected,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        target.check().await.map_err(|error| error.to_string())?;
+        Ok::<_, String>((
+            artifact,
+            restored,
+            observations,
+            writer_principal,
+            after_catalog,
+            after_values,
+            observed,
+        ))
+    }
+    .await;
+    drop(run);
+    drop(target);
+    let mut admin = PeerVerifiedConn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    if !had_settings {
+        admin
+            .query("REVOKE pg_read_all_settings FROM pbps_native_alt")
+            .await
+            .unwrap();
+    }
+    let restored_membership = admin.query(MEMBERSHIP).await.unwrap();
+    drop(admin);
+    setup(&[]).await;
+
+    let (
+        artifact,
+        restored,
+        (versions, deployer, scratch_login, scratch_principal),
+        writer_principal,
+        after_catalog,
+        after_values,
+        observed,
+    ) = outcome
+        .expect("the generated-column producer, artifact reader and typed apply must succeed");
+    assert_eq!(
+        restored_membership[0].try_get::<bool>("member").unwrap(),
+        Some(had_settings)
+    );
+    for (side, version) in ["target", "scratch"].into_iter().zip(versions) {
+        let numeric = version
+            .value()
+            .expect("qualification reported an actual numeric version")
+            .parse::<i64>()
+            .unwrap();
+        assert_eq!(numeric / 10_000, expected_major, "{side} actual major");
+        eprintln!(
+            "PBPS1274_GENERATION {}",
+            serde_json::json!({
+                "case": case_name,
+                "phase": "qualified",
+                "side": side,
+                "server_version_num": numeric,
+                "observed_major": numeric / 10_000,
+            })
+        );
+    }
+    for (side, rows, effective, login) in [
+        ("target", &target_principal, "pbps_native_alt", "postgres"),
+        (
+            "scratch",
+            &scratch_principal,
+            deployer.as_deref().unwrap(),
+            scratch_login.as_str(),
+        ),
+        ("writer", &writer_principal, "pbps_native_alt", "postgres"),
+    ] {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].try_get::<&str>("effective").unwrap(),
+            Some(effective)
+        );
+        assert_eq!(rows[0].try_get::<&str>("login").unwrap(), Some(login));
+        assert_eq!(rows[0].try_get::<&str>("superuser").unwrap(), Some("off"));
+        for flag in ["rolsuper", "rolcreatedb", "rolcreaterole"] {
+            assert_eq!(
+                rows[0].try_get::<bool>(flag).unwrap(),
+                Some(false),
+                "{side} {flag}"
+            );
+        }
+        eprintln!("generation_principal side={side} effective={effective} login={login} ordinary=true");
+    }
+    let before: Value = serde_json::from_str(&before_catalog).unwrap();
+    let after: Value = serde_json::from_str(
+        after_catalog[0]
+            .try_get::<&str>("inventory")
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let before_values: Value = serde_json::from_str(&before_values).unwrap();
+    let after_values: Value =
+        serde_json::from_str(after_values[0].try_get::<&str>("values").unwrap().unwrap()).unwrap();
+    eprintln!(
+        "PBPS1274_GENERATION {}",
+        serde_json::json!({
+            "case": case_name,
+            "phase": "observed",
+            "before_catalog": before,
+            "after_catalog": after,
+            "before_values": {"a": before_values[0], "g": before_values[1], "d": before_values[2]},
+            "after_values": after_values,
+            "after_value_columns": if set_expression { vec!["a", "g", "d"] } else { vec!["a", "g", "d", "h"] },
+        })
+    );
+    assert_eq!(restored.checksum(), artifact.checksum());
+    let PlanAnalysis::Resolved(evidence) = &restored.analysis else {
+        unreachable!()
+    };
+    assert_eq!(
+        restored.ids.table_uid(&table),
+        inputs.base_ids.table_uid(&table)
+    );
+    for name in ["a", "g", "d"] {
+        assert_eq!(
+            restored.ids.column_uid(&table.column(name)),
+            inputs.base_ids.column_uid(&table.column(name))
+        );
+    }
+    assert_eq!(
+        restored.changes.changes.len(),
+        1,
+        "one typed generated-column change"
+    );
+    let changed = &restored.changes.changes[0].change;
+    if set_expression {
+        assert!(matches!(changed, Change::AlterColumnExpression { uid, column, from, to }
+            if Some(uid) == inputs.base_ids.column_uid(&table.column("g"))
+                && column == &table.column("g") && from == "a * 2 + 1" && to == "a * 3"));
+    } else {
+        assert!(matches!(changed, Change::AddColumn { uid, table: selected, name, column }
+            if Some(uid) == restored.ids.column_uid(&table.column("h"))
+                && selected == &table && name == "h"
+                && column.as_ref() == &inputs.desired.tables[&table].columns["h"]));
+    }
+    let required = if set_expression {
+        vec!["g", "d"]
+    } else {
+        vec!["g", "d", "h"]
+    };
+    assert_eq!(evidence.surfaces().len(), required.len());
+    for name in required {
+        let [column, attrdef, owner, reference] = generation_objects(&table, name);
+        let surface = Surface::Default(table.column(name));
+        let resolutions: Vec<_> = evidence
+            .surfaces()
+            .iter()
+            .filter(|row| row.surface == surface)
+            .collect();
+        assert_eq!(resolutions.len(), 1, "one required {name} attrdef surface");
+        assert_eq!(resolutions[0].current.is_some(), name != "h");
+        if let Some(current) = &resolutions[0].current {
+            assert_eq!(current.object, attrdef);
+        }
+        assert_eq!(resolutions[0].desired.as_ref().unwrap().object, attrdef);
+        for (opening, manifest) in [(true, evidence.before()), (false, evidence.after())] {
+            let objects = if name == "d" {
+                vec![attrdef.clone()]
+            } else {
+                vec![attrdef.clone(), owner.clone(), reference.clone()]
+            };
+            for object in objects {
+                let records: Vec<_> = manifest
+                    .prerequisites()
+                    .iter()
+                    .filter(|row| row.object == object)
+                    .collect();
+                if opening && name == "h" {
+                    assert!(records.is_empty());
+                } else {
+                    assert_eq!(records.len(), 1, "exact child inventory for {name}: {object:?}");
+                    assert_eq!(records[0].ownership, ObjectOwnership::Surface(surface.clone()));
+                }
+            }
+            let columns: Vec<_> = manifest
+                .prerequisites()
+                .iter()
+                .filter(|row| row.object == column)
+                .collect();
+            assert_eq!(columns.len(), usize::from(!opening || name != "h"));
+            if let Some(record) = columns.first() {
+                assert_eq!(
+                    record.ownership,
+                    ObjectOwnership::Surface(Surface::Column(table.column(name)))
+                );
+            }
+        }
+    }
+    let expected = evidence.after().prerequisites();
+    assert_eq!(
+        expected.len(),
+        observed.prerequisites().len(),
+        "complete fresh closing inventory"
+    );
+    for record in expected {
+        let actual = observed
+            .prerequisites()
+            .iter()
+            .find(|row| row.object == record.object)
+            .unwrap();
+        assert_eq!(
+            record.properties, actual.properties,
+            "closing properties: {:?}", record.object
+        );
+        assert_eq!(
+            record.bindings, actual.bindings,
+            "closing bindings: {:?}", record.object
+        );
+    }
+    assert_eq!(before.as_array().unwrap().len(), 3);
+    assert_eq!(
+        after.as_array().unwrap().len(),
+        if set_expression { 3 } else { 4 }
+    );
+    for old in before.as_array().unwrap() {
+        let new = after
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == old["name"])
+            .unwrap();
+        assert_eq!(old["table_oid"], new["table_oid"]);
+        assert_eq!(old["column_number"], new["column_number"]);
+        if old["name"] == "g" && set_expression {
+            assert_ne!(
+                old["attrdef_oid"], new["attrdef_oid"],
+                "actual SET EXPRESSION replaces attrdef"
+            );
+        }
+        if old["name"] == "d" {
+            assert_eq!(old["attrdef_oid"], new["attrdef_oid"]);
+        }
+    }
+    for inventory in [&before, &after] {
+        for row in inventory
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["name"] == "g" || row["name"] == "h")
+        {
+            assert_eq!(row["generated"], "s");
+            assert!(row["attrdef_oid"].as_i64().unwrap() > 0);
+            assert_eq!(row["internal_owner"], 1);
+            assert_eq!(row["input_reference"], 1);
+        }
+    }
+    assert_eq!(before_values, serde_json::json!([5, 11, 7]));
+    assert_eq!(
+        after_values,
+        if set_expression {
+            serde_json::json!([5, 15, 7])
+        } else {
+            serde_json::json!([5, 11, 7, 9])
+        }
+    );
+    eprintln!(
+        "PBPS1274_GENERATION {}",
+        serde_json::json!({
+            "case": case_name,
+            "phase": "passed",
+            "properties": [
+                "qualified-ordinary-target-and-scratch",
+                "exact-generated-default-ownership-and-inventory",
+                "retained-recorded-table-and-column-uids",
+                "actual-typed-change",
+                "adapter-reader",
+                "saved-plan-roundtrip",
+                "typed-apply",
+                "complete-fresh-closing-capture",
+                "actual-catalog-and-values",
+                "normal-product-cleanup-and-restored-membership",
+            ],
+        })
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn the_pg18_producer_projects_the_replaced_generated_attrdef_and_preserves_column_identity() {
+    generation_producer_case(GenerationCase::SetExpression).await;
+}
+
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn the_pg16_producer_adds_stored_generation_and_retains_existing_generated_bindings() {
+    generation_producer_case(GenerationCase::AddStored).await;
+}
