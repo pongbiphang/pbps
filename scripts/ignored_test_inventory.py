@@ -1042,9 +1042,13 @@ def workflow_runs(source, job, platform=None):
         for line in block[1].splitlines():
             axis = re.fullmatch(r"        ([\w-]+): \[([^\]]*)\]\s*", line)
             require(axis is not None, f"unsupported matrix line needs an explicit audit: {job}: {line.strip()}")
-            values = {x.strip().strip("'\"") for x in axis[2].split(",")}
-            require(values and "" not in values, f"owner matrix has no known executed variant: {job}")
-            axes[axis[1]] = values
+            require(axis[2].strip(), f"owner matrix has no known executed variant: {job}")
+            # Only plain tokens: a quoted value may hold a comma, and splitting
+            # one would invent variants that never run.
+            values = [x.strip() for x in axis[2].split(",")]
+            require(all(re.fullmatch(r"[\w.-]+", v) for v in values),
+                    f"unsupported matrix value needs an explicit audit: {job}: {line.strip()}")
+            axes[axis[1]] = set(values)
         require(axes, f"owner matrix has no known executed variant: {job}")
     for step in steps:
         condition = re.search(r"^        if: (.+)$", step, re.M)

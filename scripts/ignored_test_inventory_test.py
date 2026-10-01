@@ -153,7 +153,8 @@ class Ownership(unittest.TestCase):
                     self.check()
 
     def test_a_matrix_axis_the_audit_cannot_read_is_refused(self):
-        for axis in ("suite: ${{ fromJSON(needs.plan.outputs.suites) }}", "suite:\n          - a"):
+        for axis in ("suite: ${{ fromJSON(needs.plan.outputs.suites) }}", "suite:\n          - a",
+                     "suite: ['a,b']", "suite: [\"a,b\"]", "suite: [a, 'b']", "suite: [a, ]"):
             with self.subTest(axis=axis):
                 self.workflow.write_text(WORKFLOW.replace(
                     "    steps:", "    strategy:\n      matrix:\n        " + axis + "\n    steps:"))
