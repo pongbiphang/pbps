@@ -1523,6 +1523,12 @@ fn parent<'a>(x: &'a str) { let c = '}'; { real(x); } }
                 self.assertNotIn("TESTS", audit.python_values(audit.ast.parse(source)))
 
     def test_stale_selector_refusal_agrees_with_real_python_execution(self):
+        # Each witness runs under whatever interpreter runs this suite, so it
+        # is spelled to mean the same on all of them. The inventory itself
+        # reads source with `ast` under CI's pinned Python (3.12), and from
+        # 3.14 a module's `__annotations__` is no longer a global (PEP
+        # 649/749): `inspect.get_annotations` reaches the same evaluated
+        # `TESTS` list on both (#1319).
         variants = (
             'TESTS = dynamic_cases()', 'del TESTS', 'TESTS: list = []',
             'TESTS, other = [], None', 'TESTS = other = []',
@@ -1531,7 +1537,8 @@ fn parent<'a>(x: &'a str) { let c = '}'; { real(x); } }
             'BOX = {"tests": TESTS}\nBOX["tests"].clear()',
             'other = (TESTS := [])',
             'def helper() -> TESTS:\n    pass\nhelper.__annotations__["return"].clear()',
-            'annotation: TESTS\n__annotations__["annotation"].clear()',
+            'annotation: TESTS\nimport inspect, sys\n'
+            'inspect.get_annotations(sys.modules[__name__])["annotation"].clear()',
             'globals()["TESTS"] = []', 'exec("TESTS = []")',
             'namespace = locals()\nnamespace["TESTS"] = []',
         )
