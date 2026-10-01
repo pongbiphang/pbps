@@ -6157,11 +6157,13 @@ mod column_vector_parent {
                         .unwrap()
                         .columns
                         .shift_remove("g");
-                    let desired_ids = ids(&desired, &base_ids);
+                    let uid = base_ids.column_uid(&table.column("g")).unwrap().clone();
+                    let mut desired_ids = base_ids.clone();
+                    desired_ids.columns.remove(&uid);
                     let objects = generation_objects(&table, "g");
                     (
                         Change::DropColumn {
-                            uid: base_ids.column_uid(&table.column("g")).unwrap().clone(),
+                            uid,
                             column: table.column("g"),
                         },
                         Surface::Column(table.column("g")),
