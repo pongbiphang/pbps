@@ -264,7 +264,7 @@ one class and the dependents a class cannot see.
 | S: key, index, check or foreign key over a column → its retype or recollation | fixed | dropped in class 2, re-added in 13 (`retype_dependents`) | ✓ #1175, DECISIONS 515 |
 | **S: index key, `INCLUDE` column, filtered predicate or unique constraint over a column → tightening its nullability** | fixed | nothing is dropped: the `ALTER COLUMN … NOT NULL` is refused (5074, 4922), measured on 17.0 (`tightening_nullability_is_refused_by_what_indexes_the_column`) | **✗ #1363** |
 | P: generated column → retype or drop of its input | fixed | refused by name, with a two-plan remedy | ✓ DEC-1168.1, #1316 |
-| S: old default → retype | fixed | dependency rank −2 before −1 | ✓ |
+| Old default removed → retype → new default set | fixed | dependency ranks −2, −1, 0 inside class 9. S: the old default blocks the retype (5074). Both: a default written for the new type is invalid under the old one | ✓ (`a_default_written_for_the_new_type_is_set_after_the_type_is`) |
 | `Revoke` on an object the plan drops | fixed | not emitted | ✓ |
 
 ### Values one change writes and a later one reads
@@ -291,7 +291,7 @@ and update (SPEC §4.6).
 | Parent row → child row (insert, update) | fixed | data rank inside class 11 | ✓ |
 | Child `DeleteRow` → parent `DeleteRow` | fixed | the data rank, negated inside class 12 | ✓ |
 | Row update moving a reference away → `DeleteRow` of the old parent | fixed | class 11 before 12 | ✓ |
-| `InsertRow` reusing a value another row holds under a UNIQUE elsewhere → `DeleteRow` of that row | content | insert first (class 11 before 12): the insert is refused inside the transaction, loudly. Deleting first could cascade a moving child away silently | ✓ by design, SPEC §4.6 |
+| `InsertRow` or `UpdateRow` taking a value another row holds under a UNIQUE elsewhere → `DeleteRow` of that row | content | the write first (class 11 before 12): it is refused inside the transaction, loudly. Deleting first could cascade a moving child away silently | ✓ by design, SPEC §4.6 |
 
 ## Content-dependent pairs
 
