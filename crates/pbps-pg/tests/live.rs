@@ -23710,6 +23710,7 @@ async fn relation_name_occupants_name_each_kind_and_its_owner() {
             name("free"),
             name("t"),
         ],
+        &[],
     )
     .await
     .expect("the read");
@@ -23739,6 +23740,24 @@ async fn relation_name_occupants_name_each_kind_and_its_owner() {
             ),
         ],
         "a table and a free name are not occupants here"
+    );
+    // By owner (#1084): what `t` owns, and nothing that stands on its own.
+    let mut owned = relation_name_occupants(&mut conn, &[], &[name("t")])
+        .await
+        .expect("the owner read");
+    owned.sort_by(|a, b| a.name.cmp(&b.name));
+    assert_eq!(
+        owned
+            .iter()
+            .map(|o| (o.name.name.as_str(), o.kind))
+            .collect::<Vec<_>>(),
+        [("ix", "index"), ("t_n_seq", "sequence")]
+    );
+    assert!(
+        relation_name_occupants(&mut conn, &[], &[name("free")])
+            .await
+            .expect("an owner the catalog does not have")
+            .is_empty()
     );
     conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
         .await

@@ -1706,6 +1706,63 @@ fn a_view_kept_on_a_function_dropped_for_good_refuses_the_plan_by_name() {
     succeeds(d.run(&["verify", "--db", connection]));
 }
 
+/// #1084: a cross-schema rename carries its table's owned sequence into
+/// the destination schema under the sequence's own name, before any table is
+/// created. A table declared there at that name refuses the plan by name and
+/// the rename, and no plan is written. Control: the same rename with the new
+/// table at a free name plans and applies.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_sequence_a_schema_transfer_carries_refuses_a_table_at_its_name() {
+    let server = server();
+    let with_identity = |header: &str| {
+        format!(
+            "{header}\ncolumns:\n  id: {{type: integer, nullable: false}}\n  \
+             n: {{type: integer, nullable: false, identity: [1, 1]}}\n"
+        )
+    };
+    // Each case from its own database and project: a declared name the ids
+    // file has recorded cannot simply be taken back.
+    let renamed_beside = |slug: &str, name: &str| {
+        let own = OwnDatabase::new(&server, slug);
+        let connection = own.connection().to_owned();
+        let d = bootstrapped_demo(&connection, slug, &with_identity("table: app.t"));
+        on_server(&connection, "CREATE SCHEMA archive");
+        d.table(&with_identity("table: archive.u\nrenamed_from: app.t"));
+        std::fs::write(
+            d.dir.join(format!("schema/archive.{name}.yml")),
+            format!("table: archive.{name}\ncolumns:\n  id: {{type: integer}}\n"),
+        )
+        .unwrap();
+        (own, connection, d)
+    };
+
+    let (_own, connection, d) = renamed_beside("transfer-carried", "t_n_seq");
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("transfer-plan.json");
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    let err = stderr(&o);
+    assert!(
+        err.contains(
+            "`archive.t_n_seq`: this plan moves sequence `app.t_n_seq` on `app.t` there first, \
+             with the rename of `app.t` to `archive.u`"
+        ),
+        "{err}"
+    );
+    assert!(!plan.exists(), "a refused plan wrote {}", plan.display());
+
+    let (_own, connection, d) = renamed_beside("transfer-free", "free");
+    let plan = connected_artifact(&d, &connection, false);
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--allow", "rename"],
+    ));
+}
+
 /// A sequence or an index already at the name of a table this plan creates
 /// refuses the plan by name, and no plan is written (#951). Both share
 /// PostgreSQL's relation namespace with tables, and neither is in the catalog
