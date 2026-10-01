@@ -261,6 +261,13 @@ pub(crate) fn order(
     // up; a rename into that name waits for it too. And it takes the indexes
     // or constraints it carries out of the source schema, so a rename into
     // one of their names there waits for it as well (review of #1346).
+    // A child the plan drops is gone before the move, so the move does not
+    // release its name; the drop does, through the edges above.
+    let dropped_children: BTreeSet<(TableName, &str)> = planned
+        .iter()
+        .filter_map(|p| dropped_relation(&p.change, indexes, constraints))
+        .map(|(table, name)| (original_name(table), name))
+        .collect();
     let mut chained = false;
     for (to, (rename, from)) in &owners {
         let mut released = vec![(from.clone(), true)];
@@ -270,6 +277,9 @@ pub(crate) fn order(
                 released.extend(
                     carried_names(moving, indexes, constraints)
                         .into_iter()
+                        .filter(|carried| {
+                            !dropped_children.contains(&(from.clone(), carried.as_str()))
+                        })
                         .map(|carried| (TableName::new(from.schema.clone(), carried), true)),
                 );
             }
