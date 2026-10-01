@@ -6493,6 +6493,8 @@ async fn two_pipelines_creating_the_ledger_at_once_both_find_it_there() {
 #[tokio::test]
 #[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
 async fn a_row_type_of_the_ledgers_name_without_the_table_is_still_refused() {
+    // Its own database, not a `TestDb`, but a ledger all the same (#1097).
+    let _no_superuser_login = SUPERUSER_LOGIN.read().await;
     let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("the PostgreSQL 16 fixture");
     for connection in [conn_str(), old] {
         let mut admin = Conn::connect(Driver::Postgres, &connection).await.unwrap();
@@ -29106,6 +29108,8 @@ async fn doctor_reports_an_absent_target_of_a_recorded_only_grant() {
 #[tokio::test]
 #[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
 async fn doctor_reports_maintain_on_an_old_server_for_a_reused_table_name() {
+    // Its own database, not a `TestDb`, but a ledger all the same (#1097).
+    let _no_superuser_login = SUPERUSER_LOGIN.read().await;
     let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("the PostgreSQL 16 fixture");
     let name = format!("pbps_test_maint569_{}", std::process::id());
     for connection in [conn_str(), old] {
