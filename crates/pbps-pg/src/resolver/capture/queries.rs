@@ -20,9 +20,6 @@ pub(super) fn batch(major: u32, selection: Option<&Selection>) -> Result<String>
             let qualified = format!("c.{name}");
             let field = properties::field(class, name, kind)?;
             let expression = match field {
-                Field::Acl => format!(
-                    "CASE WHEN {qualified} IS NULL THEN NULL ELSE (SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('grantor', a.grantor::bigint, 'grantee', a.grantee::bigint, 'privilege_type', a.privilege_type, 'is_grantable', a.is_grantable)), '[]'::jsonb) FROM pg_catalog.aclexplode({qualified}) a) END"
-                ),
                 // regproc's JSON output is a live-cache name. Read the number
                 // and resolve it against this snapshot's pg_proc instead.
                 _ if matches!(kind, "oid" | "regproc") => format!("{qualified}::oid::bigint"),
@@ -44,6 +41,7 @@ pub(super) fn batch(major: u32, selection: Option<&Selection>) -> Result<String>
                 | Field::Columns(_)
                 | Field::Column(_)
                 | Field::Definition
+                | Field::Authorization
                 | Field::Physical
                 | Field::Address => qualified.clone(),
             };
@@ -130,9 +128,6 @@ fn filter(class: &str) -> &'static str {
         "pg_database" => "WHERE c.datname = current_database()",
         "pg_db_role_setting" => {
             "WHERE c.setdatabase = 0 OR c.setdatabase = (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database())"
-        }
-        "pg_shdepend" => {
-            "WHERE c.dbid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database()) OR (c.dbid = 0 AND (c.classid <> 'pg_catalog.pg_database'::regclass OR c.objid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database())))"
         }
         _ => "",
     }

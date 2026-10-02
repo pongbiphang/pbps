@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 fn evidence() -> ResolverEvidence {
     let changes = pbps_model::ChangeSet::default();
     let manifest = InputManifest::new(
-        "postgres-catalog-inputs-v1".into(),
+        capture::INPUT_RULE.into(),
         18,
         "01".repeat(8),
         ReadScope {
@@ -56,9 +56,15 @@ fn saved_evidence_requires_a_supported_adapter_major_and_qualification_rule() {
     validate_evidence(&supported).unwrap();
     let json = serde_json::to_value(&supported).unwrap();
     for (path, value) in [
+        // v1 fingerprinted owners and ACLs; its closing manifests cannot be
+        // compared under the v2 property rule.
         (
             "/before/adapter",
-            serde_json::json!("postgres-catalog-inputs-v2"),
+            serde_json::json!("postgres-catalog-inputs-v1"),
+        ),
+        (
+            "/before/adapter",
+            serde_json::json!("postgres-catalog-inputs-v3"),
         ),
         ("/before/engine_major", serde_json::json!(17)),
         (

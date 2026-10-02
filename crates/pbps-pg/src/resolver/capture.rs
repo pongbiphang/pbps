@@ -79,10 +79,12 @@ pub struct DroppedSignature {
 
 pub use pbps_db::resolver::capture::{CaptureError, Uncovered};
 
-mod creation_acl;
 mod manifest;
 mod ownership;
 pub use manifest::{BindingRecord, CapturedInputs, CompiledCapture, SealError};
+
+/// The canonical property rule every sealed PostgreSQL prerequisite uses.
+pub(crate) const INPUT_RULE: &str = properties::RULE;
 pub use ownership::RecordedOwnership;
 
 mod assess;

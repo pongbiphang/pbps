@@ -107,13 +107,12 @@ impl Catalog {
         let mut signature = Vec::new();
         for &(field, target) in references {
             let oid = number(row, field)?;
-            // Optional schema on a default ACL means database-wide, not an
-            // unreadable schema. Keep that explicit slot in its identity.
+            // An optional zero reference (a setting for every database or
+            // role) is an explicit slot, not an unreadable object.
             signature.push(if oid == 0 {
                 let optional = matches!(
                     (class, field),
-                    ("pg_default_acl", "defaclnamespace")
-                        | ("pg_db_role_setting", "setdatabase" | "setrole")
+                    ("pg_db_role_setting", "setdatabase" | "setrole")
                         | ("pg_operator", "oprleft" | "oprright")
                         | ("pg_constraint", "conrelid" | "contypid")
                 );
@@ -236,15 +235,6 @@ impl Catalog {
                     signature: vec![column],
                 }
             }
-            "pg_default_acl" => self.related(
-                class,
-                row,
-                &[
-                    ("defaclrole", "pg_authid"),
-                    ("defaclnamespace", "pg_namespace"),
-                ],
-                &["defaclobjtype"],
-            )?,
             "pg_auth_members" => self.related(
                 class,
                 row,

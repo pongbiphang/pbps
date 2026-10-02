@@ -1179,3 +1179,25 @@ its closing fingerprint covers the approved grant projection of that same
 observation. Both use the same versioned canonical input and HMAC component,
 so a target-only recheck can compare each phase directly. The final ordered
 grant changes must match the projection request or production refuses.
+
+Authorization metadata is not a binding input, and the producer does not
+predict it. Measured on PostgreSQL 16 and 18, revoking EXECUTE on the chosen
+overload from PUBLIC, giving it to another owner, or revoking every privilege
+on a referenced table and changing its owner leaves the view, default and CHECK
+bindings unchanged. Revoking the deployer's USAGE on an earlier schema does
+change the binding: name lookup skips that schema. Capture rule
+`postgres-catalog-inputs-v2` therefore drops owner and ACL fields, and the
+`pg_shdepend`, `pg_init_privs` and `pg_default_acl` rows, from every
+prerequisite. The deployer's effective schema privileges stay in the
+engine-computed authorization condition. The earlier design fingerprinted that
+metadata, so every transitioned record needed a predicted closing owner, ACL,
+grantor and shared-dependency edge, including the default privileges applied at
+creation. That was a second implementation of PostgreSQL's permission rules: it
+took most of this issue's commits and review findings, and each round surfaced
+another catalog case to model and measure, such as empty default ACLs (#1304).
+A closing record of a created or rebuilt object is now the compiled scratch
+record, so nothing here predicts an owner, ACL, grantor or shared-dependency
+edge. An in-place column change keeps the opening table's properties under the
+approved column order, renames and key changes. A rebuild that would drop a
+routine grant option is the ordinary connected rebuild guard's refusal
+(`modules::before_a_rebuild`), not the producer's.

@@ -54,7 +54,6 @@ fn snapshot(major: u32) -> (CapturedInputs, ObjectIdentity, ObjectIdentity) {
             ),
             (column.clone(), attribute(&view, "x")),
         ]),
-        role_pinned: BTreeMap::new(),
         attribute_numbers: BTreeMap::from([(column.clone(), 1)]),
         candidates: BTreeMap::new(),
         limitations: BTreeSet::new(),
