@@ -84,11 +84,18 @@ fn preserves_children(changes: &ChangeSet, evidence: &ResolverEvidence) {
     }
 }
 
+/// ACLs are not fingerprinted (DEC-1274.1): a GRANT or REVOKE changes no
+/// prerequisite, so the table and its children all keep their opening
+/// fingerprints, and an owner transition cannot be claimed for it.
 #[test]
-fn table_authorization_mutations_preserve_unchanged_child_fingerprints() {
+fn table_authorization_mutations_leave_every_fingerprint_untouched() {
     for revoke in [false, true] {
-        let (changes, evidence) = owner_fixture(grant(revoke), "table");
-        preserves_children(&changes, &evidence);
+        let (changes, mut evidence) = owner_fixture(grant(revoke), "table");
+        refuses(&changes, &evidence);
+        evidence.transitions.clear();
+        let sealed = seal(&changes, &evidence).expect("a grant needs no transition");
+        sealed.validate(&changes).unwrap();
+        assert_eq!(sealed.after, evidence.before);
     }
 }
 
@@ -126,18 +133,21 @@ fn nullability_mutations_preserve_unchanged_default_fingerprints() {
 }
 
 #[test]
-fn a_table_grant_can_share_inventory_with_an_explicit_default_change() {
+fn a_table_grant_beside_a_default_change_moves_only_the_default() {
     let (mut changes, mut evidence) = owner_fixture(grant(false), "table");
     let (defaults, observations) = fixture();
     changes.changes.extend(defaults.changes);
     evidence.surfaces = observations.surfaces;
+    evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
+    // The table's own records cannot ride on the grant.
     evidence.transitions[0]
         .before
         .insert(object("changed-default"));
     evidence.transitions[0]
         .after
         .insert(object("changed-default"));
-    evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
+    refuses(&changes, &evidence);
+    evidence.transitions = observations.transitions;
     preserves_children(&changes, &evidence);
 }
 
@@ -167,7 +177,13 @@ fn saved_table_grants_cannot_authorize_sibling_fingerprint_changes() {
 
 #[test]
 fn owner_mutations_still_require_every_directly_owned_internal_record() {
-    let (changes, evidence) = owner_fixture(grant(false), "table");
+    let (changes, evidence) = owner_fixture(
+        Change::DropUnique {
+            table: table(),
+            name: "uq".into(),
+        },
+        "table",
+    );
     let valid = seal(&changes, &evidence).expect("owner-only valid mutation was refused");
     valid.validate(&changes).unwrap();
     for name in ["table", "internal"] {

@@ -1235,3 +1235,9 @@ records, so it checks the opening side of every transition and that the closing
 manifest is exactly the untouched opening records plus placeholders of
 installed records; the closing-side inventory and ownership checks run when the
 plan is sealed.
+
+A GRANT, REVOKE or PUBLIC execution change makes no transition. Owners and ACLs
+are not fingerprinted, so its target's catalog record does not change: it stays
+an untouched input with its full fingerprint, and a concurrent change to it
+still fails the closing recheck. The authorization condition checks the grant
+itself.

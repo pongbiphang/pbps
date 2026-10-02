@@ -687,7 +687,7 @@ mod tests {
         assert_eq!(plan.validate_analysis(), Err(EvidenceError::Projection));
     }
     #[test]
-    fn an_approved_grant_changes_only_its_owned_catalog_properties() {
+    fn an_approved_grant_keeps_its_target_as_an_untouched_input() {
         let template = plan();
         let PlanAnalysis::Resolved(template) = template.analysis else {
             panic!("resolved")
@@ -701,65 +701,47 @@ mod tests {
         };
         // The view exists now, observed with its real fingerprint.
         let before = observed(&template, &compiled());
-        let mut json = serde_json::to_value(&before).unwrap();
-        for record in json["prerequisites"].as_array_mut().unwrap() {
-            record["properties"] = json!("ee".repeat(32));
-        }
-        let compiled: InputManifest = serde_json::from_value(json).unwrap();
+        let mut authorization = template.authorization.clone();
+        authorization.changes = BTreeSet::from([0]);
+        // ACLs are not fingerprinted (DEC-1274.1): the grant changes no
+        // prerequisite, so it needs no transition and the granted view keeps
+        // its full opening fingerprint for the closing recheck.
+        let evidence = ResolverEvidence::new(
+            &changes,
+            template.qualification.clone(),
+            authorization.clone(),
+            before.clone(),
+            &before,
+            vec![],
+            vec![],
+            OrderingProof::new(&changes, BTreeSet::new()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(evidence.after, before);
+        // A transition cannot turn the grant into permission to replace the
+        // view's fingerprint with a placeholder.
         let transition = ObjectTransition {
             surface: Surface::Module("app.v".parse().unwrap()),
             before: BTreeSet::from([object("app", "v")]),
             after: BTreeSet::from([object("app", "v")]),
         };
-        let mut authorization = template.authorization.clone();
-        authorization.changes = BTreeSet::from([0]);
-        let evidence = ResolverEvidence::new(
-            &changes,
-            template.qualification.clone(),
-            authorization,
-            before.clone(),
-            &compiled,
-            vec![],
-            vec![transition.clone()],
-            OrderingProof::new(&changes, BTreeSet::new()).unwrap(),
-        )
-        .unwrap();
-        // The granted view is the plan's own record: a candidate member, so
-        // kept as a placeholder, never its compiled "ee" fingerprint.
-        assert!(
-            evidence
-                .after
-                .prerequisites()
-                .iter()
-                .find(|p| p.object == object("app", "v"))
-                .unwrap()
-                .is_managed_closing()
-        );
-        assert_eq!(
-            evidence
-                .after
-                .prerequisites()
-                .iter()
-                .find(|p| p.object == object("ext", "input"))
-                .unwrap()
-                .properties,
-            "bb".repeat(32)
-        );
-        assert_closing(&evidence, &compiled);
-        assert_eq!(evidence.after.membership(), before.membership());
         assert!(
             before
-                .project(&ChangeSet::default(), &compiled, &[transition])
+                .project(&changes, &before, std::slice::from_ref(&transition))
                 .is_err()
         );
-        let mut changed = changes.clone();
-        if let Change::Grant { target, .. } = &mut changed.changes[0].change {
-            *target = "app.other".parse().unwrap();
-        }
         assert!(
-            before
-                .project(&changed, &compiled, &evidence.transitions)
-                .is_err()
+            ResolverEvidence::new(
+                &changes,
+                template.qualification.clone(),
+                authorization,
+                before.clone(),
+                &before,
+                vec![],
+                vec![transition],
+                OrderingProof::new(&changes, BTreeSet::new()).unwrap(),
+            )
+            .is_err()
         );
     }
 
