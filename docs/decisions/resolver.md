@@ -1211,3 +1211,11 @@ constraint, and its relation, constraint and trigger function are unique, a
 self-referencing key included. An internal constraint trigger is identified by
 those three, its name is neither a property nor part of its rendered definition,
 and it belongs to the table surface that owns the constraint.
+
+PostgreSQL names an unnamed primary key and its index, an identity sequence and
+a PostgreSQL 18 NOT NULL constraint after the table and column when it creates
+them, and `ALTER TABLE ... RENAME` keeps those names while renaming the relation
+and its row and array types (measured on 16 and 18). Scratch creates them under
+the final names. For a table the plan keeps, and a child the plan does not
+recreate, the producer takes the target's name before deriving transitions,
+whether the rename is in this plan or an earlier deployment.

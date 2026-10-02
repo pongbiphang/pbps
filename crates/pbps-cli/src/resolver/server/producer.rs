@@ -179,7 +179,7 @@ impl ScratchRun {
         &self,
         key: &EnvironmentFingerprintKey,
         sealed: &super::QualifiedScope,
-        producer: super::ProducerOutcome,
+        mut producer: super::ProducerOutcome,
         opening: pbps_model::resolver::InputManifest,
         ordered: pbps_diff::resolver::Ordered,
         base: pbps_diff::Side<'_>,
@@ -211,6 +211,18 @@ impl ScratchRun {
         if matches!(sealed.authorization_context, scope::Authorization::Mssql(_)) {
             return Err(Error::Scope("SQL Server evidence is unsupported".into()));
         }
+        // Auto-generated child names follow the target, not scratch, for the
+        // tables the plan keeps; the transitions below must see those names.
+        producer
+            .compiled
+            .retain_auto_named_children(
+                producer.opening_capture.catalog(),
+                &changes,
+                base.ids,
+                desired.ids,
+                desired.schema,
+            )
+            .map_err(|error| Error::Binding(format!("retained child names: {error}")))?;
         let compiled_records = producer
             .compiled
             .planning_records()

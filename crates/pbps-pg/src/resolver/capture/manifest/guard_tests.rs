@@ -366,6 +366,176 @@ fn a_foreign_keys_internal_triggers_belong_to_its_table_surface() {
     }
 }
 
+/// Children PostgreSQL named when the table had another name, an unnamed
+/// key, its index and an identity sequence, keep those names on the target.
+fn auto_named_capture(
+    major: u32,
+    table: &str,
+    children: &str,
+) -> (
+    CapturedInputs,
+    ObjectIdentity,
+    ObjectIdentity,
+    ObjectIdentity,
+) {
+    let relation = identity("pg_class", &["app", table], vec![]);
+    let column = identity("column", &["id"], vec![relation.clone()]);
+    let key = identity(
+        "pg_constraint",
+        &[&format!("{children}_pkey")],
+        vec![
+            identity("pg_namespace", &["app"], vec![]),
+            relation.clone(),
+            identity("pg_type", &[], vec![]),
+        ],
+    );
+    let index = identity("pg_class", &["app", &format!("{children}_pkey")], vec![]);
+    let sequence = identity("pg_class", &["app", &format!("{children}_id_seq")], vec![]);
+    let inputs = BTreeMap::from([
+        (
+            relation.clone(),
+            input(BTreeMap::from([("relkind".into(), json!("r"))])),
+        ),
+        (
+            column.clone(),
+            input(BTreeMap::from([("attname".into(), json!("id"))])),
+        ),
+        (
+            key.clone(),
+            input(BTreeMap::from([
+                ("contype".into(), json!("p")),
+                ("conname".into(), json!(format!("{children}_pkey"))),
+                ("conindid".into(), json!(&index)),
+            ])),
+        ),
+        (
+            index.clone(),
+            input(BTreeMap::from([
+                ("relkind".into(), json!("i")),
+                ("relname".into(), json!(format!("{children}_pkey"))),
+            ])),
+        ),
+        (
+            sequence.clone(),
+            input(BTreeMap::from([
+                ("relkind".into(), json!("S")),
+                ("relname".into(), json!(format!("{children}_id_seq"))),
+            ])),
+        ),
+        (
+            identity("pg_depend", &["i"], vec![sequence.clone(), column]),
+            input(BTreeMap::new()),
+        ),
+    ]);
+    (capture(major, inputs), key, index, sequence)
+}
+
+#[test]
+fn a_kept_tables_auto_named_children_keep_the_targets_names() {
+    use pbps_model::{Column, Identity, PrimaryKey, Schema, Table};
+    let context = AuthorizationContext {
+        principal: DeploymentPrincipal {
+            login: "deployer".into(),
+            effective: "deployer".into(),
+            superuser: false,
+        },
+        schemas: BTreeMap::new(),
+        roles: BTreeMap::new(),
+        settings: BTreeMap::new(),
+    };
+    let roles = RoleMap::generate(&context, &[], "deployer", "autoname");
+    let uid: pbps_model::Uid = "t_000000".parse().unwrap();
+    for major in [16, 18] {
+        // (opening table, its child spelling, final table, plan sets a key)
+        for (old, children, new, key_change) in [
+            ("old_t", "old_t", "new_t", false),
+            ("t", "older", "t", false),
+            ("old_t", "old_t", "new_t", true),
+        ] {
+            let old_table = TableName::new("app", old);
+            let new_table = TableName::new("app", new);
+            let mut base_ids = IdsFile::default();
+            base_ids.tables.insert(uid.clone(), old_table.clone());
+            base_ids
+                .columns
+                .insert("c_000000".parse().unwrap(), old_table.column("id"));
+            let mut desired_ids = IdsFile::default();
+            desired_ids.tables.insert(uid.clone(), new_table.clone());
+            desired_ids
+                .columns
+                .insert("c_000000".parse().unwrap(), new_table.column("id"));
+            let mut column = Column::new("integer".parse().unwrap());
+            column.identity = Some(Identity {
+                seed: 1,
+                increment: 1,
+            });
+            let mut table = Table::default();
+            table.columns.insert("id".into(), column);
+            table.primary_key = Some(PrimaryKey {
+                name: None,
+                columns: vec!["id".into()],
+            });
+            let mut desired = Schema::default();
+            desired.tables.insert(new_table.clone(), table);
+            let mut steps = Vec::new();
+            if old != new {
+                steps.push(Change::RenameTable {
+                    uid: uid.clone(),
+                    from: old_table.clone(),
+                    to: new_table.clone(),
+                    defaults: Vec::new(),
+                });
+            }
+            if key_change {
+                steps.push(Change::SetPrimaryKey {
+                    table: new_table.clone(),
+                    from: None,
+                    to: Some(PrimaryKey {
+                        name: None,
+                        columns: vec!["id".into()],
+                    }),
+                    nonclustered: false,
+                });
+            }
+            let changes = ChangeSet {
+                changes: steps.into_iter().map(PlannedChange::new).collect(),
+            };
+            let (opening, ..) = auto_named_capture(major, old, children);
+            let (compiled, new_key, new_index, new_sequence) = auto_named_capture(major, new, new);
+            let mut producer = CompiledCapture::new(compiled, &key(), &roles, BTreeMap::new());
+            producer
+                .retain_auto_named_children(&opening, &changes, &base_ids, &desired_ids, &desired)
+                .unwrap();
+            let names: BTreeSet<_> = producer.captured.inputs.keys().cloned().collect();
+            let kept = |object: &ObjectIdentity, name: String| {
+                let mut kept = object.clone();
+                *kept.name.last_mut().unwrap() = name;
+                kept
+            };
+            let key_name = if key_change { new } else { children };
+            let label = format!("PG{major} {old}->{new} key_change={key_change}");
+            assert!(
+                names.contains(&kept(&new_key, format!("{key_name}_pkey"))),
+                "{label}"
+            );
+            assert!(
+                names.contains(&kept(&new_index, format!("{key_name}_pkey"))),
+                "{label}"
+            );
+            assert!(
+                names.contains(&kept(&new_sequence, format!("{children}_id_seq"))),
+                "{label}"
+            );
+            let key_record = &producer.captured.inputs[&kept(&new_key, format!("{key_name}_pkey"))];
+            assert_eq!(
+                key_record.properties["conindid"],
+                json!(kept(&new_index, format!("{key_name}_pkey"))),
+                "{label}"
+            );
+        }
+    }
+}
+
 #[test]
 fn generated_attrdefs_and_their_edges_have_exact_default_ownership() {
     let table = TableName::new("app", "t");
