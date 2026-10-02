@@ -83,6 +83,132 @@ pub(crate) fn order_occupied_objects_under(
     }
 }
 
+/// A column by its table and name.
+pub(crate) type Column = (TableName, String);
+
+/// The columns whose names the database is asked about before column renames
+/// are ordered: each rename's source and target, on every table that renames
+/// two or more of its columns in this plan (DEC-1366.3).
+// The complement is every change that renames no column.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub(crate) fn renamed_column_names(cs: &ChangeSet) -> Vec<Column> {
+    let mut per_table: BTreeMap<&TableName, usize> = BTreeMap::new();
+    for p in &cs.changes {
+        if let Change::RenameColumn { table, .. } = &p.change {
+            *per_table.entry(table).or_default() += 1;
+        }
+    }
+    let mut out: Vec<(TableName, String)> = cs
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::RenameColumn {
+                table, from, to, ..
+            } if per_table[table] > 1 => {
+                Some([(table.clone(), from.clone()), (table.clone(), to.clone())])
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Orders each table's column renames by which names the database reads as
+/// one (`alike`, as `catalog::column_names_alike` answers): a rename into a
+/// name runs after the rename that vacates it, under the collation as under
+/// the exact spelling. The renames keep the positions they had and only trade
+/// them, so an order the differ already got right stays as it is. Renames
+/// that wait on one another, such as `a -> B` beside `b -> A` on a
+/// case-insensitive database, are refused (DEC-1366.3).
+pub(crate) fn order_column_renames(
+    cs: &mut ChangeSet,
+    alike: &[(Column, Column)],
+    label: &str,
+) -> anyhow::Result<()> {
+    let mut first: BTreeMap<&Column, &Column> = BTreeMap::new();
+    for (earlier, later) in alike {
+        let root = *first.get(earlier).unwrap_or(&earlier);
+        first.insert(later, root);
+    }
+    let one = |c: &Column| -> Column { (*first.get(c).unwrap_or(&c)).clone() };
+    // Each table's renames, by position, with the names they vacate and
+    // take as the database reads them.
+    type Ends = (usize, Column, Column);
+    let mut tables: BTreeMap<TableName, Vec<Ends>> = BTreeMap::new();
+    for (i, p) in cs.changes.iter().enumerate() {
+        if let Change::RenameColumn {
+            table, from, to, ..
+        } = &p.change
+        {
+            tables.entry(table.clone()).or_default().push((
+                i,
+                one(&(table.clone(), from.clone())),
+                one(&(table.clone(), to.clone())),
+            ));
+        }
+    }
+    let mut placed: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
+    for (table, renames) in tables {
+        if renames.len() < 2 {
+            continue;
+        }
+        // What each rename waits for: the one vacating the name it takes.
+        let waits: Vec<Vec<usize>> = (0..renames.len())
+            .map(|r| {
+                (0..renames.len())
+                    .filter(|&v| v != r && renames[v].1 == renames[r].2)
+                    .collect()
+            })
+            .collect();
+        let mut left: Vec<usize> = (0..renames.len()).collect();
+        let mut order: Vec<usize> = Vec::new();
+        while !left.is_empty() {
+            let Some(k) = left
+                .iter()
+                .position(|&r| waits[r].iter().all(|v| order.contains(v)))
+            else {
+                let waiting: Vec<String> = left
+                    .iter()
+                    .map(|&r| crate::report::describe(&cs.changes[renames[r].0].change))
+                    .collect();
+                anyhow::bail!(
+                    "`{label}` reads names these column renames of `{table}` use as one, under \
+                     its collation, and they wait on one another, so no order runs them: {}. \
+                     Rename one of them through a name nothing here uses, in a plan of its own \
+                     first, then this one (DEC-1366.3).",
+                    waiting.join(", ")
+                );
+            };
+            order.push(left.remove(k));
+        }
+        placed.push((
+            renames.iter().map(|r| r.0).collect(),
+            order.into_iter().map(|r| renames[r].0).collect(),
+        ));
+    }
+    if placed.is_empty() {
+        return Ok(());
+    }
+    let mut taken: Vec<Option<PlannedChange>> = std::mem::take(&mut cs.changes)
+        .into_iter()
+        .map(Some)
+        .collect();
+    let mut at: Vec<usize> = (0..taken.len()).collect();
+    for (slots, order) in placed {
+        for (slot, from) in slots.into_iter().zip(order) {
+            at[slot] = from;
+        }
+    }
+    cs.changes = at
+        .into_iter()
+        .map(|i| taken[i].take().expect("each change once"))
+        .collect();
+    Ok(())
+}
+
 /// Whether a change moves in the search, and how.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Part {
@@ -639,6 +765,131 @@ mod tests {
         let ran = renames(&cs);
         let at = |from: &str| ran.iter().position(|(f, _)| f == from).unwrap();
         assert!(at("dbo.B") < at("dbo.A"), "{ran:?}");
+    }
+
+    fn rename_column(table: &str, from: &str, to: &str) -> PlannedChange {
+        PlannedChange::new(Change::RenameColumn {
+            uid: pbps_model::Uid::derived(
+                pbps_model::UidKind::Column,
+                &format!("{table}.{from}"),
+                0,
+            ),
+            table: name(table),
+            from: from.into(),
+            to: to.into(),
+            table_was: None,
+        })
+    }
+
+    fn column_renames(cs: &ChangeSet) -> Vec<(String, String, String)> {
+        cs.changes
+            .iter()
+            .filter_map(|p| {
+                if let Change::RenameColumn {
+                    table, from, to, ..
+                } = &p.change
+                {
+                    Some((table.to_string(), from.clone(), to.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn column(table: &str, column: &str) -> Column {
+        (name(table), column.to_owned())
+    }
+
+    /// DEC-1366.3: which column names are one is the collation's. On
+    /// `Turkish_100_CI_AS` `A` and `a` are one name and `I` and `i` are two,
+    /// so `A -> i` runs before `I -> a`; another table's rename keeps its
+    /// place. Where the database reads all four as distinct, the plan's own
+    /// order stands, and an exact chain is still ordered.
+    #[test]
+    fn the_databases_alike_column_names_order_a_rename_chain() {
+        let plan = || {
+            vec![
+                rename_column("dbo.t", "I", "a"),
+                rename_column("dbo.u", "x", "y"),
+                rename_column("dbo.t", "A", "i"),
+            ]
+        };
+        let mut cs = ChangeSet { changes: plan() };
+        assert_eq!(
+            renamed_column_names(&cs),
+            [
+                column("dbo.t", "A"),
+                column("dbo.t", "I"),
+                column("dbo.t", "a"),
+                column("dbo.t", "i"),
+            ],
+            "only a table renaming two columns is asked about"
+        );
+        let turkish = [(column("dbo.t", "A"), column("dbo.t", "a"))];
+        order_column_renames(&mut cs, &turkish, "prod").unwrap();
+        let t = |from: &str, to: &str| ("dbo.t".to_owned(), from.to_owned(), to.to_owned());
+        assert_eq!(
+            column_renames(&cs),
+            [
+                t("A", "i"),
+                ("dbo.u".to_owned(), "x".to_owned(), "y".to_owned()),
+                t("I", "a")
+            ]
+        );
+
+        let mut cs = ChangeSet { changes: plan() };
+        order_column_renames(&mut cs, &[], "prod").unwrap();
+        assert_eq!(column_renames(&cs)[0], t("I", "a"));
+
+        let mut cs = ChangeSet {
+            changes: vec![
+                rename_column("dbo.t", "a", "b"),
+                rename_column("dbo.t", "b", "c"),
+            ],
+        };
+        order_column_renames(&mut cs, &[], "prod").unwrap();
+        assert_eq!(column_renames(&cs), [t("b", "c"), t("a", "b")]);
+        // A rename into a case variant of its own name waits for nothing.
+        let mut cs = ChangeSet {
+            changes: vec![
+                rename_column("dbo.t", "a", "A"),
+                rename_column("dbo.t", "b", "c"),
+            ],
+        };
+        order_column_renames(
+            &mut cs,
+            &[(column("dbo.t", "a"), column("dbo.t", "A"))],
+            "prod",
+        )
+        .unwrap();
+        assert_eq!(column_renames(&cs), [t("a", "A"), t("b", "c")]);
+    }
+
+    /// Two column renames into each other's names under the collation have
+    /// no order on that database: refused at `plan --db`, naming both.
+    #[test]
+    fn column_renames_trading_names_under_the_collation_are_refused() {
+        let mut cs = ChangeSet {
+            changes: vec![
+                rename_column("dbo.t", "a", "B"),
+                rename_column("dbo.t", "b", "A"),
+            ],
+        };
+        let alike = [
+            (column("dbo.t", "A"), column("dbo.t", "a")),
+            (column("dbo.t", "B"), column("dbo.t", "b")),
+        ];
+        let e = order_column_renames(&mut cs, &alike, "prod")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("wait on one another"), "{e}");
+        assert!(
+            e.contains("rename column a -> B") && e.contains("rename column b -> A"),
+            "{e}"
+        );
+        // On a database that reads them as four names, the pair is valid.
+        order_column_renames(&mut cs, &[], "prod").unwrap();
     }
 
     /// A drop on a renamed table names the table as it is called where the

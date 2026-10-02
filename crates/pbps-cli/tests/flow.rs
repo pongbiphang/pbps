@@ -18038,7 +18038,7 @@ fn names_one_under_the_collation_are_ordered_or_refused_at_plan() {
 ///   frees the other one for a move that has to go first (#1361);
 /// - a move's old name in its new schema, held by a sequence (#1362);
 /// - names the collation reads as one: on `Turkish_100_CI_AS` `A` and `a`
-///   are, `I` and `i` are not;
+///   are, `I` and `i` are not, for tables and for columns (DEC-1366.3);
 /// - a move carrying a generated default into the new schema under its old
 ///   name, which a rename into that name has to wait for;
 /// - a name a column rename frees, which runs after every table rename
@@ -18234,6 +18234,85 @@ fn renames_only_the_catalog_can_order_apply_or_are_refused_at_plan() {
         );
         step(&d);
         apply(&d, own.connection(), "Turkish pair");
+    }
+
+    // The same Turkish pair as column renames of one table, `I -> a` and
+    // `A -> i` (DEC-1366.3). The differ's order came from uids minted at each
+    // `plan`, so four fresh projects rather than one.
+    for round in 0..4 {
+        let own = OwnDatabase::collated(
+            &server,
+            &format!("order1366_tcol{round}"),
+            "Turkish_100_CI_AS",
+        );
+        let d = Demo::new(&format!("order1366-tcol{round}"));
+        let columns = |names: [&str; 2]| {
+            format!(
+                "  {}: {{type: int}}\n  {}: {{type: bigint}}\n",
+                names[0], names[1]
+            )
+        };
+        write(
+            &d,
+            "dbo.t",
+            Some(table("dbo.t", None, "pk_t", &columns(["I", "A"]))),
+        );
+        step(&d);
+        bootstrap(&d, own.connection());
+        write(
+            &d,
+            "dbo.t",
+            Some(table("dbo.t", None, "pk_t", &columns(["a", "A"]))),
+        );
+        let o = d.run(&["rename", "dbo.t.I", "a"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        step(&d);
+        write(
+            &d,
+            "dbo.t",
+            Some(table("dbo.t", None, "pk_t", &columns(["a", "i"]))),
+        );
+        let o = d.run(&["rename", "dbo.t.A", "i"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        step(&d);
+        apply(&d, own.connection(), "Turkish column chain");
+    }
+
+    // Column renames trading names under a case-insensitive collation have no
+    // order there: refused at `plan --db`.
+    {
+        let own = OwnDatabase::collated(&server, "order1366_cswap", ci);
+        let d = Demo::new("order1366-cswap");
+        let columns = |names: [&str; 2]| {
+            format!(
+                "  {}: {{type: int}}\n  {}: {{type: bigint}}\n",
+                names[0], names[1]
+            )
+        };
+        write(
+            &d,
+            "dbo.t",
+            Some(table("dbo.t", None, "pk_t", &columns(["a", "b"]))),
+        );
+        step(&d);
+        bootstrap(&d, own.connection());
+        write(
+            &d,
+            "dbo.t",
+            Some(table("dbo.t", None, "pk_t", &columns(["B", "b"]))),
+        );
+        let o = d.run(&["rename", "dbo.t.a", "B"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        step(&d);
+        write(
+            &d,
+            "dbo.t",
+            Some(table("dbo.t", None, "pk_t", &columns(["B", "A"]))),
+        );
+        let o = d.run(&["rename", "dbo.t.b", "A"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        step(&d);
+        refused(&d, own.connection(), &["wait on one another", "DEC-1366.3"]);
     }
 
     // `s3.old`'s default reaches `s2` as `DF_pbps_old_x` and leaves that name
