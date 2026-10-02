@@ -1531,13 +1531,18 @@ fn owners_query() -> String {
 /// `owner` and `acl` are the catalog columns of the securable in the caller's
 /// query; the caller supplies `me` as a `pg_roles` row for `current_user`.
 pub(crate) fn revocable_by_current_role(owner: &str, acl: &str) -> String {
-    format!(
-        "COALESCE(a.grantor = CASE
-             WHEN me.rolsuper OR me.oid = {owner} THEN {owner}
-             WHEN EXISTS (SELECT FROM pg_catalog.aclexplode({acl}) own
-                 WHERE own.grantee = me.oid AND own.is_grantable
-                   AND own.privilege_type = a.privilege_type) THEN me.oid
-             ELSE (WITH RECURSIVE reach(oid, depth) AS (
+    // The inherited candidates: the owner and every grant-option holder this
+    // role can act as.
+    let candidates = format!(
+        "SELECT {owner} AS oid WHERE pg_catalog.pg_has_role(me.oid, {owner}, 'USAGE')
+         UNION
+         SELECT opt.grantee FROM pg_catalog.aclexplode({acl}) opt
+          WHERE opt.is_grantable AND opt.privilege_type = a.privilege_type
+            AND opt.grantee <> 0
+            AND pg_catalog.pg_has_role(me.oid, opt.grantee, 'USAGE')"
+    );
+    let nearest = format!(
+        "WITH RECURSIVE reach(oid, depth) AS (
                  SELECT me.oid, 0
                  UNION
                  SELECT e.roleid, r.depth + 1 FROM reach r
@@ -1549,22 +1554,29 @@ pub(crate) fn revocable_by_current_role(owner: &str, acl: &str) -> String {
                           WHERE d.datname = pg_catalog.current_database()) e
                      ON e.member = r.oid
                   WHERE r.depth < (SELECT count(*) FROM pg_catalog.pg_roles))
-               SELECT min(n.oid::bigint)::oid FROM (
-                 SELECT c.oid, c.depth, min(c.depth) OVER () AS nearest,
-                        bool_or(c.depth IS NULL) OVER () AS unknown
-                   FROM (SELECT candidate.oid,
-                                (SELECT min(r.depth) FROM reach r
-                                  WHERE r.oid = candidate.oid) AS depth
-                           FROM (
-                 SELECT {owner} AS oid WHERE pg_catalog.pg_has_role(me.oid, {owner}, 'USAGE')
-                 UNION
-                 SELECT opt.grantee FROM pg_catalog.aclexplode({acl}) opt
-                  WHERE opt.is_grantable AND opt.privilege_type = a.privilege_type
-                    AND opt.grantee <> 0
-                    AND pg_catalog.pg_has_role(me.oid, opt.grantee, 'USAGE')
-                           ) candidate) c) n
-                WHERE NOT n.unknown AND n.depth = n.nearest
-               HAVING count(*) = 1)
+             SELECT min(n.oid::bigint)::oid FROM (
+               SELECT c.oid, c.depth, min(c.depth) OVER () AS nearest,
+                      bool_or(c.depth IS NULL) OVER () AS unknown
+                 FROM (SELECT candidate.oid,
+                              (SELECT min(r.depth) FROM reach r
+                                WHERE r.oid = candidate.oid) AS depth
+                         FROM ({candidates}) candidate) c) n
+              WHERE NOT n.unknown AND n.depth = n.nearest
+             HAVING count(*) = 1"
+    );
+    // A lone candidate is the grantor without walking anything: it is
+    // reachable, or `pg_has_role` would not have kept it. The walk runs only
+    // when two or more compete, so its cost is not paid once per ACL row of
+    // every object (review of #1422). `CASE` evaluates only the branch taken.
+    format!(
+        "COALESCE(a.grantor = CASE
+             WHEN me.rolsuper OR me.oid = {owner} THEN {owner}
+             WHEN EXISTS (SELECT FROM pg_catalog.aclexplode({acl}) own
+                 WHERE own.grantee = me.oid AND own.is_grantable
+                   AND own.privilege_type = a.privilege_type) THEN me.oid
+             ELSE (SELECT CASE WHEN count(*) = 1 THEN min(lone.oid::bigint)::oid
+                               WHEN count(*) > 1 THEN ({nearest}) END
+                     FROM ({candidates}) lone)
          END, false) AND (SELECT count(DISTINCT grantor)
              FROM pg_catalog.aclexplode({acl})
             WHERE grantee = a.grantee AND privilege_type = a.privilege_type) = 1"
