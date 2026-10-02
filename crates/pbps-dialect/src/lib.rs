@@ -1833,6 +1833,35 @@ fn dollar_tag(s: &str) -> Option<usize> {
 /// dollar-quoted literal ends before it can say whether a default is one — and
 /// a second spelling of this rule is how the difference above gets rediscovered
 /// (PITFALLS, "one rule, spelled in three places").
+/// Code with its delimiters dropped and the whitespace around a dot removed,
+/// so `[dbo] . [f]` reads `dbo.f`: the form [`Dialect::may_name_qualified`]
+/// looks for a qualified name in.
+fn undelimited(code: &str) -> String {
+    let bare: String = code
+        .chars()
+        .filter(|c| !matches!(c, '[' | ']' | '"'))
+        .collect();
+    let mut out = String::with_capacity(bare.len());
+    let mut chars = bare.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_whitespace() {
+            let mut run = String::from(c);
+            while let Some(next) = chars.peek().copied().filter(|n| n.is_whitespace()) {
+                run.push(next);
+                chars.next();
+            }
+            // Dropped next to a dot, on either side; kept anywhere else.
+            if out.ends_with('.') || chars.peek() == Some(&'.') {
+                continue;
+            }
+            out.push_str(&run);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// A fold for comparing identifiers that can only make more of them equal:
 /// lowercase, with the dot `İ` lowercases into dropped and the dotless `ı`
 /// taken as `i`. A Turkish collation binds `[i]` to a column named `İ`, and
@@ -2040,6 +2069,20 @@ pub trait Dialect {
     /// false no would cost an apply the engine refuses. Ignoring case is part
     /// of that: under a case-insensitive collation `A2` reads `a2`, and the
     /// engine stores `[a2]` either way (measured on 17.0, #1174).
+    /// Whether `text` may name `schema.name`, schema-qualified: the scan
+    /// [`may_name`](Dialect::may_name) makes, over the qualified form. For a
+    /// function a computed column calls, which SQL Server only calls by a
+    /// two-part name, so a function of the same leaf name in another schema
+    /// is not taken for it (#1174 review).
+    fn may_name_qualified(&self, text: &str, schema: &str, name: &str) -> bool {
+        if schema.is_empty() || name.is_empty() {
+            return false;
+        }
+        let code = identifier_fold(&undelimited(&self.lexicon().code_only(text)));
+        let wanted = identifier_fold(&format!("{schema}.{name}"));
+        names_at_a_boundary(&code, &wanted)
+    }
+
     fn may_name(&self, text: &str, name: &str) -> bool {
         // A delimited name doubles its closing delimiter: `a]b` is stored as
         // `[a]]b]` and `a"b` as `"a""b"`, so each spelling is looked for
@@ -3107,6 +3150,12 @@ mod tests {
         // A Turkish collation binds `[i]` to `İ` and `[ı]` to `I`.
         assert!(d.may_name("[i] * 2", "İ"));
         assert!(d.may_name("[ı] * 2", "I"));
+        // Qualified: the schema decides, however the name is spelled.
+        assert!(d.may_name_qualified("[dbo].[f](a)", "dbo", "f"));
+        assert!(d.may_name_qualified("DBO . f(a) + 1", "dbo", "f"));
+        assert!(!d.may_name_qualified("x.f(a)", "dbo", "f"));
+        assert!(!d.may_name_qualified("f(a)", "dbo", "f"));
+        assert!(!d.may_name_qualified("'dbo.f'", "dbo", "f"));
         // A delimited name is stored with its closing delimiter doubled.
         assert!(d.may_name("[a]]b] * 2", "a]b"));
         assert!(d.may_name("\"a\"\"b\" * 2", "a\"b"));

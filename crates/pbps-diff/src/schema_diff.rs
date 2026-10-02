@@ -855,9 +855,10 @@ fn diff_partial_rebuilding(
                     .modules
                     .get(id)
                     .is_some_and(|m| m.kind == pbps_model::ModuleKind::Function)
-                && expressions
-                    .iter()
-                    .any(|e| dialect.may_name(e, &id.object_name().name))
+                && expressions.iter().any(|e| {
+                    let at = id.object_name();
+                    dialect.may_name_qualified(e, &at.schema, &at.name)
+                })
             {
                 let slot = released_module_at.entry(id.clone()).or_insert(at);
                 *slot = (*slot).max(at);
@@ -1869,8 +1870,13 @@ fn refuse_computed_dependencies(
                 if let Some((id, what)) = module
                     && function(id)
                 {
-                    let name = id.object_name().name;
-                    if dialect.may_name(&computed.expression, &name) {
+                    let qualified = id.object_name();
+                    let name = qualified.name.clone();
+                    if dialect.may_name_qualified(
+                        &computed.expression,
+                        &qualified.schema,
+                        &qualified.name,
+                    ) {
                         errs.push(DiffError::ComputedFunctionChanged {
                             computed: at.clone(),
                             function: name,
@@ -3753,6 +3759,29 @@ mod tests {
                 .unwrap_or_else(|| panic!("{kind}: {k:?}"))
         };
         assert!(at("DropModule") < at("DropTable"), "{k:?}");
+        // A function of the same leaf name in another schema is not the one
+        // it calls: only `x.f` moves after the table's drop (#1174 review).
+        let two = with_functions(
+            shaped(Column::new(ty("int")), "x.f(a2)"),
+            &[("x.f", "one"), ("dbo.f", "one")],
+        );
+        let order: Vec<String> = run(
+            &two,
+            &Schema::default(),
+            &[Intent::DropTable {
+                table: "dbo.t".parse().unwrap(),
+                reason: "gone".into(),
+            }],
+        )
+        .changes
+        .iter()
+        .filter_map(|p| match &p.change {
+            Change::DropTable { .. } => Some("table".to_owned()),
+            Change::DropModule { id, .. } => Some(id.object_name().to_string()),
+            _ => None,
+        })
+        .collect();
+        assert_eq!(order, ["dbo.f", "table", "x.f"]);
         // Nor is such a view's alter refused.
         let view = |definition: &str| {
             with_modules(

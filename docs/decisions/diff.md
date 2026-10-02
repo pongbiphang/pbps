@@ -1665,7 +1665,11 @@ code only and ignoring case: under a case-insensitive collation `A2` reads
 `a2`, and the engine stores `[a2]`. Only a function module is matched against
 an expression, for a move and for a refusal alike: a computed column calls
 nothing else, so a view or procedure that shares a name the expression uses is
-never what it calls. It looks for a delimited name's escaped
+never what it calls. It is matched by its schema-qualified name
+(`Dialect::may_name_qualified`), because SQL Server calls a scalar function
+only by a two-part name, so `x.f` is not taken for `dbo.f`. Ordering by text
+is the class design #1431 replaces with the catalog's own edges on a connected
+plan. It looks for a delimited name's escaped
 spelling too: `a]b` is stored as `[a]]b]`. Its case fold can only make more
 names equal. `İ` folds to `i` without the combining dot, and `ı` to `i`,
 because a Turkish collation binds `[i]` to `İ`. Accent-, width- and
