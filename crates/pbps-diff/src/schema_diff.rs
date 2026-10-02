@@ -821,33 +821,46 @@ fn diff_partial_rebuilding(
         .iter()
         .filter_map(|p| row_table(&p.change).cloned())
         .collect();
-    // The modules a computed column this plan drops may call: dropping one
+    // The modules a computed column this plan removes may call: dropping one
     // while the column stands is refused (3729, measured on 17.0), and module
-    // drops are class 0, ahead of the computed column's at (2, 4). So these
-    // go at (2, 5), right after it (#1174 review).
-    let called_by_a_dropped_computed: BTreeSet<ModuleId> = planned
-        .iter()
-        .filter_map(|p| {
-            if let Change::DropModule { id, .. } = &p.change {
-                Some(id)
+    // drops are class 0, ahead of the column's removal. So each goes right
+    // after the last removal that releases it: at (2, 5) after a computed
+    // column's drop at (2, 4), and at (6, 2) after its table's drop in class
+    // 6, which takes the column with it (#1174 review).
+    let mut released_module_at: BTreeMap<ModuleId, (u8, usize)> = BTreeMap::new();
+    for p in &planned {
+        let (expressions, at): (Vec<&str>, (u8, usize)) =
+            if let Change::DropComputedColumn { computed, .. } = &p.change {
+                (vec![computed.expression.as_str()], (2, 5))
+            } else if let Change::DropTable { name, .. } = &p.change {
+                (
+                    base.schema
+                        .tables
+                        .get(name)
+                        .into_iter()
+                        .flat_map(|t| t.computed.values().map(|c| c.expression.as_str()))
+                        .collect(),
+                    (order_key(&p.change), 2),
+                )
             } else {
-                None
+                continue;
+            };
+        for module in &planned {
+            if let Change::DropModule { id, .. } = &module.change
+                && expressions
+                    .iter()
+                    .any(|e| dialect.may_name(e, &id.object_name().name))
+            {
+                let slot = released_module_at.entry(id.clone()).or_insert(at);
+                *slot = (*slot).max(at);
             }
-        })
-        .filter(|id| {
-            let function = id.object_name().name;
-            planned.iter().any(|p| {
-                matches!(&p.change, Change::DropComputedColumn { computed, .. }
-                    if dialect.may_name(&computed.expression, &function))
-            })
-        })
-        .cloned()
-        .collect();
+        }
+    }
     let sort_class = |c: &Change| -> (u8, usize) {
         if let Change::DropModule { id, .. } = c
-            && called_by_a_dropped_computed.contains(id)
+            && let Some(at) = released_module_at.get(id)
         {
-            return (2, 5);
+            return *at;
         }
         // A tightening of a table whose rows this plan writes or deletes runs
         // after them, at the end of the deletes' class: the rows may be what
@@ -3577,6 +3590,21 @@ mod tests {
                 .unwrap_or_else(|| panic!("{kind}: {k:?}"))
         };
         assert!(at("DropComputedColumn") < at("DropModule"), "{k:?}");
+        // The same when the column goes with its table (#1174 review).
+        let k = kinds(&run(
+            &calls("one"),
+            &Schema::default(),
+            &[Intent::DropTable {
+                table: "dbo.t".parse().unwrap(),
+                reason: "gone".into(),
+            }],
+        ));
+        let at = |kind: &str| {
+            k.iter()
+                .position(|x| x == kind)
+                .unwrap_or_else(|| panic!("{kind}: {k:?}"))
+        };
+        assert!(at("DropTable") < at("DropModule"), "{k:?}");
         // Negative: an altered module it does not name.
         let plain = shaped(Column::new(ty("int")), "a2 * 2");
         let errors = errors_of(

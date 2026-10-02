@@ -1630,9 +1630,10 @@ both act as a part does, an index's place in the drift check included:
   an index's is. It is addressed by the table's name at the point where it
   runs.
 - A module drop of a function a computed column may call, where the plan
-  drops that computed column, moves from class 0 to (2, 5), right after the
-  computed column's drop. Dropping the function while the column stands is
-  3729, and module drops otherwise run first.
+  removes that computed column, moves from class 0 to right after the last
+  removal. That is (2, 5) after the column's own drop, and (6, 2) after its
+  table's drop, which takes the column with it. Dropping the function while
+  the column stands is 3729, and module drops otherwise run first.
 
 The drop is `destructive`, as an index drop is: the values are derived, but
 the object is gone. The add carries no risk. A persisted add is unchecked in

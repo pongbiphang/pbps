@@ -2464,9 +2464,10 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     out
 }
 
-/// A computed column dropped together with the function it calls: the
-/// function's drop runs after the column's, which the engine requires (3729
-/// while the column stands), and the plan applies (#1174 review).
+/// A computed column dropped together with the function it calls, alone or
+/// with its table: the function's drop runs after the column's or the
+/// table's, which the engine requires (3729 while the column stands), and the
+/// plan applies (#1174 review).
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
 fn a_computed_column_and_the_function_it_calls_drop_together() {
@@ -2479,6 +2480,8 @@ fn a_computed_column_and_the_function_it_calls_drop_together() {
     on_server(
         own.connection(),
         "CREATE TABLE dbo.t (id int NOT NULL CONSTRAINT pk_t PRIMARY KEY, a int NULL,
+             called AS (dbo.plus_one(a)));
+         CREATE TABLE dbo.u (id int NOT NULL CONSTRAINT pk_u PRIMARY KEY, a int NULL,
              called AS (dbo.plus_one(a)));",
     );
     let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
@@ -2498,7 +2501,7 @@ fn a_computed_column_and_the_function_it_calls_drop_together() {
     for entry in walk(&d.dir.join("schema")) {
         let text = std::fs::read_to_string(&entry).unwrap();
         seen.push(entry.display().to_string());
-        if text.contains("plus_one") && !text.contains("table: dbo.t") {
+        if text.contains("plus_one") && !text.contains("table: ") {
             std::fs::remove_file(&entry).unwrap();
             removed.push(entry);
         }
@@ -2508,6 +2511,8 @@ fn a_computed_column_and_the_function_it_calls_drop_together() {
         1,
         "the function's declaration among {seen:?}"
     );
+    std::fs::remove_file(d.dir.join("schema/dbo.u.yml")).unwrap();
+    ok(&d.run(&["drop-table", "dbo.u", "--reason", "goes with its function"]));
     ok(&d.run(&["plan"]));
     d.commit();
     let plan = d.dir.join("plan.json");
@@ -2528,6 +2533,7 @@ fn a_computed_column_and_the_function_it_calls_drop_together() {
             .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
     };
     assert!(at("DROP COLUMN [called]") < at("DROP FUNCTION"), "{script}");
+    assert!(at("DROP TABLE [dbo].[u]") < at("DROP FUNCTION"), "{script}");
     ok(&d.run(&[
         "apply",
         "--db",
