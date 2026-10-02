@@ -14665,7 +14665,7 @@ fn a_trigger_function_replaced_between_the_check_and_the_row_write_is_rolled_bac
         if staged {
             args.push("--staged");
         }
-        let child = Command::new(BIN)
+        let mut child = Command::new(BIN)
             .arg("--project")
             .arg(&d.dir)
             .args(&args)
@@ -14675,20 +14675,15 @@ fn a_trigger_function_replaced_between_the_check_and_the_row_write_is_rolled_bac
             .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        let mut waited = 0;
-        while scalar(
-            &connection,
-            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 428 \
-             AND NOT granted",
-        ) == 0
-        {
-            waited += 1;
-            assert!(
-                waited < 3000,
-                "{slug}: the apply never reached the row write"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
+        // A child that exits first reports its own cause instead of a timeout
+        // that only said "never reached" (#1320).
+        wait_for_the_apply(&format!("{slug}: the row write"), &mut child, || {
+            scalar(
+                &connection,
+                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 428 \
+                 AND NOT granted",
+            ) > 0
+        });
         // Inside the window: the membership that lets the inheritor replace
         // the function, and the replacement.
         on_server(
