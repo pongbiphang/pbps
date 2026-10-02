@@ -790,7 +790,7 @@ fn function_creates(cs: &ChangeSet) -> Vec<(String, usize)> {
 }
 
 /// Whether `text` may call one of `functions`: the function's bare name
-/// occurs in it as code, by the engine's lexer, or as a word inside a literal,
+/// occurs in it as code, by the engine's lexer, or in a literal's contents,
 /// which an OID-alias type such as `regprocedure` resolves to the function
 /// (`pbps_pg::generated::may_call`, DEC-1364.1). Which function a call binds
 /// to is not known without parsing it (DECISIONS 174), so a name in another
@@ -2106,6 +2106,31 @@ mod tests {
         assert!(order[0].starts_with("create app.f"), "{order:?}");
         assert!(order[1].starts_with("AddColumn"), "{order:?}");
         assert_eq!(order[2], "add check ck_regproc", "{order:?}");
+
+        // A quoted name is read whole inside the literal.
+        let mut cs = plan(vec![
+            check_of(
+                "ck_quoted",
+                "'app.\"my func\"(integer)'::regprocedure IS NOT NULL",
+            ),
+            routine("app.my func(integer)", "SELECT 1"),
+        ]);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
+        assert_eq!(names(&cs)[1], "add check ck_quoted", "{:?}", names(&cs));
+    }
+
+    /// A function's name in a comment is no call: a column whose default only
+    /// mentions it there stays ahead of the function, which reads the column,
+    /// and the plan is not refused as a cycle (DEC-1364.1).
+    #[test]
+    fn a_function_named_only_in_a_comment_is_no_call() {
+        let mut cs = plan(vec![
+            add_column("g", "0 /* app.f(1) */", false),
+            routine("app.f(integer)", "SELECT g FROM app.t LIMIT 1"),
+        ]);
+        let before = names(&cs);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 0);
+        assert_eq!(names(&cs), before);
     }
 
     /// DEC-1364.1: a view over `*` of the table takes every column when it

@@ -99,18 +99,21 @@ pub fn may_name(text: &str, name: &str) -> bool {
 }
 
 /// Whether an expression may call the function named `name`: [`may_name`],
-/// or the name as a word inside a string literal. Measured on 18.6, a literal
-/// an OID-alias type reads (`'app.f(integer)'::regprocedure`, `'app.f'::regproc`,
-/// `regprocedure('app.f(integer)')`) names the function to the engine, which
-/// refuses it before the function exists and records a dependency on it
-/// after. The literal may also be read so without a cast, as a default of
-/// such a column or compared with one, so every literal counts (DEC-1364.1).
+/// or the name read the same way inside a string literal. Measured on 18.6, a
+/// literal an OID-alias type reads (`'app.f(integer)'::regprocedure`,
+/// `'app.f'::regproc`, `regprocedure('app.f(integer)')`) names the function
+/// to the engine, which refuses it before the function exists and records a
+/// dependency on it after. The literal may also be read so without a cast, as
+/// a default of such a column or compared with one, so every literal counts.
+/// Its contents are read as code, so a quoted name in it is one name; a
+/// comment is no literal (DEC-1364.1).
 #[must_use]
 pub fn may_call(expression: &str, name: &str) -> bool {
     may_name(expression, name)
-        || expression
-            .split(|c: char| !pbps_dialect::continues_ident(c))
-            .any(|word| word.eq_ignore_ascii_case(name))
+        || crate::LEXICON
+            .string_literals(expression)
+            .iter()
+            .any(|contents| may_name(contents, name))
 }
 
 /// Whether a definition may take a table's columns without naming them: a
@@ -140,8 +143,18 @@ mod tests {
     fn a_function_named_inside_a_literal_may_be_called() {
         assert!(may_call("('app.f(integer)'::regprocedure)::text", "f"));
         assert!(may_call("'app.f'::regproc", "f"));
+        assert!(may_call("regprocedure(E'app.f(integer)')", "f"));
         assert!(may_call("app.f(a)", "f"));
+        // A quoted name is one name, delimiters and all.
+        assert!(may_call(
+            "'app.\"my func\"(integer)'::regprocedure",
+            "my func"
+        ));
+        assert!(!may_call("'app.\"my func\"(integer)'::regprocedure", "my"));
+        // Negative: a longer name, a comment, and no name at all.
         assert!(!may_call("'app.ff(integer)'::regprocedure", "f"));
+        assert!(!may_call("0 /* f */", "f"));
+        assert!(!may_call("0 -- 'f'", "f"));
         assert!(!may_call("a * 2", "f"));
     }
 
