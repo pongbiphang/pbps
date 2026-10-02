@@ -135,7 +135,7 @@ async fn every_session_qualifies_its_forwarders_mqueue_before_returning() {
                         refused = true;
                         reason = error.to_string();
                         terminal = server.check().await.is_err();
-                        server.discard().await.unwrap();
+                        require_discarded(FixtureFailure::Open(&error), server.discard().await);
                     }
                 }
             } else {
