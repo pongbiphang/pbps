@@ -1188,7 +1188,8 @@ over the column can refuse what it computes.
 State version 12 carries the field and still reads 6 to 11. An older
 reader reported every generated column as a limitation, which no recorder
 accepts. Plan version 16 turns 15 away. The declaration schema is published
-as set 22. SQL Server refuses `generated:`: its computed columns are #1174's.
+as set 22. SQL Server refuses `generated:`: its computed columns are
+`computed:` (DEC-1174.1).
 
 Pinned by `a_stored_generated_column_round_trips_and_changes_its_expression`
 (`crates/pbps-pg/tests/live.rs`),
@@ -1567,3 +1568,141 @@ Pinned by `the_databases_alike_column_names_order_a_rename_chain` and
 `column_renames_trading_names_under_the_collation_are_refused`
 (`crates/pbps-cli/src/object_order.rs`), and the Turkish column rounds of the
 live `renames_only_the_catalog_can_order_apply_or_are_refused_at_plan`.
+
+<a id="dec-1174-1"></a>
+
+**DEC-1174.1. A SQL Server computed column is a part of its table, not a
+column: declared under `computed:`, changed by a drop and an add, and
+refused by name where a change would need it out of the way (#1174).**
+
+Measured on 17.0.4075.5:
+
+- The engine infers a computed column's type and nullability:
+  `CONCAT(b,'-',a)` reads back as `varchar(23)` NOT NULL.
+- `ALTER COLUMN … AS` is a syntax error (156). `ADD|DROP PERSISTED` alone
+  changes in place.
+- A computed column cannot be written (271).
+- While it stands, the engine refuses each of these:
+
+  | Change | Error |
+  |---|---|
+  | dropping it while an index or check is over it | 4922 |
+  | renaming a column it reads | 15336 |
+  | dropping, retyping, recollating or changing the nullability of a column it reads | 4922 |
+  | `ALTER FUNCTION` on a function it calls, even without SCHEMABINDING | 3729 |
+
+**The model.** `Table::computed` maps a name to `{expression, persisted,
+not_null}`. It is beside `columns`, so neither can hold what only the other
+has:
+
+- A computed column has no type to declare, which would be a second source
+  of truth for what the engine infers.
+- It is never one of `row_columns`, so no reference row can write it.
+
+PostgreSQL's generated columns (DEC-1168.1) declare their type and keep
+`generated:`; PostgreSQL refuses `computed:`. Leon chose this shape over an
+optional `type` on `Column` and over a required one compared with the
+read-back.
+
+**NOT NULL.** `not_null` is held only where it is declared. The engine
+reports `is_nullable = 0` for a declared `PERSISTED NOT NULL` and for an
+expression that is never NULL alike, so a read-back holds `not_null` wherever
+a persisted column is not nullable. A declaration matches a read-back when
+the expression and persistence are equal and the read-back is NOT NULL
+wherever the declaration says so (`ComputedColumn::declares`). Re-declaring
+NOT NULL on a never-NULL expression is harmless, and dropping the flag from
+a declaration does not remove a constraint the engine holds.
+
+**Changes.** `AddComputedColumn` and `DropComputedColumn` are the only
+changes. An expression or persistence change is both, so the column moves to
+the end of its table, which schema equality already ignores. With no uid, a
+renamed computed column is the same pair under two names. In the ordering,
+both act as a part does, an index's place in the drift check included:
+
+- The drop is at (2, 4), after the index, unique and check drops of class 2
+  and before every rename, drop or retype of what it reads.
+- The add is at (9, 3), after the columns it reads reach their final type and
+  before the class-13 additions over it.
+- The indexes, uniques, checks and filtered indexes over a computed column
+  that is dropped and re-added are rebuilt around it, through
+  `recreate_retyped_dependents`, as around a retype (DECISIONS 461). So are
+  those over a name that passes between an ordinary and a computed column in
+  either direction: a column drop and a computed add, or a computed drop and
+  a column add.
+- In the connected scheduler of DEC-1366.1, its drop is a drop on a table, as
+  an index's is. It is addressed by the table's name at the point where it
+  runs.
+- A module drop of a function a computed column may call, where the plan
+  removes that computed column, moves from class 0 to right after the last
+  removal. That is (2, 5) after the column's own drop, and (6, 2) after its
+  table's drop, which takes the column with it. Dropping the function while
+  the column stands is 3729, and module drops otherwise run first. What the
+  moved module names among the plan's other module drops moves with it, such
+  as a function a schema-bound one calls, and the drop rank keeps it behind.
+
+The drop is `destructive`, as an index drop is: the values are derived, but
+the object is gone. The add carries no risk. A persisted add is unchecked in
+the pre-flight, and a key probe over a computed column the plan adds is
+unchecked, not counted over the values the old expression stored.
+
+**Refused by name, offline** (`DiffError::ComputedInputChanged`,
+`ComputedFunctionChanged`). A standing computed column is one that is there
+before the plan and that the plan neither drops nor adds. A change is both.
+One the plan adds, new or again, comes at (9, 3), after every input change.
+
+- A plan is refused that renames, drops, retypes or changes the nullability
+  of a column a standing computed column may read (#1420).
+- So is a plan that alters or drops a module a computed column may call,
+  where the column stands or is added again in the same plan: either way it
+  calls the module when the module changes (#1421). Only one the plan drops
+  for good is out of the way first, with the module's drop moved after it.
+- So is a plan that drops a computed column, for good or to add it again,
+  while a schema-bound module that may read it stands (4922). One the plan
+  drops goes first, in class 0. Rebuilding such a module around the change
+  belongs with #1431.
+- So is a computed column that may call a module the same plan creates,
+  whether by `ADD` or inside a `CREATE TABLE` (#1421). The module is created
+  in class 14, after the table (7) and the column (9).
+
+"May" is `Dialect::may_name`, the over-approximation of DEC-1316.1 applied to
+code only and ignoring case: under a case-insensitive collation `A2` reads
+`a2`, and the engine stores `[a2]`. Only a function module is matched against
+an expression, for a move and for a refusal alike: a computed column calls
+nothing else, so a view or procedure that shares a name the expression uses is
+never what it calls. It is matched by its schema-qualified name
+(`Dialect::may_name_qualified`), because SQL Server calls a scalar function
+only by a two-part name, so `x.f` is not taken for `dbo.f`. Ordering by text
+is the class design #1431 replaces with the catalog's own edges on a connected
+plan. It looks for a delimited name's escaped
+spelling too: `a]b` is stored as `[a]]b]`. Its case fold can only make more
+names equal. `İ` folds to `i` without the combining dot, and `ı` to `i`,
+because a Turkish collation binds `[i]` to `İ`. Accent-, width- and
+kana-insensitive equivalences are a collation's, which no textual fold
+closes. Their structural answer is the catalog's own edges on a connected
+plan (#1426). Until then the engine refuses such a plan inside its
+transaction. A key over a computed column is
+refused by validation (#1419).
+
+**Drift.** The drift check compares computed columns as named parts, and holds a
+plan's add to its persistence and to a declared NOT NULL. That includes the
+computed columns inside a `CREATE TABLE`, which no separate change carries. One
+another session adds or removes after the create is movement (SPEC §7.6).
+
+**Pull.** `sys.computed_columns` gives the definition, unwrapped as a check's
+is, and `is_persisted`. A definition the reader may not see stays a
+limitation by name, never an ordinary column. Expressions are tracked in
+`DeclaredExpressions::computed`, so the engine's respelling is no change.
+
+Pinned by:
+
+- `a_computed_column_change_is_a_drop_and_an_add_around_its_index` and
+  `a_standing_computed_column_refuses_a_change_to_what_it_reads`
+  (`crates/pbps-diff/src/schema_diff.rs`);
+- `a_computed_column_is_read_into_its_own_section`,
+  `a_computed_column_is_validated_as_its_own_kind` and
+  `a_computed_column_is_created_added_and_dropped_as_declared`
+  (`crates/pbps-mssql`);
+- `may_name_reads_code_not_literals_and_ignores_case` (`crates/pbps-dialect`);
+- the live `computed_columns_round_trip_and_change_through_the_cli`
+  (`crates/pbps-cli/tests/flow.rs`).
+

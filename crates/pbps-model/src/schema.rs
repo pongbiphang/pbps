@@ -264,6 +264,19 @@ pub struct Table {
     /// hashing them for that reason (DECISIONS 238).
     pub columns: IndexMap<String, Column>,
 
+    /// SQL Server computed columns (#1174): a name, an expression, and
+    /// whether the value is stored. Not [`Column`]s. The engine infers their
+    /// type and nullability, so there is none to declare or compare, and no
+    /// reference row can write one, so they are not among
+    /// [`row_columns`](Table::row_columns). A separate map rather than a
+    /// kind of column, so that neither can hold what only the other has.
+    ///
+    /// Ordered by name: a computed column is created at the end of its table
+    /// (an expression change re-adds it there, measured on 17.0), so no
+    /// declared order could be kept.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub computed: BTreeMap<String, ComputedColumn>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_key: Option<PrimaryKey>,
 
@@ -688,6 +701,38 @@ pub struct Generated {
     /// than computed on read. A kind, not a flag to leave off: PostgreSQL 18
     /// reads a generation expression with no kind as `VIRTUAL`.
     pub stored: bool,
+}
+
+/// A SQL Server computed column (#1174, DEC-1174.1).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComputedColumn {
+    /// The expression, kept verbatim as a default's is.
+    pub expression: String,
+    /// Whether the value is computed on write and stored (`PERSISTED`),
+    /// rather than on read. Off unless declared, as in the engine.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub persisted: bool,
+    /// `PERSISTED NOT NULL`: a NULL the expression yields is refused. The
+    /// engine infers the nullability of every other computed column, and
+    /// reads back the same `is_nullable = 0` for an expression that is never
+    /// NULL as for a declared `NOT NULL`. So a read-back holds this wherever
+    /// a persisted column is not nullable, and only a declared `true` is held
+    /// to the database (`ComputedColumn::declares`), never a declared absence.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub not_null: bool,
+}
+
+impl ComputedColumn {
+    /// Whether a column read back as `read` is what this declaration asks
+    /// for: the same expression and persistence, and NOT NULL wherever this
+    /// declares it. A declaration without `not_null` matches either reading,
+    /// since the engine may have inferred it (#1174).
+    pub fn declares(&self, read: &ComputedColumn) -> bool {
+        self.expression == read.expression
+            && self.persisted == read.persisted
+            && (!self.not_null || read.not_null)
+    }
 }
 
 /// One key of an index, in the index's order.

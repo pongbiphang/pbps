@@ -28,6 +28,8 @@ fn full_catalog() -> RawCatalog {
         default: None,
         default_constraint: None,
         collation: None,
+        computed_definition: None,
+        computed_persisted: false,
     };
 
     let mut id = col(1, "id", "bigint");

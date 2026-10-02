@@ -21,14 +21,14 @@ The differ sorts every planned change by, in order:
    |---|---|
    | 0 | `DropModule`, `DropRole` |
    | 1 | `RenameTable`, `RenameRole` |
-   | 2 | `DropIndex`, `DropUnique`, `DropForeignKey`, `DropCheck`, `SetPrimaryKey { to: None }` |
+   | 2 | `DropIndex`, `DropUnique`, `DropForeignKey`, `DropCheck`, `SetPrimaryKey { to: None }`; `DropComputedColumn` at the class's end (2, 4) |
    | 3 | `RenameColumn` |
    | 4 | `Revoke` |
    | 5 | `DropColumn` |
    | 6 | `DropTable` |
    | 7 | `CreateTable` |
    | 8 | `AddColumn` |
-   | 9 (`COLUMN_ALTERATIONS`) | `AlterColumnType`, `AlterColumnNullability`, `AlterColumnDefault`, `AlterColumnExpression` |
+   | 9 (`COLUMN_ALTERATIONS`) | `AlterColumnType`, `AlterColumnNullability`, `AlterColumnDefault`, `AlterColumnExpression`; `AddComputedColumn` at the class's end (9, 3) |
    | 10 | `SetColumnDeprecated` |
    | 11 | `InsertRow`, `UpdateRow` |
    | 12 | `DeleteRow` |
@@ -144,6 +144,7 @@ requirement is common to all of them, so it is listed once,
 | `RenameTable` | 1 | The target name free | The table's new name |
 | `RenameRole` | 1 | P: performed by hand. S: the target name free | The role's new name |
 | `DropIndex`, `DropUnique`, `DropForeignKey`, `DropCheck`, `SetPrimaryKey { to: None }` | 2 | A foreign key on a key is dropped before the key | Frees names; releases columns for a rename, drop or retype |
+| `DropComputedColumn` | 2 (2, 4) | S: the indexes, uniques and checks over it gone (4922) | Removes a computed column, frees its name and releases the columns and functions it reads (DEC-1174.1) |
 | `RenameColumn` | 3 | The target name free. S: no check and no filtered index naming the column (DECISIONS 474) | The column's new name. P: dependents' text follows the rename |
 | `Revoke` | 4 | The target exists (a revoke on an object the plan drops is not emitted) | Removes a permission |
 | `DropColumn` | 5 | Its indexes, constraints, inbound foreign keys and modules gone. P: generated columns reading it gone | Removes the column, frees its name |
@@ -154,6 +155,7 @@ requirement is common to all of them, so it is listed once,
 | `AlterColumnNullability` | 9 | Tightening: the values non-null | Accepts or refuses NULL |
 | `AlterColumnDefault` | 9 | Functions the default calls: *content* | The default |
 | `AlterColumnExpression` | 9 | P: its inputs, a relaxation of its own column. Functions it calls: *content* | Recomputed stored values |
+| `AddComputedColumn` | 9 (9, 3) | S: the columns it reads, in their final type. Functions it calls exist (one this plan creates is refused by name) | A computed column at the end of its table (DEC-1174.1) |
 | `SetColumnDeprecated` | 10 | Nothing | Metadata only |
 | `InsertRow`, `UpdateRow` | 11 | The columns written, defaults the row takes, parent rows | Rows |
 | `DeleteRow` | 12 | Child rows moved away or cascaded | Removes a row |
@@ -250,6 +252,9 @@ and the expression-bearing changes that need a function.
 | `AlterColumnType` of an existing input → generated `AddColumn` reading it | fixed | (9, 2) after the in-place alterations: a standing generated reader blocks the retype | ✓ DEC-1168.1 |
 | S: clustered `SetPrimaryKey`, `AddUnique` or `AddIndex` → the table's other added indexes | fixed (cost) | rank inside class 13. Built after them, the clustered layout would rebuild each one; correctness needs nothing here | ✓ DEC-1178.1 |
 | `AddColumn` or `RenameColumn` (input) → `AlterColumnExpression` reading it | fixed | class 8 or 3 before 9 | ✓ DEC-1168.1 |
+| S: `AddColumn`, `AlterColumnType` or `AlterColumnNullability` (input) → `AddComputedColumn` reading it | fixed | (9, 3) after class 8 and the class's alterations | ✓ DEC-1174.1 |
+| S: `AddComputedColumn` → the index, unique or check over it | fixed | class 9 before 13 | ✓ DEC-1174.1 |
+| S: function created → `AddComputedColumn` calling it | content, over-approximated | refused by name (`may_name`): the function is class 14 | ✓ DEC-1174.1 |
 | Retype of a generated column → its `AlterColumnExpression` | fixed | rank −1 before 0: the new expression is computed in the final type | ✓ DEC-1168.1 (`a_generated_columns_nullability_relaxes_before_and_tightens_after_its_expression`) |
 | Referenced key → `AddForeignKey` | fixed | rank inside class 13 | ✓ |
 | `CreateRole` → `Grant` to it | fixed | class 15 before 16 | ✓ |
@@ -285,6 +290,9 @@ one class and the dependents a class cannot see.
 | Inbound foreign key → `DropTable` | fixed | class 2 before 6 | ✓ |
 | `SetPrimaryKey { to: None }` → relaxing a key column's nullability | fixed | class 2 before 9 | ✓ DECISIONS 269 |
 | Generated column → its input's drop | fixed | (5, 0); (2, 2) beside a rename | ✓ DEC-1168.1 |
+| S: index, unique or check over a computed column → its drop, and its re-add around an expression change | fixed | dropped in class 2 before (2, 4), re-added in 13 (`recreate_retyped_dependents`) | ✓ DEC-1174.1 |
+| S: computed column dropped, alone or with its table → drop of a function it calls | content, over-approximated | the function's drop moves from class 0 to (2, 5) after the column's, or (6, 2) after the table's (3729 otherwise) | ✓ DEC-1174.1 |
+| S: standing or re-added computed column → rename, drop, retype or nullability change of a column it reads; alter or drop of a function it calls | fixed, over-approximated | refused by name (`may_name`), with a two-plan remedy; a computed column the plan drops or changes is out of the way at (2, 4) | ✓ DEC-1174.1 |
 | S: key, index, check or foreign key over a column → its retype or recollation | fixed | dropped in class 2, re-added in 13 (`retype_dependents`) | ✓ #1175, DECISIONS 515 |
 | S: index key, `INCLUDE` column, filtered predicate or unique constraint over a column → tightening its nullability; filtered predicate → relaxing it | fixed | dropped in class 2, re-added in 13 (`nullability_dependents`), alone or inside a retype | ✓ DEC-1363.1 |
 | P: generated column → retype or drop of its input | fixed | refused by name, with a two-plan remedy, unless the plan drops the generated column or changes its expression to one that does not name the input | ✓ DEC-1168.1 |

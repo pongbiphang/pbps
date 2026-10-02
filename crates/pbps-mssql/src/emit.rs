@@ -573,6 +573,28 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             ))
         }
 
+        // A computed column (#1174). The expression is the declaration's,
+        // verbatim, inside the parentheses `AS` takes. Neither the expression
+        // nor the persistence changes in place (`ALTER COLUMN … AS` is a
+        // syntax error, measured on 17.0), so a change of either is this
+        // statement after the drop below, and the column is re-added at the
+        // end of its table.
+        Change::AddComputedColumn {
+            table,
+            name,
+            computed,
+        } => one(format!(
+            "ALTER TABLE {} ADD {};",
+            qualified(table)?,
+            computed_definition(name, computed)?
+        )),
+        // No default can stand on a computed column, so none is looked for.
+        Change::DropComputedColumn { table, name, .. } => one(format!(
+            "ALTER TABLE {} DROP COLUMN {};",
+            qualified(table)?,
+            quote(name)?
+        )),
+
         // Refused by validation: this model holds generated columns for
         // PostgreSQL only (DEC-1168.1). An error rather than a statement for a
         // column this engine was never given.
@@ -1660,6 +1682,21 @@ fn create_index(
     Ok(s)
 }
 
+/// `[c] AS (expression) [PERSISTED]`: the expression verbatim, as a check's
+/// is, inside the parentheses `AS` takes (#1174).
+fn computed_definition(
+    name: &str,
+    computed: &pbps_model::ComputedColumn,
+) -> Result<String, DialectError> {
+    Ok(format!(
+        "{} AS ({}){}{}",
+        quote(name)?,
+        verbatim(&computed.expression),
+        if computed.persisted { " PERSISTED" } else { "" },
+        if computed.not_null { " NOT NULL" } else { "" }
+    ))
+}
+
 fn create_table(name: &TableName, table: &Table) -> Sql {
     if table.columns.is_empty() {
         return Err(DialectError::Invalid {
@@ -1672,6 +1709,12 @@ fn create_table(name: &TableName, table: &Table) -> Sql {
     let mut body: Vec<String> = Vec::new();
     for (col_name, column) in &table.columns {
         body.push(column_definition(name, col_name, column)?);
+    }
+    // After the columns they read, and where an `ADD` would put them: at the
+    // end, so a table created here and one changed in place agree on where a
+    // computed column stands (#1174).
+    for (col_name, computed) in &table.computed {
+        body.push(computed_definition(col_name, computed)?);
     }
     // The primary key goes inline; every other constraint is added afterwards,
     // so that creating a table and altering one take the same code path and cannot
@@ -1998,6 +2041,47 @@ mod tests {
             sql[0],
             "CREATE TABLE [dbo].[customer] (\n    [id] bigint NOT NULL,\n    [email] nvarchar(255) NULL,\n    CONSTRAINT [pk_customer] PRIMARY KEY CLUSTERED ([id])\n);"
         );
+    }
+
+    /// A computed column is `AS (expression)` with its persistence and NOT
+    /// NULL, after the columns of a created table and by `ADD` on one that is
+    /// there, and dropped as a column is, with no default to look for
+    /// (#1174).
+    #[test]
+    fn a_computed_column_is_created_added_and_dropped_as_declared() {
+        let stored = pbps_model::ComputedColumn {
+            expression: "a * 2".into(),
+            persisted: true,
+            not_null: true,
+        };
+        let mut t = Table::default();
+        t.columns.insert("a".into(), Column::new(ty("int")));
+        t.computed.insert("c".into(), stored.clone());
+        let sql = sql_of(&Change::CreateTable {
+            uid: uid("t_k7x2mq"),
+            name: tname("dbo.t"),
+            table: Box::new(t),
+        });
+        assert_eq!(
+            sql[0],
+            "CREATE TABLE [dbo].[t] (\n    [a] int NULL,\n    [c] AS (a * 2\n) PERSISTED NOT NULL\n);"
+        );
+        let added = sql_of(&Change::AddComputedColumn {
+            table: tname("dbo.t"),
+            name: "c".into(),
+            computed: pbps_model::ComputedColumn {
+                persisted: false,
+                not_null: false,
+                ..stored.clone()
+            },
+        });
+        assert_eq!(added, ["ALTER TABLE [dbo].[t] ADD [c] AS (a * 2\n);"]);
+        let dropped = sql_of(&Change::DropComputedColumn {
+            table: tname("dbo.t"),
+            name: "c".into(),
+            computed: stored,
+        });
+        assert_eq!(dropped, ["ALTER TABLE [dbo].[t] DROP COLUMN [c];"]);
     }
 
     /// A key's layout is always spelled, because a bare `PRIMARY KEY` beside

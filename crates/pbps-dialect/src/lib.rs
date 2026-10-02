@@ -378,6 +378,9 @@ impl Unchecked {
                 format!("new NOT NULL column {}", table.column(name))
             }
             Change::AlterColumnNullability { column, .. } => format!("NOT NULL column {column}"),
+            Change::AddComputedColumn { table, name, .. } => {
+                format!("new computed column {}", table.column(name))
+            }
             Change::AlterColumnType { column, .. } => format!("type conversion of {column}"),
             Change::DeleteRow { table, key, .. } => format!("references to row {key} in {table}"),
             Change::CreateTable { .. }
@@ -387,6 +390,7 @@ impl Unchecked {
             | Change::RenameColumn { .. }
             | Change::AlterColumnDefault { .. }
             | Change::AlterColumnExpression { .. }
+            | Change::DropComputedColumn { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::DropUnique { .. }
             | Change::DropForeignKey { .. }
@@ -1829,6 +1833,71 @@ fn dollar_tag(s: &str) -> Option<usize> {
 /// dollar-quoted literal ends before it can say whether a default is one — and
 /// a second spelling of this rule is how the difference above gets rediscovered
 /// (PITFALLS, "one rule, spelled in three places").
+/// Code with its delimiters dropped and the whitespace around a dot removed,
+/// so `[dbo] . [f]` reads `dbo.f`: the form [`Dialect::may_name_qualified`]
+/// looks for a qualified name in.
+fn undelimited(code: &str) -> String {
+    let bare: String = code
+        .chars()
+        .filter(|c| !matches!(c, '[' | ']' | '"'))
+        .collect();
+    let mut out = String::with_capacity(bare.len());
+    let mut chars = bare.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_whitespace() {
+            let mut run = String::from(c);
+            while let Some(next) = chars.peek().copied().filter(|n| n.is_whitespace()) {
+                run.push(next);
+                chars.next();
+            }
+            // Dropped next to a dot, on either side; kept anywhere else.
+            if out.ends_with('.') || chars.peek() == Some(&'.') {
+                continue;
+            }
+            out.push_str(&run);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// A fold for comparing identifiers that can only make more of them equal:
+/// lowercase, with the dot `İ` lowercases into dropped and the dotless `ı`
+/// taken as `i`. A Turkish collation binds `[i]` to a column named `İ`, and
+/// plain lowercasing turns `İ` into `i` plus a combining dot that no `i` in
+/// the code matches (#1174 review).
+fn identifier_fold(text: &str) -> String {
+    text.chars()
+        .flat_map(char::to_lowercase)
+        .filter(|c| *c != '\u{307}')
+        .map(|c| if c == 'ı' { 'i' } else { c })
+        .collect()
+}
+
+/// Whether `name` occurs in `code` with nothing that continues an identifier
+/// on either side: the scan behind [`Dialect::may_name`].
+fn names_at_a_boundary(code: &str, name: &str) -> bool {
+    let Some(first) = name.chars().next() else {
+        return false;
+    };
+    let mut from = 0;
+    while let Some(offset) = code[from..].find(name) {
+        let start = from + offset;
+        let end = start + name.len();
+        let before = code[..start]
+            .chars()
+            .next_back()
+            .is_some_and(continues_ident);
+        let after = code[end..].chars().next().is_some_and(continues_ident);
+        if !before && !after {
+            return true;
+        }
+        from = start + first.len_utf8();
+    }
+    false
+}
+
 pub fn continues_ident(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii()
 }
@@ -1989,6 +2058,45 @@ pub trait Dialect {
     ///
     /// [`normalize_definition`]: Dialect::normalize_definition
     fn lexicon(&self) -> Lexicon;
+
+    /// Whether `text` may name `name` as an identifier: in code, never in a
+    /// literal or a comment, ignoring case, and bounded by what cannot
+    /// continue an identifier, so `[a]` and `a*2` name `a` and `amount` does
+    /// not.
+    ///
+    /// An over-approximation, as DEC-1316.1's scan is: a function or a field
+    /// that shares the name counts too. A false yes costs a second plan; a
+    /// false no would cost an apply the engine refuses. Ignoring case is part
+    /// of that: under a case-insensitive collation `A2` reads `a2`, and the
+    /// engine stores `[a2]` either way (measured on 17.0, #1174).
+    /// Whether `text` may name `schema.name`, schema-qualified: the scan
+    /// [`may_name`](Dialect::may_name) makes, over the qualified form. For a
+    /// function a computed column calls, which SQL Server only calls by a
+    /// two-part name, so a function of the same leaf name in another schema
+    /// is not taken for it (#1174 review).
+    fn may_name_qualified(&self, text: &str, schema: &str, name: &str) -> bool {
+        if schema.is_empty() || name.is_empty() {
+            return false;
+        }
+        let code = identifier_fold(&undelimited(&self.lexicon().code_only(text)));
+        let wanted = identifier_fold(&format!("{schema}.{name}"));
+        names_at_a_boundary(&code, &wanted)
+    }
+
+    fn may_name(&self, text: &str, name: &str) -> bool {
+        // A delimited name doubles its closing delimiter: `a]b` is stored as
+        // `[a]]b]` and `a"b` as `"a""b"`, so each spelling is looked for
+        // (#1174 review). A name with neither has one spelling.
+        let spellings = [
+            name.to_owned(),
+            name.replace(']', "]]"),
+            name.replace('"', "\"\""),
+        ];
+        let code = identifier_fold(&self.lexicon().code_only(text));
+        spellings
+            .iter()
+            .any(|spelling| names_at_a_boundary(&code, &identifier_fold(spelling)))
+    }
 
     /// The comparison form of a module definition (ADR-0002).
     ///
@@ -3025,6 +3133,33 @@ mod tests {
     use pbps_model::{CheckConstraint, Index, IndexColumn, PrimaryKey, UniqueConstraint};
 
     use super::*;
+
+    /// The scan finds a name in code whatever its case or brackets, and not
+    /// inside a longer name, a literal or a comment: an over-approximation
+    /// that may say yes wrongly and must not say no wrongly (#1174).
+    #[test]
+    fn may_name_reads_code_not_literals_and_ignores_case() {
+        let d = MinimalDialect;
+        for text in ["[a2] * 2", "A2*2", "f(a2)", "x.a2 + 1"] {
+            assert!(d.may_name(text, "a2"), "{text}");
+        }
+        for text in ["a20 * 2", "ba2", "'a2' + x", "x -- a2\n + 1", ""] {
+            assert!(!d.may_name(text, "a2"), "{text}");
+        }
+        assert!(!d.may_name("a2", ""));
+        // A Turkish collation binds `[i]` to `İ` and `[ı]` to `I`.
+        assert!(d.may_name("[i] * 2", "İ"));
+        assert!(d.may_name("[ı] * 2", "I"));
+        // Qualified: the schema decides, however the name is spelled.
+        assert!(d.may_name_qualified("[dbo].[f](a)", "dbo", "f"));
+        assert!(d.may_name_qualified("DBO . f(a) + 1", "dbo", "f"));
+        assert!(!d.may_name_qualified("x.f(a)", "dbo", "f"));
+        assert!(!d.may_name_qualified("f(a)", "dbo", "f"));
+        assert!(!d.may_name_qualified("'dbo.f'", "dbo", "f"));
+        // A delimited name is stored with its closing delimiter doubled.
+        assert!(d.may_name("[a]]b] * 2", "a]b"));
+        assert!(d.may_name("\"a\"\"b\" * 2", "a\"b"));
+    }
 
     #[test]
     fn safe_type_changes_need_no_approval() {

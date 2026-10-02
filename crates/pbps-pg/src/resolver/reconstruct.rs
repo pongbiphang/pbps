@@ -272,6 +272,8 @@ impl Reconstruction {
                 | Change::AddCheck { .. }
                 | Change::DropCheck { .. }
                 | Change::AddIndex { .. }
+                | Change::AddComputedColumn { .. }
+                | Change::DropComputedColumn { .. }
                 | Change::DropIndex { .. }
                 | Change::UpdateRow { .. }
                 | Change::DeleteRow { .. }

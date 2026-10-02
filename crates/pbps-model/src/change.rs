@@ -22,7 +22,8 @@ use crate::module::{Module, ModuleId, ModuleKind, ObjectName, RoutineId};
 use crate::name::{ColumnRef, TableName};
 use crate::role::{GrantTarget, Permission};
 use crate::schema::{
-    CheckConstraint, Collation, Column, ForeignKey, Index, PrimaryKey, Table, UniqueConstraint,
+    CheckConstraint, Collation, Column, ComputedColumn, ForeignKey, Index, PrimaryKey, Table,
+    UniqueConstraint,
 };
 use crate::strategy::Strategy;
 use crate::types::ColumnType;
@@ -278,6 +279,22 @@ pub enum Change {
         column: ColumnRef,
         from: String,
         to: String,
+    },
+    /// A SQL Server computed column created (#1174, DEC-1174.1), at the end
+    /// of its table. An expression or persisted change is this after a
+    /// [`Change::DropComputedColumn`]: the engine changes neither in place
+    /// (`ALTER COLUMN … AS` is a syntax error, measured on 17.0).
+    AddComputedColumn {
+        table: TableName,
+        name: String,
+        computed: ComputedColumn,
+    },
+    /// A SQL Server computed column dropped, carrying what it was. Its values
+    /// are derived, so dropping one loses nothing a re-add cannot compute.
+    DropComputedColumn {
+        table: TableName,
+        name: String,
+        computed: ComputedColumn,
     },
     /// Deprecation flag changed. Produces no structural change; may optionally be
     /// written to an extended property.
@@ -741,6 +758,10 @@ pub enum Part {
     ForeignKey,
     Check,
     Index,
+    /// A SQL Server computed column (#1174). A part rather than a column:
+    /// added and dropped whole by name, never altered in place, and outside
+    /// `columns`, as an index is.
+    Computed,
 }
 
 /// One named part of a table, and what this plan leaves there.
@@ -806,6 +827,7 @@ pub enum PartDefinition<'a> {
     ForeignKey(&'a ForeignKey),
     Check(&'a CheckConstraint),
     Index(&'a Index, bool),
+    Computed(&'a ComputedColumn),
 }
 
 impl PartDefinition<'_> {
@@ -816,6 +838,7 @@ impl PartDefinition<'_> {
             PartDefinition::ForeignKey(_) => Part::ForeignKey,
             PartDefinition::Check(_) => Part::Check,
             PartDefinition::Index(..) => Part::Index,
+            PartDefinition::Computed(_) => Part::Computed,
         }
     }
 }
@@ -997,6 +1020,8 @@ impl Change {
             | Change::AddCheck { table, .. }
             | Change::DropCheck { table, .. }
             | Change::AddIndex { table, .. }
+            | Change::AddComputedColumn { table, .. }
+            | Change::DropComputedColumn { table, .. }
             | Change::DropIndex { table, .. }
             | Change::InsertRow { table, .. }
             | Change::UpdateRow { table, .. }
@@ -1067,6 +1092,8 @@ impl Change {
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
             | Change::DropIndex { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
@@ -1175,6 +1202,8 @@ impl Change {
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
             | Change::DropIndex { .. }
             | Change::SetDataMode { .. }
             | Change::CreateModule { .. }
@@ -1234,6 +1263,8 @@ impl Change {
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
             | Change::DropIndex { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
@@ -1334,6 +1365,8 @@ impl Change {
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
             | Change::DropIndex { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
@@ -1388,6 +1421,8 @@ impl Change {
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
             | Change::DropIndex { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
@@ -1460,6 +1495,8 @@ impl Change {
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
             | Change::DropIndex { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
@@ -1509,6 +1546,8 @@ impl Change {
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
             | Change::DropIndex { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
@@ -1554,6 +1593,8 @@ impl Change {
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
             | Change::DropIndex { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
@@ -1640,6 +1681,8 @@ impl Change {
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
             | Change::DropIndex { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
@@ -1696,6 +1739,8 @@ impl Change {
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
             | Change::DropIndex { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
@@ -1793,6 +1838,18 @@ impl Change {
             Change::DropIndex { table, name, .. } => {
                 it(table, Some(name), PartAfter::Gone(Part::Index))
             }
+            Change::AddComputedColumn {
+                table,
+                name,
+                computed,
+            } => it(
+                table,
+                Some(name),
+                standing(PartDefinition::Computed(computed)),
+            ),
+            Change::DropComputedColumn { table, name, .. } => {
+                it(table, Some(name), PartAfter::Gone(Part::Computed))
+            }
             Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
@@ -1850,6 +1907,8 @@ impl Change {
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
             | Change::DropIndex { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
@@ -1901,6 +1960,8 @@ impl Change {
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
             | Change::DropIndex { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
@@ -1940,6 +2001,8 @@ impl Change {
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
             | Change::DropIndex { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
@@ -1970,6 +2033,9 @@ impl Change {
             Change::DropTable { .. }
             | Change::DropColumn { .. }
             | Change::DropIndex { .. }
+            // An object gone, as an index is, though its values are derived:
+            // an expression change, a drop and an add, faces this gate too.
+            | Change::DropComputedColumn { .. }
             // Removing uniqueness needs approval even without deleting rows;
             // FK/CHECK relaxation has a separate policy (DECISIONS 486).
             | Change::DropUnique { .. } => {
@@ -2082,6 +2148,9 @@ impl Change {
             // unique index, which can fail on the data like any other
             // uniqueness. A plain index constrains nothing.
             | Change::AddIndex { .. }
+            // Nor does a computed column: it holds no value of its own, and
+            // one the engine cannot compute is refused inside the transaction.
+            | Change::AddComputedColumn { .. }
             // A revoke that follows a `CREATE` takes nothing from anybody:
             // the object it names did not exist a statement earlier.
             | Change::PublicExecution {

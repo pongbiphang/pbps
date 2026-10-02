@@ -243,6 +243,8 @@ pub fn planned_estimates(changes: &ChangeSet) -> Vec<(usize, Estimate)> {
                 | Change::AddCheck { .. }
                 | Change::DropCheck { .. }
                 | Change::AddIndex { .. }
+                | Change::AddComputedColumn { .. }
+                | Change::DropComputedColumn { .. }
                 | Change::InsertRow { .. }
                 | Change::UpdateRow { .. }
                 | Change::DeleteRow { .. }
@@ -329,6 +331,8 @@ pub fn planned_estimates(changes: &ChangeSet) -> Vec<(usize, Estimate)> {
                 | Change::AddCheck { .. }
                 | Change::DropCheck { .. }
                 | Change::AddIndex { .. }
+                | Change::AddComputedColumn { .. }
+                | Change::DropComputedColumn { .. }
                 | Change::DropIndex { .. }
                 | Change::InsertRow { .. }
                 | Change::UpdateRow { .. }

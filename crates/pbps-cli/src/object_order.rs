@@ -228,6 +228,9 @@ fn part(change: &Change) -> Option<Part> {
         | Change::DropUnique { .. }
         | Change::DropForeignKey { .. }
         | Change::DropCheck { .. }
+        // A drop on a table as an index's is (DEC-1174.1): it names the
+        // table, and is addressed by its name where it runs.
+        | Change::DropComputedColumn { .. }
         | Change::SetPrimaryKey { to: None, .. } => Some(Part::Drop),
         _ => None,
     }
@@ -244,6 +247,7 @@ fn addressed(change: &Change, table: &TableName) -> Change {
         | Change::DropUnique { table: at, .. }
         | Change::DropForeignKey { table: at, .. }
         | Change::DropCheck { table: at, .. }
+        | Change::DropComputedColumn { table: at, .. }
         | Change::SetPrimaryKey {
             table: at,
             to: None,
@@ -899,7 +903,9 @@ mod tests {
         let table = |cs: &[PlannedChange]| -> Vec<String> {
             cs.iter()
                 .filter_map(|p| {
-                    if let Change::DropCheck { table, .. } = &p.change {
+                    if let Change::DropCheck { table, .. }
+                    | Change::DropComputedColumn { table, .. } = &p.change
+                    {
                         Some(table.to_string())
                     } else {
                         None
@@ -907,6 +913,20 @@ mod tests {
                 })
                 .collect()
         };
+        // A computed column's drop is addressed the same way (#1174).
+        let computed = PlannedChange::new(Change::DropComputedColumn {
+            table: name("s2.new"),
+            name: "c".into(),
+            computed: pbps_model::ComputedColumn {
+                expression: "a * 2".into(),
+                persisted: false,
+                not_null: false,
+            },
+        });
+        let after = [rename("s1.old", "s2.new", &[]), computed];
+        let search = Search::new(&after);
+        assert_eq!(table(&search.reordered(&[0, 1])), ["s2.new"]);
+        assert_eq!(table(&search.reordered(&[1, 0])), ["s1.old"]);
         let before = [drop_check("s1.old", "c"), rename("s1.old", "s2.new", &[])];
         let search = Search::new(&before);
         assert_eq!(table(&search.reordered(&[0, 1])), ["s1.old"]);

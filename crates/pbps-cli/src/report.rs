@@ -339,6 +339,8 @@ fn role_of(change: &Change) -> Option<&str> {
         | Change::AddCheck { .. }
         | Change::DropCheck { .. }
         | Change::AddIndex { .. }
+        | Change::AddComputedColumn { .. }
+        | Change::DropComputedColumn { .. }
         | Change::DropIndex { .. }
         | Change::InsertRow { .. }
         | Change::UpdateRow { .. }
@@ -385,6 +387,8 @@ fn renames(cs: &ChangeSet) -> Renames {
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
             | Change::DropIndex { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
@@ -677,6 +681,13 @@ pub fn describe(c: &Change) -> String {
         Change::AlterColumnExpression { column, to, .. } => {
             format!("~ {} generated as {to}", column.name)
         }
+        Change::AddComputedColumn { name, computed, .. } => format!(
+            "+ add computed column {name} as ({}){}{}",
+            computed.expression,
+            if computed.persisted { " persisted" } else { "" },
+            if computed.not_null { " not null" } else { "" }
+        ),
+        Change::DropComputedColumn { name, .. } => format!("- drop computed column {name}"),
         Change::SetColumnDeprecated { column, reason, .. } => match reason {
             Some(r) => format!("~ {} marked deprecated: {r}", column.name),
             None => format!("~ {} no longer deprecated", column.name),

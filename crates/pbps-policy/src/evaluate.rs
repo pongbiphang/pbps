@@ -240,6 +240,10 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                     to_nullable: false,
                     ..
                 } => Some(&column.table),
+                // Neither side: a computed column stores nothing, and an
+                // expression change drops and re-adds one under its name, so
+                // readers find it there throughout (#1174).
+                Change::AddComputedColumn { .. } | Change::DropComputedColumn { .. } => None,
                 Change::AlterColumnType { .. }
                 | Change::CreateTable { .. }
                 | Change::DropTable { .. }

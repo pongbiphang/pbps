@@ -305,6 +305,11 @@ pub struct TableDto {
     /// the column layout of `CREATE TABLE`.
     pub columns: IndexMap<String, ColumnDto>,
 
+    /// SQL Server computed columns: `{expression: "a * 2", persisted: true}`.
+    /// No type: the engine infers it (#1174).
+    #[serde(default)]
+    pub computed: BTreeMap<String, ComputedDto>,
+
     #[serde(default)]
     pub primary_key: Option<PrimaryKeyDto>,
 
@@ -481,6 +486,20 @@ pub struct ForeignKeyDto {
 }
 
 /// How a generated column is computed (DEC-1168.1).
+/// A SQL Server computed column (#1174).
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ComputedDto {
+    /// The expression, kept verbatim.
+    pub expression: String,
+    /// `true` for a value computed on write and stored (`PERSISTED`).
+    #[serde(default)]
+    pub persisted: bool,
+    /// `true` for `PERSISTED NOT NULL`. Requires `persisted`.
+    #[serde(default)]
+    pub not_null: bool,
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GeneratedDto {

@@ -956,6 +956,8 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
             | change @ pbps_model::Change::DropCheck { .. }
             | change @ pbps_model::Change::AddIndex { .. }
             | change @ pbps_model::Change::DropIndex { .. }
+            | change @ pbps_model::Change::AddComputedColumn { .. }
+            | change @ pbps_model::Change::DropComputedColumn { .. }
             | change @ pbps_model::Change::InsertRow { .. }
             | change @ pbps_model::Change::UpdateRow { .. }
             | change @ pbps_model::Change::DeleteRow { .. }
