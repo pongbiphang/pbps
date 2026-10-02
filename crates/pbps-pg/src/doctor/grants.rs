@@ -348,8 +348,9 @@ fn catalog_question(values: &str) -> String {
     // shared with the pull so that the diagnosis and the read that refuses a
     // plan cannot answer it differently (#251).
     let held = crate::catalog::revocable_by_current_role("t.owner", "t.acl");
+    let depths = crate::catalog::MEMBERSHIP_DEPTHS;
     format!(
-        "WITH managed AS (
+        "WITH RECURSIVE {depths}, managed AS (
             SELECT r.oid FROM pg_catalog.pg_roles r
             JOIN (VALUES {values}) AS wanted(name) ON r.rolname = wanted.name
         ), targets AS (

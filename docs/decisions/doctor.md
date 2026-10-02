@@ -801,6 +801,11 @@ What stays as it was:
   costs roles times depth rather than one row per path. It has no fixed depth
   cap: it is bounded by the number of roles, which no acyclic membership path
   can exceed.
+- The walk runs once per statement, as a `WITH RECURSIVE` member the query
+  declares, and each ACL row only looks its candidates up. Inside each row's
+  expression, the planner charged the walk once per ACL row; the estimate
+  crossed `jit_above_cost`, and every catalog read paid about 450 ms of JIT
+  compilation on 18, which slowed the live CI shards several times over.
 
 The live regression is `the_nearest_inherited_grantor_decides_an_adopted_revoke`.
 It asks doctor and the catalog read, then checks each case with an actual
