@@ -4,7 +4,7 @@
 //! UIDs distinguish a renamed old name from a new object reusing that name.
 
 use super::Error;
-use pbps_model::resolver::{ObjectOwnership, ObjectTransition, Surface};
+use pbps_model::resolver::{ObjectIdentity, ObjectOwnership, ObjectTransition, Surface};
 use pbps_model::{Change, ChangeSet, Schema};
 use pbps_pg::resolver::capture::BindingRecord;
 use std::collections::{BTreeMap, BTreeSet};
@@ -50,6 +50,63 @@ fn inventory(
     records
         .iter()
         .filter(|entry| contains(&entry.ownership, surface, children))
+        .map(|entry| entry.object.clone())
+        .collect()
+}
+
+/// Whether an identity names one of `set` anywhere in its signature.
+fn mentions(object: &ObjectIdentity, set: &BTreeSet<ObjectIdentity>) -> bool {
+    object
+        .signature
+        .iter()
+        .any(|part| set.contains(part) || mentions(part, set))
+}
+
+/// Records another managed surface owns that name a renamed object: those a
+/// dependency row ties to it (a foreign key on another table), then, to a
+/// fixed point, every record whose identity names one already found (that
+/// key's RI triggers on either table and their dependency rows). PostgreSQL
+/// rewrites them in place, so the rename carries them (DEC-1274.1). An
+/// unqualified record is never carried; one another transition inventories
+/// stays there.
+fn referencing(
+    records: &[BindingRecord],
+    renamed: &BTreeSet<ObjectIdentity>,
+    taken: &BTreeSet<ObjectIdentity>,
+) -> BTreeSet<ObjectIdentity> {
+    let mut found: BTreeSet<ObjectIdentity> = records
+        .iter()
+        .filter(|entry| entry.object.class == "pg_depend")
+        .filter(|entry| {
+            entry
+                .object
+                .signature
+                .get(1)
+                .is_some_and(|referenced| renamed.contains(referenced))
+        })
+        .filter_map(|entry| entry.object.signature.first().cloned())
+        .collect();
+    loop {
+        let size = found.len();
+        let named: BTreeSet<_> = renamed.union(&found).cloned().collect();
+        found.extend(
+            records
+                .iter()
+                .filter(|entry| mentions(&entry.object, &named))
+                .map(|entry| entry.object.clone()),
+        );
+        if found.len() == size {
+            break;
+        }
+    }
+    records
+        .iter()
+        .filter(|entry| {
+            found.contains(&entry.object)
+                && matches!(entry.ownership, ObjectOwnership::Surface(_))
+                && !renamed.contains(&entry.object)
+                && !taken.contains(&entry.object)
+        })
         .map(|entry| entry.object.clone())
         .collect()
 }
@@ -453,6 +510,7 @@ pub(super) fn derive(
                 };
                 (
                     ObjectTransition {
+                        references: BTreeSet::new(),
                         surface,
                         before,
                         after,
@@ -493,6 +551,46 @@ pub(super) fn derive(
         transitions[parent]
             .after
             .retain(|object| !child_after.contains(object));
+    }
+    let renames: BTreeSet<Surface> = changes
+        .changes
+        .iter()
+        .filter_map(|step| {
+            if let Change::RenameTable { uid, to, .. } = &step.change {
+                Some(Surface::Table(
+                    final_tables.get(uid).cloned().unwrap_or_else(|| to.clone()),
+                ))
+            } else if let Change::RenameColumn { uid, table, to, .. } = &step.change {
+                Some(Surface::Column(final_column(
+                    uid,
+                    &table.column(to),
+                    desired,
+                )))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let mut taken_before: BTreeSet<_> = transitions
+        .iter()
+        .flat_map(|t| t.before.iter().cloned())
+        .collect();
+    let mut taken_after: BTreeSet<_> = transitions
+        .iter()
+        .flat_map(|t| t.after.iter().cloned())
+        .collect();
+    for transition in &mut transitions {
+        if !renames.contains(&transition.surface) {
+            continue;
+        }
+        let before = referencing(opening, &transition.before, &taken_before);
+        let after = referencing(compiled, &transition.after, &taken_after);
+        taken_before.extend(before.iter().cloned());
+        taken_after.extend(after.iter().cloned());
+        transition.references.extend(before.iter().cloned());
+        transition.references.extend(after.iter().cloned());
+        transition.before.extend(before);
+        transition.after.extend(after);
     }
     Ok(transitions)
 }

@@ -565,6 +565,7 @@ mod tests {
                 }),
             }],
             vec![ObjectTransition {
+                references: BTreeSet::new(),
                 surface,
                 before: BTreeSet::new(),
                 after: BTreeSet::from([object("app", "v")]),
@@ -721,6 +722,7 @@ mod tests {
         // A transition cannot turn the grant into permission to replace the
         // view's fingerprint with a placeholder.
         let transition = ObjectTransition {
+            references: BTreeSet::new(),
             surface: Surface::Module("app.v".parse().unwrap()),
             before: BTreeSet::from([object("app", "v")]),
             after: BTreeSet::from([object("app", "v")]),

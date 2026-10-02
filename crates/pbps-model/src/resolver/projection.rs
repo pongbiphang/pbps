@@ -14,6 +14,13 @@ pub struct ObjectTransition {
     pub surface: Surface,
     pub before: BTreeSet<ObjectIdentity>,
     pub after: BTreeSet<ObjectIdentity>,
+    /// Records owned by another managed surface that a rename carries
+    /// because they reference the renamed object: a foreign key pointing at a
+    /// renamed table, its RI triggers and dependency rows. PostgreSQL rewrites
+    /// them in place. Only a rename may carry them, and only with qualified
+    /// ownership; the adapter proves the reference (DEC-1274.1).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub references: BTreeSet<ObjectIdentity>,
 }
 
 impl InputManifest {
@@ -139,7 +146,9 @@ impl InputManifest {
             // placeholder's ownership: the transition installing it must
             // authorize that owner, as sealing checked.
             let owned = transitions.iter().any(|t| {
-                t.after.contains(&p.object) && authorized(changes, t, &p.ownership, false)
+                t.after.contains(&p.object)
+                    && (authorized(changes, t, &p.ownership, false)
+                        || carried_reference(changes, t, &p.object, &p.ownership))
             });
             if !installed.contains(&p.object) || !owned {
                 return Ok(false);
@@ -254,6 +263,10 @@ impl InputManifest {
         let mut owners = BTreeSet::new();
         for transition in transitions {
             if (transition.before.is_empty() && transition.after.is_empty())
+                || !transition
+                    .references
+                    .iter()
+                    .all(|r| transition.before.contains(r) || transition.after.contains(r))
                 || !owners.insert(&transition.surface)
                 || !changes.changes.iter().enumerate().any(|(index, p)| {
                     touches(&p.change, &transition.surface)
@@ -273,7 +286,8 @@ impl InputManifest {
                         .binary_search_by(|p| p.object.cmp(object))
                         .map_err(|_| ManifestError::Incomplete)?;
                     let ownership = &records[position].ownership;
-                    let affected = authorized(changes, transition, ownership, before);
+                    let affected = authorized(changes, transition, ownership, before)
+                        || carried_reference(changes, transition, object, ownership);
                     if !affected {
                         return Err(ManifestError::Invalid);
                     }
@@ -406,6 +420,27 @@ fn authorized(
                     .contains(ownership)
             }))
     })
+}
+
+/// A record another managed surface owns may ride on a rename that rewrites
+/// its reference (DEC-1274.1): the transition must list it as a reference,
+/// a rename must touch the transition's surface, and the record's ownership
+/// must be qualified. Any other reference still confers no authority.
+fn carried_reference(
+    changes: &ChangeSet,
+    transition: &ObjectTransition,
+    object: &ObjectIdentity,
+    ownership: &ObjectOwnership,
+) -> bool {
+    transition.references.contains(object)
+        && matches!(ownership, ObjectOwnership::Surface(_))
+        && changes.changes.iter().enumerate().any(|(index, step)| {
+            matches!(
+                step.change,
+                Change::RenameTable { .. } | Change::RenameColumn { .. }
+            ) && (touches(&step.change, &transition.surface)
+                || vector_transition_matches(&step.change, changes, index, &transition.surface))
+        })
 }
 
 /// A signature lookup may change only between the plan's own records: what

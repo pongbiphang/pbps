@@ -1236,6 +1236,16 @@ manifest is exactly the untouched opening records plus placeholders of
 installed records; the closing-side inventory and ownership checks run when the
 plan is sealed.
 
+A rename may also carry records another managed surface owns, when they name
+the renamed table or column: a foreign key on another table, its RI triggers on
+both tables and their dependency rows. PostgreSQL rewrites them in place, and
+the differ keeps the key, so their closing state cannot be the opening one.
+The adapter proves each reference: a dependency row ties the record to the
+renamed object, or its identity names one already carried. The transition lists
+them as references, and the model accepts a reference only on a transition a
+rename touches, and only with qualified ownership. Referencing still confers
+no authority anywhere else (DEC-614.2).
+
 A GRANT, REVOKE or PUBLIC execution change makes no transition. Owners and ACLs
 are not fingerprinted, so its target's catalog record does not change: it stays
 an untouched input with its full fingerprint, and a concurrent change to it
