@@ -1520,7 +1520,11 @@ A dropped column that another generated column's new text may read has no
 order. Once that column reads it, the drop is refused. Before that, its
 expression names a column that is gone. So the plan is refused naming the
 reader, with a two-plan remedy, unless the plan gives the name to a new
-column, which the text then reads. Before this, a reader the differ sorted
+column, which the text then reads. A generated column the plan adds is such a reader
+too (#1425): it reads its input from the moment it exists, and the differ
+drops the input first. Only a drop looks at it, since the differ adds a
+generated column after every column alteration, a retype among them
+(DEC-1168.1). Before this, a reader the differ sorted
 ahead of the release was passed over, and `DROP COLUMN` failed at apply. A new
 reader sorted ahead of the retype it must follow is now held back too, where
 the moves only looked between the retype and its release.

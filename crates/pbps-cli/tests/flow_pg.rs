@@ -6798,6 +6798,68 @@ fn a_new_reader_of_a_dropped_input_is_refused_before_anything_runs() {
     );
 }
 
+/// #1425: the same with a generated column the revision adds rather than one
+/// it changes. The differ drops `a` before it adds `h`, and the `ADD COLUMN`
+/// would fail with `a` gone, so `plan --db` refuses it by name first.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_new_generated_column_reading_a_dropped_input_is_refused_before_anything_runs() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "generated-added-reader");
+    let connection = own.connection().to_owned();
+    on_server(
+        &connection,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.t (id integer PRIMARY KEY, a integer, b integer)",
+    );
+    let d = Demo::new("generated-added-reader");
+    succeeds(d.run(&["pull", "--db", &connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    let path = d.dir.join("schema/app.t.yml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut column = String::new();
+    let mut edited: Vec<String> = Vec::new();
+    for l in text.lines() {
+        if !l.starts_with("   ") {
+            column = l.trim().trim_end_matches(':').to_owned();
+        }
+        if column == "a" {
+            continue;
+        }
+        edited.push(l.to_owned());
+        if l == "columns:" {
+            edited.push("  h:".into());
+            edited.push("    type: integer".into());
+            edited.push("    generated: {expression: 'a + 1', stored: true}".into());
+        }
+    }
+    let edited = edited.join("\n") + "\n";
+    assert!(
+        edited.contains("'a + 1'") && !edited.contains("\n  a:"),
+        "app.t is where this test expects it:\n{text}"
+    );
+    std::fs::write(&path, edited).unwrap();
+    succeeds(d.run(&["drop", "app.t.a", "--reason", "gone"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("the expression of the new app.t.h"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT count(*)::int8 FROM information_schema.columns \
+              WHERE table_schema = 'app' AND table_name = 't' AND column_name = 'a'"
+        ),
+        1
+    );
+}
+
 /// A NOT NULL tightening runs after the plan's rows on its table, which may
 /// be what fills or removes its NULLs: an `ensure` update that gives the NULL
 /// a value, and an `exact` table that deletes the row holding it. Both apply,

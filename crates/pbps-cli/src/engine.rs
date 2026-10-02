@@ -1240,6 +1240,8 @@ fn release_of(
 ///   no order performs (#1391);
 /// - changes that wait on one another, as two generated columns trading
 ///   retyped inputs do.
+// The complement is every change that carries no generation expression.
+#[allow(clippy::wildcard_enum_match_arm)]
 pub(crate) fn order_after_releases(
     changes: &mut ChangeSet,
     dependences: &BTreeMap<TableName, Vec<pbps_pg::generated::Dependence>>,
@@ -1278,12 +1280,31 @@ pub(crate) fn order_after_releases(
                 &pbps_model::ColumnRef::new(column.table.clone(), live.clone()),
             );
         for (j, q) in changes.changes.iter().enumerate() {
-            let Change::AlterColumnExpression { column: c, to, .. } = &q.change else {
-                continue;
+            // A changed expression, or a generated column the plan adds,
+            // which reads its input from the moment it exists (#1425). The
+            // differ adds a generated column after every column alteration
+            // (DEC-1168.1), so only a drop has to look at it: a retype runs
+            // before it already.
+            let (c, to, added) = match &q.change {
+                Change::AlterColumnExpression { column: c, to, .. } => (c.clone(), to, false),
+                Change::AddColumn {
+                    table: t,
+                    name,
+                    column: added,
+                    ..
+                } => match &added.generated {
+                    Some(generated) if matches!(p.change, Change::DropColumn { .. }) => (
+                        pbps_model::ColumnRef::new(t.clone(), name.clone()),
+                        &generated.expression,
+                        true,
+                    ),
+                    _ => continue,
+                },
+                _ => continue,
             };
-            let (at, generated) = names.column(c);
+            let (at, generated) = names.column(&c);
             if at != table
-                || readers.contains(&generated.as_str())
+                || (!added && readers.contains(&generated.as_str()))
                 || !((!live_is_another && may_read(to, &live)) || may_read(to, &column.name))
             {
                 continue;
@@ -1291,11 +1312,16 @@ pub(crate) fn order_after_releases(
             if matches!(p.change, Change::AlterColumnType { .. }) {
                 waits[j].insert(i);
             } else if !reused(changes, column) {
+                let what = if added {
+                    "the expression of the new"
+                } else {
+                    "the new expression of"
+                };
                 return Err(format!(
-                    "{column} is dropped in this plan, and the new expression of {c} may read \
-                     it: once {c} reads it, the drop is refused, and before that the \
-                     expression names a column that is gone. Change that expression in a plan \
-                     of its own first, or write it without {column}."
+                    "{column} is dropped in this plan, and {what} {c} may read it: once {c} \
+                     reads it, the drop is refused, and before that the expression names a \
+                     column that is gone. Change that expression in a plan of its own first, or \
+                     write it without {column}."
                 ));
             }
         }
@@ -2663,6 +2689,41 @@ mod tests {
                 column: Box::new(pbps_model::Column::new("text".parse().unwrap())),
             },
             reader(),
+        ]);
+        assert_eq!(order_after_releases(&mut cs, &BTreeMap::new()), Ok(0));
+        // #1425: a generated column the plan adds reads its input from the
+        // moment it exists, so one reading a dropped column has no order
+        // either; the differ would run the drop first and the `ADD COLUMN`
+        // would fail. Unless the name goes to a new column it reads instead.
+        let generated_h = |expression: &str| Change::AddColumn {
+            uid: uid("c_hhhhhh"),
+            table: t.clone(),
+            name: "h".into(),
+            column: Box::new(pbps_model::Column {
+                generated: Some(pbps_model::Generated {
+                    expression: expression.into(),
+                    stored: true,
+                }),
+                ..pbps_model::Column::new("integer".parse().unwrap())
+            }),
+        };
+        let mut cs = plan(vec![drop("a"), generated_h("a + 1")]);
+        let refusal = order_after_releases(&mut cs, &BTreeMap::new()).unwrap_err();
+        assert!(
+            refusal.contains("the expression of the new app.t.h"),
+            "{refusal}"
+        );
+        let mut cs = plan(vec![drop("a"), generated_h("b + 1")]);
+        assert_eq!(order_after_releases(&mut cs, &BTreeMap::new()), Ok(0));
+        let mut cs = plan(vec![
+            drop("a"),
+            Change::AddColumn {
+                uid: uid("c_eeeeee"),
+                table: t.clone(),
+                name: "a".into(),
+                column: Box::new(pbps_model::Column::new("integer".parse().unwrap())),
+            },
+            generated_h("a + 1"),
         ]);
         assert_eq!(order_after_releases(&mut cs, &BTreeMap::new()), Ok(0));
         // `a` renamed to `x` and retyped, and a new column taking the name
