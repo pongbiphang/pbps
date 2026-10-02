@@ -821,7 +821,34 @@ fn diff_partial_rebuilding(
         .iter()
         .filter_map(|p| row_table(&p.change).cloned())
         .collect();
+    // The modules a computed column this plan drops may call: dropping one
+    // while the column stands is refused (3729, measured on 17.0), and module
+    // drops are class 0, ahead of the computed column's at (2, 4). So these
+    // go at (2, 5), right after it (#1174 review).
+    let called_by_a_dropped_computed: BTreeSet<ModuleId> = planned
+        .iter()
+        .filter_map(|p| {
+            if let Change::DropModule { id, .. } = &p.change {
+                Some(id)
+            } else {
+                None
+            }
+        })
+        .filter(|id| {
+            let function = id.object_name().name;
+            planned.iter().any(|p| {
+                matches!(&p.change, Change::DropComputedColumn { computed, .. }
+                    if dialect.may_name(&computed.expression, &function))
+            })
+        })
+        .cloned()
+        .collect();
     let sort_class = |c: &Change| -> (u8, usize) {
+        if let Change::DropModule { id, .. } = c
+            && called_by_a_dropped_computed.contains(id)
+        {
+            return (2, 5);
+        }
         // A tightening of a table whose rows this plan writes or deletes runs
         // after them, at the end of the deletes' class: the rows may be what
         // fills or removes its NULLs, and no row change needs the column NOT
@@ -1685,10 +1712,14 @@ fn refuse_computed_dependencies(
                 if t == table && n == name)
         })
     };
+    // Added by an `ADD`, or with its table by a `CREATE TABLE`: both come
+    // before a module this plan creates (class 7 and 9, before 14).
     let added = |table: &TableName, name: &str| {
         changes.iter().any(|c| {
             matches!(c, Change::AddComputedColumn { table: t, name: n, .. }
                 if t == table && n == name)
+                || matches!(c, Change::CreateTable { name: t, table: created, .. }
+                    if t == table && created.computed.contains_key(name))
         })
     };
     for (table_name, table) in &declared.tables {
@@ -1707,8 +1738,15 @@ fn refuse_computed_dependencies(
                     });
                 }
                 let module = match change {
-                    Change::AlterModule { id, .. } if standing => Some((id, "alters")),
-                    Change::DropModule { id, .. } if standing => Some((id, "drops")),
+                    // Standing, or re-added: either way it calls the module
+                    // when the module changes. One only dropped is out of the
+                    // way first, its module's drop moved after it.
+                    Change::AlterModule { id, .. } if standing || added(table_name, name) => {
+                        Some((id, "alters"))
+                    }
+                    Change::DropModule { id, .. } if standing || added(table_name, name) => {
+                        Some((id, "drops"))
+                    }
                     Change::CreateModule { id, .. } if added(table_name, name) => {
                         Some((id, "creates"))
                     }
@@ -3498,6 +3536,47 @@ mod tests {
                     if function == "f" && *change == "alters")),
             "{errors:?}"
         );
+        // Re-added around the alter, it calls the module when the module
+        // changes: refused too (#1174 review).
+        let errors = errors_of(
+            &calls("one"),
+            &with_modules(
+                shaped(Column::new(ty("int")), "dbo.f(a2) + 1"),
+                &[("dbo.f", "two")],
+            ),
+            &[],
+        );
+        assert!(
+            errors.iter().any(|e| matches!(e,
+                DiffError::ComputedFunctionChanged { change, .. } if *change == "alters")),
+            "{errors:?}"
+        );
+        // Created with its table and the module it calls in one plan: the
+        // module comes after the table, so it is refused.
+        let fresh = Schema::default();
+        let errors = errors_of(&fresh, &calls("one"), &[]);
+        assert!(
+            errors.iter().any(|e| matches!(e,
+                DiffError::ComputedFunctionChanged { change, .. } if *change == "creates")),
+            "{errors:?}"
+        );
+        // Dropped together with the module it calls: no refusal, and the
+        // module's drop comes after the column's (3729 otherwise).
+        let neither = schema_of(
+            "dbo.t",
+            table(&[
+                ("id", Column::new(ty("int")).not_null()),
+                ("A2", Column::new(ty("int"))),
+            ]),
+        );
+        assert!(errors_of(&calls("one"), &neither, &[]).is_empty());
+        let k = kinds(&run(&calls("one"), &neither, &[]));
+        let at = |kind: &str| {
+            k.iter()
+                .position(|x| x == kind)
+                .unwrap_or_else(|| panic!("{kind}: {k:?}"))
+        };
+        assert!(at("DropComputedColumn") < at("DropModule"), "{k:?}");
         // Negative: an altered module it does not name.
         let plain = shaped(Column::new(ty("int")), "a2 * 2");
         let errors = errors_of(

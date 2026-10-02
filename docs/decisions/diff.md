@@ -1629,6 +1629,10 @@ both act as a part does, an index's place in the drift check included:
 - In the connected scheduler of DEC-1366.1, its drop is a drop on a table, as
   an index's is. It is addressed by the table's name at the point where it
   runs.
+- A module drop of a function a computed column may call, where the plan
+  drops that computed column, moves from class 0 to (2, 5), right after the
+  computed column's drop. Dropping the function while the column stands is
+  3729, and module drops otherwise run first.
 
 The drop is `destructive`, as an index drop is: the values are derived, but
 the object is gone. The add carries no risk. A persisted add is unchecked in
@@ -1640,15 +1644,20 @@ unchecked, not counted over the values the old expression stored.
 neither drops nor changes.
 
 - A plan is refused that renames, drops, retypes or changes the nullability
-  of a column a standing computed column may read, or alters or drops a
-  module it may call (#1420, #1421).
-- So is a computed column that may call a module the same plan creates
-  (#1421). The module is created in class 14, after the column is added.
+  of a column a standing computed column may read (#1420).
+- So is a plan that alters or drops a module a computed column may call,
+  where the column stands or is added again in the same plan: either way it
+  calls the module when the module changes (#1421). Only one the plan drops
+  for good is out of the way first, with the module's drop moved after it.
+- So is a computed column that may call a module the same plan creates,
+  whether by `ADD` or inside a `CREATE TABLE` (#1421). The module is created
+  in class 14, after the table (7) and the column (9).
 
 "May" is `Dialect::may_name`, the over-approximation of DEC-1316.1 applied to
 code only and ignoring case: under a case-insensitive collation `A2` reads
-`a2`, and the engine stores `[a2]`. A key over a computed column is refused by
-validation (#1419).
+`a2`, and the engine stores `[a2]`. It looks for a delimited name's escaped
+spelling too: `a]b` is stored as `[a]]b]`. A key over a computed column is
+refused by validation (#1419).
 
 **Pull.** `sys.computed_columns` gives the definition, unwrapped as a check's
 is, and `is_persisted`. A definition the reader may not see stays a

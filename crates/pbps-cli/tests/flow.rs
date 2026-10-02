@@ -2450,6 +2450,100 @@ fn computed_columns_round_trip_and_change_through_the_cli() {
     );
 }
 
+/// Every file under `dir`, at any depth.
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            out.extend(walk(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// A computed column dropped together with the function it calls: the
+/// function's drop runs after the column's, which the engine requires (3729
+/// while the column stands), and the plan applies (#1174 review).
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_computed_column_and_the_function_it_calls_drop_together() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "computed1174_fn");
+    on_server(
+        own.connection(),
+        "CREATE FUNCTION dbo.plus_one (@x int) RETURNS int AS BEGIN RETURN @x + 1 END;",
+    );
+    on_server(
+        own.connection(),
+        "CREATE TABLE dbo.t (id int NOT NULL CONSTRAINT pk_t PRIMARY KEY, a int NULL,
+             called AS (dbo.plus_one(a)));",
+    );
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let d = Demo::new("computed1174-fn");
+    ok(&d.run(&["pull", "--db", own.connection()]));
+    d.commit();
+    ok(&d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]));
+    let path = d.dir.join("schema/dbo.t.yml");
+    let pulled = std::fs::read_to_string(&path).unwrap();
+    let start = pulled.find("\ncomputed:\n").expect(&pulled);
+    let end = pulled[start + 1..]
+        .find("\n\n")
+        .map_or(pulled.len(), |e| start + 1 + e);
+    std::fs::write(&path, format!("{}{}", &pulled[..start], &pulled[end..])).unwrap();
+    let mut removed = Vec::new();
+    let mut seen = Vec::new();
+    for entry in walk(&d.dir.join("schema")) {
+        let text = std::fs::read_to_string(&entry).unwrap();
+        seen.push(entry.display().to_string());
+        if text.contains("plus_one") && !text.contains("table: dbo.t") {
+            std::fs::remove_file(&entry).unwrap();
+            removed.push(entry);
+        }
+    }
+    assert_eq!(
+        removed.len(),
+        1,
+        "the function's declaration among {seen:?}"
+    );
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    ok(&d.run(&[
+        "plan",
+        "--db",
+        own.connection(),
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    assert!(at("DROP COLUMN [called]") < at("DROP FUNCTION"), "{script}");
+    ok(&d.run(&[
+        "apply",
+        "--db",
+        own.connection(),
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "destructive",
+    ]));
+    let o = d.run(&["plan", "--db", own.connection()]);
+    ok(&o);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+}
+
 /// A column collation goes the whole way through the CLI (#1175). `pull`
 /// declares a column collated away from its database's default, `bootstrap`
 /// rebuilds it onto a database with another default, and a second `pull`

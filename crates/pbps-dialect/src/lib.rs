@@ -1833,6 +1833,29 @@ fn dollar_tag(s: &str) -> Option<usize> {
 /// dollar-quoted literal ends before it can say whether a default is one — and
 /// a second spelling of this rule is how the difference above gets rediscovered
 /// (PITFALLS, "one rule, spelled in three places").
+/// Whether `name` occurs in `code` with nothing that continues an identifier
+/// on either side: the scan behind [`Dialect::may_name`].
+fn names_at_a_boundary(code: &str, name: &str) -> bool {
+    let Some(first) = name.chars().next() else {
+        return false;
+    };
+    let mut from = 0;
+    while let Some(offset) = code[from..].find(name) {
+        let start = from + offset;
+        let end = start + name.len();
+        let before = code[..start]
+            .chars()
+            .next_back()
+            .is_some_and(continues_ident);
+        let after = code[end..].chars().next().is_some_and(continues_ident);
+        if !before && !after {
+            return true;
+        }
+        from = start + first.len_utf8();
+    }
+    false
+}
+
 pub fn continues_ident(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii()
 }
@@ -2005,26 +2028,18 @@ pub trait Dialect {
     /// of that: under a case-insensitive collation `A2` reads `a2`, and the
     /// engine stores `[a2]` either way (measured on 17.0, #1174).
     fn may_name(&self, text: &str, name: &str) -> bool {
-        let name = name.to_lowercase();
-        let Some(first) = name.chars().next() else {
-            return false;
-        };
+        // A delimited name doubles its closing delimiter: `a]b` is stored as
+        // `[a]]b]` and `a"b` as `"a""b"`, so each spelling is looked for
+        // (#1174 review). A name with neither has one spelling.
+        let spellings = [
+            name.to_owned(),
+            name.replace(']', "]]"),
+            name.replace('"', "\"\""),
+        ];
         let code = self.lexicon().code_only(text).to_lowercase();
-        let mut from = 0;
-        while let Some(offset) = code[from..].find(&name) {
-            let start = from + offset;
-            let end = start + name.len();
-            let before = code[..start]
-                .chars()
-                .next_back()
-                .is_some_and(continues_ident);
-            let after = code[end..].chars().next().is_some_and(continues_ident);
-            if !before && !after {
-                return true;
-            }
-            from = start + first.len_utf8();
-        }
-        false
+        spellings
+            .iter()
+            .any(|spelling| names_at_a_boundary(&code, &spelling.to_lowercase()))
     }
 
     /// The comparison form of a module definition (ADR-0002).
@@ -3076,6 +3091,9 @@ mod tests {
             assert!(!d.may_name(text, "a2"), "{text}");
         }
         assert!(!d.may_name("a2", ""));
+        // A delimited name is stored with its closing delimiter doubled.
+        assert!(d.may_name("[a]]b] * 2", "a]b"));
+        assert!(d.may_name("\"a\"\"b\" * 2", "a\"b"));
     }
 
     #[test]
