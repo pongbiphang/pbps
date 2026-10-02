@@ -1443,25 +1443,43 @@ fn recreate_retyped_dependents(
     // A column can carry two of these, a retype and the tightening split out
     // of it (#1367), so the answers are merged rather than the last kept.
     let mut retyped: BTreeMap<ColumnRef, pbps_dialect::RetypeDependents> = BTreeMap::new();
-    // A computed column dropped and added again under its name: what is over
-    // it has to come down first (4922, measured on 17.0) and go back after,
-    // as around a retype. No foreign key is ever over one (validation), and
-    // a check or a filter names it in text this does not parse (#1174).
-    let recomputed: BTreeSet<ColumnRef> = changes
-        .iter()
-        .filter_map(|change| {
-            if let Change::AddComputedColumn { table, name, .. } = change {
-                Some(table.column(name))
+    // A computed column dropped and added again under its name, or replacing
+    // an ordinary column of that name, or replaced by one: what is over the
+    // name has to come down first (4922, measured on 17.0) and go back after,
+    // as around a retype. No foreign key is ever over a computed column
+    // (validation), and a check or a filter names it in text this does not
+    // parse (#1174).
+    let removed = |column: &ColumnRef| -> Option<bool> {
+        changes.iter().find_map(|c| {
+            if let Change::DropComputedColumn { table, name, .. } = c
+                && *table == column.table
+                && *name == column.name
+            {
+                Some(true)
+            } else if let Change::DropColumn {
+                column: dropped, ..
+            } = c
+                && dropped == column
+            {
+                Some(false)
             } else {
                 None
             }
         })
-        .filter(|column| {
-            changes.iter().any(|c| {
-                matches!(c, Change::DropComputedColumn { table, name, .. }
-                    if *table == column.table && *name == column.name)
-            })
+    };
+    let recomputed: BTreeSet<ColumnRef> = changes
+        .iter()
+        .filter_map(|change| {
+            if let Change::AddComputedColumn { table, name, .. } = change {
+                Some((table.column(name), true))
+            } else if let Change::AddColumn { table, name, .. } = change {
+                Some((table.column(name), false))
+            } else {
+                None
+            }
         })
+        .filter(|(column, computed)| removed(column).is_some_and(|was| was || *computed))
+        .map(|(column, _)| column)
         .collect();
     for column in recomputed {
         also(
@@ -3473,6 +3491,37 @@ mod tests {
         );
         // Negative: an unchanged one is no change.
         assert!(run(&base, &base, &[]).changes.is_empty());
+        // An ordinary column `c` replaced by a computed one, and back, with
+        // the index over `c` unchanged: it comes down and goes back around
+        // the swap (#1174 review).
+        let ordinary = {
+            let mut t = table(&[
+                ("id", Column::new(ty("int")).not_null()),
+                ("a", Column::new(ty("int"))),
+                ("c", Column::new(ty("int"))),
+            ]);
+            t.indexes = with(computed("a * 2", false, false)).tables
+                [&"dbo.t".parse::<TableName>().unwrap()]
+                .indexes
+                .clone();
+            schema_of("dbo.t", t)
+        };
+        let drop_c = [Intent::DropColumn {
+            column: "dbo.t.c".parse().unwrap(),
+            reason: "computed now".into(),
+        }];
+        assert_eq!(
+            kinds(&run(
+                &ordinary,
+                &with(computed("a * 2", false, false)),
+                &drop_c
+            )),
+            ["DropIndex", "DropColumn", "AddComputedColumn", "AddIndex"]
+        );
+        assert_eq!(
+            kinds(&run(&with(computed("a * 2", false, false)), &ordinary, &[])),
+            ["DropIndex", "DropComputedColumn", "AddColumn", "AddIndex"]
+        );
     }
 
     /// A plan that renames, drops, retypes or changes the nullability of a

@@ -1833,6 +1833,19 @@ fn dollar_tag(s: &str) -> Option<usize> {
 /// dollar-quoted literal ends before it can say whether a default is one — and
 /// a second spelling of this rule is how the difference above gets rediscovered
 /// (PITFALLS, "one rule, spelled in three places").
+/// A fold for comparing identifiers that can only make more of them equal:
+/// lowercase, with the dot `İ` lowercases into dropped and the dotless `ı`
+/// taken as `i`. A Turkish collation binds `[i]` to a column named `İ`, and
+/// plain lowercasing turns `İ` into `i` plus a combining dot that no `i` in
+/// the code matches (#1174 review).
+fn identifier_fold(text: &str) -> String {
+    text.chars()
+        .flat_map(char::to_lowercase)
+        .filter(|c| *c != '\u{307}')
+        .map(|c| if c == 'ı' { 'i' } else { c })
+        .collect()
+}
+
 /// Whether `name` occurs in `code` with nothing that continues an identifier
 /// on either side: the scan behind [`Dialect::may_name`].
 fn names_at_a_boundary(code: &str, name: &str) -> bool {
@@ -2036,10 +2049,10 @@ pub trait Dialect {
             name.replace(']', "]]"),
             name.replace('"', "\"\""),
         ];
-        let code = self.lexicon().code_only(text).to_lowercase();
+        let code = identifier_fold(&self.lexicon().code_only(text));
         spellings
             .iter()
-            .any(|spelling| names_at_a_boundary(&code, &spelling.to_lowercase()))
+            .any(|spelling| names_at_a_boundary(&code, &identifier_fold(spelling)))
     }
 
     /// The comparison form of a module definition (ADR-0002).
@@ -3091,6 +3104,9 @@ mod tests {
             assert!(!d.may_name(text, "a2"), "{text}");
         }
         assert!(!d.may_name("a2", ""));
+        // A Turkish collation binds `[i]` to `İ` and `[ı]` to `I`.
+        assert!(d.may_name("[i] * 2", "İ"));
+        assert!(d.may_name("[ı] * 2", "I"));
         // A delimited name is stored with its closing delimiter doubled.
         assert!(d.may_name("[a]]b] * 2", "a]b"));
         assert!(d.may_name("\"a\"\"b\" * 2", "a\"b"));

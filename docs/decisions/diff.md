@@ -1625,7 +1625,10 @@ both act as a part does, an index's place in the drift check included:
   before the class-13 additions over it.
 - The indexes, uniques, checks and filtered indexes over a computed column
   that is dropped and re-added are rebuilt around it, through
-  `recreate_retyped_dependents`, as around a retype (DECISIONS 461).
+  `recreate_retyped_dependents`, as around a retype (DECISIONS 461). So are
+  those over a name that passes between an ordinary and a computed column in
+  either direction: a column drop and a computed add, or a computed drop and
+  a column add.
 - In the connected scheduler of DEC-1366.1, its drop is a drop on a table, as
   an index's is. It is addressed by the table's name at the point where it
   runs.
@@ -1658,7 +1661,9 @@ One the plan adds, new or again, comes at (9, 3), after every input change.
 "May" is `Dialect::may_name`, the over-approximation of DEC-1316.1 applied to
 code only and ignoring case: under a case-insensitive collation `A2` reads
 `a2`, and the engine stores `[a2]`. It looks for a delimited name's escaped
-spelling too: `a]b` is stored as `[a]]b]`. A key over a computed column is
+spelling too: `a]b` is stored as `[a]]b]`. Its case fold can only make more
+names equal. `İ` folds to `i` without the combining dot, and `ı` to `i`,
+because a Turkish collation binds `[i]` to `İ`. A key over a computed column is
 refused by validation (#1419).
 
 **Pull.** `sys.computed_columns` gives the definition, unwrapped as a check's
