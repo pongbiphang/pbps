@@ -126,6 +126,24 @@ impl Dialect for Mssql {
         }
     }
 
+    /// Measured on 17.0 (#1363), tightening a column to NOT NULL is refused
+    /// (5074 with 4922 behind it) by an index over it, as a key or an
+    /// INCLUDE column or in a filter's predicate, and by a UNIQUE constraint
+    /// on it. Relaxing it to NULL is refused by a filtered index whose
+    /// predicate names it, and by nothing else. A CHECK naming it, either
+    /// side of a foreign key and a DEFAULT block neither, and a primary key
+    /// column is NOT NULL throughout. It holds inside a type change too: a
+    /// `varchar` widening, which keeps its indexes alone, is refused once it
+    /// also tightens.
+    fn nullability_dependents(&self, to_nullable: bool) -> pbps_dialect::RetypeDependents {
+        pbps_dialect::RetypeDependents {
+            keys_and_indexes: !to_nullable,
+            checks: false,
+            filtered_indexes: true,
+            foreign_keys: false,
+        }
+    }
+
     /// A non-Unicode column stores bytes in its collation's code page, so a
     /// collation change can change them without an error: measured on 17.0,
     /// `varchar(5)` holding `ééééé` kept `éé` under a UTF-8 collation, and

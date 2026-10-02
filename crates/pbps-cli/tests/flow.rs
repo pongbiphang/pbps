@@ -2066,6 +2066,127 @@ fn a_synonym_at_an_added_checks_name_refuses_the_plan() {
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
 }
 
+/// Tightening a column to NOT NULL on SQL Server takes down and puts back
+/// the indexes and unique constraints over it, in the saved plan (#1363):
+/// a key, an `INCLUDE` column, a filtered index and a UNIQUE constraint each
+/// refuse the bare `ALTER COLUMN` (5074), and so does an index over a
+/// `varchar` that widens as it tightens. A CHECK does not refuse it and is
+/// left standing, and a foreign key referencing the UNIQUE constraint comes
+/// down and goes back with it. Relaxing the same columns takes down the
+/// filtered index alone, the one thing that refuses a relaxation.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn tightening_a_column_rebuilds_what_indexes_it_through_the_cli() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "tighten1363");
+    on_server(
+        own.connection(),
+        "CREATE TABLE dbo.t (id int NOT NULL CONSTRAINT pk_t PRIMARY KEY,
+             k_ix int NULL, k_inc int NULL, k_filt int NULL,
+             k_uq int NULL CONSTRAINT uq_t UNIQUE,
+             k_ck int NULL CONSTRAINT ck_t CHECK (k_ck > 0),
+             v varchar(10) NULL);
+         CREATE INDEX ix_k ON dbo.t (k_ix);
+         CREATE INDEX ix_inc ON dbo.t (id) INCLUDE (k_inc);
+         CREATE INDEX ix_filt ON dbo.t (id) WHERE k_filt > 0;
+         CREATE INDEX ix_v ON dbo.t (v);
+         INSERT dbo.t VALUES (1, 5, 5, 5, 5, 5, 'abc');
+         CREATE TABLE dbo.c (id int NOT NULL CONSTRAINT pk_c PRIMARY KEY,
+             r int NULL CONSTRAINT fk_c REFERENCES dbo.t (k_uq));
+         INSERT dbo.c VALUES (1, 5);",
+    );
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let d = Demo::new("tighten1363");
+    ok(&d.run(&["pull", "--db", own.connection()]));
+    d.commit();
+    ok(&d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]));
+    let path = d.dir.join("schema/dbo.t.yml");
+    let pulled = std::fs::read_to_string(&path).unwrap();
+    // Every column but `id` becomes NOT NULL (`relax` false) or back.
+    let declare = |relax: bool| {
+        let mut text = pulled.clone();
+        for column in ["k_ix", "k_inc", "k_filt", "k_uq", "k_ck"] {
+            let from = format!("  {column}:\n    type: int\n");
+            assert!(text.contains(&from), "{column}: {text}");
+            if !relax {
+                text = text.replacen(&from, &format!("{from}    nullable: false\n"), 1);
+            }
+        }
+        let from = "  v:\n    type: varchar(10)\n";
+        assert!(text.contains(from), "{text}");
+        // Relaxed, `v` keeps its new length: a type change rebuilds every
+        // filtered index of its table (DEC-1169.2), which is not this.
+        let to = if relax {
+            "  v:\n    type: varchar(20)\n"
+        } else {
+            "  v:\n    type: varchar(20)\n    nullable: false\n"
+        };
+        std::fs::write(&path, text.replacen(from, to, 1)).unwrap();
+    };
+    let plan = d.dir.join("plan.json");
+    let apply = |allow: &[&str]| {
+        ok(&d.run(&["plan"]));
+        d.commit();
+        ok(&d.run(&[
+            "plan",
+            "--db",
+            own.connection(),
+            "--out",
+            plan.to_str().unwrap(),
+        ]));
+        let saved = std::fs::read_to_string(&plan).unwrap();
+        let checksum = plan_checksum(&plan);
+        let mut args = vec![
+            "apply",
+            "--db",
+            own.connection(),
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+        ];
+        for a in allow {
+            args.extend_from_slice(&["--allow", a]);
+        }
+        ok(&d.run(&args));
+        let o = d.run(&["plan", "--db", own.connection()]);
+        ok(&o);
+        assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+        saved
+    };
+
+    declare(false);
+    let saved = apply(&["not-null", "constraint", "destructive"]);
+    // `fk_c` references `uq_t`, so it comes down and goes back with it.
+    for name in ["ix_k", "ix_inc", "ix_filt", "uq_t", "ix_v", "fk_c"] {
+        assert!(
+            saved.contains(&format!("\"name\": \"{name}\"")),
+            "{name} is not rebuilt in the saved plan: {saved}"
+        );
+    }
+    assert!(!saved.contains("\"ck_t\""), "the check is rebuilt: {saved}");
+    on_server(
+        own.connection(),
+        "IF (SELECT COUNT(*) FROM sys.columns WHERE object_id = OBJECT_ID('dbo.t')
+              AND name <> 'id' AND is_nullable = 1) <> 0 THROW 50000, 'still nullable', 1;
+         IF (SELECT COUNT(*) FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.t')
+              AND name IN ('ix_k', 'ix_inc', 'ix_filt', 'uq_t', 'ix_v')) <> 5
+             THROW 50000, 'a dependent was not put back', 1;
+         IF OBJECT_ID('dbo.fk_c', 'F') IS NULL THROW 50000, 'fk_c was not put back', 1;",
+    );
+
+    // Relaxing takes down the filtered index, and nothing else.
+    declare(true);
+    let saved = apply(&["destructive"]);
+    assert!(saved.contains("\"name\": \"ix_filt\""), "{saved}");
+    for name in ["ix_k", "ix_inc", "uq_t", "ix_v", "fk_c"] {
+        assert!(
+            !saved.contains(&format!("\"name\": \"{name}\"")),
+            "{name} is rebuilt by a relaxation: {saved}"
+        );
+    }
+}
+
 /// A column collation goes the whole way through the CLI (#1175). `pull`
 /// declares a column collated away from its database's default, `bootstrap`
 /// rebuilds it onto a database with another default, and a second `pull`
