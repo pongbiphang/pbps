@@ -1163,6 +1163,7 @@
         "an_expression_change_releases_a_generated_column_from_a_dropped_function",
         "an_expression_change_releases_its_old_input_in_the_same_plan",
         "a_new_reader_of_a_dropped_input_is_refused_before_anything_runs",
+        "a_new_generated_column_reading_a_dropped_input_is_refused_before_anything_runs",
         "an_index_at_a_held_or_carried_name_refuses_the_plan",
         "an_inherited_trigger_function_owner_cannot_use_the_deployers_privileges",
         "an_operator_wider_than_the_ledger_column_is_recorded_cut_to_it",
