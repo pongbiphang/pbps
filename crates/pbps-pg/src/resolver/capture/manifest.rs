@@ -115,6 +115,9 @@ struct ParentColumnOrder {
 // A declaration map cannot predict the live order of an existing relation.
 // Replay only approved vector operations against the opening UID-backed order;
 // physical slots and the independently compiled scratch order are not answers.
+// Every retained table needs this, not only one whose columns change: a key,
+// constraint or grant runs in place and keeps the target's order, which can
+// differ from the declaration order scratch created.
 fn projected_column_order(
     opening: &CapturedInputs,
     compiled: &CapturedInputs,
@@ -125,14 +128,6 @@ fn projected_column_order(
 ) -> Result<Option<ParentColumnOrder>, pbps_model::resolver::ManifestError> {
     use pbps_model::Change;
     use pbps_model::resolver::ManifestError;
-    if !changes.changes.iter().any(|step| {
-        matches!(
-            &step.change,
-            Change::AddColumn { .. } | Change::DropColumn { .. } | Change::RenameColumn { .. }
-        )
-    }) {
-        return Ok(None);
-    }
     let mut recorded_tables = desired_ids.tables.iter().filter(|(_, name)| *name == table);
     let (table_uid, _) = recorded_tables.next().ok_or(ManifestError::Invalid)?;
     if recorded_tables.next().is_some() {
@@ -159,7 +154,6 @@ fn projected_column_order(
         return Err(ManifestError::Invalid);
     }
     let mut current = prior.clone();
-    let mut affected = false;
     let mut separate = false;
     let mut key_change = false;
     for step in &changes.changes {
@@ -172,11 +166,6 @@ fn projected_column_order(
             current = to.clone();
             separate = true;
         }
-        if let Change::AddColumn { table, .. } | Change::RenameColumn { table, .. } = &step.change {
-            affected |= table == &current;
-        } else if let Change::DropColumn { column, .. } = &step.change {
-            affected |= column.table == current;
-        }
         if let Change::SetPrimaryKey { table, .. }
         | Change::AddUnique { table, .. }
         | Change::DropUnique { table, .. }
@@ -186,9 +175,6 @@ fn projected_column_order(
             separate |= table == &current;
             key_change |= table == &current;
         }
-    }
-    if !affected {
-        return Ok(None);
     }
     if &current != table {
         return Err(ManifestError::Invalid);
@@ -819,9 +805,9 @@ impl CompiledCapture {
 
     /// Consume the fixed-key producer once the exact final typed sequence is
     /// known. A transitioned record's closing properties are the compiled
-    /// scratch record's, except where an in-place column change keeps the
-    /// existing table: that table keeps its opening properties, with the
-    /// approved column order, renames and key changes applied. Owners and
+    /// scratch record's, except for a retained table: every in-place change
+    /// keeps its opening properties, with the approved column order, renames
+    /// and key changes applied. Owners and
     /// ACLs are not fingerprinted (rule v2), so nothing here predicts them.
     /// No caller supplies a property mapping.
     pub fn seal_for_plan(

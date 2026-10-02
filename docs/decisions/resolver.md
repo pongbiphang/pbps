@@ -1197,7 +1197,9 @@ took most of this issue's commits and review findings, and each round surfaced
 another catalog case to model and measure, such as empty default ACLs (#1304).
 A closing record of a created or rebuilt object is now the compiled scratch
 record, so nothing here predicts an owner, ACL, grantor or shared-dependency
-edge. An in-place column change keeps the opening table's properties under the
-approved column order, renames and key changes. A rebuild that would drop a
-routine grant option is the ordinary connected rebuild guard's refusal
+edge. A retained table keeps its opening properties under the approved column
+order, renames and key changes, for every in-place change: a key, constraint or
+grant keeps the target's physical column order, which can differ from the
+declaration order scratch created. A rebuild that would drop a routine grant
+option is the ordinary connected rebuild guard's refusal
 (`modules::before_a_rebuild`), not the producer's.

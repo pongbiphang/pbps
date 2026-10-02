@@ -537,6 +537,45 @@ mod column_vector_parent {
         }
     }
 
+    /// A key, constraint or grant runs in place and keeps the target's
+    /// physical order, which can differ from the declaration order scratch
+    /// created. Without a column-vector edit the opening order still holds.
+    #[test]
+    fn in_place_table_changes_without_column_edits_keep_the_opening_order() {
+        let scratch = [("a", "c_000000"), ("d", "c_000002"), ("g", "c_000001")];
+        let table = TableName::new("app", "t");
+        for major in [16, 18] {
+            let key = Fixture::new(
+                major,
+                vec![Change::SetPrimaryKey {
+                    table: table.clone(),
+                    from: None,
+                    to: Some(pbps_model::PrimaryKey {
+                        name: None,
+                        columns: vec!["a".into()],
+                    }),
+                    nonclustered: false,
+                }],
+                &scratch,
+            );
+            key.assert_order(&["a", "g", "d"]);
+            let projected = key.project().unwrap().unwrap();
+            assert!(projected.separate_table_mutation && projected.key_change);
+            let grant = Fixture::new(
+                major,
+                vec![Change::Grant {
+                    role: "reader".into(),
+                    target: "app.t".parse().unwrap(),
+                    permissions: BTreeSet::from([pbps_model::Permission::Select]),
+                }],
+                &scratch,
+            );
+            grant.assert_order(&["a", "g", "d"]);
+            let projected = grant.project().unwrap().unwrap();
+            assert!(!projected.separate_table_mutation && !projected.key_change);
+        }
+    }
+
     #[test]
     fn parent_column_order_follows_opening_positions_and_ordered_typed_changes() {
         let table = TableName::new("app", "t");
