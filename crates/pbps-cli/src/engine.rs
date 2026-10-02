@@ -571,9 +571,10 @@ pub async fn refuse_created_name_occupants(
     }
 }
 
-/// Orders this plan's table renames on SQL Server from what the catalog
-/// holds, and refuses a name a change claims that another `sys.objects`
-/// entry holds when it runs (#1077, #1366): it reads the names the plan
+/// Orders this plan's column and table renames on SQL Server from what the
+/// catalog holds and how its collation compares names, and refuses a name a
+/// change claims that another `sys.objects` entry holds when it runs (#1077,
+/// #1366): it reads the names the plan
 /// creates or moves things to, and the children of the tables it changes,
 /// so the plan's own moves can be walked. The last pass to reorder the plan:
 /// called after every other one, so what it settles is what is saved.
@@ -584,6 +585,25 @@ pub async fn order_created_object_names(
 ) -> anyhow::Result<()> {
     if conn.driver() != Driver::Mssql {
         return Ok(());
+    }
+    // Column renames first: each one may move a generated default, which the
+    // `sys.objects` walk below follows in the order they run (DEC-1366.3).
+    let columns = crate::object_order::renamed_column_names(cs);
+    if !columns.is_empty() {
+        let tables: Vec<&TableName> = columns.iter().map(|(t, _)| t).collect();
+        let grouped: Vec<(usize, String)> = columns
+            .iter()
+            .map(|(t, name)| {
+                let group = tables.iter().position(|u| *u == t).unwrap_or_default();
+                (group, name.clone())
+            })
+            .collect();
+        let alike: Vec<_> = pbps_mssql::catalog::column_names_alike(conn, &grouped)
+            .await?
+            .into_iter()
+            .map(|(a, b)| (columns[a].clone(), columns[b].clone()))
+            .collect();
+        crate::object_order::order_column_renames(cs, &alike, label)?;
     }
     let (mut names, parents) = crate::deploy::object_reads(cs);
     let mut occupants = pbps_mssql::catalog::object_name_occupants(conn, &names, &parents).await?;

@@ -64,10 +64,12 @@ Then, in this order:
   (indexes share the relation namespace), a named constraint on SQL Server.
   It orders chains. A table rename cycle is left out of its graph, and the
   engine refuses it. A column rename cycle is refused at diff time
-  (`ColumnRenameCycle`); a column chain is ordered by `chain_depth`.
+  (`ColumnRenameCycle`); a column chain is ordered by `chain_depth`, and
+  on a connected SQL Server plan by the collation's answer (DEC-1366.3).
 - **On a connected SQL Server plan, `order_created_object_names`** (in
-  `crates/pbps-cli/src/engine.rs`, last of the passes that reorder) walks the
-  plan over the catalog's `sys.objects` names. Where that walk refuses the
+  `crates/pbps-cli/src/engine.rs`, last of the passes that reorder) first
+  orders each table's column renames by the collation's answer (DEC-1366.3),
+  then walks the plan over the catalog's `sys.objects` names. Where that walk refuses the
   order, it tries the other orders of the table renames among the drops and
   keeps the first one it clears (`object_order`, DEC-1366.1). A name only a
   later class frees is refused with that change named (DEC-1366.2).
@@ -202,7 +204,7 @@ namespace. Renames *into* a name (classes 1 and 3) are the exception, and
 | `DropTable` or a rename away → `RenameTable` into its name | fixed | `rename_order` | ✓ DEC-536.1 |
 | `DropColumn` → `RenameColumn` into its name | fixed | the drop moves to (2, 3), ahead of class 3 | ✓ DECISIONS 474 |
 | `DropColumn` or `RenameColumn` away → `AddColumn` of its name | fixed | class 5 or 3 before 8 | ✓ |
-| A column rename chain | fixed | `chain_depth` inside class 3 | ✓ |
+| A column rename chain | fixed | `chain_depth` inside class 3; on a connected SQL Server plan, reordered by the collation's answer | ✓ DEC-1366.3 |
 | A column rename cycle (a swap) | — | refused at diff time, `ColumnRenameCycle` | ✓ refused by design |
 | A table rename chain | fixed | `rename_order` | ✓ DEC-536.1 |
 | A table rename cycle | — | left out of `rename_order`'s graph; refused at `plan --db` with the remedy | ✓ refused by design, DEC-1366.2 |

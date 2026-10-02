@@ -867,6 +867,46 @@ pub async fn object_name_occupants(
     Ok(out)
 }
 
+/// Among `names`, the pairs of columns of one group the database reads as one
+/// column name under its catalog collation, by index into `names`, each as
+/// `(earlier, later)`. A group is one table, by the caller's index. A fold in
+/// Rust cannot answer this: on `Turkish_100_CI_AS`, `A` and `a` are one name
+/// and `I` and `i` are two (#1366).
+pub async fn column_names_alike(
+    conn: &mut Conn,
+    names: &[(usize, String)],
+) -> Result<Vec<(usize, usize)>, DbError> {
+    if names.len() < 2 {
+        return Ok(Vec::new());
+    }
+    let values = names
+        .iter()
+        .enumerate()
+        .map(|(k, (group, name))| format!("({k}, {group}, {})", crate::ident::literal(name)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT a.k AS earlier, b.k AS later
+           FROM (VALUES {values}) AS a(k, g, column_name)
+           JOIN (VALUES {values}) AS b(k, g, column_name)
+             ON a.k < b.k AND a.g = b.g
+            AND a.column_name = b.column_name COLLATE CATALOG_DEFAULT
+          ORDER BY a.k, b.k;"
+    );
+    let mut out = Vec::new();
+    for row in conn.query(&sql).await? {
+        let index = |column: &str| -> Result<usize, DbError> {
+            let k = get::<i32>(&row, column)?;
+            usize::try_from(k)
+                .ok()
+                .filter(|k| *k < names.len())
+                .ok_or_else(|| DbError::BadRow(format!("an alike-column index out of range: {k}")))
+        };
+        out.push((index("earlier")?, index("later")?));
+    }
+    Ok(out)
+}
+
 /// Of the groups in `added`, the ones where an added column's name is a name
 /// the same group's `recorded` columns have, compared under the catalog
 /// collation (#676, #1243). A group is one table, by the caller's index. Asked of the

@@ -1454,7 +1454,7 @@ An offline plan keeps the differ's order. It is a preview that is never
 applied (SPEC 7.3), and its guesses stay, since without a catalog they are the
 best order available. PostgreSQL is unchanged: identifiers compare exactly
 there, and the names an index or key holds are declared. A column rename chain
-within a table is still ordered by DEC-981.3's fold.
+within a table is ordered from the database's answer as well (DEC-1366.3).
 
 Pinned by the unit tests in `crates/pbps-cli/src/object_order.rs`, and the
 live `renames_only_the_catalog_can_order_apply_or_are_refused_at_plan`
@@ -1530,3 +1530,36 @@ Pinned by `a_released_input_is_retyped_or_dropped_after_its_release`
 `a_new_reader_of_a_dropped_input_is_refused_before_anything_runs` and
 `an_expression_change_releases_its_old_input_in_the_same_plan`
 (`crates/pbps-cli/tests/flow_pg.rs`).
+
+<a id="dec-1366-3"></a>
+
+**DEC-1366.3. A connected SQL Server plan orders each table's column renames by
+which names the database's collation reads as one.** The differ links a column
+rename chain through names equal after lower-casing (DEC-981.3, DEC-541.1), and
+keeps a folded edge only where it closes no cycle. A Rust case fold is not the
+target's collation. On `Turkish_100_CI_AS`, `A` and `a` are one name and `I`
+and `i` are two. So for `I -> a` beside `A -> i`, the fold links both pairs,
+and the edge it keeps may be the false `I`/`i` one. `sp_rename` then fails
+mid-apply with Msg 15335. Nothing connected checked column names before this.
+
+So before the `sys.objects` walk, `plan --db` asks the database which of the
+renamed columns' names are one, for each table that renames two or more of its
+columns (`column_names_alike`, under `CATALOG_DEFAULT`, as
+`tables_reusing_a_column_name` compares). A rename into a name then runs after
+the rename that vacates that name, under the collation as under the exact
+spelling. The renames keep the positions the differ gave them and only trade
+them, so an order the differ already got right stays exactly as it was. The
+walk runs after them, since a column rename moves a generated default
+(DEC-981.1).
+
+Renames that wait on one another under the collation have no order on that
+database. `a -> B` beside `b -> A` is the case-insensitive swap. The plan is
+refused naming them, with the remedy: rename one through a name nothing uses,
+in a plan of its own first. On a case-sensitive database the same pair is four
+names and applies. An offline plan keeps the fold, which is a preview's best
+guess (SPEC 7.3).
+
+Pinned by `the_databases_alike_column_names_order_a_rename_chain` and
+`column_renames_trading_names_under_the_collation_are_refused`
+(`crates/pbps-cli/src/object_order.rs`), and the Turkish column rounds of the
+live `renames_only_the_catalog_can_order_apply_or_are_refused_at_plan`.
