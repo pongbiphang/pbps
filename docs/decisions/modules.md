@@ -1537,15 +1537,18 @@ calls is that function's own, as before.
   create is ordered again as a stable topological order: the column waits for
   the creates its text names, and every later change that may need an earlier
   one keeps following it. Anything not shown independent keeps its order. What
-  may need a new column: a module naming it, or naming its table beside a `*`
-  or a `NATURAL` join (measured on 18.6, a view and a `BEGIN ATOMIC` body
-  expand `*` when created, and a column added later is not theirs); a row
+  may need a new column: a module naming it, or naming its table; a row
   writing it or taking its default; a change of its table naming it; a foreign
-  key referencing it. A module needs another it names, in code or in a literal
-as above, a view a trigger is on,
-  an overload of its own name (DECISIONS 212), and what it declares in
-  `depends_on:`. A row needs nothing to cross it: a trigger the plan creates
-  must not fire on a row written before the modules.
+  key referencing it. A module naming the table counts whatever it spells,
+  because the ways to take a table's whole column shape without naming a
+  column form no closed list. Measured on 18.6, a view's or a `BEGIN ATOMIC`
+  body's `*`, a `NATURAL` join, and a positional `INSERT INTO t VALUES (…)`,
+  atomic or not, are all bound to the columns when the module is created, and
+  a column added later is not theirs. A module needs another it names, in code
+  or in a literal as above, a view a trigger is on, an overload of its own name
+  (DECISIONS 212), and what it declares in `depends_on:`. A row needs nothing
+  to cross it: a trigger the plan creates must not fire on a row written
+  before the modules.
 
 When no order exists, the plan is refused by name, naming the column, the
 functions, and what needs the column, with the two-plan remedy: the functions
@@ -1554,10 +1557,16 @@ genuine case is a function that reads the column it is called from, directly or
 through a function it calls. The engine refuses either create first, so there
 is no order to find. A row the plan writes into the column is refused the same
 way. Both used to fail inside the apply. Because both directions are
-over-approximated, a refusal can name a cycle the engine would not have, such
-as a column calling a built-in that shares a created function's name, beside a
-function that reads the table through `*`. The earlier rule kept such a column
-ahead and applied it. The remedy applies it in two plans.
+over-approximated, a refusal can name a cycle the engine would not have:
+- a function that names the column's table but reads only its other columns,
+  such as a default `app.next_id()` reading `max(id)`. That plan also failed
+  inside the apply before this rule, which kept the column ahead of the
+  function it calls.
+- a column calling a built-in that shares a created function's name, beside a
+  function naming the table. The earlier rule kept such a column ahead and
+  applied it.
+
+The remedy applies either in two plans.
 
 Left to the engine, as before: a generated column of a table the plan creates
 that calls a function the plan creates or rebuilds. It stays inside `CREATE
@@ -1571,7 +1580,7 @@ Pinned by `an_addition_naming_no_created_function_keeps_its_place`,
 `a_function_named_only_in_a_comment_is_no_call`,
 `a_module_naming_a_moved_module_in_a_literal_follows_it`,
 `a_column_calling_a_new_function_follows_it_and_its_readers_follow_the_column`,
-`a_view_over_every_column_of_the_table_follows_a_moved_column`,
+`a_module_naming_the_table_follows_a_moved_column`,
 `a_declared_dependency_holds_a_module_behind_a_moved_reader`,
 `a_column_calling_a_function_that_reads_it_is_refused_by_name` and
 `a_row_writing_a_column_that_calls_a_new_function_is_refused`

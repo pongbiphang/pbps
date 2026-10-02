@@ -1281,12 +1281,13 @@ fn needs(later: &Change, earlier: &Change, deps: &ModuleDeps) -> bool {
 }
 
 /// Whether a module may read column `column` of `table`: its definition names
-/// the column, or names the table and may take every column of it without
-/// naming them (`pbps_pg::generated::may_take_every_column`).
+/// the column or the table. A module naming the table may take its whole
+/// column shape without naming a column, in more spellings than a list could
+/// hold: measured on 18.6, a view's or an atomic body's `*`, a `NATURAL` join,
+/// and a positional `INSERT INTO t VALUES (…)`, atomic or not, are all bound
+/// to the columns there when the module is created (DEC-1364.1).
 fn reads_column(id: &ModuleId, definition: &str, table: &TableName, column: &str) -> bool {
-    pbps_pg::generated::may_read(definition, column)
-        || (names_table(id, definition, table)
-            && pbps_pg::generated::may_take_every_column(definition))
+    pbps_pg::generated::may_read(definition, column) || names_table(id, definition, table)
 }
 
 /// Whether a module may name `table`: its definition holds the table's bare
@@ -2151,16 +2152,21 @@ mod tests {
         }
     }
 
-    /// DEC-1364.1: a view over `*` of the table takes every column when it
-    /// is created, so it follows a column that moves; a view over another
-    /// table keeps its place.
+    /// DEC-1364.1: a module naming the table may take its whole column shape
+    /// without naming the column, by `*`, a spelled list beside it, or a
+    /// positional insert, so it follows a column that moves. A view over
+    /// another table keeps its place.
     #[test]
-    fn a_view_over_every_column_of_the_table_follows_a_moved_column() {
+    fn a_module_naming_the_table_follows_a_moved_column() {
         let mut cs = plan(vec![
             add_column("g", "app.f(1)", true),
             new_view("app.a_all", "SELECT * FROM app.t"),
             new_view("app.a_other", "SELECT * FROM app.u"),
             new_view("app.a_spelled", "SELECT id FROM app.t"),
+            routine(
+                "app.a_writer()",
+                "INSERT INTO app.t VALUES (1, 2, 3) RETURNING 1",
+            ),
             routine("app.f(integer)", "SELECT 1"),
         ]);
         assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
@@ -2168,10 +2174,11 @@ mod tests {
             names(&cs),
             [
                 "create app.a_other",
-                "create app.a_spelled",
                 "create app.f(integer)",
                 &names(&plan(vec![add_column("g", "app.f(1)", true)]))[0],
                 "create app.a_all",
+                "create app.a_spelled",
+                "create app.a_writer()",
             ]
         );
     }
@@ -2256,7 +2263,8 @@ mod tests {
     /// DEC-1364.1: a function a new column calls, and that reads the column,
     /// is a cycle no order performs. The plan is refused by name with the
     /// two-plan remedy, directly or through a function it calls, and left as
-    /// it was.
+    /// it was. A function that only names the column's table is held to the
+    /// same, since naming the table may take its whole column shape.
     #[test]
     fn a_column_calling_a_function_that_reads_it_is_refused_by_name() {
         for changes in [
@@ -2274,6 +2282,10 @@ mod tests {
                         "(x integer) RETURNS integer LANGUAGE sql AS $$ SELECT app.a_helper() $$",
                     )),
                 },
+            ],
+            vec![
+                add_column("g", "app.f(1)", false),
+                routine("app.f(integer)", "SELECT max(id) FROM app.t"),
             ],
         ] {
             let mut cs = plan(changes);

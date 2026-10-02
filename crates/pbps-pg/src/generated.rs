@@ -117,25 +117,9 @@ pub fn may_call(expression: &str, name: &str) -> bool {
             .any(|contents| crate::impact::mentions_in_literal(contents, name))
 }
 
-/// Whether a definition may take a table's columns without naming them: a
-/// `*` outside literals and comments, or a `NATURAL` join. Measured on 18.6,
-/// a view over `SELECT *` and a `BEGIN ATOMIC` body expand the star when they
-/// are created, so a column added after them is not theirs. A `*` that
-/// multiplies counts too; a "yes" means *may* (DEC-1364.1).
-#[must_use]
-pub fn may_take_every_column(definition: &str) -> bool {
-    let code = crate::LEXICON.code_only(definition);
-    // Not `may_name`: `natural` is reserved, and that scan reads a reserved
-    // word as a name only where it is quoted or follows a dot.
-    code.contains('*')
-        || code
-            .split(|c: char| !pbps_dialect::continues_ident(c))
-            .any(|word| word.eq_ignore_ascii_case("natural"))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{may_call, may_name, may_read, may_take_every_column};
+    use super::{may_call, may_name, may_read};
 
     /// A function an OID-alias literal names is a call to the engine, so a
     /// name inside a literal counts; a longer name still does not
@@ -177,23 +161,6 @@ mod tests {
         assert!(!may_name("app.ff(a)", "f"));
         assert!(!may_name("'f(a)' || b", "f"));
         assert!(!may_name("b -- f(a)", "f"));
-    }
-
-    /// A star or a natural join may take every column; a body that spells
-    /// its columns, or holds a star only in a literal, does not (DEC-1364.1).
-    #[test]
-    fn a_star_or_a_natural_join_may_take_every_column() {
-        assert!(may_take_every_column("SELECT * FROM app.t"));
-        assert!(may_take_every_column(
-            "SELECT id FROM app.t NATURAL JOIN app.u"
-        ));
-        assert!(may_take_every_column(
-            "() RETURNS SETOF app.t LANGUAGE sql BEGIN ATOMIC SELECT * FROM app.t; END"
-        ));
-        assert!(!may_take_every_column("SELECT id, a FROM app.t"));
-        assert!(!may_take_every_column(
-            "SELECT id, '*' AS natural_key FROM app.t"
-        ));
     }
 
     /// The scan reads a name however it is spelled, a Unicode escape and its

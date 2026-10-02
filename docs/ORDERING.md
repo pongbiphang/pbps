@@ -257,7 +257,7 @@ and the expression-bearing changes that need a function.
 | Function created or rebuilt → check, filtered index or set default calling it | content, over-approximated | `after_the_rebuilds`: after the last function create, when its text names the function | ✓ DEC-942.1, DEC-1364.1 |
 | Function created or rebuilt → `AlterColumnExpression` calling it | content, over-approximated | `after_the_rebuilds`, when its text names the function | ✓ DEC-1168.1, DEC-1364.1 |
 | Function created or rebuilt → `AddColumn` whose default or generation expression calls it | content, over-approximated | `after_their_functions`: after the create its text names, and what may read the column after it; a cycle is refused by name | ✓ DEC-1364.1 |
-| `AddColumn` → a module created that reads it | content, over-approximated | class 8 before 14; reordered after a column that moves, by name, or by table with `*` | ✓ DEC-1364.1 |
+| `AddColumn` → a module created that reads it | content, over-approximated | class 8 before 14; reordered after a column that moves, when it names the column or its table | ✓ DEC-1364.1 |
 | Function rebuilt → default a row of the plan takes | content | stays ahead of the rows | ⧗ #1030 |
 | Function created → a new table's expression-bearing parts | content, over-approximated | `split_new_tables`, then `after_the_rebuilds`, when their text names the function | ✓ #1027, DEC-1364.1 |
 | Function created → a new table's generated column calling it | content | stays inside `CREATE TABLE`: split out, the column would move to the end of the table | ⧗ DEC-1364.1 |
@@ -332,12 +332,12 @@ is conservative, so it can never be wrong in the dangerous direction.
   (DEC-1364.1). Only an addition whose text names one moves after the last
   create; the rest keep the differ's place. A new column whose expression
   names one follows that create, and what may read the column follows the
-  column: a module naming it, or naming its table beside a `*`. Where the
+  column: a module naming it, or naming its table. Where the
   function itself may read the column, or a row the plan writes needs it,
   no order performs both, and the plan is refused by name with a two-plan
   remedy. Over-approximated in both directions, a refusal can name a cycle the
-  engine would not have; it then refuses a plan the earlier positional rule
-  also left to fail.
+  engine would not have, almost always in a plan the earlier positional rule
+  also left to fail (DEC-1364.1 names the exception).
 
 What is left to the engine is recorded on #1350, each with a two-plan remedy:
 - an expression change still calling a function the plan rebuilds;
