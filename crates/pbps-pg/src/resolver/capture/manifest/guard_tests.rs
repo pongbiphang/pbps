@@ -226,6 +226,58 @@ fn a_foreign_keys_internal_triggers_belong_to_its_table_surface() {
     }
 }
 
+/// A generated relation owned through an internal edge, here an identity
+/// sequence, brings its attribute rows with it: PostgreSQL drops them with
+/// the relation, so they belong to the same surface.
+#[test]
+fn a_generated_relations_attributes_share_its_inherited_surface() {
+    for major in [16, 18] {
+        let (mut captured, schema, ids) = generated_attrdef_fixture(major);
+        let table = TableName::new("app", "t");
+        let relation = relation_identity(&table);
+        let id_column = identity("column", &["id"], vec![relation.clone()]);
+        let sequence = identity("pg_class", &["app", "t_id_seq"], vec![]);
+        let stray = identity("pg_class", &["app", "unrelated_seq"], vec![]);
+        for relation in [&sequence, &stray] {
+            captured.inputs.insert(
+                relation.clone(),
+                input(BTreeMap::from([("relkind".into(), json!("S"))])),
+            );
+            for (number, name) in [(1, "last_value"), (2, "log_cnt"), (3, "is_called")] {
+                let attribute = identity("column", &[name], vec![relation.clone()]);
+                captured.attribute_numbers.insert(attribute.clone(), number);
+                captured.inputs.insert(
+                    attribute,
+                    input(BTreeMap::from([
+                        ("attrelid".into(), json!(relation)),
+                        ("attname".into(), json!(name)),
+                        ("attisdropped".into(), json!(false)),
+                    ])),
+                );
+            }
+        }
+        captured.inputs.insert(
+            identity("pg_depend", &["i"], vec![sequence.clone(), id_column]),
+            input(BTreeMap::new()),
+        );
+        let owned = classify_attrdefs(&captured, &schema, &ids).unwrap();
+        let owner = ObjectOwnership::Surface(Surface::Column(table.column("id")));
+        assert_eq!(owned.get(&sequence), Some(&owner), "PG{major} sequence");
+        for name in ["last_value", "log_cnt", "is_called"] {
+            assert_eq!(
+                owned.get(&identity("column", &[name], vec![sequence.clone()])),
+                Some(&owner),
+                "PG{major} sequence attribute {name}"
+            );
+            assert_eq!(
+                owned.get(&identity("column", &[name], vec![stray.clone()])),
+                Some(&ObjectOwnership::Unqualified),
+                "PG{major} unrelated attribute {name}"
+            );
+        }
+    }
+}
+
 #[test]
 fn generated_attrdefs_and_their_edges_have_exact_default_ownership() {
     let table = TableName::new("app", "t");
