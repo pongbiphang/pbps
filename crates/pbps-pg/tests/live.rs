@@ -28462,8 +28462,10 @@ async fn the_nearest_inherited_grantor_decides_an_adopted_revoke() {
 }
 
 /// The nearest-grantor walk visits each role once per depth, and has no
-/// depth cutoff of its own (review of #1422). The owner is the only candidate
-/// in both shapes, so its entry is revocable and the `REVOKE` removes it:
+/// depth cutoff of its own (review of #1422). In both shapes a grant-option
+/// holder sits one membership beyond the owner, so two candidates compete and
+/// the walk must run; the owner is the unique nearest, so its entry is
+/// revocable and the `REVOKE` removes it:
 ///
 /// - `deep`: the owner 70 inheritable memberships away, past any fixed cap.
 /// - `diamond`: 24 levels of two roles, each inheriting both of the next.
@@ -28510,10 +28512,15 @@ async fn a_deep_or_diamond_membership_graph_still_finds_the_nearest_grantor() {
         sql.push_str(&format!("GRANT {diamond_owner} TO {upper}; "));
     }
     for (table, owner) in [("deep", &deep_owner), ("diamond", &diamond_owner)] {
+        // A second candidate, one membership beyond the owner.
+        let holder = role(format!("pbps_g565_{table}_b_{pid}"), &mut sql);
         sql.push_str(&format!(
-            "CREATE TABLE public.{table}(id integer); \
+            "GRANT {holder} TO {owner}; \
+             CREATE TABLE public.{table}(id integer); \
              ALTER TABLE public.{table} OWNER TO {owner}; \
-             SET ROLE {owner}; GRANT SELECT ON public.{table} TO {recipient}; RESET ROLE; "
+             SET ROLE {owner}; \
+             GRANT SELECT ON public.{table} TO {holder} WITH GRANT OPTION; \
+             GRANT SELECT ON public.{table} TO {recipient}; RESET ROLE; "
         ));
     }
     db.conn.execute(&sql).await.unwrap();
