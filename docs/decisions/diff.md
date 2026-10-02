@@ -1656,6 +1656,10 @@ One the plan adds, new or again, comes at (9, 3), after every input change.
   where the column stands or is added again in the same plan: either way it
   calls the module when the module changes (#1421). Only one the plan drops
   for good is out of the way first, with the module's drop moved after it.
+- So is a plan that drops a computed column, for good or to add it again,
+  while a schema-bound module that may read it stands (4922). One the plan
+  drops goes first, in class 0. Rebuilding such a module around the change
+  belongs with #1431.
 - So is a computed column that may call a module the same plan creates,
   whether by `ADD` or inside a `CREATE TABLE` (#1421). The module is created
   in class 14, after the table (7) and the column (9).

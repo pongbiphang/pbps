@@ -83,6 +83,18 @@ pub enum DiffError {
         change: &'static str,
     },
 
+    /// A plan that drops a SQL Server computed column, or changes and so
+    /// drops and re-adds it, while a schema-bound module that may read it
+    /// stands: the engine refuses the drop (4922, measured on 17.0, #1174
+    /// review). A module the plan drops goes first, in class 0, and is not
+    /// this.
+    #[error(
+        "computed column {computed} is dropped by this plan, and the schema-bound {module} may \
+         read it. Drop {module}, or recreate it without SCHEMABINDING, in a plan of its own \
+         first, then this one."
+    )]
+    ComputedReadBySchemaBound { computed: ColumnRef, module: String },
+
     /// A `data:` block on a table whose primary key cannot key its rows
     /// (ADR-0004). `validate` says the same thing against the file and the
     /// line; this is here so that a differ reached another way never quietly
@@ -1800,6 +1812,30 @@ fn refuse_computed_dependencies(
                     if t == table && created.computed.contains_key(name))
         })
     };
+    // A computed column this plan drops, for good or to add again, under a
+    // schema-bound module that may read it and that the plan leaves standing.
+    let module_dropped = |id: &ModuleId| {
+        changes
+            .iter()
+            .any(|c| matches!(c, Change::DropModule { id: d, .. } if d == id))
+    };
+    for change in changes {
+        let Change::DropComputedColumn { table, name, .. } = change else {
+            continue;
+        };
+        for (id, module) in &base.modules {
+            if dialect.may_name(&module.definition, "schemabinding")
+                && !module_dropped(id)
+                && dialect.may_name(&module.definition, &table.name)
+                && dialect.may_name(&module.definition, name)
+            {
+                errs.push(DiffError::ComputedReadBySchemaBound {
+                    computed: table.column(name),
+                    module: id.object_name().to_string(),
+                });
+            }
+        }
+    }
     for (table_name, table) in &declared.tables {
         for (name, computed) in &table.computed {
             // Standing: there before the plan and there throughout. One the
@@ -3782,6 +3818,31 @@ mod tests {
         })
         .collect();
         assert_eq!(order, ["dbo.f", "table", "x.f"]);
+        // A schema-bound module over the computed column refuses its drop or
+        // its change while the module stands, and not once the plan drops the
+        // module too (#1174 review).
+        let bound = |expression: &str, keep_view: bool| {
+            let schema = shaped(Column::new(ty("int")), expression);
+            if keep_view {
+                with_modules(
+                    schema,
+                    &[(
+                        "dbo.v",
+                        "CREATE VIEW dbo.v WITH SCHEMABINDING AS SELECT c FROM dbo.t",
+                    )],
+                )
+            } else {
+                schema
+            }
+        };
+        let errors = errors_of(&bound("a2 * 2", true), &bound("a2 * 3", true), &[]);
+        assert!(
+            errors.iter().any(|e| matches!(e,
+                DiffError::ComputedReadBySchemaBound { module, .. } if module == "dbo.v")),
+            "{errors:?}"
+        );
+        let errors = errors_of(&bound("a2 * 2", true), &bound("a2 * 3", false), &[]);
+        assert!(errors.is_empty(), "{errors:?}");
         // Nor is such a view's alter refused.
         let view = |definition: &str| {
             with_modules(
