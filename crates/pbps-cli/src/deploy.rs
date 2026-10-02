@@ -5494,6 +5494,7 @@ pub fn cmd_plan_db(
                 &mut cs,
                 &loaded.schema,
                 &[&resolved.ids, &recorded_ids],
+                &hints.module_deps,
                 dialect.as_ref(),
                 &rediff,
             )

@@ -1632,6 +1632,192 @@ fn what_calls_a_new_function_follows_its_create() {
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
 }
 
+/// Writes `app.<name>(integer)` into the declarations, with `body` as its
+/// SQL body.
+fn declare_function(d: &Demo, name: &str, body: &str) {
+    std::fs::write(
+        d.dir
+            .join(format!("schema/app.{name}%28integer%29.function.yml")),
+        format!(
+            "function: app.{name}(integer)\npublic_execute: true\n\ndefinition: |-\n  \
+             (x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ {body} $$\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// Adds `columns`, each a line of YAML, to the declared `app.t`.
+fn declare_columns(d: &Demo, columns: &str) {
+    let table = d.dir.join("schema/app.t.yml");
+    let text = std::fs::read_to_string(&table).unwrap();
+    let edited = text.replacen("columns:\n", &format!("columns:\n{columns}"), 1);
+    assert_ne!(
+        edited, text,
+        "app.t declares its columns where this test expects"
+    );
+    std::fs::write(&table, edited).unwrap();
+}
+
+/// `app.t (id, a)` with two rows, pulled, committed and baselined.
+fn adopted_table(name: &str) -> (OwnDatabase, Demo) {
+    let own = OwnDatabase::new(&server(), name);
+    on_server(
+        own.connection(),
+        "CREATE SCHEMA app; \
+         CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$; \
+         CREATE TABLE app.t (id integer PRIMARY KEY, a integer); \
+         INSERT INTO app.t VALUES (1, 5), (2, 7)",
+    );
+    let d = Demo::new(name);
+    succeeds(d.run(&["pull", "--db", own.connection()]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]));
+    (own, d)
+}
+
+/// Plans the committed revision against `connection`, returning the saved
+/// plan's path and its script.
+fn connected_plan(d: &Demo, connection: &str) -> (std::path::PathBuf, String) {
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    (plan, script)
+}
+
+/// #1364: new columns whose generation expression or default call a function
+/// the same plan creates follow its `CREATE FUNCTION`, and a new function
+/// that reads one follows the column, though the differ put it first. A
+/// second generated column calling nothing new stays ahead of the creates,
+/// where a new function reads it. One plan applies (DEC-1364.1). Before, the
+/// columns stayed ahead of the function they call, and the engine refused
+/// them.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_new_column_calling_a_new_function_follows_its_create() {
+    let (own, d) = adopted_table("new-column-new-function");
+    let connection = own.connection();
+    declare_function(&d, "g", "SELECT x * 2");
+    // Named to come before `g`, which the differ creates in name order.
+    declare_function(&d, "a_reader", "SELECT c FROM app.t WHERE id = x");
+    declare_function(&d, "z_reader", "SELECT p FROM app.t WHERE id = x");
+    declare_columns(
+        &d,
+        "  c: {type: integer, generated: {expression: 'app.g(a)', stored: true}}\n  \
+         n: {type: integer, default: 'app.g(1)'}\n  \
+         p: {type: integer, generated: {expression: 'a * 3', stored: true}}\n",
+    );
+    let (plan, script) = connected_plan(&d, connection);
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    let create = at("CREATE FUNCTION \"app\".\"g\"");
+    for column in ["c", "n"] {
+        assert!(
+            create < at(&format!("ADD COLUMN \"{column}\"")),
+            "{column}: {script}"
+        );
+    }
+    assert!(at("ADD COLUMN \"p\"") < create, "{script}");
+    assert!(
+        at("CREATE FUNCTION \"app\".\"a_reader\"") > at("ADD COLUMN \"c\""),
+        "{script}"
+    );
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "grant-widen"],
+    ));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT (c + n + p)::int8 FROM app.t WHERE id = 2"
+        ),
+        14 + 2 + 21
+    );
+    assert_eq!(scalar(connection, "SELECT app.a_reader(1)::int8"), 10);
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
+/// #1364, a corner #1350 recorded: a new column whose default or generation
+/// expression calls a function the same plan rebuilds follows the rebuild.
+/// Ahead of it, the column's call held the old function, and the rebuild's
+/// `DROP FUNCTION` was refused (DEC-1364.1).
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_new_column_calling_a_rebuilt_function_follows_the_rebuild() {
+    let (own, d) = adopted_table("new-column-rebuilt-function");
+    let connection = own.connection();
+    let function = d.dir.join("schema/app.f%28integer%29.function.yml");
+    let text = std::fs::read_to_string(&function).unwrap();
+    let edited = text.replace("SELECT x", "SELECT x + 1");
+    assert_ne!(edited, text);
+    std::fs::write(&function, edited).unwrap();
+    declare_columns(
+        &d,
+        "  c: {type: integer, generated: {expression: 'app.f(a)', stored: true}}\n  \
+         n: {type: integer, default: 'app.f(1)'}\n",
+    );
+    let (plan, script) = connected_plan(&d, connection);
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    let create = at("CREATE FUNCTION \"app\".\"f\"");
+    assert!(at("DROP FUNCTION \"app\".\"f\"") < create, "{script}");
+    for column in ["c", "n"] {
+        assert!(create < at(&format!("ADD COLUMN \"{column}\"")), "{script}");
+    }
+    succeeds(approved_apply(&d, connection, &plan, &[]));
+    assert_eq!(
+        scalar(connection, "SELECT (c + n)::int8 FROM app.t WHERE id = 2"),
+        8 + 2
+    );
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
+/// #1364: a new generated column calling a new function that reads the
+/// column is a cycle no order performs, and planning refuses it by name with
+/// the two-plan remedy, rather than leaving the engine to refuse it at apply
+/// (DEC-1364.1).
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_new_column_calling_a_function_that_reads_it_is_refused_by_name() {
+    let (own, d) = adopted_table("new-column-cycle");
+    let connection = own.connection();
+    declare_function(&d, "g", "SELECT coalesce(max(c), 0) + x FROM app.t");
+    declare_columns(
+        &d,
+        "  c: {type: integer, generated: {expression: 'app.g(a)', stored: true}}\n",
+    );
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let refused = d.run(&["plan", "--db", connection]);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    let why = stderr(&refused);
+    for needle in ["`app.t.c`", "`app.g(integer)`", "two plans"] {
+        assert!(why.contains(needle), "{needle}: {why}");
+    }
+}
+
 /// A new default calling a function the revision rebuilds, on a table whose
 /// row the same plan updates in another column: the update takes nothing from
 /// the default, so the default follows `CREATE FUNCTION` and the plan applies

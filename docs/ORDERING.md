@@ -84,10 +84,12 @@ Then, in this order:
     `release_generated_inputs` then moves the retype or drop of a column a
     generated column reads after the expression change that stops reading it
     (DEC-1316.1).
-  - `split_new_tables` splits the expression-bearing parts out of a new table
-    ahead of a function create.
-  - `after_the_rebuilds` moves expression-bearing additions after the last
-    function create (DEC-942.1).
+  - `split_new_tables` splits the parts of a new table whose text names a
+    function the plan creates out of it, ahead of that create.
+  - `after_the_rebuilds` moves the expression-bearing additions whose text
+    names a function the plan creates after the last function create, and
+    places a new column whose expression names one after that create, with
+    what may read the column after it (DEC-942.1, DEC-1364.1).
 - **On SQL Server**, a retype or recollation drops and re-adds the keys,
   indexes and checks over the column, through `retype_dependents` and
   `recollate_dependents` (#1175, DECISIONS 515). `CREATE OR ALTER` means a
@@ -252,11 +254,13 @@ and the expression-bearing changes that need a function.
 | Tightening → primary key or unique key over the column | fixed | class 9 before 13 | ✓ |
 | Row writes → `SetDataMode` of their table | fixed | class 11 and 12 before 17 | ✓ |
 | Module → module that names it | content, over-approximated | `creation_order_with`, lexed names (DECISIONS 315) | ✓ |
-| Function created or rebuilt → check, filtered index or set default calling it | content, over-approximated | `after_the_rebuilds`: after the last function create | ✓ DEC-942.1 |
-| Function created or rebuilt → `AlterColumnExpression` calling it | content, over-approximated | `after_the_rebuilds` | ✓ DEC-1168.1 |
-| Function created or rebuilt → `AddColumn` whose default or generation expression calls it | content | stays ahead: the function may read the column | ⧗ DEC-942.1, DEC-1168.1; #1350 |
+| Function created or rebuilt → check, filtered index or set default calling it | content, over-approximated | `after_the_rebuilds`: after the last function create, when its text names the function | ✓ DEC-942.1, DEC-1364.1 |
+| Function created or rebuilt → `AlterColumnExpression` calling it | content, over-approximated | `after_the_rebuilds`, when its text names the function | ✓ DEC-1168.1, DEC-1364.1 |
+| Function created or rebuilt → `AddColumn` whose default or generation expression calls it | content, over-approximated | `after_their_functions`: after the create its text names, and what may read the column after it; a cycle is refused by name | ✓ DEC-1364.1 |
+| `AddColumn` → a module created that reads it | content, over-approximated | class 8 before 14; reordered after a column that moves, by name, or by table with `*` | ✓ DEC-1364.1 |
 | Function rebuilt → default a row of the plan takes | content | stays ahead of the rows | ⧗ #1030 |
-| Function created → a new table's expression-bearing parts | content, over-approximated | `split_new_tables`, then `after_the_rebuilds` | ✓ #1027 |
+| Function created → a new table's expression-bearing parts | content, over-approximated | `split_new_tables`, then `after_the_rebuilds`, when their text names the function | ✓ #1027, DEC-1364.1 |
+| Function created → a new table's generated column calling it | content | stays inside `CREATE TABLE`: split out, the column would move to the end of the table | ⧗ DEC-1364.1 |
 
 ### Something removed before what it blocks
 
@@ -315,41 +319,34 @@ and update (SPEC §4.6).
 
 Every content-dependent pair is the same question: does this expression or
 body name that function or column? The planner never answers it from the
-text's meaning (DECISIONS 174). It uses one of two stand-ins:
+text's meaning (DECISIONS 174). It answers with **a lexical
+over-approximation**: the text is read through the dialect's lexer, and every
+name it could refer to is taken as an edge. An edge too many costs nothing but
+a later position; one too few puts a change before what it needs. The answer
+is conservative, so it can never be wrong in the dangerous direction.
 
-- **A lexical over-approximation.** `creation_order_with` reads each module's
-  definition through the dialect's lexer and takes every name it could refer
-  to as an edge (DECISIONS 315). An edge too many costs nothing but a later
-  position; one too few puts a module before what it needs. The answer is
-  conservative, so it can never be wrong in the dangerous direction.
-- **A positional stand-in.** `after_the_rebuilds` assumes every check, filtered
-  index, default and expression change calls a function the plan creates, and
-  moves them all after the last create. It is right unless the assumption
-  breaks a reverse edge. That is why an added column, generated or with a
-  default, stays ahead: a function the plan creates may read it.
+- `creation_order_with` reads each module's definition this way (DECISIONS
+  315).
+- `after_the_rebuilds` reads a check's, an index's, a default's and a
+  generation expression's text for the functions the plan creates or rebuilds
+  (DEC-1364.1). Only an addition whose text names one moves after the last
+  create; the rest keep the differ's place. A new column whose expression
+  names one follows that create, and what may read the column follows the
+  column: a module naming it, or naming its table beside a `*`. Where the
+  function itself may read the column, or a row the plan writes needs it,
+  no order performs both, and the plan is refused by name with a two-plan
+  remedy. Over-approximated in both directions, a refusal can name a cycle the
+  engine would not have; it then refuses a plan the earlier positional rule
+  also left to fail.
 
 What is left to the engine is recorded on #1350, each with a two-plan remedy:
-- a new column whose default or generation expression calls a function the
-  plan creates or rebuilds;
 - an expression change still calling a function the plan rebuilds;
 - a function dropped after its release whose own body reads a column dropped
   or retyped earlier;
-- a default a plan row takes calling a rebuilt function (#1030).
-
-**The lexical over-approximation could close most of them without a parser and
-without the resolver.** The lexer `creation_order_with` already uses would read
-a default's or a generation expression's text for the function names it could
-call. With that, `after_the_rebuilds` would move only the additions whose text
-names a created function, and leave the rest in place. A column whose
-expression names no created function could then stay ahead of the creates, as
-it must for a function that reads it. One whose expression does name one would
-follow it, which is right unless that same function also reads the column. That
-last case is a genuine cycle, which the engine cannot perform in one step
-either, and a named refusal is the correct answer for it.
-
-The cost is a second consumer of the lexer, and positions that depend on text.
-That is the same trade DECISIONS 315 already made for modules. It is a design
-change to DEC-942.1, tracked by #1364.
+- a default a plan row takes calling a rebuilt function (#1030);
+- a generated column of a table the plan creates calling a function the plan
+  creates or rebuilds: taken out of `CREATE TABLE`, the column would change
+  the table's column order (DEC-1364.1).
 
 ## Value flow
 
@@ -374,7 +371,7 @@ counterpart would make that table the one row a new kind adds.
 |---|---|---|
 | S: tightening a column an index or a unique constraint covers is refused at apply | fixed, wrong | fixed, DEC-1363.1 |
 | Tightening runs before the reference rows that fill its NULLs, and its probe ignores them | fixed, wrong | fixed, DEC-1367.1 |
-| Content-dependent corners of expression-bearing changes around function creates, rebuilds and drops | content | #1350; the lexical over-approximation above as the structural fix, #1364 |
+| Content-dependent corners of expression-bearing changes around function creates, rebuilds and drops | content | #1350; the lexical over-approximation above closes the new-column corner (DEC-1364.1) |
 | Value-flow guards are per-probe, not one rule | value | recorded above; a refactor when a new value-rewriting kind arrives (#1174) |
 
 Every other interacting pair is ordered correctly. Its evidence is the

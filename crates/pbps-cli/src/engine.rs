@@ -2083,6 +2083,7 @@ pub async fn account_for_module_dependents(
     changes: &mut ChangeSet,
     declared: &pbps_model::Schema,
     ids: &[&pbps_model::IdsFile],
+    deps: &pbps_model::ModuleDeps,
     dialect: &dyn pbps_dialect::Dialect,
     rediff: &dyn Fn(&BTreeSet<pbps_model::ModuleId>) -> anyhow::Result<ChangeSet>,
 ) -> anyhow::Result<ConnectedCheck> {
@@ -2104,7 +2105,8 @@ pub async fn account_for_module_dependents(
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
     let split = crate::dependents::split_new_tables(changes, ids, dialect);
     let released = crate::dependents::released(changes, &found);
-    let moved = crate::dependents::after_the_rebuilds(changes, &released);
+    let moved = crate::dependents::after_the_rebuilds(changes, &released, deps)
+        .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
     let left = crate::dependents::unaccounted(changes, &found);
     if !left.is_empty() {
         anyhow::bail!(
@@ -2119,7 +2121,7 @@ pub async fn account_for_module_dependents(
         engine: "PostgreSQL",
         status: "passed",
         message: format!(
-            "{dependents} dependent(s) of {} dropped or rebuilt module(s) removed before the drop; {added} change(s) added to the plan for them; {split} part(s) split out of new tables; {moved} addition(s) moved after the rebuilt function(s)",
+            "{dependents} dependent(s) of {} dropped or rebuilt module(s) removed before the drop; {added} change(s) added to the plan for them; {split} part(s) split out of new tables; {moved} addition(s) moved after the function(s) they call",
             found.len()
         ),
     })

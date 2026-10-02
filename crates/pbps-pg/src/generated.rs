@@ -89,9 +89,67 @@ pub fn may_read(expression: &str, column: &str) -> bool {
     crate::impact::mentions(expression, column)
 }
 
+/// Whether a text may call or read anything named `name`: the scan
+/// [`may_read`] runs, asked of a function's or a table's bare name. The
+/// schema is not compared, so a name in another schema counts too; a "yes"
+/// means *may* (DEC-1364.1).
+#[must_use]
+pub fn may_name(text: &str, name: &str) -> bool {
+    crate::impact::mentions(text, name)
+}
+
+/// Whether a definition may take a table's columns without naming them: a
+/// `*` outside literals and comments, or a `NATURAL` join. Measured on 18.6,
+/// a view over `SELECT *` and a `BEGIN ATOMIC` body expand the star when they
+/// are created, so a column added after them is not theirs. A `*` that
+/// multiplies counts too; a "yes" means *may* (DEC-1364.1).
+#[must_use]
+pub fn may_take_every_column(definition: &str) -> bool {
+    let code = crate::LEXICON.code_only(definition);
+    // Not `may_name`: `natural` is reserved, and that scan reads a reserved
+    // word as a name only where it is quoted or follows a dot.
+    code.contains('*')
+        || code
+            .split(|c: char| !pbps_dialect::continues_ident(c))
+            .any(|word| word.eq_ignore_ascii_case("natural"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::may_read;
+    use super::{may_name, may_read, may_take_every_column};
+
+    /// A call is read by the function's bare name, qualified or not, in a
+    /// routine's body as in an expression; a literal or a comment is no call
+    /// (DEC-1364.1).
+    #[test]
+    fn a_function_is_named_by_its_bare_name_wherever_it_is_code() {
+        assert!(may_name("app.f(a) + 1", "f"));
+        assert!(may_name("f(a)", "f"));
+        assert!(may_name(
+            "(x integer) RETURNS integer LANGUAGE sql AS $$ SELECT app.f(x) $$",
+            "f"
+        ));
+        assert!(!may_name("app.ff(a)", "f"));
+        assert!(!may_name("'f(a)' || b", "f"));
+        assert!(!may_name("b -- f(a)", "f"));
+    }
+
+    /// A star or a natural join may take every column; a body that spells
+    /// its columns, or holds a star only in a literal, does not (DEC-1364.1).
+    #[test]
+    fn a_star_or_a_natural_join_may_take_every_column() {
+        assert!(may_take_every_column("SELECT * FROM app.t"));
+        assert!(may_take_every_column(
+            "SELECT id FROM app.t NATURAL JOIN app.u"
+        ));
+        assert!(may_take_every_column(
+            "() RETURNS SETOF app.t LANGUAGE sql BEGIN ATOMIC SELECT * FROM app.t; END"
+        ));
+        assert!(!may_take_every_column("SELECT id, a FROM app.t"));
+        assert!(!may_take_every_column(
+            "SELECT id, '*' AS natural_key FROM app.t"
+        ));
+    }
 
     /// The scan reads a name however it is spelled, a Unicode escape and its
     /// `UESCAPE` included, and data in a literal is no name (DEC-1316.1).
