@@ -597,3 +597,22 @@ declared row keys under the key column's declared collation, not the one the
 catalog had before the plan. That is the collation the column has once the
 plan has run, including for a table the plan creates or renames (replacing
 DECISIONS 148's catalog read for this question).
+
+<a id="dec-1445-1"></a>
+
+**DEC-1445.1. The canonical read scope turns JIT off for itself, instead of
+the catalog queries being kept under the server's JIT threshold.** Since the
+per-key operator classes of #1169, the catalog batch's planner estimate is
+over the default `jit_above_cost`, so a server built with LLVM compiled it on
+every read. Measured on 18.6 against a near-empty database: ~280 ms of
+compilation (1,048 functions) for a statement that executes in ~15 ms, paid
+by every `plan --db`, `apply`, `verify` and `pull`, several times per apply,
+and by every PostgreSQL live test, whose per-test time tripled with that
+commit. Rewriting the query under the threshold was rejected: the estimate
+grows linearly with the catalog (~20 million at 2,000 tables on 16.15,
+past the optimize and inline thresholds too), and the threshold is the server's
+configuration, so a large database or `jit_above_cost = 0` would cross it
+again. `set_config('jit', 'off', true)` sits beside DECISIONS 254's settings:
+local to the transaction or savepoint DECISIONS 250 and 418 already unwind,
+so the statements an apply runs after a read are under the session's own
+`jit`.

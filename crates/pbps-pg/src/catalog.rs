@@ -744,6 +744,17 @@ pub(crate) fn probe_set(token: &str) -> String {
 /// `lc_monetary` is deliberately absent: it belongs to the same class, and
 /// `SET` fails outright on a locale the server does not have, which would turn
 /// a readable database into an unreadable one.
+///
+/// `jit` is the one setting here that changes no rendering, only the cost of
+/// reading (DEC-1445.1). The catalog batch's planner estimate is over the default
+/// `jit_above_cost`, almost all of it the per-key operator-class subqueries in
+/// [`indexes_query`], so a server with JIT compiled the batch on every read.
+/// **Measured** on 18.6 against a near-empty database: ~280 ms of compilation
+/// (1,048 functions) for a statement that executes in ~15 ms. Off here rather
+/// than by trimming the estimate, because the estimate grows with the catalog
+/// and the threshold is the server's configuration: a larger database, or
+/// `jit_above_cost = 0`, would cross it again. Local like the rest, so the
+/// statements an apply runs after the read are under the session's own `jit`.
 pub(crate) const CANONICAL_PATH: &str = "SELECT pg_catalog.set_config('search_path', '', true),
        pg_catalog.set_config('quote_all_identifiers', 'off', true),
        pg_catalog.set_config('datestyle', 'ISO, MDY', true),
@@ -751,7 +762,8 @@ pub(crate) const CANONICAL_PATH: &str = "SELECT pg_catalog.set_config('search_pa
        pg_catalog.set_config('timezone', 'UTC', true),
        pg_catalog.set_config('bytea_output', 'hex', true),
        pg_catalog.set_config('extra_float_digits', '1', true),
-       pg_catalog.set_config('standard_conforming_strings', 'on', true)";
+       pg_catalog.set_config('standard_conforming_strings', 'on', true),
+       pg_catalog.set_config('jit', 'off', true)";
 
 /// Reads the whole managed set back: one snapshot, one search path, no writes.
 ///
@@ -2567,6 +2579,43 @@ mod tests {
         }
     }
 
+    /// The read itself runs without JIT, in both scopes, and the caller's own
+    /// `jit` is what the statements after it run under (DEC-1445.1). The session
+    /// asks for JIT on everything, so the setting the read sees is the scope's
+    /// and not the server default.
+    #[tokio::test]
+    #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+    async fn the_canonical_scope_reads_without_jit_and_hands_back_the_sessions_own() {
+        let connection = std::env::var("PBPS_TEST_PG_DB").unwrap();
+        let mut conn = Conn::connect(pbps_db::Driver::Postgres, &connection)
+            .await
+            .unwrap();
+        conn.execute("SET jit = on; SET jit_above_cost = 0")
+            .await
+            .unwrap();
+        let jit = |rows: Vec<Row>| text(&rows[0], "jit").unwrap();
+        for caller_owned in [false, true] {
+            if caller_owned {
+                conn.execute("BEGIN").await.unwrap();
+            }
+            let during =
+                jit(
+                    canonical_query(&mut conn, "SELECT current_setting('jit') AS jit", &[])
+                        .await
+                        .unwrap(),
+                );
+            let after = jit(conn
+                .query("SELECT current_setting('jit') AS jit")
+                .await
+                .unwrap());
+            if caller_owned {
+                conn.execute("ROLLBACK").await.unwrap();
+            }
+            assert_eq!(during, "off", "caller_owned = {caller_owned}");
+            assert_eq!(after, "on", "caller_owned = {caller_owned}");
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -2844,6 +2893,9 @@ mod tests {
         ] {
             assert!(CANONICAL_PATH.contains(setting), "{setting}");
         }
+        // Not a rendering setting: the cost of the read (DEC-1445.1). Local like the
+        // rest; pinned live by `the_canonical_scope_reads_without_jit_and_hands_back_the_sessions_own`.
+        assert!(CANONICAL_PATH.contains("'jit', 'off', true"));
         // Asked of this backend, and of the statement rather than the
         // transaction: `xact_start = query_start` is what "no transaction was
         // open before this one" looks like. Pinned live by
