@@ -137,6 +137,7 @@ fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, Re
     let mut closing = vec![];
     for (from, to) in [("a", "b"), ("b", "c")] {
         let mut transition = ObjectTransition {
+            references: BTreeSet::new(),
             surface: surface(from, false, false),
             before: BTreeSet::new(),
             after: BTreeSet::new(),
@@ -173,6 +174,7 @@ fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, Re
         // A table aggregate contains both column renames and the table's own
         // records, while their endpoint names still belong to different UIDs.
         evidence.transitions = vec![ObjectTransition {
+            references: BTreeSet::new(),
             // The final table label also covers the column changes
             // whose statement-time owner is the renamed table.
             surface: Surface::Table(table),
@@ -197,6 +199,7 @@ fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, Re
         parent.ownership = ObjectOwnership::Surface(Surface::Table(table.clone()));
         parent.bindings.clear();
         evidence.transitions.push(ObjectTransition {
+            references: BTreeSet::new(),
             surface: Surface::Table(table),
             before: BTreeSet::from([parent.object.clone()]),
             after: BTreeSet::from([parent.object.clone()]),

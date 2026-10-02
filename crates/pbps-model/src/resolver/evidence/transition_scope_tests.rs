@@ -75,6 +75,7 @@ pub(super) fn fixture() -> (ChangeSet, ResolverEvidence) {
         desired: Some(bound),
     }];
     evidence.transitions = vec![ObjectTransition {
+        references: BTreeSet::new(),
         surface: Surface::Table(table),
         before: BTreeSet::from([object("changed-default")]),
         after: BTreeSet::from([object("changed-default")]),

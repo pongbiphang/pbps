@@ -2259,6 +2259,156 @@ fn an_object_grant_after_a_same_name_replacement_names_the_replacement() {
     }
 }
 
+/// A foreign key on another table names the renamed table through its
+/// dependency row, its RI trigger on the renamed table and its own triggers.
+/// The rename carries exactly those, on both sides; another record of the
+/// referencing table, an unqualified dependent and a rename of an unrelated
+/// table carry nothing.
+#[test]
+fn a_rename_carries_the_records_that_name_the_renamed_table() {
+    use pbps_db::resolver::capture::ObjectIdentity;
+    use pbps_model::{Column, PlannedChange, Table};
+    use pbps_pg::resolver::capture::BindingRecord;
+    use std::collections::BTreeSet;
+
+    let parent: pbps_model::TableName = "app.p".parse().unwrap();
+    let renamed: pbps_model::TableName = "app.q".parse().unwrap();
+    let child: pbps_model::TableName = "app.c".parse().unwrap();
+    let other: pbps_model::TableName = "app.o".parse().unwrap();
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("id".into(), Column::new("integer".parse().unwrap()));
+    let mut base = Schema::default();
+    for name in [&parent, &child, &other] {
+        base.tables.insert(name.clone(), table.clone());
+    }
+    let base_ids = ids(&base, &IdsFile::default());
+    let relation = |name: &pbps_model::TableName| ObjectIdentity {
+        class: "pg_class".into(),
+        name: vec![name.schema.clone(), name.name.clone()],
+        signature: vec![],
+    };
+    let identity = |class: &str, name: &str, signature: Vec<ObjectIdentity>| ObjectIdentity {
+        class: class.into(),
+        name: if name.is_empty() {
+            vec![]
+        } else {
+            vec![name.into()]
+        },
+        signature,
+    };
+    let record = |object: ObjectIdentity, owner: Option<&pbps_model::TableName>| BindingRecord {
+        object,
+        ownership: owner.map_or(ObjectOwnership::Unqualified, |owner| {
+            ObjectOwnership::Surface(Surface::Table(owner.clone()))
+        }),
+        bindings: vec![],
+    };
+    let function = identity("pg_proc", "RI_FKey_check_ins", vec![]);
+    let key = identity("pg_constraint", "c_fk", vec![relation(&child)]);
+    let check = identity("pg_constraint", "c_ck", vec![relation(&child)]);
+    let child_trigger = identity(
+        "pg_trigger",
+        "",
+        vec![relation(&child), key.clone(), function.clone()],
+    );
+    let side = |target: &pbps_model::TableName| {
+        let parent_trigger = identity(
+            "pg_trigger",
+            "",
+            vec![relation(target), key.clone(), function.clone()],
+        );
+        let edge = identity("pg_depend", "n", vec![key.clone(), relation(target)]);
+        let stranger = identity(
+            "pg_depend",
+            "n",
+            vec![identity("pg_rewrite", "_RETURN", vec![]), relation(target)],
+        );
+        let records = vec![
+            record(relation(target), Some(target)),
+            record(relation(&child), Some(&child)),
+            record(relation(&other), Some(&other)),
+            record(key.clone(), Some(&child)),
+            record(check.clone(), Some(&child)),
+            record(child_trigger.clone(), Some(&child)),
+            record(parent_trigger.clone(), Some(&child)),
+            record(edge.clone(), Some(&child)),
+            record(stranger, None),
+        ];
+        let carried = BTreeSet::from([key.clone(), child_trigger.clone(), parent_trigger, edge]);
+        (records, carried)
+    };
+    let (opening, opening_carried) = side(&parent);
+    let (compiled, compiled_carried) = side(&renamed);
+    let run = |from: &pbps_model::TableName, to: &pbps_model::TableName| {
+        let uid = base_ids.table_uid(from).unwrap().clone();
+        let mut desired = base.clone();
+        let moved = desired.tables.remove(from).unwrap();
+        desired.tables.insert(to.clone(), moved);
+        let mut desired_ids = base_ids.clone();
+        desired_ids.rename_table(from, to);
+        let changes = ChangeSet {
+            changes: vec![PlannedChange::new(Change::RenameTable {
+                uid,
+                from: from.clone(),
+                to: to.clone(),
+                defaults: vec![],
+            })],
+        };
+        let (opening, compiled) = if from == &parent {
+            (opening.clone(), compiled.clone())
+        } else {
+            let mut compiled = opening.clone();
+            compiled[2] = record(relation(to), Some(to));
+            (opening.clone(), compiled)
+        };
+        super::transitions::derive(
+            &changes,
+            pbps_diff::Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            pbps_diff::Side {
+                schema: &desired,
+                ids: &desired_ids,
+            },
+            &opening,
+            &compiled,
+        )
+        .unwrap()
+    };
+    let transitions = run(&parent, &renamed);
+    let rename = transitions
+        .iter()
+        .find(|t| t.surface == Surface::Table(renamed.clone()))
+        .unwrap();
+    assert_eq!(
+        rename.references,
+        opening_carried.union(&compiled_carried).cloned().collect()
+    );
+    assert_eq!(
+        rename.before,
+        opening_carried
+            .iter()
+            .cloned()
+            .chain([relation(&parent)])
+            .collect()
+    );
+    assert_eq!(
+        rename.after,
+        compiled_carried
+            .iter()
+            .cloned()
+            .chain([relation(&renamed)])
+            .collect()
+    );
+    assert!(!rename.before.contains(&check) && !rename.after.contains(&check));
+    let unrelated: pbps_model::TableName = "app.o2".parse().unwrap();
+    let transitions = run(&other, &unrelated);
+    assert!(transitions.iter().all(|t| t.references.is_empty()));
+}
+
 /// Dropping a table and renaming another into its name in one plan puts two
 /// recorded UIDs behind one closing spelling. Both opening tables are the
 /// transition's inventory: the dropped one and the renamed one.
@@ -4061,6 +4211,118 @@ async fn review_plan(
     let result = result.expect("the review fixture's typed plan is valid");
     result.evidence.validate(&result.changes).unwrap();
     result
+}
+
+/// Renaming a table, or a column, that another table's foreign key
+/// references rewrites that key in place: its constraint, its RI triggers on
+/// both tables and their dependency rows now name the new spelling. The
+/// differ keeps the key, so the rename must carry those records, and the
+/// closing manifest must still match the real post-DDL catalog.
+async fn referenced_rename_case(column: bool) {
+    setup(&[
+        "CREATE SCHEMA pbps_evidence1274",
+        "CREATE TABLE pbps_evidence1274.p (n integer NOT NULL, CONSTRAINT p_pk PRIMARY KEY (n))",
+        "CREATE TABLE pbps_evidence1274.c (n integer NOT NULL, \
+         CONSTRAINT c_fk FOREIGN KEY (n) REFERENCES pbps_evidence1274.p (n))",
+    ])
+    .await;
+    let parent: pbps_model::TableName = "pbps_evidence1274.p".parse().unwrap();
+    let child: pbps_model::TableName = "pbps_evidence1274.c".parse().unwrap();
+    let renamed: pbps_model::TableName = "pbps_evidence1274.q".parse().unwrap();
+    let schema = |parent_name: &pbps_model::TableName, key: &str| {
+        let mut parent_table = pbps_model::Table::default();
+        parent_table.columns.insert(
+            key.into(),
+            pbps_model::Column::new("integer".parse().unwrap()).not_null(),
+        );
+        parent_table.primary_key = Some(pbps_model::PrimaryKey {
+            name: Some("p_pk".into()),
+            columns: vec![key.into()],
+        });
+        let mut child_table = review_table();
+        child_table.foreign_keys.insert(
+            "c_fk".into(),
+            pbps_model::ForeignKey {
+                columns: vec!["n".into()],
+                references_table: parent_name.clone(),
+                references_columns: vec![key.into()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+        let mut schema = Schema::default();
+        schema.tables.insert(parent_name.clone(), parent_table);
+        schema.tables.insert(child.clone(), child_table);
+        schema
+    };
+    let base = schema(&parent, "n");
+    let base_ids = pbps_diff::resolve(
+        &base,
+        &IdsFile::default(),
+        &[],
+        &pbps_diff::Context {
+            operator: "1274-test".into(),
+            today: "2026-10-03".into(),
+        },
+    )
+    .unwrap()
+    .ids;
+    let mut desired_ids = base_ids.clone();
+    let desired = if column {
+        let uid = base_ids.column_uid(&parent.column("n")).unwrap();
+        desired_ids.columns.get_mut(uid).unwrap().name = "k".into();
+        schema(&parent, "k")
+    } else {
+        desired_ids.rename_table(&parent, &renamed);
+        schema(&renamed, "n")
+    };
+    let inputs = Inputs::with_ids(base, desired, base_ids, desired_ids);
+    let key = ProjectKey::new(true);
+    let mut owned = Some(ObservedContainers::begin());
+    let mut target = target().await;
+    let mut run = open(Profile::Container, &mut target).await;
+    let result = review_plan(&mut target, &mut run, &mut owned, &inputs, &key).await;
+    let changes = &result.changes.changes;
+    assert!(changes.iter().any(|step| {
+        if column {
+            matches!(&step.change, Change::RenameColumn { table, from, to, .. }
+                if table == &parent && from == "n" && to == "k")
+        } else {
+            matches!(&step.change, Change::RenameTable { from, to, .. }
+                if from == &parent && to == &renamed)
+        }
+    }));
+    assert!(
+        !changes.iter().any(|step| matches!(
+            step.change,
+            Change::DropForeignKey { .. } | Change::AddForeignKey { .. }
+        )),
+        "the referencing key is rewritten in place, not rebuilt"
+    );
+    let closing = result.evidence.after().clone();
+    let mut peer = pbps_db::Conn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    execute_plan(&mut peer, &result.changes).await;
+    drop(peer);
+    assert_review_closing_matches_target(&mut target, &closing, &key).await;
+    target.check().await.unwrap();
+    setup(&[]).await;
+}
+
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn renaming_a_referenced_table_carries_the_foreign_key_that_names_it() {
+    referenced_rename_case(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn renaming_a_referenced_column_carries_the_foreign_key_that_names_it() {
+    referenced_rename_case(true).await;
 }
 
 /// ADD CONSTRAINT changes the table in place. Its target owner and ACLs are

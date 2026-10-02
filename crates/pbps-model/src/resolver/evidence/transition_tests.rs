@@ -59,6 +59,7 @@ fn drop_fixture(change: Change, surface: Surface) -> (ChangeSet, ResolverEvidenc
             *manifest = serde_json::from_value(json).unwrap();
         }
         evidence.transitions.push(ObjectTransition {
+            references: BTreeSet::new(),
             surface: Surface::Table(column.table.clone()),
             before: BTreeSet::from([parent.object.clone()]),
             after: BTreeSet::from([parent.object]),
@@ -346,6 +347,7 @@ fn a_dropped_view_can_be_replaced_by_a_table_at_the_same_logical_address() {
     evidence.transitions.insert(
         0,
         ObjectTransition {
+            references: BTreeSet::new(),
             surface: Surface::Table("app.v".parse().unwrap()),
             before: BTreeSet::new(),
             after: BTreeSet::from([desired.object]),
@@ -508,6 +510,7 @@ fn owner_coverage(
     }];
     let owned = BTreeSet::from([owner_object.clone(), child_object.clone()]);
     evidence.transitions = vec![ObjectTransition {
+        references: BTreeSet::new(),
         surface: owner.clone(),
         before: if creating {
             BTreeSet::new()
@@ -520,6 +523,7 @@ fn owner_coverage(
         // The table already exists on both sides of this fixture. Its exact
         // inventory supplements, and never replaces, the column inventory.
         evidence.transitions.push(ObjectTransition {
+            references: BTreeSet::new(),
             surface: Surface::Table(table.clone()),
             before: BTreeSet::from([table_object.clone()]),
             after: BTreeSet::from([table_object]),
@@ -545,6 +549,7 @@ fn owner_coverage(
             .unwrap()
             .clone();
         aggregate.transitions = vec![ObjectTransition {
+            references: BTreeSet::new(),
             surface: Surface::Table(table),
             ..owner_transition
         }];
@@ -558,6 +563,7 @@ fn owner_coverage(
     }
     let child_only = BTreeSet::from([child_object]);
     evidence.transitions = vec![ObjectTransition {
+        references: BTreeSet::new(),
         surface: child,
         before: if creating {
             BTreeSet::new()
@@ -750,6 +756,7 @@ pub(super) fn rename_endpoints(column: bool) -> (ChangeSet, ResolverEvidence, In
     // Plain tables and columns need not occur in a binding-surface inventory.
     evidence.surfaces.clear();
     evidence.transitions = vec![ObjectTransition {
+        references: BTreeSet::new(),
         surface: from.clone(),
         before: BTreeSet::from([old_object.clone()]),
         after: BTreeSet::from([new_object.clone()]),
@@ -764,6 +771,7 @@ pub(super) fn rename_endpoints(column: bool) -> (ChangeSet, ResolverEvidence, In
             .object
             .clone();
         evidence.transitions.push(ObjectTransition {
+            references: BTreeSet::new(),
             surface: Surface::Table(table.clone()),
             before: BTreeSet::from([parent.clone()]),
             after: BTreeSet::from([parent]),
@@ -789,6 +797,7 @@ pub(super) fn rename_endpoints(column: bool) -> (ChangeSet, ResolverEvidence, In
     let mut split = evidence.clone();
     split.transitions[rename_index].after.clear();
     split.transitions.push(ObjectTransition {
+        references: BTreeSet::new(),
         surface: to,
         before: BTreeSet::new(),
         after: BTreeSet::from([new_object.clone()]),
@@ -798,6 +807,7 @@ pub(super) fn rename_endpoints(column: bool) -> (ChangeSet, ResolverEvidence, In
     if column {
         let mut aggregate = evidence.clone();
         aggregate.transitions = vec![ObjectTransition {
+            references: BTreeSet::new(),
             surface: Surface::Table(table),
             ..evidence.transitions[rename_index].clone()
         }];
@@ -866,6 +876,105 @@ pub(super) fn rename_endpoints(column: bool) -> (ChangeSet, ResolverEvidence, In
 #[test]
 fn plain_table_renames_require_opening_and_closing_inventories() {
     rename_endpoints(false);
+}
+
+/// A foreign key on another table that points at a renamed table is
+/// rewritten in place by PostgreSQL. A rename may carry it as a reference;
+/// no other change may, and an unqualified record never rides along.
+#[test]
+fn a_rename_can_carry_another_tables_reference_and_nothing_else_can() {
+    for column in [false, true] {
+        let (changes, evidence, compiled) = rename_endpoints(column);
+        let rename = evidence
+            .transitions
+            .iter()
+            .position(|t| {
+                changes.changes.iter().any(|step| {
+                    matches!(
+                        step.change,
+                        Change::RenameTable { .. } | Change::RenameColumn { .. }
+                    ) && super::super::projection::touches(&step.change, &t.surface)
+                })
+            })
+            .unwrap();
+        let foreign = ObjectIdentity {
+            class: "constraint-fixture".into(),
+            name: vec!["child_fk".into()],
+            signature: vec![],
+        };
+        let record = |ownership: ObjectOwnership, properties: &str| crate::resolver::Prerequisite {
+            object: foreign.clone(),
+            ownership,
+            canonicalization: "fixture-v1".into(),
+            properties: properties.repeat(32),
+            bindings: vec![],
+        };
+        let child = ObjectOwnership::Surface(Surface::Table("app.child".parse().unwrap()));
+        let add = |manifest: &InputManifest, p: crate::resolver::Prerequisite| {
+            let mut records: Vec<_> = manifest.prerequisites().to_vec();
+            records.push(p);
+            records.sort_by(|a, b| a.object.cmp(&b.object));
+            let mut json = serde_json::to_value(manifest).unwrap();
+            json["prerequisites"] = serde_json::to_value(records).unwrap();
+            serde_json::from_value::<InputManifest>(json).unwrap()
+        };
+        let carry = |ownership: ObjectOwnership, listed: bool| {
+            let mut carried = evidence.clone();
+            carried.before = add(&evidence.before, record(ownership.clone(), "c1"));
+            let compiled = add(&compiled, record(ownership, "c2"));
+            let transition = &mut carried.transitions[rename];
+            transition.before.insert(foreign.clone());
+            transition.after.insert(foreign.clone());
+            if listed {
+                transition.references.insert(foreign.clone());
+            }
+            (carried, compiled)
+        };
+        let (carried, carried_compiled) = carry(child.clone(), true);
+        let sealed = carried
+            .before
+            .project(&changes, &carried_compiled, &carried.transitions)
+            .unwrap();
+        assert!(
+            sealed.prerequisites().iter().all(|p| p.object != foreign),
+            "a carried reference is not compared with a predicted fingerprint"
+        );
+        for (ownership, listed, case) in [
+            (child.clone(), false, "an unlisted reference"),
+            (
+                ObjectOwnership::Unqualified,
+                true,
+                "an unqualified reference",
+            ),
+        ] {
+            let (wrong, wrong_compiled) = carry(ownership, listed);
+            assert!(
+                wrong
+                    .before
+                    .project(&changes, &wrong_compiled, &wrong.transitions)
+                    .is_err(),
+                "{case} rode on the rename (column={column})"
+            );
+        }
+        // The same listed reference on a non-rename change is refused.
+        let mut no_rename = carried.clone();
+        let other = ChangeSet {
+            changes: vec![PlannedChange::new(Change::DropCheck {
+                table: "app.v".parse().unwrap(),
+                name: "positive".into(),
+            })],
+        };
+        no_rename.transitions[rename].surface = Surface::Check {
+            table: "app.v".parse().unwrap(),
+            name: "positive".into(),
+        };
+        assert!(
+            no_rename
+                .before
+                .project(&other, &carried_compiled, &no_rename.transitions)
+                .is_err()
+        );
+    }
 }
 
 #[test]
@@ -2388,6 +2497,7 @@ mod column_vector_parent {
             let compiled = evidence.before.clone();
             evidence.surfaces[0].desired = evidence.surfaces[0].current.clone();
             evidence.transitions = vec![ObjectTransition {
+                references: BTreeSet::new(),
                 surface,
                 before: inventory.clone(),
                 after: inventory,
