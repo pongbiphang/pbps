@@ -14,7 +14,7 @@ fn resolved_plan() -> SavedPlan {
     // explanation regression into an unrelated deserialization refusal.
     let changes = ChangeSet::default();
     let manifest = InputManifest::new(
-        "postgres-catalog-inputs-v1".into(),
+        "postgres-catalog-inputs-v2".into(),
         18,
         "01".repeat(8),
         ReadScope {

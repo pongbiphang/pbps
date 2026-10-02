@@ -40,7 +40,7 @@ pub(super) fn prepare(
 ) -> Result<Prepared, Uncovered> {
     let mut index = BTreeMap::new();
     for &class in properties::CLASSES {
-        if matches!(class, "pg_depend" | "pg_shdepend" | "pg_init_privs") {
+        if class == "pg_depend" {
             continue;
         }
         for (position, row) in catalog.rows[class].iter().enumerate() {
@@ -78,12 +78,13 @@ pub(super) fn prepare(
             render: render::Selection::default(),
         },
     };
-    // Authorization is a complete snapshot set, not a cache-derived effective
-    // privilege answer. Include absence and all grant/membership properties.
+    // Role attributes, memberships and role/database settings are complete
+    // snapshot sets. Object ACLs and owners are not binding inputs (see
+    // properties.rs); the deployer's effective privileges are the separate
+    // AuthorizationCondition.
     for &class in &[
         "pg_roles",
         "pg_auth_members",
-        "pg_default_acl",
         "pg_db_role_setting",
         "pg_parameter_acl",
         "pg_database",
@@ -263,7 +264,7 @@ impl Builder<'_> {
                 | Field::References(_)
                 | Field::Columns(_)
                 | Field::Column(_)
-                | Field::Acl
+                | Field::Authorization
                 | Field::Definition
                 | Field::Physical
                 | Field::Address => {}
@@ -335,13 +336,9 @@ impl Builder<'_> {
     }
 
     fn dependencies(&mut self) -> Result<(), Uncovered> {
-        for &class in &["pg_depend", "pg_shdepend", "pg_init_privs"] {
+        for &class in &["pg_depend"] {
             for row in &self.catalog.rows[class] {
-                let (class_field, object_field, sub_field) = if class == "pg_init_privs" {
-                    ("classoid", "objoid", "objsubid")
-                } else {
-                    ("classid", "objid", "objsubid")
-                };
+                let (class_field, object_field, sub_field) = ("classid", "objid", "objsubid");
                 let fail = || Uncovered::class(class, "unreadable prerequisite dependency");
                 let subject = self.catalog.address(
                     logical::number(row, class_field).map_err(|_| fail())?,

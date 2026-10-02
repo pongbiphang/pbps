@@ -206,12 +206,9 @@ impl ScratchRun {
             .authorization_context
             .persisted(key, &changes)
             .map_err(Error::Scope)?;
-        let pg_authorization = match &sealed.authorization_context {
-            scope::Authorization::Postgres(context) => context,
-            scope::Authorization::Mssql(_) => {
-                return Err(Error::Scope("SQL Server evidence is unsupported".into()));
-            }
-        };
+        if matches!(sealed.authorization_context, scope::Authorization::Mssql(_)) {
+            return Err(Error::Scope("SQL Server evidence is unsupported".into()));
+        }
         let compiled_records = producer
             .compiled
             .planning_records()
@@ -229,12 +226,11 @@ impl ScratchRun {
                 &transitions,
                 base.ids,
                 desired.ids,
-                pg_authorization,
             )
             .map_err(|error| Error::Binding(format!("final compiled catalog manifest: {error}")))?;
-        // Typed preservation can replace the scratch owner's shared-dependency
-        // addresses. Re-inventory the final sealed records before projecting;
-        // the model must see exactly those closing addresses.
+        // A retained PostgreSQL 18 NOT NULL child keeps its opening name, so
+        // sealing can re-address it. Re-inventory the final sealed records
+        // before projecting; the model must see exactly those closing addresses.
         let transitions = transitions::derive(
             &changes,
             base,

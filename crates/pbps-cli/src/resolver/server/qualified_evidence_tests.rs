@@ -1012,12 +1012,33 @@ async fn execute_plan_with_extras(
     conn.execute("COMMIT").await.unwrap();
 }
 
+/// Owners, ACLs and their shared-dependency and initial-privilege rows are not
+/// binding inputs (capture rule v2), so no manifest may carry their records.
+fn assert_no_authorization_records(manifest: &pbps_model::resolver::InputManifest) {
+    let records: Vec<_> = manifest
+        .prerequisites()
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.object.class.as_str(),
+                "pg_shdepend" | "pg_init_privs" | "pg_default_acl"
+            )
+        })
+        .map(|record| &record.object)
+        .collect();
+    assert!(
+        records.is_empty(),
+        "authorization records sealed: {records:?}"
+    );
+}
+
 /// PostgreSQL's typed AlterModule is expanded to DROP+CREATE, so a replaced
-/// view receives creation defaults rather than retaining its old relation and
-/// column ACL. Compare projected closing facts to a real post-DDL capture.
+/// view loses the target's relation and column grants. Those grants are not
+/// binding inputs: the projected closing facts still equal a real post-DDL
+/// capture.
 #[tokio::test]
 #[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
-async fn a_rebuilt_view_projects_creation_defaults_instead_of_old_target_grants() {
+async fn a_rebuilt_view_with_old_target_grants_closes_on_the_actual_catalog() {
     use pbps_db::fingerprint::EnvironmentFingerprintKey;
     use pbps_db::resolver::capture::ObjectIdentity;
 
@@ -1075,7 +1096,7 @@ async fn a_rebuilt_view_projects_creation_defaults_instead_of_old_target_grants(
         Ok(result) => result,
         Err(error) => {
             close(&mut run, &mut owned).await;
-            panic!("the view rebuild and its creation defaults must qualify: {error}");
+            panic!("the view rebuild beside old target grants must qualify: {error}");
         }
     };
     result.evidence.validate(&result.changes).unwrap();
@@ -1095,6 +1116,8 @@ async fn a_rebuilt_view_projects_creation_defaults_instead_of_old_target_grants(
     assert!(dropped < created);
 
     let closing = result.evidence.after().clone();
+    assert_no_authorization_records(result.evidence.before());
+    assert_no_authorization_records(&closing);
     close(&mut run, &mut owned).await;
     let mut peer = pbps_db::Conn::connect(
         Driver::Postgres,
@@ -1183,7 +1206,7 @@ async fn a_rebuilt_view_projects_creation_defaults_instead_of_old_target_grants(
             .expect("the fresh post-DDL target capture contains the same catalog object");
         assert_eq!(
             expected.properties, observed.properties,
-            "the final projected {} properties must match actual rebuild defaults",
+            "the final projected {} properties must match the actual rebuild",
             object.class
         );
         assert_eq!(expected.bindings, observed.bindings);
@@ -1639,61 +1662,12 @@ async fn recorded_rename_case(profile: Profile, keep_public: bool, ordinary_tabl
         ("postgres".into(), 0, 0),
         "the recreated routine's pinned owner has no shared dependency"
     );
-    let routine_owner_edges: Vec<_> = closing
-        .prerequisites()
-        .iter()
-        .filter(|row| {
-            row.object.class == "pg_shdepend"
-                && row.object.name == ["o"]
-                && row.object.signature.first().is_some_and(|subject| {
-                    subject.class == "pg_proc" && subject.name == [cases::SCHEMA, "a"]
-                })
-        })
-        .collect();
-    assert!(
-        routine_owner_edges.is_empty(),
-        "the sealed closing routine cannot invent a pinned owner edge: {routine_owner_edges:?}"
-    );
+    assert_no_authorization_records(&closing);
     if ordinary_table_owner {
         assert_eq!(
             catalog_owner_dependency("table-u").await,
             ("pbps_native_alt".into(), 1, 1),
-            "the in-place rename keeps the ordinary owner's exact edge"
-        );
-        let table_owner_edges: Vec<_> = closing
-            .prerequisites()
-            .iter()
-            .filter(|row| {
-                row.object.class == "pg_shdepend"
-                    && row.object.name == ["o"]
-                    && row.object.signature.first().is_some_and(|subject| {
-                        subject.class == "pg_class" && subject.name == [cases::SCHEMA, "u"]
-                    })
-            })
-            .collect();
-        assert_eq!(table_owner_edges.len(), 1);
-        let role = &table_owner_edges[0].object.signature[1];
-        assert_eq!(role.class, "pg_authid");
-        assert_eq!(role.name, ["pbps_native_alt"]);
-        assert_eq!(
-            catalog_owner_dependency("index-ix").await,
-            ("pbps_native_alt".into(), 0, 0),
-            "the rebuilt index inherits its ordinary table owner without an owner edge"
-        );
-        let index_owner_edges: Vec<_> = closing
-            .prerequisites()
-            .iter()
-            .filter(|row| {
-                row.object.class == "pg_shdepend"
-                    && row.object.name == ["o"]
-                    && row.object.signature.first().is_some_and(|subject| {
-                        subject.class == "pg_class" && subject.name == [cases::SCHEMA, "ix"]
-                    })
-            })
-            .collect();
-        assert!(
-            index_owner_edges.is_empty(),
-            "the sealed closing index cannot invent an owner edge: {index_owner_edges:?}"
+            "the in-place rename keeps the other role's ownership"
         );
     }
     let selected =
@@ -1770,7 +1744,7 @@ async fn the_supplied_recorded_table_and_column_uids_survive_rename_with_depende
 
 #[tokio::test]
 #[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
-async fn recorded_rename_retains_the_ordinary_table_owner_dependency() {
+async fn recorded_rename_of_a_table_owned_by_another_role_closes_on_the_actual_catalog() {
     recorded_rename_case(Profile::Container, false, true).await;
 }
 
@@ -1787,18 +1761,15 @@ async fn the_supplied_rebuilt_routine_with_explicit_public_execution_matches_the
 }
 
 /// A binding-induced routine rebuild must replay only the declared role
-/// grants. The fixture carries both an ordinary role (with an ACL shared
-/// dependency) and the pinned pg_monitor role (without that dependency).
-async fn rebuilt_routine_role_acl_case(grant_option: bool) {
+/// grants, for an ordinary role and for the pinned pg_monitor role. A grant
+/// option the declarations cannot restore is the ordinary rebuild guard's
+/// refusal (`modules::before_a_rebuild`), not the producer's.
+async fn rebuilt_routine_role_acl_case() {
     use pbps_db::fingerprint::EnvironmentFingerprintKey;
     use pbps_model::{GrantTarget, Permission, Role};
 
     let mut statements = cases::REPLACEMENT_TARGET_SETUP.to_vec();
-    statements.push(if grant_option {
-        "GRANT EXECUTE ON ROUTINE pbps_evidence1274.a() TO pbps_native_alt WITH GRANT OPTION"
-    } else {
-        "GRANT EXECUTE ON ROUTINE pbps_evidence1274.a() TO pbps_native_alt"
-    });
+    statements.push("GRANT EXECUTE ON ROUTINE pbps_evidence1274.a() TO pbps_native_alt");
     statements.push("GRANT EXECUTE ON ROUTINE pbps_evidence1274.a() TO pg_monitor");
     setup(&statements).await;
     let mut peer = PeerVerifiedConn::connect(
@@ -1853,22 +1824,6 @@ async fn rebuilt_routine_role_acl_case(grant_option: bool) {
         )
         .await;
     close(&mut run, &mut owned).await;
-    if grant_option {
-        let error = match result {
-            Err(error) => error,
-            Ok(_) => panic!("a grant option absent from declarations must refuse sealing"),
-        };
-        assert!(
-            error
-                .to_string()
-                .to_ascii_lowercase()
-                .contains("grant option"),
-            "the refusal identifies the unrepresentable option: {error}"
-        );
-        target.check().await.unwrap();
-        setup(&[]).await;
-        return;
-    }
     let result = result.expect("both declared routine grants can be restored");
     result.evidence.validate(&result.changes).unwrap();
     let created = result
@@ -1936,74 +1891,17 @@ async fn rebuilt_routine_role_acl_case(grant_option: bool) {
         .iter()
         .find(|record| record.object == object.object)
         .expect("the same routine exists after DDL");
-    assert_eq!(
-        object.properties, actual.properties,
-        "final role grants affect proacl"
-    );
+    assert_eq!(object.properties, actual.properties);
     assert_eq!(object.bindings, actual.bindings);
-    // The SQL ACL oracle above cannot prove that the projected dependency
-    // inventory retained the ordinary role's distinct shared edge.
-    let acl_edge = |role: &str| pbps_db::resolver::capture::ObjectIdentity {
-        class: "pg_shdepend".into(),
-        name: vec!["a".into()],
-        signature: vec![
-            object.object.clone(),
-            pbps_db::resolver::capture::ObjectIdentity {
-                class: "pg_authid".into(),
-                name: vec![role.into()],
-                signature: Vec::new(),
-            },
-        ],
-    };
-    let ordinary_edge = acl_edge("pbps_native_alt");
-    let projected: Vec<_> = closing
-        .prerequisites()
-        .iter()
-        .filter(|row| row.object == ordinary_edge)
-        .collect();
-    let captured: Vec<_> = observed
-        .prerequisites()
-        .iter()
-        .filter(|row| row.object == ordinary_edge)
-        .collect();
-    assert_eq!(
-        projected.len(),
-        1,
-        "the projected ordinary ACL edge is exact"
-    );
-    assert_eq!(
-        captured.len(),
-        1,
-        "the fresh target has the ordinary ACL edge"
-    );
-    assert_eq!(projected[0].properties, captured[0].properties);
-    assert_eq!(projected[0].bindings, captured[0].bindings);
-    let pinned_edge = acl_edge("pg_monitor");
-    assert!(
-        closing
-            .prerequisites()
-            .iter()
-            .all(|row| row.object != pinned_edge)
-            && observed
-                .prerequisites()
-                .iter()
-                .all(|row| row.object != pinned_edge),
-        "a pinned role's grant has no shared ACL edge in either inventory"
-    );
+    assert_no_authorization_records(&closing);
     target.check().await.unwrap();
     setup(&[]).await;
 }
 
 #[tokio::test]
 #[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
-async fn rebuilt_routine_replays_declared_grants_and_only_ordinary_role_acl_edges() {
-    rebuilt_routine_role_acl_case(false).await;
-}
-
-#[tokio::test]
-#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
-async fn unrepresentable_routine_grant_option_refuses_before_evidence() {
-    rebuilt_routine_role_acl_case(true).await;
+async fn rebuilt_routine_replays_declared_role_grants() {
+    rebuilt_routine_role_acl_case().await;
 }
 
 /// An unrelated column arrival cannot turn an unchanged routine's opening
@@ -2119,12 +2017,12 @@ async fn an_unaffected_routine_keeps_its_grant_option_through_connected_evidence
     setup(&[]).await;
 }
 
-/// The new routines are created under the target creator's schema defaults,
-/// not the scratch role's defaults. PUBLIC is then revoked by the ordered plan;
-/// the ordinary role's option and shared dependency must survive that revoke.
+/// The new routines are created under the target's schema default privileges,
+/// which scratch does not have. Those ACLs are not binding inputs, so the
+/// closing evidence still equals the actual post-DDL catalog.
 #[tokio::test]
 #[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
-async fn newly_created_routines_project_schema_default_grants_then_public_revoke() {
+async fn newly_created_routines_under_target_default_privileges_close_on_the_actual_catalog() {
     use pbps_db::fingerprint::EnvironmentFingerprintKey;
 
     setup(&[
@@ -2154,7 +2052,7 @@ async fn newly_created_routines_project_schema_default_grants_then_public_revoke
         Ok(result) => result,
         Err(error) => {
             close(&mut run, &mut owned).await;
-            panic!("the target's captured creation defaults must qualify: {error}");
+            panic!("target default privileges must not refuse the plan: {error}");
         }
     };
     close(&mut run, &mut owned).await;
@@ -2222,10 +2120,7 @@ async fn newly_created_routines_project_schema_default_grants_then_public_revoke
             .iter()
             .find(|row| row.object == expected.object)
             .expect("the post-DDL target contains the same routine");
-        assert_eq!(
-            expected.properties, actual.properties,
-            "creation defaults and final grants are both projected"
-        );
+        assert_eq!(expected.properties, actual.properties);
         assert_eq!(expected.bindings, actual.bindings);
     }
     target.check().await.unwrap();
@@ -3540,13 +3435,13 @@ async fn recorded_renames_with_type_and_nullability_edits_match_actual_child_cat
     setup(&[]).await;
 }
 
-/// A newly created routine follows the target connection's effective creator.
-/// A preserved ordinary table owner does not exercise this creation branch.
+/// A routine created by an ordinary deployer is owned by that role on the
+/// target and by the run-local role on scratch. Owners are not binding inputs,
+/// so the closing evidence still equals the actual post-DDL catalog.
 #[tokio::test]
 #[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
-async fn a_new_routine_created_as_an_ordinary_deployer_keeps_its_owner_edge() {
+async fn a_new_routine_created_by_an_ordinary_deployer_closes_on_the_actual_catalog() {
     use pbps_db::fingerprint::EnvironmentFingerprintKey;
-    use pbps_db::resolver::capture::ObjectIdentity;
     use pbps_model::{Module, ModuleKind};
 
     setup(&[
@@ -3654,32 +3549,7 @@ async fn a_new_routine_created_as_an_ordinary_deployer_keeps_its_owner_edge() {
             if id.to_string() == "pbps_evidence1274.a()")
     }));
     let closing = result.evidence.after().clone();
-    let routine = ObjectIdentity {
-        class: "pg_proc".into(),
-        name: vec![cases::SCHEMA.into(), "a".into()],
-        signature: Vec::new(),
-    };
-    let owner_edge = ObjectIdentity {
-        class: "pg_shdepend".into(),
-        name: vec!["o".into()],
-        signature: vec![
-            routine.clone(),
-            ObjectIdentity {
-                class: "pg_authid".into(),
-                name: vec!["pbps_native_alt".into()],
-                signature: Vec::new(),
-            },
-        ],
-    };
-    assert_eq!(
-        closing
-            .prerequisites()
-            .iter()
-            .filter(|row| row.object == owner_edge)
-            .count(),
-        1,
-        "the projected new routine has its ordinary creator's exact owner edge"
-    );
+    assert_no_authorization_records(&closing);
     let mut writer = pbps_db::Conn::connect(
         Driver::Postgres,
         &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
@@ -3700,7 +3570,7 @@ async fn a_new_routine_created_as_an_ordinary_deployer_keeps_its_owner_edge() {
     assert_eq!(
         catalog_owner_dependency("routine-a").await,
         ("pbps_native_alt".into(), 1, 1),
-        "actual creation as the ordinary deployer records one owner edge"
+        "actual creation is owned by the ordinary deployer"
     );
     let selected = EnvironmentFingerprintKey::from_file(&key.root.join("key")).unwrap();
     let (_, observed) = target
@@ -4450,684 +4320,6 @@ async fn adding_index_keeps_existing_table_metadata_and_sets_the_engine_index_fl
 }
 
 #[derive(Clone, Copy)]
-enum GrantorRoute {
-    DirectWithInheritedOwner,
-    UniqueInheritedDelegate,
-    RevokeBesideOwnerGrant,
-}
-
-/// These roles and the schema live only in the runner's disposable target.
-/// The actor's prior catalog-read membership is restored after each case.
-async fn grantor_route_case(route: GrantorRoute) {
-    use pbps_db::resolver::capture::ObjectIdentity;
-    use pbps_model::{GrantTarget, Permission, Role};
-
-    const OWNER: &str = "pbps_1274_grant_owner";
-    const DELEGATE: &str = "pbps_1274_grant_delegate";
-    const OTHER: &str = "pbps_1274_grant_other";
-    const ACTOR: &str = "pbps_native_alt";
-    const READER: &str = "pg_monitor";
-    let inherited = matches!(route, GrantorRoute::UniqueInheritedDelegate);
-    let revoke = matches!(route, GrantorRoute::RevokeBesideOwnerGrant);
-    let selected_grantor = if inherited { DELEGATE } else { ACTOR };
-
-    setup(&[
-        "CREATE SCHEMA pbps_evidence1274",
-        "CREATE TABLE pbps_evidence1274.t (n integer NOT NULL)",
-    ])
-    .await;
-    let mut admin = PeerVerifiedConn::connect(
-        Driver::Postgres,
-        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
-    )
-    .await
-    .unwrap();
-    let present = admin
-        .query(
-            "SELECT count(*)::int8 AS n FROM pg_catalog.pg_roles \
-             WHERE rolname IN ('pbps_1274_grant_owner', 'pbps_1274_grant_delegate', \
-                               'pbps_1274_grant_other')",
-        )
-        .await
-        .unwrap();
-    assert_eq!(present[0].try_get::<i64>("n").unwrap(), Some(0));
-    admin
-        .query("CREATE ROLE pbps_1274_grant_owner")
-        .await
-        .unwrap();
-    admin
-        .query("CREATE ROLE pbps_1274_grant_other")
-        .await
-        .unwrap();
-    if inherited {
-        admin
-            .query("CREATE ROLE pbps_1274_grant_delegate")
-            .await
-            .unwrap();
-    }
-    let settings_membership_sql = concat!(
-        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members m ",
-        "JOIN pg_catalog.pg_roles granted ON granted.oid = m.roleid ",
-        "JOIN pg_catalog.pg_roles member ON member.oid = m.member ",
-        "WHERE granted.rolname = 'pg_read_all_settings' ",
-        "AND member.rolname = 'pbps_native_alt') AS member"
-    );
-    let prior = admin.query(settings_membership_sql).await.unwrap();
-    assert_eq!(prior.len(), 1);
-    let had_settings = prior[0].try_get::<bool>("member").unwrap().unwrap();
-    if !had_settings {
-        admin
-            .query("GRANT pg_read_all_settings TO pbps_native_alt")
-            .await
-            .unwrap();
-    }
-    admin
-        .query(
-            "GRANT USAGE, CREATE ON SCHEMA pbps_evidence1274 \
-             TO pbps_native_alt, pbps_1274_grant_owner",
-        )
-        .await
-        .unwrap();
-    admin
-        .query("ALTER TABLE pbps_evidence1274.t OWNER TO pbps_1274_grant_owner")
-        .await
-        .unwrap();
-    admin
-        .query("GRANT SELECT ON pbps_evidence1274.t TO pbps_1274_grant_other")
-        .await
-        .unwrap();
-    if inherited {
-        admin
-            .query(
-                "GRANT SELECT ON pbps_evidence1274.t \
-                 TO pbps_1274_grant_delegate WITH GRANT OPTION",
-            )
-            .await
-            .unwrap();
-        admin
-            .query("GRANT pbps_1274_grant_delegate TO pbps_native_alt")
-            .await
-            .unwrap();
-    } else {
-        if matches!(route, GrantorRoute::DirectWithInheritedOwner) {
-            admin
-                .query("GRANT pbps_1274_grant_owner TO pbps_native_alt")
-                .await
-                .unwrap();
-        }
-        admin
-            .query(
-                "GRANT SELECT ON pbps_evidence1274.t \
-                 TO pbps_native_alt WITH GRANT OPTION",
-            )
-            .await
-            .unwrap();
-    }
-    let inherited_option = admin
-        .query(if inherited {
-            "SELECT pg_catalog.pg_has_role('pbps_native_alt'::regrole, \
-             'pbps_1274_grant_delegate'::regrole, 'USAGE') AS inherited"
-        } else {
-            "SELECT pg_catalog.pg_has_role('pbps_native_alt'::regrole, \
-             'pbps_1274_grant_owner'::regrole, 'USAGE') AS inherited"
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        inherited_option[0].try_get::<bool>("inherited").unwrap(),
-        Some(!revoke),
-        "the actor's measured inherited route is actually usable"
-    );
-    if revoke {
-        // The same grantee/privilege has two original grantors. The actor's
-        // later REVOKE cannot erase the owner's independently granted row.
-        admin
-            .query("GRANT SELECT ON pbps_evidence1274.t TO pg_monitor")
-            .await
-            .unwrap();
-        admin.query("SET ROLE pbps_native_alt").await.unwrap();
-        admin
-            .query("GRANT SELECT ON pbps_evidence1274.t TO pg_monitor")
-            .await
-            .unwrap();
-        admin.query("RESET ROLE").await.unwrap();
-        let opening = admin
-            .query(
-                "SELECT pg_catalog.pg_get_userbyid(a.grantor)::text AS grantor, \
-                        a.is_grantable AS grant_option \
-                 FROM pg_catalog.pg_class t \
-                 CROSS JOIN LATERAL pg_catalog.aclexplode(t.relacl) a \
-                 WHERE t.oid = 'pbps_evidence1274.t'::regclass \
-                   AND a.grantee = 'pg_monitor'::regrole \
-                   AND a.privilege_type = 'SELECT'",
-            )
-            .await
-            .unwrap();
-        let mut grantors = opening
-            .iter()
-            .map(|row| {
-                (
-                    row.try_get::<&str>("grantor").unwrap().unwrap().to_owned(),
-                    row.try_get::<bool>("grant_option").unwrap().unwrap(),
-                )
-            })
-            .collect::<Vec<_>>();
-        grantors.sort();
-        let mut expected = vec![(ACTOR.to_owned(), false), (OWNER.to_owned(), false)];
-        expected.sort();
-        assert_eq!(grantors, expected);
-    }
-    drop(admin);
-
-    // Admission and its first fresh read bind this same ordinary actor. A
-    // separate observer's SET ROLE would not establish the grantor context.
-    let mut peer = PeerVerifiedConn::connect(
-        Driver::Postgres,
-        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
-    )
-    .await
-    .unwrap();
-    peer.query("SET ROLE pbps_native_alt").await.unwrap();
-    let principal = peer
-        .query(
-            "SELECT current_user::text AS effective, \
-             pg_catalog.current_setting('is_superuser') AS superuser",
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        principal[0].try_get::<&str>("effective").unwrap(),
-        Some(ACTOR)
-    );
-    assert_eq!(
-        principal[0].try_get::<&str>("superuser").unwrap(),
-        Some("off")
-    );
-    let mut target = NativeTarget::establish(
-        peer,
-        std::env::var("PBPS_NATIVE_SERVICE_PID")
-            .unwrap()
-            .parse()
-            .unwrap(),
-    )
-    .await
-    .unwrap();
-    let table_name: pbps_model::TableName = "pbps_evidence1274.t".parse().unwrap();
-    let grant_target: GrantTarget = "pbps_evidence1274.t".parse().unwrap();
-    let mut base = Schema::default();
-    base.tables.insert(table_name.clone(), review_table());
-    for role in [OWNER, OTHER, ACTOR, READER] {
-        base.roles.insert(role.into(), Role::default());
-    }
-    if inherited {
-        base.roles.insert(DELEGATE.into(), Role::default());
-    }
-    let declared_select = BTreeSet::from([Permission::Select]);
-    base.roles
-        .get_mut(OTHER)
-        .unwrap()
-        .grants
-        .insert(grant_target.clone(), declared_select.clone());
-    if revoke {
-        base.roles
-            .get_mut(READER)
-            .unwrap()
-            .grants
-            .insert(grant_target.clone(), declared_select.clone());
-    }
-    let mut desired = base.clone();
-    if revoke {
-        desired.roles.get_mut(READER).unwrap().grants.clear();
-    } else {
-        desired
-            .roles
-            .get_mut(READER)
-            .unwrap()
-            .grants
-            .insert(grant_target.clone(), declared_select.clone());
-    }
-    let inputs = Inputs::from_pair((base, desired));
-    let key = ProjectKey::new(true);
-    let mut owned = Some(ObservedContainers::begin());
-    let mut run = open(Profile::Container, &mut target).await;
-    let result = review_plan(&mut target, &mut run, &mut owned, &inputs, &key).await;
-    assert!(
-        result
-            .changes
-            .changes
-            .iter()
-            .any(|step| match &step.change {
-                Change::Grant {
-                    role,
-                    target,
-                    permissions,
-                } if !revoke => {
-                    role == READER && target == &grant_target && permissions == &declared_select
-                }
-                Change::Revoke {
-                    role,
-                    target,
-                    permissions,
-                } if revoke => {
-                    role == READER && target == &grant_target && permissions == &declared_select
-                }
-                Change::CreateTable { .. }
-                | Change::DropTable { .. }
-                | Change::RenameTable { .. }
-                | Change::AddColumn { .. }
-                | Change::DropColumn { .. }
-                | Change::RenameColumn { .. }
-                | Change::AlterColumnType { .. }
-                | Change::AlterColumnNullability { .. }
-                | Change::AlterColumnDefault { .. }
-                | Change::AlterColumnExpression { .. }
-                | Change::SetColumnDeprecated { .. }
-                | Change::SetPrimaryKey { .. }
-                | Change::AddUnique { .. }
-                | Change::DropUnique { .. }
-                | Change::AddForeignKey { .. }
-                | Change::DropForeignKey { .. }
-                | Change::AddCheck { .. }
-                | Change::DropCheck { .. }
-                | Change::AddIndex { .. }
-                | Change::DropIndex { .. }
-                | Change::InsertRow { .. }
-                | Change::UpdateRow { .. }
-                | Change::DeleteRow { .. }
-                | Change::SetDataMode { .. }
-                | Change::CreateModule { .. }
-                | Change::AlterModule { .. }
-                | Change::DropModule { .. }
-                | Change::CreateRole { .. }
-                | Change::DropRole { .. }
-                | Change::RenameRole { .. }
-                | Change::Grant { .. }
-                | Change::Revoke { .. }
-                | Change::PublicExecution { .. } => false,
-            })
-    );
-    let closing = result.evidence.after().clone();
-    let mut writer = pbps_db::Conn::connect(
-        Driver::Postgres,
-        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
-    )
-    .await
-    .unwrap();
-    writer.execute("SET ROLE pbps_native_alt").await.unwrap();
-    execute_plan(&mut writer, &result.changes).await;
-    drop(writer);
-    let mut observer = PeerVerifiedConn::connect(
-        Driver::Postgres,
-        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
-    )
-    .await
-    .unwrap();
-    let acl = observer
-        .query(
-            "SELECT pg_catalog.pg_get_userbyid(a.grantee)::text AS grantee, \
-                    pg_catalog.pg_get_userbyid(a.grantor)::text AS grantor, \
-                    a.is_grantable AS grant_option \
-             FROM pg_catalog.pg_class t \
-             CROSS JOIN LATERAL pg_catalog.aclexplode(t.relacl) a \
-             WHERE t.oid = 'pbps_evidence1274.t'::regclass \
-               AND a.privilege_type = 'SELECT' \
-               AND a.grantee IN ('pg_monitor'::regrole, \
-                                 'pbps_1274_grant_other'::regrole)",
-        )
-        .await
-        .unwrap();
-    let entries: Vec<_> = acl
-        .iter()
-        .map(|row| {
-            (
-                row.try_get::<&str>("grantee").unwrap().unwrap().to_owned(),
-                row.try_get::<&str>("grantor").unwrap().unwrap().to_owned(),
-                row.try_get::<bool>("grant_option").unwrap().unwrap(),
-            )
-        })
-        .collect();
-    assert_eq!(
-        entries
-            .iter()
-            .filter(|entry| entry.0 == OTHER && entry.1 == OWNER && !entry.2)
-            .count(),
-        1,
-        "the unrelated owner's exact ACL row survives the typed step"
-    );
-    let reader: Vec<_> = entries.iter().filter(|entry| entry.0 == READER).collect();
-    if revoke {
-        assert_eq!(reader.len(), 1, "only the actor's ACL row is revoked");
-        assert_eq!(reader[0].1, OWNER, "the owner's same-grantee row survives");
-        assert!(!reader[0].2, "the owner's grant option stays absent");
-    } else {
-        assert_eq!(reader.len(), 1);
-        assert_eq!(reader[0].1, selected_grantor);
-        assert!(!reader[0].2, "the typed GRANT adds no grant option");
-    }
-    drop(observer);
-    let observed = assert_review_closing_matches_target(&mut target, &closing, &key).await;
-    let table_id = ObjectIdentity {
-        class: "pg_class".into(),
-        name: vec![cases::SCHEMA.into(), "t".into()],
-        signature: Vec::new(),
-    };
-    let dependencies = |manifest: &pbps_model::resolver::InputManifest| {
-        manifest
-            .prerequisites()
-            .iter()
-            .filter(|row| {
-                row.object.class == "pg_shdepend" && row.object.signature.first() == Some(&table_id)
-            })
-            .map(|row| row.object.clone())
-            .collect::<BTreeSet<_>>()
-    };
-    assert!(!dependencies(&closing).is_empty());
-    assert_eq!(
-        dependencies(&closing),
-        dependencies(&observed),
-        "the projected owner/ACL shared dependencies equal the fresh post-DDL catalog"
-    );
-    target.check().await.unwrap();
-    drop(target);
-    setup(&[]).await;
-    let mut admin = PeerVerifiedConn::connect(
-        Driver::Postgres,
-        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
-    )
-    .await
-    .unwrap();
-    if inherited {
-        admin
-            .query("REVOKE pbps_1274_grant_delegate FROM pbps_native_alt")
-            .await
-            .unwrap();
-    } else if matches!(route, GrantorRoute::DirectWithInheritedOwner) {
-        admin
-            .query("REVOKE pbps_1274_grant_owner FROM pbps_native_alt")
-            .await
-            .unwrap();
-    }
-    if !had_settings {
-        admin
-            .query("REVOKE pg_read_all_settings FROM pbps_native_alt")
-            .await
-            .unwrap();
-    }
-    if inherited {
-        admin
-            .query("DROP ROLE pbps_1274_grant_delegate")
-            .await
-            .unwrap();
-    }
-    admin
-        .query("DROP ROLE pbps_1274_grant_other")
-        .await
-        .unwrap();
-    admin
-        .query("DROP ROLE pbps_1274_grant_owner")
-        .await
-        .unwrap();
-    let restored = admin.query(settings_membership_sql).await.unwrap();
-    assert_eq!(
-        restored[0].try_get::<bool>("member").unwrap(),
-        Some(had_settings)
-    );
-    let absent = admin
-        .query(
-            "SELECT count(*)::int8 AS n FROM pg_catalog.pg_roles \
-             WHERE rolname IN ('pbps_1274_grant_owner', 'pbps_1274_grant_delegate', \
-                               'pbps_1274_grant_other')",
-        )
-        .await
-        .unwrap();
-    assert_eq!(absent[0].try_get::<i64>("n").unwrap(), Some(0));
-}
-
-#[tokio::test]
-#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
-async fn direct_actor_option_beats_inherited_owner_for_retained_table_grant() {
-    grantor_route_case(GrantorRoute::DirectWithInheritedOwner).await;
-}
-
-#[tokio::test]
-#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
-async fn unique_inherited_delegate_is_the_retained_table_grantor() {
-    grantor_route_case(GrantorRoute::UniqueInheritedDelegate).await;
-}
-
-#[tokio::test]
-#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
-async fn revoke_by_actor_keeps_an_unrelated_owners_grant_row() {
-    grantor_route_case(GrantorRoute::RevokeBesideOwnerGrant).await;
-}
-
-#[tokio::test]
-#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
-async fn competing_inherited_grant_options_refuse_before_publishing_evidence() {
-    use pbps_model::{GrantTarget, Permission, Role};
-
-    const ACTOR: &str = "pbps_native_alt";
-    const FIRST: &str = "pbps_1274_grant_z";
-    const SECOND: &str = "pbps_1274_grant_a";
-    const READER: &str = "pg_monitor";
-    setup(&[
-        "CREATE SCHEMA pbps_evidence1274",
-        "CREATE TABLE pbps_evidence1274.t (n integer NOT NULL)",
-    ])
-    .await;
-    let mut admin = PeerVerifiedConn::connect(
-        Driver::Postgres,
-        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
-    )
-    .await
-    .unwrap();
-    let present = admin
-        .query(
-            "SELECT count(*)::int8 AS n FROM pg_catalog.pg_roles \
-         WHERE rolname IN ('pbps_1274_grant_z', 'pbps_1274_grant_a')",
-        )
-        .await
-        .unwrap();
-    assert_eq!(present[0].try_get::<i64>("n").unwrap(), Some(0));
-    // Creation and membership orders disagree with names; neither order is
-    // promised as PostgreSQL's chosen grantor (DEC-483).
-    admin.query("CREATE ROLE pbps_1274_grant_z").await.unwrap();
-    admin.query("CREATE ROLE pbps_1274_grant_a").await.unwrap();
-    let settings_membership_sql = concat!(
-        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members m ",
-        "JOIN pg_catalog.pg_roles granted ON granted.oid = m.roleid ",
-        "JOIN pg_catalog.pg_roles member ON member.oid = m.member ",
-        "WHERE granted.rolname = 'pg_read_all_settings' ",
-        "AND member.rolname = 'pbps_native_alt') AS member"
-    );
-    let prior = admin.query(settings_membership_sql).await.unwrap();
-    let had_settings = prior[0].try_get::<bool>("member").unwrap().unwrap();
-    if !had_settings {
-        admin
-            .query("GRANT pg_read_all_settings TO pbps_native_alt")
-            .await
-            .unwrap();
-    }
-    admin
-        .query("GRANT USAGE, CREATE ON SCHEMA pbps_evidence1274 TO pbps_native_alt")
-        .await
-        .unwrap();
-    admin
-        .query(
-            "GRANT SELECT ON pbps_evidence1274.t \
-         TO pbps_1274_grant_z, pbps_1274_grant_a WITH GRANT OPTION",
-        )
-        .await
-        .unwrap();
-    admin
-        .query("GRANT pbps_1274_grant_a TO pbps_native_alt")
-        .await
-        .unwrap();
-    admin
-        .query("GRANT pbps_1274_grant_z TO pbps_native_alt")
-        .await
-        .unwrap();
-    let options = admin
-        .query(
-            "SELECT count(*)::int8 AS n FROM pg_catalog.pg_class t \
-         CROSS JOIN LATERAL pg_catalog.aclexplode(t.relacl) a \
-         WHERE t.oid = 'pbps_evidence1274.t'::regclass \
-           AND a.grantee IN ('pbps_1274_grant_z'::regrole, \
-                             'pbps_1274_grant_a'::regrole) \
-           AND a.privilege_type = 'SELECT' AND a.is_grantable",
-        )
-        .await
-        .unwrap();
-    assert_eq!(options[0].try_get::<i64>("n").unwrap(), Some(2));
-    for role in [FIRST, SECOND] {
-        let inherited = admin
-            .query(&format!(
-                "SELECT pg_catalog.pg_has_role('pbps_native_alt'::regrole, \
-             '{role}'::regrole, 'USAGE') AS inherited"
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            inherited[0].try_get::<bool>("inherited").unwrap(),
-            Some(true)
-        );
-    }
-    drop(admin);
-
-    let mut peer = PeerVerifiedConn::connect(
-        Driver::Postgres,
-        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
-    )
-    .await
-    .unwrap();
-    peer.query("SET ROLE pbps_native_alt").await.unwrap();
-    let principal = peer
-        .query(
-            "SELECT current_user::text AS effective, \
-         pg_catalog.current_setting('is_superuser') AS superuser",
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        principal[0].try_get::<&str>("effective").unwrap(),
-        Some(ACTOR)
-    );
-    assert_eq!(
-        principal[0].try_get::<&str>("superuser").unwrap(),
-        Some("off")
-    );
-    let mut target = NativeTarget::establish(
-        peer,
-        std::env::var("PBPS_NATIVE_SERVICE_PID")
-            .unwrap()
-            .parse()
-            .unwrap(),
-    )
-    .await
-    .unwrap();
-    let mut base = Schema::default();
-    base.tables
-        .insert("pbps_evidence1274.t".parse().unwrap(), review_table());
-    for role in [ACTOR, FIRST, SECOND, READER] {
-        base.roles.insert(role.into(), Role::default());
-    }
-    let mut desired = base.clone();
-    let grant_target: GrantTarget = "pbps_evidence1274.t".parse().unwrap();
-    desired
-        .roles
-        .get_mut(READER)
-        .unwrap()
-        .grants
-        .insert(grant_target, BTreeSet::from([Permission::Select]));
-    let inputs = Inputs::from_pair((base, desired));
-    let key = ProjectKey::new(true);
-    let mut owned = Some(ObservedContainers::begin());
-    let mut run = open(Profile::Container, &mut target).await;
-    let result = run
-        .plan_resolved(
-            &mut target,
-            &inputs.binding(),
-            inputs.base(),
-            inputs.desired(),
-            &inputs.hints,
-            &[],
-            &key.project,
-            Some(ENVIRONMENT),
-        )
-        .await;
-    close(&mut run, &mut owned).await;
-    drop(target);
-    let refusal = match result {
-        Err(Error::Binding(message)) => message,
-        Err(error) => format!("unexpected refusal: {error}"),
-        Ok(_) => "unexpected producer success".into(),
-    };
-    let mut observer = PeerVerifiedConn::connect(
-        Driver::Postgres,
-        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
-    )
-    .await
-    .unwrap();
-    let reader_acl = observer
-        .query(
-            "SELECT count(*)::int8 AS n FROM pg_catalog.pg_class t \
-         CROSS JOIN LATERAL pg_catalog.aclexplode(t.relacl) a \
-         WHERE t.oid = 'pbps_evidence1274.t'::regclass \
-           AND a.grantee = 'pg_monitor'::regrole \
-           AND a.privilege_type = 'SELECT'",
-        )
-        .await
-        .unwrap();
-    let reader_rows = reader_acl[0].try_get::<i64>("n").unwrap();
-    drop(observer);
-    setup(&[]).await;
-    let mut admin = PeerVerifiedConn::connect(
-        Driver::Postgres,
-        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
-    )
-    .await
-    .unwrap();
-    admin
-        .query("REVOKE pbps_1274_grant_a FROM pbps_native_alt")
-        .await
-        .unwrap();
-    admin
-        .query("REVOKE pbps_1274_grant_z FROM pbps_native_alt")
-        .await
-        .unwrap();
-    if !had_settings {
-        admin
-            .query("REVOKE pg_read_all_settings FROM pbps_native_alt")
-            .await
-            .unwrap();
-    }
-    admin.query("DROP ROLE pbps_1274_grant_a").await.unwrap();
-    admin.query("DROP ROLE pbps_1274_grant_z").await.unwrap();
-    let restored = admin.query(settings_membership_sql).await.unwrap();
-    assert_eq!(
-        restored[0].try_get::<bool>("member").unwrap(),
-        Some(had_settings)
-    );
-    let absent = admin
-        .query(
-            "SELECT count(*)::int8 AS n FROM pg_catalog.pg_roles \
-         WHERE rolname IN ('pbps_1274_grant_z', 'pbps_1274_grant_a')",
-        )
-        .await
-        .unwrap();
-    assert_eq!(absent[0].try_get::<i64>("n").unwrap(), Some(0));
-    assert_eq!(
-        reader_rows,
-        Some(0),
-        "refusal left the target ACL unchanged"
-    );
-    assert!(
-        refusal.contains("final compiled catalog manifest"),
-        "two inherited candidates must refuse before evidence: {refusal}"
-    );
-}
-
-#[derive(Clone, Copy)]
 enum SchemaGrantorRoute {
     DirectOverInheritedOwner,
     WholeStatementInheritedDelegate,
@@ -5653,20 +4845,15 @@ async fn generation_producer_case(case: GenerationCase) {
         let selected = EnvironmentFingerprintKey::from_file(&key.root.join("key"))
             .map_err(|error| error.to_string())?;
         // Reread every projected prerequisite, including inputs no longer reached
-        // by the closing bindings. Address rows come from rooted subjects because
-        // the capture index excludes these address-only catalog classes.
+        // by the closing bindings. Dependency rows come from rooted subjects
+        // because the capture index excludes that address-only catalog class.
         let mut closing_scope = catalog_scope(evidence.after().scope());
         closing_scope.retained.extend(
             evidence
                 .after()
                 .prerequisites()
                 .iter()
-                .filter(|record| {
-                    !matches!(
-                        record.object.class.as_str(),
-                        "pg_depend" | "pg_shdepend" | "pg_init_privs"
-                    )
-                })
+                .filter(|record| record.object.class != "pg_depend")
                 .map(|record| record.object.clone()),
         );
         let (_, observed) = target

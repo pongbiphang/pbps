@@ -351,16 +351,53 @@ async fn exercise_capture(connection: String) {
         ),
         "type modifier output must qualify even without a constant"
     );
-    conn.execute("REVOKE ALL ON SCHEMA app FROM postgres")
+    // Owners and ACLs do not change what a creation binds (DEC-1274.1), so
+    // they are not prerequisites. Revoking EXECUTE on a candidate overload,
+    // granting on a referenced table and moving its owner leave the capture
+    // equal; the deployer's effective schema privileges are the separate
+    // authorization condition.
+    let token = crate::catalog::probe_token().replace('-', "_");
+    let other = format!("pbps_1274_owner_{token}");
+    // The role itself is part of the role inventory, so it exists first.
+    conn.execute(&format!(
+        "CREATE ROLE {other}; \
+         CREATE FUNCTION app.acl_probe(integer) RETURNS integer LANGUAGE SQL RETURN $1 + 1"
+    ))
+    .await
+    .unwrap();
+    let before_authorization = capture(&mut conn, &scope).await.unwrap();
+    conn.execute(&format!(
+        "REVOKE ALL ON SCHEMA app FROM postgres; \
+         REVOKE EXECUTE ON FUNCTION app.acl_probe(integer) FROM PUBLIC; \
+         GRANT SELECT ON app.t TO {other} WITH GRANT OPTION; \
+         ALTER TABLE app.t OWNER TO {other}; \
+         ALTER FUNCTION app.acl_probe(integer) OWNER TO {other}"
+    ))
+    .await
+    .unwrap();
+    let (_, changes) = recapture(&mut conn, &before_authorization).await.unwrap();
+    // Control: a binding-relevant property of the same objects still counts.
+    conn.execute("ALTER FUNCTION app.acl_probe(integer) STABLE")
         .await
         .unwrap();
-    let (_, changes) = recapture(&mut conn, &original).await.unwrap();
-    assert!(changes.iter().any(|change| {
+    let (_, control) = recapture(&mut conn, &before_authorization).await.unwrap();
+    conn.execute(&format!(
+        "ALTER TABLE app.t OWNER TO postgres; \
+         ALTER FUNCTION app.acl_probe(integer) OWNER TO postgres; \
+         DROP OWNED BY {other}; DROP ROLE {other}"
+    ))
+    .await
+    .unwrap();
+    assert!(
+        changes.is_empty(),
+        "owner and ACL changes are not binding inputs: {changes:?}"
+    );
+    assert!(control.iter().any(|change| {
         change.change == InputChange::Properties
             && change
                 .object
                 .as_ref()
-                .is_some_and(|id| id.class == "pg_namespace" && id.name == ["app"])
+                .is_some_and(|id| id.class == "pg_proc" && id.name == ["app", "acl_probe"])
     }));
 }
 
