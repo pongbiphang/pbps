@@ -1539,7 +1539,8 @@ calls is that function's own, as before.
   or a `NATURAL` join (measured on 18.6, a view and a `BEGIN ATOMIC` body
   expand `*` when created, and a column added later is not theirs); a row
   writing it or taking its default; a change of its table naming it; a foreign
-  key referencing it. A module needs another it names, a view a trigger is on,
+  key referencing it. A module needs another it names, in code or in a literal
+as above, a view a trigger is on,
   an overload of its own name (DECISIONS 212), and what it declares in
   `depends_on:`. A row needs nothing to cross it: a trigger the plan creates
   must not fire on a row written before the modules.
@@ -1566,6 +1567,7 @@ place, so its retype is refused only when the release names one.
 Pinned by `an_addition_naming_no_created_function_keeps_its_place`,
 `a_function_named_only_in_an_oid_alias_literal_is_followed`,
 `a_function_named_only_in_a_comment_is_no_call`,
+`a_module_naming_a_moved_module_in_a_literal_follows_it`,
 `a_column_calling_a_new_function_follows_it_and_its_readers_follow_the_column`,
 `a_view_over_every_column_of_the_table_follows_a_moved_column`,
 `a_declared_dependency_holds_a_module_behind_a_moved_reader`,

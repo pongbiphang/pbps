@@ -1223,7 +1223,8 @@ fn cycle(
 /// - A column added: a module that may read it ([`reads_column`]), a row that
 ///   writes it or takes its default, and another change of its table that
 ///   names it. A module drop and a row delete never need a new column.
-/// - A module created: a module that names it, is attached to it, shares
+/// - A module created: a module that names it, in code or in a literal an
+///   OID-alias type may read (`may_call`), is attached to it, shares
 ///   its name (overloads are ordered by `depends_on:` alone, DECISIONS 212) or
 ///   declares it in `depends_on:`.
 /// - Any other change of a table: a module that names the table, and a change
@@ -1257,7 +1258,7 @@ fn needs(later: &Change, earlier: &Change, deps: &ModuleDeps) -> bool {
                 Change::CreateModule { id, module } | Change::AlterModule { id, module } => {
                     let named = before
                         .referenced_name()
-                        .is_some_and(|n| pbps_pg::generated::may_name(&module.definition, &n.name));
+                        .is_some_and(|n| pbps_pg::generated::may_call(&module.definition, &n.name));
                     let attached = id.attached_to().is_some()
                         && id.attached_to() == before.referenced_name().as_ref();
                     let sibling = id.referenced_name().is_some()
@@ -2164,6 +2165,39 @@ mod tests {
                 &names(&plan(vec![add_column("g", "app.f(1)", true)]))[0],
                 "create app.a_all",
             ]
+        );
+    }
+
+    /// A module naming another only in a literal, as `regprocedure` reads it
+    /// in a `BEGIN ATOMIC` body, still follows it when that one moves after a
+    /// column (DEC-1364.1).
+    #[test]
+    fn a_module_naming_a_moved_module_in_a_literal_follows_it() {
+        let mut cs = plan(vec![
+            add_column("g", "app.z(1)", true),
+            routine("app.a_reader()", "SELECT g FROM app.t LIMIT 1"),
+            Change::CreateModule {
+                id: id("app.b_user()"),
+                module: Box::new(module(
+                    ModuleKind::Function,
+                    "() RETURNS text LANGUAGE sql \
+                     BEGIN ATOMIC SELECT 'app.a_reader()'::regprocedure::text; END",
+                )),
+            },
+            routine("app.z(integer)", "SELECT 1"),
+        ]);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
+        let at =
+            |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
+        let created =
+            |name: &str| at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id(name)));
+        let column = at(&|c| matches!(c, Change::AddColumn { .. }));
+        let order = names(&cs);
+        assert!(created("app.z(integer)") < column, "{order:?}");
+        assert!(column < created("app.a_reader()"), "{order:?}");
+        assert!(
+            created("app.a_reader()") < created("app.b_user()"),
+            "{order:?}"
         );
     }
 
