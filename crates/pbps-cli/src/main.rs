@@ -15,6 +15,7 @@ mod hooks;
 mod init;
 mod integration;
 mod key;
+mod object_order;
 mod output;
 mod pins;
 mod prompt;

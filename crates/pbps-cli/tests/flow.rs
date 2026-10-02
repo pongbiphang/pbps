@@ -18030,6 +18030,280 @@ fn names_one_under_the_collation_are_ordered_or_refused_at_plan() {
     }
 }
 
+/// #1366: the renames whose order only the target's catalog decides, each
+/// ordered by `plan --db` and applied, or refused there with the reason:
+/// - a default adopted under a hand-chosen name, carried away by a move that
+///   has to run before a rename into that name (#1361);
+/// - the generated name a default actually holds, here its fallback, which
+///   frees the other one for a move that has to go first (#1361);
+/// - a move's old name in its new schema, held by a sequence (#1362);
+/// - names the collation reads as one: on `Turkish_100_CI_AS` `A` and `a`
+///   are, `I` and `i` are not;
+/// - a move carrying a generated default into the new schema under its old
+///   name, which a rename into that name has to wait for;
+/// - a name a column rename frees, which runs after every table rename
+///   (DEC-1366.2).
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn renames_only_the_catalog_can_order_apply_or_are_refused_at_plan() {
+    let Ok(server) = std::env::var("PBPS_TEST_DB") else {
+        panic!("PBPS_TEST_DB is not set");
+    };
+    let table = |name: &str, renamed_from: Option<&str>, pk: &str, columns: &str| {
+        let renamed_from = renamed_from.map_or(String::new(), |f| format!("renamed_from: {f}\n"));
+        format!(
+            "table: {name}\n{renamed_from}columns:\n  id: {{type: int, nullable: false}}\n\
+             {columns}primary_key: {{name: {pk}, columns: [id]}}\n"
+        )
+    };
+    let write = |d: &Demo, name: &str, body: Option<String>| {
+        let path = d.dir.join(format!("schema/{name}.yml"));
+        match body {
+            Some(body) => std::fs::write(path, body).unwrap(),
+            None => std::fs::remove_file(path).unwrap(),
+        }
+    };
+    let step = |d: &Demo| {
+        let o = d.run(&["plan"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        d.commit();
+    };
+    let bootstrap = |d: &Demo, connection: &str| {
+        let o = d.run(&["bootstrap", "--db", connection]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+    };
+    let apply = |d: &Demo, connection: &str, what: &str| {
+        let plan = d.dir.join("plan.json");
+        let o = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+        assert_eq!(code(&o), 0, "{what}: {}{}", stdout(&o), stderr(&o));
+        let checksum = plan_checksum(&plan);
+        let o = d.run(&[
+            "apply",
+            "--db",
+            connection,
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+            "--allow",
+            "rename",
+        ]);
+        assert_eq!(code(&o), 0, "{what}: {}{}", stdout(&o), stderr(&o));
+        let o = d.run(&["verify", "--db", connection]);
+        assert_eq!(code(&o), 0, "{what}: {}{}", stdout(&o), stderr(&o));
+        let o = d.run(&["plan", "--db", connection]);
+        assert!(stdout(&o).contains("No changes"), "{what}: {}", stdout(&o));
+    };
+    let refused = |d: &Demo, connection: &str, said: &[&str]| {
+        let o = d.run(&["plan", "--db", connection]);
+        assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        for s in said {
+            assert!(stderr(&o).contains(s), "{s}: {}", stderr(&o));
+        }
+    };
+    let schemas = |connection: &str, names: &[&str]| {
+        for s in names {
+            on_server(connection, &format!("EXEC(N'CREATE SCHEMA {s};');"));
+        }
+    };
+    let ci = "Latin1_General_100_CI_AS";
+    let defaulted = |column: &str| format!("  {column}: {{type: int, default: \"0\"}}\n");
+
+    // An adopted default `c` on `s1.old`, which the move carries to `s2`.
+    {
+        let own = OwnDatabase::collated(&server, "order1366_adopted", ci);
+        schemas(own.connection(), &["s1", "s2"]);
+        let d = Demo::new("order1366-adopted");
+        write(
+            &d,
+            "s1.old",
+            Some(table("s1.old", None, "pk_old", &defaulted("x"))),
+        );
+        write(&d, "s1.a", Some(table("s1.a", None, "pk_a", "")));
+        step(&d);
+        bootstrap(&d, own.connection());
+        on_server(
+            own.connection(),
+            "EXEC sp_rename N's1.DF_pbps_old_x', N'c', N'OBJECT';",
+        );
+        write(&d, "s1.old", None);
+        write(&d, "s1.a", None);
+        write(
+            &d,
+            "s2.new",
+            Some(table("s2.new", Some("s1.old"), "pk_old", &defaulted("x"))),
+        );
+        write(&d, "s1.c", Some(table("s1.c", Some("s1.a"), "pk_a", "")));
+        step(&d);
+        apply(&d, own.connection(), "adopted default");
+    }
+
+    // `z.old`'s default parked at its fallback, `a.other`'s at its generated
+    // name: `a.other` moves into `z.DF_pbps_old_x` first, then `z.old` into
+    // the name `a.other`'s default left.
+    {
+        let own = OwnDatabase::collated(&server, "order1366_parked", ci);
+        schemas(own.connection(), &["z", "a"]);
+        let d = Demo::new("order1366-parked");
+        write(
+            &d,
+            "z.old",
+            Some(table("z.old", None, "pk_old", &defaulted("x"))),
+        );
+        write(
+            &d,
+            "a.other",
+            Some(table("a.other", None, "pk_other", &defaulted("y"))),
+        );
+        step(&d);
+        bootstrap(&d, own.connection());
+        let fallback =
+            pbps_mssql::emit::fallback_default_constraint_name(&"z.old".parse().unwrap(), "x");
+        on_server(
+            own.connection(),
+            &format!("EXEC sp_rename N'z.DF_pbps_old_x', N'{fallback}', N'OBJECT';"),
+        );
+        write(&d, "z.old", None);
+        write(&d, "a.other", None);
+        write(
+            &d,
+            "a.DF_pbps_other_y",
+            Some(table(
+                "a.DF_pbps_other_y",
+                Some("z.old"),
+                "pk_old",
+                &defaulted("x"),
+            )),
+        );
+        write(
+            &d,
+            "z.DF_pbps_old_x",
+            Some(table(
+                "z.DF_pbps_old_x",
+                Some("a.other"),
+                "pk_other",
+                &defaulted("y"),
+            )),
+        );
+        step(&d);
+        apply(&d, own.connection(), "parked default");
+    }
+
+    // A sequence at `s2.old`, where the transfer puts `s1.old` first.
+    {
+        let own = OwnDatabase::collated(&server, "order1366_stop", ci);
+        schemas(own.connection(), &["s1", "s2"]);
+        let d = Demo::new("order1366-stop");
+        write(&d, "s1.old", Some(table("s1.old", None, "pk_old", "")));
+        step(&d);
+        bootstrap(&d, own.connection());
+        on_server(own.connection(), "CREATE SEQUENCE s2.old START WITH 1");
+        write(&d, "s1.old", None);
+        write(
+            &d,
+            "s2.new",
+            Some(table("s2.new", Some("s1.old"), "pk_old", "")),
+        );
+        step(&d);
+        refused(
+            &d,
+            own.connection(),
+            &["`s2.old`: the database already has sequence object `s2.old`"],
+        );
+    }
+
+    // `I -> a` and `A -> i` on a Turkish collation: `A -> i` first.
+    {
+        let own = OwnDatabase::collated(&server, "order1366_turkish", "Turkish_100_CI_AS");
+        let d = Demo::new("order1366-turkish");
+        write(&d, "dbo.I", Some(table("dbo.I", None, "pk_one", "")));
+        write(&d, "dbo.A", Some(table("dbo.A", None, "pk_two", "")));
+        step(&d);
+        bootstrap(&d, own.connection());
+        write(&d, "dbo.I", None);
+        write(&d, "dbo.A", None);
+        write(
+            &d,
+            "dbo.a",
+            Some(table("dbo.a", Some("dbo.I"), "pk_one", "")),
+        );
+        write(
+            &d,
+            "dbo.i",
+            Some(table("dbo.i", Some("dbo.A"), "pk_two", "")),
+        );
+        step(&d);
+        apply(&d, own.connection(), "Turkish pair");
+    }
+
+    // `s3.old`'s default reaches `s2` as `DF_pbps_old_x` and leaves that name
+    // there once the move renames it; `s2.a -> s2.DF_pbps_old_x` waits.
+    {
+        let own = OwnDatabase::collated(&server, "order1366_carried", ci);
+        schemas(own.connection(), &["s2", "s3"]);
+        let d = Demo::new("order1366-carried");
+        write(
+            &d,
+            "s3.old",
+            Some(table("s3.old", None, "pk_old", &defaulted("x"))),
+        );
+        write(&d, "s2.a", Some(table("s2.a", None, "pk_a", "")));
+        step(&d);
+        bootstrap(&d, own.connection());
+        write(&d, "s3.old", None);
+        write(&d, "s2.a", None);
+        write(
+            &d,
+            "s2.new",
+            Some(table("s2.new", Some("s3.old"), "pk_old", &defaulted("x"))),
+        );
+        write(
+            &d,
+            "s2.DF_pbps_old_x",
+            Some(table("s2.DF_pbps_old_x", Some("s2.a"), "pk_a", "")),
+        );
+        step(&d);
+        apply(&d, own.connection(), "carried default");
+    }
+
+    // `dbo.t.old -> new` frees `DF_pbps_t_old` only after every table
+    // rename, so `dbo.a -> dbo.DF_pbps_t_old` is refused with the remedy.
+    {
+        let own = OwnDatabase::collated(&server, "order1366_class", ci);
+        let d = Demo::new("order1366-class");
+        write(
+            &d,
+            "dbo.t",
+            Some(table("dbo.t", None, "pk_t", &defaulted("old"))),
+        );
+        write(&d, "dbo.a", Some(table("dbo.a", None, "pk_a", "")));
+        step(&d);
+        bootstrap(&d, own.connection());
+        write(
+            &d,
+            "dbo.t",
+            Some(table("dbo.t", None, "pk_t", &defaulted("new"))),
+        );
+        let o = d.run(&["rename", "dbo.t.old", "new"]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+        write(&d, "dbo.a", None);
+        write(
+            &d,
+            "dbo.DF_pbps_t_old",
+            Some(table("dbo.DF_pbps_t_old", Some("dbo.a"), "pk_a", "")),
+        );
+        step(&d);
+        refused(
+            &d,
+            own.connection(),
+            &[
+                "which a later change frees: `dbo.t` ~ rename column old -> new",
+                "in a plan of its own",
+            ],
+        );
+    }
+}
+
 /// #981's original case on SQL Server: `s1.old` carries a check `c` into
 /// `s2` while the plan drops the table `s2.c`. The drop runs first
 /// (DEC-536.1), so the transfer is not refused (Msg 15530).

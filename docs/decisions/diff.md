@@ -1243,7 +1243,8 @@ alternative the table does not hold never displaces an exact or a folded
 edge. Any table rename, within its schema too, releases the generated names
 of its old table name and claims those of the new one, as the SQL Server
 emitter renames them. Between two generated alternatives the offline order
-cannot tell which one the table holds; that is the catalog's to say (#1361).
+cannot tell which one the table holds; that is the catalog's to say, and a
+connected plan asks it (#1361, DEC-1366.1).
 The rule is:
 
 - An edge found only this way is added after every exact edge, and only if it
@@ -1394,3 +1395,84 @@ Pinned by `a_tightening_runs_after_the_rows_of_its_table` and
 (`crates/pbps-cli/tests/flow_pg.rs`) and
 `a_tightening_follows_the_rows_that_fill_or_remove_its_nulls_through_the_cli`
 (`crates/pbps-cli/tests/flow.rs`).
+
+<a id="dec-1366-1"></a>
+
+**DEC-1366.1. A connected SQL Server plan orders its table renames from the
+catalog: where the namespace walk refuses the differ's order, the other orders
+of the renames are walked, and the first one it clears is the plan (#1366).**
+The differ orders renames and the drops that free their names from the
+declarations alone (DEC-536.1, DEC-981.3). Some of what decides that order is
+only in the target:
+
+- a default adopted under a hand-chosen name (#1361);
+- which of its generated names a default holds, the generated one or the
+  fallback (DEC-981.1);
+- an object the project does not record, at a target or at the name a
+  transfer passes through (#1362);
+- which spellings the collation reads as one name, which a case fold only
+  guesses: on `Turkish_100_CI_AS`, `A` and `a` are one name and `I` and `i`
+  are two.
+
+Each guess the offline graph gained to cover one of these surfaced the next
+(#1346). The namespace walk already simulates all of them from the catalog
+read (DEC-981.2), but on its own it could only refuse. So connected planning
+asks it for an order rather than a verdict:
+
+- **Only table renames move**, among the drops of classes 2 and 6 and among
+  one another. The drops keep their order, which already puts a foreign key's
+  drop before the key or table it references. A drop claims no name, so no
+  order a rename needs is one the drops would have to give up. Every other
+  change keeps its place, after the renames and drops; so does every class
+  DECISIONS 496 keeps (DEC-1366.2).
+- **A drop on a renamed table is readdressed** to the name its table has where
+  the drop now runs. The address is part of the typed, checksummed change
+  (DECISIONS 496).
+- **The search is depth first**, with the plan's own order tried first, so a
+  plan the walk clears is left exactly as it was. A namespace state reached
+  twice is walked once. A rename that can run is not always the one to run:
+  a default it moves goes to its generated name when that is free and to its
+  fallback otherwise, so running it early can park the default at a name a
+  later rename claims. Only a whole order the walk clears is kept. After
+  20,000 trials the plan is refused, saying another order may exist; the
+  plans pbps meets need tens.
+- **The read covers every order's claims**: the targets, each transfer's
+  intermediate name, and the names a transfer carries each child to, which a
+  second read asks once the first has found the children.
+- **It runs last** among the passes that reorder a connected plan
+  (`order_created_object_names`, after the module and generated-input passes),
+  so the order it settles is the one the later checks read and the one saved.
+  `apply` replays it.
+
+An offline plan keeps the differ's order. It is a preview that is never
+applied (SPEC 7.3), and its guesses stay, since without a catalog they are the
+best order available. PostgreSQL is unchanged: identifiers compare exactly
+there, and the names an index or key holds are declared. A column rename chain
+within a table is still ordered by DEC-981.3's fold.
+
+Pinned by the unit tests in `crates/pbps-cli/src/object_order.rs`, and the
+live `renames_only_the_catalog_can_order_apply_or_are_refused_at_plan`
+(`crates/pbps-cli/tests/flow.rs`).
+
+<a id="dec-1366-2"></a>
+
+**DEC-1366.2. A name that only a change of a later class frees is refused at
+`plan --db`, naming that change and the two-deployment remedy.** A column
+rename (class 3) moves its generated default to the new column's name, so it
+frees the old default name; a table rename (class 1) into that name needs the
+column rename to run first. The classes DECISIONS 496 keeps do not allow that:
+the column rename names its table by the name the table rename gives it.
+Moving one change across the class line for this case would need its own
+reasoning about every other change of both classes. The case is rare enough
+not to justify that, and the plan has a direct remedy.
+
+So the connected walk names the later change that frees a held name. Before
+this, the walk said only that the name was held, and `sp_rename` would have
+failed at apply otherwise. The remedy is to deploy the change that frees the
+name in a plan of its own, then the rest. Two renames that each wait for the
+other, such as a swap, get the same message: no order runs either first.
+
+Pinned by `a_name_only_a_later_class_frees_is_refused_with_its_remedy` and
+`a_swap_is_refused_as_two_changes_waiting_on_each_other`
+(`crates/pbps-cli/src/object_order.rs`), and the live
+`renames_only_the_catalog_can_order_apply_or_are_refused_at_plan`.
