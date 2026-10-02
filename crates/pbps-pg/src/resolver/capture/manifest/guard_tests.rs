@@ -447,10 +447,14 @@ fn a_kept_tables_auto_named_children_keep_the_targets_names() {
     let uid: pbps_model::Uid = "t_000000".parse().unwrap();
     for major in [16, 18] {
         // (opening table, its child spelling, final table, plan sets a key)
-        for (old, children, new, key_change) in [
-            ("old_t", "old_t", "new_t", false),
-            ("t", "older", "t", false),
-            ("old_t", "old_t", "new_t", true),
+        // (opening table, its child spelling, final table, plan sets a key,
+        // plan changes the identity column's type)
+        for (old, children, new, key_change, retyped) in [
+            ("old_t", "old_t", "new_t", false, false),
+            ("t", "older", "t", false, false),
+            ("old_t", "old_t", "new_t", true, false),
+            // A type change keeps the sequence and its name (PG16/18).
+            ("t", "older", "t", false, true),
         ] {
             let old_table = TableName::new("app", old);
             let new_table = TableName::new("app", new);
@@ -497,6 +501,18 @@ fn a_kept_tables_auto_named_children_keep_the_targets_names() {
                     nonclustered: false,
                 });
             }
+            if retyped {
+                steps.push(Change::AlterColumnType {
+                    uid: "c_000000".parse().unwrap(),
+                    column: new_table.column("id"),
+                    from: "integer".parse().unwrap(),
+                    to: "bigint".parse().unwrap(),
+                    from_nullable: false,
+                    to_nullable: false,
+                    from_collation: None,
+                    to_collation: None,
+                });
+            }
             let changes = ChangeSet {
                 changes: steps.into_iter().map(PlannedChange::new).collect(),
             };
@@ -513,7 +529,7 @@ fn a_kept_tables_auto_named_children_keep_the_targets_names() {
                 kept
             };
             let key_name = if key_change { new } else { children };
-            let label = format!("PG{major} {old}->{new} key_change={key_change}");
+            let label = format!("PG{major} {old}->{new} key_change={key_change} retyped={retyped}");
             assert!(
                 names.contains(&kept(&new_key, format!("{key_name}_pkey"))),
                 "{label}"
