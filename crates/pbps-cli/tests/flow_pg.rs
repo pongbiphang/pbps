@@ -1699,9 +1699,10 @@ fn connected_plan(d: &Demo, connection: &str) -> (std::path::PathBuf, String) {
 /// the same plan creates follow its `CREATE FUNCTION`, and a new function
 /// that reads one follows the column, though the differ put it first. A
 /// second generated column calling nothing new stays ahead of the creates,
-/// where a new function reads it. One plan applies (DEC-1364.1). Before, the
-/// columns stayed ahead of the function they call, and the engine refused
-/// them.
+/// where a new function reads it. A default naming the function only inside
+/// a `regprocedure` literal follows it too: the engine resolves that literal.
+/// One plan applies (DEC-1364.1). Before, the columns stayed ahead of the
+/// function they call, and the engine refused them.
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_new_column_calling_a_new_function_follows_its_create() {
@@ -1715,7 +1716,8 @@ fn a_new_column_calling_a_new_function_follows_its_create() {
         &d,
         "  c: {type: integer, generated: {expression: 'app.g(a)', stored: true}}\n  \
          n: {type: integer, default: 'app.g(1)'}\n  \
-         p: {type: integer, generated: {expression: 'a * 3', stored: true}}\n",
+         p: {type: integer, generated: {expression: 'a * 3', stored: true}}\n  \
+         r: {type: text, default: \"('app.g(integer)'::regprocedure)::text\"}\n",
     );
     let (plan, script) = connected_plan(&d, connection);
     let at = |needle: &str| {
@@ -1724,7 +1726,8 @@ fn a_new_column_calling_a_new_function_follows_its_create() {
             .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
     };
     let create = at("CREATE FUNCTION \"app\".\"g\"");
-    for column in ["c", "n"] {
+    // `r` names the function only in a literal its cast resolves.
+    for column in ["c", "n", "r"] {
         assert!(
             create < at(&format!("ADD COLUMN \"{column}\"")),
             "{column}: {script}"

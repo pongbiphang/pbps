@@ -1508,10 +1508,16 @@ a created function was refused by the engine, and the apply rolled back
 **Which functions a text may call** is read the way `creation_order_with`
 reads a module (DECISIONS 315): the function's bare name as a token outside
 literals and comments, by the PostgreSQL lexer (`pbps_pg::generated::may_name`,
-the scan of DEC-1316.1). The schema is not compared, and a column or field of
-the same name counts. A false yes costs a later position. A call the text
-spells is never missed; one made inside another function the text calls is
-that function's own, as before.
+the scan of DEC-1316.1). A word inside a literal counts too
+(`pbps_pg::generated::may_call`). Measured on 18.6, a literal an OID-alias type
+reads names the function to the engine: `'app.f(integer)'::regprocedure`,
+`'app.f'::regproc` and `regprocedure('app.f(integer)')` are refused before the
+function exists, and record a dependency on it after. Without a cast, such a
+literal may be read as a default of a column of that type, or compared with
+one, so every literal counts. The schema is not compared, and a column, field
+or word of the same name counts. A false yes costs a later position. A call
+the text spells is never missed; one made inside another function the text
+calls is that function's own, as before.
 
 - `after_the_rebuilds` moves a check, an index holding an expression, a
   default being set and a changed generation expression only when its text
@@ -1554,6 +1560,7 @@ column order. The other corners on #1350 are not this rule's. A release
 place, so its retype is refused only when the release names one.
 
 Pinned by `an_addition_naming_no_created_function_keeps_its_place`,
+`a_function_named_only_in_an_oid_alias_literal_is_followed`,
 `a_column_calling_a_new_function_follows_it_and_its_readers_follow_the_column`,
 `a_view_over_every_column_of_the_table_follows_a_moved_column`,
 `a_declared_dependency_holds_a_module_behind_a_moved_reader`,

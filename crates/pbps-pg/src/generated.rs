@@ -98,6 +98,21 @@ pub fn may_name(text: &str, name: &str) -> bool {
     crate::impact::mentions(text, name)
 }
 
+/// Whether an expression may call the function named `name`: [`may_name`],
+/// or the name as a word inside a string literal. Measured on 18.6, a literal
+/// an OID-alias type reads (`'app.f(integer)'::regprocedure`, `'app.f'::regproc`,
+/// `regprocedure('app.f(integer)')`) names the function to the engine, which
+/// refuses it before the function exists and records a dependency on it
+/// after. The literal may also be read so without a cast, as a default of
+/// such a column or compared with one, so every literal counts (DEC-1364.1).
+#[must_use]
+pub fn may_call(expression: &str, name: &str) -> bool {
+    may_name(expression, name)
+        || expression
+            .split(|c: char| !pbps_dialect::continues_ident(c))
+            .any(|word| word.eq_ignore_ascii_case(name))
+}
+
 /// Whether a definition may take a table's columns without naming them: a
 /// `*` outside literals and comments, or a `NATURAL` join. Measured on 18.6,
 /// a view over `SELECT *` and a `BEGIN ATOMIC` body expand the star when they
@@ -116,7 +131,19 @@ pub fn may_take_every_column(definition: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{may_name, may_read, may_take_every_column};
+    use super::{may_call, may_name, may_read, may_take_every_column};
+
+    /// A function an OID-alias literal names is a call to the engine, so a
+    /// name inside a literal counts; a longer name still does not
+    /// (DEC-1364.1).
+    #[test]
+    fn a_function_named_inside_a_literal_may_be_called() {
+        assert!(may_call("('app.f(integer)'::regprocedure)::text", "f"));
+        assert!(may_call("'app.f'::regproc", "f"));
+        assert!(may_call("app.f(a)", "f"));
+        assert!(!may_call("'app.ff(integer)'::regprocedure", "f"));
+        assert!(!may_call("a * 2", "f"));
+    }
 
     /// A call is read by the function's bare name, qualified or not, in a
     /// routine's body as in an expression; a literal or a comment is no call

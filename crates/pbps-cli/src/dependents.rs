@@ -790,15 +790,17 @@ fn function_creates(cs: &ChangeSet) -> Vec<(String, usize)> {
 }
 
 /// Whether `text` may call one of `functions`: the function's bare name
-/// occurs in it as code, by the engine's lexer (DEC-1364.1). Which function a
-/// call binds to is not known without parsing it (DECISIONS 174), so a name
-/// in another schema, or a column or field of the same name, counts too. A
-/// false yes costs a later position; a false no would put the call ahead of
-/// the create the engine needs.
+/// occurs in it as code, by the engine's lexer, or as a word inside a literal,
+/// which an OID-alias type such as `regprocedure` resolves to the function
+/// (`pbps_pg::generated::may_call`, DEC-1364.1). Which function a call binds
+/// to is not known without parsing it (DECISIONS 174), so a name in another
+/// schema, or a column, field or word of the same name, counts too. A false
+/// yes costs a later position; a false no would put the call ahead of the
+/// create the engine needs.
 fn calls_one_of(text: &str, functions: &[(String, usize)]) -> bool {
     functions
         .iter()
-        .any(|(name, _)| pbps_pg::generated::may_name(text, name))
+        .any(|(name, _)| pbps_pg::generated::may_call(text, name))
 }
 
 /// The expression text an index holds: its filter and its expression keys.
@@ -1101,7 +1103,7 @@ fn after_their_functions(cs: &mut ChangeSet, deps: &ModuleDeps) -> Result<usize,
         {
             let named: Vec<usize> = functions
                 .iter()
-                .filter(|(name, at)| *at > i && pbps_pg::generated::may_name(text, name))
+                .filter(|(name, at)| *at > i && pbps_pg::generated::may_call(text, name))
                 .map(|(_, at)| *at)
                 .collect();
             if !named.is_empty() {
@@ -2013,8 +2015,8 @@ mod tests {
                 to: "id * 3".into(),
             },
             add_column("h", "id * 2", true),
-            // Data in a literal and a longer name are no call.
-            check_of("ck_literal", "note <> 'app.f(1)' AND app.ff(id) > 0"),
+            // A longer name is no call, in code or in a literal.
+            check_of("ck_longer", "note <> 'app.ff(1)' AND app.ff(id) > 0"),
             alter(&s, "app.f(integer)"),
         ]);
         let before = names(&cs);
@@ -2087,6 +2089,23 @@ mod tests {
             assert_eq!(column("plain"), 0, "{order:?}");
             assert!(created("app.f(integer)") < created("app.z()"), "{order:?}");
         }
+    }
+
+    /// DEC-1364.1: a literal an OID-alias type reads names the function to
+    /// the engine, so a check naming a new function only that way follows its
+    /// create, and so does a column whose default does.
+    #[test]
+    fn a_function_named_only_in_an_oid_alias_literal_is_followed() {
+        let mut cs = plan(vec![
+            add_column("r", "('app.f(integer)'::regprocedure)::text", false),
+            check_of("ck_regproc", "'app.f'::regproc IS NOT NULL"),
+            routine("app.f(integer)", "SELECT 1"),
+        ]);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 2);
+        let order = names(&cs);
+        assert!(order[0].starts_with("create app.f"), "{order:?}");
+        assert!(order[1].starts_with("AddColumn"), "{order:?}");
+        assert_eq!(order[2], "add check ck_regproc", "{order:?}");
     }
 
     /// DEC-1364.1: a view over `*` of the table takes every column when it
