@@ -1097,7 +1097,9 @@ teardown uses the old name, restoration the approved final name, and both keep
 the final owner's strategy. Comparing surface names alone lost these dependent
 rebuilds; PostgreSQL refused the resulting routine drop with `2BP01`.
 
-The expected closing manifest is projected from approved typed changes and
+*Amended by DEC-1274.1: the closing manifest keeps the plan's own records only
+as identity-and-bindings placeholders, not as predicted properties.* The
+expected closing manifest is projected from approved typed changes and
 engine-observed ownership transitions. It preserves untouched external
 properties and changes only the approved objects' properties, candidate
 membership and lookup results; row changes cannot authorize a catalog change.
@@ -1195,12 +1197,7 @@ grantor and shared-dependency edge, including the default privileges applied at
 creation. That was a second implementation of PostgreSQL's permission rules: it
 took most of this issue's commits and review findings, and each round surfaced
 another catalog case to model and measure, such as empty default ACLs (#1304).
-A closing record of a created or rebuilt object is now the compiled scratch
-record, so nothing here predicts an owner, ACL, grantor or shared-dependency
-edge. A retained table keeps its opening properties under the approved column
-order, renames and key changes, for every in-place change: a key, constraint or
-grant keeps the target's physical column order, which can differ from the
-declaration order scratch created. A rebuild that would drop a routine grant
+A rebuild that would drop a routine grant
 option is the ordinary connected rebuild guard's refusal
 (`modules::before_a_rebuild`), not the producer's.
 
@@ -1212,13 +1209,29 @@ self-referencing key included. An internal constraint trigger is identified by
 those three, its name is neither a property nor part of its rendered definition,
 and it belongs to the table surface that owns the constraint.
 
-PostgreSQL names an unnamed primary key and its index, an identity sequence and
-a PostgreSQL 18 NOT NULL constraint after the table and column when it creates
-them, and `ALTER TABLE ... RENAME` keeps those names while renaming the relation
-and its row and array types (measured on 16 and 18). Scratch creates them under
-the final names. For a table the plan keeps, and a child the plan does not
-recreate, the producer takes the target's name before deriving transitions,
-whether the rename is in this plan or an earlier deployment. A column type change
-keeps the sequence and the NOT NULL child with their names; only adding or
-dropping the column recreates them, and a nullability change recreates the NOT
-NULL child under the current spelling.
+The closing manifest does not predict what the plan changes. Scratch reproduces
+only what the declarations say; the target also keeps what they do not: names
+PostgreSQL generated when the table had another name (an unnamed primary key
+and its index, an identity sequence, a PostgreSQL 18 NOT NULL constraint; a
+rename keeps all of them, measured on 16 and 18), its physical column order,
+storage and compression settings, a column's stored missing value, relation
+options. Each review round of this issue found another such property, because
+the projection took the plan's own records from scratch and had to correct them
+one case at a time.
+
+The closing check exists to catch a concurrent change to an input the plan did
+not change, a wrong resulting binding, and an authorization change (ADR-0016
+case 22). So the closing manifest keeps every prerequisite the plan does not
+change with its full fingerprint, and keeps each record the plan installs only
+as a placeholder: identity, ownership and bindings, no property fingerprint
+(`MANAGED_CLOSING`), and only when it carries bindings or a kept record,
+candidate member, runtime limitation or signature lookup names it. Candidate
+membership still adds the plan's own members, which are declared names. An
+installed record nobody names, such as an engine-named key or sequence, is left
+out. Its declared properties are the ordinary managed revalidation's to check
+at apply (DECISIONS 423), and a property no declaration states, such as a
+storage setting, does not change a binding. The reader cannot see the compiled
+records, so it checks the opening side of every transition and that the closing
+manifest is exactly the untouched opening records plus placeholders of
+installed records; the closing-side inventory and ownership checks run when the
+plan is sealed.

@@ -65,6 +65,12 @@ fn required_option<'de, D: serde::Deserializer<'de>, T: serde::Deserialize<'de>>
     <Option<T> as serde::Deserialize>::deserialize(d)
 }
 
+/// A closing record of an object the plan itself installs. Only its identity
+/// and bindings are expected; its properties are the managed revalidation's
+/// to check, so it carries no fingerprint (DEC-1274.1).
+pub const MANAGED_CLOSING: &str = "managed-closing-v1";
+const NO_FINGERPRINT: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
 /// Complete properties under `canonicalization`, including definitions and
 /// literals, reduced by the adapter to an environment-keyed HMAC. Bindings are
 /// logical addresses only. Neither a raw property map nor SQL can be stored here.
@@ -76,6 +82,23 @@ pub struct Prerequisite {
     pub canonicalization: String,
     pub properties: String,
     pub bindings: Vec<Binding>,
+}
+
+impl Prerequisite {
+    /// The closing placeholder of a record the plan installs.
+    pub fn managed_closing(&self) -> Self {
+        Self {
+            object: self.object.clone(),
+            ownership: self.ownership.clone(),
+            canonicalization: MANAGED_CLOSING.into(),
+            properties: NO_FINGERPRINT.into(),
+            bindings: self.bindings.clone(),
+        }
+    }
+
+    pub fn is_managed_closing(&self) -> bool {
+        self.canonicalization == MANAGED_CLOSING
+    }
 }
 
 /// Required, complete catalog input for one coherent observation. Fields have
@@ -256,8 +279,10 @@ impl InputManifest {
             }
         }
         for p in &self.prerequisites {
+            let placeholder =
+                p.canonicalization == MANAGED_CLOSING && p.properties == NO_FINGERPRINT;
             if !identity(&p.object)
-                || p.canonicalization != self.adapter
+                || (p.canonicalization != self.adapter && !placeholder)
                 || !hex(&p.properties, 64)
                 || p.bindings
                     .iter()

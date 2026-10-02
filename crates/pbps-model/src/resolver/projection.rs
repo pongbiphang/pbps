@@ -17,9 +17,16 @@ pub struct ObjectTransition {
 }
 
 impl InputManifest {
-    /// Preserve all untouched prerequisites and change exactly the catalog
-    /// records that the approved plan changes. `compiled` supplies their
-    /// measured desired properties, never SQL to run during apply.
+    /// The closing manifest of an approved plan: every prerequisite the plan
+    /// does not change, unchanged, plus the candidate membership, runtime-bound
+    /// set and signature lookups the plan's own objects add or remove.
+    ///
+    /// A record the plan changes is not predicted (DEC-1274.1). Its declared
+    /// properties are the managed revalidation's to check at apply, and its
+    /// bindings are the sealed surface resolutions'. Scratch cannot reproduce
+    /// what the target keeps undeclared about it: generated names, column
+    /// order, storage settings or a column's stored missing value. `compiled`
+    /// proves the closing inventories and supplies the plan's own members.
     pub fn project(
         &self,
         changes: &ChangeSet,
@@ -33,6 +40,202 @@ impl InputManifest {
         {
             return Err(ManifestError::Invalid);
         }
+        let (removed, installed) = self.check_transitions(changes, Some(compiled), transitions)?;
+        for object in &installed {
+            if compiled
+                .prerequisites()
+                .binary_search_by(|p| p.object.cmp(object))
+                .is_err()
+            {
+                return Err(ManifestError::Incomplete);
+            }
+        }
+        let mut membership = self.membership().to_vec();
+        if membership.len() != compiled.membership().len() {
+            return Err(ManifestError::Incomplete);
+        }
+        for (result, desired) in membership.iter_mut().zip(compiled.membership()) {
+            if result.predicate != desired.predicate {
+                return Err(ManifestError::Incomplete);
+            }
+            result.members.retain(|id| !removed.contains(id));
+            result
+                .members
+                .extend(desired.members.intersection(&installed).cloned());
+        }
+        let mut runtime_bound = self.runtime_bound().clone();
+        runtime_bound.retain(|id| !removed.contains(id));
+        runtime_bound.extend(compiled.runtime_bound().intersection(&installed).cloned());
+        let mut lookups = self.identifications().to_vec();
+        if lookups.len() != compiled.identifications().len() {
+            return Err(ManifestError::Incomplete);
+        }
+        for (result, desired) in lookups.iter_mut().zip(compiled.identifications()) {
+            if (&result.signature, &result.search_path, &result.kind)
+                != (&desired.signature, &desired.search_path, &desired.kind)
+            {
+                return Err(ManifestError::Incomplete);
+            }
+            result.resolved = resolved_lookup(result, desired, &removed, &installed)?;
+        }
+        let source: BTreeMap<_, _> = compiled
+            .prerequisites()
+            .iter()
+            .filter(|p| installed.contains(&p.object))
+            .map(|p| (p.object.clone(), p.managed_closing()))
+            .collect();
+        self.closing(&removed, &source, membership, runtime_bound, lookups)
+    }
+
+    /// The reader's check that `after` is this manifest's closing manifest for
+    /// the plan. Without the compiled capture it proves the opening-side
+    /// authority and that only the plan's own records changed.
+    pub fn closing_matches(
+        &self,
+        changes: &ChangeSet,
+        after: &Self,
+        transitions: &[ObjectTransition],
+    ) -> Result<bool, ManifestError> {
+        let (removed, installed) = self.check_transitions(changes, None, transitions)?;
+        if after.membership().len() != self.membership().len()
+            || after.identifications().len() != self.identifications().len()
+        {
+            return Ok(false);
+        }
+        let mut membership = Vec::new();
+        for (opening, closing) in self.membership().iter().zip(after.membership()) {
+            if opening.predicate != closing.predicate {
+                return Ok(false);
+            }
+            let kept: BTreeSet<_> = opening.members.difference(&removed).cloned().collect();
+            if !kept.is_subset(&closing.members)
+                || !closing
+                    .members
+                    .difference(&kept)
+                    .all(|id| installed.contains(id))
+            {
+                return Ok(false);
+            }
+            membership.push(closing.clone());
+        }
+        let kept: BTreeSet<_> = self.runtime_bound().difference(&removed).cloned().collect();
+        if !kept.is_subset(after.runtime_bound())
+            || !after
+                .runtime_bound()
+                .difference(&kept)
+                .all(|id| installed.contains(id))
+        {
+            return Ok(false);
+        }
+        // A placeholder is only ever a record the plan installs; which ones
+        // the closing manifest must keep follows from its references below.
+        let mut source = BTreeMap::new();
+        for p in after
+            .prerequisites()
+            .iter()
+            .filter(|p| p.is_managed_closing())
+        {
+            // The reader holds no compiled records, but it does hold each
+            // placeholder's ownership: the transition installing it must
+            // authorize that owner, as sealing checked.
+            let owned = transitions.iter().any(|t| {
+                t.after.contains(&p.object) && authorized(changes, t, &p.ownership, false)
+            });
+            if !installed.contains(&p.object) || !owned {
+                return Ok(false);
+            }
+            source.insert(p.object.clone(), p.clone());
+        }
+        let mut lookups = Vec::new();
+        for (opening, closing) in self.identifications().iter().zip(after.identifications()) {
+            if (&opening.signature, &opening.search_path, &opening.kind)
+                != (&closing.signature, &closing.search_path, &closing.kind)
+            {
+                return Ok(false);
+            }
+            let mut lookup = opening.clone();
+            lookup.resolved = resolved_lookup(opening, closing, &removed, &installed)?;
+            lookups.push(lookup);
+        }
+        Ok(&self.closing(
+            &removed,
+            &source,
+            membership,
+            after.runtime_bound().clone(),
+            lookups,
+        )? == after)
+    }
+
+    /// Untouched records as they are, and a placeholder for each installed
+    /// record that carries bindings or that a kept record, member, runtime
+    /// limitation or lookup names. Other installed records, such as engine-
+    /// named keys or sequences, are the managed revalidation's alone.
+    fn closing(
+        &self,
+        removed: &BTreeSet<ObjectIdentity>,
+        installed: &BTreeMap<ObjectIdentity, super::Prerequisite>,
+        membership: Vec<super::Membership>,
+        runtime_bound: BTreeSet<ObjectIdentity>,
+        lookups: Vec<super::RoutineLookup>,
+    ) -> Result<Self, ManifestError> {
+        let mut objects: BTreeMap<_, _> = self
+            .prerequisites()
+            .iter()
+            .map(|p| (p.object.clone(), p.clone()))
+            .collect();
+        for object in removed {
+            if objects.remove(object).is_none() {
+                return Err(ManifestError::Incomplete);
+            }
+        }
+        let mut pending: Vec<ObjectIdentity> = installed
+            .values()
+            .filter(|p| !p.bindings.is_empty())
+            .map(|p| p.object.clone())
+            .chain(
+                objects
+                    .values()
+                    .flat_map(|p| p.bindings.iter().map(|b| b.target.clone())),
+            )
+            .chain(membership.iter().flat_map(|m| m.members.iter().cloned()))
+            .chain(runtime_bound.iter().cloned())
+            .chain(lookups.iter().filter_map(|l| l.resolved.clone()))
+            .chain(self.scope().retained.iter().cloned())
+            .collect();
+        while let Some(object) = pending.pop() {
+            if objects.contains_key(&object) {
+                continue;
+            }
+            let Some(placeholder) = installed.get(&object) else {
+                continue;
+            };
+            pending.extend(placeholder.bindings.iter().map(|b| b.target.clone()));
+            objects.insert(object, placeholder.clone());
+        }
+        Self::new(
+            self.adapter().into(),
+            self.engine_major(),
+            self.key_id().into(),
+            self.scope().clone(),
+            self.baseline().into(),
+            self.session().into(),
+            objects.into_values().collect(),
+            membership,
+            runtime_bound,
+            lookups,
+        )
+    }
+
+    /// Typed authority for every transition: each catalog change has one, and
+    /// each inventoried record is owned by a surface the change affects. The
+    /// closing side needs the compiled records' ownership, so a reader without
+    /// them checks the opening side alone.
+    fn check_transitions(
+        &self,
+        changes: &ChangeSet,
+        compiled: Option<&Self>,
+        transitions: &[ObjectTransition],
+    ) -> Result<(BTreeSet<ObjectIdentity>, BTreeSet<ObjectIdentity>), ManifestError> {
         // Checking supplied entries alone accepts an empty inventory for a
         // DROP, leaving the closing manifest at the pre-DDL state (SPEC 9.3.2).
         for (index, step) in changes.changes.iter().enumerate() {
@@ -59,49 +262,18 @@ impl InputManifest {
             {
                 return Err(ManifestError::Invalid);
             }
-            for (inventory, manifest, before) in [
-                (&transition.before, self, true),
-                (&transition.after, compiled, false),
-            ] {
+            let sides = [
+                Some((&transition.before, self, true)),
+                compiled.map(|compiled| (&transition.after, compiled, false)),
+            ];
+            for (inventory, manifest, before) in sides.into_iter().flatten() {
                 for object in inventory {
                     let records = manifest.prerequisites();
                     let position = records
                         .binary_search_by(|p| p.object.cmp(object))
                         .map_err(|_| ManifestError::Incomplete)?;
                     let ownership = &records[position].ownership;
-                    // Ownership permits aggregation, not unrelated mutations.
-                    // The same typed scope that requires a record below must
-                    // also authorize replacing it (SPEC 9.3.2).
-                    let affected = changes.changes.iter().enumerate().any(|(index, step)| {
-                        vector_inventory_permitted(
-                            &step.change,
-                            changes,
-                            index,
-                            before,
-                            &transition.surface,
-                            ownership,
-                        ) || touches(&step.change, &transition.surface)
-                            && ownership.permits(&transition_at_endpoint(
-                                &transition.surface,
-                                changes,
-                                index,
-                                before,
-                            ))
-                            && (changed_owners(&step.change).is_some_and(
-                                |(candidates, opening, closing)| {
-                                    (if before { opening } else { closing })
-                                        && candidates.iter().any(|owner| {
-                                            owner
-                                                .at_endpoint(changes, index, before)
-                                                .contains(ownership)
-                                        })
-                                },
-                            ) || column_parent(&step.change).is_some_and(|parent| {
-                                OwnerScope::Exact(parent)
-                                    .at_endpoint(changes, index, before)
-                                    .contains(ownership)
-                            }))
-                    });
+                    let affected = authorized(changes, transition, ownership, before);
                     if !affected {
                         return Err(ManifestError::Invalid);
                     }
@@ -126,10 +298,11 @@ impl InputManifest {
             if let Some((candidates, opening, closing)) = changed_owners(&step.change) {
                 let complete = candidates.iter().any(|owner| {
                     [
-                        (self, &removed, opening, true),
-                        (compiled, &installed, closing, false),
+                        Some((self, &removed, opening, true)),
+                        compiled.map(|compiled| (compiled, &installed, closing, false)),
                     ]
                     .into_iter()
+                    .flatten()
                     .all(|(manifest, inventory, required, before)| {
                         if !required {
                             return true;
@@ -161,9 +334,11 @@ impl InputManifest {
             // excuse an omitted column/default inventory (SPEC 9.3.2).
             if let Some(parent) = column_parent(&step.change) {
                 let owner = OwnerScope::Exact(parent);
-                for (manifest, inventory, before) in
-                    [(self, &removed, true), (compiled, &installed, false)]
-                {
+                let sides = [
+                    Some((self, &removed, true)),
+                    compiled.map(|compiled| (compiled, &installed, false)),
+                ];
+                for (manifest, inventory, before) in sides.into_iter().flatten() {
                     let owner = owner.at_endpoint(changes, index, before);
                     let records: Vec<_> = manifest
                         .prerequisites()
@@ -180,80 +355,80 @@ impl InputManifest {
                 }
             }
         }
-        let mut objects: BTreeMap<_, _> = self
-            .prerequisites()
-            .iter()
-            .map(|p| (p.object.clone(), p.clone()))
-            .collect();
-        for object in &removed {
-            if objects.remove(object).is_none() {
-                return Err(ManifestError::Incomplete);
-            }
+        // A record the plan installs cannot already be an input it keeps: a
+        // CREATE over an existing, untouched object is not an approved change.
+        if installed.iter().any(|object| {
+            !removed.contains(object)
+                && self
+                    .prerequisites()
+                    .binary_search_by(|p| p.object.cmp(object))
+                    .is_ok()
+        }) {
+            return Err(ManifestError::Invalid);
         }
-        let compiled_objects: BTreeMap<_, _> = compiled
-            .prerequisites()
-            .iter()
-            .map(|p| (&p.object, p))
-            .collect();
-        for object in &installed {
-            let p = compiled_objects
-                .get(object)
-                .ok_or(ManifestError::Incomplete)?;
-            if objects.insert(object.clone(), (*p).clone()).is_some() {
-                return Err(ManifestError::Invalid);
-            }
-        }
-        let mut membership = self.membership().to_vec();
-        for (result, desired) in membership.iter_mut().zip(compiled.membership()) {
-            if result.predicate != desired.predicate {
-                return Err(ManifestError::Incomplete);
-            }
-            result.members.retain(|id| !removed.contains(id));
-            result
-                .members
-                .extend(desired.members.intersection(&installed).cloned());
-        }
-        let mut runtime_bound = self.runtime_bound().clone();
-        runtime_bound.retain(|id| !removed.contains(id));
-        runtime_bound.extend(compiled.runtime_bound().intersection(&installed).cloned());
-        let mut lookups = self.identifications().to_vec();
-        if lookups.len() != compiled.identifications().len() {
-            return Err(ManifestError::Incomplete);
-        }
-        for (result, desired) in lookups.iter_mut().zip(compiled.identifications()) {
-            if (&result.signature, &result.search_path, &result.kind)
-                != (&desired.signature, &desired.search_path, &desired.kind)
-            {
-                return Err(ManifestError::Incomplete);
-            }
-            if result.resolved != desired.resolved {
-                if result
-                    .resolved
-                    .as_ref()
-                    .is_some_and(|id| !removed.contains(id))
-                    || desired
-                        .resolved
-                        .as_ref()
-                        .is_some_and(|id| !installed.contains(id))
-                {
-                    return Err(ManifestError::Invalid);
-                }
-                result.resolved = desired.resolved.clone();
-            }
-        }
-        Self::new(
-            self.adapter().into(),
-            self.engine_major(),
-            self.key_id().into(),
-            self.scope().clone(),
-            self.baseline().into(),
-            self.session().into(),
-            objects.into_values().collect(),
-            membership,
-            runtime_bound,
-            lookups,
-        )
+        Ok((removed, installed))
     }
+}
+
+/// Ownership permits aggregation, not unrelated mutations. The same typed
+/// scope that requires a record must also authorize replacing it (SPEC 9.3.2).
+fn authorized(
+    changes: &ChangeSet,
+    transition: &ObjectTransition,
+    ownership: &ObjectOwnership,
+    before: bool,
+) -> bool {
+    changes.changes.iter().enumerate().any(|(index, step)| {
+        vector_inventory_permitted(
+            &step.change,
+            changes,
+            index,
+            before,
+            &transition.surface,
+            ownership,
+        ) || touches(&step.change, &transition.surface)
+            && ownership.permits(&transition_at_endpoint(
+                &transition.surface,
+                changes,
+                index,
+                before,
+            ))
+            && (changed_owners(&step.change).is_some_and(|(candidates, opening, closing)| {
+                (if before { opening } else { closing })
+                    && candidates.iter().any(|owner| {
+                        owner
+                            .at_endpoint(changes, index, before)
+                            .contains(ownership)
+                    })
+            }) || column_parent(&step.change).is_some_and(|parent| {
+                OwnerScope::Exact(parent)
+                    .at_endpoint(changes, index, before)
+                    .contains(ownership)
+            }))
+    })
+}
+
+/// A signature lookup may change only between the plan's own records: what
+/// it named before must be removed, and what it names after installed.
+fn resolved_lookup(
+    opening: &super::RoutineLookup,
+    closing: &super::RoutineLookup,
+    removed: &BTreeSet<ObjectIdentity>,
+    installed: &BTreeSet<ObjectIdentity>,
+) -> Result<Option<ObjectIdentity>, ManifestError> {
+    if opening.resolved != closing.resolved
+        && (opening
+            .resolved
+            .as_ref()
+            .is_some_and(|id| !removed.contains(id))
+            || closing
+                .resolved
+                .as_ref()
+                .is_some_and(|id| !installed.contains(id)))
+    {
+        return Err(ManifestError::Invalid);
+    }
+    Ok(closing.resolved.clone())
 }
 
 // Internal records share their qualified surface's atomic properties. Child

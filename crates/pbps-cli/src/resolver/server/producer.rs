@@ -179,7 +179,7 @@ impl ScratchRun {
         &self,
         key: &EnvironmentFingerprintKey,
         sealed: &super::QualifiedScope,
-        mut producer: super::ProducerOutcome,
+        producer: super::ProducerOutcome,
         opening: pbps_model::resolver::InputManifest,
         ordered: pbps_diff::resolver::Ordered,
         base: pbps_diff::Side<'_>,
@@ -211,18 +211,6 @@ impl ScratchRun {
         if matches!(sealed.authorization_context, scope::Authorization::Mssql(_)) {
             return Err(Error::Scope("SQL Server evidence is unsupported".into()));
         }
-        // Auto-generated child names follow the target, not scratch, for the
-        // tables the plan keeps; the transitions below must see those names.
-        producer
-            .compiled
-            .retain_auto_named_children(
-                producer.opening_capture.catalog(),
-                &changes,
-                base.ids,
-                desired.ids,
-                desired.schema,
-            )
-            .map_err(|error| Error::Binding(format!("retained child names: {error}")))?;
         let compiled_records = producer
             .compiled
             .planning_records()
@@ -234,24 +222,8 @@ impl ScratchRun {
             transitions::derive(&changes, base, desired, &opening_records, &compiled_records)?;
         let compiled = producer
             .compiled
-            .seal_for_plan(
-                producer.opening_capture.catalog(),
-                &changes,
-                &transitions,
-                base.ids,
-                desired.ids,
-            )
+            .seal_for_plan()
             .map_err(|error| Error::Binding(format!("final compiled catalog manifest: {error}")))?;
-        // A retained PostgreSQL 18 NOT NULL child keeps its opening name, so
-        // sealing can re-address it. Re-inventory the final sealed records
-        // before projecting; the model must see exactly those closing addresses.
-        let transitions = transitions::derive(
-            &changes,
-            base,
-            desired,
-            &opening_records,
-            &super::resolution::records(&compiled),
-        )?;
         let qualification = Qualification {
             rule: pbps_pg::resolver::compatibility::RULE.into(),
             target_environment: crate::resolver::sealing::target_catalog_fingerprint(

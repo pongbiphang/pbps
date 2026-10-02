@@ -17,8 +17,7 @@ use crate::resolver::docker::{
     CandidateImage, ContainerControl, ContainerSession, LocalApi, forwarder::Forwarder,
 };
 use crate::resolver::native::{
-    CapturedTargetInputs, FORWARDER_PRIVILEGES, MqueueLease, NativeTarget, ProcessLease,
-    TargetWitness, guarded_tasks,
+    FORWARDER_PRIVILEGES, MqueueLease, NativeTarget, ProcessLease, TargetWitness, guarded_tasks,
 };
 use crate::resolver::scope::{self, PlannedGrant};
 use pbps_db::Driver;
@@ -1437,7 +1436,6 @@ struct AnalysisOutcome {
 
 struct ProducerOutcome {
     compiled: engine::CompiledCapture,
-    opening_capture: CapturedTargetInputs,
     opening_build: String,
     surfaces: Vec<pbps_model::resolver::SurfaceResolution>,
 }
@@ -2189,7 +2187,6 @@ impl ScratchRun {
             )?;
             Some(ProducerOutcome {
                 compiled,
-                opening_capture: current,
                 opening_build: opening_build.expect("qualified build"),
                 surfaces,
             })
