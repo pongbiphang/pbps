@@ -1641,8 +1641,9 @@ the pre-flight, and a key probe over a computed column the plan adds is
 unchecked, not counted over the values the old expression stored.
 
 **Refused by name, offline** (`DiffError::ComputedInputChanged`,
-`ComputedFunctionChanged`). A standing computed column is one the plan
-neither drops nor changes.
+`ComputedFunctionChanged`). A standing computed column is one that is there
+before the plan and that the plan neither drops nor adds. A change is both.
+One the plan adds, new or again, comes at (9, 3), after every input change.
 
 - A plan is refused that renames, drops, retypes or changes the nullability
   of a column a standing computed column may read (#1420).

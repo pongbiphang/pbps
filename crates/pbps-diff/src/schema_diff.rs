@@ -1737,7 +1737,10 @@ fn refuse_computed_dependencies(
     };
     for (table_name, table) in &declared.tables {
         for (name, computed) in &table.computed {
-            let standing = !dropped(table_name, name);
+            // Standing: there before the plan and there throughout. One the
+            // plan adds, new or again, comes at (9, 3), after every input
+            // change, and one it drops is gone at (2, 4), before them.
+            let standing = !dropped(table_name, name) && !added(table_name, name);
             let at = table_name.column(name);
             for change in changes {
                 if standing
@@ -3523,6 +3526,17 @@ mod tests {
                 "{what}: {errors:?}"
             );
         }
+        // Added by this plan, it comes after the input's change: no refusal
+        // (#1174 review).
+        let bare = schema_of(
+            "dbo.t",
+            table(&[
+                ("id", Column::new(ty("int")).not_null()),
+                ("A2", Column::new(ty("int"))),
+            ]),
+        );
+        let errors = errors_of(&bare, &shaped(Column::new(ty("bigint")), "a2 * 2"), &[]);
+        assert!(errors.is_empty(), "{errors:?}");
         // Changed together with its expression, it is dropped first and
         // re-added after: no refusal.
         let errors = errors_of(&base, &shaped(Column::new(ty("bigint")), "a2 * 3"), &[]);
