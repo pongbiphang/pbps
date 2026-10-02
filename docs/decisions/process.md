@@ -714,3 +714,31 @@ permissiveness cannot make a prohibited import acceptable. Permanent operational
 rule-removal tests must admit a complete owner after disabling only their rule;
 a second guard's refusal is not evidence. Unsupported literal nodes never use
 an execution or evaluator fallback. See [test execution](../TEST-EXECUTION.md).
+
+
+<a id="dec-1428-1"></a>
+
+**DEC-1428.1. Historical Python programs carry explicit syntax windows and
+earn execution receipts on every supported interpreter.** The fixture checker
+supports Python 3.11+, but historical inputs include type-alias statements
+introduced in 3.12 and named expressions in annotations rejected in 3.14.
+Changing those sources to fit one interpreter would lose their provenance;
+skipping them would turn missing evidence into successful coverage.
+
+Optional corpus metadata supplies an inclusive minimum, an exclusive upper
+boundary and a nonempty reason. Untagged rows keep the documented minimum.
+Malformed, empty or contradictory ranges fail. Independent case-to-boundary
+assertions prevent a broader qualification from hiding ordinary programs.
+The shared harness still invokes the actual interpreter and complete owner for
+every row. Eligible programs retain their original runtime and owner oracles.
+Ineligible programs must fail with SyntaxError; below a syntax minimum the
+owner must refuse parsing. Python 3.14 still parses the annotation AST before
+rejecting compilation, so those rows retain their original owner diagnostic.
+
+Only completed runtime and owner checks earn receipts. Independent eligibility
+and full-row coverage assertions catch dropped tasks and broad skips. Actual
+3.11, 3.12 and 3.14 runs qualify the boundaries; removing each boundary restores
+the corresponding regression, while skipping eligible tagged rows fails the
+ledger. Existing source-form rule-removal controls remain required. This does
+not expand DEC-1413.1 into an effect interpreter or prove the separate module
+annotation behavior in #1262. See [test execution](../TEST-EXECUTION.md).
