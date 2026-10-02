@@ -110,6 +110,33 @@ async fn exercise_capture(connection: String) {
         changes.is_empty(),
         "logical capture must ignore fresh physical OIDs: {changes:?}"
     );
+    // A foreign key's internal RI triggers are named after their own OID.
+    // Their identity is the relation, constraint and function, so dropping
+    // and re-adding the same key compares equal.
+    conn.execute("CREATE TABLE app.parent(id integer PRIMARY KEY); ALTER TABLE app.t ADD CONSTRAINT t_parent_fk FOREIGN KEY (id) REFERENCES app.parent(id)").await.unwrap();
+    let with_key = capture(&mut conn, &scope).await.unwrap();
+    let triggers: Vec<_> = with_key
+        .objects()
+        .filter(|id| id.class == "pg_trigger")
+        .collect();
+    assert_eq!(triggers.len(), 4, "two RI triggers per side: {triggers:?}");
+    assert!(
+        triggers.iter().all(|id| id.name.is_empty()
+            && id
+                .signature
+                .get(1)
+                .is_some_and(|key| key.name == ["t_parent_fk"])),
+        "internal triggers are named by their constraint, not an OID: {triggers:?}"
+    );
+    conn.execute("ALTER TABLE app.t DROP CONSTRAINT t_parent_fk; ALTER TABLE app.t ADD CONSTRAINT t_parent_fk FOREIGN KEY (id) REFERENCES app.parent(id)").await.unwrap();
+    let (_, changes) = recapture(&mut conn, &with_key).await.unwrap();
+    assert!(
+        changes.is_empty(),
+        "a re-added key's RI triggers must compare equal: {changes:?}"
+    );
+    conn.execute("ALTER TABLE app.t DROP CONSTRAINT t_parent_fk; DROP TABLE app.parent")
+        .await
+        .unwrap();
     conn.execute(
         "CREATE FUNCTION app.arriving(integer) RETURNS integer LANGUAGE SQL RETURN $1 + 1",
     )

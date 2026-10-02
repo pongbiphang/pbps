@@ -410,8 +410,12 @@ pub(super) fn normalize(
                 .expect("column identities serialize"),
         );
     }
+    // An internal constraint trigger's name embeds its OID; its identity is
+    // its relation, constraint and function instead (logical.rs). The name is
+    // neither a property nor part of its rendered definition.
+    let oid_named = class == "pg_trigger" && logical::internal_constraint_trigger(row)?;
     if complete {
-        let definition = &definitions["complete"];
+        let mut definition = definitions["complete"].clone();
         let required = class != "pg_proc" || matches!(logical::string(row, "prokind")?, "f" | "p");
         if required && !definition.as_str().is_some_and(|s| !s.is_empty()) {
             return Err(Uncovered::Definition);
@@ -419,9 +423,20 @@ pub(super) fn normalize(
         if !required && !definition.is_null() {
             return Err(Uncovered::Definition);
         }
-        output.insert("engine_definition".to_owned(), definition.clone());
+        if oid_named {
+            let name = logical::string(row, "tgname")?;
+            let rendered = definition.as_str().ok_or(Uncovered::Definition)?;
+            if rendered.matches(name).count() != 1 {
+                return Err(Uncovered::Definition);
+            }
+            definition = Value::String(rendered.replace(name, "<internal constraint trigger>"));
+        }
+        output.insert("engine_definition".to_owned(), definition);
     }
     for &(name, kind) in layout {
+        if oid_named && name == "tgname" {
+            continue;
+        }
         let value = row.get(name).ok_or(Uncovered::Field)?;
         let normalized = match field(class, name, kind)? {
             Field::Physical | Field::Authorization => continue,
