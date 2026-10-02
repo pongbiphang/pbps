@@ -497,6 +497,11 @@ pub(super) fn classify(
                 }
             };
             if allowed {
+                // A generated relation (a key's index, an identity sequence)
+                // has attribute rows that go with it, as a declared index's do.
+                if made.class == "pg_class" {
+                    physical_attributes(capture, &mut owned, made, &owner, false)?;
+                }
                 assign(&mut owned, made.clone(), owner)?;
                 changed = true;
             }
