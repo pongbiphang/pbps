@@ -1213,126 +1213,204 @@ fn release_of(
 /// class 9, both ahead of the expression change, where the engine still sees
 /// the generated column reading the input and refuses.
 ///
-/// `dependences` is each table's live edges, by catalog name. Returns how many
-/// changes moved, or a refusal when the input's name is taken by a change
-/// between its drop and the release: that change needs the name free, and the
-/// release needs the column still there. Also a refusal when the moves would
-/// cycle: a generated column that releases one retyped input and starts
-/// reading another, and a second doing the reverse, leave no order at all.
+/// The order comes from edges that do not depend on the order (DEC-1391.1):
+/// - each live reader's release (`dependences`, by catalog name) runs before
+///   the retype or drop of its input;
+/// - a retype runs before the default written for its new type, matched by
+///   uid, and before any other generated column's expression change whose new
+///   text may read the column (`may_read`): once it reads it, the engine
+///   refuses the retype.
+///
+/// A change runs where the differ put it unless an edge holds it back; then
+/// it runs right after the last change it waits for. Nothing moves earlier.
+/// Returns how many changes moved, or a refusal:
+/// - a change the moved one passes needs what it holds back: a column's name
+///   taken before its drop runs, or a row, key or module that may need its
+///   new type before its retype runs;
+/// - a drop of a column another generated column's new text may read, which
+///   no order performs (#1391);
+/// - changes that wait on one another, as two generated columns trading
+///   retyped inputs do.
 pub(crate) fn order_after_releases(
     changes: &mut ChangeSet,
     dependences: &BTreeMap<TableName, Vec<pbps_pg::generated::Dependence>>,
 ) -> Result<usize, String> {
+    use pbps_model::Change;
+    use pbps_pg::generated::may_read;
     let names = LiveNames::of(changes);
-    let mut moved = 0;
-    // Each change's original position, moved with it. The pass is a pure
-    // function of the order and the cursor, so an arrangement it has moved
-    // from before at the same cursor is one it would loop through forever.
-    let mut ids: Vec<usize> = (0..changes.changes.len()).collect();
-    let mut seen = std::collections::BTreeSet::new();
-    let mut i = 0;
-    while i < changes.changes.len() {
-        let Some((table, live, column, _)) = names.changed(&changes.changes[i].change) else {
-            i += 1;
+    let n = changes.changes.len();
+    // What each change waits for, by position.
+    let mut waits: Vec<std::collections::BTreeSet<usize>> =
+        vec![std::collections::BTreeSet::new(); n];
+    for (i, p) in changes.changes.iter().enumerate() {
+        let Some((table, live, column, _)) = names.changed(&p.change) else {
             continue;
         };
-        let column = column.clone();
-        let release = dependences
+        let readers: Vec<&str> = dependences
             .get(&table)
             .into_iter()
             .flatten()
             .filter(|d| d.base == live)
-            .filter_map(|d| release_of(changes, &names, &table, &d.generated, &live, &column.name))
-            .max();
-        let Some(release) = release.filter(|r| *r > i) else {
-            i += 1;
-            continue;
-        };
-        if let Some(taker) = changes.changes[i + 1..release].iter().find(|p| {
-            matches!(&p.change, pbps_model::Change::AddColumn { table, name, .. }
-                if *table == column.table && *name == column.name)
-                || matches!(&p.change, pbps_model::Change::RenameColumn { table, to, .. }
-                    if *table == column.table && *to == column.name)
-        }) {
-            return Err(format!(
-                "{column} is released from its generated column by an expression change in this \
-                 plan, and `{}` takes its name before that change runs. Apply the expression \
-                 change in a plan of its own first, then this one.",
-                taker.change.subject()
-            ));
-        }
-        // A retype never moves past what the differ puts after the column
-        // alterations. A release that follows a function the plan creates
-        // sits after the rows, the constraints and the modules
-        // (`after_the_rebuilds`), and any of those may need the column's new
-        // type: a row writing a value only it accepts, a function whose body
-        // is checked against it. The retype cannot both follow the release and
-        // precede them, so the plan is refused by name (DEC-1316.1).
-        if matches!(
-            changes.changes[i].change,
-            pbps_model::Change::AlterColumnType { .. }
-        ) && let Some(past) = changes.changes[i + 1..release]
-            .iter()
-            .find(|p| after_the_alterations(&p.change))
-        {
-            return Err(format!(
-                "{column} is retyped after the expression change that releases it, which \
-                 follows `{}`: that change may need the new type. Apply the expression change \
-                 in a plan of its own first, then this one.",
-                past.change.subject()
-            ));
-        }
-        // A retype takes along what runs after it and before the release and
-        // has to follow it (DEC-1316.1), in their order:
-        // - the default written for the new type on the same column, which the
-        //   old type may refuse. Matched by uid, which a rename does not change.
-        // - another generated column's expression change whose new text may
-        //   read the column. Once it reads it, the engine refuses the retype.
-        //   The catalog knows only the old readers, so the new ones are found
-        //   by the same over-approximating scan.
-        if !seen.insert((i, ids.clone())) {
-            return Err(format!(
-                "{column} cannot be retyped in this plan: a generated column it releases waits \
-                 for another input's retype, and that input is released by a column that \
-                 starts reading {column}. Change those generated columns to expressions that \
-                 read neither input in a plan of its own first, then this one."
-            ));
-        }
-        let uid =
-            if let pbps_model::Change::AlterColumnType { uid, .. } = &changes.changes[i].change {
-                Some(uid.clone())
-            } else {
-                None
-            };
-        let mut group = vec![changes.changes.remove(i)];
-        let mut group_ids = vec![ids.remove(i)];
-        let mut release = release - 1;
-        let mut j = i;
-        while j < release {
-            let follows = uid.as_ref().is_some_and(|uid| {
-                matches!(&changes.changes[j].change,
-                    pbps_model::Change::AlterColumnDefault { uid: u, to: Some(_), .. } if u == uid)
-                    || matches!(&changes.changes[j].change,
-                        pbps_model::Change::AlterColumnExpression { column: c, to, .. }
-                            if names.table(&c.table) == table
-                                && (pbps_pg::generated::may_read(to, &live)
-                                    || pbps_pg::generated::may_read(to, &column.name)))
-            });
-            if follows {
-                group.push(changes.changes.remove(j));
-                group_ids.push(ids.remove(j));
-                release -= 1;
-            } else {
-                j += 1;
+            .map(|d| d.generated.as_str())
+            .collect();
+        for generated in &readers {
+            if let Some(r) = release_of(changes, &names, &table, generated, &live, &column.name) {
+                waits[i].insert(r);
             }
         }
-        moved += group.len();
-        for (k, (p, id)) in group.into_iter().zip(group_ids).enumerate() {
-            changes.changes.insert(release + 1 + k, p);
-            ids.insert(release + 1 + k, id);
+        // A generated column the catalog does not see reading the column,
+        // whose new text may. A live reader whose new text still names it is
+        // not released, which `unreleased` refuses.
+        for (j, q) in changes.changes.iter().enumerate() {
+            let Change::AlterColumnExpression { column: c, to, .. } = &q.change else {
+                continue;
+            };
+            let (at, generated) = names.column(c);
+            if at != table
+                || readers.contains(&generated.as_str())
+                || !(may_read(to, &live) || may_read(to, &column.name))
+            {
+                continue;
+            }
+            if matches!(p.change, Change::AlterColumnType { .. }) {
+                waits[j].insert(i);
+            } else if !reused(changes, column) {
+                return Err(format!(
+                    "{column} is dropped in this plan, and the new expression of {c} may read \
+                     it: once {c} reads it, the drop is refused, and before that the \
+                     expression names a column that is gone. Change that expression in a plan \
+                     of its own first, or write it without {column}."
+                ));
+            }
+        }
+        if let Change::AlterColumnType { uid, .. } = &p.change {
+            for (j, q) in changes.changes.iter().enumerate() {
+                if matches!(&q.change,
+                    Change::AlterColumnDefault { uid: u, to: Some(_), .. } if u == uid)
+                {
+                    waits[j].insert(i);
+                }
+            }
         }
     }
+    // Each change in the differ's order, a held one where what it waits for
+    // has run, checked against what it passed on the way.
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    let mut done = vec![false; n];
+    // Each held change, with where the order stood when it was held.
+    let mut held: Vec<(usize, usize)> = Vec::new();
+    let mut moved = 0;
+    for i in 0..n {
+        if !waits[i].iter().all(|w| done[*w]) {
+            held.push((i, order.len()));
+            moved += 1;
+            continue;
+        }
+        order.push(i);
+        done[i] = true;
+        while let Some(k) = held
+            .iter()
+            .position(|(h, _)| waits[*h].iter().all(|w| done[*w]))
+        {
+            let (h, from) = held.remove(k);
+            passes(changes, &names, h, &order[from..])?;
+            order.push(h);
+            done[h] = true;
+        }
+    }
+    if let Some(&(first, _)) = held.first() {
+        let column = names.changed(&changes.changes[first].change).map_or_else(
+            || changes.changes[first].change.subject(),
+            |c| c.2.to_string(),
+        );
+        let waiting: Vec<String> = held
+            .iter()
+            .map(|(h, _)| {
+                let change = &changes.changes[*h].change;
+                format!("`{}` {}", change.subject(), crate::report::describe(change))
+            })
+            .collect();
+        return Err(format!(
+            "{column} cannot be retyped in this plan: these changes wait on one another, as two \
+             generated columns trading retyped inputs do: {}. Change those generated columns to \
+             expressions that read neither input in a plan of its own first, then this one.",
+            waiting.join(", ")
+        ));
+    }
+    let mut taken: Vec<Option<pbps_model::PlannedChange>> = std::mem::take(&mut changes.changes)
+        .into_iter()
+        .map(Some)
+        .collect();
+    changes.changes = order
+        .into_iter()
+        .map(|i| taken[i].take().expect("each change runs once"))
+        .collect();
     Ok(moved)
+}
+
+/// Whether the plan gives a dropped column's name to another column: a reader
+/// of that name then reads the new one.
+fn reused(changes: &ChangeSet, column: &pbps_model::ColumnRef) -> bool {
+    changes.changes.iter().any(|p| {
+        matches!(&p.change, pbps_model::Change::AddColumn { table, name, .. }
+            if *table == column.table && *name == column.name)
+            || matches!(&p.change, pbps_model::Change::RenameColumn { table, to, .. }
+                if *table == column.table && *to == column.name)
+    })
+}
+
+/// Refuses moving the change at `held` past `passed`, the changes that ran
+/// since it was held, where one of them needs what it holds back.
+fn passes(
+    changes: &ChangeSet,
+    names: &LiveNames,
+    held: usize,
+    passed: &[usize],
+) -> Result<(), String> {
+    let change = &changes.changes[held].change;
+    let Some((_, _, column, _)) = names.changed(change) else {
+        return Ok(());
+    };
+    // A drop holds its name until it runs: a change taking the name needs it
+    // free, and the release needs the column still there.
+    if let Some(taker) = passed
+        .iter()
+        .map(|i| &changes.changes[*i].change)
+        .find(|c| {
+            matches!(c, pbps_model::Change::AddColumn { table, name, .. }
+            if *table == column.table && *name == column.name)
+                || matches!(c, pbps_model::Change::RenameColumn { table, to, .. }
+                if *table == column.table && *to == column.name)
+        })
+    {
+        return Err(format!(
+            "{column} is released from its generated column by an expression change in this \
+             plan, and `{}` takes its name before that change runs. Apply the expression \
+             change in a plan of its own first, then this one.",
+            taker.subject()
+        ));
+    }
+    // A retype never moves past what the differ puts after the column
+    // alterations. A release that follows a function the plan creates
+    // sits after the rows, the constraints and the modules
+    // (`after_the_rebuilds`), and any of those may need the column's new
+    // type: a row writing a value only it accepts, a function whose body
+    // is checked against it. The retype cannot both follow the release and
+    // precede them, so the plan is refused by name (DEC-1316.1).
+    if matches!(change, pbps_model::Change::AlterColumnType { .. })
+        && let Some(past) = passed
+            .iter()
+            .map(|i| &changes.changes[*i].change)
+            .find(|c| after_the_alterations(c))
+    {
+        return Err(format!(
+            "{column} is retyped after the expression change that releases it, which \
+             follows `{}`: that change may need the new type. Apply the expression change \
+             in a plan of its own first, then this one.",
+            past.subject()
+        ));
+    }
+    Ok(())
 }
 
 /// A change the differ puts after the column alterations: rows, keys and
@@ -2529,6 +2607,48 @@ mod tests {
         ]);
         let refusal = order_after_releases(&mut cs, &reads_a).unwrap_err();
         assert!(refusal.contains("in a plan of its own first"), "{refusal}");
+        // A new reader sorted ahead of the retype it has to follow: held
+        // back until the retype has run, which itself waits for its release
+        // (DEC-1391.1).
+        let reader = || Change::AlterColumnExpression {
+            uid: uid("c_gggggg"),
+            column: col("h"),
+            from: "b".into(),
+            to: "a + 1".into(),
+        };
+        let mut cs = plan(vec![reader(), retype("a"), recompute("b * 2")]);
+        assert_eq!(order_after_releases(&mut cs, &reads_a), Ok(2));
+        assert!(
+            matches!(&cs.changes[0].change, Change::AlterColumnExpression { column, .. } if column.name == "g")
+                && matches!(cs.changes[1].change, Change::AlterColumnType { .. })
+                && matches!(&cs.changes[2].change, Change::AlterColumnExpression { column, .. } if column.name == "h"),
+            "{:?}",
+            cs.changes
+        );
+        // #1391: a new reader of a dropped input has no order: once it reads
+        // the column the drop is refused, and before that its text names a
+        // column that is gone. Refused by name, whatever the order.
+        for changes in [
+            vec![drop("a"), reader(), recompute("b * 2")],
+            vec![reader(), drop("a"), recompute("b * 2")],
+        ] {
+            let mut cs = plan(changes);
+            let refusal = order_after_releases(&mut cs, &reads_a).unwrap_err();
+            assert!(refusal.contains("new expression of app.t.h"), "{refusal}");
+        }
+        // Unless the plan gives the name to a new column, which is what the
+        // new text then reads.
+        let mut cs = plan(vec![
+            drop("a"),
+            Change::AddColumn {
+                uid: uid("c_eeeeee"),
+                table: t.clone(),
+                name: "a".into(),
+                column: Box::new(pbps_model::Column::new("text".parse().unwrap())),
+            },
+            reader(),
+        ]);
+        assert_eq!(order_after_releases(&mut cs, &BTreeMap::new()), Ok(0));
     }
 
     /// The one frame the ready-phase review named: a `DbError::Driver`'s

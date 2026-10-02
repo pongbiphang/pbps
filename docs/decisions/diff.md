@@ -1290,7 +1290,9 @@ it by the catalog's own name, so only its table is reversed; a rename into the
 freed name belongs to another column.
 
 On a connected plan, `release_generated_inputs` moves the retype or drop of a
-released column to right after the expression change that releases it. A
+released column to right after the expression change that releases it. How it
+finds that order is DEC-1391.1's: edges that do not depend on the order,
+where this entry first described a pass of positional moves. A
 retype takes along the default written for its new type, matched by uid. The
 old type may refuse that default: measured on 18.6, `SET DEFAULT 'abc'` on an
 `integer` is `invalid input syntax`. It also takes along another generated
@@ -1300,10 +1302,9 @@ catalog knows only the old readers.
 
 Those two rules can cycle. A generated column may release one retyped input
 and start reading another while a second column does the reverse. Each must
-then follow one retype and precede the other, and no order runs. The pass is a
-pure function of the order and its cursor, so an arrangement it has already
-moved from, at the same cursor, is one it would loop through forever. It
-refuses there, and names the remedy: a plan of its own that first changes
+then follow one retype and precede the other, and no order runs: a
+cycle among the edges of DEC-1391.1. It refuses there, and names the
+remedy: a plan of its own that first changes
 those columns to expressions reading neither input. It
 runs after the module passes, which may move that change past a function's
 create, and before the checks that read the order (`drop_blockers`,
@@ -1481,3 +1482,47 @@ Pinned by `a_name_only_a_later_class_frees_is_refused_with_its_remedy` and
 `a_swap_is_refused_as_two_changes_waiting_on_each_other`
 (`crates/pbps-cli/src/object_order.rs`), and the live
 `renames_only_the_catalog_can_order_apply_or_are_refused_at_plan`.
+
+<a id="dec-1391-1"></a>
+
+**DEC-1391.1. The release order of generated inputs comes from edges that do
+not depend on the order, and a new reader of a dropped input is refused by
+name.** DEC-1316.1 first ordered a released input's retype or drop by moving
+it: to right after its release, taking along the changes found between the
+two. Review found each move meeting another rule: the default for the new
+type, a new reader of a retyped input, the same for a dropped one (#1391), and
+two columns trading inputs, which looped until a repeat check stopped it.
+Each was a fact about which generated column reads which column, decided by
+where a change happened to sort (#1366).
+
+These facts do not change with the order, so they are edges:
+
+- each live reader's release, from `pg_depend`, comes before its input's
+  retype or drop;
+- a retype comes before the default written for its new type, matched by uid;
+- a retype comes before any other generated column's expression change whose
+  new text may read the column (`may_read`, over-approximated as DEC-1316.1
+  says). The engine refuses a retype once that column reads it.
+
+A change runs where the differ put it unless an edge holds it back. Then it
+runs right after the last change it waits for, so nothing moves earlier than
+the differ put it. A change held back is checked against what it passes, as
+before: a column's name taken before its drop runs, and a row, key or module
+that may need the new type before its retype runs. Changes left waiting on
+one another form a cycle, and the plan is refused naming them. The repeat
+check is gone with the moves.
+
+A dropped column that another generated column's new text may read has no
+order. Once that column reads it, the drop is refused. Before that, its
+expression names a column that is gone. So the plan is refused naming the
+reader, with a two-plan remedy, unless the plan gives the name to a new
+column, which the text then reads. Before this, a reader the differ sorted
+ahead of the release was passed over, and `DROP COLUMN` failed at apply. A new
+reader sorted ahead of the retype it must follow is now held back too, where
+the moves only looked between the retype and its release.
+
+Pinned by `a_released_input_is_retyped_or_dropped_after_its_release`
+(`crates/pbps-cli/src/engine.rs`) and the live
+`a_new_reader_of_a_dropped_input_is_refused_before_anything_runs` and
+`an_expression_change_releases_its_old_input_in_the_same_plan`
+(`crates/pbps-cli/tests/flow_pg.rs`).
