@@ -53,6 +53,36 @@ pub enum DiffError {
     )]
     GenerationChangeUnsupported { column: ColumnRef },
 
+    /// A plan that renames, drops, retypes or changes the nullability of a
+    /// column a SQL Server computed column may read, while the computed
+    /// column stands: the engine refuses each (15336, 4922; measured on 17.0,
+    /// #1174). A computed column the plan drops, or changes and so drops and
+    /// re-adds, is out of the way first and is not this.
+    #[error(
+        "computed column {computed} may read `{column}`, which this plan {change}, and SQL \
+         Server refuses that while the computed column stands. Drop the computed column, or \
+         change its expression, in a plan of its own first, then this one."
+    )]
+    ComputedInputChanged {
+        computed: ColumnRef,
+        column: String,
+        change: &'static str,
+    },
+
+    /// A plan that alters or drops a function a SQL Server computed column
+    /// may call while the column stands (3729, measured on 17.0), or adds a
+    /// computed column calling one the plan creates, which comes after it
+    /// (#1174).
+    #[error(
+        "computed column {computed} may call `{function}`, which this plan {change}. Apply \
+         the function change and the computed column change in separate plans."
+    )]
+    ComputedFunctionChanged {
+        computed: ColumnRef,
+        function: String,
+        change: &'static str,
+    },
+
     /// A `data:` block on a table whose primary key cannot key its rows
     /// (ADR-0004). `validate` says the same thing against the file and the
     /// line; this is here so that a differ reached another way never quietly
@@ -342,6 +372,7 @@ fn diff_partial_rebuilding(
             declared_table,
             &mut changes,
         );
+        diff_computed(declared_name, base_table, declared_table, &mut changes);
         // Rows are compared by column *name* on each side, and a rename in
         // this same plan means the two sides know one column by two names.
         // The uid is what says they are the same column.
@@ -372,6 +403,7 @@ fn diff_partial_rebuilding(
         dialect,
         &mut changes,
     );
+    refuse_computed_dependencies(declared.schema, dialect, &changes, &mut errs);
     // A module declaration can stay byte-for-byte identical while a new
     // overload or shadow changes what it should bind to. Ask the dialect
     // before sorting, rather than appending unreviewed SQL at apply time.
@@ -398,6 +430,8 @@ fn diff_partial_rebuilding(
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
             | Change::DropIndex { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
@@ -438,6 +472,8 @@ fn diff_partial_rebuilding(
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
             | Change::DropIndex { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
@@ -579,6 +615,8 @@ fn diff_partial_rebuilding(
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
             | Change::DropIndex { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
@@ -621,6 +659,8 @@ fn diff_partial_rebuilding(
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
             | Change::DropIndex { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
@@ -838,6 +878,17 @@ fn diff_partial_rebuilding(
             && column.generated.is_some()
         {
             return (COLUMN_ALTERATIONS, 2);
+        }
+        // A computed column comes down after every index and constraint drop
+        // of class 2, the ones that free a renamed column's name (2, 3)
+        // included, and goes up after every alteration of class 9: it reads
+        // the columns, in their final type, and nothing in either class reads
+        // it (#1174).
+        if matches!(c, Change::DropComputedColumn { .. }) {
+            return (2, 4);
+        }
+        if matches!(c, Change::AddComputedColumn { .. }) {
+            return (COLUMN_ALTERATIONS, 3);
         }
         if let Change::RenameColumn { table, from, .. } = c {
             let depth = chain_depth
@@ -1166,6 +1217,8 @@ fn recreate_referenced_foreign_keys(
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
@@ -1350,6 +1403,37 @@ fn recreate_retyped_dependents(
     // A column can carry two of these, a retype and the tightening split out
     // of it (#1367), so the answers are merged rather than the last kept.
     let mut retyped: BTreeMap<ColumnRef, pbps_dialect::RetypeDependents> = BTreeMap::new();
+    // A computed column dropped and added again under its name: what is over
+    // it has to come down first (4922, measured on 17.0) and go back after,
+    // as around a retype. No foreign key is ever over one (validation), and
+    // a check or a filter names it in text this does not parse (#1174).
+    let recomputed: BTreeSet<ColumnRef> = changes
+        .iter()
+        .filter_map(|change| {
+            if let Change::AddComputedColumn { table, name, .. } = change {
+                Some(table.column(name))
+            } else {
+                None
+            }
+        })
+        .filter(|column| {
+            changes.iter().any(|c| {
+                matches!(c, Change::DropComputedColumn { table, name, .. }
+                    if *table == column.table && *name == column.name)
+            })
+        })
+        .collect();
+    for column in recomputed {
+        also(
+            retyped.entry(column).or_default(),
+            pbps_dialect::RetypeDependents {
+                keys_and_indexes: true,
+                checks: true,
+                filtered_indexes: true,
+                foreign_keys: false,
+            },
+        );
+    }
     for (column, dependents) in changes.iter().filter_map(|change| match change {
         Change::AlterColumnType {
             column,
@@ -1397,6 +1481,8 @@ fn recreate_retyped_dependents(
         | Change::AddCheck { .. }
         | Change::DropCheck { .. }
         | Change::AddIndex { .. }
+        | Change::AddComputedColumn { .. }
+        | Change::DropComputedColumn { .. }
         | Change::DropIndex { .. }
         | Change::InsertRow { .. }
         | Change::UpdateRow { .. }
@@ -1546,6 +1632,168 @@ fn recreate_retyped_dependents(
 /// Constraints and indexes are always matched by name and never modified in
 /// place — the database itself does drop + add, and pretending otherwise would
 /// only give the emitter one more path that can fail.
+/// The column a change renames, drops, retypes or tightens or relaxes on
+/// `table`, under the name its expression would use, and what the change
+/// does to it. Every one is an `ALTER COLUMN` or an `sp_rename` the engine
+/// refuses on a computed column's input (#1174).
+fn input_change<'a>(change: &'a Change, table: &TableName) -> Option<(&'a str, &'static str)> {
+    if let Change::RenameColumn { table: t, from, .. } = change
+        && t == table
+    {
+        return Some((from, "renames"));
+    }
+    if let Change::DropColumn { column, .. } = change
+        && column.table == *table
+    {
+        return Some((&column.name, "drops"));
+    }
+    if let Change::AlterColumnType { column, .. } = change
+        && column.table == *table
+    {
+        return Some((&column.name, "retypes or recollates"));
+    }
+    if let Change::AlterColumnNullability { column, .. } = change
+        && column.table == *table
+    {
+        return Some((&column.name, "changes the nullability of"));
+    }
+    None
+}
+
+/// The plans a standing SQL Server computed column cannot be part of, each
+/// refused by name (DEC-1174.1):
+///
+/// - a rename, drop, retype or nullability change of a column its expression
+///   may read: 15336 and 4922, measured on 17.0;
+/// - an alter or drop of a module it may call: 3729, even without
+///   SCHEMABINDING;
+/// - and, for one this plan adds, a module this plan creates, which the
+///   ordering puts after it (class 14 after class 9).
+///
+/// "May" by [`Dialect::may_name`], which over-approximates. A computed column
+/// this plan drops, or changes and so drops and re-adds, is out of the way
+/// before any of these and is not standing.
+fn refuse_computed_dependencies(
+    declared: &Schema,
+    dialect: &dyn Dialect,
+    changes: &[Change],
+    errs: &mut Vec<DiffError>,
+) {
+    let dropped = |table: &TableName, name: &str| {
+        changes.iter().any(|c| {
+            matches!(c, Change::DropComputedColumn { table: t, name: n, .. }
+                if t == table && n == name)
+        })
+    };
+    let added = |table: &TableName, name: &str| {
+        changes.iter().any(|c| {
+            matches!(c, Change::AddComputedColumn { table: t, name: n, .. }
+                if t == table && n == name)
+        })
+    };
+    for (table_name, table) in &declared.tables {
+        for (name, computed) in &table.computed {
+            let standing = !dropped(table_name, name);
+            let at = table_name.column(name);
+            for change in changes {
+                if standing
+                    && let Some((column, what)) = input_change(change, table_name)
+                    && dialect.may_name(&computed.expression, column)
+                {
+                    errs.push(DiffError::ComputedInputChanged {
+                        computed: at.clone(),
+                        column: column.to_owned(),
+                        change: what,
+                    });
+                }
+                let module = match change {
+                    Change::AlterModule { id, .. } if standing => Some((id, "alters")),
+                    Change::DropModule { id, .. } if standing => Some((id, "drops")),
+                    Change::CreateModule { id, .. } if added(table_name, name) => {
+                        Some((id, "creates"))
+                    }
+                    Change::CreateTable { .. }
+                    | Change::DropTable { .. }
+                    | Change::RenameTable { .. }
+                    | Change::AddColumn { .. }
+                    | Change::DropColumn { .. }
+                    | Change::RenameColumn { .. }
+                    | Change::AlterColumnType { .. }
+                    | Change::AlterColumnNullability { .. }
+                    | Change::AlterColumnDefault { .. }
+                    | Change::AlterColumnExpression { .. }
+                    | Change::AddComputedColumn { .. }
+                    | Change::DropComputedColumn { .. }
+                    | Change::SetColumnDeprecated { .. }
+                    | Change::SetPrimaryKey { .. }
+                    | Change::AddUnique { .. }
+                    | Change::DropUnique { .. }
+                    | Change::AddForeignKey { .. }
+                    | Change::DropForeignKey { .. }
+                    | Change::AddCheck { .. }
+                    | Change::DropCheck { .. }
+                    | Change::AddIndex { .. }
+                    | Change::DropIndex { .. }
+                    | Change::InsertRow { .. }
+                    | Change::UpdateRow { .. }
+                    | Change::DeleteRow { .. }
+                    | Change::SetDataMode { .. }
+                    | Change::CreateModule { .. }
+                    | Change::AlterModule { .. }
+                    | Change::DropModule { .. }
+                    | Change::CreateRole { .. }
+                    | Change::DropRole { .. }
+                    | Change::RenameRole { .. }
+                    | Change::Grant { .. }
+                    | Change::Revoke { .. }
+                    | Change::PublicExecution { .. } => None,
+                };
+                if let Some((id, what)) = module {
+                    let function = id.object_name().name;
+                    if dialect.may_name(&computed.expression, &function) {
+                        errs.push(DiffError::ComputedFunctionChanged {
+                            computed: at.clone(),
+                            function,
+                            change: what,
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A table's computed columns (#1174, DEC-1174.1). Neither the expression nor
+/// the persistence changes in place, so a column that differs is dropped and
+/// added again, which `recreate_retyped_dependents` then rebuilds the indexes
+/// and checks over. With no uid, a renamed one is the same pair under two
+/// names, which the engine performs as well.
+fn diff_computed(name: &TableName, base: &Table, declared: &Table, changes: &mut Vec<Change>) {
+    // `declares`, not equality: a read-back holds `not_null` wherever the
+    // engine reports the column not nullable, which it also does for an
+    // expression that can never be NULL.
+    let kept = |wanted: Option<&pbps_model::ComputedColumn>,
+                was: Option<&pbps_model::ComputedColumn>| matches!((wanted, was), (Some(w), Some(b)) if w.declares(b));
+    for (column, was) in &base.computed {
+        if !kept(declared.computed.get(column), Some(was)) {
+            changes.push(Change::DropComputedColumn {
+                table: name.clone(),
+                name: column.clone(),
+                computed: was.clone(),
+            });
+        }
+    }
+    for (column, wanted) in &declared.computed {
+        if !kept(Some(wanted), base.computed.get(column)) {
+            changes.push(Change::AddComputedColumn {
+                table: name.clone(),
+                name: column.clone(),
+                computed: wanted.clone(),
+            });
+        }
+    }
+}
+
 fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &mut Vec<Change>) {
     // A declaration that leaves the key unnamed (`primary_key: [id]`) leaves
     // the name to the engine, and the engine invents one (`PK__t__357D...`)
@@ -2161,6 +2409,8 @@ fn dependency_rank(
         | Change::AddCheck { .. }
         | Change::DropCheck { .. }
         | Change::DropIndex { .. }
+        | Change::AddComputedColumn { .. }
+        | Change::DropComputedColumn { .. }
         | Change::SetDataMode { .. } => 0,
         // The clustered index goes in ahead of the rest of the addition
         // class. Building it rebuilds every nonclustered index already on the
@@ -2745,6 +2995,11 @@ fn order_key(c: &Change) -> u8 {
         | Change::DropForeignKey { .. }
         | Change::DropCheck { .. }
         | Change::SetPrimaryKey { to: None, .. } => 2,
+        // After the drops above (`sort_class` places it at the class's end),
+        // since an index or check over it blocks it (4922), and before every
+        // rename, drop or retype of a column its expression reads, which it
+        // blocks in turn (15336, 4922; measured on 17.0, #1174).
+        Change::DropComputedColumn { .. } => 2,
         // A class of its own, after the table renames: `sp_rename` on a column
         // names the table, and `resolve_columns` iterates the *declared*
         // schema, so a `RenameColumn` always carries the post-rename table.
@@ -2771,6 +3026,10 @@ fn order_key(c: &Change) -> u8 {
         | Change::AlterColumnNullability { .. }
         | Change::AlterColumnDefault { .. }
         | Change::AlterColumnExpression { .. } => COLUMN_ALTERATIONS,
+        // Once every column its expression reads is there in its final type
+        // (`sort_class` places it after the class's alterations), and before
+        // the indexes and checks of class 13 that may be over it (#1174).
+        Change::AddComputedColumn { .. } => COLUMN_ALTERATIONS,
         Change::SetColumnDeprecated { .. } => 10,
         // Rows arrive once every column they name exists and has its final
         // type, and before the constraints below: ADR-0004's "create table ->
@@ -3089,6 +3348,164 @@ mod tests {
         fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
             MinimalDialect.probe_framing()
         }
+    }
+
+    /// A computed column's expression or persistence change is a drop and an
+    /// add, in their classes, with the index over it rebuilt around them; a
+    /// read-back's `not_null` is held only where the declaration says it
+    /// (#1174, DEC-1174.1).
+    #[test]
+    fn a_computed_column_change_is_a_drop_and_an_add_around_its_index() {
+        let computed =
+            |expression: &str, persisted: bool, not_null: bool| pbps_model::ComputedColumn {
+                expression: expression.into(),
+                persisted,
+                not_null,
+            };
+        let with = |c: pbps_model::ComputedColumn| {
+            let mut t = table(&[
+                ("id", Column::new(ty("int")).not_null()),
+                ("a", Column::new(ty("int"))),
+            ]);
+            t.computed.insert("c".into(), c);
+            t.indexes.insert(
+                "ix_c".into(),
+                Index {
+                    columns: vec![IndexColumn {
+                        key: pbps_model::IndexKey::Column("c".into()),
+                        descending: false,
+                        opclass: None,
+                    }],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                    method: Default::default(),
+                },
+            );
+            schema_of("dbo.t", t)
+        };
+        let base = with(computed("a * 2", true, false));
+        assert_eq!(
+            kinds(&run(&base, &with(computed("a * 3", true, false)), &[])),
+            [
+                "DropIndex",
+                "DropComputedColumn",
+                "AddComputedColumn",
+                "AddIndex"
+            ]
+        );
+        assert_eq!(
+            kinds(&run(&base, &with(computed("a * 2", false, false)), &[])),
+            [
+                "DropIndex",
+                "DropComputedColumn",
+                "AddComputedColumn",
+                "AddIndex"
+            ]
+        );
+        // The read-back says NOT NULL wherever a persisted column is not
+        // nullable; a declaration that leaves it out is the same column.
+        let read_not_null = with(computed("a * 2", true, true));
+        assert!(run(&read_not_null, &base, &[]).changes.is_empty());
+        // A declared one is held to it.
+        assert_eq!(
+            kinds(&run(&base, &read_not_null, &[])),
+            [
+                "DropIndex",
+                "DropComputedColumn",
+                "AddComputedColumn",
+                "AddIndex"
+            ]
+        );
+        // Negative: an unchanged one is no change.
+        assert!(run(&base, &base, &[]).changes.is_empty());
+    }
+
+    /// A plan that renames, drops, retypes or changes the nullability of a
+    /// column a standing computed column may read, or alters a module it may
+    /// call, is refused by name; one that changes the computed column too is
+    /// not, since it is out of the way first (#1174, DEC-1174.1).
+    #[test]
+    fn a_standing_computed_column_refuses_a_change_to_what_it_reads() {
+        let errors_of = |base: &Schema, want: &Schema, intents: &[Intent]| {
+            let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let ids = crate::resolve(want, &base_ids, intents, &ctx())
+                .unwrap()
+                .ids;
+            diff_partial(
+                Side {
+                    schema: base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: want,
+                    ids: &ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .errors
+        };
+        let shaped = |a: Column, expression: &str| {
+            let mut t = table(&[("id", Column::new(ty("int")).not_null()), ("A2", a)]);
+            t.computed.insert(
+                "c".into(),
+                pbps_model::ComputedColumn {
+                    expression: expression.into(),
+                    persisted: false,
+                    not_null: false,
+                },
+            );
+            schema_of("dbo.t", t)
+        };
+        // Named in another case: the engine reads it all the same.
+        let base = shaped(Column::new(ty("int")), "a2 * 2");
+        for (changed, what) in [
+            (Column::new(ty("bigint")), "retypes"),
+            (Column::new(ty("int")).not_null(), "nullability"),
+        ] {
+            let errors = errors_of(&base, &shaped(changed, "a2 * 2"), &[]);
+            assert!(
+                matches!(errors.as_slice(), [DiffError::ComputedInputChanged { column, .. }] if column == "A2"),
+                "{what}: {errors:?}"
+            );
+        }
+        // Changed together with its expression, it is dropped first and
+        // re-added after: no refusal.
+        let errors = errors_of(&base, &shaped(Column::new(ty("bigint")), "a2 * 3"), &[]);
+        assert!(errors.is_empty(), "{errors:?}");
+        // Negative: a column it does not read, or names only in a literal.
+        let base = shaped(Column::new(ty("int")), "id + len('a2')");
+        let errors = errors_of(
+            &base,
+            &shaped(Column::new(ty("bigint")), "id + len('a2')"),
+            &[],
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        // A module it may call, altered while it stands.
+        let calls = |definition: &str| {
+            with_modules(
+                shaped(Column::new(ty("int")), "dbo.f(a2)"),
+                &[("dbo.f", definition)],
+            )
+        };
+        let errors = errors_of(&calls("one"), &calls("two"), &[]);
+        assert!(
+            errors.iter().any(|e| matches!(e,
+                DiffError::ComputedFunctionChanged { function, change, .. }
+                    if function == "f" && *change == "alters")),
+            "{errors:?}"
+        );
+        // Negative: an altered module it does not name.
+        let plain = shaped(Column::new(ty("int")), "a2 * 2");
+        let errors = errors_of(
+            &with_modules(plain.clone(), &[("dbo.f", "one")]),
+            &with_modules(plain, &[("dbo.f", "two")]),
+            &[],
+        );
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     /// A nullability change takes down and puts back what the dialect says

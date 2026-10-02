@@ -275,6 +275,18 @@ fn changed_owners(change: &Change) -> Option<(Vec<OwnerScope>, bool, bool)> {
         Change::DropColumn { column, .. } => {
             (WithChildren(Surface::Column(column.clone())), true, false)
         }
+        // A computed column is a column surface in the namespace, and its
+        // dependents (an index over it) go with it (#1174).
+        Change::AddComputedColumn { table, name, .. } => (
+            WithChildren(Surface::Column(table.column(name))),
+            false,
+            true,
+        ),
+        Change::DropComputedColumn { table, name, .. } => (
+            WithChildren(Surface::Column(table.column(name))),
+            true,
+            false,
+        ),
         Change::RenameColumn { table, from, .. } => (
             WithChildren(Surface::Column(table.column(from))),
             true,

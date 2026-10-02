@@ -147,6 +147,8 @@ pub fn rename_targets(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
             | Change::DropIndex { .. }
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }

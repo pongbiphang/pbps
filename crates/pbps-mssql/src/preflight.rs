@@ -365,6 +365,8 @@ impl AsStored {
                 | Change::AddCheck { .. }
                 | Change::DropCheck { .. }
                 | Change::AddIndex { .. }
+                | Change::AddComputedColumn { .. }
+                | Change::DropComputedColumn { .. }
                 | Change::DropIndex { .. }
                 | Change::InsertRow { .. }
                 | Change::UpdateRow { .. }
@@ -421,6 +423,14 @@ impl AsStored {
                 }
                 Change::AlterColumnType { column, to, .. } => {
                     this.types.insert(column.clone(), to.clone());
+                }
+                // A computed column's values are its expression over each row,
+                // which no probe evaluates before apply: a key over one this
+                // plan adds, or re-adds with another expression, is unchecked
+                // rather than counted over the values the old one stored
+                // (#1174).
+                Change::AddComputedColumn { table, name, .. } => {
+                    this.added.insert(table.column(name), Added::Unspellable);
                 }
                 // Both run before the deletes, so a child counted through
                 // either would refuse a delete that will be valid by then.
@@ -562,6 +572,7 @@ impl AsStored {
                 | Change::AddCheck { .. }
                 | Change::DropCheck { .. }
                 | Change::AddIndex { .. }
+                | Change::DropComputedColumn { .. }
                 | Change::DropIndex { .. }
                 // A module carries no data and no identity, so nothing here
                 // applies to one.
@@ -869,6 +880,18 @@ fn build(
             Ok(out)
         }
 
+        // A persisted computed column is computed over every stored row when
+        // it is added, and an expression that fails on one (an overflow, a
+        // division by zero) fails the statement. No probe evaluates it before
+        // apply; a non-persisted one is computed on read and asks nothing
+        // (#1174).
+        Change::AddComputedColumn { computed, .. } if computed.persisted => Ok(skip(
+            change,
+            "a persisted computed column's values cannot be evaluated before apply",
+            unchecked,
+        )),
+        Change::AddComputedColumn { .. } => Ok(Vec::new()),
+
         // The same question `AddUnique` asks, because in SQL Server it is the
         // same object: a UNIQUE constraint is enforced by a unique index, and
         // which YAML key the uniqueness was written under cannot decide
@@ -1008,6 +1031,7 @@ fn build(
         | Change::DropCheck { .. }
         // The unique ones are counted above; a plain index refuses nothing.
         | Change::AddIndex { .. }
+        | Change::DropComputedColumn { .. }
         | Change::DropIndex { .. }
         // Inserting and updating a declared row need no probe: the row's whole
         // content is in the plan, and anything the engine refuses about it

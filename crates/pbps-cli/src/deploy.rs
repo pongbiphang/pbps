@@ -2700,6 +2700,13 @@ fn part_as_planned(
             index_as_declared(was, table.indexes.get(name)?)
                 && table.index_is_clustered(name) == clustered
         }
+        // Held to its persistence, which the catalog reads back as given.
+        // The expression is respelled (`([a]*(2))`), as a check's is, so it
+        // is not compared here (#1174).
+        PartDefinition::Computed(was) => {
+            let now = table.computed.get(name)?;
+            now.persisted == was.persisted && (!was.not_null || now.not_null)
+        }
     })
 }
 
@@ -3479,6 +3486,7 @@ fn refuse_unplanned_movement(
                 pending!(foreign_keys, ForeignKey);
                 pending!(checks, Check);
                 pending!(indexes, Index);
+                pending!(computed, Computed);
             }
             let empty = BTreeSet::new();
             for column in was.columns.keys().chain(now.columns.keys()) {
@@ -3589,6 +3597,18 @@ fn refuse_unplanned_movement(
             );
             named_alike(n, Part::Check, "check", &was.checks, &now.checks, s, m);
             named_alike(n, Part::Index, "index", &was.indexes, &now.indexes, s, m);
+            // A computed column another session added, dropped or redefined
+            // is movement, as an index is: both reads are the catalog's, so
+            // they compare outright (#1174).
+            named_alike(
+                n,
+                Part::Computed,
+                "computed column",
+                &was.computed,
+                &now.computed,
+                s,
+                m,
+            );
             // And which of them holds the rows (#1178). Every part can read
             // back unchanged while another session moves the clustered index
             // between them, so the layout is compared on its own. The plan
@@ -3685,6 +3705,8 @@ fn refuse_unplanned_movement(
                         | pbps_model::Change::AddCheck { .. }
                         | pbps_model::Change::DropCheck { .. }
                         | pbps_model::Change::AddIndex { .. }
+                        | pbps_model::Change::AddComputedColumn { .. }
+                        | pbps_model::Change::DropComputedColumn { .. }
                         | pbps_model::Change::DropIndex { .. }
                         | pbps_model::Change::InsertRow { .. }
                         | pbps_model::Change::UpdateRow { .. }
@@ -4019,6 +4041,7 @@ fn refuse_unplanned_movement(
                     pbps_model::Part::ForeignKey => "foreign key",
                     pbps_model::Part::Check => "check",
                     pbps_model::Part::Index => "index",
+                    pbps_model::Part::Computed => "computed column",
                 };
                 let name = part_name.unwrap_or("");
                 moved.push(format!(
@@ -4035,6 +4058,9 @@ fn refuse_unplanned_movement(
                 }
                 (pbps_model::Part::Check, Some(n)) => ("check", table.checks.contains_key(n)),
                 (pbps_model::Part::Index, Some(n)) => ("index", table.indexes.contains_key(n)),
+                (pbps_model::Part::Computed, Some(n)) => {
+                    ("computed column", table.computed.contains_key(n))
+                }
                 // Only the primary key is nameless, and it is matched above.
                 (_, None) => continue,
             };

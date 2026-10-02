@@ -372,6 +372,20 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
             table: Table {
                 description: dto.description,
                 columns,
+                computed: dto
+                    .computed
+                    .into_iter()
+                    .map(|(name, c)| {
+                        (
+                            name,
+                            pbps_model::ComputedColumn {
+                                expression: c.expression,
+                                persisted: c.persisted,
+                                not_null: c.not_null,
+                            },
+                        )
+                    })
+                    .collect(),
                 primary_key,
                 unique,
                 foreign_keys,

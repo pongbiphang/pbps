@@ -40,6 +40,9 @@ pub struct DeclaredExpressions {
     /// `Generated::expression`, by table and column (DEC-1168.1).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub generated: BTreeMap<TableName, BTreeMap<String, String>>,
+    /// `ComputedColumn::expression`, by table and computed column (#1174).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub computed: BTreeMap<TableName, BTreeMap<String, String>>,
     /// `CheckConstraint::expression`, by table and constraint name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub checks: BTreeMap<TableName, BTreeMap<String, String>>,
@@ -57,6 +60,7 @@ impl DeclaredExpressions {
     pub fn is_empty(&self) -> bool {
         self.defaults.is_empty()
             && self.generated.is_empty()
+            && self.computed.is_empty()
             && self.checks.is_empty()
             && self.filters.is_empty()
             && self.keys.is_empty()
@@ -207,6 +211,13 @@ impl Declared {
                         .insert(column.clone(), generated.expression.clone());
                 }
             }
+            for (computed, spec) in &table.computed {
+                d.expressions
+                    .computed
+                    .entry(name.clone())
+                    .or_default()
+                    .insert(computed.clone(), spec.expression.clone());
+            }
             for (check, spec) in &table.checks {
                 d.expressions
                     .checks
@@ -255,6 +266,7 @@ impl Declared {
                     self.expressions
                         .generated
                         .extend(fresh.expressions.generated);
+                    self.expressions.computed.extend(fresh.expressions.computed);
                     self.expressions.checks.extend(fresh.expressions.checks);
                     self.expressions.filters.extend(fresh.expressions.filters);
                     self.expressions.keys.extend(fresh.expressions.keys);
@@ -263,6 +275,7 @@ impl Declared {
                 Change::RenameTable { from, to, .. } => {
                     rekey_table(&mut self.expressions.defaults, from, to);
                     rekey_table(&mut self.expressions.generated, from, to);
+                    rekey_table(&mut self.expressions.computed, from, to);
                     rekey_table(&mut self.expressions.checks, from, to);
                     rekey_table(&mut self.expressions.filters, from, to);
                     rekey_table(&mut self.expressions.keys, from, to);
@@ -323,6 +336,20 @@ impl Declared {
                         .entry(column.table.clone())
                         .or_default()
                         .insert(column.name.clone(), to.clone());
+                }
+                Change::AddComputedColumn {
+                    table,
+                    name,
+                    computed,
+                } => {
+                    self.expressions
+                        .computed
+                        .entry(table.clone())
+                        .or_default()
+                        .insert(name.clone(), computed.expression.clone());
+                }
+                Change::DropComputedColumn { table, name, .. } => {
+                    remove_nested(&mut self.expressions.computed, table, name);
                 }
                 Change::AddCheck {
                     table,
@@ -400,6 +427,7 @@ impl Declared {
     fn forget_table(&mut self, name: &TableName) {
         self.expressions.defaults.remove(name);
         self.expressions.generated.remove(name);
+        self.expressions.computed.remove(name);
         self.expressions.checks.remove(name);
         self.expressions.filters.remove(name);
         self.expressions.keys.remove(name);
@@ -441,6 +469,13 @@ impl Declared {
                         && let Some(read) = &mut spec.generated
                     {
                         read.expression = declared.clone();
+                    }
+                }
+            }
+            if let Some(computed) = self.expressions.computed.get(name) {
+                for (column, spec) in &mut table.computed {
+                    if let Some(declared) = computed.get(column) {
+                        spec.expression = declared.clone();
                     }
                 }
             }

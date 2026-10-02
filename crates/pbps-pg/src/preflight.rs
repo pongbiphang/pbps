@@ -770,6 +770,8 @@ impl AsStored {
                 | Change::AddCheck { .. }
                 | Change::DropCheck { .. }
                 | Change::AddIndex { .. }
+                | Change::AddComputedColumn { .. }
+                | Change::DropComputedColumn { .. }
                 | Change::DropIndex { .. }
                 | Change::CreateModule { .. }
                 | Change::AlterModule { .. }
@@ -3344,6 +3346,8 @@ fn build(
         | Change::DropCheck { .. }
         // The unique ones are counted above; a plain index refuses nothing.
         | Change::AddIndex { .. }
+        | Change::AddComputedColumn { .. }
+        | Change::DropComputedColumn { .. }
         | Change::DropIndex { .. }
         // A module holds no rows. A definition the engine will not compile
         // fails inside the plan's transaction, where the rollback is total.
@@ -3592,6 +3596,8 @@ pub(crate) fn probes(changes: &ChangeSet) -> Preflight {
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
             | Change::DropIndex { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }

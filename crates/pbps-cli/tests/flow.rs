@@ -1836,14 +1836,21 @@ fn source_default_collation_notice_is_only_printed_once_during_onboarding() {
         stderr(&init)
     );
 
-    // An unrelated catalog warning must still survive the shared connected read.
+    // An unrelated catalog warning must still survive the shared connected
+    // read: a column of an alias type, which is left out (a computed column
+    // was this warning until #1174 made it expressible).
+    on_server(own.connection(), "CREATE TYPE dbo.notice_type FROM int;");
     on_server(
         own.connection(),
-        "ALTER TABLE dbo.characters ADD derived AS (LEN(code));",
+        "ALTER TABLE dbo.characters ADD derived dbo.notice_type NULL;",
     );
     let verify = d.run(&["verify", "--db", own.connection()]);
     assert_eq!(code(&verify), 2, "{}", stderr(&verify));
-    assert!(stderr(&verify).contains("computed"), "{}", stderr(&verify));
+    assert!(
+        stderr(&verify).contains("user-defined type"),
+        "{}",
+        stderr(&verify)
+    );
     assert!(!stderr(&verify).contains(notice), "{}", stderr(&verify));
 }
 
@@ -2324,6 +2331,122 @@ fn a_tightening_follows_the_rows_that_fill_or_remove_its_nulls_through_the_cli()
     on_server(
         own.connection(),
         "IF (SELECT COUNT(*) FROM dbo.kept WHERE c IS NULL) <> 2 THROW 50000, 'something ran', 1;",
+    );
+}
+
+/// SQL Server computed columns go the whole way through the CLI (#1174).
+/// `pull` declares a persisted and a non-persisted one, with the index and
+/// check over them, in their own section; the next connected plan is empty;
+/// `bootstrap` rebuilds them on an empty database and a second `pull` writes
+/// the same files. An expression change on populated rows drops and re-adds
+/// the column around its index and check, applies, recomputes the values and
+/// leaves nothing to plan. A retype of a column a standing computed column
+/// reads is refused by name before anything runs.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn computed_columns_round_trip_and_change_through_the_cli() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let source = OwnDatabase::new(&server, "computed1174_src");
+    let target = OwnDatabase::new(&server, "computed1174_dst");
+    on_server(
+        source.connection(),
+        "CREATE TABLE dbo.t (id int NOT NULL CONSTRAINT pk_t PRIMARY KEY, a int NULL, b varchar(10) NULL,
+             doubled AS (a * 2),
+             label AS (CONCAT(b, '-', a)) PERSISTED,
+             base AS (ISNULL(a, 0) + 1) PERSISTED NOT NULL);
+         CREATE INDEX ix_label ON dbo.t (label);
+         ALTER TABLE dbo.t ADD CONSTRAINT ck_label CHECK (label <> '');
+         INSERT dbo.t (id, a, b) VALUES (1, 5, 'x'), (2, NULL, 'y');",
+    );
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let file = |d: &Demo| std::fs::read_to_string(d.dir.join("schema/dbo.t.yml")).unwrap();
+
+    let d = Demo::new("computed1174");
+    ok(&d.run(&["pull", "--db", source.connection()]));
+    let pulled = file(&d);
+    assert!(pulled.contains("\ncomputed:\n"), "{pulled}");
+    assert!(pulled.contains("  label: {expression:"), "{pulled}");
+    assert!(
+        pulled.contains("persisted: true, not_null: true"),
+        "{pulled}"
+    );
+    assert!(!pulled.contains("  doubled:\n    type"), "{pulled}");
+    assert!(
+        !pulled.contains("computed columns are not supported"),
+        "{pulled}"
+    );
+    d.commit();
+    ok(&d.run(&["baseline", "--db", source.connection(), "--reason", "adopt"]));
+    let o = d.run(&["plan", "--db", source.connection()]);
+    ok(&o);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+    ok(&d.run(&["bootstrap", "--db", target.connection()]));
+    let again = Demo::new("computed1174-again");
+    ok(&again.run(&["pull", "--db", target.connection()]));
+    assert_eq!(file(&again), file(&d));
+
+    // An expression change on populated rows, through the gate.
+    let path = d.dir.join("schema/dbo.t.yml");
+    let changed = pulled.replacen("'-'", "'+'", 1);
+    assert_ne!(changed, pulled, "{pulled}");
+    std::fs::write(&path, &changed).unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    ok(&d.run(&[
+        "plan",
+        "--db",
+        source.connection(),
+        "--out",
+        plan.to_str().unwrap(),
+    ]));
+    let checksum = plan_checksum(&plan);
+    let apply = |allow: &[&str]| {
+        let mut args = vec![
+            "apply",
+            "--db",
+            source.connection(),
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+        ];
+        for a in allow {
+            args.extend_from_slice(&["--allow", a]);
+        }
+        d.run(&args)
+    };
+    let refused = apply(&[]);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        stderr(&refused).contains("destructive"),
+        "{}",
+        stderr(&refused)
+    );
+    // The check over it is re-added, which is a constraint to approve too.
+    ok(&apply(&["destructive", "constraint"]));
+    let o = d.run(&["plan", "--db", source.connection()]);
+    ok(&o);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+    on_server(
+        source.connection(),
+        "IF (SELECT label FROM dbo.t WHERE id = 1) <> 'x+5' THROW 50000, 'not recomputed', 1;
+         IF OBJECT_ID('dbo.ck_label', 'C') IS NULL THROW 50000, 'check not put back', 1;
+         IF INDEXPROPERTY(OBJECT_ID('dbo.t'), 'ix_label', 'IndexID') IS NULL
+             THROW 50000, 'index not put back', 1;",
+    );
+
+    // Negative: `a` is read by every computed column, which all stand; its
+    // retype is refused by name, offline, before anything connects.
+    let retyped = changed.replacen("  a:\n    type: int\n", "  a:\n    type: bigint\n", 1);
+    assert_ne!(retyped, changed, "{changed}");
+    std::fs::write(&path, retyped).unwrap();
+    let o = d.run(&["plan"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("computed column dbo.t.doubled may read `a`"),
+        "{}",
+        stderr(&o)
     );
 }
 
@@ -12791,10 +12914,12 @@ fn a_ledger_failure_rolls_back_the_ddl_it_would_have_recorded() {
 }
 
 /// Unsupported catalog facts inside a managed table are drift, even when the
-/// expressible subset still has the same checksum.
+/// expressible subset still has the same checksum. A column of an alias type
+/// is one; a computed column was one until #1174, and is now ordinary drift
+/// in the expressible subset.
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
-fn a_computed_column_inside_the_managed_set_is_reported_as_drift() {
+fn an_unexpressible_column_inside_the_managed_set_is_reported_as_drift() {
     let connection = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -12831,7 +12956,12 @@ fn a_computed_column_inside_the_managed_set_is_reported_as_drift() {
     );
     rt.block_on(async {
         let mut conn = connect_live(&connection).await.unwrap();
-        conn.execute("ALTER TABLE dbo.pbps_computed_drift ADD twice AS (id * 2);")
+        conn.execute(
+            "IF TYPE_ID(N'dbo.pbps_drift_type') IS NULL CREATE TYPE dbo.pbps_drift_type FROM int;",
+        )
+        .await
+        .unwrap();
+        conn.execute("ALTER TABLE dbo.pbps_computed_drift ADD aliased dbo.pbps_drift_type NULL;")
             .await
             .unwrap();
     });
@@ -12840,7 +12970,7 @@ fn a_computed_column_inside_the_managed_set_is_reported_as_drift() {
     let planned = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
     assert_eq!(code(&planned), 1, "{}", stdout(&planned));
     assert!(
-        stderr(&planned).contains("computed"),
+        stderr(&planned).contains("user-defined type"),
         "{}",
         stderr(&planned)
     );
@@ -12852,9 +12982,9 @@ fn a_computed_column_inside_the_managed_set_is_reported_as_drift() {
     assert!(
         report["data"]["unexpressible"]
             .as_array()
-            .is_some_and(|items| items
-                .iter()
-                .any(|item| item.as_str().is_some_and(|s| s.contains("computed"))))
+            .is_some_and(|items| items.iter().any(|item| item
+                .as_str()
+                .is_some_and(|s| s.contains("user-defined type"))))
     );
 
     let status = Command::new(BIN)
@@ -12867,10 +12997,26 @@ fn a_computed_column_inside_the_managed_set_is_reported_as_drift() {
     let report: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
     assert_eq!(report["data"][0]["state"], "drift", "{report}");
 
+    // A computed column added by hand is expressible since #1174, and is
+    // drift in the subset the state records: still refused.
     rt.block_on(async {
         let mut conn = connect_live(&connection).await.unwrap();
         conn.execute(
-            "DROP TABLE dbo.pbps_computed_drift; DROP TABLE dbo.__pbps_lock; DROP TABLE dbo.__pbps_state;",
+            "ALTER TABLE dbo.pbps_computed_drift DROP COLUMN aliased; \
+             ALTER TABLE dbo.pbps_computed_drift ADD twice AS (id * 2);",
+        )
+        .await
+        .unwrap();
+    });
+    let planned = d.run(&["plan", "--db", &connection]);
+    assert_eq!(code(&planned), 1, "{}", stdout(&planned));
+    assert!(stderr(&planned).contains("drifted"), "{}", stderr(&planned));
+
+    rt.block_on(async {
+        let mut conn = connect_live(&connection).await.unwrap();
+        conn.execute(
+            "DROP TABLE dbo.pbps_computed_drift; DROP TABLE dbo.__pbps_lock; DROP TABLE dbo.__pbps_state; \
+             DROP TYPE dbo.pbps_drift_type;",
         )
         .await
         .unwrap();

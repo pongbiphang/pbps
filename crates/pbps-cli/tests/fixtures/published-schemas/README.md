@@ -47,3 +47,4 @@ DECISIONS 465).
 - `20/` adds an index's `method:` and a key's operator class (issue #1169).
 - `21/` adds an index's `keys:`, which may hold expression keys (issue #1169).
 - `22/` adds a column's `generated:` (issue #1168).
+- `23/` adds a table's `computed:` (issue #1174).

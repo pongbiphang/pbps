@@ -237,6 +237,14 @@ indexes:
   true}`** (PostgreSQL): computed on every write, never a default, and its
   kind always said. Its expression changes in place on PostgreSQL 17 and
   later; a change to or from generated is refused (DEC-1168.1).
+- **A SQL Server computed column is declared under `computed:`**, beside
+  `columns:` and not among them: `{expression: "a * 2"}`, with `persisted:
+  true` for a stored value and `not_null: true` for `PERSISTED NOT NULL`. It
+  has no type, nullability or default to declare: the engine infers them. An
+  index, unique constraint or check may be over one. A primary or foreign key
+  may not yet (#1419). Created at the end of its table, a computed column is
+  changed by a drop and an add, never in place. PostgreSQL refuses
+  `computed:`: its form is `generated:` (DEC-1174.1).
 - **An index with an expression key lists its keys under `keys:`**, one
   mapping each: `{column: id}` or `{expression: "lower(email)"}`, with
   optional `opclass:` and `order: desc`. An index names its keys under
@@ -701,7 +709,7 @@ exists when prod deploys the rename five versions later.
 | Class | Trigger | Risk |
 |---|---|---|
 | `rename` | A column, table or role is renamed | Dependent objects break (see 7.4); a role's old name is gone to `IS_ROLEMEMBER` and its kin |
-| `destructive` | DROP COLUMN / DROP TABLE / DROP INDEX / DROP UNIQUE constraint | Data loss or loss of a uniqueness guarantee |
+| `destructive` | DROP COLUMN / DROP TABLE / DROP INDEX / DROP UNIQUE constraint / DROP of a computed column, which a computed column's expression change includes | Data loss or loss of a uniqueness guarantee; a computed column's values are derived, but it is an object gone |
 | `narrowing` | Type narrowing, a value-changing or incompatible conversion, or a changed generation expression | Changed values (including binary padding, or every row recomputed), truncation, failed conversion |
 | `not-null` | nullable → NOT NULL with no DEFAULT | Existing NULLs violate it |
 | `constraint` | Adding UNIQUE / FK / CHECK, or a **unique index** | Existing rows may not satisfy it |
@@ -790,7 +798,7 @@ dependencies and prints a report:
 |---|---|---|
 | views / SPs / functions / triggers | `sys.sql_expression_dependencies` | Lists every referrer |
 | SCHEMABINDING views | As above plus `is_schema_bound` | **Blocks the rename outright**; must be dropped first |
-| Computed columns | `sys.computed_columns` | The definition breaks |
+| Computed columns | `sys.computed_columns` | The engine refuses the rename (15336). A plan renaming a column a standing computed column may read is refused offline by name (DEC-1174.1) |
 | DEFAULT / CHECK definitions | `sys.check_constraints` | The definition text holds the old name |
 | Index / constraint names | `sys.indexes` | The objects are fine, but names may embed the old column name (naming drift) |
 

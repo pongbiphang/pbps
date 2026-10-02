@@ -93,6 +93,20 @@ pub fn render(
         }
     }
 
+    if !table.computed.is_empty() {
+        s.push_str("\ncomputed:\n");
+        for (col_name, c) in &table.computed {
+            let _ = writeln!(
+                s,
+                "  {}: {{expression: {}{}{}}}",
+                scalar(col_name),
+                scalar(&c.expression),
+                if c.persisted { ", persisted: true" } else { "" },
+                if c.not_null { ", not_null: true" } else { "" }
+            );
+        }
+    }
+
     if let Some(pk) = &table.primary_key {
         s.push('\n');
         match pk {
@@ -805,6 +819,31 @@ indexes:
         assert_eq!(t.table.columns["a"].generated, None);
         let unstated = "table: app.t\ncolumns:\n  a: {type: integer}\n  b:\n    type: integer\n    generated: {expression: 'a * 2'}\n";
         assert!(crate::load_table_str(Path::new("t.yml"), unstated).is_err());
+    }
+
+    /// A computed column reads back with its expression and persisted state
+    /// and renders again, in its own section: it is not a column, and a
+    /// `type` on it is a load error (#1174).
+    #[test]
+    fn a_computed_column_round_trips_in_its_own_section() {
+        let yaml = "table: dbo.t\ncolumns:\n  a: {type: int}\n\ncomputed:\n  c1: {expression: a * 2}\n  c2: {expression: \"concat(a, '-')\", persisted: true}\n";
+        round_trip(yaml);
+        let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
+        assert_eq!(
+            t.table.computed["c2"],
+            pbps_model::ComputedColumn {
+                expression: "concat(a, '-')".into(),
+                persisted: true,
+                not_null: false
+            }
+        );
+        assert!(!t.table.computed["c1"].persisted);
+        round_trip(
+            "table: dbo.t\ncolumns:\n  a: {type: int}\n\ncomputed:\n  c3: {expression: a + 1, persisted: true, not_null: true}\n",
+        );
+        assert!(!t.table.columns.contains_key("c1"));
+        let typed = "table: dbo.t\ncolumns:\n  a: {type: int}\ncomputed:\n  c1: {expression: a * 2, type: int}\n";
+        assert!(crate::load_table_str(Path::new("t.yml"), typed).is_err());
     }
 
     /// A kind the selector does not have is a load error, not a default

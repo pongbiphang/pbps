@@ -92,6 +92,11 @@ pub struct RawColumn {
     /// (inherited, or the same name spelled explicitly) or an explicit
     /// `COLLATE` that overrides it.
     pub collation: Option<String>,
+    /// A computed column's expression as stored, wrapped in parentheses;
+    /// `None` for an ordinary column and for one the reader may not see.
+    pub computed_definition: Option<String>,
+    /// `sys.computed_columns.is_persisted`; false for an ordinary column.
+    pub computed_persisted: bool,
 }
 
 /// One column of a PRIMARY KEY or UNIQUE constraint, in key order.
@@ -825,14 +830,30 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         let table_name = name_of(c.object_id, &names);
 
         if c.is_computed {
-            push_limitation(
-                &mut warnings,
-                &mut limitations,
-                names.get(&c.object_id),
-                format!(
-                    "{table_name}.{}: computed columns are not supported yet; it was left out of the declarations",
-                    c.name
-                ),
+            // A definition the reader may not see is not an ordinary column
+            // and not an empty expression: it stays out, by name (#1174).
+            let Some(definition) = &c.computed_definition else {
+                push_limitation(
+                    &mut warnings,
+                    &mut limitations,
+                    names.get(&c.object_id),
+                    format!(
+                        "{table_name}.{}: the computed column's definition cannot be read; it was left out of the declarations",
+                        c.name
+                    ),
+                );
+                continue;
+            };
+            table.computed.insert(
+                c.name.clone(),
+                pbps_model::ComputedColumn {
+                    expression: strip_stored_parens(definition).to_owned(),
+                    persisted: c.computed_persisted,
+                    // Read back wherever a persisted column is not nullable,
+                    // which is also how an expression that is never NULL
+                    // reads; only a declared `not_null` is held to it.
+                    not_null: c.computed_persisted && !c.is_nullable,
+                },
             );
             continue;
         }
@@ -1305,13 +1326,17 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     // This is source context for bootstrapping the emitted declarations, not
     // managed-object drift that would refuse valid same-default deployments
     // (DECISIONS 491). Match the surviving column inventory: omitted temporal
-    // tables, computed columns and UDTs already have their own limitations.
-    // COLUMNS also reads system objects and the ledger, which cannot match.
+    // tables, unreadable computed columns and UDTs already have their own
+    // limitations. A held computed column counts: one of a character type is
+    // computed under the database's default collation on whichever database
+    // it is bootstrapped onto (#1174). COLUMNS also reads system objects and
+    // the ledger, which cannot match.
     if raw.columns.iter().any(|column| {
         column.collation.is_some()
-            && tables
-                .get(&column.object_id)
-                .is_some_and(|table| table.columns.contains_key(&column.name))
+            && tables.get(&column.object_id).is_some_and(|table| {
+                table.columns.contains_key(&column.name)
+                    || table.computed.contains_key(&column.name)
+            })
     }) {
         onboarding_notices.push(format!(
             "source database default collation `{}` is not recorded in the declarations; \
@@ -1802,6 +1827,8 @@ mod tests {
             default: None,
             default_constraint: None,
             collation: None,
+            computed_definition: None,
+            computed_persisted: false,
         }
     }
 
@@ -1981,6 +2008,51 @@ mod tests {
         }
     }
 
+    /// A computed column is read into its own section, with its expression
+    /// unwrapped as a check's is, its persistence, and NOT NULL wherever a
+    /// persisted one is not nullable. One whose definition cannot be read is
+    /// a limitation by name, never an ordinary column (#1174).
+    #[test]
+    fn a_computed_column_is_read_into_its_own_section() {
+        let computed = |name: &str, definition: Option<&str>, persisted: bool, nullable: bool| {
+            let mut c = raw_column(10, name, "int");
+            c.is_computed = true;
+            c.computed_definition = definition.map(str::to_owned);
+            c.computed_persisted = persisted;
+            c.is_nullable = nullable;
+            c
+        };
+        let raw = RawCatalog {
+            tables: vec![raw_table(10, "dbo", "t")],
+            columns: vec![
+                raw_column(10, "a", "int"),
+                computed("c1", Some("([a]*(2))"), false, true),
+                computed("c2", Some("(isnull([a],(0)))"), true, false),
+                computed("c3", Some("([a]+(1))"), true, true),
+                computed("hidden", None, false, true),
+            ],
+            ..Default::default()
+        };
+        let pulled = assemble(&raw);
+        let table = &pulled.schema.tables[&TableName::new("dbo", "t")];
+        assert_eq!(table.columns.keys().collect::<Vec<_>>(), ["a"]);
+        let read = |name: &str| table.computed[name].clone();
+        assert_eq!(
+            read("c1"),
+            pbps_model::ComputedColumn {
+                expression: "[a]*(2)".into(),
+                persisted: false,
+                not_null: false
+            }
+        );
+        assert!(read("c2").persisted && read("c2").not_null);
+        assert!(read("c3").persisted && !read("c3").not_null);
+        assert!(!table.computed.contains_key("hidden"));
+        assert!(pulled.limitations.iter().any(|l| {
+            l.detail.contains("t.hidden") && l.detail.contains("definition cannot be read")
+        }));
+    }
+
     #[test]
     fn omitted_character_columns_do_not_report_a_database_collation() {
         for computed in [true, false] {
@@ -2016,7 +2088,7 @@ mod tests {
                     limitation.target.object_name() == table_name
                         && limitation.detail.contains("customer.code")
                         && limitation.detail.contains(if computed {
-                            "computed columns"
+                            "computed column"
                         } else {
                             "user-defined type"
                         })
@@ -3157,6 +3229,8 @@ mod module_tests {
                 default: None,
                 default_constraint: None,
                 collation: None,
+                computed_definition: None,
+                computed_persisted: false,
             }],
             ..Default::default()
         }

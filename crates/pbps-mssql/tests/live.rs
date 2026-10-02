@@ -1495,15 +1495,13 @@ async fn pull_warns_about_what_it_cannot_express() {
 
     let legacy = &pulled.schema.tables[&TableName::new("dbo", "legacy")];
     assert!(legacy.columns.contains_key("doc"), "xml is expressible");
+    // Expressible since #1174, in its own section and never as a column.
     assert!(
-        !legacy.columns.contains_key("total"),
-        "the computed column must be left out, not misdeclared"
+        !legacy.columns.contains_key("total") && legacy.computed.contains_key("total"),
+        "the computed column must be held as one, not misdeclared"
     );
     assert!(
-        pulled
-            .warnings
-            .iter()
-            .any(|w| w.contains("total") && w.contains("computed")),
+        !pulled.warnings.iter().any(|w| w.contains("total")),
         "{:?}",
         pulled.warnings
     );
@@ -1630,20 +1628,27 @@ async fn omitted_character_columns_do_not_request_a_bootstrap_collation() {
         .await
         .expect("create character alias type");
     db.conn
-        .execute(
-            "ALTER TABLE dbo.numeric_only ADD computed_code AS CONVERT(varchar(20), amount),
-                 alias_code dbo.code_type NULL;",
-        )
+        .execute("ALTER TABLE dbo.numeric_only ADD alias_code dbo.code_type NULL;")
         .await
-        .expect("add omitted character columns to a retained numeric table");
+        .expect("add an omitted character column to a retained numeric table");
     let rows = db.conn
         .query("SELECT c.name FROM sys.columns c WHERE c.object_id = OBJECT_ID('dbo.numeric_only') AND c.collation_name IS NOT NULL;")
         .await
-        .expect("measure computed and alias column collations");
-    assert_eq!(rows.len(), 2);
+        .expect("measure the alias column's collation");
+    assert_eq!(rows.len(), 1);
     let omitted = pbps_mssql::catalog::introspect(&mut db.conn)
         .await
         .expect("introspect omitted character columns on a retained table");
+
+    // A character computed column is held since #1174, and is computed under
+    // the database default wherever it is bootstrapped: it asks.
+    db.conn
+        .execute("ALTER TABLE dbo.numeric_only ADD computed_code AS CONVERT(varchar(20), amount);")
+        .await
+        .expect("add a held character computed column");
+    let computed = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect the held computed character column");
 
     db.conn
         .execute("ALTER TABLE dbo.numeric_only ADD declared_code varchar(20) NULL;")
@@ -1655,7 +1660,7 @@ async fn omitted_character_columns_do_not_request_a_bootstrap_collation() {
     db.drop().await;
 
     let numeric_name = TableName::new("dbo", "numeric_only");
-    for pulled in [&temporal, &omitted, &declared] {
+    for pulled in [&temporal, &omitted, &computed, &declared] {
         assert_eq!(pulled.schema.tables.len(), 1);
         assert!(pulled.schema.tables.contains_key(&numeric_name));
         for name in ["versioned", "versioned_history"] {
@@ -1682,16 +1687,18 @@ async fn omitted_character_columns_do_not_request_a_bootstrap_collation() {
             .columns
             .contains_key("amount")
     );
-    for (column, reason) in [
-        ("computed_code", "computed columns"),
-        ("alias_code", "user-defined type"),
-    ] {
-        assert!(omitted.limitations.iter().any(|limitation| {
-            limitation.target.object_name() == numeric_name
-                && limitation.detail.contains(column)
-                && limitation.detail.contains(reason)
-        }));
-    }
+    assert!(
+        computed.schema.tables[&numeric_name]
+            .computed
+            .contains_key("computed_code")
+    );
+    assert_eq!(computed.onboarding_notices.len(), 1);
+    assert_eq!(computed.limitations, omitted.limitations);
+    assert!(omitted.limitations.iter().any(|limitation| {
+        limitation.target.object_name() == numeric_name
+            && limitation.detail.contains("alias_code")
+            && limitation.detail.contains("user-defined type")
+    }));
     assert_eq!(declared.limitations, omitted.limitations);
     assert_eq!(declared.onboarding_notices.len(), 1);
     assert!(declared.onboarding_notices[0].starts_with("source database default collation `"));

@@ -593,6 +593,17 @@ impl Dialect for Postgres {
     fn validate_table(&self, name: &TableName, table: &Table) -> Vec<DialectError> {
         let mut found = Vec::new();
         found.extend(validate::table_structure(table));
+        // SQL Server's computed columns (#1174). PostgreSQL's are generated
+        // columns, which declare their type (DEC-1168.1).
+        for computed in table.computed.keys() {
+            found.push(DialectError::Invalid {
+                dialect: crate::types::DIALECT,
+                message: format!(
+                    "`{computed}` is a computed column, which this model holds for SQL Server; \
+                     declare it as a column with `generated:` on PostgreSQL"
+                ),
+            });
+        }
         // The names first, and this is not a formality: `quote_ident` refuses
         // an identifier over [`MAX_IDENT_BYTES`], so a table this method called
         // clean is one the emitter cannot spell. `validate` is the command that
@@ -1174,6 +1185,43 @@ fn generated_name(name1: &str, name2: Option<&str>, label: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A computed column is SQL Server's in this model, and refused on
+    /// PostgreSQL by name, where a generated column is the form (#1174).
+    #[test]
+    fn a_computed_column_is_refused_on_postgres() {
+        use pbps_dialect::Dialect;
+        let mut table = pbps_model::Table::default();
+        table.columns.insert(
+            "a".into(),
+            pbps_model::Column::new("integer".parse().unwrap()),
+        );
+        let name: pbps_model::TableName = "app.t".parse().unwrap();
+        assert!(
+            super::Postgres::default()
+                .validate_table(&name, &table)
+                .is_empty()
+        );
+        table.computed.insert(
+            "c".into(),
+            pbps_model::ComputedColumn {
+                expression: "a * 2".into(),
+                persisted: true,
+                not_null: false,
+            },
+        );
+        let found: Vec<String> = super::Postgres::default()
+            .validate_table(&name, &table)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            found
+                .iter()
+                .any(|m| m.contains("computed column") && m.contains("generated:")),
+            "{found:?}"
+        );
+    }
+
     /// #465: the generated names are the engine's own, measured on 18.6 —
     /// the short forms, a long table cut to fit 63 bytes, a long table and a
     /// long column shortened in turn, and two-byte characters cut at a

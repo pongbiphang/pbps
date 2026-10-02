@@ -215,6 +215,8 @@ pub async fn drop_blockers(
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
@@ -341,6 +343,8 @@ fn stored(
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
             | Change::DropIndex { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
@@ -486,6 +490,8 @@ async fn removal(
         | Change::AddForeignKey { .. }
         | Change::AddCheck { .. }
         | Change::AddIndex { .. }
+        | Change::AddComputedColumn { .. }
+        | Change::DropComputedColumn { .. }
         | Change::InsertRow { .. }
         | Change::UpdateRow { .. }
         | Change::DeleteRow { .. }

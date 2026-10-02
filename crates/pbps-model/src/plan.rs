@@ -144,7 +144,11 @@ use crate::schema::Schema;
 /// Bumped to 16 for generated columns (DEC-1168.1): a column's `generated`
 /// in a created table's or added column's payload, and
 /// `AlterColumnExpression`.
-pub const CURRENT_VERSION: u32 = 16;
+///
+/// Bumped to 17 for SQL Server computed columns (DEC-1174.1): a table's
+/// `computed` in a created table's payload, and `AddComputedColumn` and
+/// `DropComputedColumn`.
+pub const CURRENT_VERSION: u32 = 17;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -603,7 +607,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 16);
+        assert_eq!(CURRENT_VERSION, 17);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads

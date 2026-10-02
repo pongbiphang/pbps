@@ -130,9 +130,15 @@ SELECT c.object_id, c.name, ty.name AS type_name,
        dc.name AS default_constraint_name,
        -- NULL for every type but the character ones; compared in `assemble`
        -- against the database's own default collation (issue #94).
-       c.collation_name
+       c.collation_name,
+       -- A computed column's expression and whether it is stored (#1174).
+       -- The definition is NULL where the reader may not see it.
+       cc.definition AS computed_definition,
+       CONVERT(bit, ISNULL(cc.is_persisted, 0)) AS computed_persisted
   FROM sys.columns c
   JOIN sys.types ty ON ty.user_type_id = c.user_type_id
+  LEFT JOIN sys.computed_columns cc
+         ON cc.object_id = c.object_id AND cc.column_id = c.column_id
   LEFT JOIN sys.identity_columns ic
          ON ic.object_id = c.object_id AND ic.column_id = c.column_id
   LEFT JOIN sys.default_constraints dc
@@ -378,6 +384,8 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             default_constraint: opt::<i32>(&row, "default_constraint_object_id")?
                 .zip(opt::<&str>(&row, "default_constraint_name")?.map(str::to_owned)),
             collation: opt::<&str>(&row, "collation_name")?.map(str::to_owned),
+            computed_definition: opt::<&str>(&row, "computed_definition")?.map(str::to_owned),
+            computed_persisted: get(&row, "computed_persisted")?,
         });
     }
 

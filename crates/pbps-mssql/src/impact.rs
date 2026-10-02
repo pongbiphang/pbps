@@ -130,6 +130,8 @@ pub async fn key_drop_blockers(
                 | Change::AddCheck { .. }
                 | Change::DropCheck { .. }
                 | Change::AddIndex { .. }
+                | Change::AddComputedColumn { .. }
+                | Change::DropComputedColumn { .. }
                 | Change::InsertRow { .. }
                 | Change::UpdateRow { .. }
                 | Change::DeleteRow { .. }
@@ -286,6 +288,8 @@ pub async fn key_drop_blockers(
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
             | Change::DropIndex { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
@@ -470,6 +474,8 @@ pub fn rename_targets(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
             | Change::AddCheck { .. }
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
             | Change::DropIndex { .. }
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }

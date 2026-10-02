@@ -697,13 +697,43 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
         }
     }
 
+    for (name, computed) in &table.computed {
+        if let Err(e) = ident::quote(name) {
+            errs.push(e);
+        }
+        if table.columns.contains_key(name) {
+            errs.push(invalid(format!(
+                "`{name}` is both a column and a computed column"
+            )));
+        }
+        if computed.expression.trim().is_empty() {
+            errs.push(invalid(format!(
+                "computed column `{name}` has an empty expression"
+            )));
+        }
+        // Measured on 17.0: 8183, "Only UNIQUE or PRIMARY KEY constraints can
+        // be created on computed columns, while CHECK, FOREIGN KEY, and NOT
+        // NULL constraints require that computed columns be persisted".
+        if computed.not_null && !computed.persisted {
+            errs.push(invalid(format!(
+                "computed column `{name}` is `not_null` but not `persisted`, and SQL Server holds \
+                 NOT NULL on persisted computed columns only"
+            )));
+        }
+    }
+
     if let Some(pk) = &table.primary_key {
         if let Some(n) = &pk.name
             && let Err(e) = ident::quote(n)
         {
             errs.push(e);
         }
-        errs.extend(key_columns("primary key", &pk.columns, table));
+        errs.extend(key_columns(
+            "primary key",
+            &pk.columns,
+            table,
+            Computed::Refused,
+        ));
         for c in &pk.columns {
             if table.columns.get(c).is_some_and(|c| c.nullable) {
                 errs.push(invalid(format!(
@@ -721,6 +751,7 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
             &format!("unique constraint `{n}`"),
             &u.columns,
             table,
+            Computed::Allowed,
         ));
     }
 
@@ -732,6 +763,7 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
             &format!("foreign key `{n}`"),
             &fk.columns,
             table,
+            Computed::Refused,
         ));
         if fk.columns.len() != fk.references_columns.len() {
             errs.push(invalid(format!(
@@ -763,7 +795,7 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
             errs.push(e);
         }
         // An expression key is PostgreSQL's (DEC-1169.2): SQL Server indexes a
-        // computed column instead, which this model does not hold.
+        // computed column instead (#1174).
         for key in &idx.columns {
             if let Some(expression) = key.key.expression() {
                 errs.push(invalid(format!(
@@ -777,7 +809,12 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
             .iter()
             .filter_map(|c| c.key.column().map(str::to_owned))
             .collect();
-        errs.extend(key_columns(&format!("index `{n}`"), &keys, table));
+        errs.extend(key_columns(
+            &format!("index `{n}`"),
+            &keys,
+            table,
+            Computed::Allowed,
+        ));
         if keys.len() > MAX_INDEX_KEY_COLUMNS {
             errs.push(invalid(format!(
                 "index `{n}` has {} key columns; SQL Server allows at most {MAX_INDEX_KEY_COLUMNS}",
@@ -785,7 +822,7 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
             )));
         }
         for inc in &idx.include {
-            if !table.columns.contains_key(inc) {
+            if !table.columns.contains_key(inc) && !table.computed.contains_key(inc) {
                 errs.push(invalid(format!(
                     "index `{n}` includes `{inc}`, which is not a column of this table"
                 )));
@@ -841,8 +878,26 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
     errs
 }
 
+/// Whether a key may name a computed column (#1174).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Computed {
+    /// An index or unique constraint: the engine indexes a computed column
+    /// whose expression is deterministic, and refuses one that is not at
+    /// create, inside the transaction.
+    Allowed,
+    /// A primary or foreign key, which needs the column `PERSISTED` and, for
+    /// a key, `NOT NULL`, and which a reference row keyed by it could not
+    /// write. Not held yet.
+    Refused,
+}
+
 /// The checks shared by every construct that builds a key out of columns.
-fn key_columns(what: &str, columns: &[String], table: &Table) -> Vec<DialectError> {
+fn key_columns(
+    what: &str,
+    columns: &[String],
+    table: &Table,
+    computed: Computed,
+) -> Vec<DialectError> {
     let mut errs = Vec::new();
     if columns.is_empty() {
         errs.push(invalid(format!("{what} names no columns")));
@@ -850,6 +905,13 @@ fn key_columns(what: &str, columns: &[String], table: &Table) -> Vec<DialectErro
     let mut seen = Vec::new();
     for c in columns {
         match table.columns.get(c) {
+            // Its type is the engine's to infer, so whether it can be a key
+            // is the engine's to say.
+            None if table.computed.contains_key(c) && computed == Computed::Allowed => {}
+            None if table.computed.contains_key(c) => errs.push(invalid(format!(
+                "{what} uses the computed column `{c}`, and a key over a computed column is not \
+                 held yet"
+            ))),
             None => errs.push(invalid(format!(
                 "{what} references `{c}`, which is not a column of this table"
             ))),
@@ -911,6 +973,82 @@ mod tests {
             },
         );
         assert_eq!(messages(&table(&name, &t)), "");
+    }
+
+    /// A computed column needs a name of its own and an expression; `not_null`
+    /// needs `persisted` (8183); an index or unique constraint may be over
+    /// one, and a primary or foreign key may not yet (#1174).
+    #[test]
+    fn a_computed_column_is_validated_as_its_own_kind() {
+        let computed =
+            |expression: &str, persisted: bool, not_null: bool| pbps_model::ComputedColumn {
+                expression: expression.into(),
+                persisted,
+                not_null,
+            };
+        let found = |t: &Table| {
+            super::table(&"dbo.t".parse().unwrap(), t)
+                .into_iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        };
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("a".into(), Column::new("int".parse().unwrap()).not_null());
+        table
+            .computed
+            .insert("c".into(), computed("a * 2", true, true));
+        table.indexes.insert(
+            "ix_c".into(),
+            pbps_model::Index {
+                columns: vec![pbps_model::IndexColumn {
+                    key: pbps_model::IndexKey::Column("c".into()),
+                    descending: false,
+                    opclass: None,
+                }],
+                include: Vec::new(),
+                unique: true,
+                filter: None,
+                method: Default::default(),
+            },
+        );
+        table.unique.insert(
+            "uq_c".into(),
+            pbps_model::UniqueConstraint {
+                columns: vec!["c".into()],
+            },
+        );
+        assert!(found(&table).is_empty(), "{:?}", found(&table));
+        for (bad, why) in [
+            (computed("", false, false), "empty expression"),
+            (computed("a * 2", false, true), "not `persisted`"),
+        ] {
+            let mut t = table.clone();
+            t.computed.insert("c".into(), bad);
+            assert!(found(&t).iter().any(|m| m.contains(why)), "{:?}", found(&t));
+        }
+        let mut clash = table.clone();
+        clash
+            .computed
+            .insert("a".into(), computed("1", false, false));
+        assert!(
+            found(&clash)
+                .iter()
+                .any(|m| m.contains("both a column and a computed column"))
+        );
+        let mut keyed = table.clone();
+        keyed.primary_key = Some(pbps_model::PrimaryKey {
+            name: None,
+            columns: vec!["c".into()],
+        });
+        assert!(
+            found(&keyed)
+                .iter()
+                .any(|m| m.contains("key over a computed column")),
+            "{:?}",
+            found(&keyed)
+        );
     }
 
     /// A generated column is PostgreSQL's in this model, and is refused on

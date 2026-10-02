@@ -672,6 +672,8 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         | Change::DropForeignKey { .. }
         | Change::DropCheck { .. }
         | Change::DropIndex { .. }
+        | Change::AddComputedColumn { .. }
+        | Change::DropComputedColumn { .. }
         | Change::CreateModule { .. }
         | Change::AlterModule { .. }
         | Change::DropModule { .. }

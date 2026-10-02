@@ -2273,6 +2273,17 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         // later only: 16 has no in-place form, and the connected path refuses
         // a plan that needs one there rather than emitting a drop and re-add
         // that would take the column's dependents with it (DEC-1168.1).
+        // Refused by validation: computed columns are SQL Server's (#1174),
+        // and PostgreSQL's own are generated columns. An error rather than a
+        // statement for a column this engine was never given.
+        Change::AddComputedColumn { table, name, .. }
+        | Change::DropComputedColumn { table, name, .. } => Err(DialectError::Invalid {
+            dialect: crate::types::DIALECT,
+            message: format!(
+                "{} is a computed column, which this model holds for SQL Server only",
+                table.column(name)
+            ),
+        }),
         Change::AlterColumnExpression { column, to, .. } => one(
             pg,
             &column.table,

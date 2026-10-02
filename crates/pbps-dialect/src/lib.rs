@@ -378,6 +378,9 @@ impl Unchecked {
                 format!("new NOT NULL column {}", table.column(name))
             }
             Change::AlterColumnNullability { column, .. } => format!("NOT NULL column {column}"),
+            Change::AddComputedColumn { table, name, .. } => {
+                format!("new computed column {}", table.column(name))
+            }
             Change::AlterColumnType { column, .. } => format!("type conversion of {column}"),
             Change::DeleteRow { table, key, .. } => format!("references to row {key} in {table}"),
             Change::CreateTable { .. }
@@ -387,6 +390,7 @@ impl Unchecked {
             | Change::RenameColumn { .. }
             | Change::AlterColumnDefault { .. }
             | Change::AlterColumnExpression { .. }
+            | Change::DropComputedColumn { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::DropUnique { .. }
             | Change::DropForeignKey { .. }
@@ -1990,6 +1994,39 @@ pub trait Dialect {
     /// [`normalize_definition`]: Dialect::normalize_definition
     fn lexicon(&self) -> Lexicon;
 
+    /// Whether `text` may name `name` as an identifier: in code, never in a
+    /// literal or a comment, ignoring case, and bounded by what cannot
+    /// continue an identifier, so `[a]` and `a*2` name `a` and `amount` does
+    /// not.
+    ///
+    /// An over-approximation, as DEC-1316.1's scan is: a function or a field
+    /// that shares the name counts too. A false yes costs a second plan; a
+    /// false no would cost an apply the engine refuses. Ignoring case is part
+    /// of that: under a case-insensitive collation `A2` reads `a2`, and the
+    /// engine stores `[a2]` either way (measured on 17.0, #1174).
+    fn may_name(&self, text: &str, name: &str) -> bool {
+        let name = name.to_lowercase();
+        let Some(first) = name.chars().next() else {
+            return false;
+        };
+        let code = self.lexicon().code_only(text).to_lowercase();
+        let mut from = 0;
+        while let Some(offset) = code[from..].find(&name) {
+            let start = from + offset;
+            let end = start + name.len();
+            let before = code[..start]
+                .chars()
+                .next_back()
+                .is_some_and(continues_ident);
+            let after = code[end..].chars().next().is_some_and(continues_ident);
+            if !before && !after {
+                return true;
+            }
+            from = start + first.len_utf8();
+        }
+        false
+    }
+
     /// The comparison form of a module definition (ADR-0002).
     ///
     /// # Why this is normalization and not parsing
@@ -3025,6 +3062,21 @@ mod tests {
     use pbps_model::{CheckConstraint, Index, IndexColumn, PrimaryKey, UniqueConstraint};
 
     use super::*;
+
+    /// The scan finds a name in code whatever its case or brackets, and not
+    /// inside a longer name, a literal or a comment: an over-approximation
+    /// that may say yes wrongly and must not say no wrongly (#1174).
+    #[test]
+    fn may_name_reads_code_not_literals_and_ignores_case() {
+        let d = MinimalDialect;
+        for text in ["[a2] * 2", "A2*2", "f(a2)", "x.a2 + 1"] {
+            assert!(d.may_name(text, "a2"), "{text}");
+        }
+        for text in ["a20 * 2", "ba2", "'a2' + x", "x -- a2\n + 1", ""] {
+            assert!(!d.may_name(text, "a2"), "{text}");
+        }
+        assert!(!d.may_name("a2", ""));
+    }
 
     #[test]
     fn safe_type_changes_need_no_approval() {
