@@ -8,6 +8,23 @@ import ignored_test_inventory_history_test as history_tests
 
 
 class AbsorbedIssues(unittest.TestCase):
+    def test_version_windows_identify_exactly_the_preserved_incompatible_programs(self):
+        history = json.loads((Path(__file__).parent / 'fixtures/closed-python-obligations.json').read_text())
+        aliases = {(1308, f'{use}-lazy-{call}-selector-{position}')
+                   for use in ('unused', 'evaluated')
+                   for call in ('globals()', 'inspect()', 'defaults.globals()')
+                   for position in ('before', 'after')}
+        aliases.add((1308, 'ordinary-source-without-reflective-spelling'))
+        annotations = {(issue, variant) for issue in (1233, 1330)
+                       for variant in ('definition-order', 'safe-definition')}
+        tagged = {(case['issue'], case['variant']) for case in history['cases'] if 'python' in case}
+        self.assertEqual(tagged, aliases | annotations)
+        for case in history['cases']:
+            key = (case['issue'], case['variant'])
+            expected = ((3, 12), None) if key in aliases else ((3, 11), (3, 14)) if key in annotations else ((3, 11), None)
+            with self.subTest(issue=key[0], variant=key[1]):
+                self.assertEqual(history_tests.python_range(case), expected)
+
     def test_every_listed_issue_has_an_executable_construct_and_line_control(self):
         path = Path(__file__).parent / 'fixtures/closed-python-obligations.json'
         history = json.loads(path.read_text())

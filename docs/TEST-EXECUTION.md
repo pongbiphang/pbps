@@ -115,6 +115,31 @@ its runtime control, refuses it, removes only that rule and observes admission,
 then restores refusal. A refusal by another guard does not count as that rule's
 counterfactual. Literal node decoding has no execution fallback.
 
+Historical program compatibility is explicit (DEC-1428.1). A corpus row may
+declare `python.minimum` (inclusive), `python.before` (exclusive), and a required
+reason. Untagged programs retain the documented Python 3.11 minimum. Type-alias
+statements require 3.12; the preserved named-expression annotation programs
+compile before 3.14. Original source, adapter, runtime outcome, provenance and
+owner disposition remain intact in both historical tables.
+
+Every row still runs in an actual child interpreter. Eligible rows must match
+their original runtime outcome and complete owner disposition. Ineligible rows
+must produce `SyntaxError`, not an arbitrary execution error. Below a syntax
+minimum the owner must report invalid Python; above the annotation boundary the
+AST remains parseable, so its original owner disposition is still checked.
+Completed runtime and owner checks produce per-case receipts; independent
+eligibility and coverage assertions reject dropped rows or broad skips.
+
+Run `scripts/ignored_test_inventory_test.py` with actual CPython 3.11, 3.12 and
+3.14 when changing these boundaries; CI runs its configured Python version.
+The integrated suite includes both historical consumers and closed-form
+controls. Generic type-parameter bindings retain their original source as an
+unsupported-syntax control on 3.11 and a binding-rule removal control on 3.12+.
+Independently removing each version boundary must restore its actual-interpreter
+failure, and skipping tagged but eligible rows must fail the execution ledger.
+Syntax eligibility does not establish annotation execution semantics or settle
+the separate module-annotation question in #1262.
+
 ## Maintaining the inventory
 
 - Add a newly ignored case's fully qualified libtest name to the correct target

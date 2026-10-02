@@ -227,6 +227,29 @@ class ClosedFixtures(unittest.TestCase):
                 with self.assertRaisesRegex(audit.InventoryError, 'protected binding TESTS'):
                     self.check(fixture(body))
 
+    def test_type_parameter_bindings_keep_actual_syntax_and_rule_removal_controls(self):
+        for parameter in ('TESTS', '*TESTS', '**TESTS'):
+            with self.subTest(parameter=parameter):
+                source = fixture('def unused[' + parameter + '](): pass\n')
+                if sys.version_info[:2] < (3, 12):
+                    observed = self.root / 'observed.py'
+                    observed.write_text(source, encoding='utf-8')
+                    child = subprocess.run([sys.executable, '-B', str(observed)], cwd=self.root,
+                                           capture_output=True, text=True, timeout=10)
+                    self.assertNotEqual(child.returncode, 0)
+                    self.assertEqual(child.stderr.splitlines()[-1].split(':')[0], 'SyntaxError')
+                    with self.assertRaisesRegex(audit.InventoryError,
+                                                r'runner.py:3: invalid Python fixture: '):
+                        self.check(source)
+                else:
+                    self.assertEqual(self.actual(source), [['owned'], True])
+                    with self.assertRaisesRegex(audit.InventoryError,
+                                                r'runner.py:3:.*protected binding TESTS'):
+                        self.check(source)
+                    with patch.object(audit, 'RULES', {key: value for key, value in audit.RULES.items()
+                                                     if key != 'bindings'}):
+                        self.assertEqual(self.check(source), 1)
+
     def test_reflection_is_checked_as_ast_nodes_and_never_as_string_contents(self):
         self.assertEqual(self.check(fixture('message = "globals gc builtins __dict__"\n')), 1)
         for body, construct in [('import gc\n', 'reflection import gc'),

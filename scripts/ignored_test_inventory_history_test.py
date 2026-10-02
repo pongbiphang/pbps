@@ -12,6 +12,38 @@ import ignored_test_inventory as audit
 import ignored_test_inventory_closed_test as closed
 
 
+def python_range(case):
+    """An explicit syntax window, never a fallback for unexpected failures."""
+    support = case.get('python', {})
+    if ('python' in case and (not isinstance(support, dict)
+            or set(support) - {'minimum', 'before', 'reason'}
+            or not {'minimum', 'before'}.intersection(support)
+            or not isinstance(support.get('reason'), str) or not support['reason'].strip())):
+        raise ValueError('invalid Python support range')
+    minimum, before = support.get('minimum', [3, 11]), support.get('before')
+    if minimum is None or ('before' in support and before is None):
+        raise ValueError('invalid Python support range')
+    for version in (minimum, before):
+        if version is not None and (not isinstance(version, (list, tuple)) or len(version) != 2
+                or any(type(part) is not int or part < 0 for part in version)):
+            raise ValueError('invalid Python support range')
+    minimum = tuple(minimum)
+    before = tuple(before) if before is not None else None
+    if minimum < (3, 11) or (before is not None and before <= minimum):
+        raise ValueError('invalid Python support range')
+    return minimum, before
+
+
+def supports_python(case, version=None):
+    minimum, before = python_range(case)
+    version = sys.version_info[:2] if version is None else version
+    if version < minimum:
+        return False
+    if before is not None and version >= before:
+        return False
+    return True
+
+
 class HistoricalCases(unittest.TestCase):
     def test_every_retired_property_has_preserved_program_inputs(self):
         history = json.loads((Path(__file__).parent / 'fixtures/closed-python-history.json').read_text())
@@ -19,6 +51,21 @@ class HistoricalCases(unittest.TestCase):
         self.assertEqual({case['origin'] for case in cases}, set(history['migrated_methods']))
         self.assertEqual(len({case['id'] for case in cases}), len(cases))
         self.assertTrue(all(case['format'] and case['source'] and case['runtime'] for case in cases))
+
+    def test_syntax_windows_keep_both_boundaries_and_ordinary_programs(self):
+        for version in ((3, 11), (3, 12), (3, 13), (3, 14)):
+            self.assertTrue(supports_python({}, version))
+            self.assertEqual(supports_python({'python': {'minimum': [3, 12], 'reason': 'type alias'}},
+                                            version), version >= (3, 12))
+            self.assertEqual(supports_python({'python': {'before': [3, 14], 'reason': 'annotation'}},
+                                            version), version < (3, 14))
+        for support in ({}, {'minimum': [3, 12]}, {'minimum': [3, True], 'reason': 'invalid'},
+                        {'minimum': None, 'reason': 'missing'}, {'before': None, 'reason': 'missing'},
+                        {'minimum': [3, 12], 'before': [3, 12], 'reason': 'empty'},
+                        {'minimum': [3, 10], 'reason': 'below the documented minimum'},
+                        {'before': [3, 14], 'reason': ' ', 'skip': True}):
+            with self.subTest(support=support), self.assertRaises(ValueError):
+                python_range({'python': support})
 
     def test_historical_programs_keep_their_runtime_and_complete_owner_dispositions(self):
         history = json.loads((Path(__file__).parent / 'fixtures/closed-python-history.json').read_text())
@@ -43,7 +90,14 @@ class HistoricalCases(unittest.TestCase):
                 child = subprocess.run([sys.executable, '-B', str(observed)], cwd=root,
                                        capture_output=True, text=True, timeout=10)
                 expected = case['runtime']
-                if 'error' in expected:
+                supported = supports_python(case)
+                if not supported:
+                    # Keep the original program as an explicit compatibility
+                    # control. A broad skip or unexpected runtime error cannot
+                    # stand in for its historical execution (DEC-1428.1).
+                    self.assertNotEqual(child.returncode, 0, 'version-ineligible syntax executed')
+                    self.assertEqual(child.stderr.splitlines()[-1].split(':')[0], 'SyntaxError')
+                elif 'error' in expected:
                     # A failed execution is retained as a failure control. It
                     # supplies no successful empty-selector evidence.
                     self.assertNotEqual(child.returncode, 0)
@@ -73,12 +127,21 @@ class HistoricalCases(unittest.TestCase):
                         del owner.inventory['owners']['live']['selection']
                     platform = 'linux'
                 (root / filename).write_text(source, encoding='utf-8')
-                if case['diagnostic'] is None:
+                minimum, _ = python_range(case)
+                if not supported and sys.version_info[:2] < minimum:
+                    with self.assertRaisesRegex(audit.InventoryError,
+                                                r'runner.py:\d+: invalid Python fixture: '):
+                        audit.validate(root, owner.inventory, owner.targets, platform)
+                elif case['diagnostic'] is None:
                     self.assertEqual(audit.validate(root, owner.inventory, owner.targets, platform), 1)
                 else:
                     with self.assertRaises(audit.InventoryError) as raised:
                         audit.validate(root, owner.inventory, owner.targets, platform)
                     self.assertEqual(str(raised.exception), case['diagnostic'])
+                # Above the annotation boundary Python still builds the AST;
+                # retain the original owner diagnostic even though compilation
+                # fails. Only completed runtime AND owner checks earn a receipt.
+                return 'executed' if supported else 'unsupported-syntax'
             finally:
                 owner.doCleanups()
 
@@ -86,9 +149,22 @@ class HistoricalCases(unittest.TestCase):
         # checker itself neither imports nor executes these fixture programs.
         with ThreadPoolExecutor(max_workers=4) as pool:
             tasks = [(case, pool.submit(exercise, case)) for case in history['cases']]
+            outcomes = {}
             for case, task in tasks:
                 with self.subTest(case=case['id'], property=case['origin']):
-                    task.result()
+                    outcomes[case['id']] = task.result()
+        self.assertEqual(set(outcomes), {case['id'] for case in history['cases']},
+                         'every preserved program needs an actual-interpreter and owner receipt')
+        # Independent range comparison detects dropped tasks and broad skips;
+        # eligibility itself cannot manufacture execution receipts.
+        expected = {case['id'] for case in history['cases']
+                    if python_range(case)[0] <= sys.version_info[:2]
+                    and (python_range(case)[1] is None or sys.version_info[:2] < python_range(case)[1])}
+        self.assertEqual({name for name, outcome in outcomes.items() if outcome == 'executed'}, expected,
+                         'every version-eligible program must actually execute')
+        self.assertEqual({name for name, outcome in outcomes.items() if outcome == 'unsupported-syntax'},
+                         set(outcomes) - expected)
+        return outcomes
 
 
 if __name__ == '__main__':
