@@ -1731,8 +1731,11 @@ rename walk of DEC-1366.1:
   function or a table, moves after it (#1432).
 - Refused by name: a rename, drop, retype or nullability change of a column a
   standing computed column reads (15336, 4922); an alter or drop of a
-  function a standing or re-added computed column calls (3729); a computed
-  column's drop under a schema-bound module the plan leaves standing (4922).
+  function a standing computed column calls (3729); a computed column's drop
+  under a schema-bound module the plan leaves standing (4922). A column the
+  plan drops and adds again is not standing: its edge is the old
+  expression's, which is gone before the function changes. What the new
+  expression calls has no edge yet, and the differ's screen reads it.
 
 The differ keeps its over-approximating refusals as an offline screen, where
 a false yes costs a second plan. It no longer moves a function's drop, and it

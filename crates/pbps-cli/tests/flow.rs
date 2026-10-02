@@ -2779,6 +2779,62 @@ fn the_catalogs_edges_refuse_what_the_engine_would() {
     );
 }
 
+/// A computed column rewritten off the function it called lets the same plan
+/// alter that function (#1455 review): the catalog's edge is the old
+/// expression's, which is dropped in class 2, before the alter of class 14,
+/// and the new one is added without it.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_computed_column_rewritten_off_a_function_lets_it_change() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "edges1455");
+    for sql in [
+        "CREATE FUNCTION dbo.f (@x int) RETURNS int AS BEGIN RETURN @x * 3 END;",
+        "CREATE TABLE dbo.t (id int NOT NULL CONSTRAINT pk_t PRIMARY KEY, a int NULL,
+             c AS (dbo.f(a)));",
+    ] {
+        on_server(own.connection(), sql);
+    }
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let d = Demo::new("edges1455");
+    ok(&d.run(&["pull", "--db", own.connection()]));
+    d.commit();
+    ok(&d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]));
+    let mut rewrote = 0;
+    for path in walk(&d.dir.join("schema")) {
+        let text = std::fs::read_to_string(&path).unwrap();
+        let changed = text
+            .replacen("[dbo].[f]([a])", "[a]*(2)", 1)
+            .replacen("@x * 3", "@x * 4", 1);
+        if changed != text {
+            rewrote += 1;
+            std::fs::write(&path, changed).unwrap();
+        }
+    }
+    assert_eq!(rewrote, 2, "the table and the function");
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    ok(&d.run(&[
+        "plan",
+        "--db",
+        own.connection(),
+        "--out",
+        plan.to_str().unwrap(),
+    ]));
+    ok(&d.run(&[
+        "apply",
+        "--db",
+        own.connection(),
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "destructive",
+    ]));
+}
+
 /// A column collation goes the whole way through the CLI (#1175). `pull`
 /// declares a column collated away from its database's default, `bootstrap`
 /// rebuilds it onto a database with another default, and a second `pull`

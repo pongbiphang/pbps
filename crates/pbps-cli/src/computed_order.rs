@@ -19,10 +19,13 @@
 //!   table's. What the function is schema-bound to, among the plan's own
 //!   drops, moves after it: another function, a table (#1432).
 //! - **Refusals.** A standing computed column blocks a rename, drop, retype
-//!   or nullability change of a column it reads (15336, 4922). Standing, or
-//!   added again in the plan, it blocks an alter or drop of a function it
-//!   calls (3729). A schema-bound module over a computed column blocks the
-//!   column's drop (4922). Each is refused by name.
+//!   or nullability change of a column it reads (15336, 4922), and an alter
+//!   or drop of a function it calls (3729). A schema-bound module over a
+//!   computed column blocks the column's drop (4922). Each is refused by
+//!   name. A column the plan drops and adds again is not standing: the edge
+//!   is its old expression's, which is gone before the function changes, and
+//!   what its new expression calls is the differ's offline screen to judge,
+//!   as the catalog has no edge for text not yet stored.
 //! - Nothing is rebuilt: a module over a computed column the plan changes is
 //!   refused, not dropped and recreated around it. That is follow-up scope.
 //!
@@ -147,11 +150,6 @@ pub(crate) fn order_by_edges(
     let standing = |table: &TableName, column: &str| {
         !table_gone(table) && !is(&dropped, table, column) && !is(&added, table, column)
     };
-    // There when a module change reaches it: standing, or added again at
-    // (9, 3), after the module drops of class 0 and before the alters of 14.
-    let calls_then = |table: &TableName, column: &str| {
-        !table_gone(table) && (!is(&dropped, table, column) || is(&added, table, column))
-    };
     let computed_edges = || edges.iter().filter(|e| e.from_column.is_some());
 
     let mut refused = Vec::new();
@@ -184,15 +182,10 @@ pub(crate) fn order_by_edges(
         if let Some((function, what)) = module {
             for e in computed_edges() {
                 let computed = e.from_column.as_deref().unwrap_or_default();
-                // Dropped for good, the column is out of the way first: the
-                // function's drop is moved after it below.
-                let blocks = if what == "drops" {
-                    !table_gone(&e.from) && !is(&dropped, &e.from, computed)
-                        || is(&added, &e.from, computed) && is(&dropped, &e.from, computed)
-                } else {
-                    calls_then(&e.from, computed)
-                };
-                if same_object(&e.to, &function) && blocks {
+                // Dropped, for good or to add again, the column is out of the
+                // way first: the function's drop is moved after it below, and
+                // its alter runs in class 14, after the drop's class 2.
+                if same_object(&e.to, &function) && standing(&e.from, computed) {
                     refused.push(format!(
                         "computed column {}.{computed} calls `{function}`, which this plan {what}, \
                          and SQL Server refuses that while the column calls it. Apply the \
@@ -447,8 +440,7 @@ mod tests {
     /// The refusals, each by the catalog's edge and so by the engine's
     /// spelling: an input change under a standing computed column (`café`
     /// read by `[cafe]` under an accent-insensitive collation is the edge,
-    /// not the text, #1426), a function change under a standing or re-added
-    /// one, and a computed column's drop under a schema-bound module (#1439:
+    /// not the text, #1426), a function change under a standing one, and a computed column's drop under a schema-bound module (#1439:
     /// `is_schema_bound`, not the word).
     #[test]
     fn the_edges_refuse_what_the_engine_would() {
@@ -465,7 +457,11 @@ mod tests {
         let calls = [computed_edge("dbo.t", "c", "dbo.f", None)];
         let e = order(vec![drop_module("dbo.f")], &calls).unwrap_err();
         assert!(e.contains("calls `dbo.f`"), "{e}");
-        let e = order(
+        // Dropped to be added again, the column's edge is its old
+        // expression's, gone before the function changes: no refusal, and
+        // the drop moves after the column's (#1455 review). What the new
+        // expression calls is the differ's screen.
+        let ran = order(
             vec![
                 drop_module("dbo.f"),
                 drop_computed("dbo.t", "c"),
@@ -473,8 +469,11 @@ mod tests {
             ],
             &calls,
         )
-        .unwrap_err();
-        assert!(e.contains("calls `dbo.f`"), "{e}");
+        .unwrap();
+        assert!(
+            ran.iter().position(|x| x == "dbo.f") > ran.iter().position(|x| x == "dbo.t"),
+            "{ran:?}"
+        );
 
         let viewed = [bound_edge("dbo.v", "dbo.t", Some("c"))];
         let e = order(vec![drop_computed("dbo.t", "c")], &viewed).unwrap_err();

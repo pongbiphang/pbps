@@ -941,6 +941,7 @@
         "a_column_a_filtered_index_names_is_renamed_after_the_index_is_dropped",
         "a_column_collation_round_trips_and_changes_through_the_cli",
         "a_computed_column_and_the_function_it_calls_drop_together",
+        "a_computed_column_rewritten_off_a_function_lets_it_change",
         "a_connected_sql_server_plan_names_inapplicable_postgres_checks_in_json",
         "a_created_table_with_a_foreign_key_applies",
         "a_declared_child_row_survives_a_parent_delete_with_and_without_a_retype",
