@@ -14,9 +14,13 @@ struct Affected {
     children: bool,
     opening: bool,
     closing: bool,
-    /// A DROP can coexist with a CREATE of the same spelling under a new UID.
-    /// Its opening endpoint is the dropped UID, never the desired one's.
-    dropped_before: Option<Surface>,
+    /// A DROP can coexist with a CREATE or a rename into the same spelling
+    /// under another UID. Each dropped UID's opening endpoint is kept, beside
+    /// the one the desired UID records; a later change never replaces them.
+    dropped_before: BTreeSet<Surface>,
+    /// A change other than a drop also addresses this spelling, so the UID
+    /// the desired schema records there has an opening endpoint too.
+    kept: bool,
 }
 
 fn contains(owner: &ObjectOwnership, surface: &Surface, children: bool) -> bool {
@@ -272,16 +276,11 @@ pub(super) fn derive(
             let entry = affected
                 .entry(Surface::Table(final_table.clone()))
                 .or_default();
-            if entry.dropped_before.is_some() && entry.dropped_before != prior {
-                return Err(Error::Binding(
-                    "a parent inventory mixes recorded table UIDs".into(),
-                ));
-            }
             // Keep the parent exact: adding it must not grant authority over
             // other columns, defaults, checks or independent indexes.
             entry.opening = true;
             entry.closing = true;
-            entry.dropped_before = prior;
+            entry.dropped_before.extend(prior);
         }
         let (surface, children, opening, closing, dropped) = match &step.change {
             Change::CreateTable { uid, name, .. } => {
@@ -511,23 +510,23 @@ pub(super) fn derive(
         entry.children |= children;
         entry.opening |= opening;
         entry.closing |= closing;
-        if dropped.is_some() {
-            entry.dropped_before = dropped;
-        }
+        entry.kept |= dropped.is_none();
+        entry.dropped_before.extend(dropped);
     }
-    let (mut transitions, opening_endpoints): (Vec<ObjectTransition>, Vec<Option<Surface>>) =
+    let (mut transitions, opening_endpoints): (Vec<ObjectTransition>, Vec<BTreeSet<Surface>>) =
         affected
             .into_iter()
             .map(|(surface, intent)| {
-                let prior = intent
-                    .dropped_before
-                    .or_else(|| opening_endpoint(&surface, base, desired));
+                let mut priors = intent.dropped_before;
+                if priors.is_empty() || intent.kept {
+                    priors.extend(opening_endpoint(&surface, base, desired));
+                }
                 let before = if intent.opening {
-                    prior
-                        .as_ref()
+                    priors
+                        .iter()
                         .filter(|prior| declared(base.schema, prior))
-                        .map(|prior| inventory(opening, prior, intent.children))
-                        .unwrap_or_default()
+                        .flat_map(|prior| inventory(opening, prior, intent.children))
+                        .collect()
                 } else {
                     BTreeSet::new()
                 };
@@ -542,7 +541,7 @@ pub(super) fn derive(
                         before,
                         after,
                     },
-                    prior,
+                    priors,
                 )
             })
             .unzip();
@@ -561,10 +560,11 @@ pub(super) fn derive(
             // takes that name in the desired schema. Use the endpoint that
             // selected its opening inventory, never resolve it again by the
             // final spelling of the transition.
-            if let (Some(child_opening), Some(parent_opening)) =
-                (&opening_endpoints[index], &opening_endpoints[parent])
-                && specializes(child_opening, parent_opening)
-            {
+            if opening_endpoints[index].iter().any(|child_opening| {
+                opening_endpoints[parent]
+                    .iter()
+                    .any(|parent_opening| specializes(child_opening, parent_opening))
+            }) {
                 child_before.extend(child.before.iter().cloned());
             }
             if specializes(&child.surface, &transitions[parent].surface) {

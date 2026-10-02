@@ -2210,6 +2210,86 @@ fn an_object_grant_after_a_same_name_replacement_names_the_replacement() {
     }
 }
 
+/// Dropping a table and renaming another into its name in one plan puts two
+/// recorded UIDs behind one closing spelling. Both opening tables are the
+/// transition's inventory: the dropped one and the renamed one.
+#[test]
+fn a_rename_into_a_dropped_tables_name_inventories_both_opening_tables() {
+    use pbps_db::resolver::capture::ObjectIdentity;
+    use pbps_model::{Column, PlannedChange, Table};
+    use pbps_pg::resolver::capture::BindingRecord;
+    use std::collections::BTreeSet;
+
+    let target: pbps_model::TableName = "app.target".parse().unwrap();
+    let other: pbps_model::TableName = "app.other".parse().unwrap();
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("id".into(), Column::new("integer".parse().unwrap()));
+    let mut base = Schema::default();
+    base.tables.insert(target.clone(), table.clone());
+    base.tables.insert(other.clone(), table.clone());
+    let base_ids = ids(&base, &IdsFile::default());
+    let dropped_uid = base_ids.table_uid(&target).unwrap().clone();
+    let renamed_uid = base_ids.table_uid(&other).unwrap().clone();
+    let mut desired = Schema::default();
+    desired.tables.insert(target.clone(), table);
+    let mut desired_ids = base_ids.clone();
+    desired_ids.tables.remove(&dropped_uid);
+    desired_ids
+        .columns
+        .retain(|_, column| column.table != target);
+    desired_ids.rename_table(&other, &target);
+    let relation = |name: &pbps_model::TableName| ObjectIdentity {
+        class: "pg_class".into(),
+        name: vec![name.schema.clone(), name.name.clone()],
+        signature: vec![],
+    };
+    let owned = |name: &pbps_model::TableName| BindingRecord {
+        object: relation(name),
+        ownership: ObjectOwnership::Surface(Surface::Table(name.clone())),
+        bindings: vec![],
+    };
+    let changes = ChangeSet {
+        changes: vec![
+            PlannedChange::new(Change::DropTable {
+                uid: dropped_uid,
+                name: target.clone(),
+            }),
+            PlannedChange::new(Change::RenameTable {
+                uid: renamed_uid,
+                from: other.clone(),
+                to: target.clone(),
+                defaults: vec![],
+            }),
+        ],
+    };
+    let transitions = super::transitions::derive(
+        &changes,
+        pbps_diff::Side {
+            schema: &base,
+            ids: &base_ids,
+        },
+        pbps_diff::Side {
+            schema: &desired,
+            ids: &desired_ids,
+        },
+        &[owned(&target), owned(&other)],
+        &[owned(&target)],
+    )
+    .unwrap();
+    let merged = transitions
+        .iter()
+        .find(|t| t.surface == Surface::Table(target.clone()))
+        .unwrap();
+    assert_eq!(
+        merged.before,
+        BTreeSet::from([relation(&target), relation(&other)]),
+        "the dropped table's opening record must not be replaced by the renamed one's"
+    );
+    assert_eq!(merged.after, BTreeSet::from([relation(&target)]));
+}
+
 /// A recorded rename frees a spelling another UID may take. A check dropped
 /// from the old table belongs to its opening UID exactly once.
 #[test]
