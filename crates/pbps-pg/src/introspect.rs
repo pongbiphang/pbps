@@ -445,8 +445,9 @@ pub struct RawGrant {
     ///
     /// The name alone does not decide it, which is why
     /// [`RawGrant::revocable`] exists beside it. An inherited grantor counts
-    /// too when nothing competes with it — measured, `ih_deploy` inheriting
-    /// `ih_mid` and holding no direct option removed `ih_reader=r/ih_mid`,
+    /// too when it is the unique nearest candidate (DEC-565.1) — measured,
+    /// `ih_deploy` inheriting `ih_mid` and holding no direct option removed
+    /// `ih_reader=r/ih_mid`,
     /// while the same revoke with a competing direct option in place removed
     /// nothing and reported success (DECISIONS 483). This field is what the
     /// report names; the decision is the engine's.

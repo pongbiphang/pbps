@@ -1493,12 +1493,24 @@ fn owners_query() -> String {
 /// An effective grant option answers `GRANT`, not `REVOKE`: PostgreSQL only
 /// changes the entries attributed to the grantor it selects. Owner and
 /// superuser act as the owner; otherwise the current role wins when it holds a
-/// **direct** option, and a **unique inherited** option is sufficient too —
-/// measured on 18.6, `ih_deploy` inheriting `ih_mid` and holding no direct
-/// option of its own revoked `ih_reader=r/ih_mid`, while the same revoke with
-/// a competing direct option in place removed nothing and reported success.
-/// Competing inherited paths need explicit role selection, because PostgreSQL
-/// does not promise which one wins (DECISIONS 483).
+/// **direct** option, and a **nearest unique inherited** option is
+/// sufficient too — measured on 18.6, `ih_deploy` inheriting `ih_mid` and
+/// holding no direct option of its own revoked `ih_reader=r/ih_mid`, while the
+/// same revoke with a competing direct option in place removed nothing and
+/// reported success.
+///
+/// Among inherited candidates the engine takes the **nearest**: it walks the
+/// inheritable memberships breadth first from the current role (with the
+/// database owner's implicit `pg_database_owner`) and selects the first role
+/// holding the option (`select_best_grantor`). So a unique candidate at the
+/// least depth wins. Measured on 18 and 16, a deployer inheriting the owner
+/// directly and a grant-option holder through one more role revoked the
+/// owner's entry (#565). Candidates sharing the least depth are still
+/// ambiguous: the walk's order within one depth is the catalog's, and
+/// PostgreSQL does not promise it (DECISIONS 483). A candidate whose depth the
+/// walk does not find declines the selection rather than being left out,
+/// since leaving out a nearer competitor would let a farther role look
+/// nearest (DEC-565.1).
 ///
 /// One original grantor per grantee, target **and privilege** as well: a
 /// `REVOKE` removes only the entries its selected grantor put there, so
@@ -1520,14 +1532,34 @@ pub(crate) fn revocable_by_current_role(owner: &str, acl: &str) -> String {
              WHEN EXISTS (SELECT FROM pg_catalog.aclexplode({acl}) own
                  WHERE own.grantee = me.oid AND own.is_grantable
                    AND own.privilege_type = a.privilege_type) THEN me.oid
-             ELSE (SELECT min(candidate.oid::bigint)::oid FROM (
+             ELSE (WITH RECURSIVE reach(oid, depth) AS (
+                 SELECT me.oid, 0
+                 UNION ALL
+                 SELECT e.roleid, r.depth + 1 FROM reach r
+                   JOIN (SELECT m.member, m.roleid FROM pg_catalog.pg_auth_members m
+                          WHERE m.inherit_option
+                         UNION ALL
+                         SELECT d.datdba, 'pg_database_owner'::pg_catalog.regrole::oid
+                           FROM pg_catalog.pg_database d
+                          WHERE d.datname = pg_catalog.current_database()) e
+                     ON e.member = r.oid
+                  WHERE r.depth < 64)
+               SELECT min(n.oid::bigint)::oid FROM (
+                 SELECT c.oid, c.depth, min(c.depth) OVER () AS nearest,
+                        bool_or(c.depth IS NULL) OVER () AS unknown
+                   FROM (SELECT candidate.oid,
+                                (SELECT min(r.depth) FROM reach r
+                                  WHERE r.oid = candidate.oid) AS depth
+                           FROM (
                  SELECT {owner} AS oid WHERE pg_catalog.pg_has_role(me.oid, {owner}, 'USAGE')
                  UNION
                  SELECT opt.grantee FROM pg_catalog.aclexplode({acl}) opt
                   WHERE opt.is_grantable AND opt.privilege_type = a.privilege_type
                     AND opt.grantee <> 0
                     AND pg_catalog.pg_has_role(me.oid, opt.grantee, 'USAGE')
-             ) candidate HAVING count(*) = 1)
+                           ) candidate) c) n
+                WHERE NOT n.unknown AND n.depth = n.nearest
+               HAVING count(*) = 1)
          END, false) AND (SELECT count(DISTINCT grantor)
              FROM pg_catalog.aclexplode({acl})
             WHERE grantee = a.grantee AND privilege_type = a.privilege_type) = 1"
