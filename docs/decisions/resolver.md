@@ -1203,3 +1203,11 @@ grant keeps the target's physical column order, which can differ from the
 declaration order scratch created. A rebuild that would drop a routine grant
 option is the ordinary connected rebuild guard's refusal
 (`modules::before_a_rebuild`), not the producer's.
+
+A foreign key's internal RI triggers are named after their own OID, so a
+created or dropped key's triggers could never match between scratch and
+target. Measured on PostgreSQL 16 and 18, each has an internal dependency on its
+constraint, and its relation, constraint and trigger function are unique, a
+self-referencing key included. An internal constraint trigger is identified by
+those three, its name is neither a property nor part of its rendered definition,
+and it belongs to the table surface that owns the constraint.

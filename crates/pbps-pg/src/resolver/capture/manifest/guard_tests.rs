@@ -287,6 +287,85 @@ fn classify_attrdefs(
     )
 }
 
+/// A foreign key's internal RI triggers carry the constraint in their logical
+/// identity and an internal dependency on it, so they change with the table
+/// surface that owns the key. A declared trigger, and an internal trigger of
+/// an unowned constraint, gain nothing from that rule.
+#[test]
+fn a_foreign_keys_internal_triggers_belong_to_its_table_surface() {
+    for major in [16, 18] {
+        let (mut captured, mut schema, ids) = generated_attrdef_fixture(major);
+        let table = TableName::new("app", "t");
+        let relation = relation_identity(&table);
+        schema.tables.get_mut(&table).unwrap().foreign_keys.insert(
+            "t_fk".into(),
+            pbps_model::ForeignKey {
+                columns: vec!["a".into()],
+                references_table: table.clone(),
+                references_columns: vec!["id".into()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+        let namespace = identity("pg_namespace", &["app"], vec![]);
+        let no_type = identity("pg_type", &[], vec![]);
+        let constraint = |name: &str| {
+            identity(
+                "pg_constraint",
+                &[name],
+                vec![namespace.clone(), relation.clone(), no_type.clone()],
+            )
+        };
+        let declared = constraint("t_fk");
+        let unowned = constraint("undeclared_fk");
+        for key in [&declared, &unowned] {
+            captured.inputs.insert(
+                key.clone(),
+                input(BTreeMap::from([("contype".into(), json!("f"))])),
+            );
+        }
+        let trigger = |key: &ObjectIdentity, function: &str| {
+            identity(
+                "pg_trigger",
+                &[],
+                vec![
+                    relation.clone(),
+                    key.clone(),
+                    identity("pg_proc", &["pg_catalog", function], vec![]),
+                ],
+            )
+        };
+        let check = trigger(&declared, "RI_FKey_check_ins");
+        let action = trigger(&declared, "RI_FKey_noaction_del");
+        let stray = trigger(&unowned, "RI_FKey_check_ins");
+        let user = identity("pg_trigger", &["audit"], vec![relation.clone()]);
+        for (made, maker) in [
+            (&check, &declared),
+            (&action, &declared),
+            (&stray, &unowned),
+        ] {
+            captured.inputs.insert(made.clone(), input(BTreeMap::new()));
+            captured.inputs.insert(
+                identity("pg_depend", &["i"], vec![made.clone(), maker.clone()]),
+                input(BTreeMap::new()),
+            );
+        }
+        captured.inputs.insert(user.clone(), input(BTreeMap::new()));
+        let owned = classify_attrdefs(&captured, &schema, &ids).unwrap();
+        let owner = ObjectOwnership::Surface(Surface::Table(table.clone()));
+        assert_eq!(owned.get(&declared), Some(&owner), "PG{major} key");
+        assert_eq!(owned.get(&check), Some(&owner), "PG{major} check trigger");
+        assert_eq!(owned.get(&action), Some(&owner), "PG{major} action trigger");
+        for object in [&unowned, &stray, &user] {
+            assert_eq!(
+                owned.get(object),
+                Some(&ObjectOwnership::Unqualified),
+                "PG{major} {object:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn generated_attrdefs_and_their_edges_have_exact_default_ownership() {
     let table = TableName::new("app", "t");

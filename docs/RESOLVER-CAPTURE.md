@@ -97,7 +97,8 @@ authorization metadata: they do not change what a creation binds, so they are
 not read as prerequisites (DEC-1274.1). The deployer's effective privileges,
 which do change name lookup, are the separate authorization condition. Public
 `pg_roles` supplies role facts without reading password verifiers from
-`pg_authid`.
+`pg_authid`. A constraint's internal triggers, whose names embed
+their OID, are identified by relation, constraint and trigger function.
 
 Actual stored node trees supply creation-time bindings, including pinned
 builtins that `pg_depend` omits. Qualified surfaces include views, SQL-standard

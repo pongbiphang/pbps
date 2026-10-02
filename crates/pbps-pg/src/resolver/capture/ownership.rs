@@ -487,6 +487,11 @@ pub(super) fn classify(
                     ("pg_class", "pg_constraint", Surface::Table(_)) => {
                         matches!(property(capture, made, "relkind")?, Some("i" | "I"))
                     }
+                    // A foreign key's internal RI triggers, on its own and on
+                    // the referenced table, are identified by that constraint.
+                    ("pg_trigger", "pg_constraint", Surface::Table(_)) => {
+                        made.signature.get(1) == Some(maker)
+                    }
                     ("pg_attrdef", "column", Surface::Column(_)) => true,
                     _ => false,
                 }
