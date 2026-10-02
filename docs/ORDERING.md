@@ -65,6 +65,12 @@ Then, in this order:
   It orders chains. A table rename cycle is left out of its graph, and the
   engine refuses it. A column rename cycle is refused at diff time
   (`ColumnRenameCycle`); a column chain is ordered by `chain_depth`.
+- **On a connected SQL Server plan, `order_created_object_names`** (in
+  `crates/pbps-cli/src/engine.rs`, last of the passes that reorder) walks the
+  plan over the catalog's `sys.objects` names. Where that walk refuses the
+  order, it tries the other orders of the table renames among the drops and
+  keeps the first one it clears (`object_order`, DEC-1366.1). A name only a
+  later class frees is refused with that change named (DEC-1366.2).
 - **On a connected plan, `order_role_drops`** (called from `deploy.rs`, once
   `plan --db` has read the dropped roles' members) ranks the role drops by
   membership again. The differ saw no members when it sorted (DECISIONS 127,
@@ -196,7 +202,9 @@ namespace. Renames *into* a name (classes 1 and 3) are the exception, and
 | A column rename chain | fixed | `chain_depth` inside class 3 | ✓ |
 | A column rename cycle (a swap) | — | refused at diff time, `ColumnRenameCycle` | ✓ refused by design |
 | A table rename chain | fixed | `rename_order` | ✓ DEC-536.1 |
-| A table rename cycle | — | left out of `rename_order`'s graph; the engine refuses it | ✓ refused by design |
+| A table rename cycle | — | left out of `rename_order`'s graph; refused at `plan --db` with the remedy | ✓ refused by design, DEC-1366.2 |
+| A catalog-only holder (adopted or fallback default, unrecorded object, collation pair) → `RenameTable` into its name | engine-sourced | `object_order` on a connected SQL Server plan | ✓ DEC-1366.1 |
+| `RenameColumn` or another later class freeing a default name → `RenameTable` into it | — | refused at `plan --db` with the remedy | ✓ refused by design, DEC-1366.2 |
 | Index (P) or named constraint (S) drop → `RenameTable` into its name | fixed | `rename_order` | ✓ DECISIONS 496, DEC-496.1 |
 | Constraint or index drop → add of the same name | fixed | class 2 before 13 | ✓ DECISIONS 168 (namespaces) |
 | `DropModule` → `CreateModule` of its id | fixed | class 0 before 14 | ✓ |

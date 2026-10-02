@@ -548,11 +548,10 @@ fn roles_are_the_clusters(question: &str) -> anyhow::Error {
     )
 }
 
-/// Refuses a name this plan creates that an object outside the catalog
-/// inventory already holds: on PostgreSQL a relation-namespace entry (#951),
-/// on SQL Server any `sys.objects` entry (#1077). SQL Server also reads the
-/// names its renames may move generated defaults to, and the children of the
-/// tables it changes, so the plan's own moves can be walked.
+/// Refuses a name this plan creates that a PostgreSQL relation-namespace
+/// entry outside the catalog inventory already holds (#951). SQL Server's
+/// `sys.objects` walk also orders the plan, so it runs after every pass that
+/// changes the plan: [`order_created_object_names`].
 pub async fn refuse_created_name_occupants(
     conn: &mut Conn,
     cs: &ChangeSet,
@@ -568,33 +567,57 @@ pub async fn refuse_created_name_occupants(
             .await?;
             crate::deploy::refuse_uninventoried_occupants(cs, &occupants, label)
         }
-        Driver::Mssql => {
-            let (names, parents) = crate::deploy::object_reads(cs);
-            let occupants =
-                pbps_mssql::catalog::object_name_occupants(conn, &names, &parents).await?;
-            // An absent row is a free name only where nothing can be hidden
-            // from this login (#1192), so only the names the read found no
-            // row at need the proof. A name holds one object per schema, so
-            // one this login sees leaves no room for a hidden one: a table
-            // dropped and recreated at its own name is not asked. Nor are
-            // `parents`, read for what the walk moves or removes with a
-            // table, so a drop-only plan claims nothing to prove (review of
-            // #1360).
-            let mut schemas: Vec<String> = names
-                .iter()
-                .filter(|n| !occupants.iter().any(|o| &o.wanted == *n))
-                .map(|n| n.schema.clone())
-                .collect();
-            schemas.sort();
-            schemas.dedup();
-            pbps_mssql::catalog::prove_schemas_visible(conn, &schemas).await?;
-            // Which of the plan's own names are one under the database's
-            // collation (#1215).
-            let candidates = crate::deploy::alike_candidates(cs, &names, &occupants);
-            let alike = pbps_mssql::catalog::object_names_alike(conn, &candidates).await?;
-            crate::deploy::refuse_occupied_objects_under(cs, &occupants, &alike, label)
-        }
+        Driver::Mssql => Ok(()),
     }
+}
+
+/// Orders this plan's table renames on SQL Server from what the catalog
+/// holds, and refuses a name a change claims that another `sys.objects`
+/// entry holds when it runs (#1077, #1366): it reads the names the plan
+/// creates or moves things to, and the children of the tables it changes,
+/// so the plan's own moves can be walked. The last pass to reorder the plan:
+/// called after every other one, so what it settles is what is saved.
+pub async fn order_created_object_names(
+    conn: &mut Conn,
+    cs: &mut ChangeSet,
+    label: &str,
+) -> anyhow::Result<()> {
+    if conn.driver() != Driver::Mssql {
+        return Ok(());
+    }
+    let (mut names, parents) = crate::deploy::object_reads(cs);
+    let mut occupants = pbps_mssql::catalog::object_name_occupants(conn, &names, &parents).await?;
+    // Where a transfer carries each child of a moved table: a name the
+    // first read could not know to ask until it found the child (#1366).
+    let carried: Vec<TableName> = crate::deploy::carried_destinations(cs, &occupants)
+        .into_iter()
+        .filter(|n| !names.contains(n))
+        .collect();
+    if !carried.is_empty() {
+        occupants.extend(pbps_mssql::catalog::object_name_occupants(conn, &carried, &[]).await?);
+        names.extend(carried);
+    }
+    // An absent row is a free name only where nothing can be hidden
+    // from this login (#1192), so only the names the read found no
+    // row at need the proof. A name holds one object per schema, so
+    // one this login sees leaves no room for a hidden one: a table
+    // dropped and recreated at its own name is not asked. Nor are
+    // `parents`, read for what the walk moves or removes with a
+    // table, so a drop-only plan claims nothing to prove (review of
+    // #1360).
+    let mut schemas: Vec<String> = names
+        .iter()
+        .filter(|n| !occupants.iter().any(|o| &o.wanted == *n))
+        .map(|n| n.schema.clone())
+        .collect();
+    schemas.sort();
+    schemas.dedup();
+    pbps_mssql::catalog::prove_schemas_visible(conn, &schemas).await?;
+    // Which of the plan's own names are one under the database's
+    // collation (#1215).
+    let candidates = crate::deploy::alike_candidates(cs, &names, &occupants);
+    let alike = pbps_mssql::catalog::object_names_alike(conn, &candidates).await?;
+    crate::object_order::order_occupied_objects_under(cs, &occupants, &alike, label)
 }
 
 /// Which requested names occur in an already captured table inventory.

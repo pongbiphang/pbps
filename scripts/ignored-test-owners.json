@@ -1010,6 +1010,7 @@
         "init_from_a_real_database_produces_a_valid_project",
         "ledger_migration_guidance_keeps_the_explicit_or_configured_target",
         "names_one_under_the_collation_are_ordered_or_refused_at_plan",
+        "renames_only_the_catalog_can_order_apply_or_are_refused_at_plan",
         "nonstandard_foreign_key_state_refuses_key_replacement_before_writing",
         "pull_leaves_out_a_trigger_whose_table_it_does_not_write",
         "pull_refuses_dotted_engine_names_before_writing_declarations_or_ids",

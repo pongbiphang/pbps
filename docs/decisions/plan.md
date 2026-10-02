@@ -496,8 +496,9 @@ snapshot could not see. The read is what bounds it. An object the plan moves
 that the read did not return is unknown to it, and a name only a rebuild uses
 is not asked at all.
 
-Both engines' reads are one question routed by `engine`
-(`refuse_created_name_occupants`), not a driver branch in `deploy`.
+Both engines' reads are routed by `engine`, not a driver branch in `deploy`:
+`refuse_created_name_occupants` for PostgreSQL, and `order_created_object_names`
+for SQL Server, whose walk also orders the plan (DEC-1366.1).
 
 Refusing the same-kind module rather than letting `CREATE OR ALTER` replace it
 is DEC-316.1's reasoning. Replacing an object this project never recorded is
