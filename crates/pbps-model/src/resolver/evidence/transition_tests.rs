@@ -1237,7 +1237,12 @@ fn aggregate_renames_require_owned_records_at_both_endpoints() {
             .next()
             .unwrap()
             .clone();
-        let new = evidence.transitions[rename_index].after.iter().next().unwrap().clone();
+        let new = evidence.transitions[rename_index]
+            .after
+            .iter()
+            .next()
+            .unwrap()
+            .clone();
         let mut children = Vec::new();
         for (manifest, object) in [(&mut evidence.before, &old), (&mut evidence.after, &new)] {
             let owner = manifest
@@ -1278,8 +1283,12 @@ fn aggregate_renames_require_owned_records_at_both_endpoints() {
             *manifest = serde_json::from_value(json).unwrap();
             children.push(child);
         }
-        evidence.transitions[rename_index].before.insert(children[0].clone());
-        evidence.transitions[rename_index].after.insert(children[1].clone());
+        evidence.transitions[rename_index]
+            .before
+            .insert(children[0].clone());
+        evidence.transitions[rename_index]
+            .after
+            .insert(children[1].clone());
         evidence.validate(&changes).unwrap();
         for omit_before in [true, false] {
             let mut omitted = evidence.clone();
