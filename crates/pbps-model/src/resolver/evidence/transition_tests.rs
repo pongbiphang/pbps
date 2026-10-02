@@ -1052,10 +1052,15 @@ fn omitted_closing_record(
 
 fn aggregate_records(change: Change, owner: Surface, child: Surface, creating: bool) {
     let (changes, evidence) = owner_coverage(change, owner.clone(), child, creating);
+    let owner_index = evidence
+        .transitions
+        .iter()
+        .position(|transition| transition.surface == owner)
+        .unwrap();
     let inventory = if creating {
-        &evidence.transitions[0].after
+        &evidence.transitions[owner_index].after
     } else {
-        &evidence.transitions[0].before
+        &evidence.transitions[owner_index].before
     };
     let manifest = if creating {
         &evidence.after
@@ -1075,9 +1080,9 @@ fn aggregate_records(change: Change, owner: Surface, child: Surface, creating: b
         let mut omitted = evidence.clone();
         omitted.surfaces.clear();
         if creating {
-            omitted.transitions[0].after.remove(object);
+            assert!(omitted.transitions[owner_index].after.remove(object));
         } else {
-            omitted.transitions[0].before.remove(object);
+            assert!(omitted.transitions[owner_index].before.remove(object));
         }
         assert!(
             evidence
@@ -1914,9 +1919,16 @@ mod inline_binding_floor {
             .unwrap()
             .object
             .clone();
-        let Change::AddColumn { column, .. } = &mut changes.changes[0].change else {
+        let Change::AddColumn {
+            table,
+            name,
+            column,
+            ..
+        } = &mut changes.changes[0].change
+        else {
             panic!("add column fixture")
         };
+        let owner = Surface::Column(table.column(name.as_str()));
         column.default = None;
         let mut compiled = serde_json::to_value(&evidence.after).unwrap();
         compiled["prerequisites"]
@@ -1924,7 +1936,12 @@ mod inline_binding_floor {
             .unwrap()
             .retain(|p| p["object"] != serde_json::to_value(&child).unwrap());
         let compiled: InputManifest = serde_json::from_value(compiled).unwrap();
-        evidence.transitions[0].after.remove(&child);
+        let transition = evidence
+            .transitions
+            .iter_mut()
+            .find(|transition| transition.surface == owner)
+            .unwrap();
+        assert!(transition.after.remove(&child));
         evidence.surfaces.clear();
         evidence.after = evidence
             .before
