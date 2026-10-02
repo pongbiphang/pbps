@@ -153,10 +153,9 @@ than merging it: GitHub builds `master` plus everything queued ahead plus this
 PR and runs `ci.yml` on the `merge_group` event, merging only if that is green
 (DECISIONS 502). Wait for the merge to land before deleting the issue branch
 and removing its worktree — a queued PR is not a merged one, and the queue can
-still eject it. Delete the
-branch on the **remote** as well as locally: GitHub retargets a PR stacked on it
-onto `master` when the branch is deleted, not when it is merged, and nothing
-deletes it here otherwise.
+still eject it. Complete §7's dependent verification before deleting the
+**remote** head and local branch; automatic retargeting is not a closeout gate
+(DEC-1228.1).
 
 If the queue ejects the PR, read the failing job before re-queueing and say
 which case it was. A conflict is handled in §5. A merge-group failure that
@@ -171,6 +170,25 @@ merged on the second roll.
 
 ## 7. Closeout
 
-After merge, verify the PR state, merge commit, and issue closure. Report the
-draft and ready review counts, qualifying routes, merge commit, tests actually
-run, tests skipped, every deferred finding and its issue, and cleanup status.
+After an actual merge, verify the PR state, merge commit, and issue closure.
+The primary agent owns this ordered closeout (DEC-1228.1):
+
+1. Enumerate all open PRs based on the merged head branch, completing pagination.
+   Record each dependent's head and expected remaining diff after removing the
+   parent's already merged work. Failed or incomplete reads are not empty sets.
+2. While the parent branch exists, explicitly change each dependent's base to
+   the merged parent's base. Verify OPEN state, the intended base, unchanged
+   recorded head and expected remaining diff. Retain the parent branch if any
+   check fails; do not rebase merely for this cleanup.
+3. Re-enumerate immediately before deleting the owned remote head; newly found
+   dependents must pass steps 1–2. A successfully verified empty set requires no
+   base changes. Delete only after these checks, then reverify the recorded
+   dependents and enumeration before removing the local branch and worktree.
+   Treat unexpected closure or a changed head, base or diff as failed closeout.
+4. Refresh each dependent's existing review and current-head CI evidence after
+   its base change before enqueueing it. An unchanged head does not excuse
+   missing required checks or dismissed reviews.
+
+Report the draft and ready review counts, qualifying routes, merge commit,
+tests actually run, tests skipped, every deferred finding and its issue,
+dependent verification and cleanup status.

@@ -315,18 +315,15 @@ record](../DECISIONS.md), which says how to add an entry here.
     tree minutes earlier, so a red one is a flake until the failing job says
     otherwise.
 
-    **A stacked pull request retargets itself only once the upstream branch is
-    deleted.** GitHub retargets every open pull request based on a merged head
-    branch onto that pull request's base, but the trigger is the *deletion* of
-    the branch, not the merge. This repository has `delete_branch_on_merge`
-    off, and the obvious remedy is refused: with a queue required, `gh pr merge
-    --delete-branch` errors out instead of enqueueing, because deleting the head
-    branch before the queue has merged closes the pull request and removes it
-    from the queue. The branch is therefore deleted as a separate closeout step
-    once the merge has landed, and that deletion is what retargets whatever was
-    stacked on it. Left undeleted, the downstream pull request stays based on a
-    merged feature branch: it never enters the `master` queue, and merging it
-    writes to that branch rather than to `master`.
+    **A stacked pull request needs a verified base change after its upstream
+    merge.** A PR still based on a merged feature branch does not enter the
+    `master` queue. DEC-1228.1 replaces the assumption that deleting that branch
+    reliably retargets every dependent: the primary agent explicitly changes
+    and verifies dependent bases before deleting the merged remote head, then
+    verifies them again. Deletion remains a separate step after the merge
+    actually lands. With a queue required, `gh pr merge --delete-branch` still
+    errors instead of enqueueing, because early head deletion can close the PR
+    and remove it from the queue.
 
     Measured against the field rather than chosen. Of the fifteen projects
     surveyed for 501, the four running a merge queue — rust-analyzer, cargo,
@@ -742,3 +739,53 @@ the corresponding regression, while skipping eligible tagged rows fails the
 ledger. Existing source-form rule-removal controls remain required. This does
 not expand DEC-1413.1 into an effect interpreter or prove the separate module
 annotation behavior in #1262. See [test execution](../TEST-EXECUTION.md).
+
+
+<a id="dec-1228-1"></a>
+
+**DEC-1228.1. Explicitly retarget and verify dependent PRs before deleting an
+actually merged parent branch, then verify them again.** The automatic
+retargeting assumption in Decision 502 made remote deletion the action that
+would establish the downstream base. An observed failure made that ordering
+unsafe: deleting #1216's merged head closed #1226 with its old base intact.
+
+[GitHub's branch documentation](https://docs.github.com/en/pull-requests/how-tos/commit-changes/managing-branches-within-your-repository)
+describes automatic retargeting after merged-head deletion. The retained
+[#1216](https://github.com/pongbiphang/pbps/pull/1216) and
+[#1226](https://github.com/pongbiphang/pbps/pull/1226) events instead show
+`base_ref_deleted` and `closed` at 2026-09-27T23:37:04Z (31952476780 and
+31952477016), followed by parent restoration, reopening and an explicit base
+change. The dependent head remained `ed622e0bd1bd6a88b7278333c0ce24050fc85fd2`.
+Reopening started [another CI run](https://github.com/pongbiphang/pbps/actions/runs/36359397387)
+after [the qualified run](https://github.com/pongbiphang/pbps/actions/runs/36356526170).
+These events do not establish a cause or equate every deletion mechanism.
+
+The primary agent first verifies the parent actually merged, then reads every
+page of open PRs based on its head branch. For each dependent, record the head
+and expected surviving patch before changing its base to the merged parent's
+base, while the parent branch still exists. For an ordinary stack, verify the
+merged parent head is an ancestor of the dependent head and use their diff to
+identify the downstream work; otherwise inspect the commit provenance rather
+than assume a subtraction. After retargeting, compare the complete PR diff to
+that expected patch, checking content as well as file names. OPEN state, the
+intended base and the unchanged head are separate required checks. Unexpected
+parent changes or missing downstream changes are failures, even with the right
+base name. Refresh the enumeration immediately before deletion and apply the
+same checks to new dependents. A failed or incomplete read cannot authorize
+deletion; a successfully verified empty set needs no base changes.
+
+Only then delete the owned remote head. Re-read the recorded PRs and the open
+PR enumeration afterwards, so a closed dependent cannot vanish from the check.
+On failure, stop cleanup and report the observed state. The historical recovery
+was to restore the exact owned parent ref, reopen the dependent, explicitly
+retarget it and verify its state, head and remaining diff before retrying
+deletion; a changed or foreign ref must not be overwritten. Remove the local
+branch and worktree after successful verification.
+
+This procedure changes bases without rewriting reviewed heads. It does not
+waive review or CI gates: refresh current evidence after the base change and
+require the existing gates before enqueueing each dependent. A conflict or
+confirmed merge-group interaction still follows Decision 502's rebase path;
+ordinary cleanup and movement of `master` do not. Validation uses the retained
+failure/recovery sequence and a real successfully enumerated empty-dependent
+closeout, not throwaway production PRs.

@@ -162,13 +162,21 @@ checksum-pinned, and state lives in the database itself.
   ahead plus this pull request, runs `ci.yml` on the `merge_group` event, and
   merges only if that is green. Wait for the merge to land before deleting the
   branch and removing the worktree — a queued pull request is not a merged one.
-- **Delete the remote head branch once the merge has landed**, not only the
-  local one. GitHub retargets a pull request stacked on a merged branch onto
-  that pull request's base when the branch is *deleted*, not when it is merged,
-  and this repository does not delete it by itself. A downstream pull request
-  left based on a merged feature branch never enters the `master` queue at all:
-  merging it writes to that branch, and its work never reaches `master`
-  (DECISIONS 502).
+- **Verify dependents before deleting the merged remote head branch.** Confirm
+  the parent actually merged, then enumerate all open PRs based on its head
+  branch, completing pagination. Record each dependent's head and expected
+  remaining diff after the parent's merged changes. While the parent branch
+  still exists, explicitly change each dependent's base to the merged parent's
+  base. Verify every dependent is OPEN, has that base and its unchanged recorded
+  head, and shows the expected remaining diff. Re-enumerate immediately before
+  deletion; any new dependent must pass the same checks. An unreadable or
+  incomplete result is not an empty dependent set; retain the parent branch
+  when any verification fails. A successfully verified empty set needs no base
+  changes. Delete only the owned remote head after these checks, reverify the
+  recorded dependents and enumeration afterwards, then remove the local branch
+  and worktree. Do not rely on automatic retargeting or rebase merely for
+  cleanup. Existing review and current-head CI gates still apply to each
+  dependent before enqueueing; refresh them after the base change (DEC-1228.1).
 - A pull request must be green on its **own** head before it can be queued, so
   a merge costs **two pre-merge runs** of `ci.yml` — one on the pull request,
   one on the merge group — plus the post-merge run on `master`, which gates
