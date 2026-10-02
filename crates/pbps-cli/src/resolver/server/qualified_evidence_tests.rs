@@ -552,6 +552,19 @@ async fn positive(profile: Profile) {
     result.evidence.validate(&result.changes).unwrap();
     pbps_pg::resolver::validate_evidence(&result.evidence)
         .expect("the actual producer evidence must pass the artifact reader");
+    if matches!(profile, Profile::Supplied) {
+        // The evidence names the profile the run was admitted under; the
+        // PG16 fixture's profile pins a different layout and server major.
+        let configured = std::env::var("PBPS_SERVER_ENDPOINT").unwrap();
+        let admitted = configured
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("profile="))
+            .unwrap();
+        assert!(matches!(
+            &result.evidence.qualification().runtime,
+            pbps_model::resolver::ResolverRuntime::Supplied { profile, .. } if profile == admitted
+        ));
+    }
 
     let affected = view(&result.evidence, "v");
     let control = view(&result.evidence, "control");
