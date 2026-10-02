@@ -1196,6 +1196,11 @@ Pinned by `a_stored_generated_column_round_trips_and_changes_its_expression`
 and `a_generated_columns_expression_change_is_refused_by_name_before_postgres_17`
 (`crates/pbps-cli/tests/flow_pg.rs`).
 
+*Amended by [DEC-1364.1](modules.md#dec-1364-1): a column added with a
+generation expression that names a function the plan creates or rebuilds
+follows that create, with what may read the column after it, and an
+expression change moves only when its text names one.*
+
 <a id="dec-981-2"></a>
 
 **DEC-981.2. The SQL Server namespace walk claims a table rename's own target

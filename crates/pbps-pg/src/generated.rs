@@ -89,9 +89,79 @@ pub fn may_read(expression: &str, column: &str) -> bool {
     crate::impact::mentions(expression, column)
 }
 
+/// Whether a text may call or read anything named `name`: the scan
+/// [`may_read`] runs, asked of a function's or a table's bare name. The
+/// schema is not compared, so a name in another schema counts too; a "yes"
+/// means *may* (DEC-1364.1).
+#[must_use]
+pub fn may_name(text: &str, name: &str) -> bool {
+    crate::impact::mentions(text, name)
+}
+
+/// Whether an expression may call the function named `name`: [`may_name`],
+/// or the name read the same way inside a string literal. Measured on 18.6, a
+/// literal an OID-alias type reads (`'app.f(integer)'::regprocedure`,
+/// `'app.f'::regproc`, `regprocedure('app.f(integer)')`) names the function
+/// to the engine, which refuses it before the function exists and records a
+/// dependency on it after. The literal may also be read so without a cast, as
+/// a default of such a column or compared with one, so every literal counts.
+/// Its contents are read as code, so a quoted name in it is one name, and as
+/// the OID-alias input reads them, so a reserved word bare is a name too; a
+/// comment is no literal (DEC-1364.1).
+#[must_use]
+pub fn may_call(expression: &str, name: &str) -> bool {
+    may_name(expression, name)
+        || crate::LEXICON
+            .string_literals(expression)
+            .iter()
+            .any(|contents| crate::impact::mentions_in_literal(contents, name))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::may_read;
+    use super::{may_call, may_name, may_read};
+
+    /// A function an OID-alias literal names is a call to the engine, so a
+    /// name inside a literal counts; a longer name still does not
+    /// (DEC-1364.1).
+    #[test]
+    fn a_function_named_inside_a_literal_may_be_called() {
+        assert!(may_call("('app.f(integer)'::regprocedure)::text", "f"));
+        assert!(may_call("'app.f'::regproc", "f"));
+        assert!(may_call("regprocedure(E'app.f(integer)')", "f"));
+        assert!(may_call("app.f(a)", "f"));
+        // A quoted name is one name, delimiters and all.
+        assert!(may_call(
+            "'app.\"my func\"(integer)'::regprocedure",
+            "my func"
+        ));
+        assert!(!may_call("'app.\"my func\"(integer)'::regprocedure", "my"));
+        // A reserved word bare in a literal is a name to the OID-alias input,
+        // and in code it is not.
+        assert!(may_call("'select(integer)'::regprocedure", "select"));
+        assert!(!may_call("a > (SELECT 0)", "select"));
+        // Negative: a longer name, a comment, and no name at all.
+        assert!(!may_call("'app.ff(integer)'::regprocedure", "f"));
+        assert!(!may_call("0 /* f */", "f"));
+        assert!(!may_call("0 -- 'f'", "f"));
+        assert!(!may_call("a * 2", "f"));
+    }
+
+    /// A call is read by the function's bare name, qualified or not, in a
+    /// routine's body as in an expression; a literal or a comment is no call
+    /// (DEC-1364.1).
+    #[test]
+    fn a_function_is_named_by_its_bare_name_wherever_it_is_code() {
+        assert!(may_name("app.f(a) + 1", "f"));
+        assert!(may_name("f(a)", "f"));
+        assert!(may_name(
+            "(x integer) RETURNS integer LANGUAGE sql AS $$ SELECT app.f(x) $$",
+            "f"
+        ));
+        assert!(!may_name("app.ff(a)", "f"));
+        assert!(!may_name("'f(a)' || b", "f"));
+        assert!(!may_name("b -- f(a)", "f"));
+    }
 
     /// The scan reads a name however it is spelled, a Unicode escape and its
     /// `UESCAPE` included, and data in a literal is no name (DEC-1316.1).

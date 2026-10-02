@@ -25,7 +25,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::Dialect;
 use pbps_model::{
-    Change, ChangeSet, ColumnRef, IdsFile, ModuleId, ModuleKind, PlannedChange, Schema,
+    Change, ChangeSet, ColumnRef, IdsFile, ModuleDeps, ModuleId, ModuleKind, PlannedChange, Schema,
+    TableName,
 };
 use pbps_pg::modules::{Dependent, Holds, Part};
 
@@ -770,18 +771,68 @@ fn last_function_create(cs: &ChangeSet) -> Option<usize> {
     })
 }
 
+/// Every function this plan creates or rebuilds, by the bare name a call
+/// spells, with the position of its create.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn function_creates(cs: &ChangeSet) -> Vec<(String, usize)> {
+    cs.changes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| match &p.change {
+            Change::AlterModule { id, module } | Change::CreateModule { id, module }
+                if module.kind == ModuleKind::Function =>
+            {
+                id.referenced_name().map(|n| (n.name, i))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether `text` may call one of `functions`: the function's bare name
+/// occurs in it as code, by the engine's lexer, or in a literal's contents,
+/// which an OID-alias type such as `regprocedure` resolves to the function
+/// (`pbps_pg::generated::may_call`, DEC-1364.1). Which function a call binds
+/// to is not known without parsing it (DECISIONS 174), so a name in another
+/// schema, or a column, field or word of the same name, counts too. A false
+/// yes costs a later position; a false no would put the call ahead of the
+/// create the engine needs.
+fn calls_one_of(text: &str, functions: &[(String, usize)]) -> bool {
+    functions
+        .iter()
+        .any(|(name, _)| pbps_pg::generated::may_call(text, name))
+}
+
+/// The expression text an index holds: its filter and its expression keys.
+fn index_text(index: &pbps_model::Index) -> String {
+    let mut parts: Vec<&str> = index.filter.iter().map(String::as_str).collect();
+    parts.extend(index.columns.iter().filter_map(|c| c.key.expression()));
+    parts.join(" , ")
+}
+
+/// The expression an added column carries: its default or its generation
+/// expression. The engine refuses both together (DEC-1168.1).
+fn column_expression(column: &pbps_model::Column) -> Option<&str> {
+    column
+        .default
+        .as_deref()
+        .or_else(|| column.generated.as_ref().map(|g| g.expression.as_str()))
+}
+
 /// Splits a table this plan creates, ahead of a function it creates or
-/// rebuilds, into the table and its expression-bearing parts as separate
-/// changes, so that [`after_the_rebuilds`] can move them after the function
-/// (#1027, DEC-942.1). Returns how many changes it added.
+/// rebuilds, into the table and its parts that may call that function as
+/// separate changes, so that [`after_the_rebuilds`] can move them after the
+/// function (#1027, DEC-942.1, DEC-1364.1). Returns how many changes it added.
 ///
 /// The differ writes a new table as one `CreateTable` carrying its checks,
 /// indexes and column defaults, and emits them together. Moving that change
 /// is not an option, since views and routines may read the table. So its
 /// checks become `AddCheck`, its indexes that hold an expression (a filter
 /// or an expression key, DEC-1169.2) `AddIndex`, and its column defaults
-/// `AlterColumnDefault`, each right after the table. The same rule as for an
-/// existing table then places them. An index over plain columns stays in the
+/// `AlterColumnDefault`, each right after the table, when their text names a
+/// function the plan creates or rebuilds. The same rule as for an existing
+/// table then places them. A part whose text names none stays in the table,
+/// where nothing it calls is missing. An index over plain columns stays in the
 /// table: it holds no expression. A default stays when a row the plan
 /// writes takes it (an insert that omits the column, an update that sets it
 /// back to its default, #1030), and when no ids file names the column, since
@@ -793,8 +844,8 @@ fn last_function_create(cs: &ChangeSet) -> Option<usize> {
 ///
 /// A generated column is not split out. Its expression may call the function
 /// as a default's may, but the engine has no way to give an existing column
-/// one, and taking the column out of the table would leave a function the
-/// plan creates reading a column that is not there yet (DEC-1168.1).
+/// one, and taken out of the table as a column of its own it would change the
+/// table's column order (DEC-1168.1, DEC-1364.1).
 // The complement is every change that writes no rows.
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(crate) fn split_new_tables(
@@ -806,6 +857,8 @@ pub(crate) fn split_new_tables(
         return 0;
     };
     let taken = defaults_taken_by_rows(cs);
+    let functions = function_creates(cs);
+    let calls = |text: &str| calls_one_of(text, &functions);
     let mut added = 0;
     for i in (0..last).rev() {
         let Change::CreateTable { name, table, .. } = &mut cs.changes[i].change else {
@@ -813,17 +866,25 @@ pub(crate) fn split_new_tables(
         };
         let name = name.clone();
         let mut parts: Vec<Change> = Vec::new();
-        for (check, constraint) in std::mem::take(&mut table.checks) {
-            parts.push(Change::AddCheck {
-                table: name.clone(),
-                name: check,
-                constraint,
-            });
+        let calling: Vec<String> = table
+            .checks
+            .iter()
+            .filter(|(_, check)| calls(&check.expression))
+            .map(|(n, _)| n.clone())
+            .collect();
+        for check in calling {
+            if let Some(constraint) = table.checks.remove(&check) {
+                parts.push(Change::AddCheck {
+                    table: name.clone(),
+                    name: check,
+                    constraint,
+                });
+            }
         }
         let filtered: Vec<String> = table
             .indexes
             .iter()
-            .filter(|(_, index)| index.holds_expression())
+            .filter(|(_, index)| index.holds_expression() && calls(&index_text(index)))
             .map(|(n, _)| n.clone())
             .collect();
         for index in filtered {
@@ -847,7 +908,9 @@ pub(crate) fn split_new_tables(
             let Some(uid) = ids.iter().find_map(|ids| ids.column_uid(&column_ref)) else {
                 continue;
             };
-            if let Some(to) = spec.default.take() {
+            if spec.default.as_deref().is_some_and(calls)
+                && let Some(to) = spec.default.take()
+            {
                 parts.push(Change::AlterColumnDefault {
                     uid: uid.clone(),
                     column: column_ref,
@@ -872,8 +935,8 @@ pub(crate) fn split_new_tables(
 }
 
 /// Moves what this plan adds that may call a function it creates or rebuilds
-/// to after that function's create (#942, DEC-942.1). Returns how many changes
-/// moved.
+/// to after that function's create (#942, DEC-942.1, DEC-1364.1). Returns how
+/// many changes moved, or why no order performs the plan.
 ///
 /// [`weave`] reads the catalog, where an addition this plan makes does not
 /// exist yet, so it never sees one. The differ puts a check or an index in
@@ -885,13 +948,16 @@ pub(crate) fn split_new_tables(
 /// database, it names one not there yet, and the check is refused itself.
 ///
 /// Which function an expression calls is not known without parsing it, and
-/// the planner does not parse expressions (DECISIONS 174). So the rule is
-/// positional: when the plan creates or rebuilds a function, every addition
-/// that can carry an expression goes after the last function the plan
-/// creates, in the order it had. That is a check, an index with a filter (an index's columns
-/// are names, so its filter is the only place a call can be), and a default
-/// being set. A unique index with no filter stays where it is, since a
-/// foreign key in its class may rest on it and holds no expression anyway.
+/// the planner does not parse expressions (DECISIONS 174). It is read the way
+/// `creation_order_with` reads a module's definition (DECISIONS 315): every
+/// name the text could call, by the engine's lexer, is taken as a call
+/// ([`calls_one_of`]). An addition whose text names a function the plan
+/// creates or rebuilds goes after the last function the plan creates, in the
+/// order it had. That is a check, an index with a filter or an expression key
+/// (an index's other columns are names), a default being set, and a changed
+/// generation expression. An addition whose text names none stays where the
+/// differ put it. A unique index with no expression stays too, since a
+/// foreign key in its class may rest on it.
 ///
 /// One default does not move: a default a row this plan writes takes, an
 /// insert that omits the column or an update that sets it back to its
@@ -900,19 +966,28 @@ pub(crate) fn split_new_tables(
 /// column, or touches only others, takes nothing from it. Leaving it in
 /// place means a default that calls the rebuilt function still meets the
 /// `DROP` there, and the apply fails and rolls back. That is loud, where
-/// moving it would record rows the declarations did not ask for. A column
-/// added with a default calling the function is the same case: the column
-/// has to exist before the modules that may read it.
+/// moving it would record rows the declarations did not ask for.
+///
+/// A column added with a default or a generation expression that names a
+/// function the plan creates or rebuilds is placed by [`after_their_functions`].
 #[allow(clippy::wildcard_enum_match_arm)]
-pub(crate) fn after_the_rebuilds(cs: &mut ChangeSet, released: &BTreeSet<ColumnRef>) -> usize {
+pub(crate) fn after_the_rebuilds(
+    cs: &mut ChangeSet,
+    released: &BTreeSet<ColumnRef>,
+    deps: &ModuleDeps,
+) -> Result<usize, String> {
     let Some(last) = last_function_create(cs) else {
-        return 0;
+        return Ok(0);
     };
     let taken = defaults_taken_by_rows(cs);
+    let functions = function_creates(cs);
+    let calls = |text: &str| calls_one_of(text, &functions);
     let recomputed: BTreeSet<&ColumnRef> = cs.changes[..last]
         .iter()
         .filter_map(|p| match &p.change {
-            Change::AlterColumnExpression { column, .. } if !released.contains(column) => {
+            Change::AlterColumnExpression { column, to, .. }
+                if !released.contains(column) && calls(to) =>
+            {
                 Some(column)
             }
             _ => None,
@@ -921,20 +996,18 @@ pub(crate) fn after_the_rebuilds(cs: &mut ChangeSet, released: &BTreeSet<ColumnR
     let moves: Vec<bool> = cs.changes[..last]
         .iter()
         .map(|p| match &p.change {
-            Change::AddCheck { .. } => true,
+            Change::AddCheck { constraint, .. } => calls(&constraint.expression),
             Change::AlterColumnDefault {
                 column,
-                to: Some(_),
+                to: Some(to),
                 ..
-            } => !taken.contains(column),
+            } => !taken.contains(column) && calls(to),
             // A generation expression binds the functions it calls exactly
             // as a default does (DEC-1168.1). No row writes a generated
-            // column, so none is taken ahead of it. A column added with one
-            // stays, as a column added with a default does: a function the
-            // plan creates may read it.
+            // column, so none is taken ahead of it.
             // One that releases a generated column from a module the plan
             // drops stays ahead of that drop, which `weave` put after it.
-            Change::AlterColumnExpression { column, .. } => !released.contains(column),
+            Change::AlterColumnExpression { column, .. } => recomputed.contains(column),
             // What validates a recomputed column's values stays behind its new
             // expression, which the order kept among the moved preserves: a
             // `NOT NULL`, and a key over it on either side of a foreign key.
@@ -945,7 +1018,7 @@ pub(crate) fn after_the_rebuilds(cs: &mut ChangeSet, released: &BTreeSet<ColumnR
                 ..
             } => recomputed.contains(column),
             Change::AddIndex { table, index, .. } => {
-                index.holds_expression()
+                (index.holds_expression() && calls(&index_text(index)))
                     || index.column_keys().is_some_and(|keys| {
                         keys.iter().any(|k| recomputed.contains(&table.column(k)))
                     })
@@ -993,7 +1066,288 @@ pub(crate) fn after_the_rebuilds(cs: &mut ChangeSet, released: &BTreeSet<ColumnR
     kept.extend(moved);
     kept.extend(tail);
     cs.changes = kept;
-    count
+    Ok(count + after_their_functions(cs, deps)?)
+}
+
+/// Places a column this plan adds whose default or generation expression
+/// names a function the plan creates or rebuilds after that function's
+/// create, and whatever may need the column after the column (DEC-1364.1).
+/// Returns how many such columns it placed, or why no order performs them.
+///
+/// The column cannot simply follow the last create, as a check does: a
+/// module the plan creates may read it, and measured on 18.6 the engine
+/// resolves a SQL body's columns at `CREATE FUNCTION`, `BEGIN ATOMIC` or not,
+/// and expands a view's or an atomic body's `*` there. So the stretch from the
+/// column to the last function create is ordered again, keeping the plan's
+/// order wherever nothing says otherwise: a stable topological order in which
+/// the column waits for the creates its text names, and every later change
+/// that [`needs`] an earlier one keeps following it. Only what may not need
+/// the column is let past it.
+///
+/// A column that a function it calls may read, directly or through what that
+/// function needs, closes a cycle no order performs: the engine refuses
+/// either create first. So does a row the plan writes into the column, since
+/// rows are written before the modules, where a trigger the plan creates
+/// cannot fire on them. Such a plan is refused, naming the column and the
+/// functions, with the two-plan remedy.
+fn after_their_functions(cs: &mut ChangeSet, deps: &ModuleDeps) -> Result<usize, String> {
+    let functions = function_creates(cs);
+    let Some(last) = functions.iter().map(|(_, at)| *at).max() else {
+        return Ok(0);
+    };
+    // Each such column, with the creates after it that its text names.
+    let mut waits: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (i, p) in cs.changes[..last].iter().enumerate() {
+        if let Change::AddColumn { column, .. } = &p.change
+            && let Some(text) = column_expression(column)
+        {
+            let named: Vec<usize> = functions
+                .iter()
+                .filter(|(name, at)| *at > i && pbps_pg::generated::may_call(text, name))
+                .map(|(_, at)| *at)
+                .collect();
+            if !named.is_empty() {
+                waits.insert(i, named);
+            }
+        }
+    }
+    let Some(&start) = waits.keys().next() else {
+        return Ok(0);
+    };
+    let window: Vec<&Change> = cs.changes[start..=last].iter().map(|p| &p.change).collect();
+    let n = window.len();
+    // What may be held back: the columns, and whatever may need one of them
+    // or something already held back. Only these can change places. The rest
+    // keep their order among themselves, so `needs` is asked only of pairs
+    // with one side here: a schema of many modules is not lexed pair by pair.
+    let mut held: BTreeSet<usize> = waits.keys().map(|at| at - start).collect();
+    for i in 0..n {
+        if !held.contains(&i) && held.range(..i).any(|&j| needs(window[i], window[j], deps)) {
+            held.insert(i);
+        }
+    }
+    let mut preds: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
+    let mut previous_free: Option<usize> = None;
+    for i in 0..n {
+        if held.contains(&i) {
+            preds[i].extend((0..i).filter(|&j| needs(window[i], window[j], deps)));
+        } else {
+            preds[i].extend(
+                held.range(..i)
+                    .filter(|&&j| needs(window[i], window[j], deps)),
+            );
+            preds[i].extend(previous_free);
+            previous_free = Some(i);
+        }
+    }
+    // A column follows the creates its text names. One that may also need the
+    // column keeps both edges: that is the cycle refused below.
+    for (at, named) in &waits {
+        preds[at - start].extend(named.iter().map(|create| create - start));
+    }
+    // Kahn's algorithm, always taking the earliest ready change, so that what
+    // nothing holds back keeps its place.
+    let mut done = vec![false; n];
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    while let Some(i) = (0..n).find(|&i| !done[i] && preds[i].iter().all(|&j| done[j])) {
+        done[i] = true;
+        order.push(i);
+    }
+    if order.len() < n {
+        return Err(cycle(cs, start, &waits, &done, &window, deps));
+    }
+    let mut taken: Vec<Option<PlannedChange>> = cs.changes.drain(start..=last).map(Some).collect();
+    let placed: Vec<PlannedChange> = order
+        .iter()
+        .map(|&i| taken[i].take().expect("each change is ordered once"))
+        .collect();
+    cs.changes.splice(start..start, placed);
+    Ok(waits.len())
+}
+
+/// Why [`after_their_functions`] found no order: the first column it could
+/// not place, the functions it calls, and what may need the column.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn cycle(
+    cs: &ChangeSet,
+    start: usize,
+    waits: &BTreeMap<usize, Vec<usize>>,
+    done: &[bool],
+    window: &[&Change],
+    deps: &ModuleDeps,
+) -> String {
+    let Some((&at, named)) = waits.iter().find(|(at, _)| !done[**at - start]) else {
+        return "a column this plan adds cannot be ordered against the functions it calls; \
+                this is a bug in pbps, please report it"
+            .into();
+    };
+    let column = match &cs.changes[at].change {
+        Change::AddColumn { table, name, .. } => format!("{table}.{name}"),
+        other => format!("{other:?}"),
+    };
+    let module = |i: usize| cs.changes[i].change.module_id().map(|id| format!("`{id}`"));
+    let functions: Vec<String> = named.iter().filter_map(|&i| module(i)).collect();
+    let blockers: Vec<String> = (0..window.len())
+        .filter(|&i| !done[i] && start + i != at && needs(window[i], window[at - start], deps))
+        .filter_map(|i| match window[i] {
+            Change::InsertRow { table, .. } | Change::UpdateRow { table, .. } => {
+                Some(format!("a row this plan writes into `{table}`"))
+            }
+            _ => module(start + i),
+        })
+        .collect();
+    let blockers = if blockers.is_empty() {
+        "something those functions need".to_owned()
+    } else {
+        blockers.join(", ")
+    };
+    let (them, their) = if functions.len() == 1 {
+        ("it", "its")
+    } else {
+        ("them", "their")
+    };
+    let functions = functions.join(", ");
+    format!(
+        "the column `{column}` this plan adds calls {functions}, which the plan creates or \
+         rebuilds, so it has to be added after {them}. But {blockers} may need the column, so \
+         has to come after it, and {them} cannot be created before that. No order performs \
+         both. Split it into two plans: create {functions} in a plan of {their} own first, or \
+         add the column without the call first and give it the call in a second plan"
+    )
+}
+
+/// Whether `later` may need `earlier`, a change ahead of it in the plan, to
+/// have run first: what [`after_their_functions`] may not reorder. Anything
+/// not shown independent here is held in order.
+///
+/// - A column added: a module that may read it ([`reads_column`]), a row that
+///   writes it or takes its default, and another change of its table that
+///   names it. A module drop and a row delete never need a new column.
+/// - A module created: a module that names it, in code or in a literal an
+///   OID-alias type may read (`may_call`), is attached to it, shares
+///   its name (overloads are ordered by `depends_on:` alone, DECISIONS 212) or
+///   declares it in `depends_on:`.
+/// - Any other change of a table: a module that names the table, and a change
+///   of the same table or one referencing it.
+/// - A row write: everything after it. A trigger the plan creates must not
+///   fire on a row the plan writes before the modules.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn needs(later: &Change, earlier: &Change, deps: &ModuleDeps) -> bool {
+    match earlier {
+        Change::AddColumn { table, name, .. } => match later {
+            Change::CreateModule { id, module } | Change::AlterModule { id, module } => {
+                reads_column(id, &module.definition, table, name)
+            }
+            Change::DropModule { .. } | Change::DeleteRow { .. } => false,
+            Change::InsertRow {
+                table: t,
+                row,
+                defaults,
+                ..
+            } => t == table && (row.get(name).is_some() || defaults.contains_key(name)),
+            Change::UpdateRow {
+                table: t,
+                columns,
+                unchanged,
+                ..
+            } => t == table && (columns.contains_key(name) || unchanged.contains_key(name)),
+            other => names_column(other, table, name),
+        },
+        Change::CreateModule { id: before, .. } | Change::AlterModule { id: before, .. } => {
+            match later {
+                Change::CreateModule { id, module } | Change::AlterModule { id, module } => {
+                    let named = before
+                        .referenced_name()
+                        .is_some_and(|n| pbps_pg::generated::may_call(&module.definition, &n.name));
+                    let attached = id.attached_to().is_some()
+                        && id.attached_to() == before.referenced_name().as_ref();
+                    let sibling = id.referenced_name().is_some()
+                        && id.referenced_name() == before.referenced_name();
+                    let declared = deps.get(id).is_some_and(|d| d.contains(before));
+                    named || attached || sibling || declared
+                }
+                _ => true,
+            }
+        }
+        Change::InsertRow { .. } | Change::UpdateRow { .. } | Change::DeleteRow { .. } => true,
+        other => match (later, other.table()) {
+            (Change::CreateModule { id, module } | Change::AlterModule { id, module }, Some(t)) => {
+                names_table(id, &module.definition, t)
+            }
+            (later, Some(t)) => touches(later, t),
+            _ => true,
+        },
+    }
+}
+
+/// Whether a module may read column `column` of `table`: its definition names
+/// the column or the table. A module naming the table may take its whole
+/// column shape without naming a column, in more spellings than a list could
+/// hold: measured on 18.6, a view's or an atomic body's `*`, a `NATURAL` join,
+/// and a positional `INSERT INTO t VALUES (…)`, atomic or not, are all bound
+/// to the columns there when the module is created (DEC-1364.1).
+fn reads_column(id: &ModuleId, definition: &str, table: &TableName, column: &str) -> bool {
+    pbps_pg::generated::may_read(definition, column) || names_table(id, definition, table)
+}
+
+/// Whether a module may name `table`: its definition holds the table's bare
+/// name, or it is a trigger on it.
+fn names_table(id: &ModuleId, definition: &str, table: &TableName) -> bool {
+    id.attached_to()
+        .is_some_and(|on| on.schema == table.schema && on.name == table.name)
+        || pbps_pg::generated::may_name(definition, &table.name)
+}
+
+/// Whether a change of a table may name the new column `column` of `table`.
+/// A change of another table names it only as a foreign key's target.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn names_column(change: &Change, table: &TableName, column: &str) -> bool {
+    let named = |text: &str| pbps_pg::generated::may_read(text, column);
+    let listed = |columns: &[String]| columns.iter().any(|c| c == column);
+    if let Change::AddForeignKey { constraint, .. } = change
+        && &constraint.references_table == table
+        && listed(&constraint.references_columns)
+    {
+        return true;
+    }
+    if change.table() != Some(table) {
+        return change.table().is_none();
+    }
+    match change {
+        Change::AddColumn { column: c, .. } => column_expression(c).is_some_and(named),
+        Change::AlterColumnDefault { column: c, to, .. } => {
+            c.name == column || to.as_deref().is_some_and(named)
+        }
+        Change::AlterColumnExpression { column: c, to, .. } => c.name == column || named(to),
+        Change::AlterColumnType { column: c, .. }
+        | Change::AlterColumnNullability { column: c, .. }
+        | Change::SetColumnDeprecated { column: c, .. } => c.name == column,
+        Change::AddCheck { constraint, .. } => named(&constraint.expression),
+        Change::AddIndex { index, .. } => {
+            index.columns.iter().any(|c| c.key.column() == Some(column))
+                || listed(&index.include)
+                || named(&index_text(index))
+        }
+        Change::AddUnique { constraint, .. } => listed(&constraint.columns),
+        Change::SetPrimaryKey { to, .. } => to.as_ref().is_none_or(|pk| listed(&pk.columns)),
+        Change::AddForeignKey { constraint, .. } => listed(&constraint.columns),
+        _ => true,
+    }
+}
+
+/// Whether a change acts on `table`, or on a table referencing it. A change
+/// that names no table is held to anything.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn touches(change: &Change, table: &TableName) -> bool {
+    match change {
+        Change::AddForeignKey {
+            table: t,
+            constraint,
+            ..
+        } => t == table || &constraint.references_table == table,
+        Change::CreateTable { .. } => true,
+        other => other.table().is_none_or(|t| t == table),
+    }
 }
 
 /// Every dependent of a module this plan drops that the plan does not remove
@@ -1133,6 +1487,12 @@ mod tests {
         (s, ids)
     }
 
+    /// `after_the_rebuilds` with no `depends_on:` edges, for an order it
+    /// finds.
+    fn rebuilds(cs: &mut ChangeSet, released: &BTreeSet<ColumnRef>) -> usize {
+        after_the_rebuilds(cs, released, &ModuleDeps::new()).unwrap()
+    }
+
     fn plan(changes: Vec<Change>) -> ChangeSet {
         ChangeSet {
             changes: changes.into_iter().map(PlannedChange::new).collect(),
@@ -1182,11 +1542,15 @@ mod tests {
     }
 
     fn add_check(name: &str) -> Change {
+        check_of(name, "app.f(id) >= 0")
+    }
+
+    fn check_of(name: &str, expression: &str) -> Change {
         Change::AddCheck {
             table: TableName::new("app", "t"),
             name: name.into(),
             constraint: CheckConstraint {
-                expression: "app.f(id) >= 0".into(),
+                expression: expression.into(),
             },
         }
     }
@@ -1211,11 +1575,15 @@ mod tests {
     }
 
     fn set_default(table: &str) -> Change {
+        default_of(table, "app.f(1)")
+    }
+
+    fn default_of(table: &str, to: &str) -> Change {
         Change::AlterColumnDefault {
             uid: Uid::derived(UidKind::Column, &format!("app.{table}.n"), 0),
             column: ColumnRef::new(TableName::new("app", table), "n"),
             from: None,
-            to: Some("app.f(1)".into()),
+            to: Some(to.into()),
         }
     }
 
@@ -1234,7 +1602,7 @@ mod tests {
             alter(&s, "app.f(integer)"),
             alter(&s, "app.v0"),
         ]);
-        assert_eq!(after_the_rebuilds(&mut cs, &BTreeSet::new()), 4);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 4);
         assert_eq!(
             names(&cs),
             [
@@ -1250,9 +1618,9 @@ mod tests {
     }
 
     /// A generation expression binds the functions it calls, as a default
-    /// does: a changed expression follows the rebuilt function's create. A
-    /// column added with one stays ahead of it, as a column added with a
-    /// default does, since the function may read the column (DEC-1168.1).
+    /// does: a changed expression follows the rebuilt function's create, and
+    /// so does a column added with one, since the function does not read the
+    /// column (DEC-1168.1, DEC-1364.1). A column added without one stays.
     #[test]
     fn generation_expressions_follow_a_rebuilt_functions_create() {
         let (s, _) = declared();
@@ -1299,7 +1667,7 @@ mod tests {
             add("plain", pbps_model::Column::new("integer".parse().unwrap())),
             alter(&s, "app.f(integer)"),
         ]);
-        assert_eq!(after_the_rebuilds(&mut cs, &BTreeSet::new()), 3);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 4);
         let at =
             |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
         let rebuilt = at(&|c| matches!(c, Change::AlterModule { .. }));
@@ -1308,7 +1676,7 @@ mod tests {
         let plain_add = at(&|c| matches!(c, Change::AddColumn { name, .. } if name == "plain"));
         assert!(rebuilt < expression, "{:?}", names(&cs));
         assert!(
-            generated_add < rebuilt && plain_add < rebuilt,
+            rebuilt < generated_add && plain_add < rebuilt,
             "{:?}",
             names(&cs)
         );
@@ -1335,19 +1703,19 @@ mod tests {
     fn a_releasing_expression_change_stays_ahead_of_the_drop() {
         let (s, _) = declared();
         let t = TableName::new("app", "t");
-        let recompute = |column: &str| Change::AlterColumnExpression {
+        let recompute = |column: &str, to: &str| Change::AlterColumnExpression {
             uid: "c_d4e5f6".parse().unwrap(),
             column: t.column(column),
             from: "app.f(id)".into(),
-            to: "id * 2".into(),
+            to: to.into(),
         };
         let mut cs = plan(vec![
-            recompute("n"),
-            recompute("other"),
+            recompute("n", "id * 2"),
+            recompute("other", "app.f(id) * 2"),
             alter(&s, "app.f(integer)"),
         ]);
         let released = BTreeSet::from([t.column("n")]);
-        assert_eq!(after_the_rebuilds(&mut cs, &released), 1);
+        assert_eq!(rebuilds(&mut cs, &released), 1);
         let at = |name: &str| {
             cs.changes
                 .iter()
@@ -1390,7 +1758,7 @@ mod tests {
                 module: as_kind(ModuleKind::Function),
             },
         ]);
-        assert_eq!(after_the_rebuilds(&mut cs, &BTreeSet::new()), 1);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
         assert_eq!(
             names(&cs),
             [
@@ -1407,7 +1775,7 @@ mod tests {
                 id: routine.clone(),
                 kind: ModuleKind::Function,
             },
-            add_check("ck"),
+            check_of("ck", "app.g(id) >= 0"),
             Change::CreateModule {
                 id: routine.clone(),
                 module: as_kind(ModuleKind::Procedure),
@@ -1417,7 +1785,7 @@ mod tests {
                 module: as_kind(ModuleKind::Function),
             },
         ]);
-        assert_eq!(after_the_rebuilds(&mut cs, &BTreeSet::new()), 1);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
         assert_eq!(
             names(&cs),
             [
@@ -1442,7 +1810,7 @@ mod tests {
             },
         ]);
         let before = names(&cs);
-        assert_eq!(after_the_rebuilds(&mut cs, &BTreeSet::new()), 0);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 0);
         assert_eq!(names(&cs), before);
     }
 
@@ -1506,7 +1874,7 @@ mod tests {
         assert!(left.checks.is_empty());
         assert_eq!(left.indexes.keys().collect::<Vec<_>>(), ["ix_u"]);
         assert_eq!(left.columns["v"].default, None);
-        assert_eq!(after_the_rebuilds(&mut cs, &BTreeSet::new()), 3);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 3);
         assert_eq!(
             names(&cs)[1..],
             [
@@ -1543,8 +1911,9 @@ mod tests {
     /// A function new to the database, with nothing rebuilt, is a boundary
     /// too: a check, a default and a generation expression calling it follow
     /// its `CREATE FUNCTION` (DEC-942.1). A column added with a generation
-    /// expression stays ahead of it, since the function may read the column.
-    /// A new procedure is no boundary: nothing calls one from an expression.
+    /// expression that calls nothing the plan creates stays ahead of it, where
+    /// the function may read the column (DEC-1364.1). A new procedure is no
+    /// boundary: nothing calls one from an expression.
     #[test]
     fn what_may_call_a_new_function_follows_its_create() {
         let new_routine = |kind| Change::CreateModule {
@@ -1566,8 +1935,8 @@ mod tests {
             stored: true,
         });
         let mut cs = plan(vec![
-            add_check("ck"),
-            set_default("t"),
+            check_of("ck", "app.h(id) >= 0"),
+            default_of("t", "app.h(1)"),
             recompute.clone(),
             Change::AddColumn {
                 uid: "c_a1b2c3".parse().unwrap(),
@@ -1577,7 +1946,7 @@ mod tests {
             },
             new_routine(ModuleKind::Function),
         ]);
-        assert_eq!(after_the_rebuilds(&mut cs, &BTreeSet::new()), 3);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 3);
         assert!(
             matches!(cs.changes[0].change, Change::AddColumn { .. })
                 && matches!(cs.changes[1].change, Change::CreateModule { .. }),
@@ -1585,13 +1954,392 @@ mod tests {
             names(&cs)
         );
         let mut cs = plan(vec![
-            add_check("ck"),
+            check_of("ck", "app.h(id) >= 0"),
             recompute,
             new_routine(ModuleKind::Procedure),
         ]);
         let before = names(&cs);
-        assert_eq!(after_the_rebuilds(&mut cs, &BTreeSet::new()), 0);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 0);
         assert_eq!(names(&cs), before);
+    }
+
+    fn routine(name: &str, body: &str) -> Change {
+        Change::CreateModule {
+            id: id(name),
+            module: Box::new(module(
+                ModuleKind::Function,
+                &format!("() RETURNS integer LANGUAGE sql IMMUTABLE AS $$ {body} $$"),
+            )),
+        }
+    }
+
+    fn new_view(name: &str, definition: &str) -> Change {
+        Change::CreateModule {
+            id: id(name),
+            module: Box::new(module(ModuleKind::View, definition)),
+        }
+    }
+
+    /// A column `app.t.<name>` added with a generation expression, or with
+    /// a default when `generated` is false.
+    fn add_column(name: &str, expression: &str, generated: bool) -> Change {
+        let mut column = Column::new("integer".parse().unwrap());
+        if generated {
+            column.generated = Some(pbps_model::Generated {
+                expression: expression.into(),
+                stored: true,
+            });
+        } else {
+            column.default = Some(expression.into());
+        }
+        Change::AddColumn {
+            uid: Uid::derived(UidKind::Column, &format!("app.t.{name}"), 0),
+            table: TableName::new("app", "t"),
+            name: name.into(),
+            column: Box::new(column),
+        }
+    }
+
+    /// DEC-1364.1: an addition whose text names no function the plan creates
+    /// or rebuilds keeps the differ's place, beside a rebuilt function; and a
+    /// new table keeps such parts inside its `CREATE TABLE`.
+    #[test]
+    fn an_addition_naming_no_created_function_keeps_its_place() {
+        let (s, _) = declared();
+        let mut cs = plan(vec![
+            check_of("ck", "id > 0"),
+            default_of("t", "0"),
+            add_index("ix_filtered", Some("id > 0")),
+            Change::AlterColumnExpression {
+                uid: "c_d4e5f6".parse().unwrap(),
+                column: TableName::new("app", "t").column("g"),
+                from: "id * 2".into(),
+                to: "id * 3".into(),
+            },
+            add_column("h", "id * 2", true),
+            // A longer name is no call, in code or in a literal.
+            check_of("ck_longer", "note <> 'app.ff(1)' AND app.ff(id) > 0"),
+            alter(&s, "app.f(integer)"),
+        ]);
+        let before = names(&cs);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 0);
+        assert_eq!(names(&cs), before);
+
+        let n = TableName::new("app", "n");
+        let mut t = Table::default();
+        t.columns.insert(
+            "id".into(),
+            Column::new("integer".parse().unwrap()).not_null(),
+        );
+        t.checks.insert(
+            "ck_calls".into(),
+            CheckConstraint {
+                expression: "app.f(id) >= 0".into(),
+            },
+        );
+        t.checks.insert(
+            "ck_plain".into(),
+            CheckConstraint {
+                expression: "id > 0".into(),
+            },
+        );
+        let mut cs = plan(vec![
+            Change::CreateTable {
+                uid: Uid::derived(UidKind::Table, "app.n", 0),
+                name: n,
+                table: Box::new(t),
+            },
+            alter(&s, "app.f(integer)"),
+        ]);
+        assert_eq!(split_new_tables(&mut cs, &[], pg().as_ref()), 1);
+        #[allow(clippy::wildcard_enum_match_arm)]
+        match &cs.changes[0].change {
+            Change::CreateTable { table, .. } => {
+                assert_eq!(table.checks.keys().collect::<Vec<_>>(), ["ck_plain"]);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(names(&cs)[1], "add check ck_calls");
+    }
+
+    /// DEC-1364.1: a column added with an expression calling a new function
+    /// follows that function's create, and a module that reads the column
+    /// follows the column, though the differ put it ahead of the function. A
+    /// column calling nothing new, and a module reading it, keep their
+    /// places.
+    #[test]
+    fn a_column_calling_a_new_function_follows_it_and_its_readers_follow_the_column() {
+        for generated in [true, false] {
+            let mut cs = plan(vec![
+                add_column("g", "app.f(1)", generated),
+                add_column("plain", "id * 2", true),
+                routine("app.a_reader()", "SELECT g FROM app.t LIMIT 1"),
+                routine("app.f(integer)", "SELECT 1"),
+                routine("app.z()", "SELECT plain FROM app.t LIMIT 1"),
+            ]);
+            assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
+            let at =
+                |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
+            let column =
+                |name: &str| at(&|c| matches!(c, Change::AddColumn { name: n, .. } if n == name));
+            let created = |name: &str| {
+                at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id(name)))
+            };
+            let order = names(&cs);
+            assert!(created("app.f(integer)") < column("g"), "{order:?}");
+            assert!(column("g") < created("app.a_reader()"), "{order:?}");
+            assert_eq!(column("plain"), 0, "{order:?}");
+            assert!(created("app.f(integer)") < created("app.z()"), "{order:?}");
+        }
+    }
+
+    /// DEC-1364.1: a literal an OID-alias type reads names the function to
+    /// the engine, so a check naming a new function only that way follows its
+    /// create, and so does a column whose default does.
+    #[test]
+    fn a_function_named_only_in_an_oid_alias_literal_is_followed() {
+        let mut cs = plan(vec![
+            add_column("r", "('app.f(integer)'::regprocedure)::text", false),
+            check_of("ck_regproc", "'app.f'::regproc IS NOT NULL"),
+            routine("app.f(integer)", "SELECT 1"),
+        ]);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 2);
+        let order = names(&cs);
+        assert!(order[0].starts_with("create app.f"), "{order:?}");
+        assert!(order[1].starts_with("AddColumn"), "{order:?}");
+        assert_eq!(order[2], "add check ck_regproc", "{order:?}");
+
+        // A quoted name is read whole inside the literal.
+        let mut cs = plan(vec![
+            check_of(
+                "ck_quoted",
+                "'app.\"my func\"(integer)'::regprocedure IS NOT NULL",
+            ),
+            routine("app.my func(integer)", "SELECT 1"),
+        ]);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
+        assert_eq!(names(&cs)[1], "add check ck_quoted", "{:?}", names(&cs));
+
+        // A reserved word is a name, bare, to the OID-alias input.
+        let mut cs = plan(vec![
+            check_of("ck_reserved", "'select(integer)'::regprocedure IS NOT NULL"),
+            routine("public.select(integer)", "SELECT 1"),
+        ]);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
+        assert_eq!(names(&cs)[1], "add check ck_reserved", "{:?}", names(&cs));
+    }
+
+    /// A function's name in a comment, or as a Unicode identifier's escape
+    /// character, is no call: a column whose expression only holds it there
+    /// stays ahead of the function, which reads the column, and the plan is
+    /// not refused as a cycle (DEC-1364.1).
+    #[test]
+    fn a_function_named_only_in_a_comment_is_no_call() {
+        for (column, function) in [
+            (add_column("g", "0 /* app.f(1) */", false), "app.f(integer)"),
+            (
+                add_column("g", "U&\"_0061\" UESCAPE '_' * 2", true),
+                "app._()",
+            ),
+        ] {
+            let mut cs = plan(vec![
+                column,
+                routine(function, "SELECT g FROM app.t LIMIT 1"),
+            ]);
+            let before = names(&cs);
+            assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 0);
+            assert_eq!(names(&cs), before);
+        }
+    }
+
+    /// DEC-1364.1: a module naming the table may take its whole column shape
+    /// without naming the column, by `*`, a spelled list beside it, or a
+    /// positional insert, so it follows a column that moves. A view over
+    /// another table keeps its place.
+    #[test]
+    fn a_module_naming_the_table_follows_a_moved_column() {
+        let mut cs = plan(vec![
+            add_column("g", "app.f(1)", true),
+            new_view("app.a_all", "SELECT * FROM app.t"),
+            new_view("app.a_other", "SELECT * FROM app.u"),
+            new_view("app.a_spelled", "SELECT id FROM app.t"),
+            routine(
+                "app.a_writer()",
+                "INSERT INTO app.t VALUES (1, 2, 3) RETURNING 1",
+            ),
+            routine("app.f(integer)", "SELECT 1"),
+        ]);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
+        assert_eq!(
+            names(&cs),
+            [
+                "create app.a_other",
+                "create app.f(integer)",
+                &names(&plan(vec![add_column("g", "app.f(1)", true)]))[0],
+                "create app.a_all",
+                "create app.a_spelled",
+                "create app.a_writer()",
+            ]
+        );
+    }
+
+    /// A module naming another only in a literal, as `regprocedure` reads it
+    /// in a `BEGIN ATOMIC` body, still follows it when that one moves after a
+    /// column (DEC-1364.1).
+    #[test]
+    fn a_module_naming_a_moved_module_in_a_literal_follows_it() {
+        let mut cs = plan(vec![
+            add_column("g", "app.z(1)", true),
+            routine("app.a_reader()", "SELECT g FROM app.t LIMIT 1"),
+            Change::CreateModule {
+                id: id("app.b_user()"),
+                module: Box::new(module(
+                    ModuleKind::Function,
+                    "() RETURNS text LANGUAGE sql \
+                     BEGIN ATOMIC SELECT 'app.a_reader()'::regprocedure::text; END",
+                )),
+            },
+            routine("app.z(integer)", "SELECT 1"),
+        ]);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
+        let at =
+            |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
+        let created =
+            |name: &str| at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id(name)));
+        let column = at(&|c| matches!(c, Change::AddColumn { .. }));
+        let order = names(&cs);
+        assert!(created("app.z(integer)") < column, "{order:?}");
+        assert!(column < created("app.a_reader()"), "{order:?}");
+        assert!(
+            created("app.a_reader()") < created("app.b_user()"),
+            "{order:?}"
+        );
+    }
+
+    /// A `depends_on:` edge holds a module behind what it declares, though its
+    /// text names nothing: moved after the column with its reader, it is
+    /// moved too. Without the edge it keeps its place.
+    #[test]
+    fn a_declared_dependency_holds_a_module_behind_a_moved_reader() {
+        let changes = || {
+            plan(vec![
+                add_column("g", "app.f(1)", true),
+                routine("app.a_reader()", "SELECT g FROM app.t LIMIT 1"),
+                routine("app.b_user()", "SELECT 1"),
+                routine("app.f(integer)", "SELECT 1"),
+            ])
+        };
+        let at = |cs: &ChangeSet, name: &str| {
+            cs.changes
+                .iter()
+                .position(
+                    |p| matches!(&p.change, Change::CreateModule { id: i, .. } if *i == id(name)),
+                )
+                .unwrap()
+        };
+        let deps = ModuleDeps::from([(id("app.b_user()"), BTreeSet::from([id("app.a_reader()")]))]);
+        let mut cs = changes();
+        assert_eq!(after_the_rebuilds(&mut cs, &BTreeSet::new(), &deps), Ok(1));
+        assert!(
+            at(&cs, "app.a_reader()") < at(&cs, "app.b_user()"),
+            "{:?}",
+            names(&cs)
+        );
+
+        let mut cs = changes();
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
+        assert!(
+            at(&cs, "app.b_user()") < at(&cs, "app.f(integer)"),
+            "{:?}",
+            names(&cs)
+        );
+        assert!(
+            at(&cs, "app.f(integer)") < at(&cs, "app.a_reader()"),
+            "{:?}",
+            names(&cs)
+        );
+    }
+
+    /// DEC-1364.1: a function a new column calls, and that reads the column,
+    /// is a cycle no order performs. The plan is refused by name with the
+    /// two-plan remedy, directly or through a function it calls, and left as
+    /// it was. A function that only names the column's table is held to the
+    /// same, since naming the table may take its whole column shape.
+    #[test]
+    fn a_column_calling_a_function_that_reads_it_is_refused_by_name() {
+        for changes in [
+            vec![
+                add_column("g", "app.f(1)", true),
+                routine("app.f(integer)", "SELECT g FROM app.t LIMIT 1"),
+            ],
+            vec![
+                add_column("g", "app.f(1)", false),
+                routine("app.a_helper()", "SELECT max(g) FROM app.t"),
+                Change::CreateModule {
+                    id: id("app.f(integer)"),
+                    module: Box::new(module(
+                        ModuleKind::Function,
+                        "(x integer) RETURNS integer LANGUAGE sql AS $$ SELECT app.a_helper() $$",
+                    )),
+                },
+            ],
+            vec![
+                add_column("g", "app.f(1)", false),
+                routine("app.f(integer)", "SELECT max(id) FROM app.t"),
+            ],
+        ] {
+            let mut cs = plan(changes);
+            let before = names(&cs);
+            let why =
+                after_the_rebuilds(&mut cs, &BTreeSet::new(), &ModuleDeps::new()).unwrap_err();
+            assert!(why.contains("`app.t.g`"), "{why}");
+            assert!(why.contains("`app.f(integer)`"), "{why}");
+            assert!(why.contains("two plans"), "{why}");
+            assert_eq!(names(&cs), before);
+        }
+    }
+
+    /// Rows are written before the modules, so a row that writes the column,
+    /// or takes its default, cannot follow a function the column calls: the
+    /// plan is refused by name. A row that touches neither keeps its place,
+    /// and so does every row beside a generated column.
+    #[test]
+    fn a_row_writing_a_column_that_calls_a_new_function_is_refused() {
+        let insert = |row: &[&str], defaults: &[&str]| Change::InsertRow {
+            table: TableName::new("app", "t"),
+            key_column: "id".into(),
+            identity_key: false,
+            key: pbps_model::RowKey::from("1"),
+            row: pbps_model::Row(
+                row.iter()
+                    .map(|c| ((*c).to_owned(), pbps_model::Value::Null))
+                    .collect(),
+            ),
+            defaults: defaults
+                .iter()
+                .map(|c| ((*c).to_owned(), "app.f(1)".to_owned()))
+                .collect(),
+            types: BTreeMap::new(),
+        };
+        let ordered = |row: Change| {
+            let mut cs = plan(vec![
+                add_column("g", "app.f(1)", false),
+                row,
+                routine("app.f(integer)", "SELECT 1"),
+            ]);
+            after_the_rebuilds(&mut cs, &BTreeSet::new(), &ModuleDeps::new())
+        };
+        let why = ordered(insert(&["g"], &[])).unwrap_err();
+        assert!(why.contains("a row this plan writes into `app.t`"), "{why}");
+        assert!(
+            ordered(insert(&[], &["g"])).is_err(),
+            "a row taking its default"
+        );
+        assert_eq!(
+            ordered(insert(&["id"], &[])),
+            Ok(1),
+            "a row of other columns"
+        );
     }
 
     /// Negatives: no function rebuilt (a view rebuilt, or nothing), and a
@@ -1606,7 +2354,7 @@ mod tests {
         ] {
             let mut cs = plan(changes);
             let before = names(&cs);
-            assert_eq!(after_the_rebuilds(&mut cs, &BTreeSet::new()), 0);
+            assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 0);
             assert_eq!(names(&cs), before);
         }
         let mut cs = plan(vec![
@@ -1623,7 +2371,7 @@ mod tests {
             add_check("ck"),
             alter(&s, "app.f(integer)"),
         ]);
-        assert_eq!(after_the_rebuilds(&mut cs, &BTreeSet::new()), 1);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
         assert_eq!(
             names(&cs),
             [
@@ -1668,7 +2416,7 @@ mod tests {
         };
         let moved = |write: Change| {
             let mut cs = plan(vec![set_default("u"), write, alter(&s, "app.f(integer)")]);
-            after_the_rebuilds(&mut cs, &BTreeSet::new()) == 1
+            rebuilds(&mut cs, &BTreeSet::new()) == 1
         };
         assert!(moved(insert(&[])), "an insert that spells `n`");
         assert!(

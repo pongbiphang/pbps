@@ -886,6 +886,104 @@ impl Lexicon {
         self.code_only_inner(definition, !native)
     }
 
+    /// The contents of every string literal in `text`, decoded: `'…'`,
+    /// `E'…'`, `U&'…'` with its `UESCAPE`, a continued literal, and on an
+    /// engine with dollar quoting `$tag$…$tag$`. Comments and quoted
+    /// identifiers are skipped, a `U&"…"` one with its `UESCAPE` clause, so a
+    /// word in any of them is no literal's.
+    ///
+    /// For a scan that has to read what a literal *names*: an OID-alias type
+    /// resolves one to a function, `'app.f(integer)'::regprocedure`
+    /// (DEC-1364.1). An unterminated literal ends the scan.
+    #[must_use]
+    pub fn string_literals(&self, text: &str) -> Vec<String> {
+        let bytes = text.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < text.len() {
+            let rest = &text[i..];
+            let Some(ch) = rest.chars().next() else {
+                break;
+            };
+            let after_name = continues_identifier(text, i);
+            if rest.starts_with("--") {
+                i += rest.find(['\n', '\r']).unwrap_or(rest.len());
+            } else if rest.starts_with("/*") {
+                let mut depth = 0usize;
+                let mut j = i;
+                while j < text.len() {
+                    if text[j..].starts_with("/*") {
+                        depth += 1;
+                        j += 2;
+                    } else if text[j..].starts_with("*/") {
+                        depth -= 1;
+                        j += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        j += text[j..].chars().next().map_or(1, char::len_utf8);
+                    }
+                }
+                i = j;
+            } else if ch == '"' {
+                // A quoted identifier, `""` a quote inside it.
+                let mut j = i + 1;
+                while j < text.len() {
+                    if bytes[j] == b'"' {
+                        if bytes.get(j + 1) == Some(&b'"') {
+                            j += 2;
+                            continue;
+                        }
+                        j += 1;
+                        break;
+                    }
+                    j += text[j..].chars().next().map_or(1, char::len_utf8);
+                }
+                // A `U&"…"` identifier's `UESCAPE 'x'` belongs to the name,
+                // as `code_only` reads it: its operand is no literal of the
+                // expression's.
+                let unicode = i >= 2
+                    && text[..i].to_ascii_lowercase().ends_with("u&")
+                    && !continues_identifier(text, i - 2);
+                if unicode && let Some(n) = uescape_clause_len(&text[j..]) {
+                    j += n;
+                }
+                i = j;
+            } else if self.dollar_quoted_strings
+                && ch == '$'
+                && !after_name
+                && dollar_tag(rest).is_some()
+            {
+                let Some(literal) = sql_string(text, i) else {
+                    break;
+                };
+                out.push(literal.contents);
+                i = literal.end;
+            } else if let Some(start) = literal_start(rest)
+                && (start == '\'' || !after_name)
+            {
+                // A prefix is one only as a token of its own: `note'x'` is a
+                // name and a plain literal. `E'` and `U&'` are decoded by
+                // their own rules; `N'`, `B'` and `X'` hold their contents as
+                // a plain literal does.
+                let at = if matches!(start, 'e' | 'u') {
+                    i
+                } else {
+                    i + rest.find('\'').unwrap_or(0)
+                };
+                let Some(literal) = sql_string(text, at) else {
+                    break;
+                };
+                out.push(literal.contents);
+                i = literal.end;
+            } else {
+                i += ch.len_utf8();
+            }
+        }
+        out
+    }
+
     fn has_native_language(&self, definition: &str, header: &str) -> bool {
         let mut cursor = 0;
         let mut depth = 0usize;
@@ -1575,6 +1673,23 @@ fn closing_block_comment(text: &str, at: usize) -> Option<usize> {
 
 /// Blanks `ch` in `out`, keeping a line break so that line structure and
 /// positions survive.
+/// Which literal opens at the start of `text`, by its prefix: `'` for a
+/// plain one, `e` for `E'`, `u` for `U&'`, and `n`, `b` or `x` for theirs.
+fn literal_start(text: &str) -> Option<char> {
+    let lower = text.get(..3).unwrap_or(text).to_ascii_lowercase();
+    if lower.starts_with('\'') {
+        Some('\'')
+    } else if lower.starts_with("u&'") {
+        Some('u')
+    } else {
+        let mut chars = lower.chars();
+        match (chars.next(), chars.next()) {
+            (Some(p @ ('e' | 'n' | 'b' | 'x')), Some('\'')) => Some(p),
+            _ => None,
+        }
+    }
+}
+
 fn blank(out: &mut String, ch: char) {
     if matches!(ch, '\n' | '\r') {
         out.push(ch);
@@ -4600,5 +4715,30 @@ UESCAPE '!' AS s";
         for open in ["'unterminated", "E'x\\'", "/* open", "\"open"] {
             assert_eq!(PG.code_only(open).len(), open.len(), "{open}");
         }
+    }
+
+    /// The literals a text holds, decoded, and nothing a comment or a quoted
+    /// identifier holds (DEC-1364.1).
+    #[test]
+    fn string_literals_are_read_and_comments_and_names_are_not() {
+        let lexicon = PG;
+        assert_eq!(
+            lexicon.string_literals(
+                "a || 'x''y' || E'p\\'q' || $t$d$t$ || note'z' -- 'c'\n /* 'b' /* 'n' */ */ \"q'\""
+            ),
+            ["x'y", "p'q", "d", "z"]
+        );
+        assert_eq!(lexicon.string_literals("N'n' || U&'\\0061'"), ["n", "a"]);
+        // A Unicode identifier's escape clause is part of the name.
+        assert!(
+            lexicon
+                .string_literals("U&\"_0061\" UESCAPE '_' * 2")
+                .is_empty()
+        );
+        assert_eq!(
+            lexicon.string_literals("U&\"_0061\" UESCAPE '_' || 'x'"),
+            ["x"]
+        );
+        assert!(lexicon.string_literals("a * 2 -- 'x'").is_empty());
     }
 }

@@ -1459,6 +1459,11 @@ PostgreSQL: a function edit together with a new check, filtered index and
 default calling it applies, `verify` is clean, and planning again reports no
 changes. Before the move, the plan put the check ahead of `CREATE FUNCTION`.
 
+*Amended by [DEC-1364.1](#dec-1364-1): an addition moves only when its text
+names a function the plan creates or rebuilds, a new table splits out only such
+parts, and a column added with such a call follows the create instead of being
+left to the engine.*
+
 <a id="dec-230-1"></a>
 
 **DEC-230.1. A routine arriving does not rebuild a view that names it only as
@@ -1485,3 +1490,102 @@ excluded on evidence: `FROM` also opens `extract(... FROM t.dd)`, where
 column notation reads `t.dd` as `dd(t)`, and that view recreated after a new
 `dd(t)` arrives binds it. A relation arriving also brings a row type that
 type positions capture, so relation arrivals stay conservative.
+
+<a id="dec-1364-1"></a>
+
+**DEC-1364.1. What a plan adds follows a function the plan creates or rebuilds
+only when its text names that function, read by the engine's lexer; a new
+column that names one follows its create, and what may read the column
+follows the column (#1364).** DEC-942.1 assumed every check, filtered index,
+default and expression change calls a function the plan creates, and moved
+them all after the last create. For an added column that assumption breaks a
+reverse edge: a function the plan creates may read the column, and the engine
+resolves a SQL body's columns at `CREATE FUNCTION`. So such a column stayed
+ahead of every create, and one whose default or generation expression called
+a created function was refused by the engine, and the apply rolled back
+(DEC-1168.1, #1350).
+
+**Which functions a text may call** is read the way `creation_order_with`
+reads a module (DECISIONS 315): the function's bare name as a token outside
+literals and comments, by the PostgreSQL lexer (`pbps_pg::generated::may_name`,
+the scan of DEC-1316.1). A string literal's contents count too, read by the
+same scan, so a quoted name in one is one name, delimiters and all, except
+that a reserved word bare is a name there: measured on 18.6,
+`'select(integer)'::regprocedure` resolves the function `select`. A comment
+is no literal, nor is a Unicode identifier's `UESCAPE` character
+(`Lexicon::string_literals`, `pbps_pg::generated::may_call`).
+Measured on 18.6, a literal an OID-alias type
+reads names the function to the engine: `'app.f(integer)'::regprocedure`,
+`'app.f'::regproc` and `regprocedure('app.f(integer)')` are refused before the
+function exists, and record a dependency on it after. Without a cast, such a
+literal may be read as a default of a column of that type, or compared with
+one, so every literal counts, and so does `'app."my func"(integer)'`. The
+schema is not compared, and a column, field or literal word of the same name
+counts. A false yes costs a later position. A call
+the text spells is never missed; one made inside another function the text
+calls is that function's own, as before.
+
+- `after_the_rebuilds` moves a check, an index holding an expression, a
+  default being set and a changed generation expression only when its text
+  names one; the rest keep the differ's place. What validates a recomputed
+  column moves with its expression, as before.
+- `split_new_tables` takes only such parts out of a new table. A check calling
+  nothing the plan creates stays in `CREATE TABLE`, and asks for no `--allow
+  constraint` of its own.
+- `after_their_functions` places a column added with a default or a generation
+  expression that names one. The stretch from the column to the last function
+  create is ordered again as a stable topological order: the column waits for
+  the creates its text names, and every later change that may need an earlier
+  one keeps following it. Anything not shown independent keeps its order. What
+  may need a new column: a module naming it, or naming its table; a row
+  writing it or taking its default; a change of its table naming it; a foreign
+  key referencing it. A module naming the table counts whatever it spells,
+  because the ways to take a table's whole column shape without naming a
+  column form no closed list. Measured on 18.6, a view's or a `BEGIN ATOMIC`
+  body's `*`, a `NATURAL` join, and a positional `INSERT INTO t VALUES (…)`,
+  atomic or not, are all bound to the columns when the module is created, and
+  a column added later is not theirs. A module needs another it names, in code
+  or in a literal as above, a view a trigger is on, an overload of its own name
+  (DECISIONS 212), and what it declares in `depends_on:`. A row needs nothing
+  to cross it: a trigger the plan creates must not fire on a row written
+  before the modules.
+
+When no order exists, the plan is refused by name, naming the column, the
+functions, and what needs the column, with the two-plan remedy: the functions
+in a plan of their own first, or the column without the call first. The
+genuine case is a function that reads the column it is called from, directly or
+through a function it calls. The engine refuses either create first, so there
+is no order to find. A row the plan writes into the column is refused the same
+way. Both used to fail inside the apply. Because both directions are
+over-approximated, a refusal can name a cycle the engine would not have:
+- a function that names the column's table but reads only its other columns,
+  such as a default `app.next_id()` reading `max(id)`. That plan also failed
+  inside the apply before this rule, which kept the column ahead of the
+  function it calls.
+- a column calling a built-in that shares a created function's name, beside a
+  function naming the table. The earlier rule kept such a column ahead and
+  applied it.
+
+The remedy applies either in two plans.
+
+Left to the engine, as before: a generated column of a table the plan creates
+that calls a function the plan creates or rebuilds. It stays inside `CREATE
+TABLE`, because a column taken out would be added last and change the table's
+column order. The other corners on #1350 are not this rule's. A release
+(DEC-1316.1) whose new expression names no created function now keeps its
+place, so its retype is refused only when the release names one.
+
+Pinned by `an_addition_naming_no_created_function_keeps_its_place`,
+`a_function_named_only_in_an_oid_alias_literal_is_followed`,
+`a_function_named_only_in_a_comment_is_no_call`,
+`a_module_naming_a_moved_module_in_a_literal_follows_it`,
+`a_column_calling_a_new_function_follows_it_and_its_readers_follow_the_column`,
+`a_module_naming_the_table_follows_a_moved_column`,
+`a_declared_dependency_holds_a_module_behind_a_moved_reader`,
+`a_column_calling_a_function_that_reads_it_is_refused_by_name` and
+`a_row_writing_a_column_that_calls_a_new_function_is_refused`
+(`crates/pbps-cli/src/dependents.rs`), and the live
+`a_new_column_calling_a_new_function_follows_its_create`,
+`a_new_column_calling_a_rebuilt_function_follows_the_rebuild` and
+`a_new_column_calling_a_function_that_reads_it_is_refused_by_name`
+(`crates/pbps-cli/tests/flow_pg.rs`).

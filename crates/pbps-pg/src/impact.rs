@@ -473,12 +473,23 @@ fn text(row: &Row, column: &str) -> Result<String, DbError> {
 /// and masked comments can separate that dot from its identifier. Advancing
 /// by complete characters keeps non-ASCII names intact (DECISIONS 408).
 pub(crate) fn mentions(body: &str, name: &str) -> bool {
+    mentions_by(body, name, true)
+}
+
+/// [`mentions`] by the rules an OID-alias input reads a name with: measured
+/// on 18.6, `'select(integer)'::regprocedure` resolves the function `select`,
+/// so a reserved word bare is a name there (DEC-1364.1).
+pub(crate) fn mentions_in_literal(contents: &str, name: &str) -> bool {
+    mentions_by(contents, name, false)
+}
+
+fn mentions_by(body: &str, name: &str, reserved_words_apply: bool) -> bool {
     let Ok(quoted_name) = crate::quote(name) else {
         return false;
     };
     let code = crate::LEXICON.code_only(body);
     let bare_name = name == name.to_ascii_lowercase();
-    let reserved = crate::types::is_reserved(name);
+    let reserved = reserved_words_apply && crate::types::is_reserved(name);
     let mut rest = code.as_str();
     let mut after_dot = false;
     while let Some(ch) = rest.chars().next() {
