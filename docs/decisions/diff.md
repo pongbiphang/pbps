@@ -1662,7 +1662,10 @@ One the plan adds, new or again, comes at (9, 3), after every input change.
 
 "May" is `Dialect::may_name`, the over-approximation of DEC-1316.1 applied to
 code only and ignoring case: under a case-insensitive collation `A2` reads
-`a2`, and the engine stores `[a2]`. It looks for a delimited name's escaped
+`a2`, and the engine stores `[a2]`. Only a function module is matched against
+an expression, for a move and for a refusal alike: a computed column calls
+nothing else, so a view or procedure that shares a name the expression uses is
+never what it calls. It looks for a delimited name's escaped
 spelling too: `a]b` is stored as `[a]]b]`. Its case fold can only make more
 names equal. `İ` folds to `i` without the combining dot, and `ı` to `i`,
 because a Turkish collation binds `[i]` to `İ`. Accent-, width- and

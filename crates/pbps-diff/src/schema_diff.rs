@@ -403,7 +403,7 @@ fn diff_partial_rebuilding(
         dialect,
         &mut changes,
     );
-    refuse_computed_dependencies(declared.schema, dialect, &changes, &mut errs);
+    refuse_computed_dependencies(base.schema, declared.schema, dialect, &changes, &mut errs);
     // A module declaration can stay byte-for-byte identical while a new
     // overload or shadow changes what it should bind to. Ask the dialect
     // before sorting, rather than appending unreviewed SQL at apply time.
@@ -846,7 +846,15 @@ fn diff_partial_rebuilding(
                 continue;
             };
         for module in &planned {
+            // Only a function: a computed column calls nothing else, and a
+            // view or procedure that shares a column's name is not released
+            // by it (#1174 review).
             if let Change::DropModule { id, .. } = &module.change
+                && base
+                    .schema
+                    .modules
+                    .get(id)
+                    .is_some_and(|m| m.kind == pbps_model::ModuleKind::Function)
                 && expressions
                     .iter()
                     .any(|e| dialect.may_name(e, &id.object_name().name))
@@ -1760,11 +1768,21 @@ fn input_change<'a>(change: &'a Change, table: &TableName) -> Option<(&'a str, &
 /// this plan drops, or changes and so drops and re-adds, is out of the way
 /// before any of these and is not standing.
 fn refuse_computed_dependencies(
+    base: &Schema,
     declared: &Schema,
     dialect: &dyn Dialect,
     changes: &[Change],
     errs: &mut Vec<DiffError>,
 ) {
+    // A computed column calls functions and nothing else: a view or a
+    // procedure that shares a name it uses is never what it calls.
+    let function = |id: &ModuleId| {
+        [base, declared].iter().any(|s| {
+            s.modules
+                .get(id)
+                .is_some_and(|m| m.kind == pbps_model::ModuleKind::Function)
+        })
+    };
     let dropped = |table: &TableName, name: &str| {
         changes.iter().any(|c| {
             matches!(c, Change::DropComputedColumn { table: t, name: n, .. }
@@ -1848,12 +1866,14 @@ fn refuse_computed_dependencies(
                     | Change::Revoke { .. }
                     | Change::PublicExecution { .. } => None,
                 };
-                if let Some((id, what)) = module {
-                    let function = id.object_name().name;
-                    if dialect.may_name(&computed.expression, &function) {
+                if let Some((id, what)) = module
+                    && function(id)
+                {
+                    let name = id.object_name().name;
+                    if dialect.may_name(&computed.expression, &name) {
                         errs.push(DiffError::ComputedFunctionChanged {
                             computed: at.clone(),
-                            function,
+                            function: name,
                             change: what,
                         });
                     }
@@ -3628,7 +3648,7 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         // A module it may call, altered while it stands.
         let calls = |definition: &str| {
-            with_modules(
+            with_functions(
                 shaped(Column::new(ty("int")), "dbo.f(a2)"),
                 &[("dbo.f", definition)],
             )
@@ -3644,7 +3664,7 @@ mod tests {
         // changes: refused too (#1174 review).
         let errors = errors_of(
             &calls("one"),
-            &with_modules(
+            &with_functions(
                 shaped(Column::new(ty("int")), "dbo.f(a2) + 1"),
                 &[("dbo.f", "two")],
             ),
@@ -3698,7 +3718,7 @@ mod tests {
         assert!(at("DropTable") < at("DropModule"), "{k:?}");
         // A module the moved one depends on moves with it, behind it: the
         // column, then `f`, then the `g` that `f` names (#1174 review).
-        let chain = with_modules(
+        let chain = with_functions(
             shaped(Column::new(ty("int")), "dbo.f(a2)"),
             &[("dbo.f", "SELECT dbo.g(1)"), ("dbo.g", "SELECT 1")],
         );
@@ -3712,11 +3732,41 @@ mod tests {
             })
             .collect();
         assert_eq!(order, ["c", "f", "g"]);
+        // Negative: a view that shares the name of a column it reads is not
+        // what it calls, and keeps its place ahead of the table's drop
+        // (#1174 review).
+        let viewed = with_modules(
+            shaped(Column::new(ty("int")), "a2 * 2"),
+            &[("dbo.a2", "SELECT 1")],
+        );
+        let k = kinds(&run(
+            &viewed,
+            &Schema::default(),
+            &[Intent::DropTable {
+                table: "dbo.t".parse().unwrap(),
+                reason: "gone".into(),
+            }],
+        ));
+        let at = |kind: &str| {
+            k.iter()
+                .position(|x| x == kind)
+                .unwrap_or_else(|| panic!("{kind}: {k:?}"))
+        };
+        assert!(at("DropModule") < at("DropTable"), "{k:?}");
+        // Nor is such a view's alter refused.
+        let view = |definition: &str| {
+            with_modules(
+                shaped(Column::new(ty("int")), "a2 * 2"),
+                &[("dbo.a2", definition)],
+            )
+        };
+        let errors = errors_of(&view("one"), &view("two"), &[]);
+        assert!(errors.is_empty(), "{errors:?}");
         // Negative: an altered module it does not name.
         let plain = shaped(Column::new(ty("int")), "a2 * 2");
         let errors = errors_of(
-            &with_modules(plain.clone(), &[("dbo.f", "one")]),
-            &with_modules(plain, &[("dbo.f", "two")]),
+            &with_functions(plain.clone(), &[("dbo.f", "one")]),
+            &with_functions(plain, &[("dbo.f", "two")]),
             &[],
         );
         assert!(errors.is_empty(), "{errors:?}");
@@ -10357,6 +10407,16 @@ mod tests {
             description: None,
             definition: definition.to_owned(),
         }
+    }
+
+    fn with_functions(mut schema: Schema, specs: &[(&str, &str)]) -> Schema {
+        for (name, definition) in specs {
+            schema.modules.insert(
+                name.parse().unwrap(),
+                a_module(pbps_model::ModuleKind::Function, definition),
+            );
+        }
+        schema
     }
 
     fn with_modules(mut schema: Schema, specs: &[(&str, &str)]) -> Schema {
