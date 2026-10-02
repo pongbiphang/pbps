@@ -52,153 +52,68 @@ leftover file outside the compiled module tree supplies no scheduling evidence.
 Parents must themselves lead to an active CI entry. A root-only or PID-1
 helper never gains an owner merely because it appears in a library binary.
 
-Witnesses are deliberately bounded checks on the current runner forms, not a
-Python, shell or Rust interpreter. Python uses its AST and literal selector
-data; fixture modules are never imported or executed. Module entry witnesses
-accept direct calls, literal truth values, and selected branches of equality /
-inequality guards between constants and `__name__` for a script launched as
-`__main__`. Unsupported conditional
-module bodies supply no witness, and direct rebinding of `__name__` is refused.
-Function witnesses retain runtime branches: this check does not prove every
-runtime precondition or general Python control flow. Rust witnesses use a
-comment/string-aware lexer inside an unambiguous named function. They do not
-interpret Rust cfgs: the compiler's test list decides whether the parent and
-child exist. Unsupported or ambiguous witness forms must be audited before
-updating the checker and its negative tests. Comments, stringified calls,
-missing calls, disabled CI steps and mismatched runner platforms cannot supply
-an execution owner.
+Python owners use one literal grammar and one source-wide syntactic policy
+(DEC-1413.1). The checker parses each owner source once; it never imports or
+executes a fixture. Registry data expressions and selected call arguments name
+the protected selector constants. Each constant has exactly one plain assignment
+at module level. Values use literals, lists/tuples, `+`, and one synchronous
+unfiltered list-comprehension generator over literal data. Subscriptions and
+opaque calls are outside this grammar. The launch prefix comprehension, server
+list, singleton `TEST` and target's named constants all use these same rules.
+There are no per-file profiles or helper-skeleton proofs.
 
-Module-level selector data is kept only while its supported literal assignment
-remains valid. Unsupported writes, deletion and conditional rebinding discard
-that name; visible mutation or escape of a mutable selector also discards its
-shared aliases, including aliases inside supported containers. Class-construction
-positional bases and keywords, along with subscription keys (reads, writes and
-deletions, including slice components), are arguments to potentially mutating
-Python protocols. For a direct module class without decorators, fully proven
-literal bases expose only the mutable objects actually passed: starred native
-containers pass their elements, and native indexing/slicing with literal integer
-bounds preserves immutable reads and independent copies. Shared mutable children
-still escape. Unknown base expressions and nested classes retain conservative
-reference tracking; this proof does not extend the selector assignment grammar.
+A protected name cannot bind elsewhere: assignment/deletion/augmentation,
+`global`/`nonlocal`, import alias, definition or argument, exception target,
+pattern capture and type parameter fields are all checked. Mutable list
+selectors may be read only as the direct iterable of a `for` or comprehension.
+Qualified attribute, from-import and class-pattern keyword attribute reads
+follow the same restriction. Their aliases, argument passing, container storage,
+subscripting and mutation receivers
+are therefore refused without tracing Python effects. String and
+immutable tuple constants retain ordinary reads. This is a source form, not a
+scope or annotation execution interpreter: an otherwise harmless protected
+binding in an uncalled body is still outside the form. Ordinary `global ENGINE`
+and `global DOCKER_SOCKET` remain allowed.
 
-The exact-value class-base exemption also requires a pristine execution prefix
-and a bounded proof of the whole construction. Literal keywords and native dict
-unpacking (including pristine literal dictionary aliases) are accepted. A custom
-metaclass must be a directly defined, unmodified function (or a proven alias),
-whose reachable helpers only operate on native arguments. Any `type` construction
-must use the unshadowed builtin with empty bases, only as the metaclass return
-operation; helper-produced classes cannot be treated as native containers.
-Mutable global access, reflection, unknown calls, modified prepare hooks,
-and unsupported callable bodies retain conservative base-reference effects.
-The class body may contain literal local assignments and plain method definitions
-with inert definition-time expressions; an uncalled method body is not executed.
-This is a deliberately bounded proof, not execution or import of fixture code.
-Empty native base expansions also permit the default metaclass or an unshadowed
-builtin `type`, with the same class-body proof.
+The whole module is scanned for reflective AST spellings (`globals`, `locals`,
+`vars`, `eval`, `exec`, `compile`, `__import__`, `__builtins__`, `__dict__`,
+`__globals__`, `f_globals` and `f_locals`), reflection-module imports
+(`builtins`, `importlib`, `inspect`, `gc`), qualified `sys.modules`/`sys._getframe`
+access through syntactic import aliases, wildcard imports and bindings of
+`__name__`. Identifier references in import and pattern string fields are
+checked too; ordinary strings containing those words are data. The check does not attempt
+runtime alias resolution. `ctypes`, imported repository helpers and intentional
+indirect source edits remain a maintainer trust boundary; this lint is not a
+sandbox or proof of arbitrary Python behavior. Unrelated operations such as
+`~0`, set literals and ordinary annotations are not interpreted or forbidden.
 
-Literal tuples
-retain their immutability and Python concatenation semantics; a tuple can still
-expose mutable children. Data selectors accept lists or tuples of names. Unsupported
-assignment RHS values also count as escapes inside compound statements,
-augmented assignments and assignment expressions. Proven top-level literal
-replacement, string prefixes and the existing list comprehensions remain
-supported. Unknown calls and containers are not evaluated to guess their
-effects. Class-local shadows are discarded before reads in statements that may
-delete them, including implicit exception-handler cleanup. This is conservative
-about conditional execution; deletions in separate local scopes stay separate.
-Function-local bodies are not interpreted as module assignments; this
-bounded extraction does not execute helper calls or prove arbitrary runtime
-control flow.
+A data/call selector runner has a unique undecorated module-level `main` and ends
+with exactly `if __name__ == "__main__": main()` or
+`if __name__ == "__main__": raise SystemExit(main())`. `main` need not read the
+selector directly: existing named-function witnesses check the helper invocation
+route. Witness-only scripts without selector data retain direct module execution;
+this includes the sockets runner. No file-specific entry exception is configured.
+Function witnesses retain runtime branches and exclude inactive literal branches,
+nested definitions, comments and stringified calls. Tokens preserve statement
+boundaries, so `run` followed by a separate `()` cannot manufacture `run()`;
+multiline, nested, continued and partial call fragments remain supported.
 
-Visible `globals()`, `locals()`, `vars()` and unknown dynamic execution can
-retain the module namespace: later literal assignments cannot restore evidence
-after that exposure. This includes calls through direct `builtins` module
-imports, imported reflective callables and plain-name alias assignments.
-Tuple/list assignment targets also retain corresponding aliases through nested
-and starred targets. Literal RHS elements are snapshotted once in Python order,
-before any chained target writes, and targets bind from left to right. A real
-later native shadow replaces the alias; an unused reflective alias is not an
-exposure. The snapshots last only for that assignment. Unknown iteration,
-unsupported expression results, mismatched arity and target protocols refuse
-ownership rather than manufacture harmless bindings. Container contents retain
-possible reflection without acquiring a contained callable's native exemption;
-stored-container and general expression provenance remain separate proofs
-(DEC-1299.1).
+Rust witnesses retain their comment/string-aware lexer inside an unambiguous
+named function. Cargo's compiled test list supplies cfg and module reachability.
+Python, shell and Rust witnesses do not prove every runtime precondition. Missing
+invocations, disabled CI steps, mismatched platforms and ambiguous source scopes
+cannot establish ownership. Unsupported Python form diagnostics identify the
+file, line and construct rather than producing an empty successful selection.
 
-Bindings are followed in statement order: direct shadows replace aliases,
-class-local bindings do not replace module bindings, and uncalled function
-bodies do not expose namespaces. Unknown conditional writes retain possible
-reflective aliases conservatively. A conditional name deletion retains both the
-shadow and an explicit absence possibility. Reads resolve that absence through
-the live module binding or the builtin fallback; class globals delete the module
-binding, while class locals delete only their own entry. Conditional writes retain
-the absence possibility, and a guaranteed following shadow replaces it. A readable
-module/builtin fallback is not proof that a local entry exists to delete: an
-absent target supplies no completed-execution evidence. Retained continuations
-resolve each captured absence through that capture's module state (DEC-1300.1).
-With/AsyncWith keeps the running path's bindings
-separate from the prefixes that an entered manager may preserve by suppressing
-a failure. Calls inside that path see successful shadows; the exit joins the
-retained prefixes before subsequent statements. A guaranteed following shadow
-still replaces the joined aliases. This does not prove that every retained
-prefix actually throws, or that a manager always completes normally.
-
-Exact active shadows require conservative handling of opaque effects that
-could restore an erased reflective alias. A separate, permanently invalidated
-pristine-prefix proof recognizes only narrow native calls: literal-container
-`len`, constant exception construction, a fresh SimpleNamespace with a single
-empty callable member, imported nullcontext/suppress, and a plain async manager
-whose two methods return only None and a boolean. These are AST proofs, never
-fixture imports or executed callbacks. Unproven calls, protocols, mutations and
-manager effects cannot acquire this exception after a possibly reflective alias
-has been erased. Legal async fixtures qualify visitor components separately;
-interpreting arbitrary called async helpers is not a module ownership route
-(DEC-1383.1).
-Each retained continuation captures bindings through its owning scope. A class
-entered beneath a manager adds its own local continuation while inheriting the
-enclosing continuations and shared module state. Its stack is copied, so leaving
-the class cannot retain stale class locals in later enclosing statements. Nested
-classes retain enclosing captures for opaque effects but resolve names against
-their own locals and the module, not an enclosing class's locals.
-
-To preserve the measured inert-helper and real following-shadow controls, the
-pristine-prefix proof also recognizes zero-argument plain functions whose only
-statement returns None, and one narrowly proven class-frame write. That helper
-must consist solely of `sys._getframe(1).f_locals[<literal string>] = <value>`;
-its native sys binding and reflective builtin or builtins-module RHS are resolved
-from the module at call time. Only a plain native class namespace and a local
-target qualify. Other helper bodies, replaced frame access, class namespace hooks,
-and unknown RHS effects stay opaque; an actual namespace escape remains sticky
-after later shadows. These proofs do not interpret arbitrary helpers or import
-fixture code. Actual async execution remains separate from component proof and
-complete ownership validation (DEC-1389.1).
-
-Potential namespace access is tracked
-separately from the stricter pristine-binding proof for safe object inspection;
-passing an imported module to an opaque helper cannot make a later reflective
-call harmless. A direct module-level `vars(SimpleNamespace())` call is
-recognized as unrelated only with an untouched `types` import and builtin
-`vars`; imported aliases follow their final left-to-right binding. The
-constructor must receive no arguments, and the call must be an expression or
-assign only plain names. Its preceding execution must also be proven inert:
-literal data (using the same bounded proof for concatenations, aliases and
-supported comprehensions as selector extraction), uncalled helper definitions,
-direct `types`/`sys`/`builtins` imports, and the supported `types` constructor
-imports. Unknown imports, callbacks, decorators, class construction and custom
-targets permanently remove
-this exception; importing a constructor again cannot restore it. Writing inert
-values under literal string keys into a directly proven fresh dictionary remains
-safe.
-This boundary limits the reflection exception, not ordinary literal selectors.
-Other reflective object forms remain conservatively unsupported; this check
-does not import fixtures or resolve arbitrary Python runtime state.
-
-The inventory is a scheduling contract, not runtime coverage or proof that every
-branch was visited. Fixture success assertions and exact-case execution checks
-remain necessary. In particular, a listed case's early return can still need an
-engine-specific review. The Docker rehearsal case belongs to its separate job
-with `PBPS_TEST_DEV_IMAGE`, not the ordinary SQL Server run that deliberately
-leaves that opt-in unset.
+The namespace/effects evaluator and its class, continuation and pristine-prefix
+proofs are retired. DEC-1413.1 supersedes DEC-1299.1, DEC-1383.1, DEC-1389.1 and
+the evaluator policy of DEC-1300.1. Historical decisions remain as provenance.
+Regression dispositions identify the exact program and actual Python result:
+a safe program may now qualify, or be refused for a named form restriction.
+Each operational policy rule has a permanent full-owner test that first observes
+its runtime control, refuses it, removes only that rule and observes admission,
+then restores refusal. A refusal by another guard does not count as that rule's
+counterfactual. Literal node decoding has no execution fallback.
 
 ## Maintaining the inventory
 
