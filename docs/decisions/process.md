@@ -623,3 +623,33 @@ failures and opaque target escapes. Independent counterfactuals pin transfer,
 snapshot reuse, target order, nested/starred precision and fail-closed unknown
 handling; native-container exemption evidence is explicitly component-scoped.
 See [test execution](../TEST-EXECUTION.md).
+
+<a id="dec-1300-1"></a>
+
+**DEC-1300.1. Conditional deletion retains an explicit namespace fallback.**
+A skipped deletion keeps its existing shadow; a completed deletion removes that
+scope's entry. The latter is absence, not an empty non-reflective value. The
+namespace audit joins those states and carries absence as a distinct marker so
+later reads use the live module binding or builtin fallback. Copying the fallback
+value at deletion time is insufficient: an executed nested class can replace
+the module binding before the deleted local is read. A further conditional write
+keeps that possibility, while a guaranteed following shadow replaces it.
+
+Class-local deletion uses the class namespace; an explicit class global uses the
+module namespace. A readable fallback does not make an absent local deletable.
+Known missing targets refuse execution-owner evidence rather than treating their
+NameError as a successful deletion. Definite deletion remains a removal, and
+merely retaining an unused reflective fallback does not expose the namespace.
+
+The same lookup resolves captured continuation states against their captured
+module dictionaries. An opaque callback cannot hide a reflective fallback that
+was possible before a following native shadow. This preserves the existing
+scope-owned continuation proof without executing helper bodies or fixture code.
+Acceptance uses actual Python and complete ownership for module builtin lookup,
+class-local/module/global lookup, taken and skipped branches, nested control,
+live module updates, subsequent conditional/guaranteed shadows, opaque callback
+restoration and missing-target failures. Independent counterfactuals remove the
+deletion join, absence lifetime, conditional preservation, scope destination,
+continuation lookup and missing-target refusal. General control-flow truth,
+compound results, protocol dispatch and unpacking completion retain their
+separate issues. See [test execution](../TEST-EXECUTION.md).
