@@ -2,6 +2,7 @@
 
 mod adopt;
 mod baseline;
+mod computed_order;
 mod cost;
 mod db;
 mod declaration_file;

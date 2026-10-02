@@ -2561,6 +2561,224 @@ fn a_computed_column_and_the_function_it_calls_drop_together() {
     assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
 }
 
+/// A connected plan orders a SQL Server computed column's function drops by
+/// the catalog's own edges (#1431, DEC-1431.1). A dropped table's computed
+/// columns call the schema-bound `dbo.g` over `dbo.lookup`, and `x.f`; a
+/// schema-bound `dbo.f`, of `x.f`'s leaf name, reads the table. Dropping all
+/// five runs `dbo.f`, the table, the two functions it released, then the
+/// table `dbo.g` is bound to: the order only the edges know (#1423 round 8,
+/// #1432).
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn computed_function_drops_follow_the_catalogs_edges() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "edges1431");
+    for sql in [
+        "CREATE SCHEMA x;",
+        "CREATE TABLE dbo.lookup (id int NOT NULL CONSTRAINT pk_lookup PRIMARY KEY);",
+        "CREATE FUNCTION dbo.g (@x int) RETURNS int WITH SCHEMABINDING AS \
+         BEGIN RETURN @x + (SELECT COUNT(*) FROM dbo.lookup) END;",
+        "CREATE FUNCTION x.f (@x int) RETURNS int AS BEGIN RETURN @x * 3 END;",
+        "CREATE TABLE dbo.u (id int NOT NULL CONSTRAINT pk_u PRIMARY KEY, a int NULL,
+             c1 AS (dbo.g(a)), c2 AS (x.f(a)));",
+        "CREATE FUNCTION dbo.f (@x int) RETURNS int WITH SCHEMABINDING AS \
+         BEGIN RETURN @x + (SELECT COUNT(*) FROM dbo.u) END;",
+    ] {
+        on_server(own.connection(), sql);
+    }
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let d = Demo::new("edges1431");
+    ok(&d.run(&["pull", "--db", own.connection()]));
+    d.commit();
+    ok(&d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]));
+    // One table per revision, as a drop's intent names a table already gone
+    // from the declarations; the connected plan spans both.
+    for table in ["dbo.u", "dbo.lookup"] {
+        if table == "dbo.lookup" {
+            for entry in walk(&d.dir.join("schema")) {
+                std::fs::remove_file(entry).unwrap();
+            }
+        } else {
+            std::fs::remove_file(d.dir.join(format!("schema/{table}.yml"))).unwrap();
+        }
+        ok(&d.run(&["drop-table", table, "--reason", "gone"]));
+        ok(&d.run(&["plan"]));
+        d.commit();
+    }
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    ok(&d.run(&[
+        "plan",
+        "--db",
+        own.connection(),
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    assert!(
+        at("DROP FUNCTION [dbo].[f]") < at("DROP TABLE [dbo].[u]"),
+        "{script}"
+    );
+    assert!(
+        at("DROP TABLE [dbo].[u]") < at("DROP FUNCTION [x].[f]"),
+        "{script}"
+    );
+    assert!(
+        at("DROP TABLE [dbo].[u]") < at("DROP FUNCTION [dbo].[g]"),
+        "{script}"
+    );
+    assert!(
+        at("DROP FUNCTION [dbo].[g]") < at("DROP TABLE [dbo].[lookup]"),
+        "{script}"
+    );
+    ok(&d.run(&[
+        "apply",
+        "--db",
+        own.connection(),
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "destructive",
+    ]));
+}
+
+/// A connected plan refuses what the catalog's edges say SQL Server would,
+/// where a text scan could not tell (#1431, DEC-1431.1): a retype of `café`,
+/// which `[cafe]` binds under an accent-insensitive collation (#1426); and a
+/// function's alter whose name holds `]` (#1437); and a computed column's
+/// change under a `WITH SCHEMABINDING` view, while a view merely selecting a
+/// column named `schemabinding` blocks nothing (#1439).
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn the_catalogs_edges_refuse_what_the_engine_would() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let plan_against = |d: &Demo, connection: &str| {
+        ok(&d.run(&["plan"]));
+        d.commit();
+        d.run(&["plan", "--db", connection])
+    };
+
+    // Accent-insensitive: `[cafe]` reads `café`, which no text scan sees.
+    let ai = OwnDatabase::collated(&server, "edges1431_ai", "SQL_Latin1_General_CP1_CI_AI");
+    on_server(
+        ai.connection(),
+        "CREATE TABLE dbo.t (id int NOT NULL CONSTRAINT pk_t PRIMARY KEY, [café] int NULL,
+             doubled AS ([cafe] * 2));",
+    );
+    let d = Demo::new("edges1431-ai");
+    ok(&d.run(&["pull", "--db", ai.connection()]));
+    d.commit();
+    ok(&d.run(&["baseline", "--db", ai.connection(), "--reason", "adopt"]));
+    let path = d.dir.join("schema/dbo.t.yml");
+    let pulled = std::fs::read_to_string(&path).unwrap();
+    let retyped = pulled.replacen("    type: int\n", "    type: bigint\n", 2);
+    assert!(retyped.contains("café"), "{pulled}");
+    std::fs::write(&path, &retyped).unwrap();
+    let o = plan_against(&d, ai.connection());
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("computed column dbo.t.doubled reads `café`"),
+        "{}",
+        stderr(&o)
+    );
+
+    // A function whose name holds the closing delimiter, which a text match
+    // read as another name (#1437): its alter is refused while a computed
+    // column calls it.
+    let esc = OwnDatabase::new(&server, "edges1431_esc");
+    for sql in [
+        "CREATE FUNCTION dbo.[f]]x] (@x int) RETURNS int AS BEGIN RETURN @x * 3 END;",
+        "CREATE TABLE dbo.e (id int NOT NULL CONSTRAINT pk_e PRIMARY KEY, a int NULL,
+             tripled AS (dbo.[f]]x](a)));",
+    ] {
+        on_server(esc.connection(), sql);
+    }
+    let d = Demo::new("edges1431-esc");
+    ok(&d.run(&["pull", "--db", esc.connection()]));
+    d.commit();
+    ok(&d.run(&["baseline", "--db", esc.connection(), "--reason", "adopt"]));
+    let module = walk(&d.dir.join("schema"))
+        .into_iter()
+        .find(|p| std::fs::read_to_string(p).is_ok_and(|t| t.contains("@x * 3")))
+        .expect("the function's declaration");
+    let text = std::fs::read_to_string(&module).unwrap();
+    let altered = text.replacen("@x * 3", "@x * 4", 1);
+    assert_ne!(altered, text, "{text}");
+    std::fs::write(&module, altered).unwrap();
+    let o = plan_against(&d, esc.connection());
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("computed column dbo.e.tripled calls"),
+        "{}",
+        stderr(&o)
+    );
+
+    // `schemabinding` as a column alias is not the clause; the real clause
+    // is the catalog's to say.
+    let own = OwnDatabase::new(&server, "edges1431_sb");
+    for sql in [
+        "CREATE TABLE dbo.plain (id int NOT NULL CONSTRAINT pk_plain PRIMARY KEY, a int NULL,
+             c AS (a * 2));",
+        "CREATE VIEW dbo.v_plain AS SELECT 1 AS schemabinding, c FROM dbo.plain;",
+        "CREATE TABLE dbo.bound (id int NOT NULL CONSTRAINT pk_bound PRIMARY KEY, a int NULL,
+             c AS (a * 2));",
+        "CREATE VIEW dbo.v_bound WITH SCHEMABINDING AS SELECT id, c FROM dbo.bound;",
+    ] {
+        on_server(own.connection(), sql);
+    }
+    let d = Demo::new("edges1431-sb");
+    ok(&d.run(&["pull", "--db", own.connection()]));
+    d.commit();
+    ok(&d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]));
+    let change = |table: &str| {
+        let path = d.dir.join(format!("schema/dbo.{table}.yml"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let changed = text.replacen("*(2)", "*(3)", 1);
+        assert_ne!(changed, text, "{text}");
+        std::fs::write(&path, changed).unwrap();
+    };
+    change("plain");
+    let plan = d.dir.join("plan.json");
+    ok(&d.run(&["plan"]));
+    d.commit();
+    ok(&d.run(&[
+        "plan",
+        "--db",
+        own.connection(),
+        "--out",
+        plan.to_str().unwrap(),
+    ]));
+    ok(&d.run(&[
+        "apply",
+        "--db",
+        own.connection(),
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "destructive",
+    ]));
+    change("bound");
+    let o = plan_against(&d, own.connection());
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("the schema-bound dbo.v_bound reads it"),
+        "{}",
+        stderr(&o)
+    );
+}
+
 /// A column collation goes the whole way through the CLI (#1175). `pull`
 /// declares a column collated away from its database's default, `bootstrap`
 /// rebuilds it onto a database with another default, and a second `pull`

@@ -5551,6 +5551,10 @@ pub fn cmd_plan_db(
             // it (DEC-1316.1): after the module passes, which may move that
             // change, and before the checks that read the order.
             crate::engine::release_generated_inputs(&mut conn, &mut cs).await?;
+            // A computed column's function drops after it, by the catalog's
+            // edges (DEC-1431.1): before the rename walk, which reads drops
+            // but moves no module.
+            crate::engine::order_computed_by_edges(&mut conn, &mut cs).await?;
             // Last of the passes that order the plan, so the order it settles
             // from the catalog is the one checked below and saved (#1366).
             crate::engine::order_created_object_names(&mut conn, &mut cs, &target.label).await?;

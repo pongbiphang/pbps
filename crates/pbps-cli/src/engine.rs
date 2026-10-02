@@ -571,6 +571,60 @@ pub async fn refuse_created_name_occupants(
     }
 }
 
+/// Orders a SQL Server plan's function drops after the computed columns that
+/// call them, with what each is schema-bound to after it, and refuses what
+/// the catalog's expression edges say the engine will not do (#1431,
+/// DEC-1431.1). Reads the edges of the tables and modules the plan touches,
+/// under the names the catalog has them by. PostgreSQL has no computed
+/// columns, and its generated ones are `release_generated_inputs`'s.
+// The complement is every change that touches no object an expression edge
+// can name: a computed column, a column it reads, its table, or a module.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub async fn order_computed_by_edges(conn: &mut Conn, cs: &mut ChangeSet) -> anyhow::Result<()> {
+    if conn.driver() != Driver::Mssql {
+        return Ok(());
+    }
+    let mut renamed: BTreeMap<pbps_model::TableName, pbps_model::TableName> = BTreeMap::new();
+    for p in &cs.changes {
+        if let pbps_model::Change::RenameTable { from, to, .. } = &p.change {
+            renamed.insert(to.clone(), from.clone());
+        }
+    }
+    let catalog = |t: &pbps_model::TableName| renamed.get(t).cloned().unwrap_or_else(|| t.clone());
+    let mut objects: Vec<pbps_model::TableName> = Vec::new();
+    for p in &cs.changes {
+        let touched = match &p.change {
+            pbps_model::Change::AddComputedColumn { table, .. }
+            | pbps_model::Change::DropComputedColumn { table, .. }
+            | pbps_model::Change::RenameColumn { table, .. } => Some(catalog(table)),
+            pbps_model::Change::DropTable { name, .. } => Some(name.clone()),
+            pbps_model::Change::DropColumn { column, .. }
+            | pbps_model::Change::AlterColumnType { column, .. }
+            | pbps_model::Change::AlterColumnNullability { column, .. } => {
+                Some(catalog(&column.table))
+            }
+            pbps_model::Change::AlterModule { id, .. }
+            | pbps_model::Change::DropModule { id, .. } => Some(id.object_name()),
+            _ => None,
+        };
+        if let Some(object) = touched
+            && !objects.contains(&object)
+        {
+            objects.push(object);
+        }
+    }
+    if objects.is_empty() {
+        return Ok(());
+    }
+    let edges = pbps_mssql::catalog::expression_edges(conn, &objects).await?;
+    if edges.is_empty() {
+        return Ok(());
+    }
+    crate::computed_order::order_by_edges(cs, &edges)
+        .map(|_| ())
+        .map_err(|why| anyhow::anyhow!("computed_dependencies (SQL Server): {why}"))
+}
+
 /// Orders this plan's column and table renames on SQL Server from what the
 /// catalog holds and how its collation compares names, and refuses a name a
 /// change claims that another `sys.objects` entry holds when it runs (#1077,
