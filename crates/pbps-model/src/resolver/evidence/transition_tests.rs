@@ -474,6 +474,11 @@ fn owner_coverage(
         aggregate.validate(&changes).unwrap();
     }
     let valid = evidence.clone();
+    // A surface that is its own only record, as a computed column is (it has
+    // no default under it, #1174), has no child to substitute for it.
+    if owner_object == child_object {
+        return (changes, valid);
+    }
     let child_only = BTreeSet::from([child_object]);
     evidence.transitions = vec![ObjectTransition {
         surface: child,
@@ -1421,5 +1426,47 @@ fn mutations_of_created_or_removed_targets_use_the_planned_endpoint() {
             evidence.validate(&unplanned).is_err(),
             "unplanned absent endpoint accepted"
         );
+    }
+}
+
+/// A computed column's add or drop is a column lifecycle the projection
+/// accepts as a column's is: the resolver-backed plan of a table that gains
+/// or loses one is not refused as incomplete (#1174 review).
+#[test]
+fn a_computed_column_add_or_drop_is_a_projected_column_lifecycle() {
+    let table: TableName = "app.v".parse().unwrap();
+    let computed = crate::schema::ComputedColumn {
+        expression: "a * 2".into(),
+        persisted: false,
+        not_null: false,
+    };
+    for (change, creating) in [
+        (
+            Change::AddComputedColumn {
+                table: table.clone(),
+                name: "n".into(),
+                computed: computed.clone(),
+            },
+            true,
+        ),
+        (
+            Change::DropComputedColumn {
+                table: table.clone(),
+                name: "n".into(),
+                computed,
+            },
+            false,
+        ),
+    ] {
+        let (changes, evidence) = owner_coverage(
+            change,
+            Surface::Column(table.column("n")),
+            Surface::Column(table.column("n")),
+            creating,
+        );
+        evidence
+            .before
+            .project(&changes, &evidence.after, &evidence.transitions)
+            .expect("a computed column's lifecycle projects");
     }
 }

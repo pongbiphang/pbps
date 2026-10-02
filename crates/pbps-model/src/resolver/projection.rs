@@ -471,6 +471,11 @@ pub(super) fn touches(c: &Change, surface: &Surface) -> bool {
         }
         Surface::Column(column) => {
             c.columns_redefined().iter().any(|(r, _)| r == column)
+                // A computed column's lifecycle, which is a part's change and
+                // so outside `columns_redefined` (#1174).
+                || matches!(c, Change::AddComputedColumn { table, name, .. }
+                    | Change::DropComputedColumn { table, name, .. }
+                    if &table.column(name) == column)
                 || matches!(c, Change::CreateTable { name, .. } | Change::DropTable { name, .. } if name == &column.table)
         }
         Surface::Default(column) => {
