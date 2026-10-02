@@ -2140,6 +2140,120 @@ async fn newly_created_routines_under_target_default_privileges_close_on_the_act
     setup(&[]).await;
 }
 
+/// A table replaced by a view of the same name, or the reverse, holds both
+/// kinds across the two snapshots. A grant after the replacement names the
+/// kind at its own position in the typed sequence, never an ambiguity.
+#[test]
+fn an_object_grant_after_a_same_name_replacement_names_the_replacement() {
+    use pbps_db::resolver::capture::ObjectIdentity;
+    use pbps_model::{
+        Column, GrantTarget, Module, ModuleId, ModuleKind, Permission, PlannedChange, Table,
+    };
+    use pbps_pg::resolver::capture::BindingRecord;
+    use std::collections::BTreeSet;
+
+    let name: pbps_model::TableName = "app.t".parse().unwrap();
+    let view_id = ModuleId::Named(name.clone());
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("id".into(), Column::new("integer".parse().unwrap()));
+    let view = Module {
+        kind: ModuleKind::View,
+        description: None,
+        definition: "SELECT 1 AS id".into(),
+    };
+    let relation = ObjectIdentity {
+        class: "pg_class".into(),
+        name: vec!["app".into(), "t".into()],
+        signature: vec![],
+    };
+    let owned = |surface| BindingRecord {
+        object: relation.clone(),
+        ownership: ObjectOwnership::Surface(surface),
+        bindings: vec![],
+    };
+    let grant = || Change::Grant {
+        role: "reader".into(),
+        target: GrantTarget::Object(name.clone()),
+        permissions: BTreeSet::from([Permission::Select]),
+    };
+    let mut with_table = Schema::default();
+    with_table.tables.insert(name.clone(), table.clone());
+    let mut with_view = Schema::default();
+    with_view.modules.insert(view_id.clone(), view.clone());
+    let table_ids = ids(&with_table, &IdsFile::default());
+    let uid = table_ids.table_uid(&name).unwrap().clone();
+    let view_ids = ids(&with_view, &IdsFile::default());
+    for to_view in [true, false] {
+        let (base, base_ids, desired, desired_ids) = if to_view {
+            (&with_table, &table_ids, &with_view, &view_ids)
+        } else {
+            (&with_view, &view_ids, &with_table, &table_ids)
+        };
+        let (replace, expected) = if to_view {
+            (
+                vec![
+                    Change::DropTable {
+                        uid: uid.clone(),
+                        name: name.clone(),
+                    },
+                    Change::CreateModule {
+                        id: view_id.clone(),
+                        module: Box::new(view.clone()),
+                    },
+                ],
+                Surface::Module(view_id.clone()),
+            )
+        } else {
+            (
+                vec![
+                    Change::DropModule {
+                        id: view_id.clone(),
+                        kind: ModuleKind::View,
+                    },
+                    Change::CreateTable {
+                        uid: uid.clone(),
+                        name: name.clone(),
+                        table: Box::new(table.clone()),
+                    },
+                ],
+                Surface::Table(name.clone()),
+            )
+        };
+        let opening_surface = if to_view {
+            Surface::Table(name.clone())
+        } else {
+            Surface::Module(view_id.clone())
+        };
+        let changes = ChangeSet {
+            changes: replace
+                .into_iter()
+                .chain([grant()])
+                .map(PlannedChange::new)
+                .collect(),
+        };
+        let transitions = super::transitions::derive(
+            &changes,
+            pbps_diff::Side {
+                schema: base,
+                ids: base_ids,
+            },
+            pbps_diff::Side {
+                schema: desired,
+                ids: desired_ids,
+            },
+            &[owned(opening_surface)],
+            &[owned(expected.clone())],
+        )
+        .unwrap_or_else(|error| panic!("to_view={to_view}: {error}"));
+        assert!(
+            transitions.iter().any(|t| t.surface == expected),
+            "to_view={to_view}: the grant names the replacement"
+        );
+    }
+}
+
 /// A recorded rename frees a spelling another UID may take. A check dropped
 /// from the old table belongs to its opening UID exactly once.
 #[test]
