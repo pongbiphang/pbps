@@ -6,8 +6,12 @@
 use super::*;
 use crate::resolver::docker::{LocalApi, forwarder::Forwarder};
 use crate::resolver::native::NativeTarget;
+use diagnostics::{FixtureFailure, SafeFailure, require_discarded};
 use pbps_db::Driver;
 use pbps_db::transport::{PeerVerifiedConn, StreamConn, StreamLogin};
+
+#[path = "live_tests/diagnostics.rs"]
+mod diagnostics;
 
 fn fixture() {
     assert_eq!(std::env::var("PBPS_SERVER_FIXTURE").as_deref(), Ok("1"));
@@ -143,10 +147,7 @@ async fn open_when_exclusive(target: &mut NativeTarget) -> ScratchRun {
             Ok(mut server) => match server.open_scratch(&scratch_recipe(target).await).await {
                 Ok(run) => return run,
                 Err(refused) => {
-                    server
-                        .discard()
-                        .await
-                        .expect("a refused open leaves nothing it cannot remove");
+                    require_discarded(FixtureFailure::Open(&refused), server.discard().await);
                     refused
                 }
             },
@@ -158,7 +159,10 @@ async fn open_when_exclusive(target: &mut NativeTarget) -> ScratchRun {
                     cause @ (Error::Exclusivity(_) | Error::Containment(super::Premise::Occupants)),
                 recovery_names,
             } if recovery_names.is_empty() => refusals.push(cause),
-            other => panic!("the supported profile must open a scratch run: {other}"),
+            other => panic!(
+                "the supported profile must open a scratch run: {}",
+                SafeFailure(&other)
+            ),
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }

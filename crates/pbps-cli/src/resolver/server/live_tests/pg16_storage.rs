@@ -138,21 +138,21 @@ async fn the_supplied_storage_layout_admits_its_observed_major_and_survives_live
         let mut server = admit_when_exclusive("PBPS_SERVER_ENDPOINT", &mut target).await;
         let observed = match observation(&mut server, &marker).await {
             Ok(observed) => observed,
-            Err(error) => {
-                server
-                    .discard()
-                    .await
-                    .expect("an observation failure still closes its real control");
-                panic!("the qualified administrative observation failed: {error}");
+            Err(_) => {
+                require_discarded(
+                    FixtureFailure::AdministrativeObservation,
+                    server.discard().await,
+                );
+                panic!(
+                    "the qualified administrative observation failed: {}",
+                    FixtureFailure::AdministrativeObservation
+                );
             }
         };
         match server.open_scratch(&recipe).await {
             Ok(run) => break (server, observed, run),
             Err(refused) => {
-                server
-                    .discard()
-                    .await
-                    .expect("a refused open cleans its actual resources");
+                require_discarded(FixtureFailure::Open(&refused), server.discard().await);
                 match refused {
                     ServerFailure {
                         cause:
@@ -161,7 +161,10 @@ async fn the_supplied_storage_layout_admits_its_observed_major_and_survives_live
                         recovery_names,
                     } if recovery_names.is_empty() && refusals.len() < 60 => refusals.push(cause),
                     other => {
-                        panic!("the measured supplied layout must open a scratch run: {other}")
+                        panic!(
+                            "the measured supplied layout must open a scratch run: {}",
+                            SafeFailure(&other)
+                        )
                     }
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
