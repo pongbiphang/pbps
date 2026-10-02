@@ -1506,7 +1506,11 @@ These facts do not change with the order, so they are edges:
 
 A change runs where the differ put it unless an edge holds it back. Then it
 runs right after the last change it waits for, so nothing moves earlier than
-the differ put it. A change held back is checked against what it passes, as
+the differ put it. The text speaks the plan's names, so where the plan
+renames an input and gives its catalog name to another column, that name in a
+new text reads the other column: it neither keeps the input unreleased nor
+makes a new reader of it (review of #1424). A change held back is checked
+against what it passes, as
 before: a column's name taken before its drop runs, and a row, key or module
 that may need the new type before its retype runs. Changes left waiting on
 one another form a cycle, and the plan is refused naming them. The repeat

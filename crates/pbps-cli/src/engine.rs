@@ -1188,22 +1188,31 @@ impl LiveNames {
 /// `base` from it (DEC-1316.1). `None` when the plan does not change it, or
 /// when its new text may still read `base`.
 ///
-/// `base` is the input's catalog name and `named` the name the plan gives it,
-/// after a rename: the new text speaks the plan's names, so naming either one
-/// may still read it.
+/// `base` is the input's catalog name and `named` the column as the plan names
+/// it, after a rename: the new text speaks the plan's names, so naming either
+/// one may still read it, unless the plan gives the catalog name to another
+/// column.
 fn release_of(
     changes: &ChangeSet,
     names: &LiveNames,
     table: &TableName,
     generated: &str,
     base: &str,
-    named: &str,
+    named: &pbps_model::ColumnRef,
 ) -> Option<usize> {
+    // Where the plan renames the input and gives its catalog name to another
+    // column, that name in the new text reads the other one (review of
+    // #1424).
+    let base_is_another = base != named.name
+        && reused(
+            changes,
+            &pbps_model::ColumnRef::new(named.table.clone(), base),
+        );
     changes.changes.iter().position(|p| {
         matches!(&p.change, pbps_model::Change::AlterColumnExpression { column, to, .. }
             if names.column(column) == (table.clone(), generated.to_owned())
-                && !pbps_pg::generated::may_read(to, base)
-                && !pbps_pg::generated::may_read(to, named))
+                && (base_is_another || !pbps_pg::generated::may_read(to, base))
+                && !pbps_pg::generated::may_read(to, &named.name))
     })
 }
 
@@ -1254,13 +1263,20 @@ pub(crate) fn order_after_releases(
             .map(|d| d.generated.as_str())
             .collect();
         for generated in &readers {
-            if let Some(r) = release_of(changes, &names, &table, generated, &live, &column.name) {
+            if let Some(r) = release_of(changes, &names, &table, generated, &live, column) {
                 waits[i].insert(r);
             }
         }
         // A generated column the catalog does not see reading the column,
         // whose new text may. A live reader whose new text still names it is
-        // not released, which `unreleased` refuses.
+        // not released, which `unreleased` refuses. The text speaks the
+        // plan's names, so where the plan renames the column and gives its
+        // catalog name to another, that name reads the other one.
+        let live_is_another = live != column.name
+            && reused(
+                changes,
+                &pbps_model::ColumnRef::new(column.table.clone(), live.clone()),
+            );
         for (j, q) in changes.changes.iter().enumerate() {
             let Change::AlterColumnExpression { column: c, to, .. } = &q.change else {
                 continue;
@@ -1268,7 +1284,7 @@ pub(crate) fn order_after_releases(
             let (at, generated) = names.column(c);
             if at != table
                 || readers.contains(&generated.as_str())
-                || !(may_read(to, &live) || may_read(to, &column.name))
+                || !((!live_is_another && may_read(to, &live)) || may_read(to, &column.name))
             {
                 continue;
             }
@@ -1492,7 +1508,7 @@ fn unreleased(
             if d.base != live || dropped.contains(&(table.clone(), d.generated.clone())) {
                 continue;
             }
-            if release_of(changes, &names, &table, &d.generated, &live, &column.name)
+            if release_of(changes, &names, &table, &d.generated, &live, column)
                 .is_some_and(|r| r < i)
             {
                 continue;
@@ -2649,6 +2665,67 @@ mod tests {
             reader(),
         ]);
         assert_eq!(order_after_releases(&mut cs, &BTreeMap::new()), Ok(0));
+        // `a` renamed to `x` and retyped, and a new column taking the name
+        // `a`: `h`'s new text naming `a` reads the new column, not `x`, so it
+        // need not follow `x`'s retype. `g` moves from `a` to `b` and `h` from
+        // `b` to the new `a`, with `b` retyped too: `h`, `b`'s retype, `g`,
+        // then `x`'s retype (review of #1424).
+        let reads_a_and_b = BTreeMap::from([(
+            t.clone(),
+            vec![
+                pbps_pg::generated::Dependence {
+                    generated: "g".into(),
+                    base: "a".into(),
+                },
+                pbps_pg::generated::Dependence {
+                    generated: "h".into(),
+                    base: "b".into(),
+                },
+            ],
+        )]);
+        let mut cs = plan(vec![
+            rename("a", "x"),
+            Change::AddColumn {
+                uid: uid("c_eeeeee"),
+                table: t.clone(),
+                name: "a".into(),
+                column: Box::new(pbps_model::Column::new("integer".parse().unwrap())),
+            },
+            retype("x"),
+            retype("b"),
+            swap("g", "b * 2"),
+            swap("h", "a + 1"),
+        ]);
+        order_after_releases(&mut cs, &reads_a_and_b).unwrap();
+        let at = |what: &dyn Fn(&Change) -> bool| {
+            cs.changes.iter().position(|p| what(&p.change)).unwrap()
+        };
+        let retyped = |name: &'static str| move |c: &Change| matches!(c, Change::AlterColumnType { column, .. } if column.name == name);
+        let expression = |name: &'static str| move |c: &Change| matches!(c, Change::AlterColumnExpression { column, .. } if column.name == name);
+        assert!(
+            at(&expression("h")) < at(&retyped("b"))
+                && at(&retyped("b")) < at(&expression("g"))
+                && at(&expression("g")) < at(&retyped("x")),
+            "{:?}",
+            cs.changes
+        );
+        // The same reuse when the released reader is the one moving to the
+        // new column's name: `g` moves from the renamed `x` to the new `a`,
+        // which releases `x`.
+        let mut cs = plan(vec![
+            rename("a", "x"),
+            Change::AddColumn {
+                uid: uid("c_eeeeee"),
+                table: t.clone(),
+                name: "a".into(),
+                column: Box::new(pbps_model::Column::new("integer".parse().unwrap())),
+            },
+            retype("x"),
+            recompute("a * 2"),
+        ]);
+        assert_eq!(unreleased(&cs, &reads_a).len(), 1);
+        assert_eq!(order_after_releases(&mut cs, &reads_a), Ok(1));
+        assert!(unreleased(&cs, &reads_a).is_empty(), "{:?}", cs.changes);
     }
 
     /// The one frame the ready-phase review named: a `DbError::Driver`'s
