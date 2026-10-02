@@ -1218,4 +1218,7 @@ them, and `ALTER TABLE ... RENAME` keeps those names while renaming the relation
 and its row and array types (measured on 16 and 18). Scratch creates them under
 the final names. For a table the plan keeps, and a child the plan does not
 recreate, the producer takes the target's name before deriving transitions,
-whether the rename is in this plan or an earlier deployment.
+whether the rename is in this plan or an earlier deployment. A column type change
+keeps the sequence and the NOT NULL child with their names; only adding or
+dropping the column recreates them, and a nullability change recreates the NOT
+NULL child under the current spelling.

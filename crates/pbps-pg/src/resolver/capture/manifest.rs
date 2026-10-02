@@ -889,16 +889,26 @@ impl CompiledCapture {
                     .columns
                     .get(&final_column.name)
                     .is_some_and(|column| column.identity.is_some());
-                let column_rewritten = changes.changes.iter().any(|step| {
+                // Measured on PG16/18: a type change keeps the identity
+                // sequence and the NOT NULL child with their names; only a
+                // nullability change recreates the child, under the current
+                // spelling, as scratch does.
+                let column_recreated = changes.changes.iter().any(|step| {
                     matches!(&step.change,
-                        Change::AlterColumnType { uid: changed, .. }
-                        | Change::AlterColumnNullability { uid: changed, .. }
-                        | Change::DropColumn { uid: changed, .. }
+                        Change::DropColumn { uid: changed, .. }
                         | Change::AddColumn { uid: changed, .. }
                             if changed == column_uid)
                 });
+                let nullability_changed = changes.changes.iter().any(|step| {
+                    matches!(&step.change,
+                        Change::AlterColumnNullability { uid: changed, .. }
+                            if changed == column_uid)
+                        || matches!(&step.change,
+                            Change::AlterColumnType { uid: changed, from_nullable, to_nullable, .. }
+                                if changed == column_uid && from_nullable != to_nullable)
+                });
                 if identity_kept
-                    && !column_rewritten
+                    && !column_recreated
                     && let (Some(old_sequence), Some(new_sequence)) = (
                         sequence(opening, &column_identity(old_column))?,
                         sequence(&self.captured, &column_identity(final_column))?,
@@ -916,7 +926,8 @@ impl CompiledCapture {
                 // (retain_renamed_not_null); here only a column whose
                 // address is unchanged but whose child name is historical.
                 if old_column == final_column
-                    && !column_rewritten
+                    && !column_recreated
+                    && !nullability_changed
                     && let (Some(old_child), Some(new_child)) = (
                         not_null_child(opening, &column_identity(old_column))?,
                         not_null_child(&self.captured, &column_identity(final_column))?,
