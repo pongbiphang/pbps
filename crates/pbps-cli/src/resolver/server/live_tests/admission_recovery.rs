@@ -436,14 +436,14 @@ pub(in crate::resolver::server) async fn hold() {
 async fn cancel_at_admin_arrival<F>(
     step: F,
     arrival: tokio::sync::oneshot::Receiver<std::time::Instant>,
-    deadline: std::time::Duration,
+    deadline: std::time::Instant,
 ) -> Result<(std::time::Instant, std::time::Instant), String>
 where
     F: std::future::Future,
     F::Output: std::fmt::Debug,
 {
     let mut step = Box::pin(step);
-    let arrived = tokio::time::timeout(deadline, async {
+    let arrived = tokio::time::timeout_at(deadline.into(), async {
         tokio::select! {
             // An operation that already finished is not a held session, even
             // if it sent the signal in its last poll.
@@ -457,6 +457,12 @@ where
     // Drop the owned operation, not just a pinned reference to it. Cleanup
     // must observe cancellation before the observer restores its real fault.
     drop(step);
+    // A timeout polls the operation before its clock; synchronous fault
+    // injection can occupy that poll past the bound. Classify the signal's
+    // timestamp, so an on-time arrival observed late still qualifies (#1325).
+    if arrived > deadline {
+        return Err("administrative session arrival deadline expired".to_owned());
+    }
     Ok((arrived, std::time::Instant::now()))
 }
 
@@ -486,7 +492,7 @@ async fn an_arrived_step_is_cancelled_in_the_poll_that_observes_it() {
     let mut cancellation = Box::pin(cancel_at_admin_arrival(
         pending_step(dropped.clone(), Some(arrived)),
         arrival,
-        std::time::Duration::from_secs(60),
+        std::time::Instant::now() + std::time::Duration::from_secs(60),
     ));
     let (arrived, cancelled) = std::future::poll_fn(|cx| {
         let result = std::future::Future::poll(cancellation.as_mut(), cx);
@@ -506,7 +512,7 @@ async fn a_missing_arrival_fails_and_drops_the_operation() {
     let result = cancel_at_admin_arrival(
         pending_step(dropped.clone(), None),
         arrival,
-        std::time::Duration::ZERO,
+        std::time::Instant::now(),
     )
     .await;
     assert_eq!(
@@ -525,7 +531,7 @@ async fn a_closed_arrival_fails_and_drops_the_operation() {
     let result = cancel_at_admin_arrival(
         pending_step(dropped.clone(), None),
         arrival,
-        std::time::Duration::from_secs(60),
+        std::time::Instant::now() + std::time::Duration::from_secs(60),
     )
     .await;
     assert_eq!(result.unwrap_err(), "administrative arrival channel closed");
@@ -541,12 +547,73 @@ async fn a_completed_step_is_refused_even_when_it_sent_arrival() {
         arrived.send(std::time::Instant::now()).unwrap();
         "completed"
     };
-    let result = cancel_at_admin_arrival(step, arrival, std::time::Duration::from_secs(60)).await;
+    let result = cancel_at_admin_arrival(
+        step,
+        arrival,
+        std::time::Instant::now() + std::time::Duration::from_secs(60),
+    )
+    .await;
     assert_eq!(
         result.unwrap_err(),
         "step completed before administrative hold: \"completed\""
     );
     assert!(dropped.get());
+}
+
+#[tokio::test]
+async fn a_blocking_poll_cannot_qualify_an_arrival_after_the_deadline() {
+    let (arrived, arrival) = tokio::sync::oneshot::channel();
+    let dropped = Rc::new(std::cell::Cell::new(false));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+    let step = async {
+        let _guard = DropFlag(dropped.clone());
+        // Cross the known bound inside one poll, as real fault injection can.
+        std::thread::sleep(
+            deadline.saturating_duration_since(std::time::Instant::now())
+                + std::time::Duration::from_millis(1),
+        );
+        let timestamp = std::time::Instant::now();
+        assert!(timestamp > deadline, "the control actually arrived late");
+        arrived.send(timestamp).unwrap();
+        std::future::pending::<()>().await;
+    };
+    let result = cancel_at_admin_arrival(step, arrival, deadline).await;
+    assert_eq!(
+        result.unwrap_err(),
+        "administrative session arrival deadline expired"
+    );
+    assert!(dropped.get(), "the exact late operation was dropped");
+}
+
+#[tokio::test]
+async fn arrival_timestamps_define_the_deadline_even_when_observed_later() {
+    // Known timestamps pin the inclusive boundary without racing a timer.
+    let deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    for (timestamp, qualifies) in [
+        (deadline - std::time::Duration::from_nanos(1), true),
+        (deadline, true),
+        (deadline + std::time::Duration::from_nanos(1), false),
+    ] {
+        let (arrived, arrival) = tokio::sync::oneshot::channel();
+        let dropped = Rc::new(std::cell::Cell::new(false));
+        let step = async {
+            let _guard = DropFlag(dropped.clone());
+            arrived.send(timestamp).unwrap();
+            std::future::pending::<()>().await;
+        };
+        let result = cancel_at_admin_arrival(step, arrival, deadline).await;
+        assert!(dropped.get(), "the exact operation was dropped");
+        if qualifies {
+            let (arrived, cancelled) = result.unwrap();
+            assert_eq!(arrived, timestamp);
+            assert!(cancelled > deadline, "the observer ran after the bound");
+        } else {
+            assert_eq!(
+                result.unwrap_err(),
+                "administrative session arrival deadline expired"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -600,7 +667,12 @@ async fn a_cancelled_step_leaves_its_admin_session_to_cleanup() {
                             _ => run.resolve(&mut target, &binding).await.map(|_| ()),
                         }
                     };
-                    cancel_at_admin_arrival(step, arrival, std::time::Duration::from_secs(60)).await
+                    cancel_at_admin_arrival(
+                        step,
+                        arrival,
+                        started + std::time::Duration::from_secs(60),
+                    )
+                    .await
                 },
             )
             .await;
