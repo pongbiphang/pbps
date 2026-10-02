@@ -50,22 +50,72 @@ fn inventory(
         .collect()
 }
 
+/// An object grant names a table or a view, and which one it is can change
+/// within the plan: a table replaced by a view of the same name. The typed
+/// sequence before the grant decides it; the union of the opening and
+/// compiled snapshots would hold both and could not.
 fn object_grant(
     name: &pbps_model::TableName,
-    opening: &[BindingRecord],
-    compiled: &[BindingRecord],
+    changes: &ChangeSet,
+    step: usize,
+    base: &Schema,
 ) -> Result<Surface, Error> {
-    let table = Surface::Table(name.clone());
-    let view = Surface::Module(ModuleId::Named(name.clone()));
-    let present = |surface: &Surface| {
-        !inventory(opening, surface, false).is_empty()
-            || !inventory(compiled, surface, false).is_empty()
-    };
-    match (present(&table), present(&view)) {
-        (true, false) => Ok(table),
-        (false, true) => Ok(view),
+    let view = ModuleId::Named(name.clone());
+    let mut table_now = base.tables.contains_key(name);
+    let mut view_now = base.modules.contains_key(&view);
+    for planned in &changes.changes[..step] {
+        match &planned.change {
+            Change::CreateTable { name: created, .. } if created == name => table_now = true,
+            Change::DropTable { name: dropped, .. } if dropped == name => table_now = false,
+            Change::RenameTable { from, to, .. } => {
+                if from == name {
+                    table_now = false;
+                }
+                if to == name {
+                    table_now = true;
+                }
+            }
+            Change::CreateModule { id, .. } if id == &view => view_now = true,
+            Change::DropModule { id, .. } if id == &view => view_now = false,
+            Change::CreateTable { .. }
+            | Change::DropTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnNullability { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnExpression { .. }
+            | Change::SetColumnDeprecated { .. }
+            | Change::SetPrimaryKey { .. }
+            | Change::AddUnique { .. }
+            | Change::DropUnique { .. }
+            | Change::AddForeignKey { .. }
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck { .. }
+            | Change::DropCheck { .. }
+            | Change::AddIndex { .. }
+            | Change::DropIndex { .. }
+            | Change::InsertRow { .. }
+            | Change::UpdateRow { .. }
+            | Change::DeleteRow { .. }
+            | Change::SetDataMode { .. }
+            | Change::CreateModule { .. }
+            | Change::AlterModule { .. }
+            | Change::DropModule { .. }
+            | Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. }
+            | Change::PublicExecution { .. } => {}
+        }
+    }
+    match (table_now, view_now) {
+        (true, false) => Ok(Surface::Table(name.clone())),
+        (false, true) => Ok(Surface::Module(view)),
         _ => Err(Error::Binding(
-            "an object grant has no unique qualified table or view owner".into(),
+            "an object grant has no unique table or view at its position in the plan".into(),
         )),
     }
 }
@@ -189,7 +239,7 @@ pub(super) fn derive(
             ));
         }
     }
-    for step in &changes.changes {
+    for (position, step) in changes.changes.iter().enumerate() {
         let parent = if let Change::AddColumn { table, .. } | Change::RenameColumn { table, .. } =
             &step.change
         {
@@ -439,7 +489,9 @@ pub(super) fn derive(
                 match target {
                     GrantTarget::Schema(name) => Surface::Namespace(name.clone()),
                     GrantTarget::Routine(id) => Surface::Module(ModuleId::Routine(id.clone())),
-                    GrantTarget::Object(name) => object_grant(name, opening, compiled)?,
+                    GrantTarget::Object(name) => {
+                        object_grant(name, changes, position, base.schema)?
+                    }
                 },
                 false,
                 true,
