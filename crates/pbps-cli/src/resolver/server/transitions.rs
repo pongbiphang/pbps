@@ -409,7 +409,7 @@ pub(super) fn derive(
             ),
             // Authorization changes leave every fingerprinted property as it
             // was (DEC-1274.1): the target stays an untouched input, and the
-            // authorization condition checks the grant.
+            // ordinary apply guard checks that a declared grant took.
             Change::PublicExecution { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }

@@ -787,7 +787,8 @@ fn grant_target(c: &Change) -> Option<&GrantTarget> {
 // rows and pbps-only metadata cannot change catalog prerequisites. Neither
 // can a GRANT, REVOKE or PUBLIC execution change: ACLs and owners are not
 // fingerprinted (DEC-1274.1), so its target stays an untouched input with its
-// full fingerprint, and the authorization condition checks the grant itself.
+// full fingerprint. The ordinary apply guard checks that a declared grant
+// took (SPEC 7.6); an object grant does not change a binding.
 fn changes_catalog(c: &Change) -> bool {
     !matches!(
         c,

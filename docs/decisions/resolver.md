@@ -1239,5 +1239,8 @@ plan is sealed.
 A GRANT, REVOKE or PUBLIC execution change makes no transition. Owners and ACLs
 are not fingerprinted, so its target's catalog record does not change: it stays
 an untouched input with its full fingerprint, and a concurrent change to it
-still fails the closing recheck. The authorization condition checks the grant
-itself.
+still fails the closing recheck. Whether the grant took is the ordinary apply
+guard's to check: it compares every declared grant the plan touches (SPEC 7.6).
+The authorization condition covers only the deployer's schema authorization,
+which is what name lookup depends on; an object grant does not change a
+binding.
