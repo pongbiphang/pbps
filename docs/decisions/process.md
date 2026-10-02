@@ -549,6 +549,9 @@ Class observers share module-state capture with their enclosing managers.
 Explicit following writes replace the joined state. A directly raised exception
 ends that body's statement scan; unknown exceptions retain conservative prefixes.
 
+Superseded for the current Python inventory checker by DEC-1413.1. The
+historical evaluator behavior below is retained as provenance.
+
 A successful shadow does not prove an intervening opaque callback harmless.
 Narrow native-call and inert-manager facts distinguish the required safe
 controls from unproved execution after a reflective alias was erased. Opaque
@@ -573,6 +576,9 @@ Enclosing captures still observe their own state and the shared module, while
 class-local state never becomes an enclosing lookup scope. This also prevents a
 finished class's captures from refusing an unrelated later enclosing call.
 Suppressed exits retain the prefix join from DEC-1383.1.
+
+Superseded for the current Python inventory checker by DEC-1413.1. The
+historical evaluator behavior below is retained as provenance.
 
 Treating every class helper as opaque would lose the issue's measured safe
 controls. Two bounded AST facts preserve them: a plain zero-argument function
@@ -606,6 +612,9 @@ bind in Python's left-to-right order. A following proven native binding replaces
 the alias, while merely retaining an unused reflective value does not expose the
 module namespace.
 
+Superseded for the current Python inventory checker by DEC-1413.1. The
+historical evaluator behavior below is retained as provenance.
+
 Unknown shape or iteration, unsupported scalar results, arity failures and
 unproved attribute/subscript target protocols cannot establish execution ownership.
 They retain conservative exposure instead of empty alias facts. A starred
@@ -635,6 +644,9 @@ value at deletion time is insufficient: an executed nested class can replace
 the module binding before the deleted local is read. A further conditional write
 keeps that possibility, while a guaranteed following shadow replaces it.
 
+Superseded for the current Python inventory checker by DEC-1413.1. The
+historical evaluator behavior below is retained as provenance.
+
 Class-local deletion uses the class namespace; an explicit class global uses the
 module namespace. A readable fallback does not make an absent local deletable.
 Known missing targets refuse execution-owner evidence rather than treating their
@@ -653,3 +665,52 @@ deletion join, absence lifetime, conditional preservation, scope destination,
 continuation lookup and missing-target refusal. General control-flow truth,
 compound results, protocol dispatch and unpacking completion retain their
 separate issues. See [test execution](../TEST-EXECUTION.md).
+
+
+<a id="dec-1413-1"></a>
+
+**DEC-1413.1. Python fixture owners share a literal grammar and a syntactic
+form, rather than a namespace evaluator.** Extending alias, class protocol,
+continuation and cached-value proofs made each new Python feature another
+proof obligation. The checker now reads literal selector dependencies and
+checks spelling, binding and use contexts. It never executes an owner. This
+supersedes DEC-1299.1, DEC-1383.1, DEC-1389.1 and DEC-1300.1 for active checker
+behavior; their measurements and historical descriptions remain recorded.
+
+The same grammar supports list/tuple/string data, addition and one synchronous
+unfiltered literal-data comprehension. Every protected name has one plain
+module assignment and no other binding. A mutable list may be read only in a
+direct iteration position, including qualified, from-import and class-pattern
+keyword attribute references, preventing mutable aliases without following
+effects. String and immutable tuple reads remain ordinary. Source-wide AST
+restrictions refuse reflective spellings, reflection-module imports (including
+gc), syntactically qualified sys module/frame access, wildcard imports and any
+__name__ binding. Identifier reference fields in imports and class patterns
+are checked too; ordinary strings are data. Imports, arguments, definitions,
+exception/match targets and type parameters are binding fields too. These are
+syntactic rules, including in uncalled or annotation scopes; they do not pretend
+to reproduce each scope's execution semantics. Unrelated Python expressions
+are not evaluated or banned.
+
+Data/call selector owners end with a canonical __main__ guard calling the unique
+undecorated module main, directly or through raise SystemExit(main()). Existing
+named-function witnesses check helper invocation routes; main need not read
+the selector. Witness-only module runners retain their direct execution form.
+Neither launch nor server receives a per-file profile or a pinned helper
+skeleton. Statement boundaries remain in Python witness tokens, while supported
+partial, continued, multiline and nested call fragments keep their meaning.
+
+This is a maintenance lint, not a hostile-code sandbox. ctypes and repository
+helper imports remain trusted source boundaries; deliberate indirect writes or
+changes to those helpers require maintainer review, not a growing interpreter
+inside the checker. Issue #1100 records the analogous distinction for deliberate
+UI guardrail evasion; it does not supply a pre-existing policy for this checker.
+This decision establishes the checker boundary explicitly.
+
+Retired regressions keep their exact sources, actual-Python controls and named
+construct/line dispositions. Safe cases within the form are accepted; safe
+cases outside it are refused by the rule they actually violate. Operator
+permissiveness cannot make a prohibited import acceptable. Permanent operational
+rule-removal tests must admit a complete owner after disabling only their rule;
+a second guard's refusal is not evidence. Unsupported literal nodes never use
+an execution or evaluator fallback. See [test execution](../TEST-EXECUTION.md).
