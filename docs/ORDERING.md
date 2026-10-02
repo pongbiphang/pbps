@@ -284,7 +284,7 @@ one class and the dependents a class cannot see.
 | Retype → probes of later keys, checks and deletes | value | the probe projects through the new type, or the probe is unchecked | ✓ DECISIONS 340, 410 |
 | `AddColumn` backfill → probes | value | a literal is projected; an expression, identity or generated column is unchecked | ✓ DECISIONS 336, 339 |
 | Row writes → probes of keys, foreign keys and checks | value | the probe reads the rows after the plan's writes | ✓ DECISIONS 335 |
-| **Row writes setting a column, or deleting the rows that hold its NULLs → tightening it to NOT NULL** | fixed, value | the tightening (class 9) runs before the rows (11, 12), and its probe counts the NULLs stored now | **✗ #1367** |
+| Row writes setting a column, or deleting the rows that hold its NULLs → tightening it to NOT NULL | fixed, value | (12, 2), after the rows of its table; split from a retype; the probe reads the rows after the plan's writes | ✓ DEC-1367.1 |
 | `AlterColumnExpression` → tightening, keys, checks, filtered indexes, deletes | value | the probe is unchecked; the order is tighten and keys after the recomputation | ✓ DEC-1168.1 |
 | Default set → a row that takes it | value | the default goes first; it stays ahead of a rebuild | ✓ #1030 |
 | Nullability relaxed → expression recomputing a NULL | value | rank −1 before 0 | ✓ DEC-1168.1 |
@@ -365,7 +365,7 @@ counterpart would make that table the one row a new kind adds.
 | Finding | Kind | Disposition |
 |---|---|---|
 | S: tightening a column an index or a unique constraint covers is refused at apply | fixed, wrong | fixed, DEC-1363.1 |
-| Tightening runs before the reference rows that fill its NULLs, and its probe ignores them | fixed, wrong | #1367 |
+| Tightening runs before the reference rows that fill its NULLs, and its probe ignores them | fixed, wrong | fixed, DEC-1367.1 |
 | Content-dependent corners of expression-bearing changes around function creates, rebuilds and drops | content | #1350; the lexical over-approximation above as the structural fix, #1364 |
 | Value-flow guards are per-probe, not one rule | value | recorded above; a refactor when a new value-rewriting kind arrives (#1174) |
 

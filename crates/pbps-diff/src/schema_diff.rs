@@ -360,6 +360,7 @@ fn diff_partial_rebuilding(
         );
     }
 
+    split_tightenings_from_retypes(&mut changes);
     recreate_retyped_dependents(base, declared, &renames, dialect, &mut changes);
     recreate_referenced_foreign_keys(base, declared, &renames, &mut changes);
     rebind_foreign_keys_to_a_new_occupant(base, declared, &mut changes);
@@ -776,7 +777,25 @@ fn diff_partial_rebuilding(
                 .filter_map(move |(column, _)| base.ids.column_uid(&name.column(column)).cloned())
         })
         .collect();
+    let row_tables: BTreeSet<TableName> = planned
+        .iter()
+        .filter_map(|p| row_table(&p.change).cloned())
+        .collect();
     let sort_class = |c: &Change| -> (u8, usize) {
+        // A tightening of a table whose rows this plan writes or deletes runs
+        // after them, at the end of the deletes' class: the rows may be what
+        // fills or removes its NULLs, and no row change needs the column NOT
+        // NULL first. Still before the additions of class 13, a primary key
+        // among them, which SQL Server refuses over a nullable column (#1367).
+        if let Change::AlterColumnNullability {
+            column,
+            to_nullable: false,
+            ..
+        } = c
+            && row_tables.contains(&column.table)
+        {
+            return (ROW_DELETIONS, 2);
+        }
         // A generated column is dropped before the ordinary columns of its
         // class, and added after every column change of the class beyond:
         // the additions, and the in-place alterations of class 9. Measured,
@@ -1254,6 +1273,62 @@ fn rebind_foreign_keys_to_a_new_occupant(
     changes.extend(pairs);
 }
 
+/// The tables whose rows this plan writes or deletes: a tightening of one of
+/// their columns runs after those rows (#1367).
+fn tables_with_row_changes(changes: &[Change]) -> BTreeSet<TableName> {
+    changes
+        .iter()
+        .filter_map(|c| row_table(c).cloned())
+        .collect()
+}
+
+/// The table a row change writes or deletes in.
+fn row_table(change: &Change) -> Option<&TableName> {
+    if let Change::InsertRow { table, .. }
+    | Change::UpdateRow { table, .. }
+    | Change::DeleteRow { table, .. } = change
+    {
+        Some(table)
+    } else {
+        None
+    }
+}
+
+/// A tightening folded into a retype comes out of it when the plan writes or
+/// deletes rows of its table. The retype keeps the column nullable, and an
+/// `AlterColumnNullability` tightens it after the rows, which may be what
+/// fills or removes its NULLs (#1367). The same split DEC-1168.1 makes for a
+/// recomputed column, for the same reason: the check has to meet the values
+/// the plan leaves, not the ones it found.
+fn split_tightenings_from_retypes(changes: &mut Vec<Change>) {
+    let rows = tables_with_row_changes(changes);
+    let mut split = Vec::new();
+    for change in changes.iter_mut() {
+        if let Change::AlterColumnType {
+            uid,
+            column,
+            to,
+            from_nullable: true,
+            to_nullable,
+            to_collation,
+            ..
+        } = change
+            && !*to_nullable
+            && rows.contains(&column.table)
+        {
+            *to_nullable = true;
+            split.push(Change::AlterColumnNullability {
+                uid: uid.clone(),
+                column: column.clone(),
+                ty: to.clone(),
+                to_nullable: false,
+                collation: to_collation.clone(),
+            });
+        }
+    }
+    changes.extend(split);
+}
+
 /// Dependency maintenance is visible in the saved plan, including its ordinary
 /// drop/add risks (DECISIONS 461). The emitter must not discover extra
 /// cross-table work after approval. Align identities first so the selection survives simultaneous
@@ -1272,71 +1347,74 @@ fn recreate_retyped_dependents(
         dependents.filtered_indexes |= more.filtered_indexes;
         dependents.foreign_keys |= more.foreign_keys;
     };
-    let retyped: BTreeMap<_, _> = changes
-        .iter()
-        .filter_map(|change| match change {
-            Change::AlterColumnType {
-                column,
-                from,
-                to,
-                from_nullable,
-                to_nullable,
-                from_collation,
-                to_collation,
-                ..
-            } => {
-                let mut dependents = dialect.retype_dependents(from, to);
-                if from_collation != to_collation {
-                    also(&mut dependents, dialect.recollate_dependents());
-                }
-                // A nullability change in the same statement brings its own
-                // blockers, which a type change alone may not have (#1363).
-                if from_nullable != to_nullable {
-                    also(
-                        &mut dependents,
-                        dialect.nullability_dependents(*to_nullable),
-                    );
-                }
-                Some((column.clone(), dependents))
+    // A column can carry two of these, a retype and the tightening split out
+    // of it (#1367), so the answers are merged rather than the last kept.
+    let mut retyped: BTreeMap<ColumnRef, pbps_dialect::RetypeDependents> = BTreeMap::new();
+    for (column, dependents) in changes.iter().filter_map(|change| match change {
+        Change::AlterColumnType {
+            column,
+            from,
+            to,
+            from_nullable,
+            to_nullable,
+            from_collation,
+            to_collation,
+            ..
+        } => {
+            let mut dependents = dialect.retype_dependents(from, to);
+            if from_collation != to_collation {
+                also(&mut dependents, dialect.recollate_dependents());
             }
-            Change::AlterColumnNullability {
-                column,
-                to_nullable,
-                ..
-            } => Some((column.clone(), dialect.nullability_dependents(*to_nullable))),
-            Change::CreateTable { .. }
-            | Change::DropTable { .. }
-            | Change::RenameTable { .. }
-            | Change::AddColumn { .. }
-            | Change::DropColumn { .. }
-            | Change::RenameColumn { .. }
-            | Change::AlterColumnDefault { .. }
-            | Change::AlterColumnExpression { .. }
-            | Change::SetColumnDeprecated { .. }
-            | Change::SetPrimaryKey { .. }
-            | Change::AddUnique { .. }
-            | Change::DropUnique { .. }
-            | Change::AddForeignKey { .. }
-            | Change::DropForeignKey { .. }
-            | Change::AddCheck { .. }
-            | Change::DropCheck { .. }
-            | Change::AddIndex { .. }
-            | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
-            | Change::SetDataMode { .. }
-            | Change::CreateModule { .. }
-            | Change::AlterModule { .. }
-            | Change::DropModule { .. }
-            | Change::CreateRole { .. }
-            | Change::DropRole { .. }
-            | Change::RenameRole { .. }
-            | Change::Grant { .. }
-            | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => None,
-        })
-        .collect();
+            // A nullability change in the same statement brings its own
+            // blockers, which a type change alone may not have (#1363).
+            if from_nullable != to_nullable {
+                also(
+                    &mut dependents,
+                    dialect.nullability_dependents(*to_nullable),
+                );
+            }
+            Some((column.clone(), dependents))
+        }
+        Change::AlterColumnNullability {
+            column,
+            to_nullable,
+            ..
+        } => Some((column.clone(), dialect.nullability_dependents(*to_nullable))),
+        Change::CreateTable { .. }
+        | Change::DropTable { .. }
+        | Change::RenameTable { .. }
+        | Change::AddColumn { .. }
+        | Change::DropColumn { .. }
+        | Change::RenameColumn { .. }
+        | Change::AlterColumnDefault { .. }
+        | Change::AlterColumnExpression { .. }
+        | Change::SetColumnDeprecated { .. }
+        | Change::SetPrimaryKey { .. }
+        | Change::AddUnique { .. }
+        | Change::DropUnique { .. }
+        | Change::AddForeignKey { .. }
+        | Change::DropForeignKey { .. }
+        | Change::AddCheck { .. }
+        | Change::DropCheck { .. }
+        | Change::AddIndex { .. }
+        | Change::DropIndex { .. }
+        | Change::InsertRow { .. }
+        | Change::UpdateRow { .. }
+        | Change::DeleteRow { .. }
+        | Change::SetDataMode { .. }
+        | Change::CreateModule { .. }
+        | Change::AlterModule { .. }
+        | Change::DropModule { .. }
+        | Change::CreateRole { .. }
+        | Change::DropRole { .. }
+        | Change::RenameRole { .. }
+        | Change::Grant { .. }
+        | Change::Revoke { .. }
+        | Change::PublicExecution { .. } => None,
+    }) {
+        let merged = retyped.entry(column).or_default();
+        also(merged, dependents);
+    }
     if retyped.is_empty() {
         return;
     }
@@ -2612,6 +2690,10 @@ fn diff_modules(
 /// generated column's addition is placed after it (DEC-1168.1).
 const COLUMN_ALTERATIONS: u8 = 9;
 
+/// The class of row deletions, the last row changes. Named because a
+/// tightening of a table with row changes is placed at its end (#1367).
+const ROW_DELETIONS: u8 = 12;
+
 fn order_key(c: &Change) -> u8 {
     match c {
         // Modules go first and last, and both ends are load-bearing. A
@@ -2704,7 +2786,7 @@ fn order_key(c: &Change) -> u8 {
         // at the old one when the old one goes, and `ON DELETE CASCADE` takes
         // the child with it, after which the update touches zero rows and
         // nothing says so.
-        Change::DeleteRow { .. } => 12,
+        Change::DeleteRow { .. } => ROW_DELETIONS,
         Change::SetPrimaryKey { .. }
         | Change::AddUnique { .. }
         | Change::AddForeignKey { .. }
@@ -3541,6 +3623,143 @@ mod tests {
                 .collect(),
         });
         t
+    }
+
+    /// A tightening of a table whose rows this plan writes or deletes runs
+    /// after them, since they may be what fills or removes its NULLs, and a
+    /// tightening folded into a retype comes out of it to do so. A table
+    /// without row changes keeps its tightening among the column alterations,
+    /// whatever another table's rows do (#1367).
+    #[test]
+    #[allow(clippy::wildcard_enum_match_arm)]
+    fn a_tightening_runs_after_the_rows_of_its_table() {
+        let required = |mut t: Table, ty_: &str| {
+            let label = t.columns.get_mut("label").expect("the lookup's label");
+            label.ty = ty(ty_);
+            label.nullable = false;
+            t
+        };
+        let order = |cs: &ChangeSet| -> Vec<String> {
+            cs.changes
+                .iter()
+                .filter_map(|p| match &p.change {
+                    Change::AlterColumnNullability { column, .. } => {
+                        Some(format!("tighten {}", column.table))
+                    }
+                    Change::AlterColumnType {
+                        column,
+                        to_nullable,
+                        ..
+                    } => Some(format!("retype {} nullable={to_nullable}", column.table)),
+                    Change::UpdateRow { table, .. } => Some(format!("update {table}")),
+                    Change::DeleteRow { table, .. } => Some(format!("delete {table}")),
+                    _ => None,
+                })
+                .collect()
+        };
+        // An update fills the NULL: the tightening follows it.
+        let base = schema_of("dbo.s", lookup(DataMode::Ensure, &[("a", "x")]));
+        let filled = schema_of(
+            "dbo.s",
+            required(lookup(DataMode::Ensure, &[("a", "y")]), "nvarchar(50)"),
+        );
+        assert_eq!(
+            order(&run(&base, &filled, &[])),
+            ["update dbo.s", "tighten dbo.s"]
+        );
+        // An exact table deletes the row that held it: after the delete.
+        let base = schema_of("dbo.s", lookup(DataMode::Exact, &[("a", "x"), ("b", "y")]));
+        let removed = schema_of(
+            "dbo.s",
+            required(lookup(DataMode::Exact, &[("a", "x")]), "nvarchar(50)"),
+        );
+        assert_eq!(
+            order(&run(&base, &removed, &[])),
+            ["delete dbo.s", "tighten dbo.s"]
+        );
+        // Folded into a retype, the tightening comes out of it and follows the
+        // rows; the retype keeps the column nullable.
+        let widened = schema_of(
+            "dbo.s",
+            required(lookup(DataMode::Ensure, &[("a", "y")]), "nvarchar(80)"),
+        );
+        let base = schema_of("dbo.s", lookup(DataMode::Ensure, &[("a", "x")]));
+        assert_eq!(
+            order(&run(&base, &widened, &[])),
+            [
+                "retype dbo.s nullable=true",
+                "update dbo.s",
+                "tighten dbo.s"
+            ]
+        );
+        // Negative: another table's rows move nothing. `dbo.s` writes no row,
+        // so its tightening stays in class 9, ahead of `dbo.o`'s update, and a
+        // retype keeps its tightening folded in.
+        let pair = |s: Table, o: Table| {
+            let mut schema = schema_of("dbo.s", s);
+            schema.tables.insert("dbo.o".parse().unwrap(), o);
+            schema
+        };
+        let base = pair(
+            lookup(DataMode::Ensure, &[("a", "x")]),
+            lookup(DataMode::Ensure, &[("a", "x")]),
+        );
+        let declared = pair(
+            required(lookup(DataMode::Ensure, &[("a", "x")]), "nvarchar(50)"),
+            lookup(DataMode::Ensure, &[("a", "y")]),
+        );
+        assert_eq!(
+            order(&run(&base, &declared, &[])),
+            ["tighten dbo.s", "update dbo.o"]
+        );
+        let declared = pair(
+            required(lookup(DataMode::Ensure, &[("a", "x")]), "nvarchar(80)"),
+            lookup(DataMode::Ensure, &[("a", "y")]),
+        );
+        assert_eq!(
+            order(&run(&base, &declared, &[])),
+            ["retype dbo.s nullable=false", "update dbo.o"]
+        );
+    }
+
+    /// A column whose tightening was split out of its retype carries two
+    /// changes, and the dependents both bring down are rebuilt: the check a
+    /// collation change takes down, and the unique key a tightening does
+    /// (#1363, #1367).
+    #[test]
+    fn a_split_tightening_keeps_the_dependents_of_its_retype() {
+        let shaped = |collation: Option<&str>, nullable: bool, label: &str| {
+            let mut t = lookup(DataMode::Ensure, &[("a", label)]);
+            let column = t.columns.get_mut("label").expect("the lookup's label");
+            column.collation = collation.map(pbps_model::Collation::new);
+            column.nullable = nullable;
+            t.unique.insert(
+                "uq_label".into(),
+                UniqueConstraint {
+                    columns: vec!["label".into()],
+                },
+            );
+            t.checks.insert(
+                "ck_label".into(),
+                CheckConstraint {
+                    expression: "label <> ''".into(),
+                },
+            );
+            schema_of("dbo.s", t)
+        };
+        let base = shaped(None, true, "x");
+        let declared = shaped(Some("Latin1_General_CS_AS"), false, "y");
+        let k = kinds(&run_with(&Recollates, &base, &declared, &[]));
+        for kind in [
+            "AlterColumnType",
+            "AlterColumnNullability",
+            "DropCheck",
+            "AddCheck",
+            "DropUnique",
+            "AddUnique",
+        ] {
+            assert!(k.contains(&kind.to_owned()), "{kind}: {k:?}");
+        }
     }
 
     fn row_ops(cs: &ChangeSet) -> Vec<String> {
