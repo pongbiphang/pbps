@@ -4,7 +4,11 @@ use crate::resolver::{ObjectOwnership, Surface};
 use crate::{PlannedChange, TableName};
 
 fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, ResolverEvidence) {
-    let (fixture_changes, mut evidence) = super::transition_tests::rename_endpoints(column);
+    let (fixture_changes, mut evidence, compiled) =
+        super::transition_tests::rename_endpoints(column);
+    // Until sealing, `evidence.after` holds the compiled manifest, as in
+    // `transition_scope_tests::fixture`.
+    evidence.after = compiled;
     let fixture_parent = column.then(|| {
         evidence
             .transitions
@@ -230,7 +234,7 @@ fn accepts_chain(column: bool, rename_table: bool) {
     for intermediate in [false, true] {
         let (changes, evidence) = chain(column, intermediate, rename_table);
         let projected = seal(&changes, &evidence).expect("valid UID rename chain was refused");
-        assert_eq!(projected.after, evidence.after);
+        super::tests::assert_closing(&projected, &evidence.after);
         let decoded: ResolverEvidence =
             serde_json::from_value(serde_json::to_value(&projected).unwrap()).unwrap();
         decoded.validate(&changes).unwrap();
@@ -254,10 +258,16 @@ fn accepts_chain(column: bool, rename_table: bool) {
                         seal(&changes, &wrong).is_err(),
                         "missing chained rename record accepted"
                     );
-                    assert!(
-                        wrong.validate(&changes).is_err(),
-                        "saved chained rename omission accepted"
-                    );
+                    // The reader holds no compiled records, so only an
+                    // omitted opening record is its to refuse.
+                    if before {
+                        let mut saved = projected.clone();
+                        saved.transitions = wrong.transitions;
+                        assert!(
+                            saved.validate(&changes).is_err(),
+                            "saved chained rename omission accepted"
+                        );
+                    }
                 }
             }
         }

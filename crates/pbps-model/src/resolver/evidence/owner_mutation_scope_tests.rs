@@ -63,20 +63,9 @@ fn owner_fixture(change: Change, root: &str) -> (ChangeSet, ResolverEvidence) {
 fn preserves_children(changes: &ChangeSet, evidence: &ResolverEvidence) {
     let projected = seal(changes, evidence).expect("owner-only valid mutation was refused");
     projected.validate(changes).unwrap();
-    for record in projected.after.prerequisites() {
-        let source = if evidence.transitions[0].after.contains(&record.object) {
-            &evidence.after
-        } else {
-            &evidence.before
-        };
-        assert_eq!(
-            Some(record),
-            source
-                .prerequisites()
-                .iter()
-                .find(|p| p.object == record.object)
-        );
-    }
+    // `evidence.after` is the compiled capture: the owner's own records may
+    // appear only as placeholders, and every child keeps its target record.
+    super::tests::assert_closing(&projected, &evidence.after);
     for name in [
         "column",
         "changed-default",

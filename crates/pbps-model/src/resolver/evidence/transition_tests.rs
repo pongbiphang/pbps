@@ -24,6 +24,9 @@ fn drop_fixture(change: Change, surface: Surface) -> (ChangeSet, ResolverEvidenc
     let changes = ChangeSet {
         changes: vec![PlannedChange::new(change)],
     };
+    // The view the fixture plan created opens this plan observed with its
+    // real fingerprint: an opening manifest never holds a placeholder.
+    evidence.after = super::tests::observed(&evidence, &super::tests::compiled());
     std::mem::swap(&mut evidence.before, &mut evidence.after);
     let observation = &mut evidence.surfaces[0];
     std::mem::swap(&mut observation.current, &mut observation.desired);
@@ -144,11 +147,9 @@ fn dropped_surfaces_cannot_omit_their_closing_transitions() {
             "projection accepted missing {surface:?}"
         );
         assert!(evidence.after.membership()[0].members.is_empty());
-        let parent = usize::from(matches!(
-            changes.changes[0].change,
-            Change::DropColumn { .. }
-        ));
-        assert_eq!(evidence.after.prerequisites().len(), 1 + parent);
+        // A dropped column's surviving parent is reinstalled by its own
+        // transition and nothing names it, so it is not predicted either.
+        assert_eq!(evidence.after.prerequisites().len(), 1);
         assert_eq!(
             evidence
                 .after
@@ -213,7 +214,7 @@ fn changed_definitions_need_transitions_even_when_bindings_are_identical() {
     let changes = ChangeSet {
         changes: vec![PlannedChange::new(Change::AlterModule { id, module })],
     };
-    evidence.before = evidence.after.clone();
+    evidence.before = super::tests::observed(&evidence, &super::tests::compiled());
     evidence.surfaces[0].current = evidence.surfaces[0].desired.clone();
     evidence.transitions[0].before = evidence.transitions[0].after.clone();
     evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
@@ -266,7 +267,10 @@ fn unchanged_catalogs_do_not_need_a_transition_for_row_or_metadata_changes() {
             }),
         ],
     };
-    evidence.before = evidence.after.clone();
+    // Without a transition the closing manifest is the opening one, record
+    // for record: both are the observed catalog the fixture plan left.
+    evidence.before = super::tests::observed(&evidence, &super::tests::compiled());
+    evidence.after = evidence.before.clone();
     evidence.surfaces[0].current = evidence.surfaces[0].desired.clone();
     evidence.surfaces[0].surface =
         Surface::Column("app.v".parse::<TableName>().unwrap().column("n"));
@@ -389,7 +393,12 @@ fn removing_a_predicate_can_retain_the_plain_index_catalog_record() {
         }),
     }));
     evidence.transitions[0].after = evidence.transitions[0].before.clone();
-    evidence.after = evidence.before.clone();
+    // Scratch compiles the plain index as the same catalog record.
+    let compiled = evidence.before.clone();
+    evidence.after = evidence
+        .before
+        .project(&changes, &compiled, &evidence.transitions)
+        .unwrap();
     evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
     evidence.validate(&changes).unwrap();
     evidence.transitions.clear();
@@ -399,12 +408,14 @@ fn removing_a_predicate_can_retain_the_plain_index_catalog_record() {
 // A default and its owner are distinct catalog records. Keeping only the
 // child's transition must not leave a dropped owner, or omit a created one,
 // even when the binding-surface inventory contains only the expression.
+// Returns the compiled manifest too: the closing manifest no longer carries
+// the plan's own records, so it cannot stand in for compilation.
 fn owner_coverage(
     change: Change,
     owner: Surface,
     child: Surface,
     creating: bool,
-) -> (ChangeSet, ResolverEvidence) {
+) -> (ChangeSet, ResolverEvidence, InputManifest) {
     use crate::resolver::{BoundSurface, Prerequisite};
     let vector_edit = matches!(
         &change,
@@ -523,7 +534,7 @@ fn owner_coverage(
         .project(&changes, &compiled, &evidence.transitions)
         .unwrap();
     evidence.validate(&changes).unwrap();
-    assert_eq!(evidence.after, compiled);
+    super::tests::assert_closing(&evidence, &compiled);
     // A table label alone does not prove its independent parent inventory.
     if matches!(owner, Surface::Column(_)) {
         let mut aggregate = evidence.clone();
@@ -580,22 +591,26 @@ fn owner_coverage(
         .is_err(),
         "constructor accepted a missing owner transition"
     );
-    evidence.after = wrong_after;
-    assert_eq!(
-        evidence
-            .after
-            .prerequisites()
-            .iter()
-            .any(|p| p.object == owner_object),
-        !creating
-    );
-    let decoded: ResolverEvidence =
-        serde_json::from_value(serde_json::to_value(evidence).unwrap()).unwrap();
-    assert!(
-        decoded.validate(&changes).is_err(),
-        "reader accepted a stale owner record"
-    );
-    (changes, valid)
+    // A created owner omitted from the closing inventory is a closing-side
+    // defect: the reader has no compiled records to prove it, so only the
+    // projection and constructor above refuse it.
+    if !creating {
+        evidence.after = wrong_after;
+        assert!(
+            evidence
+                .after
+                .prerequisites()
+                .iter()
+                .any(|p| p.object == owner_object)
+        );
+        let decoded: ResolverEvidence =
+            serde_json::from_value(serde_json::to_value(evidence).unwrap()).unwrap();
+        assert!(
+            decoded.validate(&changes).is_err(),
+            "reader accepted a stale owner record"
+        );
+    }
+    (changes, valid, compiled)
 }
 
 #[test]
@@ -664,7 +679,7 @@ fn adding_a_column_requires_more_than_its_default_transition() {
     );
 }
 
-pub(super) fn rename_endpoints(column: bool) -> (ChangeSet, ResolverEvidence) {
+pub(super) fn rename_endpoints(column: bool) -> (ChangeSet, ResolverEvidence, InputManifest) {
     let table: TableName = "app.v".parse().unwrap();
     let (drop, surface) = dropped_surfaces().pop().unwrap();
     let (_, mut evidence) = drop_fixture(drop, surface);
@@ -768,7 +783,7 @@ pub(super) fn rename_endpoints(column: bool) -> (ChangeSet, ResolverEvidence) {
         .unwrap();
     evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
     evidence.validate(&changes).unwrap();
-    assert_eq!(evidence.after, compiled);
+    super::tests::assert_closing(&evidence, &compiled);
     // A producer may split the old/new column inventory. The independent
     // parent inventory cannot stand in for either column endpoint.
     let mut split = evidence.clone();
@@ -790,44 +805,39 @@ pub(super) fn rename_endpoints(column: bool) -> (ChangeSet, ResolverEvidence) {
     }
     for omit_before in [false, true] {
         let mut omitted = evidence.clone();
-        let mut after = serde_json::to_value(&evidence.before).unwrap();
         if omit_before {
             omitted.transitions[rename_index].before.clear();
+            let mut after = serde_json::to_value(&evidence.before).unwrap();
             let mut records = evidence.before.prerequisites().to_vec();
-            records.extend(
-                compiled
-                    .prerequisites()
-                    .iter()
-                    .filter(|p| p.object == new_object)
-                    .cloned(),
-            );
-            records.sort_by(|a, b| a.object.cmp(&b.object));
-            after["prerequisites"] = serde_json::to_value(records).unwrap();
+            // The renamed table is a candidate member, so its closing
+            // record is the placeholder; the renamed column is named by
+            // nothing and is absent.
             if !column {
+                records.extend(
+                    compiled
+                        .prerequisites()
+                        .iter()
+                        .filter(|p| p.object == new_object)
+                        .map(|p| p.managed_closing()),
+                );
                 after["membership"][0]["members"] =
                     serde_json::to_value(BTreeSet::from([old_object.clone(), new_object.clone()]))
                         .unwrap();
             }
+            records.sort_by(|a, b| a.object.cmp(&b.object));
+            after["prerequisites"] = serde_json::to_value(records).unwrap();
+            omitted.after = serde_json::from_value(after).unwrap();
+            let decoded: ResolverEvidence =
+                serde_json::from_value(serde_json::to_value(&omitted).unwrap()).unwrap();
+            assert!(
+                decoded.validate(&changes).is_err(),
+                "rename reader accepted missing opening endpoint"
+            );
         } else {
+            // The closing endpoint is a compiled record the reader cannot
+            // see; only projection and the constructor can refuse its omission.
             omitted.transitions[rename_index].after.clear();
-            after["prerequisites"] = serde_json::to_value(
-                evidence
-                    .before
-                    .prerequisites()
-                    .iter()
-                    .filter(|p| p.object != old_object)
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap();
-            after["membership"][0]["members"] = serde_json::json!([]);
         }
-        omitted.after = serde_json::from_value(after).unwrap();
-        let decoded: ResolverEvidence =
-            serde_json::from_value(serde_json::to_value(&omitted).unwrap()).unwrap();
-        assert!(
-            decoded.validate(&changes).is_err(),
-            "rename reader accepted missing endpoint (before={omit_before})"
-        );
         assert!(
             evidence
                 .before
@@ -850,7 +860,7 @@ pub(super) fn rename_endpoints(column: bool) -> (ChangeSet, ResolverEvidence) {
             "constructor accepted missing rename endpoint"
         );
     }
-    (changes, evidence)
+    (changes, evidence, compiled)
 }
 
 #[test]
@@ -870,15 +880,16 @@ fn transitions_cannot_rewrite_an_unrelated_prerequisite() {
         panic!("resolved")
     };
     let external = evidence.before.prerequisites()[0].object.clone();
-    let mut compiled = serde_json::to_value(&evidence.after).unwrap();
-    let external_record = compiled["prerequisites"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|p| p["object"] == serde_json::to_value(&external).unwrap())
-        .unwrap();
-    external_record["properties"] = serde_json::json!("aa".repeat(32));
-    let compiled: InputManifest = serde_json::from_value(compiled).unwrap();
+    let compiled = super::tests::compiled();
+    assert_eq!(
+        compiled
+            .prerequisites()
+            .iter()
+            .find(|p| p.object == external)
+            .unwrap()
+            .properties,
+        "aa".repeat(32)
+    );
     evidence.transitions[0].before.insert(external.clone());
     evidence.transitions[0].after.insert(external);
     // The retained target record has a different fingerprint from scratch.
@@ -913,11 +924,15 @@ fn transitions_cannot_rewrite_an_unrelated_prerequisite() {
     );
 }
 
-fn assert_projection_refuses(changes: &ChangeSet, evidence: ResolverEvidence) {
+fn assert_projection_refuses(
+    changes: &ChangeSet,
+    evidence: &ResolverEvidence,
+    compiled: &InputManifest,
+) {
     assert!(
         evidence
             .before
-            .project(changes, &evidence.after, &evidence.transitions)
+            .project(changes, compiled, &evidence.transitions)
             .is_err(),
         "projection accepted unqualified or unrelated ownership"
     );
@@ -927,7 +942,7 @@ fn assert_projection_refuses(changes: &ChangeSet, evidence: ResolverEvidence) {
             evidence.qualification.clone(),
             evidence.authorization.clone(),
             evidence.before.clone(),
-            &evidence.after,
+            compiled,
             evidence.surfaces.clone(),
             evidence.transitions.clone(),
             evidence.ordering.clone()
@@ -935,6 +950,9 @@ fn assert_projection_refuses(changes: &ChangeSet, evidence: ResolverEvidence) {
         .is_err(),
         "constructor accepted unqualified or unrelated ownership"
     );
+}
+
+fn assert_reader_refuses(changes: &ChangeSet, evidence: ResolverEvidence) {
     let decoded: ResolverEvidence =
         serde_json::from_value(serde_json::to_value(evidence).unwrap()).unwrap();
     assert!(
@@ -955,25 +973,34 @@ fn opening_inventory_requires_its_own_qualified_ownership() {
         let mut before = serde_json::to_value(&wrong.before).unwrap();
         before["prerequisites"][0]["ownership"] = serde_json::to_value(ownership).unwrap();
         wrong.before = serde_json::from_value(before).unwrap();
-        assert_projection_refuses(&changes, wrong);
+        // A drop installs nothing: the compiled manifest is the closing one.
+        let compiled = wrong.after.clone();
+        assert_projection_refuses(&changes, &wrong, &compiled);
+        assert_reader_refuses(&changes, wrong);
     }
 }
 
+// Closing ownership is the compiled records' ownership. The reader holds
+// none of them, so only projection and the constructor can refuse it.
 #[test]
 fn closing_inventory_requires_its_own_qualified_ownership() {
     let plan = super::tests::plan();
     let PlanAnalysis::Resolved(evidence) = plan.analysis else {
         panic!("resolved")
     };
+    let view = super::tests::compiled()
+        .prerequisites()
+        .iter()
+        .position(|p| evidence.transitions[0].after.contains(&p.object))
+        .unwrap();
     for ownership in [
         ObjectOwnership::Unqualified,
         ObjectOwnership::Surface(Surface::Module("app.other".parse().unwrap())),
     ] {
-        let mut wrong = *evidence.clone();
-        let mut after = serde_json::to_value(&wrong.after).unwrap();
-        after["prerequisites"][0]["ownership"] = serde_json::to_value(ownership).unwrap();
-        wrong.after = serde_json::from_value(after).unwrap();
-        assert_projection_refuses(&plan.changes, wrong);
+        let mut compiled = serde_json::to_value(super::tests::compiled()).unwrap();
+        compiled["prerequisites"][view]["ownership"] = serde_json::to_value(ownership).unwrap();
+        let compiled: InputManifest = serde_json::from_value(compiled).unwrap();
+        assert_projection_refuses(&plan.changes, &evidence, &compiled);
     }
 }
 
@@ -991,7 +1018,8 @@ fn proved_internal_objects_are_allowed_but_referenced_objects_are_not_owned() {
         name: vec!["opaque".into()],
         signature: vec![],
     };
-    let mut records = evidence.after.prerequisites().to_vec();
+    let compiled = super::tests::compiled();
+    let mut records = compiled.prerequisites().to_vec();
     records.push(crate::resolver::Prerequisite {
         object: internal.clone(),
         ownership: ObjectOwnership::Surface(owner),
@@ -1000,47 +1028,47 @@ fn proved_internal_objects_are_allowed_but_referenced_objects_are_not_owned() {
         bindings: vec![],
     });
     records.sort_by(|a, b| a.object.cmp(&b.object));
-    let mut after = serde_json::to_value(&evidence.after).unwrap();
-    after["prerequisites"] = serde_json::to_value(records).unwrap();
-    evidence.after = serde_json::from_value(after).unwrap();
+    let mut json = serde_json::to_value(&compiled).unwrap();
+    json["prerequisites"] = serde_json::to_value(records).unwrap();
+    let mut compiled: InputManifest = serde_json::from_value(json).unwrap();
     evidence.transitions[0].after.insert(internal.clone());
+    evidence.after = evidence
+        .before
+        .project(&plan.changes, &compiled, &evidence.transitions)
+        .unwrap();
     evidence.validate(&plan.changes).unwrap();
+    // A closing record's ownership is the compiled capture's, which only
+    // sealing holds: the reader cannot refuse it.
     own(
-        &mut evidence.after,
+        &mut compiled,
         &internal,
         Surface::Module("app.external".parse().unwrap()),
     );
-    assert_projection_refuses(&plan.changes, *evidence);
+    assert_projection_refuses(&plan.changes, &evidence, &compiled);
 }
 
-// Construct the wrong closing state caused by omitting exactly this record.
-// On DROP it survives; on CREATE it is absent. Membership follows that state
-// so the reader regression cannot pass merely because the fixture is malformed.
+// Construct the wrong closing state caused by omitting exactly this removed
+// record: it survives. Membership follows that state so the reader regression
+// cannot pass merely because the fixture is malformed. An omitted installed
+// record has no reader-side counterpart: the reader holds no compiled records.
 fn omitted_closing_record(
     before: &InputManifest,
     after: &InputManifest,
     object: &ObjectIdentity,
-    creating: bool,
 ) -> InputManifest {
     let mut records = after.prerequisites().to_vec();
-    if creating {
-        records.retain(|p| &p.object != object);
-    } else {
-        records.push(
-            before
-                .prerequisites()
-                .iter()
-                .find(|p| &p.object == object)
-                .unwrap()
-                .clone(),
-        );
-        records.sort_by(|a, b| a.object.cmp(&b.object));
-    }
+    records.push(
+        before
+            .prerequisites()
+            .iter()
+            .find(|p| &p.object == object)
+            .unwrap()
+            .clone(),
+    );
+    records.sort_by(|a, b| a.object.cmp(&b.object));
     let mut membership = after.membership().to_vec();
     for (result, opening) in membership.iter_mut().zip(before.membership()) {
-        if creating {
-            result.members.remove(object);
-        } else if opening.members.contains(object) {
+        if opening.members.contains(object) {
             result.members.insert(object.clone());
         }
     }
@@ -1051,7 +1079,7 @@ fn omitted_closing_record(
 }
 
 fn aggregate_records(change: Change, owner: Surface, child: Surface, creating: bool) {
-    let (changes, evidence) = owner_coverage(change, owner.clone(), child, creating);
+    let (changes, evidence, compiled) = owner_coverage(change, owner.clone(), child, creating);
     let owner_index = evidence
         .transitions
         .iter()
@@ -1063,7 +1091,7 @@ fn aggregate_records(change: Change, owner: Surface, child: Surface, creating: b
         &evidence.transitions[owner_index].before
     };
     let manifest = if creating {
-        &evidence.after
+        &compiled
     } else {
         &evidence.before
     };
@@ -1087,7 +1115,7 @@ fn aggregate_records(change: Change, owner: Surface, child: Surface, creating: b
         assert!(
             evidence
                 .before
-                .project(&changes, &evidence.after, &omitted.transitions)
+                .project(&changes, &compiled, &omitted.transitions)
                 .is_err(),
             "aggregate projection accepted an omitted owned record"
         );
@@ -1097,7 +1125,7 @@ fn aggregate_records(change: Change, owner: Surface, child: Surface, creating: b
                 evidence.qualification.clone(),
                 evidence.authorization.clone(),
                 evidence.before.clone(),
-                &evidence.after,
+                &compiled,
                 vec![],
                 omitted.transitions.clone(),
                 evidence.ordering.clone(),
@@ -1109,14 +1137,15 @@ fn aggregate_records(change: Change, owner: Surface, child: Surface, creating: b
         // lifecycle change independently requires an owner even when that
         // owner was omitted from both the manifest and the transition. Child
         // capture completeness itself remains the adapter's qualification.
-        if !manifest
-            .prerequisites()
-            .iter()
-            .any(|p| &p.object == object && p.ownership == ObjectOwnership::Surface(owner.clone()))
+        // A created owner is a closing record, which the reader cannot see.
+        if creating
+            || !manifest.prerequisites().iter().any(|p| {
+                &p.object == object && p.ownership == ObjectOwnership::Surface(owner.clone())
+            })
         {
             continue;
         }
-        omitted.after = omitted_closing_record(&evidence.before, &evidence.after, object, creating);
+        omitted.after = omitted_closing_record(&evidence.before, &evidence.after, object);
         let decoded: ResolverEvidence =
             serde_json::from_value(serde_json::to_value(omitted).unwrap()).unwrap();
         assert!(
@@ -1195,7 +1224,7 @@ fn aggregate_column_changes_require_all_owned_records() {
 #[test]
 fn aggregate_renames_require_owned_records_at_both_endpoints() {
     for column in [false, true] {
-        let (changes, mut evidence) = rename_endpoints(column);
+        let (changes, mut evidence, mut compiled) = rename_endpoints(column);
         let source = match &changes.changes[0].change {
             Change::RenameColumn { table, from, .. } => Surface::Column(table.column(from)),
             Change::RenameTable { from, .. } => Surface::Table(from.clone()),
@@ -1249,7 +1278,7 @@ fn aggregate_renames_require_owned_records_at_both_endpoints() {
             .unwrap()
             .clone();
         let mut children = Vec::new();
-        for (manifest, object) in [(&mut evidence.before, &old), (&mut evidence.after, &new)] {
+        for (manifest, object) in [(&mut evidence.before, &old), (&mut compiled, &new)] {
             let owner = manifest
                 .prerequisites()
                 .iter()
@@ -1294,6 +1323,10 @@ fn aggregate_renames_require_owned_records_at_both_endpoints() {
         evidence.transitions[rename_index]
             .after
             .insert(children[1].clone());
+        evidence.after = evidence
+            .before
+            .project(&changes, &compiled, &evidence.transitions)
+            .unwrap();
         evidence.validate(&changes).unwrap();
         for omit_before in [true, false] {
             let mut omitted = evidence.clone();
@@ -1305,16 +1338,15 @@ fn aggregate_renames_require_owned_records_at_both_endpoints() {
             assert!(
                 evidence
                     .before
-                    .project(&changes, &evidence.after, &omitted.transitions)
+                    .project(&changes, &compiled, &omitted.transitions)
                     .is_err(),
                 "aggregate rename accepted a child in place of its owner"
             );
-            omitted.after = omitted_closing_record(
-                &evidence.before,
-                &evidence.after,
-                if omit_before { &old } else { &new },
-                !omit_before,
-            );
+            // The closing owner is a compiled record the reader cannot see.
+            if !omit_before {
+                continue;
+            }
+            omitted.after = omitted_closing_record(&evidence.before, &evidence.after, &old);
             let decoded: ResolverEvidence =
                 serde_json::from_value(serde_json::to_value(omitted).unwrap()).unwrap();
             assert!(
@@ -1329,7 +1361,7 @@ fn aggregate_renames_require_owned_records_at_both_endpoints() {
 // record, or a child the mutation affects. Neither can hide an omitted owner.
 fn mutation_inventory(change: Change, owner: Surface, child: Surface) {
     let table: TableName = "app.v".parse().unwrap();
-    let (_, mut evidence) = owner_coverage(
+    let (_, mut evidence, _) = owner_coverage(
         Change::DropTable {
             uid: "t_000000".parse().unwrap(),
             name: table.clone(),
@@ -1391,7 +1423,7 @@ fn mutation_inventory(change: Change, owner: Surface, child: Surface) {
         evidence.authorization.changes = BTreeSet::from([0]);
     }
     evidence.validate(&changes).unwrap();
-    assert_eq!(evidence.after, compiled);
+    super::tests::assert_closing(&evidence, &compiled);
     for missing in [&root, &subordinate] {
         let mut omitted = evidence.clone();
         omitted.transitions[0].before.remove(missing);
@@ -1545,7 +1577,7 @@ fn mutations_of_created_or_removed_targets_use_the_planned_endpoint() {
                 name: table.clone(),
             }
         };
-        let (mut changes, mut evidence) = owner_coverage(
+        let (mut changes, mut evidence, _) = owner_coverage(
             change,
             Surface::Table(table.clone()),
             Surface::Default(table.column("n")),
@@ -1639,22 +1671,28 @@ mod inline_binding_floor {
     fn construct(
         changes: &ChangeSet,
         evidence: &ResolverEvidence,
+        compiled: &InputManifest,
     ) -> Result<ResolverEvidence, EvidenceError> {
         ResolverEvidence::new(
             changes,
             evidence.qualification.clone(),
             evidence.authorization.clone(),
             evidence.before.clone(),
-            &evidence.after,
+            compiled,
             evidence.surfaces.clone(),
             evidence.transitions.clone(),
             evidence.ordering.clone(),
         )
     }
 
-    fn roundtrip(changes: &ChangeSet, evidence: &ResolverEvidence) -> SavedPlan {
+    fn roundtrip(
+        changes: &ChangeSet,
+        evidence: &ResolverEvidence,
+        compiled: &InputManifest,
+    ) -> SavedPlan {
         let seed = super::super::tests::plan();
-        let sealed = construct(changes, evidence).expect("complete inline bindings must seal");
+        let sealed =
+            construct(changes, evidence, compiled).expect("complete inline bindings must seal");
         let plan = SavedPlan::new(
             PlanOrigin::Database,
             seed.dialect,
@@ -1673,8 +1711,13 @@ mod inline_binding_floor {
         decoded
     }
 
-    fn require_each(changes: &ChangeSet, evidence: &ResolverEvidence, required: &[Surface]) {
-        let plan = roundtrip(changes, evidence);
+    fn require_each(
+        changes: &ChangeSet,
+        evidence: &ResolverEvidence,
+        compiled: &InputManifest,
+        required: &[Surface],
+    ) {
+        let plan = roundtrip(changes, evidence, compiled);
         for missing in required {
             let mut omitted = evidence.clone();
             let at = omitted
@@ -1688,12 +1731,15 @@ mod inline_binding_floor {
             assert_eq!(
                 omitted
                     .before
-                    .project(changes, &omitted.after, &omitted.transitions)
+                    .project(changes, compiled, &omitted.transitions)
                     .unwrap(),
                 evidence.after
             );
             assert!(
-                matches!(construct(changes, &omitted), Err(EvidenceError::Incomplete)),
+                matches!(
+                    construct(changes, &omitted, compiled),
+                    Err(EvidenceError::Incomplete)
+                ),
                 "constructor accepted missing inline resolution {missing:?}"
             );
             let mut unread = plan.clone();
@@ -1708,7 +1754,7 @@ mod inline_binding_floor {
         }
     }
 
-    fn added_column(column: Column) -> (ChangeSet, ResolverEvidence) {
+    fn added_column(column: Column) -> (ChangeSet, ResolverEvidence, InputManifest) {
         let table: TableName = "app.v".parse().unwrap();
         owner_coverage(
             Change::AddColumn {
@@ -1736,16 +1782,17 @@ mod inline_binding_floor {
             } else {
                 column.default = Some("7".into());
             }
-            let (changes, evidence) = added_column(column);
+            let (changes, evidence, compiled) = added_column(column);
             require_each(
                 &changes,
                 &evidence,
+                &compiled,
                 &[Surface::Default("app.v.h".parse().unwrap())],
             );
         }
     }
 
-    fn plain_table() -> (ChangeSet, ResolverEvidence) {
+    fn plain_table() -> (ChangeSet, ResolverEvidence, InputManifest) {
         let name: TableName = "app.v".parse().unwrap();
         let mut table = Table::default();
         table
@@ -1766,7 +1813,7 @@ mod inline_binding_floor {
     #[test]
     fn table_creation_requires_every_distinct_inline_binding_resolution() {
         let name: TableName = "app.v".parse().unwrap();
-        let (mut changes, mut evidence) = plain_table();
+        let (mut changes, mut evidence, compiled) = plain_table();
         let Change::CreateTable { table, .. } = &mut changes.changes[0].change else {
             panic!("create table fixture")
         };
@@ -1827,15 +1874,14 @@ mod inline_binding_floor {
                 name: "filtered".into(),
             },
         ];
-        let root = evidence
-            .after
+        let root = compiled
             .prerequisites()
             .iter()
             .find(|p| p.ownership == ObjectOwnership::Surface(Surface::Table(name.clone())))
             .unwrap()
             .object
             .clone();
-        let mut records = evidence.after.prerequisites().to_vec();
+        let mut records = compiled.prerequisites().to_vec();
         evidence.surfaces.clear();
         // Opaque model addresses carry explicit ownership. These records are
         // not PostgreSQL catalog facts or runtime qualification.
@@ -1877,7 +1923,7 @@ mod inline_binding_floor {
             }
         }
         records.sort_by(|a, b| a.object.cmp(&b.object));
-        let mut compiled = serde_json::to_value(&evidence.after).unwrap();
+        let mut compiled = serde_json::to_value(&compiled).unwrap();
         compiled["prerequisites"] = serde_json::to_value(records).unwrap();
         let compiled: InputManifest = serde_json::from_value(compiled).unwrap();
         evidence.after = evidence
@@ -1887,18 +1933,18 @@ mod inline_binding_floor {
         evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
         evidence.surfaces.sort_by(|a, b| a.surface.cmp(&b.surface));
         assert_eq!(evidence.surfaces.len(), 5);
-        require_each(&changes, &evidence, &required);
+        require_each(&changes, &evidence, &compiled, &required);
     }
 
     #[test]
     fn nonbinding_and_ordinary_plans_do_not_acquire_inline_resolution_requirements() {
-        let (changes, mut evidence) = plain_table();
+        let (changes, mut evidence, compiled) = plain_table();
         evidence.surfaces.clear();
-        roundtrip(&changes, &evidence);
+        roundtrip(&changes, &evidence, &compiled);
 
         let mut column = Column::new("integer".parse().unwrap());
         column.default = Some("7".into());
-        let (mut changes, mut evidence) = added_column(column);
+        let (mut changes, mut evidence, compiled) = added_column(column);
         let seed = super::super::tests::plan();
         let ordinary = SavedPlan::new(
             PlanOrigin::Database,
@@ -1930,7 +1976,7 @@ mod inline_binding_floor {
         };
         let owner = Surface::Column(table.column(name.as_str()));
         column.default = None;
-        let mut compiled = serde_json::to_value(&evidence.after).unwrap();
+        let mut compiled = serde_json::to_value(&compiled).unwrap();
         compiled["prerequisites"]
             .as_array_mut()
             .unwrap()
@@ -1948,7 +1994,7 @@ mod inline_binding_floor {
             .project(&changes, &compiled, &evidence.transitions)
             .unwrap();
         evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
-        roundtrip(&changes, &evidence);
+        roundtrip(&changes, &evidence, &compiled);
     }
 }
 
@@ -1956,7 +2002,7 @@ mod column_vector_parent {
     use super::*;
     use crate::{Column, Generated, IdsFile, PlanOrigin, SavedPlan};
 
-    fn fixtures() -> Vec<(ChangeSet, ResolverEvidence)> {
+    fn fixtures() -> Vec<(ChangeSet, ResolverEvidence, InputManifest)> {
         let table: TableName = "app.v".parse().unwrap();
         let mut fixtures = Vec::new();
         for kind in ["plain", "default", "generated"] {
@@ -1974,7 +2020,7 @@ mod column_vector_parent {
                 }
                 Surface::Default(table.column("n"))
             };
-            let (changes, mut evidence) = owner_coverage(
+            let (changes, mut evidence, compiled) = owner_coverage(
                 Change::AddColumn {
                     uid: "c_000000".parse().unwrap(),
                     table: table.clone(),
@@ -1988,7 +2034,7 @@ mod column_vector_parent {
             if kind == "plain" {
                 evidence.surfaces.clear();
             }
-            fixtures.push((changes, evidence));
+            fixtures.push((changes, evidence, compiled));
         }
         fixtures.push(owner_coverage(
             Change::DropColumn {
@@ -2006,31 +2052,49 @@ mod column_vector_parent {
     fn construct(
         changes: &ChangeSet,
         evidence: &ResolverEvidence,
+        compiled: &InputManifest,
     ) -> Result<ResolverEvidence, EvidenceError> {
         ResolverEvidence::new(
             changes,
             evidence.qualification.clone(),
             evidence.authorization.clone(),
             evidence.before.clone(),
-            &evidence.after,
+            compiled,
             evidence.surfaces.clone(),
             evidence.transitions.clone(),
             evidence.ordering.clone(),
         )
     }
 
-    fn refuse(changes: &ChangeSet, evidence: &ResolverEvidence, reason: &str) {
+    // A closing-side defect is refused while sealing, where the compiled
+    // records are at hand. The reader holds none of them, so it can refuse
+    // only what the opening manifest and the typed plan prove.
+    fn refuse_sealing(
+        changes: &ChangeSet,
+        evidence: &ResolverEvidence,
+        compiled: &InputManifest,
+        reason: &str,
+    ) {
         assert!(
             evidence
                 .before
-                .project(changes, &evidence.after, &evidence.transitions)
+                .project(changes, compiled, &evidence.transitions)
                 .is_err(),
             "projection accepted {reason}"
         );
         assert!(
-            construct(changes, evidence).is_err(),
+            construct(changes, evidence, compiled).is_err(),
             "constructor accepted {reason}"
         );
+    }
+
+    fn refuse(
+        changes: &ChangeSet,
+        evidence: &ResolverEvidence,
+        compiled: &InputManifest,
+        reason: &str,
+    ) {
+        refuse_sealing(changes, evidence, compiled, reason);
         let decoded: ResolverEvidence =
             serde_json::from_value(serde_json::to_value(evidence).unwrap()).unwrap();
         assert!(
@@ -2041,7 +2105,7 @@ mod column_vector_parent {
 
     #[test]
     fn column_vector_edits_require_independent_parent_and_column_inventories() {
-        for (changes, evidence) in fixtures() {
+        for (changes, evidence, compiled) in fixtures() {
             let seed = super::super::tests::plan();
             let plan = SavedPlan::new(
                 PlanOrigin::Database,
@@ -2051,7 +2115,7 @@ mod column_vector_parent {
                 changes.clone(),
                 IdsFile::default(),
             )
-            .with_resolution(construct(&changes, &evidence).unwrap())
+            .with_resolution(construct(&changes, &evidence, &compiled).unwrap())
             .unwrap();
             let decoded: SavedPlan =
                 serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
@@ -2073,8 +2137,25 @@ mod column_vector_parent {
             // mismatch nor a binding failure can explain these refusals.
             for missing in [parent, column] {
                 let mut omitted = evidence.clone();
-                omitted.transitions.remove(missing);
-                refuse(&changes, &omitted, "one independent inventory omitted");
+                let removed = omitted.transitions.remove(missing);
+                // A plain added column's inventory removes nothing and no
+                // surface observes it: only its compiled records, which
+                // the reader does not hold, prove it was omitted.
+                if removed.before.is_empty() && evidence.surfaces.is_empty() {
+                    refuse_sealing(
+                        &changes,
+                        &omitted,
+                        &compiled,
+                        "one independent inventory omitted",
+                    );
+                } else {
+                    refuse(
+                        &changes,
+                        &omitted,
+                        &compiled,
+                        "one independent inventory omitted",
+                    );
+                }
             }
             for before in [true, false] {
                 let mut omitted = evidence.clone();
@@ -2083,19 +2164,46 @@ mod column_vector_parent {
                 } else {
                     omitted.transitions[parent].after.clear();
                 }
-                refuse(&changes, &omitted, "one surviving parent endpoint omitted");
+                // The reader sees an omitted closing parent only through
+                // the placeholder a candidate membership keeps for it; a
+                // renamed column's parent is named by nothing.
+                let referenced = evidence
+                    .after
+                    .prerequisites()
+                    .iter()
+                    .any(|p| evidence.transitions[parent].after.contains(&p.object));
+                if before || referenced {
+                    refuse(
+                        &changes,
+                        &omitted,
+                        &compiled,
+                        "one surviving parent endpoint omitted",
+                    );
+                } else {
+                    refuse_sealing(
+                        &changes,
+                        &omitted,
+                        &compiled,
+                        "one surviving parent endpoint omitted",
+                    );
+                }
             }
             let mut duplicate = evidence.clone();
             duplicate
                 .transitions
                 .push(evidence.transitions[parent].clone());
-            refuse(&changes, &duplicate, "duplicate parent transition");
+            refuse(
+                &changes,
+                &duplicate,
+                &compiled,
+                "duplicate parent transition",
+            );
         }
     }
 
     #[test]
     fn a_column_vector_parent_cannot_authorize_unrelated_records() {
-        let (changes, evidence) = fixtures().remove(0);
+        let (changes, evidence, compiled) = fixtures().remove(0);
         let parent = evidence
             .transitions
             .iter()
@@ -2108,12 +2216,13 @@ mod column_vector_parent {
             ObjectOwnership::Unqualified,
         ] {
             let mut excessive = evidence.clone();
+            let mut compiled = compiled.clone();
             let object = ObjectIdentity {
                 class: "unrelated-fixture".into(),
                 name: vec!["untouched".into()],
                 signature: vec![],
             };
-            for manifest in [&mut excessive.before, &mut excessive.after] {
+            for manifest in [&mut excessive.before, &mut excessive.after, &mut compiled] {
                 let mut records = manifest.prerequisites().to_vec();
                 records.push(crate::resolver::Prerequisite {
                     object: object.clone(),
@@ -2133,6 +2242,7 @@ mod column_vector_parent {
             refuse(
                 &changes,
                 &excessive,
+                &compiled,
                 "parent escalation to unrelated authority",
             );
         }
@@ -2142,7 +2252,7 @@ mod column_vector_parent {
     fn a_missing_vector_parent_endpoint_needs_its_own_table_lifecycle_change() {
         let table: TableName = "app.v".parse().unwrap();
         for creating in [true, false] {
-            let (mut changes, mut evidence) = if creating {
+            let (mut changes, mut evidence, mut compiled) = if creating {
                 fixtures().remove(0)
             } else {
                 fixtures().remove(3)
@@ -2152,10 +2262,12 @@ mod column_vector_parent {
                 .iter()
                 .position(|t| matches!(t.surface, Surface::Table(_)))
                 .unwrap();
+            // The parent is absent at the opening snapshot, or compiles to
+            // nothing at the closing one.
             let manifest = if creating {
                 &mut evidence.before
             } else {
-                &mut evidence.after
+                &mut compiled
             };
             let object = evidence.transitions[parent]
                 .after
@@ -2180,11 +2292,21 @@ mod column_vector_parent {
             } else {
                 evidence.transitions[parent].after.clear();
             }
-            refuse(
-                &changes,
-                &evidence,
-                "absent parent without its lifecycle change",
-            );
+            if creating {
+                refuse(
+                    &changes,
+                    &evidence,
+                    &compiled,
+                    "absent parent without its lifecycle change",
+                );
+            } else {
+                refuse_sealing(
+                    &changes,
+                    &evidence,
+                    &compiled,
+                    "absent parent without its lifecycle change",
+                );
+            }
             let lifecycle = if creating {
                 Change::CreateTable {
                     uid: "t_000000".parse().unwrap(),
@@ -2203,7 +2325,7 @@ mod column_vector_parent {
                 changes.changes.push(PlannedChange::new(lifecycle));
             }
             evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
-            construct(&changes, &evidence)
+            construct(&changes, &evidence, &compiled)
                 .unwrap()
                 .validate(&changes)
                 .unwrap();
@@ -2213,7 +2335,7 @@ mod column_vector_parent {
     #[test]
     fn nonvector_edits_cannot_borrow_a_parent_transition() {
         let table: TableName = "app.v".parse().unwrap();
-        let (_, fixture) = fixtures().remove(3);
+        let (_, fixture, _) = fixtures().remove(3);
         let parent = fixture
             .transitions
             .iter()
@@ -2285,7 +2407,8 @@ mod column_vector_parent {
             ),
         ] {
             let mut evidence = fixture.clone();
-            evidence.after = evidence.before.clone();
+            // An in-place edit compiles to the same records it opens with.
+            let compiled = evidence.before.clone();
             evidence.surfaces[0].desired = evidence.surfaces[0].current.clone();
             evidence.transitions = vec![ObjectTransition {
                 surface,
@@ -2296,12 +2419,15 @@ mod column_vector_parent {
                 changes: vec![PlannedChange::new(change)],
             };
             evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
-            construct(&changes, &evidence)
-                .unwrap()
-                .validate(&changes)
-                .unwrap();
+            evidence = construct(&changes, &evidence, &compiled).unwrap();
+            evidence.validate(&changes).unwrap();
             evidence.transitions.push(parent.clone());
-            refuse(&changes, &evidence, "parent authority for a nonvector edit");
+            refuse(
+                &changes,
+                &evidence,
+                &compiled,
+                "parent authority for a nonvector edit",
+            );
         }
     }
 }

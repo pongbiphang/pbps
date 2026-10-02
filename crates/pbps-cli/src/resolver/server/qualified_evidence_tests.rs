@@ -1045,6 +1045,40 @@ fn assert_no_authorization_records(manifest: &pbps_model::resolver::InputManifes
     );
 }
 
+/// What the apply-time closing check (#616) compares: every record the plan
+/// does not change, in full; a record it installs only by its bindings, and
+/// only where the closing manifest keeps it; and candidate membership. A
+/// record the plan installs is otherwise not predicted (DEC-1274.1).
+fn assert_closing_holds(
+    closing: &pbps_model::resolver::InputManifest,
+    observed: &pbps_model::resolver::InputManifest,
+) {
+    for expected in closing.prerequisites() {
+        let actual = observed
+            .prerequisites()
+            .iter()
+            .find(|row| row.object == expected.object)
+            .unwrap_or_else(|| panic!("post-DDL catalog omitted {:?}", expected.object));
+        if !expected.is_managed_closing() {
+            assert_eq!(
+                expected.properties, actual.properties,
+                "post-DDL properties differ for {:?}",
+                expected.object
+            );
+        }
+        assert_eq!(
+            expected.bindings, actual.bindings,
+            "post-DDL bindings differ for {:?}",
+            expected.object
+        );
+    }
+    assert_eq!(
+        closing.membership(),
+        observed.membership(),
+        "post-DDL candidate membership"
+    );
+}
+
 /// PostgreSQL's typed AlterModule is expanded to DROP+CREATE, so a replaced
 /// view loses the target's relation and column grants. Those grants are not
 /// binding inputs: the projected closing facts still equal a real post-DDL
@@ -1179,18 +1213,18 @@ async fn a_rebuilt_view_with_old_target_grants_closes_on_the_actual_catalog() {
         signature: vec![view.clone()],
     };
     let view_owner = ObjectOwnership::Surface(Surface::Module(view_id.clone()));
-    for manifest in [result.evidence.before(), &closing] {
-        for object in [&view, &column] {
-            let record = manifest
-                .prerequisites()
-                .iter()
-                .find(|record| &record.object == object)
-                .expect("the rebuilt view and its column remain in the exact inventory");
-            assert_eq!(
-                record.ownership, view_owner,
-                "the managed view owns its user column at both transition endpoints"
-            );
-        }
+    for object in [&view, &column] {
+        let record = result
+            .evidence
+            .before()
+            .prerequisites()
+            .iter()
+            .find(|record| &record.object == object)
+            .expect("the rebuilt view and its column are in the opening inventory");
+        assert_eq!(
+            record.ownership, view_owner,
+            "the managed view owns its user column"
+        );
     }
     let encoded = serde_json::to_value(&result.evidence).unwrap();
     let transitions: Vec<pbps_model::resolver::ObjectTransition> =
@@ -1206,24 +1240,16 @@ async fn a_rebuilt_view_with_old_target_grants_closes_on_the_actual_catalog() {
             && transition.after.contains(&column),
         "the rebuilt view transition must replace both the relation and its user column"
     );
-    for object in [view, column] {
-        let expected = closing
+    // The rebuilt view is the plan's own: kept only as a placeholder, as a
+    // candidate member, and never with a predicted fingerprint.
+    assert!(
+        closing
             .prerequisites()
             .iter()
-            .find(|record| record.object == object)
-            .expect("projected closing evidence retains the target view and column");
-        let observed = actual
-            .prerequisites()
-            .iter()
-            .find(|record| record.object == expected.object)
-            .expect("the fresh post-DDL target capture contains the same catalog object");
-        assert_eq!(
-            expected.properties, observed.properties,
-            "the final projected {} properties must match the actual rebuild",
-            object.class
-        );
-        assert_eq!(expected.bindings, observed.bindings);
-    }
+            .filter(|record| record.object == view || record.object == column)
+            .all(|record| record.is_managed_closing())
+    );
+    assert_closing_holds(&closing, &actual);
     target.check().await.unwrap();
     setup(&[]).await;
 }
@@ -1326,33 +1352,17 @@ async fn empty_cross_kind_case(profile: Profile) {
         )
         .await
         .unwrap();
-    for class in [
-        "pg_class",
-        "pg_proc",
-        "pg_attrdef",
-        "pg_constraint",
-        "pg_index",
-    ] {
+    // Every binding surface the plan creates is kept by its bindings.
+    for class in ["pg_proc", "pg_attrdef", "pg_constraint", "pg_index"] {
         assert!(
             closing
                 .prerequisites()
                 .iter()
-                .any(|record| record.object.class == class),
-            "the projected closing manifest omits a #614 catalog class: {class}"
+                .any(|record| record.object.class == class && record.is_managed_closing()),
+            "the closing manifest omits a #614 binding class: {class}"
         );
     }
-    for expected in closing.prerequisites() {
-        let actual = observed
-            .prerequisites()
-            .iter()
-            .find(|row| row.object == expected.object)
-            .expect("every projected prerequisite exists after actual DDL");
-        assert_eq!(
-            expected.properties, actual.properties,
-            "the projected catalog properties must match actual new-object defaults"
-        );
-        assert_eq!(expected.bindings, actual.bindings);
-    }
+    assert_closing_holds(&closing, &observed);
     // The empty #614 phase proves ordered creation and the fresh closing
     // catalog. On PG16/18, after COMMIT the partial-index predicate recursively
     // invokes table-reading f() even for SELECT f() or an explicit INSERT.
@@ -1693,35 +1703,7 @@ async fn recorded_rename_case(profile: Profile, keep_public: bool, ordinary_tabl
         )
         .await
         .unwrap();
-    for expected in closing.prerequisites() {
-        let actual = observed
-            .prerequisites()
-            .iter()
-            .find(|row| row.object == expected.object)
-            .unwrap_or_else(|| {
-                let same_class: Vec<_> = observed
-                    .prerequisites()
-                    .iter()
-                    .filter(|row| row.object.class == expected.object.class)
-                    .map(|row| &row.object)
-                    .collect();
-                panic!(
-                    "the UID-projected object exists under its new catalog identity: \
-                     missing {:?}; observed same-class identities: {:?}",
-                    expected.object, same_class
-                );
-            });
-        assert_eq!(
-            expected.properties, actual.properties,
-            "projected closing properties differ for {:?}",
-            expected.object
-        );
-        assert_eq!(
-            expected.bindings, actual.bindings,
-            "projected closing bindings differ for {:?}",
-            expected.object
-        );
-    }
+    assert_closing_holds(&closing, &observed);
     assert_eq!(table_column_grants("u", "n").await, opening_acl);
     let mut peer = PeerVerifiedConn::connect(
         Driver::Postgres,
@@ -1892,20 +1874,7 @@ async fn rebuilt_routine_role_acl_case() {
         )
         .await
         .unwrap();
-    let object = closing
-        .prerequisites()
-        .iter()
-        .find(|record| {
-            record.object.class == "pg_proc" && record.object.name == [cases::SCHEMA, "a"]
-        })
-        .expect("the projected routine is present");
-    let actual = observed
-        .prerequisites()
-        .iter()
-        .find(|record| record.object == object.object)
-        .expect("the same routine exists after DDL");
-    assert_eq!(object.properties, actual.properties);
-    assert_eq!(object.bindings, actual.bindings);
+    assert_closing_holds(&closing, &observed);
     assert_no_authorization_records(&closing);
     target.check().await.unwrap();
     setup(&[]).await;
@@ -2122,20 +2091,7 @@ async fn newly_created_routines_under_target_default_privileges_close_on_the_act
         )
         .await
         .unwrap();
-    for name in ["f", "a"] {
-        let expected = closing
-            .prerequisites()
-            .iter()
-            .find(|row| row.object.class == "pg_proc" && row.object.name == [cases::SCHEMA, name])
-            .expect("the final projection includes the new routine");
-        let actual = observed
-            .prerequisites()
-            .iter()
-            .find(|row| row.object == expected.object)
-            .expect("the post-DDL target contains the same routine");
-        assert_eq!(expected.properties, actual.properties);
-        assert_eq!(expected.bindings, actual.bindings);
-    }
+    assert_closing_holds(&closing, &observed);
     target.check().await.unwrap();
     setup(&[]).await;
 }
@@ -3176,15 +3132,7 @@ async fn recorded_renames_and_reused_old_spellings_keep_distinct_owned_inventori
         )
         .await
         .unwrap();
-    for expected in closing.prerequisites() {
-        let actual = observed
-            .prerequisites()
-            .iter()
-            .find(|row| row.object == expected.object)
-            .expect("both renamed and newly created records exist after DDL");
-        assert_eq!(expected.properties, actual.properties);
-        assert_eq!(expected.bindings, actual.bindings);
-    }
+    assert_closing_holds(&closing, &observed);
     assert_eq!(table_column_grants("u", "n").await, opening_acl);
     let mut peer = PeerVerifiedConn::connect(
         Driver::Postgres,
@@ -3516,15 +3464,7 @@ async fn recorded_renames_with_type_and_nullability_edits_match_actual_child_cat
         )
         .await
         .unwrap();
-    for expected in closing.prerequisites() {
-        let actual = observed
-            .prerequisites()
-            .iter()
-            .find(|row| row.object == expected.object)
-            .unwrap_or_else(|| panic!("missing actual closing identity: {:?}", expected.object));
-        assert_eq!(expected.properties, actual.properties);
-        assert_eq!(expected.bindings, actual.bindings);
-    }
+    assert_closing_holds(&closing, &observed);
     let mut peer = PeerVerifiedConn::connect(
         Driver::Postgres,
         &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
@@ -3708,24 +3648,7 @@ async fn a_new_routine_created_by_an_ordinary_deployer_closes_on_the_actual_cata
         )
         .await
         .unwrap();
-    assert_eq!(
-        closing.prerequisites().len(),
-        observed.prerequisites().len(),
-        "the closing inventory has exactly the fresh target's members"
-    );
-    for (expected, actual) in closing.prerequisites().iter().zip(observed.prerequisites()) {
-        assert_eq!(expected.object, actual.object);
-        assert_eq!(
-            expected.properties, actual.properties,
-            "projected closing properties differ for {:?}",
-            expected.object
-        );
-        assert_eq!(
-            expected.bindings, actual.bindings,
-            "projected closing bindings differ for {:?}",
-            expected.object
-        );
-    }
+    assert_closing_holds(&closing, &observed);
     target.check().await.unwrap();
     let mut admin = PeerVerifiedConn::connect(
         Driver::Postgres,
@@ -3982,23 +3905,7 @@ async fn assert_review_closing_matches_target(
         )
         .await
         .unwrap();
-    for expected in closing.prerequisites() {
-        let actual = observed
-            .prerequisites()
-            .iter()
-            .find(|row| row.object == expected.object)
-            .unwrap_or_else(|| panic!("post-DDL catalog omitted {:?}", expected.object));
-        assert_eq!(
-            expected.properties, actual.properties,
-            "post-DDL properties differ for {:?}",
-            expected.object
-        );
-        assert_eq!(
-            expected.bindings, actual.bindings,
-            "post-DDL bindings differ for {:?}",
-            expected.object
-        );
-    }
+    assert_closing_holds(closing, &observed);
     observed
 }
 
@@ -5168,6 +5075,11 @@ async fn generation_producer_case(case: GenerationCase) {
                     .collect();
                 if opening && name == "h" {
                     assert!(records.is_empty());
+                } else if !opening {
+                    // The plan's own records are not predicted: at most an
+                    // identity-and-bindings placeholder, never a fingerprint.
+                    assert!(records.iter().all(|row| row.is_managed_closing()
+                        || evidence.before().prerequisites().contains(row)));
                 } else {
                     assert_eq!(
                         records.len(),
@@ -5185,7 +5097,9 @@ async fn generation_producer_case(case: GenerationCase) {
                 .iter()
                 .filter(|row| row.object == column)
                 .collect();
-            assert_eq!(columns.len(), usize::from(!opening || name != "h"));
+            if opening {
+                assert_eq!(columns.len(), usize::from(name != "h"));
+            }
             if let Some(record) = columns.first() {
                 assert_eq!(
                     record.ownership,
@@ -5194,144 +5108,7 @@ async fn generation_producer_case(case: GenerationCase) {
             }
         }
     }
-    let expected = evidence.after().prerequisites();
-    // A net count cannot distinguish missing identities from new arrivals.
-    // Diagnose only held snapshots so a mismatch cannot change the observation.
-    let expected_records: BTreeMap<_, _> = expected
-        .iter()
-        .map(|record| (record.object.clone(), record))
-        .collect();
-    let observed_records: BTreeMap<_, _> = observed
-        .prerequisites()
-        .iter()
-        .map(|record| (record.object.clone(), record))
-        .collect();
-    let missing: Vec<_> = expected_records
-        .keys()
-        .filter(|object| !observed_records.contains_key(*object))
-        .collect();
-    let unexpected: Vec<_> = observed_records
-        .keys()
-        .filter(|object| !expected_records.contains_key(*object))
-        .collect();
-    let common: Vec<_> = expected_records
-        .keys()
-        .filter(|object| observed_records.contains_key(*object))
-        .collect();
-    let properties_mismatches: Vec<_> = common
-        .iter()
-        .copied()
-        .filter(|object| {
-            expected_records[*object].properties != observed_records[*object].properties
-        })
-        .collect();
-    let bindings_mismatches: Vec<_> = common
-        .iter()
-        .copied()
-        .filter(|object| expected_records[*object].bindings != observed_records[*object].bindings)
-        .collect();
-    if !missing.is_empty()
-        || !unexpected.is_empty()
-        || !properties_mismatches.is_empty()
-        || !bindings_mismatches.is_empty()
-    {
-        let describe = |object: &pbps_model::resolver::ObjectIdentity| {
-            let opening = evidence
-                .before()
-                .prerequisites()
-                .iter()
-                .find(|record| &record.object == object);
-            serde_json::json!({
-                "object": object,
-                "expected_ownership": expected_records.get(object).map(|record| &record.ownership),
-                "observed_ownership": observed_records.get(object).map(|record| &record.ownership),
-                "opening_present": opening.is_some(),
-                "opening_ownership": opening.map(|record| &record.ownership),
-                "retained_root_present": {
-                    "opening": evidence.before().scope().retained.contains(object),
-                    "desired": evidence.after().scope().retained.contains(object),
-                    "fresh": observed.scope().retained.contains(object),
-                },
-                "candidate_membership_present": {
-                    "opening": evidence.before().membership().iter().any(|row| row.members.contains(object)),
-                    "desired": evidence.after().membership().iter().any(|row| row.members.contains(object)),
-                    "fresh": observed.membership().iter().any(|row| row.members.contains(object)),
-                },
-            })
-        };
-        let summarize = |identities: &[&pbps_model::resolver::ObjectIdentity]| {
-            serde_json::json!({
-                "count": identities.len(),
-                "truncated": identities.len() > 8,
-                "identities": identities.iter().copied().take(8).map(&describe).collect::<Vec<_>>(),
-            })
-        };
-        let generated_object = generation_objects(&table, "g")[1].clone();
-        let generated_bindings: Vec<_> = [
-            ("opening", evidence.before()),
-            ("desired", evidence.after()),
-            ("fresh", &observed),
-        ]
-        .into_iter()
-        .map(|(side, manifest)| {
-            let record = manifest
-                .prerequisites()
-                .iter()
-                .find(|row| row.object == generated_object);
-            let count = record.map_or(0, |row| row.bindings.len());
-            serde_json::json!({
-                "side": side,
-                "surface": Surface::Default(table.column("g")),
-                "object": generated_object,
-                "present": record.is_some(),
-                "ownership": record.map(|row| &row.ownership),
-                "count": count,
-                "truncated": count > 8,
-                "bindings": record.into_iter().flat_map(|row| &row.bindings).take(8).collect::<Vec<_>>(),
-            })
-        })
-        .collect();
-        eprintln!(
-            "PBPS1274_GENERATION_INVENTORY {}",
-            serde_json::json!({
-                "diagnostic": "pbps-generated-inventory",
-                "case": case_name,
-                "phase": "closing-inventory",
-                "expected_records": expected.len(),
-                "observed_records": observed.prerequisites().len(),
-                "expected_identities": expected_records.len(),
-                "observed_identities": observed_records.len(),
-                "common_identities": common.len(),
-                "expected_minus_observed": summarize(&missing),
-                "observed_minus_expected": summarize(&unexpected),
-                "properties_mismatches": summarize(&properties_mismatches),
-                "bindings_mismatches": summarize(&bindings_mismatches),
-                "generated_default_bindings": generated_bindings,
-            })
-        );
-    }
-    assert_eq!(
-        expected.len(),
-        observed.prerequisites().len(),
-        "complete fresh closing inventory"
-    );
-    for record in expected {
-        let actual = observed
-            .prerequisites()
-            .iter()
-            .find(|row| row.object == record.object)
-            .unwrap();
-        assert_eq!(
-            record.properties, actual.properties,
-            "closing properties: {:?}",
-            record.object
-        );
-        assert_eq!(
-            record.bindings, actual.bindings,
-            "closing bindings: {:?}",
-            record.object
-        );
-    }
+    assert_closing_holds(evidence.after(), &observed);
     assert_eq!(before.as_array().unwrap().len(), 3);
     assert_eq!(
         after.as_array().unwrap().len(),
