@@ -61,6 +61,7 @@ PRODUCER_TESTS = [
     "resolver::server::qualified_evidence_tests::rebuilt_routine_with_explicit_public_execution_matches_the_post_ddl_acl",
     "resolver::server::qualified_evidence_tests::rebuilt_routine_replays_declared_role_grants",
     "resolver::server::qualified_evidence_tests::an_unaffected_routine_keeps_its_grant_option_through_connected_evidence",
+    "resolver::server::qualified_evidence_tests::a_dropped_routine_seals_its_closing_signature_lookup",
     "resolver::server::qualified_evidence_tests::newly_created_routines_under_target_default_privileges_close_on_the_actual_catalog",
     "resolver::server::qualified_evidence_tests::a_new_routine_created_by_an_ordinary_deployer_closes_on_the_actual_catalog",
     "resolver::server::qualified_evidence_tests::an_explicit_extra_schema_changes_only_the_unqualified_lookup_in_the_final_plan",

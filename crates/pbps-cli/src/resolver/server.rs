@@ -2088,6 +2088,7 @@ impl ScratchRun {
                 wanted,
                 reconstruction,
                 &namespaces,
+                &dropped.iter().filter_map(|(_, s)| s.clone()).collect(),
             )
             .await
             .map(|(captured, scope)| (Some(captured), None, scope, None)),

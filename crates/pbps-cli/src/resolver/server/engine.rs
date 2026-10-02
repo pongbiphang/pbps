@@ -227,6 +227,7 @@ pub(crate) async fn capture_desired_for_plan(
     recorded: pbps_diff::Side<'_>,
     reconstruction: &Reconstruction,
     namespaces: &std::collections::BTreeSet<String>,
+    dropped_signatures: &std::collections::BTreeSet<pbps_pg::resolver::capture::DroppedSignature>,
 ) -> Result<(CompiledCapture, CaptureScope), String> {
     use pbps_pg::resolver::capture;
     match (connection.driver(), principals) {
@@ -253,10 +254,12 @@ pub(crate) async fn capture_desired_for_plan(
                 dropped: &dropped,
                 namespaces,
             };
+            // The same lookups the opening sealed: the closing manifest records
+            // what each dropped signature names after the plan, normally none.
             let captured = capture::capture_identifying_for_plan(
                 connection,
                 &scope,
-                &Default::default(),
+                dropped_signatures,
                 key,
                 roles,
                 &ownership,

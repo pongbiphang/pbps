@@ -1999,6 +1999,55 @@ async fn an_unaffected_routine_keeps_its_grant_option_through_connected_evidence
     setup(&[]).await;
 }
 
+/// A plan that drops a routine seals a signature lookup for it in the
+/// opening manifest. The compiled capture must answer the same lookup, or
+/// the closing projection cannot pair them and every deletion is refused.
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn a_dropped_routine_seals_its_closing_signature_lookup() {
+    setup(cases::REPLACEMENT_TARGET_SETUP).await;
+    let mut owned = Some(ObservedContainers::begin());
+    let mut target = target().await;
+    let mut run = open(Profile::Container, &mut target).await;
+    let (_, base) = cases::empty_cross_kind_pair();
+    let mut desired = base.clone();
+    let dropped: pbps_model::ModuleId = "pbps_evidence1274.a()".parse().unwrap();
+    assert!(desired.modules.remove(&dropped).is_some());
+    let inputs = Inputs::from_pair((base, desired));
+    let key = ProjectKey::new(true);
+    let result = run
+        .plan_resolved(
+            &mut target,
+            &inputs.binding(),
+            inputs.base(),
+            inputs.desired(),
+            &inputs.hints,
+            &[],
+            &key.project,
+            Some(ENVIRONMENT),
+        )
+        .await;
+    close(&mut run, &mut owned).await;
+    let result = result.expect("dropping a routine must seal its closing lookup");
+    result.evidence.validate(&result.changes).unwrap();
+    assert!(
+        result.changes.changes.iter().any(|step| {
+            matches!(&step.change, Change::DropModule { id, .. } if id == &dropped)
+        })
+    );
+    let opening = result.evidence.before().identifications();
+    let closing = result.evidence.after().identifications();
+    assert!(
+        !opening.is_empty(),
+        "the opening identifies the dropped routine"
+    );
+    assert_eq!(opening.len(), closing.len());
+    assert!(opening.iter().all(|lookup| lookup.resolved.is_some()));
+    assert!(closing.iter().all(|lookup| lookup.resolved.is_none()));
+    target.check().await.unwrap();
+    setup(&[]).await;
+}
+
 /// The new routines are created under the target's schema default privileges,
 /// which scratch does not have. Those ACLs are not binding inputs, so the
 /// closing evidence still equals the actual post-DDL catalog.
