@@ -6733,6 +6733,71 @@ fn an_expression_change_releases_its_old_input_in_the_same_plan() {
     );
 }
 
+/// #1391: a revision that drops `a` while another generated column's new
+/// expression starts reading it has no order. Once `h` reads `a`, the drop is
+/// refused, and before that its expression names a column that is gone. So
+/// `plan --db` refuses it by name, before anything runs (DEC-1391.1).
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_new_reader_of_a_dropped_input_is_refused_before_anything_runs() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "generated-new-reader");
+    let connection = own.connection().to_owned();
+    on_server(
+        &connection,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.t (id integer PRIMARY KEY, a integer, b integer, \
+                             g integer GENERATED ALWAYS AS (a * 2) STORED, \
+                             h integer GENERATED ALWAYS AS (b * 3) STORED)",
+    );
+    let d = Demo::new("generated-new-reader");
+    succeeds(d.run(&["pull", "--db", &connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    let path = d.dir.join("schema/app.t.yml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut column = String::new();
+    let edited: String = text
+        .lines()
+        .filter_map(|l| {
+            if !l.starts_with("   ") {
+                column = l.trim().trim_end_matches(':').to_owned();
+            }
+            match (column.as_str(), l.trim_start().starts_with("generated:")) {
+                ("a", _) => None,
+                ("g", true) => Some("    generated: {expression: 'b * 2', stored: true}".into()),
+                ("h", true) => Some("    generated: {expression: 'a + 1', stored: true}".into()),
+                _ => Some(l.to_owned()),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert!(
+        edited.contains("'a + 1'") && edited.contains("'b * 2'") && !edited.contains("\n  a:"),
+        "app.t is where this test expects it:\n{text}"
+    );
+    std::fs::write(&path, edited).unwrap();
+    succeeds(d.run(&["drop", "app.t.a", "--reason", "gone"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let o = d.run(&["plan", "--db", &connection]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("new expression of app.t.h"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT count(*)::int8 FROM information_schema.columns \
+              WHERE table_schema = 'app' AND table_name = 't' AND column_name = 'a'"
+        ),
+        1
+    );
+}
+
 /// A NOT NULL tightening runs after the plan's rows on its table, which may
 /// be what fills or removes its NULLs: an `ensure` update that gives the NULL
 /// a value, and an `exact` table that deletes the row holding it. Both apply,

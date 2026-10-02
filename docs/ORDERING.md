@@ -82,8 +82,9 @@ Then, in this order:
     (DECISIONS 311, DEC-942.1). `after_its_release` then moves a function's
     drop after what releases its generated columns (DEC-1168.1).
     `release_generated_inputs` then moves the retype or drop of a column a
-    generated column reads after the expression change that stops reading it
-    (DEC-1316.1).
+    generated column reads after the expression change that stops reading it,
+    and what needs the retype after it, by edges from the catalog and the
+    expressions' text (DEC-1316.1, DEC-1391.1).
   - `split_new_tables` splits the parts of a new table whose text names a
     function the plan creates out of it, ahead of that create.
   - `after_the_rebuilds` moves the expression-bearing additions whose text
@@ -286,6 +287,7 @@ one class and the dependents a class cannot see.
 | S: index key, `INCLUDE` column, filtered predicate or unique constraint over a column → tightening its nullability; filtered predicate → relaxing it | fixed | dropped in class 2, re-added in 13 (`nullability_dependents`), alone or inside a retype | ✓ DEC-1363.1 |
 | P: generated column → retype or drop of its input | fixed | refused by name, with a two-plan remedy, unless the plan drops the generated column or changes its expression to one that does not name the input | ✓ DEC-1168.1 |
 | P: expression change releasing an input → that input's retype or drop | engine, over-approximated | `release_generated_inputs` moves the retype or drop right after the release. The old reads are `pg_depend`'s; a new text naming the input keeps it refused (`may_read`) | ✓ DEC-1316.1 |
+| P: retype → another generated column's expression change that starts reading it | engine, over-approximated | an edge in `release_generated_inputs`; with a drop instead, refused by name | ✓ DEC-1391.1 |
 | Old default removed → retype → new default set | fixed | dependency ranks −2, −1, 0 inside class 9. S: the old default blocks the retype (5074). Both: a default written for the new type is invalid under the old one | ✓ (`a_default_written_for_the_new_type_is_set_after_the_type_is`) |
 | `Revoke` on an object the plan drops | fixed | not emitted | ✓ |
 
