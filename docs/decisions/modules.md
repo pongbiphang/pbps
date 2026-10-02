@@ -1509,7 +1509,9 @@ a created function was refused by the engine, and the apply rolled back
 reads a module (DECISIONS 315): the function's bare name as a token outside
 literals and comments, by the PostgreSQL lexer (`pbps_pg::generated::may_name`,
 the scan of DEC-1316.1). A string literal's contents count too, read by the
-same scan, so a quoted name in one is one name, delimiters and all. A comment
+same scan, so a quoted name in one is one name, delimiters and all, except
+that a reserved word bare is a name there: measured on 18.6,
+`'select(integer)'::regprocedure` resolves the function `select`. A comment
 is no literal, nor is a Unicode identifier's `UESCAPE` character
 (`Lexicon::string_literals`, `pbps_pg::generated::may_call`).
 Measured on 18.6, a literal an OID-alias type

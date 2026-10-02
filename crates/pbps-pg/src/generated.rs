@@ -105,7 +105,8 @@ pub fn may_name(text: &str, name: &str) -> bool {
 /// to the engine, which refuses it before the function exists and records a
 /// dependency on it after. The literal may also be read so without a cast, as
 /// a default of such a column or compared with one, so every literal counts.
-/// Its contents are read as code, so a quoted name in it is one name; a
+/// Its contents are read as code, so a quoted name in it is one name, and as
+/// the OID-alias input reads them, so a reserved word bare is a name too; a
 /// comment is no literal (DEC-1364.1).
 #[must_use]
 pub fn may_call(expression: &str, name: &str) -> bool {
@@ -113,7 +114,7 @@ pub fn may_call(expression: &str, name: &str) -> bool {
         || crate::LEXICON
             .string_literals(expression)
             .iter()
-            .any(|contents| may_name(contents, name))
+            .any(|contents| crate::impact::mentions_in_literal(contents, name))
 }
 
 /// Whether a definition may take a table's columns without naming them: a
@@ -151,6 +152,10 @@ mod tests {
             "my func"
         ));
         assert!(!may_call("'app.\"my func\"(integer)'::regprocedure", "my"));
+        // A reserved word bare in a literal is a name to the OID-alias input,
+        // and in code it is not.
+        assert!(may_call("'select(integer)'::regprocedure", "select"));
+        assert!(!may_call("a > (SELECT 0)", "select"));
         // Negative: a longer name, a comment, and no name at all.
         assert!(!may_call("'app.ff(integer)'::regprocedure", "f"));
         assert!(!may_call("0 /* f */", "f"));

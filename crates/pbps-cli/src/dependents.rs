@@ -2118,6 +2118,14 @@ mod tests {
         ]);
         assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
         assert_eq!(names(&cs)[1], "add check ck_quoted", "{:?}", names(&cs));
+
+        // A reserved word is a name, bare, to the OID-alias input.
+        let mut cs = plan(vec![
+            check_of("ck_reserved", "'select(integer)'::regprocedure IS NOT NULL"),
+            routine("public.select(integer)", "SELECT 1"),
+        ]);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
+        assert_eq!(names(&cs)[1], "add check ck_reserved", "{:?}", names(&cs));
     }
 
     /// A function's name in a comment, or as a Unicode identifier's escape
