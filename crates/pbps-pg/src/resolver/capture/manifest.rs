@@ -725,6 +725,220 @@ impl CompiledCapture {
                 return Err(ManifestError::Invalid);
             }
         }
+        let retained = retained
+            .into_iter()
+            .map(|(object, name)| (object, "conname", name))
+            .collect();
+        self.relocate(&names, retained)
+    }
+
+    /// PostgreSQL names an unnamed primary key, its index, an identity
+    /// sequence and a PG18 NOT NULL constraint after the table and column when
+    /// it creates them, and a later rename keeps those names (measured on
+    /// PG16/18). Scratch creates them under the final names. For a table the
+    /// plan keeps, and a child the plan does not recreate, the target's name
+    /// is the closing name, whether the rename is in this plan or an earlier
+    /// deployment. Call before the transitions are derived.
+    pub fn retain_auto_named_children(
+        &mut self,
+        opening: &CapturedInputs,
+        changes: &pbps_model::ChangeSet,
+        base_ids: &pbps_model::IdsFile,
+        desired_ids: &pbps_model::IdsFile,
+        desired: &pbps_model::Schema,
+    ) -> Result<(), pbps_model::resolver::ManifestError> {
+        use pbps_model::Change;
+        use pbps_model::resolver::ManifestError;
+        if opening.major != self.captured.major {
+            return Err(ManifestError::Incomplete);
+        }
+        let mut names = BTreeMap::new();
+        let mut retained = Vec::new();
+        let mut map = |from: ObjectIdentity, to: ObjectIdentity, field: &'static str| {
+            if from != to {
+                let name = to.name.last().cloned().ok_or(ManifestError::Invalid)?;
+                retained.push((from.clone(), field, name));
+                if names.insert(from, to).is_some() {
+                    return Err(ManifestError::Invalid);
+                }
+            }
+            Ok(())
+        };
+        let reference = |capture: &CapturedInputs, object: &ObjectIdentity, field: &str| {
+            capture
+                .inputs
+                .get(object)
+                .and_then(|input| input.properties.get(field))
+                .and_then(|value| serde_json::from_value::<ObjectIdentity>(value.clone()).ok())
+        };
+        // The one primary key, and each column's owned sequence, of a relation.
+        let primary = |capture: &CapturedInputs, relation: &ObjectIdentity| {
+            let mut keys = capture.inputs.iter().filter(|(id, input)| {
+                id.class == "pg_constraint"
+                    && id.signature.get(1) == Some(relation)
+                    && input.properties.get("contype").and_then(Value::as_str) == Some("p")
+            });
+            match (keys.next(), keys.next()) {
+                (Some((key, _)), None) => Ok(Some(key.clone())),
+                (None, _) => Ok(None),
+                (Some(_), Some(_)) => Err(ManifestError::Invalid),
+            }
+        };
+        let sequence = |capture: &CapturedInputs, column: &ObjectIdentity| {
+            let mut owned = capture
+                .inputs
+                .keys()
+                .filter_map(|id| match id.signature.as_slice() {
+                    [made, maker]
+                        if id.class == "pg_depend"
+                            && id.name == ["i"]
+                            && maker == column
+                            && capture
+                                .inputs
+                                .get(made)
+                                .and_then(|input| input.properties.get("relkind"))
+                                .and_then(Value::as_str)
+                                == Some("S") =>
+                    {
+                        Some(made.clone())
+                    }
+                    _ => None,
+                });
+            match (owned.next(), owned.next()) {
+                (Some(found), None) => Ok(Some(found)),
+                (None, _) => Ok(None),
+                (Some(_), Some(_)) => Err(ManifestError::Invalid),
+            }
+        };
+        let column_identity = |column: &pbps_model::ColumnRef| ObjectIdentity {
+            class: "column".into(),
+            name: vec![column.name.clone()],
+            signature: vec![relation_identity(&column.table)],
+        };
+        for (uid, final_table) in &desired_ids.tables {
+            let Some(prior) = base_ids.tables.get(uid) else {
+                continue;
+            };
+            let mut spellings = BTreeSet::from([prior.clone(), final_table.clone()]);
+            let mut recreated = false;
+            for step in &changes.changes {
+                if let Change::CreateTable { uid: changed, .. }
+                | Change::DropTable { uid: changed, .. } = &step.change
+                    && changed == uid
+                {
+                    recreated = true;
+                }
+                if let Change::RenameTable {
+                    uid: changed,
+                    from,
+                    to,
+                    ..
+                } = &step.change
+                    && changed == uid
+                {
+                    spellings.insert(from.clone());
+                    spellings.insert(to.clone());
+                }
+            }
+            let Some(table) = desired.tables.get(final_table) else {
+                return Err(ManifestError::Invalid);
+            };
+            if recreated {
+                continue;
+            }
+            let opening_relation = relation_identity(prior);
+            let final_relation = relation_identity(final_table);
+            let key_changed = changes.changes.iter().any(|step| {
+                matches!(&step.change,
+                    Change::SetPrimaryKey { table, .. } if spellings.contains(table))
+            });
+            if !key_changed
+                && table
+                    .primary_key
+                    .as_ref()
+                    .is_some_and(|key| key.name.is_none())
+                && let (Some(old_key), Some(new_key)) = (
+                    primary(opening, &opening_relation)?,
+                    primary(&self.captured, &final_relation)?,
+                )
+            {
+                let mut kept = new_key.clone();
+                kept.name.clone_from(&old_key.name);
+                map(new_key.clone(), kept, "conname")?;
+                if let (Some(old_index), Some(new_index)) = (
+                    reference(opening, &old_key, "conindid"),
+                    reference(&self.captured, &new_key, "conindid"),
+                ) {
+                    let mut kept = new_index.clone();
+                    *kept.name.last_mut().ok_or(ManifestError::Invalid)? = old_index
+                        .name
+                        .last()
+                        .cloned()
+                        .ok_or(ManifestError::Invalid)?;
+                    map(new_index, kept, "relname")?;
+                }
+            }
+            for (column_uid, final_column) in &desired_ids.columns {
+                if &final_column.table != final_table {
+                    continue;
+                }
+                let Some(old_column) = base_ids.columns.get(column_uid) else {
+                    continue;
+                };
+                let identity_kept = table
+                    .columns
+                    .get(&final_column.name)
+                    .is_some_and(|column| column.identity.is_some());
+                let column_rewritten = changes.changes.iter().any(|step| {
+                    matches!(&step.change,
+                        Change::AlterColumnType { uid: changed, .. }
+                        | Change::AlterColumnNullability { uid: changed, .. }
+                        | Change::DropColumn { uid: changed, .. }
+                        | Change::AddColumn { uid: changed, .. }
+                            if changed == column_uid)
+                });
+                if identity_kept
+                    && !column_rewritten
+                    && let (Some(old_sequence), Some(new_sequence)) = (
+                        sequence(opening, &column_identity(old_column))?,
+                        sequence(&self.captured, &column_identity(final_column))?,
+                    )
+                {
+                    let mut kept = new_sequence.clone();
+                    *kept.name.last_mut().ok_or(ManifestError::Invalid)? = old_sequence
+                        .name
+                        .last()
+                        .cloned()
+                        .ok_or(ManifestError::Invalid)?;
+                    map(new_sequence, kept, "relname")?;
+                }
+                // A renamed column's NOT NULL child is the rename path's
+                // (retain_renamed_not_null); here only a column whose
+                // address is unchanged but whose child name is historical.
+                if old_column == final_column
+                    && !column_rewritten
+                    && let (Some(old_child), Some(new_child)) = (
+                        not_null_child(opening, &column_identity(old_column))?,
+                        not_null_child(&self.captured, &column_identity(final_column))?,
+                    )
+                {
+                    let mut kept = new_child.clone();
+                    kept.name.clone_from(&old_child.name);
+                    map(new_child, kept, "conname")?;
+                }
+            }
+        }
+        self.relocate(&names, retained)
+    }
+
+    /// Re-address scratch records under the names the target keeps, with the
+    /// given name properties, everywhere a record or reference can appear.
+    fn relocate(
+        &mut self,
+        names: &BTreeMap<ObjectIdentity, ObjectIdentity>,
+        retained: Vec<(ObjectIdentity, &'static str, String)>,
+    ) -> Result<(), pbps_model::resolver::ManifestError> {
+        use pbps_model::resolver::ManifestError;
         if names.is_empty() {
             return Ok(());
         }
@@ -736,26 +950,24 @@ impl CompiledCapture {
         {
             return Err(ManifestError::Invalid);
         }
-        for (object, name) in retained {
+        for (object, field, name) in retained {
             let input = self
                 .captured
                 .inputs
                 .get_mut(&object)
                 .ok_or(ManifestError::Incomplete)?;
-            input
-                .properties
-                .insert("conname".into(), Value::String(name));
+            input.properties.insert(field.into(), Value::String(name));
         }
         let mut inputs = BTreeMap::new();
         for (object, mut input) in std::mem::take(&mut self.captured.inputs) {
             for value in input.properties.values_mut() {
-                *value = relocated_value(value, &names)?;
+                *value = relocated_value(value, names)?;
             }
             for binding in &mut input.bindings {
-                binding.target = relocated_identity(&binding.target, &names);
+                binding.target = relocated_identity(&binding.target, names);
             }
             if inputs
-                .insert(relocated_identity(&object, &names), input)
+                .insert(relocated_identity(&object, names), input)
                 .is_some()
             {
                 return Err(ManifestError::Invalid);
@@ -765,7 +977,7 @@ impl CompiledCapture {
         let mut ownership = BTreeMap::new();
         for (object, owner) in std::mem::take(&mut self.ownership) {
             if ownership
-                .insert(relocated_identity(&object, &names), owner)
+                .insert(relocated_identity(&object, names), owner)
                 .is_some()
             {
                 return Err(ManifestError::Invalid);
@@ -775,7 +987,7 @@ impl CompiledCapture {
         let mut numbers = BTreeMap::new();
         for (object, number) in std::mem::take(&mut self.captured.attribute_numbers) {
             if numbers
-                .insert(relocated_identity(&object, &names), number)
+                .insert(relocated_identity(&object, names), number)
                 .is_some()
             {
                 return Err(ManifestError::Invalid);
@@ -783,12 +995,12 @@ impl CompiledCapture {
         }
         self.captured.attribute_numbers = numbers;
         for members in self.captured.candidates.values_mut() {
-            *members = relocated_set(members, &names)?;
+            *members = relocated_set(members, names)?;
         }
-        self.captured.scope.retained = relocated_set(&self.captured.scope.retained, &names)?;
-        self.captured.limitations = relocated_set(&self.captured.limitations, &names)?;
+        self.captured.scope.retained = relocated_set(&self.captured.scope.retained, names)?;
+        self.captured.limitations = relocated_set(&self.captured.limitations, names)?;
         for object in self.captured.dropped.values_mut().flatten() {
-            *object = relocated_identity(object, &names);
+            *object = relocated_identity(object, names);
         }
         Ok(())
     }
