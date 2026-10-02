@@ -2473,9 +2473,16 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 fn a_computed_column_and_the_function_it_calls_drop_together() {
     let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
     let own = OwnDatabase::new(&server, "computed1174_fn");
+    // `plus_one` is schema-bound to `base_one`, which therefore cannot be
+    // dropped while it stands: the two leave in that order, after the
+    // computed columns.
     on_server(
         own.connection(),
-        "CREATE FUNCTION dbo.plus_one (@x int) RETURNS int AS BEGIN RETURN @x + 1 END;",
+        "CREATE FUNCTION dbo.base_one (@x int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN @x END;",
+    );
+    on_server(
+        own.connection(),
+        "CREATE FUNCTION dbo.plus_one (@x int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN dbo.base_one(@x) + 1 END;",
     );
     on_server(
         own.connection(),
@@ -2501,15 +2508,15 @@ fn a_computed_column_and_the_function_it_calls_drop_together() {
     for entry in walk(&d.dir.join("schema")) {
         let text = std::fs::read_to_string(&entry).unwrap();
         seen.push(entry.display().to_string());
-        if text.contains("plus_one") && !text.contains("table: ") {
+        if (text.contains("plus_one") || text.contains("base_one")) && !text.contains("table: ") {
             std::fs::remove_file(&entry).unwrap();
             removed.push(entry);
         }
     }
     assert_eq!(
         removed.len(),
-        1,
-        "the function's declaration among {seen:?}"
+        2,
+        "the functions' declarations among {seen:?}"
     );
     std::fs::remove_file(d.dir.join("schema/dbo.u.yml")).unwrap();
     ok(&d.run(&["drop-table", "dbo.u", "--reason", "goes with its function"]));
@@ -2534,6 +2541,10 @@ fn a_computed_column_and_the_function_it_calls_drop_together() {
     };
     assert!(at("DROP COLUMN [called]") < at("DROP FUNCTION"), "{script}");
     assert!(at("DROP TABLE [dbo].[u]") < at("DROP FUNCTION"), "{script}");
+    assert!(
+        at("DROP FUNCTION [dbo].[plus_one]") < at("DROP FUNCTION [dbo].[base_one]"),
+        "{script}"
+    );
     ok(&d.run(&[
         "apply",
         "--db",

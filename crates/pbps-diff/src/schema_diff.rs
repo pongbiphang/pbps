@@ -856,6 +856,34 @@ fn diff_partial_rebuilding(
             }
         }
     }
+    // And what a moved module needs, with it: a module this plan drops that
+    // the moved one's definition names (a schema-bound function over
+    // another) cannot go first, in class 0, while the moved one still stands.
+    // The chain moves into the same slot, where the drop rank keeps the
+    // dependent ahead of what it depends on (#1174 review).
+    let mut pending: Vec<ModuleId> = released_module_at.keys().cloned().collect();
+    while let Some(moved) = pending.pop() {
+        let (Some(at), Some(module)) = (
+            released_module_at.get(&moved).copied(),
+            base.schema.modules.get(&moved),
+        ) else {
+            continue;
+        };
+        for p in &planned {
+            if let Change::DropModule { id, .. } = &p.change
+                && *id != moved
+                && pbps_model::module::references_with(
+                    &module.definition,
+                    &id.object_name(),
+                    &lexis,
+                )
+                && released_module_at.get(id).is_none_or(|was| *was < at)
+            {
+                released_module_at.insert(id.clone(), at);
+                pending.push(id.clone());
+            }
+        }
+    }
     let sort_class = |c: &Change| -> (u8, usize) {
         if let Change::DropModule { id, .. } = c
             && let Some(at) = released_module_at.get(id)
@@ -3668,6 +3696,22 @@ mod tests {
                 .unwrap_or_else(|| panic!("{kind}: {k:?}"))
         };
         assert!(at("DropTable") < at("DropModule"), "{k:?}");
+        // A module the moved one depends on moves with it, behind it: the
+        // column, then `f`, then the `g` that `f` names (#1174 review).
+        let chain = with_modules(
+            shaped(Column::new(ty("int")), "dbo.f(a2)"),
+            &[("dbo.f", "SELECT dbo.g(1)"), ("dbo.g", "SELECT 1")],
+        );
+        let order: Vec<String> = run(&chain, &neither, &[])
+            .changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::DropComputedColumn { name, .. } => Some(name.clone()),
+                Change::DropModule { id, .. } => Some(id.object_name().name),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, ["c", "f", "g"]);
         // Negative: an altered module it does not name.
         let plain = shaped(Column::new(ty("int")), "a2 * 2");
         let errors = errors_of(

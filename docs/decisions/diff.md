@@ -1636,7 +1636,9 @@ both act as a part does, an index's place in the drift check included:
   removes that computed column, moves from class 0 to right after the last
   removal. That is (2, 5) after the column's own drop, and (6, 2) after its
   table's drop, which takes the column with it. Dropping the function while
-  the column stands is 3729, and module drops otherwise run first.
+  the column stands is 3729, and module drops otherwise run first. What the
+  moved module names among the plan's other module drops moves with it, such
+  as a function a schema-bound one calls, and the drop rank keeps it behind.
 
 The drop is `destructive`, as an index drop is: the values are derived, but
 the object is gone. The add carries no risk. A persisted add is unchecked in
@@ -1663,7 +1665,11 @@ code only and ignoring case: under a case-insensitive collation `A2` reads
 `a2`, and the engine stores `[a2]`. It looks for a delimited name's escaped
 spelling too: `a]b` is stored as `[a]]b]`. Its case fold can only make more
 names equal. `İ` folds to `i` without the combining dot, and `ı` to `i`,
-because a Turkish collation binds `[i]` to `İ`. A key over a computed column is
+because a Turkish collation binds `[i]` to `İ`. Accent-, width- and
+kana-insensitive equivalences are a collation's, which no textual fold
+closes. Their structural answer is the catalog's own edges on a connected
+plan (#1426). Until then the engine refuses such a plan inside its
+transaction. A key over a computed column is
 refused by validation (#1419).
 
 **Pull.** `sys.computed_columns` gives the definition, unwrapped as a check's
