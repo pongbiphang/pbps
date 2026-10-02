@@ -797,6 +797,10 @@ What stays as it was:
   than being left out, since dropping a nearer competitor would make a farther
   role look nearest.
 - A membership granted `WITH INHERIT FALSE` is no path at all.
+- The walk keeps one row per role and depth, so a graph of repeated diamonds
+  costs roles times depth rather than one row per path. It has no fixed depth
+  cap: it is bounded by the number of roles, which no acyclic membership path
+  can exceed.
 
 The live regression is `the_nearest_inherited_grantor_decides_an_adopted_revoke`.
 It asks doctor and the catalog read, then checks each case with an actual

@@ -1512,6 +1512,11 @@ fn owners_query() -> String {
 /// since leaving out a nearer competitor would let a farther role look
 /// nearest (DEC-565.1).
 ///
+/// The walk keeps one row per role and depth (`UNION`), so a graph of
+/// repeated diamonds costs roles × depth rows, not one row per path. Its bound
+/// is the number of roles: memberships cannot form a cycle, so no real path
+/// is longer, and none is cut short (review of #1422).
+///
 /// One original grantor per grantee, target **and privilege** as well: a
 /// `REVOKE` removes only the entries its selected grantor put there, so
 /// measured on 18.6 `r1=ar/own1` beside `r1=r/dep1` keeps its `SELECT` when
@@ -1534,7 +1539,7 @@ pub(crate) fn revocable_by_current_role(owner: &str, acl: &str) -> String {
                    AND own.privilege_type = a.privilege_type) THEN me.oid
              ELSE (WITH RECURSIVE reach(oid, depth) AS (
                  SELECT me.oid, 0
-                 UNION ALL
+                 UNION
                  SELECT e.roleid, r.depth + 1 FROM reach r
                    JOIN (SELECT m.member, m.roleid FROM pg_catalog.pg_auth_members m
                           WHERE m.inherit_option
@@ -1543,7 +1548,7 @@ pub(crate) fn revocable_by_current_role(owner: &str, acl: &str) -> String {
                            FROM pg_catalog.pg_database d
                           WHERE d.datname = pg_catalog.current_database()) e
                      ON e.member = r.oid
-                  WHERE r.depth < 64)
+                  WHERE r.depth < (SELECT count(*) FROM pg_catalog.pg_roles))
                SELECT min(n.oid::bigint)::oid FROM (
                  SELECT c.oid, c.depth, min(c.depth) OVER () AS nearest,
                         bool_or(c.depth IS NULL) OVER () AS unknown

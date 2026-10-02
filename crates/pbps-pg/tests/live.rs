@@ -28461,6 +28461,117 @@ async fn the_nearest_inherited_grantor_decides_an_adopted_revoke() {
     assert!(unrevocable_on("tied"), "{:?}", pulled.unrevocable);
 }
 
+/// The nearest-grantor walk visits each role once per depth, and has no
+/// depth cutoff of its own (review of #1422). The owner is the only candidate
+/// in both shapes, so its entry is revocable and the `REVOKE` removes it:
+///
+/// - `deep`: the owner 70 inheritable memberships away, past any fixed cap.
+/// - `diamond`: 24 levels of two roles, each inheriting both of the next.
+///   That is 2^24 paths, which a walk listing paths cannot finish in time.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn a_deep_or_diamond_membership_graph_still_finds_the_nearest_grantor() {
+    let mut db = TestDb::create("graph565").await;
+    let (deployer, mut theirs) = grant_deployer(&mut db, "graph565_d").await;
+    let recipient = least_privilege_role(&mut db, "graph565_r").await;
+    let pid = std::process::id();
+    let mut made: Vec<String> = Vec::new();
+    let mut sql = String::new();
+    let mut role = |name: String, sql: &mut String| {
+        sql.push_str(&format!("CREATE ROLE {name} NOLOGIN; "));
+        made.push(name.clone());
+        name
+    };
+    // The chain: deployer -> c1 -> ... -> c70 -> owner.
+    let deep_owner = role(format!("pbps_g565_deep_o_{pid}"), &mut sql);
+    let mut above = deployer.clone();
+    for level in 1..=70 {
+        let next = role(format!("pbps_g565_c{level}_{pid}"), &mut sql);
+        sql.push_str(&format!("GRANT {next} TO {above}; "));
+        above = next;
+    }
+    sql.push_str(&format!("GRANT {deep_owner} TO {above}; "));
+    // The diamond: deployer -> {a1, b1} -> ... -> {a24, b24} -> owner.
+    let diamond_owner = role(format!("pbps_g565_dia_o_{pid}"), &mut sql);
+    let mut level_above = vec![deployer.clone()];
+    for level in 1..=24 {
+        let pair = vec![
+            role(format!("pbps_g565_a{level}_{pid}"), &mut sql),
+            role(format!("pbps_g565_b{level}_{pid}"), &mut sql),
+        ];
+        for upper in &level_above {
+            for lower in &pair {
+                sql.push_str(&format!("GRANT {lower} TO {upper}; "));
+            }
+        }
+        level_above = pair;
+    }
+    for upper in &level_above {
+        sql.push_str(&format!("GRANT {diamond_owner} TO {upper}; "));
+    }
+    for (table, owner) in [("deep", &deep_owner), ("diamond", &diamond_owner)] {
+        sql.push_str(&format!(
+            "CREATE TABLE public.{table}(id integer); \
+             ALTER TABLE public.{table} OWNER TO {owner}; \
+             SET ROLE {owner}; GRANT SELECT ON public.{table} TO {recipient}; RESET ROLE; "
+        ));
+    }
+    db.conn.execute(&sql).await.unwrap();
+    let grants = pbps_db::doctor::GrantTargets {
+        roles: vec![recipient.clone()],
+        managed_tables: ["deep", "diamond"]
+            .iter()
+            .map(|t| format!("public.{t}").parse().unwrap())
+            .collect(),
+        ..Default::default()
+    };
+    let in_time = std::time::Duration::from_secs(60);
+    let gaps = doctor::missing(
+        &tokio::time::timeout(in_time, grant_diagnosis(&mut theirs, &grants))
+            .await
+            .expect("doctor answers within a minute on a diamond graph"),
+    );
+    let pulled = tokio::time::timeout(in_time, pbps_pg::catalog::introspect(&mut theirs))
+        .await
+        .expect("the catalog read answers within a minute on a diamond graph")
+        .unwrap();
+    let mut removed = Vec::new();
+    for table in ["deep", "diamond"] {
+        theirs
+            .execute(&format!("REVOKE SELECT ON public.{table} FROM {recipient}"))
+            .await
+            .unwrap();
+        removed.push(
+            !truth(
+                &mut db.conn,
+                &format!(
+                    "SELECT EXISTS (SELECT FROM pg_class c CROSS JOIN LATERAL aclexplode(c.relacl) a
+                     WHERE c.oid = 'public.{table}'::regclass AND a.grantee = '{recipient}'::regrole)"
+                ),
+            )
+            .await,
+        );
+    }
+    db.conn
+        .execute("DROP TABLE public.deep, public.diamond")
+        .await
+        .unwrap();
+    for name in made.iter().rev() {
+        db.conn.execute(&format!("DROP ROLE {name}")).await.unwrap();
+    }
+    for role in [&recipient, &deployer] {
+        cleanup_role(&mut db, role).await;
+    }
+    db.drop().await;
+    assert!(gaps.is_empty(), "{gaps:?}");
+    assert!(
+        !pulled.unrevocable.iter().any(|u| u.role == recipient),
+        "{:?}",
+        pulled.unrevocable
+    );
+    assert_eq!(removed, [true, true], "each owner's entry is removed");
+}
+
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 async fn doctor_routine_grants_use_canonical_types_and_restore_the_search_path() {
