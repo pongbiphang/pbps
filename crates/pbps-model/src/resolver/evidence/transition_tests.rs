@@ -1532,29 +1532,6 @@ fn table_constraint_mutations_require_complete_owner_inventories() {
 }
 
 #[test]
-fn authorization_mutations_require_complete_target_inventories() {
-    let table: TableName = "app.v".parse().unwrap();
-    for change in [
-        Change::Grant {
-            role: "reader".into(),
-            target: crate::GrantTarget::Object(table.clone()),
-            permissions: BTreeSet::from([crate::Permission::Select]),
-        },
-        Change::Revoke {
-            role: "reader".into(),
-            target: crate::GrantTarget::Object(table.clone()),
-            permissions: BTreeSet::from([crate::Permission::Select]),
-        },
-    ] {
-        mutation_inventory(
-            change,
-            Surface::Table(table.clone()),
-            Surface::Table(table.clone()),
-        );
-    }
-}
-
-#[test]
 fn module_mutations_require_complete_owned_inventories() {
     let plan = super::tests::plan();
     let Change::CreateModule { id, module } = plan.changes.changes[0].change.clone() else {

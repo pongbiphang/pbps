@@ -648,31 +648,6 @@ fn changed_owners(change: &Change) -> Option<(Vec<OwnerScope>, bool, bool)> {
         Change::CreateModule { id, .. } => (Exact(Surface::Module(id.clone())), false, true),
         Change::AlterModule { id, .. } => (Exact(Surface::Module(id.clone())), true, true),
         Change::DropModule { id, .. } => (Exact(Surface::Module(id.clone())), true, false),
-        Change::PublicExecution { routine, .. } => (
-            Exact(Surface::Module(ModuleId::Routine(routine.clone()))),
-            true,
-            true,
-        ),
-        Change::Grant { target, .. } | Change::Revoke { target, .. } => match target {
-            GrantTarget::Schema(name) => (Exact(Surface::Namespace(name.clone())), true, true),
-            GrantTarget::Routine(id) => (
-                Exact(Surface::Module(ModuleId::Routine(id.clone()))),
-                true,
-                true,
-            ),
-            // An object grant may address a table or a named module. One
-            // independently owned target must account for both endpoints.
-            GrantTarget::Object(name) => {
-                return Some((
-                    vec![
-                        Exact(Surface::Table(name.clone())),
-                        Exact(Surface::Module(ModuleId::Named(name.clone()))),
-                    ],
-                    true,
-                    true,
-                ));
-            }
-        },
         Change::InsertRow { .. }
         | Change::UpdateRow { .. }
         | Change::DeleteRow { .. }
@@ -680,7 +655,10 @@ fn changed_owners(change: &Change) -> Option<(Vec<OwnerScope>, bool, bool)> {
         | Change::SetColumnDeprecated { .. }
         | Change::CreateRole { .. }
         | Change::RenameRole { .. }
-        | Change::DropRole { .. } => return None,
+        | Change::DropRole { .. }
+        | Change::Grant { .. }
+        | Change::Revoke { .. }
+        | Change::PublicExecution { .. } => return None,
     };
     Some((vec![owner], opening, closing))
 }
@@ -807,11 +785,17 @@ fn grant_target(c: &Change) -> Option<&GrantTarget> {
 }
 
 // Role identity is sealed separately by AuthorizationCondition. Reference
-// rows and pbps-only metadata cannot change catalog prerequisites.
+// rows and pbps-only metadata cannot change catalog prerequisites. Neither
+// can a GRANT, REVOKE or PUBLIC execution change: ACLs and owners are not
+// fingerprinted (DEC-1274.1), so its target stays an untouched input with its
+// full fingerprint, and the authorization condition checks the grant itself.
 fn changes_catalog(c: &Change) -> bool {
     !matches!(
         c,
-        Change::InsertRow { .. }
+        Change::Grant { .. }
+            | Change::Revoke { .. }
+            | Change::PublicExecution { .. }
+            | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
