@@ -6544,6 +6544,149 @@ fn an_expression_change_releases_its_old_input_in_the_same_plan() {
     );
 }
 
+/// A NOT NULL tightening runs after the plan's rows on its table, which may
+/// be what fills or removes its NULLs: an `ensure` update that gives the NULL
+/// a value, and an `exact` table that deletes the row holding it. Both apply,
+/// and the next plan is empty. A NULL row the plan leaves alone is still
+/// counted, and the plan is refused before anything runs (#1367).
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_tightening_follows_the_rows_that_fill_or_remove_its_nulls() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "tighten-after-rows");
+    let connection = own.connection().to_owned();
+    on_server(&connection, "CREATE SCHEMA app");
+    let d = Demo::new("tighten-after-rows");
+    let table = |name: &str, nullable: bool, data: &str| {
+        let c = if nullable {
+            "{type: integer}"
+        } else {
+            "{type: integer, nullable: false}"
+        };
+        std::fs::write(
+            d.dir.join(format!("schema/app.{name}.yml")),
+            format!(
+                "table: app.{name}\ncolumns:\n  id: {{type: integer, nullable: false}}\n  \
+                 c: {c}\nprimary_key: {{name: pk_{name}, columns: [id]}}\n{data}"
+            ),
+        )
+        .unwrap();
+    };
+    // `filled` holds a NULL an update fills, `removed` one an exact delete
+    // takes away, and `kept` one nothing touches.
+    table(
+        "filled",
+        true,
+        "data:\n  mode: ensure\n  rows:\n    1: {}\n",
+    );
+    table(
+        "removed",
+        true,
+        "data:\n  mode: exact\n  rows:\n    1: {c: 5}\n    2: {}\n",
+    );
+    table(
+        "kept",
+        true,
+        "data:\n  mode: ensure\n  rows:\n    1: {}\n    2: {}\n",
+    );
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", &connection]));
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT count(*) FROM (SELECT c FROM app.filled UNION ALL SELECT c FROM app.removed) r \
+             WHERE c IS NULL"
+        ),
+        2
+    );
+
+    table(
+        "filled",
+        false,
+        "data:\n  mode: ensure\n  rows:\n    1: {c: 5}\n",
+    );
+    table(
+        "removed",
+        false,
+        "data:\n  mode: exact\n  rows:\n    1: {c: 5}\n",
+    );
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        &connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    assert!(
+        at("UPDATE \"app\".\"filled\"")
+            < at("ALTER TABLE \"app\".\"filled\" ALTER COLUMN \"c\" SET NOT NULL"),
+        "{script}"
+    );
+    assert!(
+        at("DELETE FROM \"app\".\"removed\"")
+            < at("ALTER TABLE \"app\".\"removed\" ALTER COLUMN \"c\" SET NOT NULL"),
+        "{script}"
+    );
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &[
+            "--allow",
+            "not-null",
+            "--allow",
+            "data-update",
+            "--allow",
+            "data-delete",
+        ],
+    ));
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
+    // Negative: row 1 is filled, and row 2, which an `ensure` table no longer
+    // declaring it leaves alone, still holds its NULL. Counted over the rows
+    // the plan leaves, and refused before anything runs.
+    table(
+        "kept",
+        false,
+        "data:\n  mode: ensure\n  rows:\n    1: {c: 5}\n",
+    );
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    let refused = approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--allow", "not-null", "--allow", "data-update"],
+    );
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        stderr(&refused).contains("1 existing NULLs in app.kept.c"),
+        "{}",
+        stderr(&refused)
+    );
+    assert_eq!(
+        scalar(&connection, "SELECT count(*) FROM app.kept WHERE c IS NULL"),
+        2,
+        "nothing ran"
+    );
+}
+
 #[test]
 #[ignore = "needs PostgreSQL 16; set PBPS_TEST_PG_OLD_DB"]
 fn the_deployment_loop_reads_constraints_before_postgres_18() {

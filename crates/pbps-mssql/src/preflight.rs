@@ -670,6 +670,28 @@ fn build(
             )])
         }
 
+        // A tightening of a table whose rows this plan writes or deletes runs
+        // after them (#1367), so it meets the rows they leave, which may have
+        // filled or removed the NULLs the table holds now: the same relation
+        // the key probes read (DECISIONS 335).
+        Change::AlterColumnNullability {
+            column,
+            to_nullable: false,
+            ..
+        } if names.moved.contains_key(&column.table) => {
+            let Some(rows) = rows_after(
+                names,
+                &column.table,
+                std::slice::from_ref(&column.name),
+                names.moved.get(&column.table),
+                "c",
+                &Applies::AllRows,
+            )?
+            else {
+                return Ok(skip(change, "the planned values of the column cannot be evaluated before apply", unchecked));
+            };
+            Ok(vec![null_probe(column, &format!("(\n{rows}\n) AS r"), "r.k0")?])
+        }
         Change::AlterColumnNullability {
             column,
             to_nullable: false,

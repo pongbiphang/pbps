@@ -868,7 +868,7 @@ pre-migration checks are hand-written SQL):
 
 | Risk class | Probe |
 |---|---|
-| `not-null` | Count existing NULLs when tightening a column; for a new required column with no DEFAULT/IDENTITY, count every existing row that lacks a value |
+| `not-null` | Count existing NULLs when tightening a column, over the rows the plan's own row writes and deletes on its table leave; for a new required column with no DEFAULT/IDENTITY, count every existing row that lacks a value |
 | `constraint` | Count the rows that violate the new UNIQUE / FK / CHECK, or collide under the new unique index — over the rows a filtered index keeps, where its predicate can be asked |
 | `narrowing` | Count the values that fail or truncate under conversion |
 | `rename` | The impact queries of 7.4 |

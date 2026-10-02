@@ -1359,3 +1359,38 @@ Pinned by `a_nullability_change_rebuilds_what_the_dialect_says_blocks_it`
 (`crates/pbps-cli/tests/flow.rs`) and
 `tightening_nullability_is_refused_by_what_indexes_the_column`
 (`crates/pbps-mssql/tests/live.rs`).
+
+<a id="dec-1367-1"></a>
+
+**DEC-1367.1. A tightening runs after the plan's rows on its table, and counts
+the NULLs they leave (#1367).** A revision that makes a column NOT NULL may
+also be what gives its NULLs a value: an `ensure` row that sets it, or an
+`exact` table that deletes the row that held it. A tightening in class 9 ran
+before those rows (classes 11 and 12) and met the old NULLs. Its probe counted
+the NULLs stored now, so the plan was refused on both engines.
+
+- **Order.** A tightening of a table whose rows the plan writes or deletes
+  sorts at `(12, 2)`: after the deletes, and before the additions of class 13.
+  A primary key is among those additions, and SQL Server refuses one over a
+  nullable column. The direction is fixed. No row change needs the column NOT
+  NULL first, and a declared row that leaves the column unset is refused at
+  validation. A table without row changes keeps its tightening in class 9, so
+  no other plan's order moves.
+- **Split.** A tightening folded into a retype comes out of it on such a
+  table. The retype keeps the column nullable, and an `AlterColumnNullability`
+  follows the rows. This is the split DEC-1168.1 makes for a recomputed
+  column. The column then carries two changes, and the dependents both bring
+  down are merged (DEC-1363.1).
+- **Probe.** The NOT NULL probe on such a table reads `rows_after`, the
+  relation the key probes already read (DECISIONS 335). That relation is the
+  stored rows, minus the plan's deletes, with its updates and inserts applied.
+  A NULL row the plan leaves alone is still counted. A value no probe can
+  spell leaves the change unchecked, never passed.
+
+Pinned by `a_tightening_runs_after_the_rows_of_its_table` and
+`a_split_tightening_keeps_the_dependents_of_its_retype`
+(`crates/pbps-diff/src/schema_diff.rs`), and by the live
+`a_tightening_follows_the_rows_that_fill_or_remove_its_nulls`
+(`crates/pbps-cli/tests/flow_pg.rs`) and
+`a_tightening_follows_the_rows_that_fill_or_remove_its_nulls_through_the_cli`
+(`crates/pbps-cli/tests/flow.rs`).

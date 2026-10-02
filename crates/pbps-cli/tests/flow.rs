@@ -2187,6 +2187,146 @@ fn tightening_a_column_rebuilds_what_indexes_it_through_the_cli() {
     }
 }
 
+/// A NOT NULL tightening runs after the plan's rows on its table, which may
+/// be what fills or removes its NULLs: an `ensure` update that gives the NULL
+/// a value, and an `exact` table that deletes the row holding it. Both apply,
+/// and the next plan is empty. A NULL row the plan leaves alone is still
+/// counted, and the plan is refused before anything runs (#1367).
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_tightening_follows_the_rows_that_fill_or_remove_its_nulls_through_the_cli() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "after_rows1367");
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let d = Demo::new("after_rows1367");
+    let table = |name: &str, nullable: bool, data: &str| {
+        let c = if nullable {
+            "{type: int}"
+        } else {
+            "{type: int, nullable: false}"
+        };
+        std::fs::write(
+            d.dir.join(format!("schema/dbo.{name}.yml")),
+            format!(
+                "table: dbo.{name}\ncolumns:\n  id: {{type: int, nullable: false}}\n  \
+                 c: {c}\nprimary_key: {{name: pk_{name}, columns: [id]}}\n{data}"
+            ),
+        )
+        .unwrap();
+    };
+    // `filled` holds a NULL an update fills, `removed` one an exact delete
+    // takes away, and `kept` one nothing touches.
+    table(
+        "filled",
+        true,
+        "data:\n  mode: ensure\n  rows:\n    1: {}\n",
+    );
+    table(
+        "removed",
+        true,
+        "data:\n  mode: exact\n  rows:\n    1: {c: 5}\n    2: {}\n",
+    );
+    table(
+        "kept",
+        true,
+        "data:\n  mode: ensure\n  rows:\n    1: {}\n    2: {}\n",
+    );
+    ok(&d.run(&["plan"]));
+    d.commit();
+    ok(&d.run(&["bootstrap", "--db", own.connection()]));
+
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    let planned = |d: &Demo| {
+        ok(&d.run(&["plan"]));
+        d.commit();
+        ok(&d.run(&[
+            "plan",
+            "--db",
+            own.connection(),
+            "--out",
+            plan.to_str().unwrap(),
+            "--sql",
+            sql.to_str().unwrap(),
+        ]));
+    };
+    let apply = |allow: &[&str]| {
+        let checksum = plan_checksum(&plan);
+        let mut args = vec![
+            "apply",
+            "--db",
+            own.connection(),
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+        ];
+        for a in allow {
+            args.extend_from_slice(&["--allow", a]);
+        }
+        d.run(&args)
+    };
+
+    table(
+        "filled",
+        false,
+        "data:\n  mode: ensure\n  rows:\n    1: {c: 5}\n",
+    );
+    table(
+        "removed",
+        false,
+        "data:\n  mode: exact\n  rows:\n    1: {c: 5}\n",
+    );
+    planned(&d);
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    assert!(
+        at("UPDATE [dbo].[filled]")
+            < at("ALTER TABLE [dbo].[filled] ALTER COLUMN [c] int NOT NULL"),
+        "{script}"
+    );
+    assert!(
+        at("DELETE FROM [dbo].[removed]")
+            < at("ALTER TABLE [dbo].[removed] ALTER COLUMN [c] int NOT NULL"),
+        "{script}"
+    );
+    ok(&apply(&["not-null", "data-update", "data-delete"]));
+    let o = d.run(&["plan", "--db", own.connection()]);
+    ok(&o);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+    on_server(
+        own.connection(),
+        "IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id IN (OBJECT_ID('dbo.filled'),
+              OBJECT_ID('dbo.removed')) AND name = 'c' AND is_nullable = 1)
+             THROW 50000, 'still nullable', 1;",
+    );
+
+    // Negative: row 1 is filled, and row 2, which an `ensure` table no longer
+    // declaring it leaves alone, still holds its NULL. Counted over the rows
+    // the plan leaves, and refused before anything runs.
+    table(
+        "kept",
+        false,
+        "data:\n  mode: ensure\n  rows:\n    1: {c: 5}\n",
+    );
+    planned(&d);
+    let refused = apply(&["not-null", "data-update"]);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        stderr(&refused).contains("1 existing NULLs in dbo.kept.c"),
+        "{}",
+        stderr(&refused)
+    );
+    on_server(
+        own.connection(),
+        "IF (SELECT COUNT(*) FROM dbo.kept WHERE c IS NULL) <> 2 THROW 50000, 'something ran', 1;",
+    );
+}
+
 /// A column collation goes the whole way through the CLI (#1175). `pull`
 /// declares a column collated away from its database's default, `bootstrap`
 /// rebuilds it onto a database with another default, and a second `pull`
