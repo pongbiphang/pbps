@@ -2119,18 +2119,27 @@ mod tests {
         assert_eq!(names(&cs)[1], "add check ck_quoted", "{:?}", names(&cs));
     }
 
-    /// A function's name in a comment is no call: a column whose default only
-    /// mentions it there stays ahead of the function, which reads the column,
-    /// and the plan is not refused as a cycle (DEC-1364.1).
+    /// A function's name in a comment, or as a Unicode identifier's escape
+    /// character, is no call: a column whose expression only holds it there
+    /// stays ahead of the function, which reads the column, and the plan is
+    /// not refused as a cycle (DEC-1364.1).
     #[test]
     fn a_function_named_only_in_a_comment_is_no_call() {
-        let mut cs = plan(vec![
-            add_column("g", "0 /* app.f(1) */", false),
-            routine("app.f(integer)", "SELECT g FROM app.t LIMIT 1"),
-        ]);
-        let before = names(&cs);
-        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 0);
-        assert_eq!(names(&cs), before);
+        for (column, function) in [
+            (add_column("g", "0 /* app.f(1) */", false), "app.f(integer)"),
+            (
+                add_column("g", "U&\"_0061\" UESCAPE '_' * 2", true),
+                "app._()",
+            ),
+        ] {
+            let mut cs = plan(vec![
+                column,
+                routine(function, "SELECT g FROM app.t LIMIT 1"),
+            ]);
+            let before = names(&cs);
+            assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 0);
+            assert_eq!(names(&cs), before);
+        }
     }
 
     /// DEC-1364.1: a view over `*` of the table takes every column when it

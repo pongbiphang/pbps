@@ -889,7 +889,8 @@ impl Lexicon {
     /// The contents of every string literal in `text`, decoded: `'…'`,
     /// `E'…'`, `U&'…'` with its `UESCAPE`, a continued literal, and on an
     /// engine with dollar quoting `$tag$…$tag$`. Comments and quoted
-    /// identifiers are skipped, so a word in either is no literal's.
+    /// identifiers are skipped, a `U&"…"` one with its `UESCAPE` clause, so a
+    /// word in any of them is no literal's.
     ///
     /// For a scan that has to read what a literal *names*: an OID-alias type
     /// resolves one to a function, `'app.f(integer)'::regprocedure`
@@ -938,6 +939,15 @@ impl Lexicon {
                         break;
                     }
                     j += text[j..].chars().next().map_or(1, char::len_utf8);
+                }
+                // A `U&"…"` identifier's `UESCAPE 'x'` belongs to the name,
+                // as `code_only` reads it: its operand is no literal of the
+                // expression's.
+                let unicode = i >= 2
+                    && text[..i].to_ascii_lowercase().ends_with("u&")
+                    && !continues_identifier(text, i - 2);
+                if unicode && let Some(n) = uescape_clause_len(&text[j..]) {
+                    j += n;
                 }
                 i = j;
             } else if self.dollar_quoted_strings
@@ -4719,6 +4729,16 @@ UESCAPE '!' AS s";
             ["x'y", "p'q", "d", "z"]
         );
         assert_eq!(lexicon.string_literals("N'n' || U&'\\0061'"), ["n", "a"]);
+        // A Unicode identifier's escape clause is part of the name.
+        assert!(
+            lexicon
+                .string_literals("U&\"_0061\" UESCAPE '_' * 2")
+                .is_empty()
+        );
+        assert_eq!(
+            lexicon.string_literals("U&\"_0061\" UESCAPE '_' || 'x'"),
+            ["x"]
+        );
         assert!(lexicon.string_literals("a * 2 -- 'x'").is_empty());
     }
 }
