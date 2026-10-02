@@ -93,8 +93,10 @@ fn runtime(run: &RunControl, key: &EnvironmentFingerprintKey) -> Result<Resolver
                 &inner.control.identity.instance_key,
             ))
             .map_err(|_| Error::Scope("supplied runtime identity cannot be encoded".into()))?;
+            // The admitted profile, not a family name: each one enforces its
+            // own layout, and the PG16 profile also pins the server major.
             Ok(ResolverRuntime::Supplied {
-                profile: "linux-dedicated-v1".into(),
+                profile: inner.control.profile.name.into(),
                 identity: fingerprint(key, "pbps/pg-runtime/v1", "supplied", &bytes),
             })
         }
