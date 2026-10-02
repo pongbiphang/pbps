@@ -1679,6 +1679,11 @@ plan (#1426). Until then the engine refuses such a plan inside its
 transaction. A key over a computed column is
 refused by validation (#1419).
 
+**Drift.** The drift check compares computed columns as named parts, and holds a
+plan's add to its persistence and to a declared NOT NULL. That includes the
+computed columns inside a `CREATE TABLE`, which no separate change carries. One
+another session adds or removes after the create is movement (SPEC §7.6).
+
 **Pull.** `sys.computed_columns` gives the definition, unwrapped as a check's
 is, and `is_persisted`. A definition the reader may not see stays a
 limitation by name, never an ordinary column. Expressions are tracked in

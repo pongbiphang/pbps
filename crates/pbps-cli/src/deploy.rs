@@ -3323,6 +3323,14 @@ fn refuse_unplanned_movement(
                 declared.indexes.keys().map(String::as_str).collect(),
                 now.indexes.keys().map(String::as_str).collect(),
             );
+            // Created inside the `CREATE TABLE`, never split out of it, so the
+            // payload names every one (#1174 review).
+            named(
+                "computed column",
+                Some(pbps_model::Part::Computed),
+                declared.computed.keys().map(String::as_str).collect(),
+                now.computed.keys().map(String::as_str).collect(),
+            );
             // A column's own promise, in the fields the catalog reads back
             // unchanged — the type once normalized, measured: the live
             // created-table test declares bare `decimal`, `char`, `float` and
@@ -3349,6 +3357,19 @@ fn refuse_unplanned_movement(
                     moved.push(format!(
                         "{now_name} column `{n}` is not the one this plan's `CREATE TABLE` \
                          declares"
+                    ));
+                }
+            }
+            // A computed column is held to its persistence, and to NOT NULL
+            // where it declares one; its expression comes back respelled, as
+            // a check's does (DEC-1174.1).
+            for (n, was) in &declared.computed {
+                if let Some(now) = now.computed.get(n)
+                    && !(now.persisted == was.persisted && (!was.not_null || now.not_null))
+                {
+                    moved.push(format!(
+                        "{now_name} computed column `{n}` is not the one this plan's `CREATE \
+                         TABLE` declares"
                     ));
                 }
             }
@@ -11761,6 +11782,69 @@ mod tests {
             Settled::Whole,
         )
         .expect("a replacement is a drop and a create, and the create is the net");
+    }
+
+    /// A created table's computed columns answer for themselves: one another
+    /// session adds or removes after the `CREATE TABLE`, or one stored
+    /// differently from the declaration, is movement (#1174 review, SPEC
+    /// 7.6).
+    #[test]
+    fn a_created_tables_computed_columns_answer_for_themselves() {
+        use pbps_model::{Change, Column, ComputedColumn, PlannedChange, Table};
+        let name = TableName::new("dbo", "t");
+        let computed = |persisted: bool| ComputedColumn {
+            expression: "a * 2".into(),
+            persisted,
+            not_null: false,
+        };
+        let mut created = Table::default();
+        created
+            .columns
+            .insert("a".into(), Column::new("int".parse().unwrap()));
+        created.computed.insert("c".into(), computed(true));
+        let changes = pbps_model::ChangeSet {
+            changes: vec![PlannedChange::new(Change::CreateTable {
+                uid: "t_aaaaaa".parse().unwrap(),
+                name: name.clone(),
+                table: Box::new(created.clone()),
+            })],
+        };
+        let read = |edit: &dyn Fn(&mut Table)| {
+            let mut t = created.clone();
+            edit(&mut t);
+            Schema {
+                tables: [(name.clone(), t)].into(),
+                ..Default::default()
+            }
+        };
+        let check = |after: &Schema| {
+            refuse_unplanned_movement(
+                &pbps_mssql::Mssql,
+                &changes,
+                &Schema::default(),
+                after,
+                "test",
+                Settled::Whole,
+            )
+        };
+        check(&read(&|_| {})).expect("the computed column this plan creates, as it creates it");
+        for (what, edit) in [
+            (
+                "removed",
+                &(|t: &mut Table| {
+                    t.computed.remove("c");
+                }) as &dyn Fn(&mut Table),
+            ),
+            ("added", &|t: &mut Table| {
+                t.computed.insert("d".into(), computed(false));
+            }),
+            ("not persisted", &|t: &mut Table| {
+                t.computed.insert("c".into(), computed(false));
+            }),
+        ] {
+            let e = check(&read(edit)).expect_err(what).to_string();
+            assert!(e.contains("computed column"), "{what}: {e}");
+        }
     }
 
     /// An index split out of a created table's payload (#1027) answers for
