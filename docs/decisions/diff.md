@@ -1974,8 +1974,9 @@ model does not hold (GiST's `buffering`) is one already.
 **Drift.** A planned change excuses its part, as an index change does, and
 the whole part is held once the run is whole to the before-read with only
 the parameter change applied: dropped, or recreated under its name with
-another definition, after the plan's `ALTER INDEX`, it is movement (#1483
-review).
+another definition, after the plan's `ALTER INDEX`, it is movement. Mid-run
+it is held to either side of that statement, so no staged checkpoint records
+another definition for the next read to compare against (#1483 review).
 
 Tests: `an_index_takes_its_own_methods_parameters`,
 `an_index_parameter_must_be_its_methods` (`crates/pbps-model`);

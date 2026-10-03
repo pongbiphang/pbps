@@ -3795,8 +3795,13 @@ fn refuse_unplanned_movement(
             // drops it, or recreates it under its name with another
             // definition, after the plan's `ALTER INDEX` would otherwise be
             // recorded as the plan's result (#1442, #1483 review).
+            //
+            // Mid-run it is held too, to either side of that statement: a
+            // staged checkpoint that recorded another definition would be
+            // the before-read the next checkpoint and the close compare
+            // against, and accept (#1483 review).
             for (table, target, set, reset) in &index_storage_changes {
-                if *table != now_name || !settled.whole() {
+                if *table != now_name {
                     continue;
                 }
                 let apply = |parameters: &mut BTreeMap<String, String>| {
@@ -3812,7 +3817,8 @@ fn refuse_unplanned_movement(
                         was.primary_key.as_ref().map(|w| {
                             let mut expected = w.clone();
                             apply(&mut expected.storage_parameters);
-                            now.primary_key.as_ref() == Some(&expected)
+                            let left = now.primary_key.as_ref();
+                            left == Some(&expected) || (!settled.whole() && left == Some(w))
                         }),
                     ),
                     pbps_model::IndexPart::Unique(n) => (
@@ -3820,7 +3826,8 @@ fn refuse_unplanned_movement(
                         was.unique.get(n).map(|w| {
                             let mut expected = w.clone();
                             apply(&mut expected.storage_parameters);
-                            now.unique.get(n) == Some(&expected)
+                            let left = now.unique.get(n);
+                            left == Some(&expected) || (!settled.whole() && left == Some(w))
                         }),
                     ),
                     pbps_model::IndexPart::Index(n) => (
@@ -3828,7 +3835,8 @@ fn refuse_unplanned_movement(
                         was.indexes.get(n).map(|w| {
                             let mut expected = w.clone();
                             apply(&mut expected.storage_parameters);
-                            now.indexes.get(n) == Some(&expected)
+                            let left = now.indexes.get(n);
+                            left == Some(&expected) || (!settled.whole() && left == Some(w))
                         }),
                     ),
                 };
@@ -12278,6 +12286,16 @@ mod tests {
             .columns[0]
             .descending = true;
         let e = check(&redefined, Settled::Whole).expect_err("redefined");
+        assert!(format!("{e:#}").contains("`ix`"), "{e:#}");
+        // At a staged checkpoint too: before the plan's statement or after
+        // it, never another definition, so no checkpoint records one for
+        // the next read to compare against (#1483 review).
+        check(&schema("80"), Settled::SoFar).expect("after the statement");
+        let e = check(&redefined, Settled::SoFar).expect_err("redefined mid-run");
+        assert!(format!("{e:#}").contains("`ix`"), "{e:#}");
+        let e = check(&dropped, Settled::SoFar).expect_err("dropped mid-run");
+        assert!(format!("{e:#}").contains("`ix`"), "{e:#}");
+        let e = check(&schema("90"), Settled::SoFar).expect_err("neither side mid-run");
         assert!(format!("{e:#}").contains("`ix`"), "{e:#}");
     }
 
