@@ -1763,6 +1763,61 @@ fn a_new_column_calling_a_new_function_follows_its_create() {
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
 }
 
+/// A new table whose generated column calls a function the same plan creates
+/// follows that `CREATE FUNCTION` whole, with its column order, and a new
+/// function reading the table follows the table. One plan applies; DEC-1364.1
+/// used to leave this to the engine, which refused the table.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_new_table_generating_from_a_new_function_follows_its_create() {
+    let (own, d) = adopted_table("new-table-new-function");
+    let connection = own.connection();
+    declare_function(&d, "g", "SELECT x * 2");
+    // Named to come before `g`, which the differ creates in name order.
+    declare_function(&d, "a_reader", "SELECT c FROM app.n WHERE id = x");
+    std::fs::write(
+        d.dir.join("schema/app.n.yml"),
+        "table: app.n\ncolumns:\n  id: {type: integer, nullable: false}\n  \
+         c: {type: integer, generated: {expression: 'app.g(id)', stored: true}}\n  \
+         after: {type: integer}\nprimary_key: [id]\n",
+    )
+    .unwrap();
+    let (plan, script) = connected_plan(&d, connection);
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    assert!(
+        at("CREATE FUNCTION \"app\".\"g\"") < at("CREATE TABLE \"app\".\"n\""),
+        "{script}"
+    );
+    assert!(
+        at("CREATE TABLE \"app\".\"n\"") < at("CREATE FUNCTION \"app\".\"a_reader\""),
+        "{script}"
+    );
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "grant-widen"],
+    ));
+    on_server(connection, "INSERT INTO app.n (id, after) VALUES (3, 9)");
+    assert_eq!(scalar(connection, "SELECT app.a_reader(3)::int8"), 6);
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT attnum::int8 FROM pg_attribute \
+             WHERE attrelid = 'app.n'::regclass AND attname = 'after'"
+        ),
+        3,
+        "the generated column keeps its place in the column order"
+    );
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
 /// #1364, a corner #1350 recorded: a new column whose default or generation
 /// expression calls a function the same plan rebuilds follows the rebuild.
 /// Ahead of it, the column's call held the old function, and the rebuild's

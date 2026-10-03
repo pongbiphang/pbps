@@ -1076,7 +1076,10 @@ pub(crate) fn after_the_rebuilds(
 /// Places a column this plan adds whose default or generation expression
 /// names a function the plan creates or rebuilds after that function's
 /// create, and whatever may need the column after the column (DEC-1364.1).
-/// Returns how many such columns it placed, or why no order performs them.
+/// A table the plan creates whose generated column does so is placed whole,
+/// since that column cannot leave the table without moving in its column
+/// order (DEC-1274.2). Returns how many it placed, or why no order performs
+/// them.
 ///
 /// The column cannot simply follow the last create, as a check does: a
 /// module the plan creates may read it, and measured on 18.6 the engine
@@ -1094,6 +1097,7 @@ pub(crate) fn after_the_rebuilds(
 /// rows are written before the modules, where a trigger the plan creates
 /// cannot fire on them. Such a plan is refused, naming the column and the
 /// functions, with the two-plan remedy.
+#[allow(clippy::wildcard_enum_match_arm)]
 fn after_their_functions(cs: &mut ChangeSet, deps: &ModuleDeps) -> Result<usize, String> {
     let functions = function_creates(cs);
     let Some(last) = functions.iter().map(|(_, at)| *at).max() else {
@@ -1102,17 +1106,30 @@ fn after_their_functions(cs: &mut ChangeSet, deps: &ModuleDeps) -> Result<usize,
     // Each such column, with the creates after it that its text names.
     let mut waits: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (i, p) in cs.changes[..last].iter().enumerate() {
-        if let Change::AddColumn { column, .. } = &p.change
-            && let Some(text) = column_expression(column)
-        {
-            let named: Vec<usize> = functions
-                .iter()
-                .filter(|(name, at)| *at > i && pbps_pg::generated::may_call(text, name))
-                .map(|(_, at)| *at)
-                .collect();
-            if !named.is_empty() {
-                waits.insert(i, named);
-            }
+        // A new table's generated column stays in its CREATE TABLE, where
+        // its place in the column order is (DEC-1364.1), so the whole table
+        // waits instead.
+        let texts: Vec<&str> = match &p.change {
+            Change::AddColumn { column, .. } => column_expression(column).into_iter().collect(),
+            Change::CreateTable { table, .. } => table
+                .columns
+                .values()
+                .filter_map(|c| c.generated.as_ref().map(|g| g.expression.as_str()))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let named: Vec<usize> = functions
+            .iter()
+            .filter(|(name, at)| {
+                *at > i
+                    && texts
+                        .iter()
+                        .any(|text| pbps_pg::generated::may_call(text, name))
+            })
+            .map(|(_, at)| *at)
+            .collect();
+        if !named.is_empty() {
+            waits.insert(i, named);
         }
     }
     let Some(&start) = waits.keys().next() else {
@@ -1187,6 +1204,14 @@ fn cycle(
     };
     let column = match &cs.changes[at].change {
         Change::AddColumn { table, name, .. } => format!("{table}.{name}"),
+        Change::CreateTable { name, table, .. } => table
+            .columns
+            .iter()
+            .find(|(_, c)| c.generated.is_some())
+            .map_or_else(
+                || name.to_string(),
+                |(column, _)| format!("{name}.{column}"),
+            ),
         other => format!("{other:?}"),
     };
     let module = |i: usize| cs.changes[i].change.module_id().map(|id| format!("`{id}`"));
@@ -2097,6 +2122,56 @@ mod tests {
             assert!(column("g") < created("app.a_reader()"), "{order:?}");
             assert_eq!(column("plain"), 0, "{order:?}");
             assert!(created("app.f(integer)") < created("app.z()"), "{order:?}");
+        }
+    }
+
+    /// A new table whose generated column calls a new function cannot have
+    /// the column split out without changing its column order, so the whole
+    /// table follows the function, and a module naming the table follows the
+    /// table. A new table generating from nothing new does not wait.
+    #[test]
+    fn a_new_table_generating_from_a_new_function_follows_it_whole() {
+        let table = |name: &str, expression: &str| {
+            let mut t = Table::default();
+            t.columns.insert(
+                "id".into(),
+                Column::new("integer".parse().unwrap()).not_null(),
+            );
+            let mut g = Column::new("integer".parse().unwrap());
+            g.generated = Some(pbps_model::Generated {
+                expression: expression.into(),
+                stored: true,
+            });
+            t.columns.insert("g".into(), g);
+            Change::CreateTable {
+                uid: Uid::derived(UidKind::Table, name, 0),
+                name: name.parse().unwrap(),
+                table: Box::new(t),
+            }
+        };
+        let mut cs = plan(vec![
+            table("app.n", "app.f(id)"),
+            table("app.plain", "id * 2"),
+            routine("app.a_reader()", "SELECT g FROM app.n LIMIT 1"),
+            routine("app.f(integer)", "SELECT 1"),
+        ]);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
+        let at =
+            |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
+        let created =
+            |name: &str| at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id(name)));
+        let table_at = |name: &str| {
+            at(&|c| matches!(c, Change::CreateTable { name: n, .. } if n.to_string() == name))
+        };
+        let order = names(&cs);
+        assert!(created("app.f(integer)") < table_at("app.n"), "{order:?}");
+        assert!(table_at("app.n") < created("app.a_reader()"), "{order:?}");
+        #[allow(clippy::wildcard_enum_match_arm)]
+        match &cs.changes[table_at("app.n")].change {
+            Change::CreateTable { table, .. } => {
+                assert_eq!(table.columns.keys().collect::<Vec<_>>(), ["id", "g"]);
+            }
+            other => panic!("{other:?}"),
         }
     }
 
