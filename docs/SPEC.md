@@ -4,7 +4,8 @@
 > Language: Rust
 > Position: declarative database schema version control and deployment
 > Supported dialects: SQL Server and PostgreSQL
-> Accepted, not yet implemented: engine-assisted planning and resolver environment discovery (§9.3.2–9.3.3; ADR-0016)
+> Accepted, not yet implemented: engine-assisted planning — CLI binding resolution and saved binding evidence (§9.3.2; ADR-0016)
+> Partially delivered: resolver environment discovery — read-only `doctor` discovery, profile selection, runtime profiles and compatibility qualification are built; the remaining stages are planned (§9.3.3; [delivery tracking](RESOLVER-DELIVERY.md))
 
 ---
 
