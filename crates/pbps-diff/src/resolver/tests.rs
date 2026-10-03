@@ -1075,4 +1075,96 @@ mod generated_surface_coverage {
             ));
         }
     }
+
+    /// A generation expression stays in its CREATE TABLE or ADD COLUMN, so
+    /// that step provides its `pg_attrdef` surface: a function the plan
+    /// creates and the expression calls is ordered before the table or
+    /// column, not after it (DEC-1274.2).
+    #[test]
+    fn a_generation_expression_waits_for_the_function_it_calls() {
+        let function: pbps_model::ModuleId = "app.f(integer)".parse().unwrap();
+        let calls = |name: &str| SurfaceResolution {
+            surface: Surface::Default(name.parse().unwrap()),
+            current: None,
+            desired: Some(BoundSurface {
+                object: ObjectIdentity {
+                    class: "pg_attrdef".into(),
+                    name: name.split('.').map(str::to_owned).collect(),
+                    signature: vec![],
+                },
+                bindings: vec![],
+                // It reads its own table's column too, which the same
+                // CREATE TABLE provides: no edge of a step to itself.
+                managed_inputs: BTreeSet::from([
+                    Surface::Module(function.clone()),
+                    Surface::Column("app.t.a".parse().unwrap()),
+                ]),
+            }),
+        };
+        let module = SurfaceResolution {
+            surface: Surface::Module(function.clone()),
+            current: None,
+            desired: Some(BoundSurface {
+                object: ObjectIdentity {
+                    class: "pg_proc".into(),
+                    name: vec!["app".into(), "f".into()],
+                    signature: vec![],
+                },
+                bindings: vec![],
+                managed_inputs: BTreeSet::new(),
+            }),
+        };
+        for new_table in [true, false] {
+            let mut base = Schema::default();
+            let mut table = Table::default();
+            table
+                .columns
+                .insert("a".into(), Column::new("int".parse().unwrap()));
+            if !new_table {
+                base.tables.insert("app.t".parse().unwrap(), table.clone());
+            }
+            let before_ids = ids(&base, &IdsFile::default());
+            let mut desired = base.clone();
+            table.columns.insert("g".into(), generated("app.f(a)"));
+            desired.tables.insert("app.t".parse().unwrap(), table);
+            desired.modules.insert(
+                function.clone(),
+                pbps_model::Module {
+                    kind: pbps_model::ModuleKind::Function,
+                    description: None,
+                    definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+                },
+            );
+            let after_ids = ids(&desired, &before_ids);
+            let ordered = super::plan(
+                crate::Side {
+                    schema: &base,
+                    ids: &before_ids,
+                },
+                crate::Side {
+                    schema: &desired,
+                    ids: &after_ids,
+                },
+                &Hints::default(),
+                &[calls("app.t.g"), module.clone()],
+                &pbps_dialect::MinimalDialect,
+            )
+            .unwrap();
+            let at = |f: &dyn Fn(&Change) -> bool| {
+                ordered
+                    .changes
+                    .changes
+                    .iter()
+                    .position(|p| f(&p.change))
+                    .unwrap()
+            };
+            let created = at(&|c| matches!(c, Change::CreateModule { id, .. } if id == &function));
+            let generation = at(&|c| {
+                matches!(c, Change::CreateTable { .. })
+                    || matches!(c, Change::AddColumn { name, .. } if name == "g")
+            });
+            assert!(created < generation, "new_table={new_table}");
+            ordered.proof.validate(&ordered.changes).unwrap();
+        }
+    }
 }
