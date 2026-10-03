@@ -12820,7 +12820,7 @@ fn a_reached_table_the_deployment_role_cannot_lock_is_named_in_the_refusal() {
 /// An action uses ONLY on a regular table but still reaches every partition.
 /// Keep the lock privilege bar at the named relation and retain the engine's
 /// recursive partition lock, including the FK's concurrent-attach protection.
-/// Run on both pinned majors (#590): DECISIONS 488 measured these lock
+/// Run on both pinned majors (#590): DECISIONS 489 measured these lock
 /// semantics on 16 and 18, and each variant checks which one it reached, so
 /// two runs against one endpoint cannot pass for version coverage.
 #[test]
