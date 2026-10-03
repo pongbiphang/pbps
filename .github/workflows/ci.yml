@@ -94,6 +94,11 @@ jobs:
       # is the only place it is caught (DEC-671.1).
       - run: python3 scripts/check_decisions_test.py
       - run: python3 scripts/check-decisions.py
+      # `ci-gate` is the one required check and only as strong as its `needs`:
+      # a job left out of that list could go red under a green gate. Checked
+      # here, which the gate waits on, so a missing entry closes it (#637).
+      - run: python3 scripts/check_gate_needs_test.py
+      - run: python3 scripts/check_gate_needs.py
       # The dedicated-server fixture's retry decision runs only in the resolver
       # job, as root; this is the one place its logic is tested (DEC-958.1).
       - run: python3 scripts/live_resolver_server_test.py
