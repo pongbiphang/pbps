@@ -2636,6 +2636,10 @@ fn index_as_declared(declared: &pbps_model::Index, now: &pbps_model::Index) -> b
         && declared.unique == now.unique
         && declared.filter.is_some() == now.filter.is_some()
         && declared.method == now.method
+        // Both canonical (#1442), so compared outright: another session's
+        // `ALTER INDEX … SET` after the creation is not this plan's (#1483
+        // review).
+        && declared.storage_parameters == now.storage_parameters
 }
 
 /// Whether an index key read back is the one declared: a column by its name,
@@ -2664,6 +2668,8 @@ fn primary_key_as_declared(
             .name
             .as_ref()
             .is_some_and(|n| Some(n) != now.name.as_ref())
+        // As an index's (#1442, #1483 review).
+        && declared.storage_parameters == now.storage_parameters
 }
 
 /// Whether a part read back is the one the plan adds it as, or `None` where
@@ -2688,7 +2694,8 @@ fn part_as_planned(
             primary_key_as_declared(was, table.primary_key.as_ref()?)
                 && table.primary_key_is_clustered() == clustered
         }
-        // A unique constraint is nothing but its columns and its layout.
+        // A unique constraint is nothing but its columns, its index's
+        // storage parameters (#1442) and its layout.
         PartDefinition::Unique(was, clustered) => {
             table.unique.get(name)? == was && table.unique_is_clustered(name) == clustered
         }
@@ -12206,6 +12213,85 @@ mod tests {
                 assert!(format!("{e:#}").contains("index `ix`"), "{other:?}: {e:#}");
             }
         }
+    }
+
+    /// An index the plan adds, and a created table's key, are held to their
+    /// declared storage parameters too: another session's `ALTER INDEX …
+    /// SET` after the creation is movement, not the plan's result (#1483
+    /// review).
+    #[test]
+    fn a_created_index_is_held_to_its_declared_parameters() {
+        use pbps_model::{Change, Column, Index, IndexColumn, PlannedChange, PrimaryKey, Table};
+        let name = TableName::new("app", "t");
+        let fill = |v: &str| -> BTreeMap<String, String> {
+            [("fillfactor".to_owned(), v.to_owned())].into()
+        };
+        let index = |v: &str| Index {
+            columns: vec![IndexColumn {
+                key: pbps_model::IndexKey::Column("id".into()),
+                descending: false,
+                opclass: None,
+            }],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: fill(v),
+        };
+        let table = |ix: Option<&str>, pk: &str| {
+            let mut t = Table::default();
+            t.columns.insert(
+                "id".into(),
+                Column::new("integer".parse().unwrap()).not_null(),
+            );
+            t.primary_key = Some(PrimaryKey {
+                name: Some("t_pkey".into()),
+                columns: vec!["id".into()],
+                storage_parameters: fill(pk),
+            });
+            if let Some(v) = ix {
+                t.indexes.insert("ix".into(), index(v));
+            }
+            t
+        };
+        let schema = |t: Table| Schema {
+            tables: [(name.clone(), t)].into(),
+            ..Default::default()
+        };
+        let adding = pbps_model::ChangeSet {
+            changes: vec![PlannedChange::new(Change::AddIndex {
+                table: name.clone(),
+                name: "ix".into(),
+                index: Box::new(index("70")),
+                clustered: false,
+            })],
+        };
+        let check = |plan: &pbps_model::ChangeSet, before: &Schema, after: &Schema| {
+            refuse_unplanned_movement(
+                &pbps_pg::Postgres::new(),
+                plan,
+                before,
+                after,
+                "test",
+                Settled::Whole,
+            )
+        };
+        let before = schema(table(None, "80"));
+        check(&adding, &before, &schema(table(Some("70"), "80"))).expect("as added");
+        let e = check(&adding, &before, &schema(table(Some("90"), "80"))).expect_err("set after");
+        assert!(format!("{e:#}").contains("index `ix`"), "{e:#}");
+
+        let creating = pbps_model::ChangeSet {
+            changes: vec![PlannedChange::new(Change::CreateTable {
+                uid: "t_000000".parse().unwrap(),
+                name: name.clone(),
+                table: Box::new(table(None, "80")),
+            })],
+        };
+        let empty = Schema::default();
+        check(&creating, &empty, &schema(table(None, "80"))).expect("as created");
+        let e = check(&creating, &empty, &schema(table(None, "90"))).expect_err("set after");
+        assert!(format!("{e:#}").contains("primary key"), "{e:#}");
     }
 
     /// An index's parameters the plan sets in place are held once the run is

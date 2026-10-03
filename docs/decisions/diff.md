@@ -1976,7 +1976,9 @@ the whole part is held once the run is whole to the before-read with only
 the parameter change applied: dropped, or recreated under its name with
 another definition, after the plan's `ALTER INDEX`, it is movement. Mid-run
 it is held to either side of that statement, so no staged checkpoint records
-another definition for the next read to compare against (#1483 review).
+another definition for the next read to compare against (#1483 review). An
+index, key or unique constraint the plan adds, alone or in a `CREATE`, is
+held to its declared parameters too, as to the rest of its definition.
 
 Tests: `an_index_takes_its_own_methods_parameters`,
 `an_index_parameter_must_be_its_methods` (`crates/pbps-model`);
