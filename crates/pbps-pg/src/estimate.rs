@@ -559,7 +559,7 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             let about = format!("adding the column {}", table.column(name));
             // The identity sequence backfills every stored row even though
             // `default` is absent. Measured on PostgreSQL 16 and 18, this also
-            // rebuilds an empty table.
+            // rebuilds an empty table (DEC-605.1, narrowing Decision 401).
             if column.identity.is_some() {
                 return e(
                     about,

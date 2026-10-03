@@ -436,7 +436,8 @@ gap is not small. **Measured** on 100,000 rows through `pg_stat_user_tables`:
 | `ADD CONSTRAINT … CHECK` | no | 100,000 |
 | `ADD CONSTRAINT … UNIQUE` / `PRIMARY KEY` | no | 100,000 |
 | `ADD CONSTRAINT … FOREIGN KEY` | no | 100,000 |
-| `ADD COLUMN`, with or without a literal default | no | 0 |
+| `ADD COLUMN` without an identity, with or without a literal default | no | 0 |
+| `ADD COLUMN … GENERATED … AS IDENTITY` | **yes** | **every row** (DEC-605.1) |
 | `DROP COLUMN` | no | 0 |
 
 Carried as one fact, ordinary `SET NOT NULL` and a plain widening look the

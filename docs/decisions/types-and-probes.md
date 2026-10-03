@@ -1683,3 +1683,21 @@ silent: a later statement that spells it as a literal fails on the engine. The
 live fixture `timestamp_precision_narrowing_rounds_past_the_upper_bound_without_refusing`
 pins both sides of each threshold and the lower bound. If a release starts
 refusing, it fails there, and a count then belongs in the probes.
+
+<a id="dec-605-1"></a>
+
+**DEC-605.1. Adding an identity column rebuilds the table and reaches every
+row, which narrows Decision 401's "`ADD COLUMN` reads nothing" (#605).**
+Decision 401 and ADR-0012 Amendment 2's scan table were measured on plain and
+literal-default additions. An identity addition is different, although it
+too carries no explicit default: the sequence backfills a value into every
+stored row. Measured on PostgreSQL 18.6 and 16.15, `ADD COLUMN d int
+GENERATED ALWAYS AS IDENTITY` changes the table's `relfilenode`, even when
+the table is empty, and every populated row receives its own sequence value.
+`pbps_pg::estimate` therefore answers `Rewrite::Yes` and `Reads::EveryRow`
+for it. Plain and literal-default additions stay metadata-only, and an
+expression default stays `unknown` (DECISIONS 403). Decision 401 keeps its
+text and number; this entry is the correction. The unit test
+`adding_an_identity_backfills_rows_without_an_explicit_default` and the live
+`the_estimate_says_what_the_engine_does_about_rebuilding_the_table` pin both
+sides, with the plain and literal-default additions as negative controls.
