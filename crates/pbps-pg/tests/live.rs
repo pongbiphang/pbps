@@ -2117,8 +2117,10 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
                  id integer, CONSTRAINT unenforced_ck CHECK (id > 0) NOT ENFORCED);
              CREATE SEQUENCE {s}.loose;
              CREATE TABLE {s}.borrowing (id integer DEFAULT nextval('{s}.loose'));
-             CREATE TABLE {s}.published (id integer PRIMARY KEY);
-             ALTER TABLE {s}.published REPLICA IDENTITY FULL;
+             CREATE TABLE {s}.published (id integer PRIMARY KEY, code integer NOT NULL);
+             CREATE UNIQUE INDEX published_code ON {s}.published (code);
+             ALTER TABLE {s}.published REPLICA IDENTITY USING INDEX published_code;
+             DROP INDEX {s}.published_code;
              -- A column name the declaration format cannot write, and a key
              -- that points at the table carrying it.
              CREATE TABLE {s}.dotted (a integer PRIMARY KEY, \"x.y\" integer);
@@ -2253,8 +2255,9 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         "`stops_ck` on",
         // A default over a sequence nobody in the pull owns.
         "which it does not own",
-        // A table whose old rows reach logical replication differently.
-        "REPLICA IDENTITY FULL",
+        // A table whose replica identity names an index that was dropped,
+        // which identifies no row (#1444).
+        "names an index that was dropped",
         // A table where an `INSERT` does whatever a rule says instead.
         "rewrite rules",
         // A table whose row shape follows a composite type.
@@ -3001,6 +3004,148 @@ async fn a_stored_generated_column_round_trips_and_changes_its_expression() {
     assert_eq!(value, Some(15));
     assert_eq!(after, changed);
     assert!(plan(&after, &ids, &changed, &ids).is_empty());
+}
+
+/// Every replica identity is read back as declared, recreated in an empty
+/// database, and read back the same (#1444). Changing identities is one
+/// typed plan that applies: one moves to an index the same plan creates,
+/// after it; one moves off a unique constraint the plan drops, before it;
+/// and a rebuilt identity index is the identity again afterwards, where the
+/// engine alone would leave it naming nothing.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn every_replica_identity_round_trips_and_moves_as_a_typed_plan() {
+    use pbps_model::{Change, ReplicaIdentity as R};
+    let s = emit_schema("ri1444");
+    let t = |n: &str| TableName::new(&s, n);
+
+    let mut source = TestDb::create("ri1444_src").await;
+    fresh(&mut source, &s).await;
+    source
+        .execute(&format!(
+            "CREATE TABLE {s}.plain (id integer PRIMARY KEY);
+             CREATE TABLE {s}.whole (id integer PRIMARY KEY);
+             ALTER TABLE {s}.whole REPLICA IDENTITY FULL;
+             CREATE TABLE {s}.blind (id integer PRIMARY KEY);
+             ALTER TABLE {s}.blind REPLICA IDENTITY NOTHING;
+             CREATE TABLE {s}.keyed (id integer PRIMARY KEY);
+             ALTER TABLE {s}.keyed REPLICA IDENTITY USING INDEX keyed_pkey;
+             CREATE TABLE {s}.coded (id integer PRIMARY KEY, code integer NOT NULL,
+                                     CONSTRAINT coded_code UNIQUE (code));
+             ALTER TABLE {s}.coded REPLICA IDENTITY USING INDEX coded_code;
+             CREATE TABLE {s}.indexed (id integer PRIMARY KEY, code integer NOT NULL);
+             CREATE UNIQUE INDEX indexed_code ON {s}.indexed (code);
+             ALTER TABLE {s}.indexed REPLICA IDENTITY USING INDEX indexed_code;"
+        ))
+        .await
+        .expect("the source tables");
+    let read = pull(&mut source).await;
+    let limitations = ours_limitations(&read, &s);
+    let pulled = ours_only(&read, &s);
+    drop_schema(&mut source, &s).await;
+    source.drop().await;
+    assert!(limitations.is_empty(), "{limitations:?}");
+    let identity = |schema: &Schema, n: &str| schema.tables[&t(n)].replica_identity.clone();
+    assert_eq!(identity(&pulled, "plain"), None);
+    assert_eq!(identity(&pulled, "whole"), Some(R::Full));
+    assert_eq!(identity(&pulled, "blind"), Some(R::Nothing));
+    assert_eq!(identity(&pulled, "keyed"), Some(R::PrimaryKey));
+    assert_eq!(
+        identity(&pulled, "coded"),
+        Some(R::Unique("coded_code".into()))
+    );
+    assert_eq!(
+        identity(&pulled, "indexed"),
+        Some(R::Index("indexed_code".into()))
+    );
+
+    let ids = mint_ids(&pulled, &IdsFile::default(), &[]);
+    let mut target = TestDb::create("ri1444_dst").await;
+    fresh(&mut target, &s).await;
+    apply(
+        &mut target,
+        &Postgres::new(),
+        &plan(&Schema::default(), &IdsFile::default(), &pulled, &ids),
+    )
+    .await;
+    let rebuilt = ours_only(&pull(&mut target).await, &s);
+    assert_eq!(rebuilt, pulled);
+    assert!(plan(&rebuilt, &ids, &pulled, &ids).is_empty());
+
+    // One plan: `indexed` moves to an index it creates and loses its old
+    // one; `coded` moves to FULL and loses the constraint it was on; `whole`
+    // goes to NOTHING.
+    let mut changed = pulled.clone();
+    {
+        let indexed = changed.tables.get_mut(&t("indexed")).unwrap();
+        let mut by_id = indexed.indexes["indexed_code"].clone();
+        by_id.columns[0].key = pbps_model::IndexKey::Column("id".into());
+        indexed.indexes.remove("indexed_code");
+        indexed.indexes.insert("indexed_id".into(), by_id);
+        indexed.replica_identity = Some(R::Index("indexed_id".into()));
+        let coded = changed.tables.get_mut(&t("coded")).unwrap();
+        coded.unique.remove("coded_code");
+        coded.replica_identity = Some(R::Full);
+        changed
+            .tables
+            .get_mut(&t("whole"))
+            .unwrap()
+            .replica_identity = Some(R::Nothing);
+    }
+    let step = plan(&rebuilt, &ids, &changed, &ids);
+    let at = |pred: &dyn Fn(&Change) -> bool| {
+        step.changes
+            .iter()
+            .position(|p| pred(&p.change))
+            .unwrap_or_else(|| panic!("{step:#?}"))
+    };
+    let identity_of = |n: &str| {
+        let n = t(n);
+        move |c: &Change| matches!(c, Change::SetReplicaIdentity { table, .. } if *table == n)
+    };
+    assert!(
+        at(&|c| matches!(c, Change::AddIndex { name, .. } if name == "indexed_id"))
+            < at(&identity_of("indexed")),
+        "{step:#?}"
+    );
+    assert!(
+        at(&identity_of("coded"))
+            < at(&|c| matches!(c, Change::DropUnique { name, .. } if name == "coded_code")),
+        "{step:#?}"
+    );
+    apply(&mut target, &Postgres::new(), &step).await;
+    let after = ours_only(&pull(&mut target).await, &s);
+    assert_eq!(after, changed);
+    assert!(plan(&after, &ids, &changed, &ids).is_empty());
+
+    // The identity's index rebuilt (descending now): dropped, created, and
+    // the identity set again. Without the last, the re-read would leave the
+    // table out as naming no index.
+    let mut rebuilt_index = changed.clone();
+    rebuilt_index
+        .tables
+        .get_mut(&t("indexed"))
+        .unwrap()
+        .indexes
+        .get_mut("indexed_id")
+        .unwrap()
+        .columns[0]
+        .descending = true;
+    let step = plan(&after, &ids, &rebuilt_index, &ids);
+    assert!(
+        step.changes
+            .iter()
+            .any(|p| matches!(&p.change, Change::SetReplicaIdentity { .. })),
+        "{step:#?}"
+    );
+    apply(&mut target, &Postgres::new(), &step).await;
+    let read = pull(&mut target).await;
+    let limitations = ours_limitations(&read, &s);
+    let last = ours_only(&read, &s);
+    drop_schema(&mut target, &s).await;
+    target.drop().await;
+    assert!(limitations.is_empty(), "{limitations:?}");
+    assert_eq!(last, rebuilt_index);
 }
 
 /// Emits and executes every change of a plan, in plan order.

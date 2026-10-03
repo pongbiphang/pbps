@@ -19,7 +19,7 @@ The differ sorts every planned change by, in order:
 
    | Class | Changes |
    |---|---|
-   | 0 | `DropModule`, `DropRole` |
+   | 0 | `DropModule`, `DropRole`; P: `SetReplicaIdentity` to a target that stands, at (0, 1) |
    | 1 | `RenameTable`, `RenameRole` |
    | 2 | `DropIndex`, `DropUnique`, `DropForeignKey`, `DropCheck`, `SetPrimaryKey { to: None }`; `DropComputedColumn` at the class's end (2, 4) |
    | 3 | `RenameColumn` |
@@ -32,7 +32,7 @@ The differ sorts every planned change by, in order:
    | 10 | `SetColumnDeprecated` |
    | 11 | `InsertRow`, `UpdateRow` |
    | 12 | `DeleteRow` |
-   | 13 | `SetPrimaryKey { to: Some }`, `AddUnique`, `AddForeignKey`, `AddCheck`, `AddIndex` |
+   | 13 | `SetPrimaryKey { to: Some }`, `AddUnique`, `AddForeignKey`, `AddCheck`, `AddIndex`; P: the other `SetReplicaIdentity`, last |
    | 14 | `CreateModule`, `AlterModule` |
    | 15 | `CreateRole` |
    | 16 | `Grant`, `PublicExecution` |
@@ -53,7 +53,10 @@ The differ sorts every planned change by, in order:
      DECISIONS 127);
    - a foreign key comes after the key it references;
    - a clustered index comes before the other indexes of its table
-     (DEC-1178.1).
+     (DEC-1178.1);
+   - a replica identity whose target the plan adds, or whose columns become
+     NOT NULL in it, comes after every addition of class 13; any other comes
+     first, at (0, 1) (DEC-1444.1).
 3. **`subject()`, then the change's rendering**, which only breaks ties.
 
 Then, in this order:
@@ -161,6 +164,7 @@ requirement is common to all of them, so it is listed once,
 | `DeleteRow` | 12 | Child rows moved away or cascaded | Removes a row |
 | `SetPrimaryKey { to: Some }`, `AddUnique`, `AddIndex` | 13 | Columns, NOT NULL, unique data; a clustered index first | A key or index |
 | `AddForeignKey` | 13 | Its columns, the referenced key, valid data | A foreign key |
+| `SetReplicaIdentity` | 0 (0, 1) or 13, last | P: the key, unique constraint or unique index it names, over NOT NULL columns. At (0, 1) when that stands before the plan, before any drop of the old identity's index; after the additions otherwise | The table's replica identity (DEC-1444.1) |
 | `AddCheck` | 13 | Its columns, valid data. Functions it calls: *content* | A check |
 | `CreateModule`, `AlterModule` | 14 | What its definition names: other modules, by lexed name (DECISIONS 315); tables, columns and types | A module. P `AlterModule`: a drop and a create |
 | `CreateRole` | 15 | The name free | A role |
@@ -257,6 +261,8 @@ and the expression-bearing changes that need a function.
 | S: function created → `AddComputedColumn` calling it | content, over-approximated | refused by name (`may_name`): the function is class 14 | ✓ DEC-1174.1 |
 | Retype of a generated column → its `AlterColumnExpression` | fixed | rank −1 before 0: the new expression is computed in the final type | ✓ DEC-1168.1 (`a_generated_columns_nullability_relaxes_before_and_tightens_after_its_expression`) |
 | Referenced key → `AddForeignKey` | fixed | rank inside class 13 | ✓ |
+| P: `SetPrimaryKey`, `AddUnique` or `AddIndex` of the identity's index, new or rebuilt → `SetReplicaIdentity` | fixed | rank 2, last in class 13. A rebuilt index is not the identity until it is set again, so the differ plans the identity wherever the plan re-adds its index | ✓ DEC-1444.1 |
+| P: `SetReplicaIdentity` to a target that stands → `DropIndex`, `DropUnique` or `SetPrimaryKey { to: None }` of the old identity's index | fixed | (0, 1) before class 2. Dropped first, the old index leaves the table identifying no row until the identity is set | ✓ DEC-1444.1 |
 | `CreateRole` → `Grant` to it | fixed | class 15 before 16 | ✓ |
 | `CreateModule` or `AlterModule` → `Grant` or `PublicExecution` on the routine | fixed | class 14 before 16. P: a rebuild's lost grants and `PUBLIC` execute are restated after it | ✓ ADR-0010 §5 |
 | Tightening → primary key or unique key over the column | fixed | class 9 before 13 | ✓ |

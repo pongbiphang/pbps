@@ -782,6 +782,7 @@ impl AsStored {
                 | Change::RenameRole { .. }
                 | Change::Grant { .. }
                 | Change::Revoke { .. }
+                | Change::SetReplicaIdentity { .. }
                 | Change::PublicExecution { .. } => {}
             }
         }
@@ -3370,6 +3371,7 @@ fn build(
         | Change::RenameRole { .. }
         | Change::Grant { .. }
         | Change::Revoke { .. }
+        | Change::SetReplicaIdentity { .. }
         | Change::PublicExecution { .. } => Ok(Vec::new()),
     }
 }
@@ -3590,6 +3592,7 @@ pub(crate) fn probes(changes: &ChangeSet) -> Preflight {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::DropForeignKey { .. }

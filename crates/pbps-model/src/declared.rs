@@ -406,6 +406,7 @@ impl Declared {
                 | Change::AlterColumnNullability { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
+                | Change::SetReplicaIdentity { .. }
                 | Change::AddUnique { .. }
                 | Change::DropUnique { .. }
                 | Change::AddForeignKey { .. }

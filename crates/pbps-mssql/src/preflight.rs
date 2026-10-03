@@ -358,6 +358,7 @@ impl AsStored {
                 | Change::AlterColumnExpression { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
+                | Change::SetReplicaIdentity { .. }
                 | Change::AddUnique { .. }
                 | Change::DropUnique { .. }
                 | Change::AddForeignKey { .. }
@@ -589,6 +590,7 @@ impl AsStored {
                 | Change::RenameRole { .. }
                 | Change::Grant { .. }
                 | Change::Revoke { .. }
+                | Change::SetReplicaIdentity { .. }
                 | Change::PublicExecution { .. } => {}
             }
         }
@@ -1047,6 +1049,7 @@ fn build(
         // This dialect never produces one and `emit` refuses it; a probe
         // would be a second opinion about a statement that will not be
         // written.
+        | Change::SetReplicaIdentity { .. }
         | Change::PublicExecution { .. } => Ok(Vec::new()),
 
         // Except for the one thing a permission change can fail on that is

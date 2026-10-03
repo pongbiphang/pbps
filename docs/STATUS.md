@@ -28,6 +28,13 @@ the UNIQUE constraint or index that holds the rows; absent is a clustered
 primary key), and `pull` reads it (#1178, DEC-1178.1). PostgreSQL refuses the
 field. Columnstore, XML, spatial and hash indexes stay limitations.
 
+A PostgreSQL table declares its replica identity with `replica_identity:`
+(`full`, `nothing`, `primary_key`, or the UNIQUE constraint or unique index
+whose index it is; absent is the default), `pull` reads it, and a plan sets it
+again wherever it rebuilds the index it names (#1444, DEC-1444.1). A `USING
+INDEX` identity whose index was dropped stays a limitation. SQL Server refuses
+the field.
+
 A SQL Server column may name its collation (`collation:`); `pull` declares one
 that differs from the database's default, and a collation change is a planned
 `ALTER COLUMN` that rebuilds the keys around it (#1175, DEC-1175.1).

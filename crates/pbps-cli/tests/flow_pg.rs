@@ -948,6 +948,7 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
             | change @ pbps_model::Change::AlterColumnExpression { .. }
             | change @ pbps_model::Change::SetColumnDeprecated { .. }
             | change @ pbps_model::Change::SetPrimaryKey { .. }
+            | change @ pbps_model::Change::SetReplicaIdentity { .. }
             | change @ pbps_model::Change::AddUnique { .. }
             | change @ pbps_model::Change::DropUnique { .. }
             | change @ pbps_model::Change::AddForeignKey { .. }
@@ -6262,6 +6263,89 @@ fn a_generated_columns_expression_change_is_refused_by_name_before_postgres_17()
         "DO $$ BEGIN IF current_setting('server_version_num')::integer >= 170000 THEN RAISE EXCEPTION 'this regression needs a pre-17 server'; END IF; END $$",
     );
     generated_column_flow(&server, "generated-1168-old", false);
+}
+
+/// A replica identity goes the whole way through the CLI (#1444). Pulled as
+/// declared, moved to an index the same plan creates, after it, while its
+/// old index is dropped, applied and verified. Then reset by hand on the
+/// server, which is drift the next plan names rather than a change it
+/// quietly restates.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_replica_identity_moves_to_a_new_index_through_the_cli() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "replica-identity-1444");
+    let connection = own.connection().to_owned();
+    on_server(
+        &connection,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.t (id integer PRIMARY KEY, code integer NOT NULL, v integer); \
+         CREATE UNIQUE INDEX t_code ON app.t (code); \
+         ALTER TABLE app.t REPLICA IDENTITY USING INDEX t_code; \
+         INSERT INTO app.t VALUES (1, 10, NULL), (2, 20, 5)",
+    );
+    let d = Demo::new("replica-identity-1444");
+    succeeds(d.run(&["pull", "--db", &connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    let path = d.dir.join("schema/app.t.yml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let pulled = "indexes:\n  t_code:\n    columns: [code]\n    unique: true\n\nreplica_identity: {index: t_code}\n";
+    assert!(text.contains(pulled), "{text}");
+    std::fs::write(
+        &path,
+        text.replace(
+            pulled,
+            "indexes:\n  t_id_code:\n    columns: [id, code]\n    unique: true\n\nreplica_identity: {index: t_id_code}\n",
+        ),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        &connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    assert!(
+        at("CREATE UNIQUE INDEX \"t_id_code\"") < at("REPLICA IDENTITY USING INDEX \"t_id_code\""),
+        "{script}"
+    );
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--allow", "destructive", "--allow", "constraint"],
+    ));
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
+    // Reset by someone else: drift, named, not restated.
+    on_server(&connection, "ALTER TABLE app.t REPLICA IDENTITY DEFAULT");
+    let drifted = d.run(&["plan", "--db", &connection]);
+    assert_ne!(code(&drifted), 0, "{}", stdout(&drifted));
+    assert!(
+        stderr(&drifted).contains("has drifted"),
+        "{}",
+        stderr(&drifted)
+    );
+    let verified = d.run(&["verify", "--db", &connection]);
+    assert_ne!(code(&verified), 0, "{}", stdout(&verified));
+    let said = format!("{}{}", stdout(&verified), stderr(&verified));
+    assert!(said.contains("app.t"), "{said}");
 }
 
 /// Two functions dropped together, `g` calling `f`, each released from a

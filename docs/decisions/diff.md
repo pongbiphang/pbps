@@ -1766,3 +1766,83 @@ tables, functions and columns it reads.
 `computed_function_drops_follow_the_catalogs_edges` and
 `the_catalogs_edges_refuse_what_the_engine_would`
 (`crates/pbps-cli/tests/flow.rs`).
+
+<a id="dec-1444-1"></a>
+
+**DEC-1444.1. A PostgreSQL table declares its replica identity under
+`replica_identity:`, and a plan sets it where it changes and wherever the
+plan re-adds the index it names (#1444).**
+
+Measured on 16.15 and 18.6, alike:
+
+- `pg_class.relreplident` is `d`, `f`, `n` or `i`; for `i`,
+  `pg_index.indisreplident` marks the index, which may be a primary key's.
+- `USING INDEX` refuses a partial index and one over a nullable column.
+- `DROP INDEX` of the identity's index succeeds, and leaves `relreplident =
+  'i'` with no index marked: the table identifies no row. A rebuilt index
+  (drop and create) is therefore not the identity until it is set again. A
+  retype that rebuilds the index in place keeps it.
+
+**Model.** `Table::replica_identity`, `None` for the default: `full`,
+`nothing`, `primary_key`, `{unique: <name>}` or `{index: <name>}`. One
+selector naming the owner of the index by kind, as `clustered` does
+(DEC-1178.1). `primary_key` is held apart from the default because the
+catalog holds it apart, although it identifies the same rows while the key
+stands. Validation refuses an identity on nothing, on a non-unique, partial or
+expression index, and on nullable columns. SQL Server refuses the key.
+
+**Plan.** `SetReplicaIdentity { uid, table, to }`, planned where the declared
+identity differs from the database's, and wherever the plan adds the object
+whose index it names, new or rebuilt by any pass of the differ. Two places:
+
+- First, at (0, 1) and under the table's old name, where the table can take
+  the target as it stands: every target the plan does not add, when the
+  columns it is over are NOT NULL already. That is before the drops of class
+  2, so an identity moved off an index the plan drops never leaves the table
+  identifying no row.
+- Otherwise last in class 13, after the index it names and after the NOT NULL
+  of class 9. An identity moved to a new index while its old one is dropped
+  identifies no row between the two, inside the plan.
+
+A created table sets it as its `CREATE`'s last statement, after its indexes;
+where the resolver splits the indexes out of the `CREATE`, an identity on one
+of them is split out after them. The resolver's rule ordering an index
+against its table's other changes would put the identity before every add
+and after every drop, so the identity is exempt from it and keeps the
+differ's order.
+
+The primary key's index is found by a `DO` block when the statement runs, as
+an unnamed key's drop is: a pulled key carries no name, and the server names
+an unnamed one `_pkey` or `_pkey1`.
+
+**No risk class.** The identity decides what logical replication carries to
+name an old row, which is neither a row nor an access. `nothing` on a
+published table makes later replicated `UPDATE`s and `DELETE`s fail, which is
+the publication's to manage, and pbps does not manage publications.
+
+**Read.** A table is held whatever its identity, except one whose `USING
+INDEX` names no index: that is not `nothing`, which someone chose, and no
+declaration spells it, so the table is left out and named. An identity on an
+index the pull leaves out is named too, and never read as the default.
+
+**Drift.** A touched table's identity that changes across an apply is
+movement unless the plan sets it; a created table is held to its declared
+identity once it shows one or the run is whole.
+
+Tests:
+
+- `a_replica_identity_must_name_an_index_postgres_takes` (`crates/pbps-model`);
+- `every_replica_identity_round_trips`, `an_unknown_replica_identity_is_rejected`
+  (`crates/pbps-load`);
+- `a_replica_identity_is_set_before_its_old_index_goes_and_after_its_new_one_comes`,
+  `splitting_table_creation_sets_an_index_identity_after_its_index`,
+  `a_replica_identity_keeps_its_order_against_its_tables_indexes`
+  (`crates/pbps-diff`);
+- `every_replica_identity_spells_its_statement`,
+  `a_replica_identity_is_read_as_the_object_owning_its_index` (`crates/pbps-pg`);
+- `a_replica_identity_is_refused_on_sql_server` (`crates/pbps-mssql`);
+- `a_replica_identity_moved_by_someone_else_is_movement` (`crates/pbps-cli`);
+- the live `every_replica_identity_round_trips_and_moves_as_a_typed_plan`
+  (`crates/pbps-pg/tests/live.rs`, on 16 and 18) and
+  `a_replica_identity_moves_to_a_new_index_through_the_cli`
+  (`crates/pbps-cli/tests/flow_pg.rs`).

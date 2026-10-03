@@ -2926,6 +2926,10 @@ fn refuse_unplanned_movement(
     // the other from every comparison (DECISIONS 168).
     let mut constraints: BTreeMap<&TableName, BTreeSet<(pbps_model::Part, &str)>> = BTreeMap::new();
     let mut keys: BTreeSet<&TableName> = BTreeSet::new();
+    // The tables whose replica identity this plan sets, by the name the
+    // change runs under: the old one ahead of the renames, the new one after
+    // the additions (DEC-1444.1).
+    let mut identities: BTreeSet<&TableName> = BTreeSet::new();
     // The defaults a change of this plan's own sets, by column. A created
     // table's column may have its default taken out of the `CREATE` and set
     // after a function the plan rebuilds (#1027, DEC-942.1), so the payload
@@ -3019,6 +3023,9 @@ fn refuse_unplanned_movement(
         }
         if let pbps_model::Change::CreateTable { name, table, .. } = &p.change {
             created.insert(name, table.as_ref());
+        }
+        if let pbps_model::Change::SetReplicaIdentity { table, .. } = &p.change {
+            identities.insert(table);
         }
         if let pbps_model::Change::AlterColumnDefault { column, to, .. } = &p.change {
             set_defaults.insert((&column.table, column.name.as_str()), to.as_ref());
@@ -3445,6 +3452,17 @@ fn refuse_unplanned_movement(
                     "{now_name} is not clustered the way this plan's `CREATE TABLE` declares"
                 ));
             }
+            // The replica identity is the `CREATE`'s last statement (#1444):
+            // until then the table reads as the default, which is the plan in
+            // progress; any other identity is the one it ends with.
+            if (settled.whole() || now.replica_identity.is_some())
+                && declared.replica_identity != now.replica_identity
+            {
+                moved.push(format!(
+                    "{now_name} replica identity is not the one this plan's `CREATE TABLE` \
+                     declares"
+                ));
+            }
             if settled.whole() && declared.primary_key.is_some() && now.primary_key.is_none() {
                 moved.push(format!(
                     "{now_name} has no primary key, and this plan's `CREATE TABLE` declares one"
@@ -3630,6 +3648,16 @@ fn refuse_unplanned_movement(
                 s,
                 m,
             );
+            // The replica identity, which every part can read back unchanged
+            // around: excused only where this plan sets it (#1444).
+            if was.replica_identity != now.replica_identity
+                && !identities.contains(name)
+                && !identities.contains(now_name)
+            {
+                moved.push(format!(
+                    "{now_name} replica identity changed, and no change of this plan sets it"
+                ));
+            }
             // And which of them holds the rows (#1178). Every part can read
             // back unchanged while another session moves the clustered index
             // between them, so the layout is compared on its own. The plan
@@ -3741,7 +3769,8 @@ fn refuse_unplanned_movement(
                         | pbps_model::Change::RenameRole { .. }
                         | pbps_model::Change::Grant { .. }
                         | pbps_model::Change::Revoke { .. }
-                        | pbps_model::Change::PublicExecution { .. } => {}
+                        | pbps_model::Change::PublicExecution { .. }
+                        | pbps_model::Change::SetReplicaIdentity { .. } => {}
                     }
                 }
                 let passes_through = now_holder.is_none() || now_holder == planned;
@@ -11926,6 +11955,111 @@ mod tests {
                 assert!(format!("{e:#}").contains("index `ix`"), "{other:?}: {e:#}");
             }
         }
+    }
+
+    /// A touched table is held to its replica identity, which every part can
+    /// read back unchanged around (#1444); the plan's own setting of it, under
+    /// the name it runs by, is not movement. A created table is held to its
+    /// declared identity once it shows one, or once the run is whole.
+    #[test]
+    fn a_replica_identity_moved_by_someone_else_is_movement() {
+        use pbps_model::{Change, Column, PlannedChange, ReplicaIdentity, Table};
+        let name = TableName::new("app", "t");
+        let mut t = Table::default();
+        t.columns.insert(
+            "id".into(),
+            Column::new("integer".parse().unwrap()).not_null(),
+        );
+        let schema = |identity: Option<ReplicaIdentity>| {
+            let mut t = t.clone();
+            t.replica_identity = identity;
+            Schema {
+                tables: [(name.clone(), t)].into(),
+                ..Default::default()
+            }
+        };
+        let unrelated = pbps_model::ChangeSet {
+            changes: vec![PlannedChange::new(Change::AddCheck {
+                table: name.clone(),
+                name: "ck".into(),
+                constraint: pbps_model::CheckConstraint {
+                    expression: "id > 0".into(),
+                },
+            })],
+        };
+        let check = |plan: &pbps_model::ChangeSet, before: &Schema, after: &Schema, settled| {
+            refuse_unplanned_movement(
+                &pbps_pg::Postgres::new(),
+                plan,
+                before,
+                after,
+                "test",
+                settled,
+            )
+        };
+        check(&unrelated, &schema(None), &schema(None), Settled::SoFar).expect("unchanged");
+        let e = check(
+            &unrelated,
+            &schema(None),
+            &schema(Some(ReplicaIdentity::Full)),
+            Settled::SoFar,
+        )
+        .expect_err("another session set FULL");
+        assert!(
+            format!("{e:#}").contains("replica identity changed"),
+            "{e:#}"
+        );
+        let setting = pbps_model::ChangeSet {
+            changes: vec![PlannedChange::new(Change::SetReplicaIdentity {
+                uid: "t_000000".parse().unwrap(),
+                table: name.clone(),
+                to: Some(ReplicaIdentity::Full),
+            })],
+        };
+        check(
+            &setting,
+            &schema(None),
+            &schema(Some(ReplicaIdentity::Full)),
+            Settled::SoFar,
+        )
+        .expect("the plan's own setting");
+
+        // Created: the default mid-run is the plan in progress; another
+        // identity, or the default once the run is whole, is not.
+        let mut declared = t.clone();
+        declared.replica_identity = Some(ReplicaIdentity::Full);
+        let creating = pbps_model::ChangeSet {
+            changes: vec![PlannedChange::new(Change::CreateTable {
+                uid: "t_000000".parse().unwrap(),
+                name: name.clone(),
+                table: Box::new(declared),
+            })],
+        };
+        let empty = Schema::default();
+        check(&creating, &empty, &schema(None), Settled::SoFar).expect("not set yet");
+        check(
+            &creating,
+            &empty,
+            &schema(Some(ReplicaIdentity::Full)),
+            Settled::Whole,
+        )
+        .expect("as declared");
+        let e = check(&creating, &empty, &schema(None), Settled::Whole).expect_err("never set");
+        assert!(
+            format!("{e:#}").contains("replica identity is not the one"),
+            "{e:#}"
+        );
+        let e = check(
+            &creating,
+            &empty,
+            &schema(Some(ReplicaIdentity::Nothing)),
+            Settled::SoFar,
+        )
+        .expect_err("set otherwise");
+        assert!(
+            format!("{e:#}").contains("replica identity is not the one"),
+            "{e:#}"
+        );
     }
 
     /// An existing table the plan touches for something else is held to its

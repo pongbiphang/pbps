@@ -332,6 +332,7 @@ fn role_of(change: &Change) -> Option<&str> {
         | Change::AlterColumnExpression { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::SetPrimaryKey { .. }
+        | Change::SetReplicaIdentity { .. }
         | Change::AddUnique { .. }
         | Change::DropUnique { .. }
         | Change::AddForeignKey { .. }
@@ -380,6 +381,7 @@ fn renames(cs: &ChangeSet) -> Renames {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
@@ -695,6 +697,10 @@ pub fn describe(c: &Change) -> String {
         Change::SetPrimaryKey { to, .. } => match to {
             Some(pk) => format!("~ primary key -> ({})", pk.columns.join(", ")),
             None => "- drop primary key".to_owned(),
+        },
+        Change::SetReplicaIdentity { to, .. } => match to {
+            Some(identity) => format!("~ replica identity -> {identity}"),
+            None => "~ replica identity -> default".to_owned(),
         },
         Change::AddUnique { name, .. } => format!("+ unique constraint {name}"),
         Change::DropUnique { name, .. } => format!("- unique constraint {name}"),

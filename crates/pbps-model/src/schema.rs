@@ -190,6 +190,63 @@ impl Table {
         matches!(&self.clustered, Some(Clustered::Index(n)) if n == name)
     }
 
+    /// Why this table's [`Table::replica_identity`] cannot be what it says:
+    /// PostgreSQL takes as the identity only the index of a key, a unique
+    /// constraint, or a unique index that is not partial, over columns that
+    /// are all NOT NULL (measured on 16 and 18, #1444).
+    pub fn replica_identity_problems(&self) -> Vec<String> {
+        let nullable = |columns: &[String]| -> Vec<String> {
+            columns
+                .iter()
+                .filter(|c| self.columns.get(*c).is_some_and(|col| col.nullable))
+                .cloned()
+                .collect()
+        };
+        let over = |what: String, columns: &[String]| -> Vec<String> {
+            let open = nullable(columns);
+            if open.is_empty() {
+                Vec::new()
+            } else {
+                vec![format!(
+                    "`replica_identity` names {what}, over nullable column(s) `{}`, which \
+                     PostgreSQL does not take as a replica identity; declare them NOT NULL",
+                    open.join("`, `")
+                )]
+            }
+        };
+        match &self.replica_identity {
+            None | Some(ReplicaIdentity::Full | ReplicaIdentity::Nothing) => Vec::new(),
+            Some(ReplicaIdentity::PrimaryKey) if self.primary_key.is_none() => vec![
+                "`replica_identity: primary_key` on a table with no primary key names nothing"
+                    .to_owned(),
+            ],
+            Some(ReplicaIdentity::PrimaryKey) => Vec::new(),
+            Some(ReplicaIdentity::Unique(n)) => match self.unique.get(n) {
+                None => vec![format!(
+                    "`replica_identity` names unique constraint `{n}`, which this table does not \
+                     declare"
+                )],
+                Some(u) => over(format!("unique constraint `{n}`"), &u.columns),
+            },
+            Some(ReplicaIdentity::Index(n)) => match self.indexes.get(n) {
+                None => vec![format!(
+                    "`replica_identity` names index `{n}`, which this table does not declare"
+                )],
+                Some(ix) if !ix.unique || ix.filter.is_some() => vec![format!(
+                    "`replica_identity` names index `{n}`, which is not unique or is partial; \
+                     PostgreSQL takes only a unique, non-partial index"
+                )],
+                Some(ix) => match ix.column_keys() {
+                    None => vec![format!(
+                        "`replica_identity` names index `{n}`, which holds an expression; \
+                         PostgreSQL takes only an index over plain columns"
+                    )],
+                    Some(columns) => over(format!("index `{n}`"), &columns),
+                },
+            },
+        }
+    }
+
     /// Why this table's [`Table::clustered`] cannot be what it says.
     ///
     /// Structural, so every dialect asks it, as it asks
@@ -308,6 +365,17 @@ pub struct Table {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clustered: Option<Clustered>,
 
+    /// What a PostgreSQL table's logical-replication change records carry
+    /// to identify an old row, where that is not the default (#1444).
+    ///
+    /// `None` is `REPLICA IDENTITY DEFAULT`: the primary key, or nothing
+    /// without one. A reading, not a gap: until this field existed a table
+    /// with any other identity was left out of the pull as a limitation, so
+    /// every table pbps recorded had the default, and a state or plan
+    /// without the field reads as `None` truthfully.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_identity: Option<ReplicaIdentity>,
+
     /// Declared reference data (ADR-0004).
     ///
     /// `None` — the overwhelmingly common case — is the opt-in switch being
@@ -340,6 +408,42 @@ pub enum Clustered {
     /// This index is the clustered one; the primary key, if any, is
     /// nonclustered.
     Index(String),
+}
+
+/// What a PostgreSQL table's logical-replication records carry to identify
+/// an old row, where that is not the default (#1444). Names an index's
+/// owner by kind and declared name, as [`Clustered`] does: constraints and
+/// indexes are never renamed in place, so the selector follows a rename by
+/// being written with the new name.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicaIdentity {
+    /// `REPLICA IDENTITY FULL`: every column of the old row.
+    Full,
+    /// `REPLICA IDENTITY NOTHING`: no old row, so a published table takes
+    /// no replicated `UPDATE` or `DELETE`.
+    Nothing,
+    /// `USING INDEX` the primary key's index. It carries what the default
+    /// does while the key stands, but the catalog holds it apart, so the
+    /// model does too.
+    PrimaryKey,
+    /// `USING INDEX` this UNIQUE constraint's index.
+    Unique(String),
+    /// `USING INDEX` this unique index.
+    Index(String),
+}
+
+/// As the declaration spells it.
+impl std::fmt::Display for ReplicaIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Full => f.write_str("full"),
+            Self::Nothing => f.write_str("nothing"),
+            Self::PrimaryKey => f.write_str("primary_key"),
+            Self::Unique(n) => write!(f, "{{unique: {n}}}"),
+            Self::Index(n) => write!(f, "{{index: {n}}}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1032,6 +1136,99 @@ mod tests {
         assert!(!t.primary_key_is_clustered());
         assert!(t.unique_is_clustered("uq_email"));
         assert!(!t.index_is_clustered("uq_email"));
+    }
+
+    /// The identity names an object PostgreSQL can take: a key, a unique
+    /// constraint, or a unique, non-partial index over plain columns, all
+    /// NOT NULL. Anything else is refused by name (measured on 16 and 18,
+    /// #1444).
+    #[test]
+    fn a_replica_identity_must_name_an_index_postgres_takes() {
+        let mut t = sample();
+        let index = |unique: bool, filter: Option<&str>, key: IndexKey| Index {
+            columns: vec![IndexColumn {
+                key,
+                descending: false,
+                opclass: None,
+            }],
+            include: Vec::new(),
+            unique,
+            filter: filter.map(Into::into),
+            method: IndexMethod::default(),
+        };
+        let column = |c: &str| IndexKey::Column(c.into());
+        t.unique.insert(
+            "uq_id".into(),
+            UniqueConstraint {
+                columns: vec!["customer_id".into()],
+            },
+        );
+        t.unique.insert(
+            "uq_email".into(),
+            UniqueConstraint {
+                columns: vec!["email".into()],
+            },
+        );
+        t.indexes
+            .insert("ix_id".into(), index(true, None, column("customer_id")));
+        t.indexes
+            .insert("ix_plain".into(), index(false, None, column("customer_id")));
+        t.indexes.insert(
+            "ix_part".into(),
+            index(true, Some("customer_id > 0"), column("customer_id")),
+        );
+        t.indexes.insert(
+            "ix_expr".into(),
+            index(true, None, IndexKey::Expression("customer_id + 1".into())),
+        );
+        t.indexes
+            .insert("ix_email".into(), index(true, None, column("email")));
+        for fine in [
+            None,
+            Some(ReplicaIdentity::Full),
+            Some(ReplicaIdentity::Nothing),
+            Some(ReplicaIdentity::PrimaryKey),
+            Some(ReplicaIdentity::Unique("uq_id".into())),
+            Some(ReplicaIdentity::Index("ix_id".into())),
+        ] {
+            t.replica_identity = fine.clone();
+            assert!(t.replica_identity_problems().is_empty(), "{fine:?}");
+        }
+        for (wrong, says) in [
+            (
+                ReplicaIdentity::Unique("uq_missing".into()),
+                "does not declare",
+            ),
+            (ReplicaIdentity::Index("uq_id".into()), "does not declare"),
+            (
+                ReplicaIdentity::Index("ix_plain".into()),
+                "not unique or is partial",
+            ),
+            (
+                ReplicaIdentity::Index("ix_part".into()),
+                "not unique or is partial",
+            ),
+            (
+                ReplicaIdentity::Index("ix_expr".into()),
+                "holds an expression",
+            ),
+            (
+                ReplicaIdentity::Index("ix_email".into()),
+                "nullable column(s) `email`",
+            ),
+            (
+                ReplicaIdentity::Unique("uq_email".into()),
+                "nullable column(s) `email`",
+            ),
+        ] {
+            t.replica_identity = Some(wrong.clone());
+            let problems = t.replica_identity_problems();
+            assert_eq!(problems.len(), 1, "{wrong:?}");
+            assert!(problems[0].contains(says), "{wrong:?}: {problems:?}");
+        }
+        t.primary_key = None;
+        t.replica_identity = Some(ReplicaIdentity::PrimaryKey);
+        assert!(t.replica_identity_problems()[0].contains("names nothing"));
     }
 
     /// A snapshot or plan from before the field reads as the default layout,

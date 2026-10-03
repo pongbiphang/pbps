@@ -227,6 +227,12 @@ indexes:
   primary key, or a heap for a table without one — the engine's own default.
   One selector per table, so two clustered indexes cannot be written;
   PostgreSQL refuses the key (DEC-1178.1).
+- **`replica_identity` says what a PostgreSQL table's logical-replication
+  records carry to name an old row**, only where that is not the default:
+  `full`, `nothing`, `primary_key`, or `{unique: uq_x}` / `{index: ix_x}` for
+  the constraint or unique index whose index it is. Absent means `DEFAULT`.
+  The index must be unique, not partial, over NOT NULL columns; SQL Server
+  refuses the key (DEC-1444.1).
 - **An index key is `column [opclass] [asc|desc]`**, in PostgreSQL's order, and
   `method:` names the access method only where it is not the default `btree`.
   An absent class is the method's default for the column's type. The first

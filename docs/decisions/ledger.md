@@ -1111,3 +1111,13 @@ recorder accepts a managed table carrying one. A state older than that report
 reads back as drift. A version 12 plan would restate every `ALTER COLUMN`
 without a collation, which this build's emitter reads as the default, moving
 a collated column to it. So it is refused as stale.
+
+<a id="dec-1444-2"></a>
+
+**DEC-1444.2. State version 14 adds a table's replica identity and still reads
+6 to 13; plan version 18 turns 17 away.** An absent identity is the default.
+That is what every table an older reader recorded had: one with any other
+identity was left out of the pull as a limitation, and no recorder accepts a
+managed table carrying one. A plan is read at its own version only, and an
+older build reading a version 18 plan would create a table without the
+identity it was reviewed with, so the version is what refuses it there.

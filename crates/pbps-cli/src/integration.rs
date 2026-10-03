@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 23;
+pub const SCHEMA_VERSION: u32 = 24;
+// 24: a table's `replica_identity:` (issue #1444).
 // 23: a table's `computed:` (issue #1174).
 // 22: a column's `generated:` (issue #1168).
 // 21: an index's `keys:`, which may hold expression keys (issue #1169).

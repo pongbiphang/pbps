@@ -48,3 +48,4 @@ DECISIONS 465).
 - `21/` adds an index's `keys:`, which may hold expression keys (issue #1169).
 - `22/` adds a column's `generated:` (issue #1168).
 - `23/` adds a table's `computed:` (issue #1174).
+- `24/` adds a table's `replica_identity:` (issue #1444).

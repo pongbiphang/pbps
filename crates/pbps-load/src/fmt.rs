@@ -15,7 +15,8 @@
 use std::fmt::Write as _;
 
 use pbps_model::{
-    Clustered, Intent, Module, ModuleId, ObjectName, PrimaryKey, Strategy, Table, TableName,
+    Clustered, Intent, Module, ModuleId, ObjectName, PrimaryKey, ReplicaIdentity, Strategy, Table,
+    TableName,
 };
 
 /// Renders one table as canonical YAML.
@@ -229,6 +230,19 @@ pub fn render(
         }
         Some(Clustered::Index(n)) => {
             let _ = writeln!(s, "\nclustered: {{index: {}}}", scalar(n));
+        }
+    }
+    // The same, for the same reason.
+    match &table.replica_identity {
+        None => {}
+        Some(ReplicaIdentity::Full) => s.push_str("\nreplica_identity: full\n"),
+        Some(ReplicaIdentity::Nothing) => s.push_str("\nreplica_identity: nothing\n"),
+        Some(ReplicaIdentity::PrimaryKey) => s.push_str("\nreplica_identity: primary_key\n"),
+        Some(ReplicaIdentity::Unique(n)) => {
+            let _ = writeln!(s, "\nreplica_identity: {{unique: {}}}", scalar(n));
+        }
+        Some(ReplicaIdentity::Index(n)) => {
+            let _ = writeln!(s, "\nreplica_identity: {{index: {}}}", scalar(n));
         }
     }
 
@@ -858,6 +872,58 @@ indexes:
         ] {
             let yaml = format!(
                 "table: dbo.t\ncolumns:\n  code: {{type: int}}\nindexes:\n  ix_code:\n    columns: [code]\n{line}\n"
+            );
+            assert!(
+                crate::load_table_str(Path::new("t.yml"), &yaml).is_err(),
+                "{line} should not load"
+            );
+        }
+    }
+
+    /// Each form of the replica identity reads back as the model value it
+    /// names and renders to the same text again, and the default writes
+    /// nothing (#1444).
+    #[test]
+    fn every_replica_identity_round_trips() {
+        use pbps_model::ReplicaIdentity as R;
+        let base = "table: public.t\ncolumns:\n  id: {type: int, nullable: false}\n  code: {type: int, nullable: false}\n\nprimary_key: [id]\n\nunique:\n  uq_code: [code]\n\nindexes:\n  ix_code:\n    columns: [code]\n    unique: true\n";
+        for (line, expected) in [
+            ("replica_identity: full", R::Full),
+            ("replica_identity: nothing", R::Nothing),
+            ("replica_identity: primary_key", R::PrimaryKey),
+            (
+                "replica_identity: {unique: uq_code}",
+                R::Unique("uq_code".into()),
+            ),
+            (
+                "replica_identity: {index: ix_code}",
+                R::Index("ix_code".into()),
+            ),
+        ] {
+            let yaml = format!("{base}\n{line}\n");
+            round_trip(&yaml);
+            let t = crate::load_table_str(Path::new("t.yml"), &yaml).unwrap();
+            assert_eq!(t.table.replica_identity, Some(expected), "{yaml}");
+            let out = render(&t.name, &t.table, &t.intents, None);
+            assert!(out.contains(&format!("\n{line}\n")), "{out}");
+        }
+        let t = crate::load_table_str(Path::new("t.yml"), base).unwrap();
+        assert_eq!(t.table.replica_identity, None);
+        assert!(!render(&t.name, &t.table, &t.intents, None).contains("replica_identity"));
+    }
+
+    /// A misspelt identity is an error, not the default: read as absent,
+    /// `replica_identity: ful` would plan the table back to `DEFAULT`.
+    #[test]
+    fn an_unknown_replica_identity_is_rejected() {
+        for line in [
+            "replica_identity: ful",
+            "replica_identity: default",
+            "replica_identity: {indx: ix_code}",
+            "replica_identity: [ix_code]",
+        ] {
+            let yaml = format!(
+                "table: public.t\ncolumns:\n  code: {{type: int, nullable: false}}\nindexes:\n  ix_code:\n    columns: [code]\n    unique: true\n{line}\n"
             );
             assert!(
                 crate::load_table_str(Path::new("t.yml"), &yaml).is_err(),

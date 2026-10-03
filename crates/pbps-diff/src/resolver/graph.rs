@@ -211,6 +211,11 @@ pub(super) fn constraints(
                 (change.table(), other.table(), expression(change))
                 && t == u
                 && expression(other).is_none()
+                // A replica identity follows the index it names and goes
+                // ahead of the old identity's index's drop, as the differ
+                // ordered it (DEC-1444.1); this rule would put it before
+                // every add and after every drop of its table's indexes.
+                && !matches!(other, Change::SetReplicaIdentity { .. })
             {
                 if row(other) {
                     // A DEFAULT is consumed by INSERT/UPDATE. CHECKs and

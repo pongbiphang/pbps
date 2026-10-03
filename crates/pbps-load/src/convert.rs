@@ -9,11 +9,15 @@ use std::str::FromStr;
 
 use pbps_model::{
     CheckConstraint, Clustered, Column, ColumnType, DataMode, ForeignKey, GrantTarget, Identity,
-    Index, IndexColumn, Intent, Module, ModuleId, ModuleKind, Permission, PrimaryKey, Role, Row,
-    RowKey, Strategy, Table, TableData, TableName, UniqueConstraint, Value,
+    Index, IndexColumn, Intent, Module, ModuleId, ModuleKind, Permission, PrimaryKey,
+    ReplicaIdentity, Role, Row, RowKey, Strategy, Table, TableData, TableName, UniqueConstraint,
+    Value,
 };
 
-use crate::dto::{ClusteredDto, DataDto, ModuleDto, PrimaryKeyDto, RoleDto, TableDto, ValueDto};
+use crate::dto::{
+    ClusteredDto, DataDto, ModuleDto, PrimaryKeyDto, ReplicaIdentityDto, RoleDto, TableDto,
+    ValueDto,
+};
 use crate::error::{LoadError, SourceFile, to_span};
 
 /// The result of loading one declaration file.
@@ -396,6 +400,13 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
                     ClusteredDto::Heap => Clustered::Heap,
                     ClusteredDto::Unique(name) => Clustered::Unique(name),
                     ClusteredDto::Index(name) => Clustered::Index(name),
+                }),
+                replica_identity: dto.replica_identity.map(|r| match r {
+                    ReplicaIdentityDto::Full => ReplicaIdentity::Full,
+                    ReplicaIdentityDto::Nothing => ReplicaIdentity::Nothing,
+                    ReplicaIdentityDto::PrimaryKey => ReplicaIdentity::PrimaryKey,
+                    ReplicaIdentityDto::Unique(name) => ReplicaIdentity::Unique(name),
+                    ReplicaIdentityDto::Index(name) => ReplicaIdentity::Index(name),
                 }),
             },
             intents,

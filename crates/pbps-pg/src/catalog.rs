@@ -127,7 +127,10 @@ fn tables_query() -> String {
     let not_one_of_ours = not_one_of_ours();
     let not_an_extensions = not_an_extensions("c.oid", "pg_class");
     format!(
-        "SELECT c.oid::int8 AS oid, n.nspname AS schema_name, c.relname AS table_name
+        "SELECT c.oid::int8 AS oid, n.nspname AS schema_name, c.relname AS table_name,
+            c.relreplident::text AS replica_identity,
+            COALESCE((SELECT x.indexrelid::int8 FROM pg_catalog.pg_index x
+                       WHERE x.indrelid = c.oid AND x.indisreplident), 0) AS identity_index
        FROM pg_catalog.pg_class c
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
       WHERE {ORDINARY_TABLE}
@@ -138,22 +141,40 @@ fn tables_query() -> String {
     )
 }
 
+/// A `USING INDEX` replica identity whose index is gone: PostgreSQL lets that
+/// index be dropped and keeps `relreplident = 'i'` with no index marked
+/// `indisreplident`, which identifies no row (measured on 16 and 18, #1444).
+/// Not `nothing`, which is a choice someone made; a state no declaration
+/// spells, so the table is left out and named.
+macro_rules! identity_names_no_index {
+    () => {
+        "(c.relreplident = 'i'
+             AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_index x
+                              WHERE x.indrelid = c.oid AND x.indisreplident))"
+    };
+}
+const IDENTITY_NAMES_NO_INDEX: &str = identity_names_no_index!();
+
 /// What makes a `pg_class` row `c` a table this model holds: the predicate of
 /// [`tables_query`], as one string, so that the one other reader that has to
 /// agree with it — the trigger arm of [`modules_query`], and its complement in
 /// [`unheld_modules_query`] — cannot drift from it. Each flag is the negation
 /// of a case [`partitioned_query`] names.
-const ORDINARY_TABLE: &str = "c.relkind = 'r'
+const ORDINARY_TABLE: &str = concat!(
+    "c.relkind = 'r'
         AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i
                          WHERE i.inhrelid = c.oid OR i.inhparent = c.oid)
         AND NOT c.relrowsecurity
         AND NOT c.relforcerowsecurity
         AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_policy p WHERE p.polrelid = c.oid)
         AND c.relpersistence = 'p'
-        AND c.relreplident = 'd'
+        AND NOT ",
+    identity_names_no_index!(),
+    "
         AND NOT c.relhasrules
         AND c.reloftype = 0
-        AND c.relam = (SELECT am.oid FROM pg_catalog.pg_am am WHERE am.amname = 'heap')";
+        AND c.relam = (SELECT am.oid FROM pg_catalog.pg_am am WHERE am.amname = 'heap')"
+);
 
 /// `pg_get_viewdef` omits these options. Only the two boolean options set to
 /// false have the behavior a plain declaration recreates; check options and
@@ -409,7 +430,7 @@ fn partitioned_query() -> String {
             c.relforcerowsecurity AS force_row_security,
             (SELECT pg_catalog.count(*) FROM pg_catalog.pg_policy p
               WHERE p.polrelid = c.oid)::int8 AS policies,
-            c.relreplident::text AS replica_identity,
+            {IDENTITY_NAMES_NO_INDEX} AS identity_names_no_index,
             c.relhasrules AS has_rules, am.amname AS access_method,
             c.reloftype::regtype::text AS of_type,
             EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhparent = c.oid)
@@ -429,7 +450,7 @@ fn partitioned_query() -> String {
                       OR EXISTS (SELECT 1 FROM pg_catalog.pg_policy p
                                   WHERE p.polrelid = c.oid)
                       OR c.relpersistence <> 'p'
-                      OR c.relreplident <> 'd'
+                      OR {IDENTITY_NAMES_NO_INDEX}
                       OR c.relhasrules
                       OR c.reloftype <> 0
                       OR c.relam <> (SELECT am.oid FROM pg_catalog.pg_am am
@@ -934,19 +955,11 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             }
             "r" if text(row, "persistence")? == "u" => "an UNLOGGED table",
             "r" if text(row, "persistence")? == "t" => "a temporary table",
-            // Which old-row data logical replication publishes, and whether a
-            // replicated `UPDATE` or `DELETE` is allowed at all. `d` is the
-            // default — the primary key — and is the only one the model can
-            // read back, because it is the only one that is not a choice.
-            "r" if text(row, "replica_identity")? == "f" => {
-                "a table with `REPLICA IDENTITY FULL`, which publishes every old column"
-            }
-            "r" if text(row, "replica_identity")? == "n" => {
-                "a table with `REPLICA IDENTITY NOTHING`, which no replicated `UPDATE` or \
-                 `DELETE` may touch"
-            }
-            "r" if text(row, "replica_identity")? == "i" => {
-                "a table whose `REPLICA IDENTITY` is a named index rather than its primary key"
+            // Every replica identity is declared (#1444) but one that names
+            // an index which is gone: see `IDENTITY_NAMES_NO_INDEX`.
+            "r" if flag(row, "identity_names_no_index")? => {
+                "a table whose `REPLICA IDENTITY USING INDEX` names an index that was dropped, \
+                 so it identifies no row; set it again, or to `DEFAULT`, and pull again"
             }
             // `CREATE TABLE ... OF t`: the row shape is the composite type's,
             // and `ALTER TYPE` changes the table. Read back as an ordinary
@@ -993,6 +1006,11 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             oid: number(row, "oid")?,
             schema: text(row, "schema_name")?,
             name: text(row, "table_name")?,
+            replica_identity: first_char(&text(row, "replica_identity")?).unwrap_or(' '),
+            identity_index: {
+                let oid = number(row, "identity_index")?;
+                (oid != 0).then_some(oid)
+            },
         });
     }
     for row in batch.get("columns").ok_or_else(|| missing("columns"))? {
