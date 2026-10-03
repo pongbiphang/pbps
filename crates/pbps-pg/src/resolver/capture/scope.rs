@@ -345,6 +345,19 @@ impl Builder<'_> {
     /// binds it, and its name carries the table's OID, so it differs between
     /// the target and scratch. It and everything under it stay out of the
     /// capture (DEC-1274.1).
+    /// Whether a dependency row's dependent is authorization metadata: a
+    /// default ACL depends automatically on its schema, but owners and ACLs
+    /// are not binding inputs (rule v2, DEC-1274.1), so the row is not one
+    /// either. Any other dependent of a class the capture cannot read still
+    /// refuses.
+    fn authorization(&self, row: &Row) -> Result<bool, ()> {
+        let class = self
+            .catalog
+            .row("pg_class", logical::number(row, "classid").map_err(|_| ())?)
+            .map_err(|_| ())?;
+        Ok(logical::string(class, "relname").map_err(|_| ())? == "pg_default_acl")
+    }
+
     fn toast(&self, row: &Row) -> Result<bool, ()> {
         let relation = |field| logical::number(row, field).map_err(|_| ());
         let class = self
@@ -392,7 +405,10 @@ impl Builder<'_> {
                         .as_ref()
                         .is_ok_and(|id| self.result.members.contains_key(id));
                 }
-                if !selected || self.toast(row).map_err(|_| fail())? {
+                if !selected
+                    || self.toast(row).map_err(|_| fail())?
+                    || self.authorization(row).map_err(|_| fail())?
+                {
                     continue;
                 }
                 let (identity, properties) =
