@@ -27,6 +27,17 @@ use pbps_model::{
 /// intents still belong in the file — `pbps fmt` passes only the ones not yet
 /// absorbed into the ids file, which is how a redundant annotation gets
 /// stripped (SPEC §6.2).
+/// Storage parameters as a flow mapping, `{fillfactor: 70, …}`, each value
+/// in its canonical spelling and bare, as `storage_parameters:` writes them
+/// (#1441, #1442).
+fn flow(parameters: &std::collections::BTreeMap<String, String>) -> String {
+    let pairs: Vec<String> = parameters
+        .iter()
+        .map(|(name, value)| format!("{}: {value}", scalar(name)))
+        .collect();
+    format!("{{{}}}", pairs.join(", "))
+}
+
 pub fn render(
     name: &TableName,
     table: &Table,
@@ -114,16 +125,23 @@ pub fn render(
             PrimaryKey {
                 name: None,
                 columns,
-            } => {
+                storage_parameters,
+            } if storage_parameters.is_empty() => {
                 let _ = writeln!(s, "primary_key: {}", seq(columns));
             }
             PrimaryKey {
-                name: Some(n),
+                name,
                 columns,
+                storage_parameters,
             } => {
                 let _ = writeln!(s, "primary_key:");
-                let _ = writeln!(s, "  name: {}", scalar(n));
+                if let Some(n) = name {
+                    let _ = writeln!(s, "  name: {}", scalar(n));
+                }
                 let _ = writeln!(s, "  columns: {}", seq(columns));
+                if !storage_parameters.is_empty() {
+                    let _ = writeln!(s, "  storage_parameters: {}", flow(storage_parameters));
+                }
             }
         }
     }
@@ -131,7 +149,17 @@ pub fn render(
     if !table.unique.is_empty() {
         s.push_str("\nunique:\n");
         for (n, u) in &table.unique {
-            let _ = writeln!(s, "  {}: {}", scalar(n), seq(&u.columns));
+            if u.storage_parameters.is_empty() {
+                let _ = writeln!(s, "  {}: {}", scalar(n), seq(&u.columns));
+            } else {
+                let _ = writeln!(
+                    s,
+                    "  {}: {{columns: {}, storage_parameters: {}}}",
+                    scalar(n),
+                    seq(&u.columns),
+                    flow(&u.storage_parameters)
+                );
+            }
         }
     }
 
@@ -171,6 +199,13 @@ pub fn render(
             let _ = writeln!(s, "  {}:", scalar(n));
             if !ix.method.is_btree() {
                 let _ = writeln!(s, "    method: {}", ix.method.as_str());
+            }
+            if !ix.storage_parameters.is_empty() {
+                let _ = writeln!(
+                    s,
+                    "    storage_parameters: {}",
+                    flow(&ix.storage_parameters)
+                );
             }
             // `columns:` while every key is a column, as every index was
             // written before expressions; `keys:`, one mapping each, once any
@@ -978,6 +1013,68 @@ indexes:
                 "{line}"
             );
         }
+    }
+
+    /// A key's, a unique constraint's and an index's parameters read back
+    /// canonical and render to the same text; the plain forms stay where
+    /// there are none, and a parameter of the wrong method is an error
+    /// (#1442).
+    #[test]
+    fn index_storage_parameters_round_trip_in_every_form() {
+        let yaml = "table: public.t\ncolumns:\n  id: {type: int, nullable: false}\n  code: {type: int}\n  doc: {type: jsonb}\n\nprimary_key:\n  name: t_pkey\n  columns: [id]\n  storage_parameters: {fillfactor: '070'}\n\nunique:\n  uq_code: {columns: [code], storage_parameters: {deduplicate_items: of}}\n  uq_plain: [code]\n\nindexes:\n  ix_doc:\n    method: gin\n    storage_parameters: {fastupdate: off, gin_pending_list_limit: 7e1}\n    columns: [doc]\n";
+        let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
+        let pk = t.table.primary_key.as_ref().unwrap();
+        assert_eq!(pk.storage_parameters["fillfactor"], "56");
+        assert_eq!(
+            t.table.unique["uq_code"].storage_parameters["deduplicate_items"],
+            "false"
+        );
+        assert!(t.table.unique["uq_plain"].storage_parameters.is_empty());
+        assert_eq!(
+            t.table.indexes["ix_doc"].storage_parameters["gin_pending_list_limit"],
+            "70"
+        );
+        let out = render(&t.name, &t.table, &t.intents, None);
+        assert!(out.contains("  uq_plain: [code]\n"), "{out}");
+        assert!(
+            out.contains("  storage_parameters: {fillfactor: 56}\n"),
+            "{out}"
+        );
+        round_trip(&out);
+        let again = crate::load_table_str(Path::new("t.yml"), &out).unwrap();
+        assert_eq!(again.table, t.table);
+        // Negative: a GIN parameter on a B-tree index, and a B-tree one on
+        // a key, are errors.
+        for bad in [
+            yaml.replace("method: gin\n    ", ""),
+            yaml.replace("{fillfactor: '070'}", "{fastupdate: off}"),
+        ] {
+            assert!(
+                crate::load_table_str(Path::new("t.yml"), &bad).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    /// A column named like a YAML boolean (`n`, `y`, `on`) is a column in
+    /// every form of a key and a unique constraint: the list form is read as
+    /// strings, not buffered untyped (#1442).
+    #[test]
+    fn a_boolean_looking_column_is_a_column_in_every_key_form() {
+        let yaml = "table: public.t\ncolumns:\n  n: {type: int, nullable: false}\n  y: {type: int}\n  on: {type: int}\n\nprimary_key: [n]\n\nunique:\n  uq_y: [y]\n  uq_on: {columns: [on], storage_parameters: {fillfactor: 70}}\n";
+        let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
+        assert_eq!(t.table.primary_key.as_ref().unwrap().columns, ["n"]);
+        assert_eq!(t.table.unique["uq_y"].columns, ["y"]);
+        assert_eq!(t.table.unique["uq_on"].columns, ["on"]);
+        let named = "table: public.t\ncolumns:\n  n: {type: int, nullable: false}\nprimary_key: {name: t_pkey, columns: [n]}\n";
+        let t = crate::load_table_str(Path::new("t.yml"), named).unwrap();
+        assert_eq!(
+            t.table.primary_key.as_ref().unwrap().name.as_deref(),
+            Some("t_pkey")
+        );
+        // Negative: neither a list nor a mapping.
+        let wrong = "table: public.t\ncolumns:\n  n: {type: int}\nunique:\n  uq: n\n";
+        assert!(crate::load_table_str(Path::new("t.yml"), wrong).is_err());
     }
 
     /// A misspelt identity is an error, not the default: read as absent,

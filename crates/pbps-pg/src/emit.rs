@@ -773,19 +773,34 @@ fn column_definition(name: &str, column: &Column) -> Result<String, DialectError
 
 fn primary_key_clause(pk: &PrimaryKey) -> Result<String, DialectError> {
     let cols = column_list(&pk.columns)?;
+    let with = key_index_parameters(&pk.storage_parameters)?;
     Ok(match &pk.name {
-        Some(n) => format!("CONSTRAINT {} PRIMARY KEY ({cols})", quote(n)?),
+        Some(n) => format!("CONSTRAINT {} PRIMARY KEY ({cols}){with}", quote(n)?),
         // Unnamed leaves the server to invent one, which is a choice a user can
         // make and is emitted faithfully rather than named on their behalf.
-        None => format!("PRIMARY KEY ({cols})"),
+        None => format!("PRIMARY KEY ({cols}){with}"),
     })
 }
 
 fn unique_clause(name: &str, u: &UniqueConstraint) -> Result<String, DialectError> {
     Ok(format!(
-        "CONSTRAINT {} UNIQUE ({})",
+        "CONSTRAINT {} UNIQUE ({}){}",
         quote(name)?,
-        column_list(&u.columns)?
+        column_list(&u.columns)?,
+        key_index_parameters(&u.storage_parameters)?
+    ))
+}
+
+/// ` WITH (…)` for a key's or a unique constraint's index, a B-tree, or
+/// nothing where it has no parameters (#1442).
+fn key_index_parameters(parameters: &BTreeMap<String, String>) -> Result<String, DialectError> {
+    if parameters.is_empty() {
+        return Ok(String::new());
+    }
+    let btree = pbps_model::storage::index_parameters(pbps_model::IndexMethod::Btree);
+    Ok(format!(
+        " WITH ({})",
+        listed(parameters, &|name| btree.iter().any(|(n, _)| *n == name))?
     ))
 }
 
@@ -897,6 +912,18 @@ fn create_index(
     );
     if !index.include.is_empty() {
         s.push_str(&format!(" INCLUDE ({})", column_list(&index.include)?));
+    }
+    // After `INCLUDE` and before `WHERE`, where the grammar has it (#1442).
+    if !index.storage_parameters.is_empty() {
+        let method = index.method;
+        s.push_str(&format!(
+            " WITH ({})",
+            listed(&index.storage_parameters, &|name| {
+                pbps_model::storage::index_parameters(method)
+                    .iter()
+                    .any(|(n, _)| *n == name)
+            })?
+        ));
     }
     if let Some(filter) = &index.filter {
         s.push_str(&format!(" WHERE ({})", verbatim(filter)));
@@ -2304,34 +2331,67 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         Change::SetReplicaIdentity { table, to, .. } => {
             one(pg, table, set_replica_identity(table, to.as_ref())?)
         }
+        Change::SetIndexStorageParameters {
+            table,
+            target,
+            method,
+            set,
+            reset,
+        } => {
+            let actions = storage_actions(set, reset, &|name| {
+                pbps_model::storage::index_parameters(*method)
+                    .iter()
+                    .any(|(n, _)| *n == name)
+            })?;
+            let alter = |index: &str| -> Result<String, DialectError> {
+                Ok(format!(
+                    "ALTER INDEX {}.{} {actions};",
+                    quote(&table.schema)?,
+                    quote(index)?
+                ))
+            };
+            match target {
+                // A unique constraint's index carries the constraint's name.
+                pbps_model::IndexPart::Unique(n) | pbps_model::IndexPart::Index(n) => {
+                    one(pg, table, alter(n)?)
+                }
+                // The key's index is found when the statement runs, as an
+                // unnamed key's drop is: a pulled key carries its name, but a
+                // declared one need not (#1442).
+                pbps_model::IndexPart::PrimaryKey => {
+                    let q = qualified(table)?;
+                    let body = format!(
+                        "DECLARE ix name := (SELECT i.relname FROM pg_catalog.pg_constraint k\n\
+                         \x20                    JOIN pg_catalog.pg_class i ON i.oid = k.conindid\n\
+                         \x20                    WHERE k.conrelid = {}::pg_catalog.regclass AND k.contype = 'p');\n\
+                         BEGIN\n\
+                         \x20   EXECUTE pg_catalog.format({}, ix);\n\
+                         END",
+                        literal(&q),
+                        literal(&format!(
+                            "ALTER INDEX {}.%I {}",
+                            quote(&table.schema)?.replace('%', "%%"),
+                            actions.replace('%', "%%")
+                        ))
+                    );
+                    let tag = dollar_tag(&body);
+                    one(pg, table, format!("DO {tag}\n{body}\n{tag};"))
+                }
+            }
+        }
         Change::SetStorageParameters {
             table, set, reset, ..
         } => {
             // One statement with both subcommands, so no read between them
             // finds half the change: a staged checkpoint holds the table to
             // its old parameters or its new ones (#1441).
-            let mut actions = Vec::new();
-            if !set.is_empty() {
-                actions.push(format!("SET ({})", storage_list(set)?));
-            }
-            if !reset.is_empty() {
-                let names = reset
-                    .iter()
-                    .map(|name| {
-                        if pbps_model::storage::table_kind(name).is_none() {
-                            return Err(invalid(format!(
-                                "`{name}` is not a table storage parameter this model declares"
-                            )));
-                        }
-                        Ok(name.as_str())
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                actions.push(format!("RESET ({})", names.join(", ")));
-            }
+            let actions = storage_actions(set, reset, &|name| {
+                pbps_model::storage::table_kind(name).is_some()
+            })?;
             one(
                 pg,
                 table,
-                format!("ALTER TABLE {} {};", qualified(table)?, actions.join(", ")),
+                format!("ALTER TABLE {} {actions};", qualified(table)?),
             )
         }
         Change::SetPrimaryKey {
@@ -2867,18 +2927,57 @@ fn create_table(pg: &Postgres, name: &TableName, table: &Table) -> Sql {
 /// statement bare. Each value goes as a literal, which the engine parses as
 /// it would the bare word.
 fn storage_list(parameters: &BTreeMap<String, String>) -> Result<String, DialectError> {
+    listed(parameters, &|name| {
+        pbps_model::storage::table_kind(name).is_some()
+    })
+}
+
+/// `storage_list` over the names `allowed` admits: a table's list, or an
+/// index method's (#1442).
+fn listed(
+    parameters: &BTreeMap<String, String>,
+    allowed: &dyn Fn(&str) -> bool,
+) -> Result<String, DialectError> {
     parameters
         .iter()
         .map(|(name, value)| {
-            if pbps_model::storage::table_kind(name).is_none() {
+            if !allowed(name) {
                 return Err(invalid(format!(
-                    "`{name}` is not a table storage parameter this model declares"
+                    "`{name}` is not a storage parameter this model declares here"
                 )));
             }
             Ok(format!("{name} = {}", literal(value)))
         })
         .collect::<Result<Vec<_>, _>>()
         .map(|list| list.join(", "))
+}
+
+/// `SET (…), RESET (…)`: one statement's subcommands, so no read between them
+/// finds half the change, over the names `allowed` admits (#1441, #1442).
+fn storage_actions(
+    set: &BTreeMap<String, String>,
+    reset: &BTreeSet<String>,
+    allowed: &dyn Fn(&str) -> bool,
+) -> Result<String, DialectError> {
+    let mut actions = Vec::new();
+    if !set.is_empty() {
+        actions.push(format!("SET ({})", listed(set, allowed)?));
+    }
+    if !reset.is_empty() {
+        let names = reset
+            .iter()
+            .map(|name| {
+                if !allowed(name) {
+                    return Err(invalid(format!(
+                        "`{name}` is not a storage parameter this model declares here"
+                    )));
+                }
+                Ok(name.as_str())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        actions.push(format!("RESET ({})", names.join(", ")));
+    }
+    Ok(actions.join(", "))
 }
 
 /// `ALTER TABLE … REPLICA IDENTITY …` (#1444, DEC-1444.1).
@@ -3636,6 +3735,93 @@ mod tests {
     /// A layout only SQL Server has reaches this emitter only by a path that
     /// skipped `validate`; it is refused, never emitted as an ordinary key or
     /// index (#1178). The same changes without it emit as before.
+    /// An index takes its parameters in `WITH (…)` before its `WHERE`, a key
+    /// and a unique constraint in their clause; a change alone is one
+    /// `ALTER INDEX`, through a `DO` block for the key's index, whose name a
+    /// declaration need not give. Another method's parameter is refused
+    /// (#1442).
+    #[test]
+    fn index_storage_parameters_are_in_create_and_alter_index() {
+        let pg = Postgres::new();
+        let table = name("app", "t");
+        let mut index = pbps_model::Index {
+            columns: vec![IndexColumn {
+                key: pbps_model::IndexKey::Column("v".into()),
+                descending: false,
+                opclass: None,
+            }],
+            include: vec![],
+            unique: false,
+            filter: Some("v > 0".into()),
+            method: Default::default(),
+            storage_parameters: [("fillfactor".to_owned(), "70".to_owned())].into(),
+        };
+        let add = |index: &pbps_model::Index| {
+            sql_of(
+                &pg,
+                &Change::AddIndex {
+                    table: table.clone(),
+                    name: "ix".into(),
+                    index: Box::new(index.clone()),
+                    clustered: false,
+                },
+            )
+            .join("\n")
+        };
+        assert!(
+            add(&index).contains("(\"v\" ASC) WITH (fillfactor = '70') WHERE ("),
+            "{}",
+            add(&index)
+        );
+        index.storage_parameters = [("fastupdate".to_owned(), "true".to_owned())].into();
+        assert!(
+            pg.emit(
+                &Change::AddIndex {
+                    table: table.clone(),
+                    name: "ix".into(),
+                    index: Box::new(index),
+                    clustered: false,
+                },
+                Strategy::default()
+            )
+            .is_err()
+        );
+        let key = pbps_model::PrimaryKey {
+            name: Some("t_pkey".into()),
+            columns: vec!["id".into()],
+            storage_parameters: [("fillfactor".to_owned(), "80".to_owned())].into(),
+        };
+        assert_eq!(
+            primary_key_clause(&key).unwrap(),
+            "CONSTRAINT \"t_pkey\" PRIMARY KEY (\"id\") WITH (fillfactor = '80')"
+        );
+        let alter = |target: pbps_model::IndexPart| {
+            sql_of(
+                &pg,
+                &Change::SetIndexStorageParameters {
+                    table: table.clone(),
+                    target,
+                    method: pbps_model::IndexMethod::Btree,
+                    set: [("fillfactor".to_owned(), "60".to_owned())].into(),
+                    reset: ["deduplicate_items".to_owned()].into(),
+                },
+            )
+            .join("\n")
+        };
+        assert!(
+            alter(pbps_model::IndexPart::Index("ix".into())).contains(
+                "ALTER INDEX \"app\".\"ix\" SET (fillfactor = '60'), RESET (deduplicate_items);"
+            ),
+            "{}",
+            alter(pbps_model::IndexPart::Index("ix".into()))
+        );
+        let pk = alter(pbps_model::IndexPart::PrimaryKey);
+        assert!(
+            pk.contains("DO $pbps$") && pk.contains("k.contype = 'p'"),
+            "{pk}"
+        );
+    }
+
     /// Storage parameters are one `ALTER TABLE` with `SET` and `RESET`, each
     /// value a literal, and a created table takes them in its `CREATE` (`WITH`).
     /// A name outside the list is refused, never spliced in (#1441).
@@ -3671,7 +3857,8 @@ mod tests {
             )
             .expect_err("an unlisted name");
         assert!(
-            e.to_string().contains("not a table storage parameter"),
+            e.to_string()
+                .contains("not a storage parameter this model declares"),
             "{e}"
         );
 
@@ -3780,6 +3967,7 @@ mod tests {
                 unique: true,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
         created.replica_identity = Some(R::Index("t_ix".into()));
@@ -3821,6 +4009,7 @@ mod tests {
         let key = pbps_model::PrimaryKey {
             name: None,
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         };
         let index = pbps_model::Index {
             columns: vec![IndexColumn {
@@ -3832,9 +4021,11 @@ mod tests {
             unique: false,
             filter: None,
             method: Default::default(),
+            storage_parameters: Default::default(),
         };
         let unique = pbps_model::UniqueConstraint {
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         };
         let mut created = Table::default();
         created
@@ -5519,6 +5710,7 @@ mod tests {
                 from: Some(PrimaryKey {
                     name: None,
                     columns: vec!["id".into()],
+                    storage_parameters: Default::default(),
                 }),
                 to: None,
                 nonclustered: false,
@@ -5564,6 +5756,7 @@ mod tests {
                 from: Some(PrimaryKey {
                     name: None,
                     columns: vec!["id".into()],
+                    storage_parameters: Default::default(),
                 }),
                 to: None,
                 nonclustered: false,
@@ -5593,6 +5786,7 @@ mod tests {
             unique: false,
             filter: None,
             method: Default::default(),
+            storage_parameters: Default::default(),
         };
         let change = Change::AddIndex {
             table: name("app", "t"),
@@ -5676,6 +5870,7 @@ mod tests {
                 unique: false,
                 filter: None,
                 method: pbps_model::IndexMethod::Gin,
+                storage_parameters: Default::default(),
             }),
             clustered: false,
         };
@@ -5705,6 +5900,7 @@ mod tests {
             unique: true,
             filter: None,
             method: Default::default(),
+            storage_parameters: Default::default(),
         };
         let change = Change::AddIndex {
             table: name("app", "t"),
@@ -5829,6 +6025,7 @@ mod tests {
                     unique: false,
                     filter: Some("n > 0 -- why".into()),
                     method: Default::default(),
+                    storage_parameters: Default::default(),
                 }),
                 clustered: false,
             },

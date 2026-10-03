@@ -332,6 +332,7 @@ fn role_of(change: &Change) -> Option<&str> {
         | Change::AlterColumnExpression { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::SetPrimaryKey { .. }
+        | Change::SetIndexStorageParameters { .. }
         | Change::SetStorageParameters { .. }
         | Change::SetReplicaIdentity { .. }
         | Change::AddUnique { .. }
@@ -382,6 +383,7 @@ fn renames(cs: &ChangeSet) -> Renames {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -700,6 +702,18 @@ pub fn describe(c: &Change) -> String {
             Some(pk) => format!("~ primary key -> ({})", pk.columns.join(", ")),
             None => "- drop primary key".to_owned(),
         },
+        Change::SetIndexStorageParameters {
+            target, set, reset, ..
+        } => {
+            let mut parts: Vec<String> = set.iter().map(|(k, v)| format!("{k} = {v}")).collect();
+            parts.extend(reset.iter().map(|k| format!("{k} reset")));
+            let of = match target {
+                pbps_model::IndexPart::PrimaryKey => "primary key".to_owned(),
+                pbps_model::IndexPart::Unique(n) => format!("unique constraint {n}"),
+                pbps_model::IndexPart::Index(n) => format!("index {n}"),
+            };
+            format!("~ storage parameters of {of}: {}", parts.join(", "))
+        }
         Change::SetStorageParameters { set, reset, .. } => {
             let mut parts: Vec<String> = set.iter().map(|(k, v)| format!("{k} = {v}")).collect();
             parts.extend(reset.iter().map(|k| format!("{k} reset")));

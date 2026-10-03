@@ -9,8 +9,13 @@
 //! engine's rules, into one spelling: `true`/`false`, a decimal integer, the
 //! shortest decimal of a real, and `auto`/`on`/`off`.
 //!
+//! Indexes take their own per-method list ([`index_parameters`], #1442),
+//! parsed by the same rules.
+//!
 //! `toast.*` parameters are not here: a table without a TOAST relation
 //! silently discards them, so a declared one could never read back.
+
+use crate::IndexMethod;
 
 /// How the engine parses a parameter's value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +74,40 @@ pub fn table_kind(name: &str) -> Option<Kind> {
 pub fn canonical(name: &str, value: &str) -> Result<String, String> {
     let kind = table_kind(name)
         .ok_or_else(|| format!("`{name}` is not a table storage parameter this model declares"))?;
+    spelled(kind, name, value)
+}
+
+/// Every index parameter an index of `method` may declare, with how the
+/// engine parses it (#1442). Measured on 16 and 18: each changes in place
+/// (`ALTER INDEX … SET`), and the other method's are refused.
+pub fn index_parameters(method: IndexMethod) -> &'static [(&'static str, Kind)] {
+    match method {
+        IndexMethod::Btree => &[("deduplicate_items", Kind::Bool), ("fillfactor", Kind::Int)],
+        IndexMethod::Gin => &[
+            ("fastupdate", Kind::Bool),
+            ("gin_pending_list_limit", Kind::Int),
+        ],
+    }
+}
+
+/// `value` of index parameter `name`, for an index of `method`, in its one
+/// canonical spelling, or why it is not one. A key's and a unique
+/// constraint's index is a B-tree.
+pub fn canonical_index(method: IndexMethod, name: &str, value: &str) -> Result<String, String> {
+    let kind = index_parameters(method)
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, k)| *k)
+        .ok_or_else(|| {
+            format!(
+                "`{name}` is not a storage parameter of a {} index this model declares",
+                method.as_str()
+            )
+        })?;
+    spelled(kind, name, value)
+}
+
+fn spelled(kind: Kind, name: &str, value: &str) -> Result<String, String> {
     let read = match kind {
         Kind::Bool => parse_bool(value).map(|b| b.to_string()),
         Kind::Int => parse_int(value).map(|i| i.to_string()),
@@ -252,6 +291,38 @@ mod tests {
                     "{name}={spelling}"
                 );
             }
+        }
+    }
+
+    /// Each index method takes its own parameters, read by the same rules,
+    /// and refuses the other's (#1442).
+    #[test]
+    fn an_index_takes_its_own_methods_parameters() {
+        let b = IndexMethod::Btree;
+        let g = IndexMethod::Gin;
+        assert_eq!(canonical_index(b, "fillfactor", "070").as_deref(), Ok("56"));
+        assert_eq!(
+            canonical_index(b, "deduplicate_items", "of").as_deref(),
+            Ok("false")
+        );
+        assert_eq!(
+            canonical_index(g, "fastupdate", "TRUE").as_deref(),
+            Ok("true")
+        );
+        assert_eq!(
+            canonical_index(g, "gin_pending_list_limit", "7e1").as_deref(),
+            Ok("70")
+        );
+        for (method, name) in [
+            (b, "fastupdate"),
+            (g, "fillfactor"),
+            (b, "autovacuum_enabled"),
+            (g, "bogus"),
+        ] {
+            assert!(
+                canonical_index(method, name, "1").is_err(),
+                "{method:?} {name}"
+            );
         }
     }
 

@@ -632,6 +632,7 @@ fn indexes_query() -> String {
             pg_catalog.pg_get_expr(i.indpred, i.indrelid) AS filter,
             i.indexprs IS NOT NULL AS has_expressions,
             am.amname AS method,
+            COALESCE(ic.reloptions, '{{}}'::text[]) AS reloptions,
             (SELECT COALESCE(pg_catalog.json_agg(
                       CASE WHEN i.indclass[k.n - 1] IS NOT DISTINCT FROM COALESCE(
                              (SELECT oc.oid FROM pg_catalog.pg_opclass oc
@@ -1119,6 +1120,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             key_classes: strings(row, "key_classes")?,
             key_texts: strings(row, "key_texts")?,
             nondefault_collation: flag(row, "nondefault_collation")?,
+            reloptions: strings(row, "reloptions")?,
         });
     }
     for row in batch.get("modules").ok_or_else(|| missing("modules"))? {

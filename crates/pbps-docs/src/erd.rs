@@ -123,6 +123,7 @@ mod tests {
         region.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["region_id".into()],
+            storage_parameters: Default::default(),
         });
 
         let mut customer = Table::default();
@@ -138,6 +139,7 @@ mod tests {
         customer.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         customer.foreign_keys.insert(
             "fk_customer_region".into(),

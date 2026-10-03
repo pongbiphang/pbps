@@ -476,6 +476,31 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
              them, so remove the block",
         ));
     }
+    // Index storage parameters are PostgreSQL's too (#1442).
+    let keyed = table
+        .primary_key
+        .iter()
+        .map(|pk| ("the primary key".to_owned(), &pk.storage_parameters))
+        .chain(
+            table
+                .unique
+                .iter()
+                .map(|(n, u)| (format!("unique constraint `{n}`"), &u.storage_parameters)),
+        )
+        .chain(
+            table
+                .indexes
+                .iter()
+                .map(|(n, ix)| (format!("index `{n}`"), &ix.storage_parameters)),
+        );
+    for (what, parameters) in keyed {
+        if !parameters.is_empty() {
+            errs.push(invalid(format!(
+                "{what} declares `storage_parameters`, which are PostgreSQL index parameters; \
+                 remove them"
+            )));
+        }
+    }
 
     for part in [&name.schema, &name.name] {
         if let Err(e) = ident::quote(part) {
@@ -977,11 +1002,13 @@ mod tests {
         t.primary_key = Some(PrimaryKey {
             name: Some("pk_customer".into()),
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         t.unique.insert(
             "uq_email".into(),
             UniqueConstraint {
                 columns: vec!["email".into()],
+                storage_parameters: Default::default(),
             },
         );
         assert_eq!(messages(&table(&name, &t)), "");
@@ -1023,12 +1050,14 @@ mod tests {
                 unique: true,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
         table.unique.insert(
             "uq_c".into(),
             pbps_model::UniqueConstraint {
                 columns: vec!["c".into()],
+                storage_parameters: Default::default(),
             },
         );
         assert!(found(&table).is_empty(), "{:?}", found(&table));
@@ -1053,6 +1082,7 @@ mod tests {
         keyed.primary_key = Some(pbps_model::PrimaryKey {
             name: None,
             columns: vec!["c".into()],
+            storage_parameters: Default::default(),
         });
         assert!(
             found(&keyed)
@@ -1137,6 +1167,30 @@ mod tests {
             refused.iter().any(|m| m.contains("`storage_parameters`")),
             "{refused:?}"
         );
+        // And an index's (#1442).
+        table.storage_parameters.clear();
+        table.indexes.insert(
+            "ix".into(),
+            pbps_model::Index {
+                columns: vec![pbps_model::IndexColumn {
+                    key: pbps_model::IndexKey::Column("a".into()),
+                    descending: false,
+                    opclass: None,
+                }],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: Default::default(),
+                storage_parameters: [("fillfactor".to_owned(), "70".to_owned())].into(),
+            },
+        );
+        let refused = found(&table);
+        assert!(
+            refused
+                .iter()
+                .any(|m| m.contains("index `ix` declares `storage_parameters`")),
+            "{refused:?}"
+        );
     }
 
     /// A GIN method or an operator class is PostgreSQL's, and is refused on
@@ -1157,6 +1211,7 @@ mod tests {
             unique: false,
             filter: None,
             method,
+            storage_parameters: Default::default(),
         };
         let messages = |ix: Index| {
             let mut t = table.clone();
@@ -1204,6 +1259,7 @@ mod tests {
             unique: false,
             filter: filter.map(Into::into),
             method: Default::default(),
+            storage_parameters: Default::default(),
         };
         t.clustered = Some(Clustered::Index("cx".into()));
         t.indexes.insert("cx".into(), index(Vec::new(), None));
@@ -1243,6 +1299,7 @@ mod tests {
         t.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["nope".into()],
+            storage_parameters: Default::default(),
         });
         let errs = table(&name, &t);
         assert!(
@@ -1260,6 +1317,7 @@ mod tests {
         t.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["email".into()],
+            storage_parameters: Default::default(),
         });
         assert!(messages(&table(&name, &t)).contains("must be NOT NULL"));
     }
@@ -1271,6 +1329,7 @@ mod tests {
             "uq_body".into(),
             UniqueConstraint {
                 columns: vec!["body".into()],
+                storage_parameters: Default::default(),
             },
         );
         assert!(messages(&table(&name, &t)).contains("cannot be part of a key"));
@@ -1321,6 +1380,7 @@ mod tests {
         t.primary_key = Some(pbps_model::PrimaryKey {
             name: None,
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         let msg = messages(&table(&name, &t));
         assert!(msg.contains("key its rows by `id`"), "{msg}");
@@ -1435,6 +1495,7 @@ mod tests {
         t.primary_key = Some(pbps_model::PrimaryKey {
             name: None,
             columns: vec!["k".into()],
+            storage_parameters: Default::default(),
         });
         t.data = Some(TableData {
             mode: DataMode::Exact,
@@ -1466,6 +1527,7 @@ mod tests {
             t.primary_key = Some(pbps_model::PrimaryKey {
                 name: None,
                 columns: vec!["k".into()],
+                storage_parameters: Default::default(),
             });
             for (key, accepted) in [
                 ("- 1", true),
@@ -1499,6 +1561,7 @@ mod tests {
             t.primary_key = Some(pbps_model::PrimaryKey {
                 name: None,
                 columns: vec!["k".into()],
+                storage_parameters: Default::default(),
             });
             t.data = Some(TableData {
                 mode: DataMode::Exact,
@@ -1601,6 +1664,7 @@ mod tests {
         t.primary_key = Some(pbps_model::PrimaryKey {
             name: None,
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         let msg = messages(&table(&name, &t));
         assert!(
@@ -1772,6 +1836,7 @@ mod tests {
         t.primary_key = Some(pbps_model::PrimaryKey {
             name: None,
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         assert!(messages(&table(&name, &t)).contains("key its rows by `id`, a spatial column"));
     }
@@ -1821,6 +1886,7 @@ mod tests {
                 unique: false,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
         let msg = messages(&table(&name, &t));
@@ -1849,6 +1915,7 @@ mod tests {
         t.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["nope".into()],
+            storage_parameters: Default::default(),
         });
         t.checks.insert(
             "ck".into(),
@@ -2080,6 +2147,7 @@ mod tests {
                             table.primary_key = Some(PrimaryKey {
                                 name: Some(name.into()),
                                 columns: vec!["id".into()],
+                                storage_parameters: Default::default(),
                             })
                         }
                         1 => {
@@ -2087,6 +2155,7 @@ mod tests {
                                 name.into(),
                                 UniqueConstraint {
                                     columns: vec!["id".into()],
+                                    storage_parameters: Default::default(),
                                 },
                             );
                         }
@@ -2130,6 +2199,7 @@ mod tests {
         table.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         table.checks.insert(
             "same".into(),
@@ -2149,6 +2219,7 @@ mod tests {
                 unique: false,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
         assert!(

@@ -22,7 +22,7 @@ use crate::module::{Module, ModuleId, ModuleKind, ObjectName, RoutineId};
 use crate::name::{ColumnRef, TableName};
 use crate::role::{GrantTarget, Permission};
 use crate::schema::{
-    CheckConstraint, Collation, Column, ComputedColumn, ForeignKey, Index, PrimaryKey,
+    CheckConstraint, Collation, Column, ComputedColumn, ForeignKey, Index, IndexMethod, PrimaryKey,
     ReplicaIdentity, Table, UniqueConstraint,
 };
 use crate::strategy::Strategy;
@@ -321,6 +321,19 @@ pub enum Change {
     SetStorageParameters {
         uid: Uid,
         table: TableName,
+        set: BTreeMap<String, String>,
+        reset: BTreeSet<String>,
+    },
+
+    /// A PostgreSQL index's storage parameters (#1442): `ALTER INDEX … SET
+    /// (…), RESET (…)`, in place, which every supported parameter of both
+    /// methods is (measured on 16 and 18). Only what changes; an index
+    /// rebuilt for another reason carries its parameters in its `CREATE`
+    /// (DEC-1442.1).
+    SetIndexStorageParameters {
+        table: TableName,
+        target: IndexPart,
+        method: IndexMethod,
         set: BTreeMap<String, String>,
         reset: BTreeSet<String>,
     },
@@ -785,6 +798,17 @@ pub enum Part {
     Computed,
 }
 
+/// The index whose storage parameters a [`Change::SetIndexStorageParameters`]
+/// sets: the primary key's, a unique constraint's (which carries the
+/// constraint's name), or a standalone index's (#1442).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexPart {
+    PrimaryKey,
+    Unique(String),
+    Index(String),
+}
+
 /// One named part of a table, and what this plan leaves there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartChange<'a> {
@@ -1034,6 +1058,7 @@ impl Change {
             Change::AddColumn { table, .. }
             | Change::RenameColumn { table, .. }
             | Change::SetPrimaryKey { table, .. }
+            | Change::SetIndexStorageParameters { table, .. }
             | Change::SetStorageParameters { table, .. }
             | Change::SetReplicaIdentity { table, .. }
             | Change::AddUnique { table, .. }
@@ -1108,6 +1133,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1220,6 +1246,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1283,6 +1310,7 @@ impl Change {
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1387,6 +1415,7 @@ impl Change {
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1445,6 +1474,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1521,6 +1551,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1574,6 +1605,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1623,6 +1655,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1713,6 +1746,7 @@ impl Change {
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1773,6 +1807,7 @@ impl Change {
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1917,6 +1952,7 @@ impl Change {
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::PublicExecution { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. } => None,
         }
@@ -1945,6 +1981,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -2000,6 +2037,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -2043,6 +2081,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -2228,6 +2267,7 @@ impl Change {
             // Nor do storage parameters, which change how the engine stores
             // and vacuums the rows, not the rows: none rewrites the table
             // (DEC-1441.1).
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. } => {}
         }
         r
@@ -2726,6 +2766,7 @@ mod tests {
                 unique,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             }),
             clustered: false,
         };

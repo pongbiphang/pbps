@@ -1927,3 +1927,64 @@ Tests:
   (`crates/pbps-pg/tests/live.rs`, on 16 and 18) and
   `storage_parameters_change_through_the_cli`
   (`crates/pbps-cli/tests/flow_pg.rs`).
+
+<a id="dec-1442-1"></a>
+
+**DEC-1442.1. A PostgreSQL index, primary key and unique constraint declare
+their index's storage parameters, from a per-method list, and a change to
+them alone is made in place (#1442).**
+
+Measured on 16.15 and 18.6, alike:
+
+- A B-tree index takes `fillfactor` and `deduplicate_items`; a GIN index
+  `fastupdate` and `gin_pending_list_limit`; each refuses the other's. A key
+  and a unique constraint take theirs in the constraint clause (`… PRIMARY
+  KEY (id) WITH (fillfactor = 70)`).
+- `reloptions` keeps the spelling given, parsed by the engine's rules
+  (DEC-1441.1).
+- **Every one changes in place.** `ALTER INDEX … SET (…), RESET (…)` leaves
+  `relfilenode` unchanged, on a key's and a unique constraint's index too. No
+  supported parameter needs a rebuild.
+- The lock is on the index alone: `ShareUpdateExclusiveLock` for a B-tree's,
+  `AccessExclusiveLock` for a GIN index's, which holds every write to the
+  table, since each writes the index.
+
+**Model.** `storage_parameters` on `Index`, `PrimaryKey` and
+`UniqueConstraint`, canonical as a table's are, by the index's method
+(`storage::canonical_index`); a key's and a unique constraint's index is a
+B-tree. YAML: in an index's block; in a key's mapping form, beside an
+optional `name:`; and in a unique constraint's mapping form, `{columns: […],
+storage_parameters: {…}}`, its column list staying the plain form. Those two
+forms are read by hand rather than as an untagged enum, which would read a
+column named `n`, `y` or `on` as a boolean.
+
+**Plan.** A part is compared without its parameters to decide a rebuild; a
+difference in them alone is one `SetIndexStorageParameters`, `ALTER INDEX …
+SET (…), RESET (…)`, in class 10, with an estimate that reads nothing and
+names the method's lock. The key's index is found by a `DO` block when it
+runs, as its drop is, since a declared key need not be named. A part rebuilt
+for its definition carries its declared parameters in its `CREATE`, so none
+is lost on recreate.
+
+**Read.** From each index's `reloptions`, the key's and a unique
+constraint's through `conindid`. A name outside its method's list, or a value
+this reader cannot spell, is a named limitation. An index of a method the
+model does not hold (GiST's `buffering`) is one already.
+
+**Drift.** A planned change excuses its part, as an index change does, and
+the index's parameters are held once the run is whole to the before-read
+with the change applied.
+
+Tests: `an_index_takes_its_own_methods_parameters`,
+`an_index_parameter_must_be_its_methods` (`crates/pbps-model`);
+`index_storage_parameters_round_trip_in_every_form`,
+`a_boolean_looking_column_is_a_column_in_every_key_form` (`crates/pbps-load`);
+`index_parameters_change_in_place_and_ride_a_rebuild` (`crates/pbps-diff`);
+`index_storage_parameters_are_in_create_and_alter_index`,
+`index_storage_parameters_are_read_by_the_indexs_method`,
+`an_index_parameter_change_takes_its_methods_lock` (`crates/pbps-pg`);
+`storage_parameters_are_refused_on_sql_server` (`crates/pbps-mssql`);
+`index_storage_parameters_the_plan_sets_are_held_at_the_close`
+(`crates/pbps-cli`); the live
+`index_storage_parameters_round_trip_and_change_in_place` (on 16 and 18) and
+`index_storage_parameters_change_in_place_through_the_cli`.

@@ -32,6 +32,7 @@ fn declared(body: &str) -> Schema {
             unique: false,
             filter: Some("id >= app.f()".into()),
             method: Default::default(),
+            storage_parameters: Default::default(),
         },
     );
     schema.tables.insert("app.t".parse().unwrap(), table);
@@ -435,6 +436,7 @@ async fn exercise(target_connection: String, scratch_connection: String, worker:
     table.primary_key = Some(pbps_model::PrimaryKey {
         name: None,
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
     table.data = Some(pbps_model::TableData {
         mode: pbps_model::DataMode::Exact,
@@ -545,6 +547,7 @@ async fn new_table_online_indexes_are_transactional(target: &mut Conn) {
             unique: false,
             filter: None,
             method: Default::default(),
+            storage_parameters: Default::default(),
         },
     );
     let mut desired = Schema::default();

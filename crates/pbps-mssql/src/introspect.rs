@@ -1080,6 +1080,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             let pk = table.primary_key.get_or_insert_with(|| PrimaryKey {
                 name: Some(k.constraint_name.clone()),
                 columns: Vec::new(),
+                storage_parameters: Default::default(),
             });
             pk.columns.push(k.column.clone());
         } else {
@@ -1088,6 +1089,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 .entry(k.constraint_name.clone())
                 .or_insert_with(|| UniqueConstraint {
                     columns: Vec::new(),
+                    storage_parameters: Default::default(),
                 })
                 .columns
                 .push(k.column.clone());
@@ -1187,6 +1189,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     .as_deref()
                     .map(|f| strip_stored_parens(f).to_owned()),
                 method: Default::default(),
+                storage_parameters: Default::default(),
             });
         if i.is_included {
             index.include.push(i.column.clone());
@@ -2846,6 +2849,7 @@ mod tests {
             Some(PrimaryKey {
                 name: Some(name.into()),
                 columns: vec!["id".into()],
+                storage_parameters: Default::default(),
             })
         };
         assert_eq!(table("h").primary_key, pk("pk_h"));

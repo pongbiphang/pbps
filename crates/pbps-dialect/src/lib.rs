@@ -381,6 +381,9 @@ impl Unchecked {
             Change::SetStorageParameters { table, .. } => {
                 format!("storage parameters of {table}")
             }
+            Change::SetIndexStorageParameters { table, .. } => {
+                format!("index storage parameters on {table}")
+            }
             Change::AlterColumnNullability { column, .. } => format!("NOT NULL column {column}"),
             Change::AddComputedColumn { table, name, .. } => {
                 format!("new computed column {}", table.column(name))
@@ -3894,6 +3897,7 @@ mod tests {
                 unique: false,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
         table
@@ -3903,6 +3907,7 @@ mod tests {
         table.primary_key = Some(PrimaryKey {
             name: Some(name.to_owned()),
             columns: vec!["n".to_owned()],
+            storage_parameters: Default::default(),
         });
         table
     }
@@ -3912,6 +3917,7 @@ mod tests {
             name.to_owned(),
             UniqueConstraint {
                 columns: vec!["n".to_owned()],
+                storage_parameters: Default::default(),
             },
         );
         table

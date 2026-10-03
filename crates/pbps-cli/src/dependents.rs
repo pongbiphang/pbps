@@ -1569,6 +1569,7 @@ mod tests {
                 unique: filter.is_none(),
                 filter: filter.map(Into::into),
                 method: Default::default(),
+                storage_parameters: Default::default(),
             }),
             clustered: false,
         }
@@ -1648,6 +1649,7 @@ mod tests {
             name: format!("uq_{column}"),
             constraint: pbps_model::UniqueConstraint {
                 columns: vec![column.to_owned()],
+                storage_parameters: Default::default(),
             },
             clustered: false,
         };
@@ -1849,6 +1851,7 @@ mod tests {
                     unique: filter.is_none(),
                     filter: filter.map(Into::into),
                     method: Default::default(),
+                    storage_parameters: Default::default(),
                 },
             );
         }

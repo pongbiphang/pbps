@@ -402,6 +402,7 @@ mod tests {
         t.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         t
     }

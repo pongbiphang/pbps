@@ -195,18 +195,45 @@ impl Table {
     /// spelling, which a loaded declaration always is and a hand-edited
     /// state or plan may not be (#1441).
     pub fn storage_parameter_problems(&self) -> Vec<String> {
-        self.storage_parameters
-            .iter()
-            .filter_map(
-                |(name, value)| match crate::storage::canonical(name, value) {
-                    Ok(canonical) if canonical == *value => None,
-                    Ok(canonical) => Some(format!(
-                        "storage parameter `{name}` is `{value}`, which is spelled `{canonical}`"
+        let check = |what: &str,
+                     parameters: &BTreeMap<String, String>,
+                     canonical: &dyn Fn(&str, &str) -> Result<String, String>| {
+            parameters
+                .iter()
+                .filter_map(|(name, value)| match canonical(name, value) {
+                    Ok(spelled) if spelled == *value => None,
+                    Ok(spelled) => Some(format!(
+                        "{what}storage parameter `{name}` is `{value}`, which is spelled `{spelled}`"
                     )),
-                    Err(why) => Some(why),
-                },
-            )
-            .collect()
+                    Err(why) => Some(format!("{what}{why}")),
+                })
+                .collect::<Vec<_>>()
+        };
+        // The index's own, by its method (#1442); a key's and a unique
+        // constraint's index is a B-tree.
+        let btree = |n: &str, v: &str| crate::storage::canonical_index(IndexMethod::Btree, n, v);
+        let mut found = check("", &self.storage_parameters, &|n, v| {
+            crate::storage::canonical(n, v)
+        });
+        if let Some(pk) = &self.primary_key {
+            found.extend(check("primary key: ", &pk.storage_parameters, &btree));
+        }
+        for (name, unique) in &self.unique {
+            found.extend(check(
+                &format!("unique constraint `{name}`: "),
+                &unique.storage_parameters,
+                &btree,
+            ));
+        }
+        for (name, index) in &self.indexes {
+            let method = index.method;
+            found.extend(check(
+                &format!("index `{name}`: "),
+                &index.storage_parameters,
+                &|n, v| crate::storage::canonical_index(method, n, v),
+            ));
+        }
+        found
     }
 
     /// Why this table's [`Table::replica_identity`] cannot be what it says:
@@ -685,12 +712,26 @@ pub struct PrimaryKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub columns: Vec<String>,
+
+    /// PostgreSQL index storage parameters (#1442), by name, each in its
+    /// canonical spelling ([`crate::storage::canonical_index`]). A key's and
+    /// a unique constraint's index is a B-tree. Empty is every parameter at
+    /// its default.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub storage_parameters: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UniqueConstraint {
     pub columns: Vec<String>,
+
+    /// PostgreSQL index storage parameters (#1442), by name, each in its
+    /// canonical spelling ([`crate::storage::canonical_index`]). A key's and
+    /// a unique constraint's index is a B-tree. Empty is every parameter at
+    /// its default.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub storage_parameters: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -761,6 +802,13 @@ pub struct Index {
     /// index it always was (DEC-1169.1).
     #[serde(default, skip_serializing_if = "IndexMethod::is_btree")]
     pub method: IndexMethod,
+
+    /// PostgreSQL index storage parameters (#1442), by name, each in its
+    /// canonical spelling ([`crate::storage::canonical_index`]). A key's and
+    /// a unique constraint's index is a B-tree. Empty is every parameter at
+    /// its default.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub storage_parameters: BTreeMap<String, String>,
 }
 
 impl Index {
@@ -999,6 +1047,7 @@ mod tests {
             primary_key: Some(PrimaryKey {
                 name: Some("pk_customer".into()),
                 columns: vec!["customer_id".into()],
+                storage_parameters: Default::default(),
             }),
             ..Default::default()
         }
@@ -1132,6 +1181,7 @@ mod tests {
             "uq_email".into(),
             UniqueConstraint {
                 columns: vec!["email".into()],
+                storage_parameters: Default::default(),
             },
         );
         for fine in [
@@ -1182,18 +1232,21 @@ mod tests {
             unique,
             filter: filter.map(Into::into),
             method: IndexMethod::default(),
+            storage_parameters: Default::default(),
         };
         let column = |c: &str| IndexKey::Column(c.into());
         t.unique.insert(
             "uq_id".into(),
             UniqueConstraint {
                 columns: vec!["customer_id".into()],
+                storage_parameters: Default::default(),
             },
         );
         t.unique.insert(
             "uq_email".into(),
             UniqueConstraint {
                 columns: vec!["email".into()],
+                storage_parameters: Default::default(),
             },
         );
         t.indexes
@@ -1277,6 +1330,44 @@ mod tests {
         assert!(t.storage_parameter_problems()[0].contains("`bogus`"));
     }
 
+    /// An index's parameters are its method's, and a key's and a unique
+    /// constraint's are a B-tree's; anything else is refused by name (#1442).
+    #[test]
+    fn an_index_parameter_must_be_its_methods() {
+        let mut t = sample();
+        let gin = Index {
+            columns: vec![IndexColumn {
+                key: IndexKey::Column("email".into()),
+                descending: false,
+                opclass: None,
+            }],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method: IndexMethod::Gin,
+            storage_parameters: [("fastupdate".to_owned(), "false".to_owned())].into(),
+        };
+        t.indexes.insert("ix_gin".into(), gin);
+        t.primary_key.as_mut().unwrap().storage_parameters =
+            [("fillfactor".to_owned(), "70".to_owned())].into();
+        assert!(
+            t.storage_parameter_problems().is_empty(),
+            "{:?}",
+            t.storage_parameter_problems()
+        );
+        t.indexes.get_mut("ix_gin").unwrap().storage_parameters =
+            [("fillfactor".to_owned(), "70".to_owned())].into();
+        assert!(t.storage_parameter_problems()[0].contains("index `ix_gin`"));
+        t.indexes
+            .get_mut("ix_gin")
+            .unwrap()
+            .storage_parameters
+            .clear();
+        t.primary_key.as_mut().unwrap().storage_parameters =
+            [("fastupdate".to_owned(), "true".to_owned())].into();
+        assert!(t.storage_parameter_problems()[0].contains("primary key"));
+    }
+
     /// A snapshot or plan from before the field reads as the default layout,
     /// and the default is written as nothing, so no existing file changes.
     #[test]
@@ -1330,6 +1421,7 @@ mod tests {
             "uq_email".into(),
             UniqueConstraint {
                 columns: vec!["email".into()],
+                storage_parameters: Default::default(),
             },
         );
         let mut child = Table::default();

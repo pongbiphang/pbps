@@ -448,6 +448,10 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             dialect: DIALECT,
             feature: format!("storage parameters on `{table}`, which are PostgreSQL's"),
         }),
+        Change::SetIndexStorageParameters { table, .. } => Err(DialectError::Unsupported {
+            dialect: DIALECT,
+            feature: format!("index storage parameters on `{table}`, which are PostgreSQL's"),
+        }),
         Change::PublicExecution { routine, .. } => Err(DialectError::Unsupported {
             dialect: DIALECT,
             feature: format!(
@@ -2041,6 +2045,7 @@ mod tests {
         t.primary_key = Some(PrimaryKey {
             name: Some("pk_customer".into()),
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         let sql = sql_of(&Change::CreateTable {
             uid: uid("t_k7x2mq"),
@@ -2109,12 +2114,14 @@ mod tests {
         t.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         for n in ["uq_a", "uq_b"] {
             t.unique.insert(
                 n.into(),
                 UniqueConstraint {
                     columns: vec!["code".into()],
+                    storage_parameters: Default::default(),
                 },
             );
         }
@@ -2131,6 +2138,7 @@ mod tests {
                     unique: false,
                     filter: None,
                     method: Default::default(),
+                    storage_parameters: Default::default(),
                 },
             );
         }
@@ -2232,6 +2240,7 @@ mod tests {
         let key = PrimaryKey {
             name: Some("pk_t".into()),
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         };
         let index = Index {
             columns: vec![IndexColumn {
@@ -2243,6 +2252,7 @@ mod tests {
             unique: false,
             filter: None,
             method: Default::default(),
+            storage_parameters: Default::default(),
         };
         for build in [
             Change::SetPrimaryKey {
@@ -2262,6 +2272,7 @@ mod tests {
                 name: "uq".into(),
                 constraint: UniqueConstraint {
                     columns: vec!["id".into()],
+                    storage_parameters: Default::default(),
                 },
                 clustered: true,
             },
@@ -2955,6 +2966,7 @@ mod tests {
             from: Some(PrimaryKey {
                 name: None,
                 columns: vec!["id".into()],
+                storage_parameters: Default::default(),
             }),
             to: None,
             nonclustered: false,
@@ -2966,6 +2978,7 @@ mod tests {
             from: Some(PrimaryKey {
                 name: Some("pk_t".into()),
                 columns: vec!["id".into()],
+                storage_parameters: Default::default(),
             }),
             to: None,
             nonclustered: false,
@@ -3051,6 +3064,7 @@ mod tests {
                 unique: false,
                 filter: Some("a IS NOT NULL -- only the live ones".into()),
                 method: Default::default(),
+                storage_parameters: Default::default(),
             }),
             clustered: false,
         });
@@ -3084,6 +3098,7 @@ mod tests {
                 unique: true,
                 filter: Some("a IS NOT NULL".into()),
                 method: Default::default(),
+                storage_parameters: Default::default(),
             }),
             clustered: false,
         });
@@ -3149,6 +3164,7 @@ mod tests {
             from: Some(PrimaryKey {
                 name: None,
                 columns: vec!["id".into()],
+                storage_parameters: Default::default(),
             }),
             to: None,
             nonclustered: false,
@@ -3228,6 +3244,7 @@ mod tests {
                 unique: false,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             }),
             clustered: false,
         }
@@ -3262,6 +3279,7 @@ mod tests {
                 name: "uq_line".into(),
                 constraint: UniqueConstraint {
                     columns: vec!["order_id".into()],
+                    storage_parameters: Default::default(),
                 },
                 clustered: false,
             }),
@@ -3354,6 +3372,7 @@ mod tests {
                 unique: false,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
         let sql = online_sql_of(&Change::CreateTable {

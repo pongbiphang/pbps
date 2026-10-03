@@ -118,6 +118,7 @@ mod tests {
             primary_key: Some(PrimaryKey {
                 name: None,
                 columns: vec!["id".into()],
+                storage_parameters: Default::default(),
             }),
             ..Default::default()
         };
@@ -125,6 +126,7 @@ mod tests {
             "uq".into(),
             UniqueConstraint {
                 columns: vec!["tag".into()],
+                storage_parameters: Default::default(),
             },
         );
         table.indexes.insert(
@@ -139,6 +141,7 @@ mod tests {
                 unique: false,
                 filter: Some("[tag] IS NOT NULL".into()),
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
         table.foreign_keys.insert(

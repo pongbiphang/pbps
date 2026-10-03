@@ -1539,6 +1539,7 @@ mod tests {
             primary_key: Some(pbps_model::schema::PrimaryKey {
                 name: None,
                 columns: vec!["code".to_owned()],
+                storage_parameters: Default::default(),
             }),
             data: Some(pbps_model::TableData {
                 mode,

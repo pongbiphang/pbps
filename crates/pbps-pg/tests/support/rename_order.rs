@@ -22,6 +22,7 @@ fn fixture(case: &str) -> (Schema, Schema, Vec<Intent>) {
                 blocked.into(),
                 UniqueConstraint {
                     columns: vec!["id".into()],
+                    storage_parameters: Default::default(),
                 },
             );
             base.tables.insert(old.parse().unwrap(), t);
@@ -48,6 +49,7 @@ fn fixture(case: &str) -> (Schema, Schema, Vec<Intent>) {
                     unique: false,
                     filter: Some("id > 0".into()),
                     method: Default::default(),
+                    storage_parameters: Default::default(),
                 },
             );
         }
@@ -68,12 +70,14 @@ fn fixture(case: &str) -> (Schema, Schema, Vec<Intent>) {
             owner.primary_key = Some(PrimaryKey {
                 name: Some("target".into()),
                 columns: vec!["id".into()],
+                storage_parameters: Default::default(),
             });
         } else {
             owner.unique.insert(
                 "target".into(),
                 UniqueConstraint {
                     columns: vec!["id".into()],
+                    storage_parameters: Default::default(),
                 },
             );
         }
@@ -94,6 +98,7 @@ fn fixture(case: &str) -> (Schema, Schema, Vec<Intent>) {
             "target".into(),
             UniqueConstraint {
                 columns: vec!["id".into()],
+                storage_parameters: Default::default(),
             },
         );
         base.tables.insert("app.owner".parse().unwrap(), owner);
@@ -101,6 +106,7 @@ fn fixture(case: &str) -> (Schema, Schema, Vec<Intent>) {
         parent.primary_key = Some(PrimaryKey {
             name: Some("pk_parent".into()),
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         base.tables.insert("app.parent".parse().unwrap(), parent);
         let mut child = one_column();

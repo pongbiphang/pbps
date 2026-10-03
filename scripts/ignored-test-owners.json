@@ -1254,7 +1254,8 @@
         "update_of_triggers_only_guard_columns_the_statement_can_fire",
         "what_calls_a_new_function_follows_its_create",
         "a_replica_identity_moves_to_a_new_index_through_the_cli",
-        "storage_parameters_change_through_the_cli"
+        "storage_parameters_change_through_the_cli",
+        "index_storage_parameters_change_in_place_through_the_cli"
       ]
     },
     {
@@ -1889,6 +1890,7 @@
         "impact_lexer_keeps_longer_quoted_identifiers_whole",
         "impact_lexer_keeps_the_engine_spelling_of_embedded_quotes",
         "index_expressions_and_predicates_keep_unmeasured_costs_unknown",
+        "index_storage_parameters_round_trip_and_change_in_place",
         "installed_default_operator_classes_can_make_json_keys_valid",
         "integer_narrowing_conversion_probes_match_both_engine_boundaries",
         "integer_narrowing_key_probes_exclude_overflow_but_keep_fitting_orphans",

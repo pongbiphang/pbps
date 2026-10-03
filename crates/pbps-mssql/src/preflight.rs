@@ -358,6 +358,7 @@ impl AsStored {
                 | Change::AlterColumnExpression { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
+                | Change::SetIndexStorageParameters { .. }
                 | Change::SetStorageParameters { .. }
                 | Change::SetReplicaIdentity { .. }
                 | Change::AddUnique { .. }
@@ -591,6 +592,7 @@ impl AsStored {
                 | Change::RenameRole { .. }
                 | Change::Grant { .. }
                 | Change::Revoke { .. }
+                | Change::SetIndexStorageParameters { .. }
                 | Change::SetStorageParameters { .. }
                 | Change::SetReplicaIdentity { .. }
                 | Change::PublicExecution { .. } => {}
@@ -1051,6 +1053,7 @@ fn build(
         // This dialect never produces one and `emit` refuses it; a probe
         // would be a second opinion about a statement that will not be
         // written.
+        | Change::SetIndexStorageParameters { .. }
         | Change::SetStorageParameters { .. }
         | Change::SetReplicaIdentity { .. }
         | Change::PublicExecution { .. } => Ok(Vec::new()),
@@ -2618,6 +2621,7 @@ mod tests {
             name: "uq_code".into(),
             constraint: UniqueConstraint {
                 columns: vec!["code".into()],
+                storage_parameters: Default::default(),
             },
             clustered: false,
         });
@@ -2666,6 +2670,7 @@ mod tests {
                     name: "uq_code".into(),
                     constraint: UniqueConstraint {
                         columns: vec!["code".into()],
+                        storage_parameters: Default::default(),
                     },
                     clustered: false,
                 }),
@@ -2755,6 +2760,7 @@ mod tests {
                     name: "uq_email".into(),
                     constraint: UniqueConstraint {
                         columns: vec!["email".into()],
+                        storage_parameters: Default::default(),
                     },
                     clustered: false,
                 }),
@@ -3163,6 +3169,7 @@ mod tests {
             name: "uq_customer_email".into(),
             constraint: UniqueConstraint {
                 columns: vec!["email".into(), "tenant".into()],
+                storage_parameters: Default::default(),
             },
             clustered: false,
         });
@@ -3532,6 +3539,7 @@ mod tests {
             name: "uq_code".into(),
             constraint: pbps_model::UniqueConstraint {
                 columns: vec!["code".into()],
+                storage_parameters: Default::default(),
             },
             clustered: false,
         };
@@ -3593,6 +3601,7 @@ mod tests {
                 unique,
                 filter: filter.map(str::to_owned),
                 method: Default::default(),
+                storage_parameters: Default::default(),
             }),
             clustered: false,
         }
@@ -3883,6 +3892,7 @@ mod tests {
             name: "uq_setting_seq".into(),
             constraint: pbps_model::UniqueConstraint {
                 columns: vec!["seq".into()],
+                storage_parameters: Default::default(),
             },
             clustered: false,
         };
@@ -3905,6 +3915,7 @@ mod tests {
             name: "uq_setting_label".into(),
             constraint: pbps_model::UniqueConstraint {
                 columns: vec!["label".into()],
+                storage_parameters: Default::default(),
             },
             clustered: false,
         };
@@ -4052,6 +4063,7 @@ mod tests {
             name: "uq_region".into(),
             constraint: pbps_model::UniqueConstraint {
                 columns: vec!["region_id".into()],
+                storage_parameters: Default::default(),
             },
             clustered: false,
         };
@@ -4142,6 +4154,7 @@ mod tests {
             to: Some(PrimaryKey {
                 name: Some("pk_customer".into()),
                 columns: vec!["id".into()],
+                storage_parameters: Default::default(),
             }),
             nonclustered: false,
         });
@@ -4181,6 +4194,7 @@ mod tests {
                 from: Some(PrimaryKey {
                     name: None,
                     columns: vec!["id".into()],
+                    storage_parameters: Default::default(),
                 }),
                 to: None,
                 nonclustered: false,
@@ -4746,6 +4760,7 @@ mod tests {
                 name: "uq".into(),
                 constraint: UniqueConstraint {
                     columns: vec!["email".into()],
+                    storage_parameters: Default::default(),
                 },
                 clustered: false,
             },
@@ -4829,6 +4844,7 @@ mod tests {
             name: "uq".into(),
             constraint: UniqueConstraint {
                 columns: vec!["id".into()],
+                storage_parameters: Default::default(),
             },
             clustered: false,
         };

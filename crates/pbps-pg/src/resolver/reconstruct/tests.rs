@@ -28,6 +28,7 @@ fn table() -> Table {
             unique: false,
             filter: Some("c > app.f(1)".into()),
             method: Default::default(),
+            storage_parameters: Default::default(),
         },
     );
     table.indexes.insert(
@@ -42,6 +43,7 @@ fn table() -> Table {
             unique: false,
             filter: None,
             method: Default::default(),
+            storage_parameters: Default::default(),
         },
     );
     table.foreign_keys.insert(
@@ -251,6 +253,7 @@ fn an_index_replica_identity_is_set_after_its_index() {
             unique: true,
             filter: None,
             method: Default::default(),
+            storage_parameters: Default::default(),
         },
     );
     t.replica_identity = Some(pbps_model::ReplicaIdentity::Index("t_id".into()));

@@ -906,6 +906,7 @@ mod tests {
             primary_key: pk.map(|c| PrimaryKey {
                 name: None,
                 columns: c.into_iter().map(str::to_owned).collect(),
+                storage_parameters: Default::default(),
             }),
             data: Some(TableData {
                 mode: DataMode::Exact,
