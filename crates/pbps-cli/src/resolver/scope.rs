@@ -285,6 +285,8 @@ pub(crate) fn planned_schema_grants(
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
             | Change::DropColumn { .. }
             | Change::RenameColumn { .. }
             | Change::AlterColumnType { .. }

@@ -27,6 +27,8 @@ fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, Re
         Change::CreateTable { .. }
         | Change::DropTable { .. }
         | Change::AddColumn { .. }
+        | Change::AddComputedColumn { .. }
+        | Change::DropComputedColumn { .. }
         | Change::DropColumn { .. }
         | Change::AlterColumnType { .. }
         | Change::AlterColumnNullability { .. }

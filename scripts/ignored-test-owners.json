@@ -104,8 +104,8 @@
       "selection": {
         "kind": "data",
         "file": "scripts/live-resolver-server.py",
-        "expression": "TESTS",
-        "prefix": "resolver::server::live_tests::"
+        "expression": "TESTS + PRODUCER_TESTS",
+        "prefix": ""
       },
       "witnesses": [
         {
@@ -130,8 +130,9 @@
           "scope": "fixture",
           "requires": [
             "for test in TESTS",
+            "cases.extend([(test, False) for test in PRODUCER_TESTS if engine == \"pg\"])",
             "for test, empty in cases:",
-            "command = [binary, \"--ignored\", \"--exact\", f\"resolver::server::live_tests::{test}\"",
+            "command = [binary, \"--ignored\", \"--exact\", test, \"--nocapture\"]",
             "run(*command,"
           ]
         },
@@ -141,43 +142,6 @@
           "scope": "run",
           "requires": [
             "subprocess.run(args,"
-          ]
-        }
-      ]
-    },
-    "server-producer": {
-      "platform": "linux",
-      "fixture": "Root observer and supplied PostgreSQL; focused qualified evidence producer.",
-      "job": "resolver",
-      "script": "scripts/live-resolver-server.py",
-      "selection": {
-        "kind": "data",
-        "file": "scripts/live-resolver-server.py",
-        "expression": "PRODUCER_TESTS",
-        "prefix": ""
-      },
-      "witnesses": [
-        {
-          "file": "scripts/live-resolver-server.py",
-          "language": "python",
-          "scope": "<module>",
-          "requires": ["main()"]
-        },
-        {
-          "file": "scripts/live-resolver-server.py",
-          "language": "python",
-          "scope": "main",
-          "requires": ["fixture(args, binary, root, owned)"]
-        },
-        {
-          "file": "scripts/live-resolver-server.py",
-          "language": "python",
-          "scope": "fixture",
-          "requires": [
-            "cases.extend([(test, False) for test in PRODUCER_TESTS if engine == \"pg\"])",
-            "if test in PRODUCER_TESTS:",
-            "command[3] = test",
-            "run(*command,"
           ]
         }
       ]
@@ -194,7 +158,7 @@
       "selection": {
         "kind": "data",
         "file": "scripts/live-resolver-target.py",
-        "expression": "NATIVE_TESTS",
+        "expression": "NATIVE_TESTS + PRODUCER_TESTS + GENERATION_TESTS",
         "prefix": ""
       },
       "witnesses": [
@@ -228,7 +192,12 @@
           "language": "python",
           "scope": "native_tests",
           "requires": [
-            "for test in GENERATION_TESTS if generation_only else PRODUCER_TESTS if producer_only else NATIVE_TESTS:",
+            "selected = [test for test in GENERATION_TESTS]",
+            "selected = [test for test in PRODUCER_TESTS]",
+            "selected = [test for test in NATIVE_TESTS]",
+            "selected += [test for test in PRODUCER_TESTS]",
+            "selected += [test for test in GENERATION_TESTS]",
+            "for test in selected:",
             "run(binary, \"--ignored\", \"--exact\", test,"
           ]
         },
@@ -822,7 +791,7 @@
         "lib",
         "pbps_cli"
       ],
-      "owner": "server-producer",
+      "owner": "server",
       "validate_on": "linux",
       "ignored_on": ["linux", "win32", "darwin"],
       "cases": [
