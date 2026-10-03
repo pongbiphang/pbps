@@ -222,7 +222,6 @@ jobs:
       - run: cargo test -p pbps-mssql --test live -- --ignored --skip a_real_express_target_is_an_edition_limitation
       # Driver error conversion is a separate test target, ignored by quick.
       - run: cargo test -p pbps-db --test live_mssql -- --ignored
-      - run: python3 scripts/live-transport.py mssql
       # Phase 3.1's onboarding path and the optional dev rehearsal both cross
       # the CLI/database boundary, so the dialect-only suite cannot exercise
       # them. Keep these ignored in ordinary jobs and run them here against the
@@ -244,6 +243,34 @@ jobs:
           id=$(docker ps -aq --filter publish=14330)
           if [ -n "$id" ]; then
             docker exec "$id" tail -n 300 /var/opt/mssql/log/errorlog >&2 || docker logs "$id" >&2 2>&1 || true
+          fi
+
+  # The SQL Server TLS fixture starts its own disposable SQL Server (3 GiB
+  # limit). Run in `live`, it sat beside that job's service container: two SQL
+  # Servers on one runner, the pressure the startup crashes in docs/PITFALLS.md
+  # warn about. Here it has a runner to itself, with no services, so a crash
+  # costs this job alone and cannot be mistaken for one of `live`'s (#627).
+  live-transport-mssql:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: python3 scripts/live-transport.py mssql
+      # The fixture removes its container on success, failure and SIGTERM. A
+      # cancelled job still loses the runner, so this checks the paths that
+      # finish: a leftover `pbps-tls-*` container fails the job, and the
+      # memory the runner has is printed beside the 3 GiB limit.
+      - name: fixture resources after the run
+        if: ${{ always() }}
+        run: |
+          free -m
+          left=$(docker ps -aq --filter name=pbps-tls-)
+          if [ -n "$left" ]; then
+            echo "::error::the TLS fixture left containers behind" >&2
+            docker ps -a --filter name=pbps-tls- >&2
+            exit 1
           fi
 
   # Two real instances of one build, as two editions under two server
@@ -574,7 +601,7 @@ jobs:
   # quietly qualify a pull request that nothing ran on.
   gate:
     name: ci-gate
-    needs: [approve, lint, quick, windows, live, live-editions, live-pg, dev-rehearsal, resolver, msrv]
+    needs: [approve, lint, quick, windows, live, live-transport-mssql, live-editions, live-pg, dev-rehearsal, resolver, msrv]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
