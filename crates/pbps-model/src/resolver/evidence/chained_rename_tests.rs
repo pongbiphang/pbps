@@ -29,6 +29,7 @@ fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, Re
         | Change::AddColumn { .. }
         | Change::AddComputedColumn { .. }
         | Change::SetReplicaIdentity { .. }
+        | Change::SetStorageParameters { .. }
         | Change::DropComputedColumn { .. }
         | Change::DropColumn { .. }
         | Change::AlterColumnType { .. }

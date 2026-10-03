@@ -454,6 +454,7 @@ pub(super) fn derive(
             }
             Change::SetPrimaryKey { table, .. }
             | Change::SetReplicaIdentity { table, .. }
+            | Change::SetStorageParameters { table, .. }
             | Change::AddUnique { table, .. }
             | Change::DropUnique { table, .. }
             | Change::AddForeignKey { table, .. }
