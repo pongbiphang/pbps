@@ -72,7 +72,9 @@ pub fn canonical(name: &str, value: &str) -> Result<String, String> {
     let read = match kind {
         Kind::Bool => parse_bool(value).map(|b| b.to_string()),
         Kind::Int => parse_int(value).map(|i| i.to_string()),
-        Kind::Real => parse_real(value).map(|r| r.to_string()),
+        // `+ 0.0` turns a negative zero into zero, which `to_string` would
+        // otherwise spell `-0` (#1477 review).
+        Kind::Real => parse_real(value).map(|r| (r + 0.0).to_string()),
         Kind::IndexCleanup => {
             let word = value.trim().to_lowercase();
             if word == "auto" {
@@ -180,6 +182,13 @@ mod tests {
                 "autovacuum_vacuum_scale_factor",
                 &["0.01", "1e-2", ".01", "0.010"][..],
                 "0.01",
+            ),
+            // Negative zero is zero: kept as `-0`, a bare `-0` would load back
+            // as the integer 0 and never round-trip (#1477 review).
+            (
+                "autovacuum_vacuum_scale_factor",
+                &["0", "-0", "-0.0", "0e5"][..],
+                "0",
             ),
             (
                 "vacuum_index_cleanup",
