@@ -2259,6 +2259,151 @@ fn an_object_grant_after_a_same_name_replacement_names_the_replacement() {
     }
 }
 
+/// A check or index dropped after its table's rename is named by the new
+/// spelling, while the opening capture owns it under the old one. Its
+/// opening inventory follows the recorded table UID, so the drop is not an
+/// empty transition and the plan seals.
+#[test]
+fn a_child_dropped_after_its_tables_rename_keeps_its_opening_inventory() {
+    use pbps_db::resolver::capture::ObjectIdentity;
+    use pbps_model::{CheckConstraint, Column, Index, IndexColumn, IndexKey, PlannedChange, Table};
+    use pbps_pg::resolver::capture::BindingRecord;
+
+    let old: pbps_model::TableName = "app.t".parse().unwrap();
+    let new: pbps_model::TableName = "app.u".parse().unwrap();
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("n".into(), Column::new("integer".parse().unwrap()));
+    let mut keyed = table.clone();
+    keyed.checks.insert(
+        "c".into(),
+        CheckConstraint {
+            expression: "n > 0".into(),
+        },
+    );
+    keyed.indexes.insert(
+        "ix".into(),
+        Index {
+            columns: vec![IndexColumn {
+                key: IndexKey::Column("n".into()),
+                descending: false,
+                opclass: None,
+            }],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method: Default::default(),
+        },
+    );
+    let mut base = Schema::default();
+    base.tables.insert(old.clone(), keyed);
+    let base_ids = ids(&base, &IdsFile::default());
+    let uid = base_ids.table_uid(&old).unwrap().clone();
+    let mut desired = Schema::default();
+    desired.tables.insert(new.clone(), table);
+    let mut desired_ids = base_ids.clone();
+    desired_ids.rename_table(&old, &new);
+    let relation = |name: &pbps_model::TableName| ObjectIdentity {
+        class: "pg_class".into(),
+        name: vec![name.schema.clone(), name.name.clone()],
+        signature: vec![],
+    };
+    let check = ObjectIdentity {
+        class: "pg_constraint".into(),
+        name: vec!["c".into()],
+        signature: vec![relation(&old)],
+    };
+    let index = ObjectIdentity {
+        class: "pg_class".into(),
+        name: vec!["app".into(), "ix".into()],
+        signature: vec![],
+    };
+    let owned = |object: ObjectIdentity, surface: Surface| BindingRecord {
+        object,
+        ownership: ObjectOwnership::Surface(surface),
+        bindings: vec![],
+    };
+    let opening = vec![
+        owned(relation(&old), Surface::Table(old.clone())),
+        owned(
+            check.clone(),
+            Surface::Check {
+                table: old.clone(),
+                name: "c".into(),
+            },
+        ),
+        owned(
+            index.clone(),
+            Surface::Index {
+                table: old.clone(),
+                name: "ix".into(),
+            },
+        ),
+    ];
+    let compiled = vec![owned(relation(&new), Surface::Table(new.clone()))];
+    let changes = ChangeSet {
+        changes: vec![
+            PlannedChange::new(Change::RenameTable {
+                uid,
+                from: old.clone(),
+                to: new.clone(),
+                defaults: vec![],
+            }),
+            PlannedChange::new(Change::DropCheck {
+                table: new.clone(),
+                name: "c".into(),
+            }),
+            PlannedChange::new(Change::DropIndex {
+                table: new.clone(),
+                name: "ix".into(),
+            }),
+        ],
+    };
+    let transitions = super::transitions::derive(
+        &changes,
+        pbps_diff::Side {
+            schema: &base,
+            ids: &base_ids,
+        },
+        pbps_diff::Side {
+            schema: &desired,
+            ids: &desired_ids,
+        },
+        &opening,
+        &compiled,
+    )
+    .unwrap();
+    for (surface, object) in [
+        (
+            Surface::Check {
+                table: new.clone(),
+                name: "c".into(),
+            },
+            &check,
+        ),
+        (
+            Surface::Index {
+                table: new.clone(),
+                name: "ix".into(),
+            },
+            &index,
+        ),
+    ] {
+        let dropped = transitions
+            .iter()
+            .find(|t| t.surface == surface)
+            .expect("the drop has its own transition");
+        assert_eq!(exact(dropped).0, BTreeSet::from([object.clone()]));
+        assert!(dropped.after.is_empty());
+    }
+    let parent = transitions
+        .iter()
+        .find(|t| t.surface == Surface::Table(new.clone()))
+        .unwrap();
+    assert!(!parent.before.contains(&check) && !parent.before.contains(&index));
+}
+
 /// One DDL statement reaches past its own surface: a retype rebuilds the
 /// index over the column, and a default change flips the column's own flag.
 /// The table is the unit of the closing inventory (#1466): its whole tree
