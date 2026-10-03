@@ -1834,9 +1834,10 @@ the table's own key (#1467 review).
 **Drift.** A touched table's identity that changes across an apply is
 movement unless the plan sets it. Where it does, any value mid-run is the plan
 in progress, and once the run is whole it must be the last value the plan
-sets: another session's after the plan's is movement (#1467 review). A
-created table is held to its declared identity once it shows one or the run
-is whole.
+sets: another session's after the plan's is movement (#1467 review). That
+value is found by the table's uid, not by a name a setting ran under, which
+two tables share in a handoff (`a` to `b` while `b` goes to `c`). A created
+table is held to its declared identity once it shows one or the run is whole.
 
 Tests:
 

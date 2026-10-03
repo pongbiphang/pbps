@@ -2926,11 +2926,17 @@ fn refuse_unplanned_movement(
     // the other from every comparison (DECISIONS 168).
     let mut constraints: BTreeMap<&TableName, BTreeSet<(pbps_model::Part, &str)>> = BTreeMap::new();
     let mut keys: BTreeSet<&TableName> = BTreeSet::new();
-    // The tables whose replica identity this plan sets, by the name the
-    // change runs under — the old one ahead of the renames, the new one after
-    // the additions (DEC-1444.1) — with the last value it sets.
-    let mut identities: BTreeMap<&TableName, Option<&pbps_model::ReplicaIdentity>> =
-        BTreeMap::new();
+    // The tables whose replica identity this plan sets, by uid, with the
+    // last value it sets and a name a setting ran under: the old one ahead of
+    // the renames, the new one after the additions (DEC-1444.1). By uid, not
+    // by that name, which in a handoff (`a` to `b` while `b` goes to `c`) two
+    // tables' settings share (#1467 review).
+    let mut identities: BTreeMap<
+        &pbps_model::Uid,
+        (Option<&pbps_model::ReplicaIdentity>, &TableName),
+    > = BTreeMap::new();
+    // Each renamed table's uid, by its old and new names.
+    let mut renamed_uids: BTreeMap<&pbps_model::Uid, (&TableName, &TableName)> = BTreeMap::new();
     // The defaults a change of this plan's own sets, by column. A created
     // table's column may have its default taken out of the `CREATE` and set
     // after a function the plan rebuilds (#1027, DEC-942.1), so the payload
@@ -2955,8 +2961,9 @@ fn refuse_unplanned_movement(
         table
     }
     for (index, p) in changes.changes.iter().enumerate() {
-        if let pbps_model::Change::RenameTable { from, to, .. } = &p.change {
+        if let pbps_model::Change::RenameTable { uid, from, to, .. } = &p.change {
             renamed.insert(from, to);
+            renamed_uids.insert(uid, (from, to));
         }
         if let pbps_model::Change::RenameRole { from, to, .. } = &p.change {
             renamed_roles.insert(from, to);
@@ -3025,8 +3032,8 @@ fn refuse_unplanned_movement(
         if let pbps_model::Change::CreateTable { name, table, .. } = &p.change {
             created.insert(name, table.as_ref());
         }
-        if let pbps_model::Change::SetReplicaIdentity { table, to, .. } = &p.change {
-            identities.insert(table, to.as_ref());
+        if let pbps_model::Change::SetReplicaIdentity { uid, table, to } = &p.change {
+            identities.insert(uid, (to.as_ref(), table));
         }
         if let pbps_model::Change::AlterColumnDefault { column, to, .. } = &p.change {
             set_defaults.insert((&column.table, column.name.as_str()), to.as_ref());
@@ -3653,15 +3660,22 @@ fn refuse_unplanned_movement(
             // around (#1444). Where this plan sets it, any value is the plan in
             // progress until the run is whole, and then it must be the last one
             // the plan sets: another session's after the plan's is movement
-            // (#1467 review). The new name first, which the last setting runs
-            // under unless it ran ahead of a rename.
-            match identities.get(now_name).or_else(|| identities.get(name)) {
+            // (#1467 review). The table's uid is the one whose rename runs from
+            // this name to that, or, unrenamed, whose settings ran under it.
+            let planned = identities.iter().find_map(|(uid, (to, ran_under))| {
+                let ours = match renamed_uids.get(uid) {
+                    Some((from, to)) => *from == name && *to == now_name,
+                    None => *ran_under == name && name == now_name,
+                };
+                ours.then_some(*to)
+            });
+            match planned {
                 None if was.replica_identity != now.replica_identity => {
                     moved.push(format!(
                         "{now_name} replica identity changed, and no change of this plan sets it"
                     ));
                 }
-                Some(planned) if settled.whole() && now.replica_identity.as_ref() != *planned => {
+                Some(planned) if settled.whole() && now.replica_identity.as_ref() != planned => {
                     moved.push(format!(
                         "{now_name} replica identity is not the one this plan sets"
                     ));
@@ -12100,6 +12114,74 @@ mod tests {
             format!("{e:#}").contains("replica identity is not the one"),
             "{e:#}"
         );
+        // A name handoff: `a` becomes `b` while `b` becomes `c`. `b`'s early
+        // FULL runs under the name `b`, and `a`'s late NOTHING under its new
+        // name `b` too; each table is held to its own (#1467 review).
+        let (a, b, c) = (
+            TableName::new("app", "a"),
+            TableName::new("app", "b"),
+            TableName::new("app", "c"),
+        );
+        let named = |tables: &[(&TableName, Option<ReplicaIdentity>)]| Schema {
+            tables: tables
+                .iter()
+                .map(|(n, identity)| {
+                    let mut t = t.clone();
+                    t.replica_identity = identity.clone();
+                    ((*n).clone(), t)
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let (one, two): (pbps_model::Uid, pbps_model::Uid) =
+            ("t_000001".parse().unwrap(), "t_000002".parse().unwrap());
+        let handoff = pbps_model::ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::SetReplicaIdentity {
+                    uid: two.clone(),
+                    table: b.clone(),
+                    to: Some(ReplicaIdentity::Full),
+                }),
+                PlannedChange::new(Change::RenameTable {
+                    uid: two,
+                    from: b.clone(),
+                    to: c.clone(),
+                    defaults: Vec::new(),
+                }),
+                PlannedChange::new(Change::RenameTable {
+                    uid: one.clone(),
+                    from: a.clone(),
+                    to: b.clone(),
+                    defaults: Vec::new(),
+                }),
+                PlannedChange::new(Change::SetReplicaIdentity {
+                    uid: one,
+                    table: b.clone(),
+                    to: Some(ReplicaIdentity::Nothing),
+                }),
+            ],
+        };
+        check(
+            &handoff,
+            &named(&[(&a, None), (&b, None)]),
+            &named(&[
+                (&b, Some(ReplicaIdentity::Nothing)),
+                (&c, Some(ReplicaIdentity::Full)),
+            ]),
+            Settled::Whole,
+        )
+        .expect("each table holds its own identity");
+        let e = check(
+            &handoff,
+            &named(&[(&a, None), (&b, None)]),
+            &named(&[
+                (&b, Some(ReplicaIdentity::Nothing)),
+                (&c, Some(ReplicaIdentity::Nothing)),
+            ]),
+            Settled::Whole,
+        )
+        .expect_err("c holds b's planned FULL, not a's NOTHING");
+        assert!(format!("{e:#}").contains("app.c replica identity"), "{e:#}");
     }
 
     /// An existing table the plan touches for something else is held to its
