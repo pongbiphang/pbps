@@ -291,10 +291,10 @@ impl CandidateSession {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             // Rechecked after the sleep, not only before it: with less than
             // the sleep left on the budget the wait itself carries past the
-            // deadline, and `one_control_attempt` starts a control container
-            // before it ever reaches `timeout_at`. Without this the loop would
-            // exceed the 90 seconds it advertises and start one more container
-            // to clean up while doing it.
+            // deadline. The launch is bounded by it now (#645), but a bounded
+            // future is still polled once before its timer, which spawns a
+            // supervisor; without this the loop would schedule one more
+            // container to clean up and report it as a recovery name.
             if tokio::time::Instant::now() >= deadline {
                 return Err(failure);
             }
@@ -344,10 +344,10 @@ impl CandidateSession {
                 }
             };
             // And checked once more with the channels in hand. The bound above
-            // stops the *wait*; this stops the *launch*, because
-            // `one_control_attempt` creates its control container before it
-            // ever reaches its own `timeout_at`. The two guards are two
-            // different things the budget has to survive.
+            // stops the *wait*; this keeps an expired budget from beginning a
+            // *launch* at all: `start_launch_by` would abandon it, but only
+            // after its first poll has spawned a supervisor, leaving a
+            // container to clean up and a recovery name to report (#645).
             if tokio::time::Instant::now() >= deadline {
                 return Err(failure);
             }
@@ -374,10 +374,18 @@ impl CandidateSession {
             super::profile::LIFETIME_SECS,
         )
         .map_err(|cause| (failure(cause), false))?;
-        let control =
-            CandidateRun::start_launch(api, image, owner, launch, super::profile::LIFETIME_SECS)
-                .await
-                .map_err(|failure| (failure, false))?;
+        // Inside the deadline too: the launch is a create, a start and their
+        // inspects, and the login's own bound below starts only after it.
+        let control = CandidateRun::start_launch_by(
+            deadline,
+            api,
+            image,
+            owner,
+            launch,
+            super::profile::LIFETIME_SECS,
+        )
+        .await
+        .map_err(|failure| (failure, false))?;
         // Set by the login's own error arm and read after the future has been
         // driven to completion, which is the only place that can tell a
         // still-starting engine from a refusal that will not change.

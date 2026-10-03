@@ -117,7 +117,7 @@ impl CandidateRun {
         lifetime_secs: u64,
     ) -> Result<Self, StartFailure> {
         let owner = Owner {
-            name: format!("pbps-resolver-{token}"),
+            name: resource_name(&token),
             token,
             image: image.identity.image_id.clone(),
             creation: Creation::NotRequested,
@@ -149,6 +149,36 @@ impl CandidateRun {
             deadline,
             commands,
             cleaned,
+        })
+    }
+
+    /// [`Self::start_launch`], abandoned at `deadline` (#645). The launch
+    /// spends a create, a start and their inspects, each with its own
+    /// request budget, so an attempt begun just inside a shared deadline could
+    /// otherwise start its container after it. Abandoning is safe: the
+    /// supervisor sees its `ready` receiver go and removes what it created,
+    /// without starting an engine it has not yet started. That removal is not
+    /// confirmed when this returns, so the name is reported for recovery,
+    /// which a retrying caller treats as terminal (DECISIONS 500).
+    pub(crate) async fn start_launch_by(
+        deadline: Instant,
+        api: LocalApi,
+        image: CandidateImage,
+        token: String,
+        launch: Launch,
+        lifetime_secs: u64,
+    ) -> Result<Self, StartFailure> {
+        let name = resource_name(&token);
+        tokio::time::timeout_at(
+            deadline,
+            Self::start_launch(api, image, token, launch, lifetime_secs),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(StartFailure {
+                cause: Error::Start,
+                recovery_names: vec![name],
+            })
         })
     }
 
@@ -186,6 +216,11 @@ impl CandidateRun {
         let _ = self.commands.send(Command::Close(reply)).await;
         self.cleaned.await.map_err(|_| Error::Cleanup)?
     }
+}
+
+/// The Docker name a run owned by `token` is created under.
+fn resource_name(token: &str) -> String {
+    format!("pbps-resolver-{token}")
 }
 
 pub(super) async fn inspect(api: &mut LocalApi, resource: &str) -> Result<Option<Value>, Error> {

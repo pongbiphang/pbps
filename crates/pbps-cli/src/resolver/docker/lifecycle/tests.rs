@@ -329,6 +329,62 @@ async fn cancelled_creation_is_cleaned_without_starting_the_engine() {
     );
 }
 
+/// The control launch shares its caller's deadline (#645). A create still in
+/// flight when it passes is abandoned: the attempt reports a startup failure
+/// naming the resource whose removal it has not seen, the supervisor removes
+/// it, and the engine is never started. With time to spare the same launch
+/// succeeds.
+#[tokio::test]
+async fn a_launch_past_its_deadline_is_abandoned_named_and_removed() {
+    let fixture = Fixture::new(Observations {
+        delay_create: true,
+        ..Default::default()
+    });
+    let token = format!("{:032x}", rand::random::<u128>());
+    let launch = Launch::new(&candidate(), Driver::Postgres, &token).unwrap();
+    let failure = CandidateRun::start_launch_by(
+        Instant::now() + Duration::from_millis(50),
+        fixture.api().await,
+        candidate(),
+        token.clone(),
+        launch,
+        LIFETIME_SECS,
+    )
+    .await
+    .err()
+    .expect("a create delayed past the deadline must not yield a run");
+    assert!(matches!(failure.cause, Error::Start), "{:?}", failure.cause);
+    assert_eq!(failure.recovery_names, [format!("pbps-resolver-{token}")]);
+    fixture.removed().await;
+    assert!(
+        !fixture
+            .seen
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|r| r.contains("/start "))
+    );
+
+    let fixture = Fixture::new(Observations {
+        delay_create: true,
+        ..Default::default()
+    });
+    let token = format!("{:032x}", rand::random::<u128>());
+    let launch = Launch::new(&candidate(), Driver::Postgres, &token).unwrap();
+    let run = CandidateRun::start_launch_by(
+        Instant::now() + Duration::from_secs(30),
+        fixture.api().await,
+        candidate(),
+        token,
+        launch,
+        LIFETIME_SECS,
+    )
+    .await
+    .expect("the same launch inside its deadline starts");
+    run.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn failed_startup_is_cleaned_and_does_not_echo_the_server_error() {
     let fixture = Fixture::new(Observations {
