@@ -5920,7 +5920,7 @@ fn a_primary_key_and_unique_constraint_sharing_a_name_are_one_finding_not_two() 
 
     // The connected gate reads the same list *before* it connects
     // (DECISIONS 141), so an unreachable database still reaches it — and it
-    // counts the problems it would carry. One, not two.
+    // reports the same findings `validate` does (#573). One, not two.
     let o = d.run(&[
         "plan",
         "--db",
@@ -5928,16 +5928,11 @@ fn a_primary_key_and_unique_constraint_sharing_a_name_are_one_finding_not_two() 
         "--format",
         "json",
     ]);
-    let reported = json_output(o);
-    let message = reported["findings"][0]["message"].as_str().unwrap_or("");
-    assert!(
-        message.starts_with("the declarations have 1 problem(s)"),
-        "the connected gate counts it once too: {reported}"
-    );
+    assert_eq!(code(&o), 2, "{}{}", stdout(&o), stderr(&o));
     assert_eq!(
-        message.matches("both named `shared`").count(),
-        1,
-        "{reported}"
+        collisions(o),
+        (1, 0),
+        "the connected gate counts it once too"
     );
 
     // A check constraint of that name is not backed by an index, so it was

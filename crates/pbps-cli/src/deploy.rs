@@ -4786,13 +4786,29 @@ pub fn cmd_baseline(project: &Project, target: &Target, reason: &str) -> anyhow:
 /// declaration the dialect refuses — `execute` granted on a table, say — is
 /// not a plan that fails to convert; it is a plan whose *last* statements
 /// fail, and in staged mode the ones before them have already committed.
+///
+/// With `json`, the refusal is the findings `validate` reports for the same
+/// declarations, as one findings document: a refusal the operator can act on
+/// is not an operational failure, and `plan.failed` would hide which
+/// declaration to fix (#573).
 fn refuse_invalid_declarations(
     loaded: &pbps_load::Loaded,
     dialect: &dyn Dialect,
+    json: bool,
 ) -> anyhow::Result<()> {
     let problems = crate::declaration_problems(loaded, dialect);
     if problems.is_empty() {
         return Ok(());
+    }
+    if json {
+        return crate::output::Report::plain(
+            "plan",
+            problems
+                .into_iter()
+                .map(|(id, problem)| crate::output::Finding::error(id, problem))
+                .collect(),
+        )
+        .emit_json();
     }
     bail!(
         "the declarations have {} problem(s) that would reach the database:\n  {}\n\
@@ -4814,7 +4830,7 @@ pub fn cmd_bootstrap(
     let dialect = crate::dialect(project)?;
     let loaded = crate::load(project, dialect.as_ref())?;
     let ids = crate::read_ids(project)?;
-    refuse_invalid_declarations(&loaded, dialect.as_ref())?;
+    refuse_invalid_declarations(&loaded, dialect.as_ref(), false)?;
     let declared_modules = managed_modules(None, Some(&loaded.schema));
 
     // Every declared object needs its identity, not just "some": a role the
@@ -5216,7 +5232,7 @@ pub fn cmd_plan_db(
     let dialect = crate::dialect(project)?;
     let loaded = crate::load(project, dialect.as_ref())?;
     let ids = crate::read_ids(project)?;
-    refuse_invalid_declarations(&loaded, dialect.as_ref())?;
+    refuse_invalid_declarations(&loaded, dialect.as_ref(), json)?;
     let created_at = crate::now();
 
     let resolved = match pbps_diff::resolve_with_annotations(
@@ -5243,11 +5259,25 @@ pub fn cmd_plan_db(
         }
     };
     if resolved.ids != ids {
-        bail!(
+        let message = format!(
             "the identity file is out of date; run `pbps plan` locally and commit `{}`.\n\
              A deployment plan must be computed against the identity its reviewers read.",
             project.ids_file().display()
         );
+        // The same finding offline `plan --check` reports, so a pipeline
+        // reads one id for one refusal whichever command met it (#573).
+        if json {
+            return crate::output::Report::plain(
+                "plan",
+                vec![
+                    crate::output::Finding::error("identity.stale", message)
+                        .at(project.ids_file(), None)
+                        .remedy("pbps plan"),
+                ],
+            )
+            .emit_json();
+        }
+        bail!("{message}");
     }
 
     let (
