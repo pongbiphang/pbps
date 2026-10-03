@@ -19046,3 +19046,168 @@ fn a_dropped_table_frees_a_name_a_moved_table_carries_in_applies() {
     let o = d.run(&["verify", "--db", connection]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
 }
+
+/// What connected `plan --format json` refuses before it connects (#573):
+/// declarations `validate` rejects, and an identity file reviewers never read.
+/// Each is an answer the operator can act on, so each is the findings document
+/// `validate` and offline `plan --check` already give, exit 2 — not
+/// `plan.failed`, which says the question could not be asked. Nothing is
+/// written either way.
+mod connected_refusals {
+    use super::*;
+
+    const UNREACHABLE: &str =
+        "host=127.0.0.1 port=1 user=postgres dbname=nowhere connect_timeout=1";
+    const TABLE: &str = "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n\
+                         primary_key: {name: pk_t, columns: [id]}\n";
+
+    /// A PostgreSQL project with its identity file planned and committed, and
+    /// two artifacts already in place that a refusal must leave as they are.
+    fn project(name: &str) -> (Demo, PathBuf, PathBuf) {
+        let d = Demo::new(name);
+        std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+        std::fs::write(d.dir.join("schema/app.t.yml"), TABLE).unwrap();
+        assert_eq!(code(&d.run(&["plan"])), 0);
+        d.commit();
+        let plan = d.dir.join("out-plan.json");
+        let sql = d.dir.join("out-plan.sql");
+        std::fs::write(&plan, "earlier plan").unwrap();
+        std::fs::write(&sql, "earlier sql").unwrap();
+        (d, plan, sql)
+    }
+
+    fn connected(d: &Demo, plan: &std::path::Path, sql: &std::path::Path, json: bool) -> Output {
+        let mut args = vec![
+            "plan",
+            "--db",
+            UNREACHABLE,
+            "--out",
+            plan.to_str().unwrap(),
+            "--sql",
+            sql.to_str().unwrap(),
+        ];
+        if json {
+            args.extend(["--format", "json"]);
+        }
+        d.run(&args)
+    }
+
+    fn untouched(plan: &std::path::Path, sql: &std::path::Path) {
+        assert_eq!(std::fs::read_to_string(plan).unwrap(), "earlier plan");
+        assert_eq!(std::fs::read_to_string(sql).unwrap(), "earlier sql");
+    }
+
+    fn errors(report: &serde_json::Value) -> Vec<(String, String)> {
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["severity"] == "error")
+            .map(|f| {
+                (
+                    f["id"].as_str().unwrap().to_owned(),
+                    f["message"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn invalid_declarations_are_validates_findings_not_a_failed_plan() {
+        let (d, plan, sql) = project("connected-invalid");
+        for role in ["app_reader", "app_auditor"] {
+            std::fs::write(
+                d.dir.join(format!("schema/{role}.yml")),
+                format!("role: {role}\ngrants:\n  app.t: [view-definition]\n"),
+            )
+            .unwrap();
+        }
+        let validated = d.run(&["validate", "--format", "json"]);
+        assert_eq!(code(&validated), 2, "{}", stdout(&validated));
+        let expected = errors(&serde_json::from_str(&stdout(&validated)).unwrap());
+        // Two per role: the permission and the missing schema `usage`.
+        assert_eq!(expected.len(), 4, "{expected:?}");
+        assert!(
+            expected.iter().all(|(id, _)| id == "dialect.rejected"),
+            "{expected:?}"
+        );
+
+        let o = connected(&d, &plan, &sql, true);
+        assert_eq!(code(&o), 2, "{}{}", stdout(&o), stderr(&o));
+        let report: serde_json::Value = serde_json::from_str(&stdout(&o))
+            .unwrap_or_else(|e| panic!("one JSON document ({e}): {}", stdout(&o)));
+        assert_eq!(report["command"], "plan", "{report}");
+        assert_eq!(report["result"], "findings", "{report}");
+        assert_eq!(errors(&report), expected, "{report}");
+        assert!(stderr(&o).is_empty(), "{}", stderr(&o));
+        untouched(&plan, &sql);
+
+        // Human output keeps its sentence and its exit.
+        let o = connected(&d, &plan, &sql, false);
+        assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+        assert!(
+            stderr(&o).contains("problem(s) that would reach the database"),
+            "{}",
+            stderr(&o)
+        );
+        untouched(&plan, &sql);
+    }
+
+    #[test]
+    fn a_stale_identity_file_is_the_finding_offline_planning_reports() {
+        let (d, plan, sql) = project("connected-stale");
+        std::fs::write(
+            d.dir.join("schema/app.t.yml"),
+            TABLE.replace("primary_key", "  note: {type: integer}\nprimary_key"),
+        )
+        .unwrap();
+        let ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+        let checked = d.run(&["plan", "--check", "--format", "json"]);
+        let offline: serde_json::Value = serde_json::from_str(&stdout(&checked)).unwrap();
+
+        let o = connected(&d, &plan, &sql, true);
+        assert_eq!(code(&o), 2, "{}{}", stdout(&o), stderr(&o));
+        let report: serde_json::Value = serde_json::from_str(&stdout(&o))
+            .unwrap_or_else(|e| panic!("one JSON document ({e}): {}", stdout(&o)));
+        assert_eq!(report["result"], "findings", "{report}");
+        let findings = report["findings"].as_array().unwrap();
+        assert_eq!(findings.len(), 1, "{report}");
+        let stale = &findings[0];
+        let expected = offline["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["id"] == "identity.stale")
+            .unwrap_or_else(|| panic!("offline --check reports it: {offline}"));
+        for field in ["id", "severity", "location", "remedy"] {
+            assert_eq!(
+                stale[field], expected[field],
+                "{field}: {report} / {offline}"
+            );
+        }
+        assert!(stderr(&o).is_empty(), "{}", stderr(&o));
+        untouched(&plan, &sql);
+        assert_eq!(std::fs::read(d.dir.join("schema.ids.json")).unwrap(), ids);
+
+        let o = connected(&d, &plan, &sql, false);
+        assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+        assert!(
+            stderr(&o).contains("the identity file is out of date"),
+            "{}",
+            stderr(&o)
+        );
+        untouched(&plan, &sql);
+        assert_eq!(std::fs::read(d.dir.join("schema.ids.json")).unwrap(), ids);
+
+        // Once the identity is planned and committed, the same request reaches
+        // the database, and a target it cannot reach is still a failure.
+        assert_eq!(code(&d.run(&["plan"])), 0);
+        d.commit();
+        let o = connected(&d, &plan, &sql, true);
+        assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+        let report: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+        assert_eq!(report["result"], "unanswerable", "{report}");
+        assert_eq!(report["findings"][0]["id"], "plan.failed", "{report}");
+        untouched(&plan, &sql);
+    }
+}
