@@ -320,7 +320,9 @@ record](../DECISIONS.md), which says how to add an entry here.
     `master` queue. DEC-1228.1 replaces the assumption that deleting that branch
     reliably retargets every dependent: the primary agent explicitly changes
     and verifies dependent bases before deleting the merged remote head, then
-    verifies them again. Deletion remains a separate step after the merge
+    verifies them again, including DEC-1458.1's operation-window/all-state check
+    for newly discovered dependents. Deletion remains a separate step after the
+    merge
     actually lands. With a queue required, `gh pr merge --delete-branch` still
     errors instead of enqueueing, because early head deletion can close the PR
     and remove it from the queue.
@@ -760,8 +762,9 @@ Reopening started [another CI run](https://github.com/pongbiphang/pbps/actions/r
 after [the qualified run](https://github.com/pongbiphang/pbps/actions/runs/36356526170).
 These events do not establish a cause or equate every deletion mechanism.
 
-The primary agent first verifies the parent actually merged, then reads every
-page of open PRs based on its head branch. For each dependent, record the head
+The primary agent first verifies the parent actually merged and begins
+DEC-1458.1's window before enumeration, then reads every page of open PRs based
+on its head branch. For each dependent, record the head
 and expected surviving patch before changing its base to the merged parent's
 base, while the parent branch still exists. For an ordinary stack, verify the
 merged parent head is an ancestor of the dependent head and use their diff to
@@ -774,8 +777,9 @@ base name. Refresh the enumeration immediately before deletion and apply the
 same checks to new dependents. A failed or incomplete read cannot authorize
 deletion; a successfully verified empty set needs no base changes.
 
-Only then delete the owned remote head. Re-read the recorded PRs and the open
-PR enumeration afterwards, so a closed dependent cannot vanish from the check.
+Only then delete the owned remote head. Re-read the recorded PRs by ID and
+complete DEC-1458.1's all-state operation-window check afterwards, so a recorded
+or late-created closed dependent cannot vanish from the check.
 On failure, stop cleanup and report the observed state. The historical recovery
 was to restore the exact owned parent ref, reopen the dependent, explicitly
 retarget it and verify its state, head and remaining diff before retrying
@@ -811,3 +815,44 @@ applies only to the original bare-name runtime oracle. These actual-Python
 controls resolve the execution question left separate by DEC-1428.1 and retain
 DEC-1413.1's maintenance-lint boundary. See [test execution](../TEST-EXECUTION.md).
 
+<a id="dec-1458-1"></a>
+
+**DEC-1458.1. A closeout window includes newly closed dependents, rather than
+only the PRs still open after deletion.** DEC-1228.1's recorded-ID checks catch
+closure of a known dependent. A dependent created after the final enumeration
+has no recorded ID, so an open-only post-delete scan can silently miss its
+closure. [GitHub's PR listing API](https://docs.github.com/en/rest/pulls/pulls#list-pull-requests)
+supports `state=all`; complete that repository-wide scan after deletion.
+
+Before the first enumeration, record the operation window and the owned parent
+ref, reviewed head and merged base. Complete an initial `state=all` scan and
+retain the identities, states, bases, heads and closure times of already closed
+parent dependents. Retain the deletion request and confirmation times; confirmed
+deletion ends the window. Use inclusive timestamp boundaries and require
+evidence before treating a PR as outside the window. Re-read all recorded dependents by ID and inspect
+PRs created in the window. Current base names do not prove prior association:
+inspect base-ref history when needed, and stop if that evidence cannot decide.
+Every newly discovered parent-dependent PR is failed closeout, including one
+now closed or already retargeted. Record its observed state, base, head and
+remaining diff, and inspect commit provenance to establish expected surviving
+work; no earlier head or patch is fabricated. Recorded dependents must retain
+their expected OPEN/base/head/content checks. An unchanged older PR known to
+have been closed before the window is not a closeout failure.
+
+Any failed, incomplete or ambiguous read stops local cleanup. Restore only the
+exact recorded owned parent head using an atomic missing-ref lease; a recreated
+changed or foreign ref is not overwritten. Reopen and explicitly retarget
+affected dependents, verify their state/head/base/expected content, and repeat
+the closeout before retrying deletion. Existing review and associated current-
+head CI gates remain required. A verified empty-dependent case needs no base
+changes but still requires the pre-delete and all-state post-delete reads.
+
+Validation retains #1216/#1226's actual closure/restoration/reopen/retarget
+events and unchanged surviving patch. They establish closure and recovery, not
+an observed late creation. Bounded negative controls cover late-created closure,
+older intentional closure, changed head/base, missing content, incomplete reads
+and pagination, and changed or foreign restoration refs. Removing the all-state
+selection must hide the late-closed control; removing the window distinction
+must turn the older-closed control into a false alarm. #1463's real closeout
+supplies the successfully enumerated empty-dependent all-state control, without
+creating a throwaway production PR.

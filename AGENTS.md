@@ -163,8 +163,11 @@ checksum-pinned, and state lives in the database itself.
   merges only if that is green. Wait for the merge to land before deleting the
   branch and removing the worktree — a queued pull request is not a merged one.
 - **Verify dependents before deleting the merged remote head branch.** Confirm
-  the parent actually merged, then enumerate all open PRs based on its head
-  branch, completing pagination. Record each dependent's head and expected
+  the parent actually merged, then start the operation window and complete an
+  initial repository-wide `state=all` scan. Retain the identities, states,
+  bases, heads and closure times of already closed parent dependents, then
+  enumerate all open PRs based on its head branch, completing pagination.
+  Record each dependent's head and expected
   remaining diff after the parent's merged changes. While the parent branch
   still exists, explicitly change each dependent's base to the merged parent's
   base. Verify every dependent is OPEN, has that base and its unchanged recorded
@@ -174,9 +177,25 @@ checksum-pinned, and state lives in the database itself.
   when any verification fails. A successfully verified empty set needs no base
   changes. Delete only the owned remote head after these checks, reverify the
   recorded dependents and enumeration afterwards, then remove the local branch
-  and worktree. Do not rely on automatic retargeting or rebase merely for
-  cleanup. Existing review and current-head CI gates still apply to each
-  dependent before enqueueing; refresh them after the base change (DEC-1228.1).
+  and worktree only after the following operation-window check.
+  Record the window before the first enumeration, the parent ref/head/base,
+  and the deletion request and confirmation times; the window ends at confirmed
+  deletion. After deletion, complete a
+  repository-wide `state=all` PR scan and re-read recorded dependents by ID.
+  Inspect newly created PRs in that window, including timestamp boundary cases;
+  use base-ref history when their current base cannot establish whether they
+  depended on this parent. A newly discovered parent-dependent PR is failed
+  closeout, including one that is now closed. Do not invent a pre-delete head
+  or expected diff for it; retain its observed state/base/head/diff and inspect
+  the commit provenance before recovery. An unchanged older PR demonstrably
+  closed before the window is not a failure. Failed, incomplete or ambiguous
+  reads stop local cleanup. Recover only the exact owned parent ref; an atomic
+  missing-ref lease must prevent overwriting a changed or foreign ref, then
+  reopen/explicitly retarget and verify affected dependents before retrying.
+  A confirmed empty set must pass both scans. Do not rely on automatic
+  retargeting or rebase merely for cleanup. Existing review and current-head CI
+  gates still apply to each dependent before enqueueing; refresh them after the
+  base change (DEC-1228.1, DEC-1458.1).
 - A pull request must be green on its **own** head before it can be queued, so
   a merge costs **two pre-merge runs** of `ci.yml` — one on the pull request,
   one on the merge group — plus the post-merge run on `master`, which gates
