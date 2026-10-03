@@ -104,8 +104,8 @@
       "selection": {
         "kind": "data",
         "file": "scripts/live-resolver-server.py",
-        "expression": "TESTS",
-        "prefix": "resolver::server::live_tests::"
+        "expression": "TESTS + PRODUCER_TESTS",
+        "prefix": ""
       },
       "witnesses": [
         {
@@ -130,8 +130,9 @@
           "scope": "fixture",
           "requires": [
             "for test in TESTS",
+            "cases.extend([(test, False) for test in PRODUCER_TESTS if engine == \"pg\"])",
             "for test, empty in cases:",
-            "command = [binary, \"--ignored\", \"--exact\", f\"resolver::server::live_tests::{test}\"",
+            "command = [binary, \"--ignored\", \"--exact\", test, \"--nocapture\"]",
             "run(*command,"
           ]
         },
@@ -157,7 +158,7 @@
       "selection": {
         "kind": "data",
         "file": "scripts/live-resolver-target.py",
-        "expression": "[DAEMON_TEST, TARGET_TEST, FACTORY_TEST, RECIPE_TEST, ANALYSIS_TEST, INVALIDATION_TEST, CANCELLATION_TEST, DEADLINE_TEST, ADMIN_RECOVERY_TEST, SCRATCH_RECOVERY_TEST, JANITOR_RECOVERY_TEST, SQL_RECOVERY_CLOSE_TEST, SQL_RECOVERY_DISCARD_TEST, SQL_RECOVERY_CANCEL_TEST]",
+        "expression": "NATIVE_TESTS + PRODUCER_TESTS + GENERATION_TESTS",
         "prefix": ""
       },
       "witnesses": [
@@ -183,7 +184,7 @@
           "scope": "fixture",
           "requires": [
             "if args.native_host:",
-            "native_tests(binary, env)"
+            "native_tests(binary, env, args.producer_only, args.generation_only)"
           ]
         },
         {
@@ -191,7 +192,12 @@
           "language": "python",
           "scope": "native_tests",
           "requires": [
-            "for test in (DAEMON_TEST, TARGET_TEST, FACTORY_TEST, RECIPE_TEST, ANALYSIS_TEST, INVALIDATION_TEST, CANCELLATION_TEST, DEADLINE_TEST, ADMIN_RECOVERY_TEST, SCRATCH_RECOVERY_TEST, JANITOR_RECOVERY_TEST, SQL_RECOVERY_CLOSE_TEST, SQL_RECOVERY_DISCARD_TEST, SQL_RECOVERY_CANCEL_TEST):",
+            "selected = [test for test in GENERATION_TESTS]",
+            "selected = [test for test in PRODUCER_TESTS]",
+            "selected = [test for test in NATIVE_TESTS]",
+            "selected += [test for test in PRODUCER_TESTS]",
+            "selected += [test for test in GENERATION_TESTS]",
+            "for test in selected:",
             "run(binary, \"--ignored\", \"--exact\", test,"
           ]
         },
@@ -787,6 +793,19 @@
       ],
       "owner": "server",
       "validate_on": "linux",
+      "ignored_on": ["linux", "win32", "darwin"],
+      "cases": [
+        "resolver::server::qualified_evidence_tests::the_supplied_producer_seals_the_overload_and_default_from_one_fresh_read",
+        "resolver::server::qualified_evidence_tests::the_supplied_empty_target_producer_orders_table_routines_and_expressions_before_sealing",
+        "resolver::server::qualified_evidence_tests::the_supplied_replaced_routine_rebuilds_cross_kind_dependents_in_the_final_plan",
+        "resolver::server::qualified_evidence_tests::the_supplied_recorded_table_and_column_uids_survive_rename_with_dependent_rebuilds",
+        "resolver::server::qualified_evidence_tests::the_supplied_rebuilt_routine_with_explicit_public_execution_matches_the_post_ddl_acl"
+      ]
+    },
+    {
+      "target": ["pbps-cli", "lib", "pbps_cli"],
+      "owner": "server",
+      "validate_on": "linux",
       "ignored_on": [
         "linux",
         "win32",
@@ -860,11 +879,50 @@
         "resolver::server::container_tests::relay_recovery::admin_launch_recovery_distinguishes_absence_from_uncertainty_without_losing_other_owners",
         "resolver::server::container_tests::relay_recovery::scratch_launch_recovery_distinguishes_absence_from_uncertainty_without_losing_other_owners",
         "resolver::server::container_tests::relay_recovery::janitor_launch_recovery_distinguishes_absence_from_uncertainty_without_losing_other_owners",
+        "resolver::server::qualified_evidence_tests::the_container_producer_seals_the_overload_and_default_from_one_fresh_read",
+        "resolver::server::qualified_evidence_tests::only_recorded_table_and_index_roots_own_their_catalog_columns",
+        "resolver::server::qualified_evidence_tests::a_same_named_view_cannot_own_the_declared_table_uid",
+        "resolver::server::qualified_evidence_tests::a_same_named_index_on_another_table_cannot_own_the_declared_index",
+        "resolver::server::qualified_evidence_tests::the_connected_producer_refuses_a_missing_environment_key_before_sealing",
+        "resolver::server::qualified_evidence_tests::a_rebuilt_view_with_old_target_grants_closes_on_the_actual_catalog",
+        "resolver::server::qualified_evidence_tests::an_empty_target_producer_orders_table_routines_and_expressions_before_sealing",
+        "resolver::server::qualified_evidence_tests::a_replaced_routine_rebuilds_cross_kind_dependents_in_the_final_plan",
+        "resolver::server::qualified_evidence_tests::recorded_table_and_column_uids_survive_rename_with_dependent_rebuilds",
+        "resolver::server::qualified_evidence_tests::recorded_rename_of_a_table_owned_by_another_role_closes_on_the_actual_catalog",
+        "resolver::server::qualified_evidence_tests::rebuilt_routine_with_explicit_public_execution_matches_the_post_ddl_acl",
+        "resolver::server::qualified_evidence_tests::rebuilt_routine_replays_declared_role_grants",
+        "resolver::server::qualified_evidence_tests::an_unaffected_routine_keeps_its_grant_option_through_connected_evidence",
+        "resolver::server::qualified_evidence_tests::a_dropped_routine_seals_its_closing_signature_lookup",
+        "resolver::server::qualified_evidence_tests::renaming_a_referenced_table_carries_the_foreign_key_that_names_it",
+        "resolver::server::qualified_evidence_tests::renaming_a_referenced_column_carries_the_foreign_key_that_names_it",
+        "resolver::server::qualified_evidence_tests::dropping_a_table_with_toast_storage_closes_on_the_actual_catalog",
+        "resolver::server::qualified_evidence_tests::adding_a_default_carries_the_columns_own_flag",
+        "resolver::server::qualified_evidence_tests::dropping_a_default_carries_the_columns_own_flag",
+        "resolver::server::qualified_evidence_tests::a_retype_carries_the_key_and_index_it_rebuilds",
+        "resolver::server::qualified_evidence_tests::newly_created_routines_under_target_default_privileges_close_on_the_actual_catalog",
+        "resolver::server::qualified_evidence_tests::a_new_routine_created_by_an_ordinary_deployer_closes_on_the_actual_catalog",
+        "resolver::server::qualified_evidence_tests::an_explicit_extra_schema_changes_only_the_unqualified_lookup_in_the_final_plan",
+        "resolver::server::qualified_evidence_tests::a_prequalified_matching_scope_seals_the_same_ordinary_plan",
+        "resolver::server::qualified_evidence_tests::a_prequalified_scope_rejects_reordered_write_path_extras_before_compilation",
+        "resolver::server::qualified_evidence_tests::a_prequalified_scope_rejects_changed_preliminary_grants_before_compilation",
+        "resolver::server::qualified_evidence_tests::recorded_renames_and_reused_old_spellings_keep_distinct_owned_inventories",
+        "resolver::server::qualified_evidence_tests::recorded_renames_with_type_and_nullability_edits_match_actual_child_catalog",
+        "resolver::server::qualified_evidence_tests::persisted_authorization_is_stable_across_processes_only_with_the_same_environment_key",
+        "resolver::server::qualified_evidence_tests::adding_named_key_and_check_keeps_existing_table_owner_and_grants",
+        "resolver::server::qualified_evidence_tests::adding_check_alone_keeps_existing_table_owner_and_grants",
+        "resolver::server::qualified_evidence_tests::granting_on_an_existing_table_keeps_old_acl_and_adds_the_declared_role",
+        "resolver::server::qualified_evidence_tests::unnamed_primary_key_on_existing_table_owns_only_its_exact_constraint_and_index",
+        "resolver::server::qualified_evidence_tests::unnamed_primary_key_on_created_table_owns_only_its_exact_constraint_and_index",
+        "resolver::server::qualified_evidence_tests::adding_index_keeps_existing_table_metadata_and_sets_the_engine_index_flag",
+        "resolver::server::qualified_evidence_tests::direct_schema_option_beats_inherited_owner_for_the_typed_grant",
+        "resolver::server::qualified_evidence_tests::combined_schema_grant_uses_one_inherited_grantor_for_its_whole_mask",
         "resolver::docker::tests::direct_native_daemon_is_accepted_but_a_root_owned_proxy_is_not",
         "resolver::native::target::tests::native_aliases_share_one_instance_and_backend_children_cannot_claim_another",
         "resolver::server::container_tests::sql_recovery::confirmed_workload_removal_finishes_only_its_existing_sql_recovery",
         "resolver::server::container_tests::sql_recovery::interrupted_open_discard_finishes_sql_recovery_only_after_workload_removal",
-        "resolver::server::container_tests::sql_recovery::cancelled_cleanup_keeps_uncertain_owned_sql_names_and_remains_terminal"
+        "resolver::server::container_tests::sql_recovery::cancelled_cleanup_keeps_uncertain_owned_sql_names_and_remains_terminal",
+        "resolver::server::qualified_evidence_tests::the_pg18_producer_projects_the_replaced_generated_attrdef_and_preserves_column_identity",
+        "resolver::server::qualified_evidence_tests::the_pg16_producer_adds_stored_generation_and_retains_existing_generated_bindings"
       ]
     },
     {
@@ -1126,6 +1184,7 @@
         "a_membership_granted_after_planning_is_refused_before_the_row_write",
         "a_new_column_calling_a_function_that_reads_it_is_refused_by_name",
         "a_new_column_calling_a_new_function_follows_its_create",
+        "a_new_table_generating_from_a_new_function_follows_its_create",
         "a_new_column_calling_a_rebuilt_function_follows_the_rebuild",
         "a_new_tables_expressions_calling_a_rebuilt_function_follow_it",
         "a_newly_declared_name_the_database_already_uses_is_refused_before_the_plan",
@@ -1576,6 +1635,7 @@
         "resolver::binding_tests::a_cast_cannot_change_a_surface_that_resolves_no_call",
         "resolver::binding_tests::a_clipped_array_type_name_is_read_back",
         "resolver::binding_tests::a_common_type_the_operands_decide_is_no_named_candidate",
+        "resolver::binding_tests::a_created_surface_is_unresolved_by_a_candidate_scratch_did_not_reproduce",
         "resolver::binding_tests::a_ctes_output_types_are_no_named_candidates",
         "resolver::binding_tests::a_dropped_overload_is_held_by_its_declared_identity_not_by_a_count",
         "resolver::binding_tests::a_dropped_signature_is_rechecked_with_its_capture",
@@ -1593,6 +1653,7 @@
         "resolver::binding_tests::a_schema_the_deployer_cannot_use_holds_no_candidate",
         "resolver::binding_tests::a_set_operations_inferred_operators_are_no_named_candidates",
         "resolver::binding_tests::a_shared_identity_the_target_did_not_get_from_a_managed_object_is_unresolved",
+        "resolver::binding_tests::a_table_generating_from_a_declared_function_compiles_on_scratch",
         "resolver::binding_tests::a_type_can_take_a_call_that_defaults_reduce_to_one_argument",
         "resolver::binding_tests::a_type_cannot_take_a_call_that_is_not_a_cast",
         "resolver::binding_tests::a_type_that_would_take_a_routine_call_is_a_candidate",
@@ -1604,6 +1665,7 @@
         "resolver::binding_tests::bindings_compare_logical_names_never_object_numbers",
         "resolver::binding_tests::candidates_earlier_on_the_path_capture_and_other_overloads_and_qualified_names_do_not",
         "resolver::binding_tests::every_covered_expression_surface_gets_the_engines_answer",
+        "resolver::binding_tests::related_tables_compile_on_scratch_with_their_foreign_key",
         "resolver::binding_tests::the_observed_historical_binding_is_compared_not_a_fresh_bootstrap_of_the_old_source",
         "resolver::capture::baseline::tests::a_captured_baseline_requires_the_complete_ordinary_ledger_recipe",
         "resolver::capture::metadata_tests::deprecation_keeps_column_bound_modules_and_their_unmanaged_dependents",
@@ -1623,6 +1685,9 @@
         "resolver::capture::read::stored_tests::sql_json_surfaces_retain_return_types_and_all_child_bindings",
         "resolver::capture::read::subscripting_tests::subscripting_captures_elements_slices_assignments_and_composite_fields",
         "resolver::capture::read::tests::owned_capture_rejects_mixed_rendering_and_restores_its_session",
+        "resolver::capture::tests::a_schemas_default_privileges_are_not_a_capture_input",
+        "resolver::capture::tests::a_tables_toast_storage_is_not_a_capture_input",
+        "resolver::capture::tests::retained_roots_are_read_even_when_nothing_reaches_them",
         "resolver::capture::tests::coherent_inputs_pin_properties_membership_and_actual_bindings"
       ]
     },

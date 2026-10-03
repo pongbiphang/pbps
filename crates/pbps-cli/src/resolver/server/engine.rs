@@ -85,7 +85,9 @@ pub(crate) async fn drop_scratch(
 // designed and built separately (#619, #620). The reconstruction, the
 // managed-name inventory and both captures are that adapter's private state,
 // as the target capture's are.
-pub(super) use pbps_pg::resolver::capture::{CaptureScope, CapturedInputs, Managed, Paths};
+pub(super) use pbps_pg::resolver::capture::{
+    CaptureScope, CapturedInputs, CompiledCapture, Managed, Paths, RecordedOwnership,
+};
 pub(super) use pbps_pg::resolver::reconstruct::Reconstruction;
 
 const NO_BINDING_ADAPTER: &str =
@@ -169,6 +171,104 @@ pub(crate) async fn capture_desired(
             Ok((captured, scope))
         }
         Driver::Mssql => Err(NO_BINDING_ADAPTER.into()),
+    }
+}
+
+/// The qualified run fixes the key and principal map before either fresh
+/// scratch capture. Only the second capture's facts support the verdict.
+pub(crate) async fn capture_desired_sealed(
+    connection: &mut StreamConn,
+    base: &Managed,
+    desired: &Managed,
+    paths: &Paths,
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+    principals: &crate::resolver::scope::Principals,
+) -> Result<
+    (
+        CapturedInputs,
+        CaptureScope,
+        pbps_model::resolver::InputManifest,
+    ),
+    String,
+> {
+    use pbps_pg::resolver::capture;
+    match (connection.driver(), principals) {
+        (Driver::Postgres, crate::resolver::scope::Principals::Postgres(roles)) => {
+            let first = capture::capture(connection, &capture::managed_scope(desired))
+                .await
+                .map_err(|error| error.to_string())?;
+            let scope = capture::scope(&first, &[base, desired], paths);
+            let (captured, manifest) = capture::capture_identifying_sealed_with_roles(
+                connection,
+                &scope,
+                &Default::default(),
+                key,
+                roles,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            Ok((captured, scope, manifest))
+        }
+        _ => Err(NO_BINDING_ADAPTER.into()),
+    }
+}
+
+/// Retain the final scratch read with its key and UID-qualified roots until
+/// final typed planning decides the one closing seal. Only logical binding
+/// records and the existing verdict leave this private capability.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn capture_desired_for_plan(
+    connection: &mut StreamConn,
+    base: &Managed,
+    desired: &Managed,
+    paths: &Paths,
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+    principals: &crate::resolver::scope::Principals,
+    recorded: pbps_diff::Side<'_>,
+    reconstruction: &Reconstruction,
+    namespaces: &std::collections::BTreeSet<String>,
+    dropped_signatures: &std::collections::BTreeSet<pbps_pg::resolver::capture::DroppedSignature>,
+) -> Result<(CompiledCapture, CaptureScope), String> {
+    use pbps_pg::resolver::capture;
+    match (connection.driver(), principals) {
+        (Driver::Postgres, crate::resolver::scope::Principals::Postgres(roles)) => {
+            let first = capture::capture(connection, &capture::managed_scope(desired))
+                .await
+                .map_err(|error| error.to_string())?;
+            let scope = capture::scope(&first, &[base, desired], paths);
+            let routines = recorded
+                .schema
+                .modules
+                .keys()
+                .filter_map(|id| {
+                    reconstruction
+                        .created(id)
+                        .map(|object| (id.clone(), object.clone()))
+                })
+                .collect();
+            let dropped = Default::default();
+            let ownership = capture::RecordedOwnership {
+                schema: recorded.schema,
+                ids: recorded.ids,
+                routines: &routines,
+                dropped: &dropped,
+                namespaces,
+            };
+            // The same lookups the opening sealed: the closing manifest records
+            // what each dropped signature names after the plan, normally none.
+            let captured = capture::capture_identifying_for_plan(
+                connection,
+                &scope,
+                dropped_signatures,
+                key,
+                roles,
+                &ownership,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            Ok((captured, scope))
+        }
+        _ => Err(NO_BINDING_ADAPTER.into()),
     }
 }
 

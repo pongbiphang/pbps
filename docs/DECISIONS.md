@@ -623,3 +623,5 @@ other numbers before landing. Some records still mention them as proposals.
 | 542 | [resolver](decisions/resolver.md#decision-542) | The resolver qualifies inherited seccomp behavior before releasing its fixed bootstrap, without tracing processes (#633). |
 | 543 | [connection](decisions/connection.md#decision-543) | A PostgreSQL connection string that names no `sslmode` is connected with verified TLS, not the driver's `prefer`. |
 | DEC-614.1 | [resolver](decisions/resolver.md#dec-614-1) | Resolver evidence and its final typed order are required, versioned and separate from Schema; closing inputs derive from approved changes. |
+| DEC-1274.1 | [resolver](decisions/resolver.md#dec-1274-1) | The resolved producer binds its key before fresh reads and records separate raw opening and approved closing target facts. |
+| DEC-1274.2 | [modules](decisions/modules.md#dec-1274-2) | A new table whose generated column calls a function the plan creates follows that create whole, in the plan and on scratch. |

@@ -110,6 +110,33 @@ async fn exercise_capture(connection: String) {
         changes.is_empty(),
         "logical capture must ignore fresh physical OIDs: {changes:?}"
     );
+    // A foreign key's internal RI triggers are named after their own OID.
+    // Their identity is the relation, constraint and function, so dropping
+    // and re-adding the same key compares equal.
+    conn.execute("CREATE TABLE app.parent(id integer PRIMARY KEY); ALTER TABLE app.t ADD CONSTRAINT t_parent_fk FOREIGN KEY (id) REFERENCES app.parent(id)").await.unwrap();
+    let with_key = capture(&mut conn, &scope).await.unwrap();
+    let triggers: Vec<_> = with_key
+        .objects()
+        .filter(|id| id.class == "pg_trigger")
+        .collect();
+    assert_eq!(triggers.len(), 4, "two RI triggers per side: {triggers:?}");
+    assert!(
+        triggers.iter().all(|id| id.name.is_empty()
+            && id
+                .signature
+                .get(1)
+                .is_some_and(|key| key.name == ["t_parent_fk"])),
+        "internal triggers are named by their constraint, not an OID: {triggers:?}"
+    );
+    conn.execute("ALTER TABLE app.t DROP CONSTRAINT t_parent_fk; ALTER TABLE app.t ADD CONSTRAINT t_parent_fk FOREIGN KEY (id) REFERENCES app.parent(id)").await.unwrap();
+    let (_, changes) = recapture(&mut conn, &with_key).await.unwrap();
+    assert!(
+        changes.is_empty(),
+        "a re-added key's RI triggers must compare equal: {changes:?}"
+    );
+    conn.execute("ALTER TABLE app.t DROP CONSTRAINT t_parent_fk; DROP TABLE app.parent")
+        .await
+        .unwrap();
     conn.execute(
         "CREATE FUNCTION app.arriving(integer) RETURNS integer LANGUAGE SQL RETURN $1 + 1",
     )
@@ -351,16 +378,53 @@ async fn exercise_capture(connection: String) {
         ),
         "type modifier output must qualify even without a constant"
     );
-    conn.execute("REVOKE ALL ON SCHEMA app FROM postgres")
+    // Owners and ACLs do not change what a creation binds (DEC-1274.1), so
+    // they are not prerequisites. Revoking EXECUTE on a candidate overload,
+    // granting on a referenced table and moving its owner leave the capture
+    // equal; the deployer's effective schema privileges are the separate
+    // authorization condition.
+    let token = crate::catalog::probe_token().replace('-', "_");
+    let other = format!("pbps_1274_owner_{token}");
+    // The role itself is part of the role inventory, so it exists first.
+    conn.execute(&format!(
+        "CREATE ROLE {other}; \
+         CREATE FUNCTION app.acl_probe(integer) RETURNS integer LANGUAGE SQL RETURN $1 + 1"
+    ))
+    .await
+    .unwrap();
+    let before_authorization = capture(&mut conn, &scope).await.unwrap();
+    conn.execute(&format!(
+        "REVOKE ALL ON SCHEMA app FROM postgres; \
+         REVOKE EXECUTE ON FUNCTION app.acl_probe(integer) FROM PUBLIC; \
+         GRANT SELECT ON app.t TO {other} WITH GRANT OPTION; \
+         ALTER TABLE app.t OWNER TO {other}; \
+         ALTER FUNCTION app.acl_probe(integer) OWNER TO {other}"
+    ))
+    .await
+    .unwrap();
+    let (_, changes) = recapture(&mut conn, &before_authorization).await.unwrap();
+    // Control: a binding-relevant property of the same objects still counts.
+    conn.execute("ALTER FUNCTION app.acl_probe(integer) STABLE")
         .await
         .unwrap();
-    let (_, changes) = recapture(&mut conn, &original).await.unwrap();
-    assert!(changes.iter().any(|change| {
+    let (_, control) = recapture(&mut conn, &before_authorization).await.unwrap();
+    conn.execute(&format!(
+        "ALTER TABLE app.t OWNER TO postgres; \
+         ALTER FUNCTION app.acl_probe(integer) OWNER TO postgres; \
+         DROP OWNED BY {other}; DROP ROLE {other}"
+    ))
+    .await
+    .unwrap();
+    assert!(
+        changes.is_empty(),
+        "owner and ACL changes are not binding inputs: {changes:?}"
+    );
+    assert!(control.iter().any(|change| {
         change.change == InputChange::Properties
             && change
                 .object
                 .as_ref()
-                .is_some_and(|id| id.class == "pg_namespace" && id.name == ["app"])
+                .is_some_and(|id| id.class == "pg_proc" && id.name == ["app", "acl_probe"])
     }));
 }
 
@@ -441,5 +505,193 @@ async fn persisted_inputs_use_the_environment_key_and_never_export_source() {
             .await
             .unwrap();
         result.expect("sealing API fixture failed after cleanup");
+    }
+}
+
+/// A schema's default privileges depend automatically on it, but default
+/// ACLs are authorization metadata, not binding inputs (DEC-1274.1): their
+/// dependency row is not read, and the capture does not refuse.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_schemas_default_privileges_are_not_a_capture_input() {
+    for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+        let base = std::env::var(variable).expect("live PostgreSQL fixture setting");
+        let name = format!(
+            "pbps_dacl1274_{}",
+            crate::catalog::probe_token().replace('-', "_")
+        );
+        let mut admin = Conn::connect(Driver::Postgres, &base).await.unwrap();
+        admin
+            .execute(&format!("CREATE DATABASE {name}"))
+            .await
+            .unwrap();
+        let connection = format!("{base} dbname={name}");
+        let result = tokio::task::LocalSet::new()
+            .run_until(async move {
+                tokio::task::spawn_local(async move {
+                    let mut conn = Conn::connect(Driver::Postgres, &connection).await.unwrap();
+                    conn.execute(
+                        "CREATE SCHEMA app; CREATE TABLE app.t(id integer); \
+                         CREATE VIEW app.historical AS SELECT id FROM app.t; \
+                         ALTER DEFAULT PRIVILEGES IN SCHEMA app \
+                         GRANT EXECUTE ON ROUTINES TO pg_monitor",
+                    )
+                    .await
+                    .unwrap();
+                    let captured = capture(&mut conn, &fixture_scope())
+                        .await
+                        .expect("default privileges do not refuse the capture");
+                    assert!(
+                        captured
+                            .inputs
+                            .keys()
+                            .all(|id| !format!("{id:?}").contains("pg_default_acl"))
+                    );
+                    assert!(captured.inputs.contains_key(&ObjectIdentity {
+                        class: "pg_class".into(),
+                        name: vec!["app".into(), "t".into()],
+                        signature: vec![],
+                    }));
+                })
+                .await
+            })
+            .await;
+        admin
+            .execute(&format!("DROP DATABASE {name} WITH (FORCE)"))
+            .await
+            .unwrap();
+        result.expect("default-privilege capture fixture failed after cleanup");
+    }
+}
+
+/// A closing read lists every record of its manifest as a retained root, so
+/// a record nothing reaches any more is still read. A retained dependency row
+/// is not a catalog object: it is read with its subject, never refused as
+/// an absent root.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn retained_roots_are_read_even_when_nothing_reaches_them() {
+    for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+        let base = std::env::var(variable).expect("live PostgreSQL fixture setting");
+        let name = format!(
+            "pbps_retain1274_{}",
+            crate::catalog::probe_token().replace('-', "_")
+        );
+        let mut admin = Conn::connect(Driver::Postgres, &base).await.unwrap();
+        admin
+            .execute(&format!("CREATE DATABASE {name}"))
+            .await
+            .unwrap();
+        let connection = format!("{base} dbname={name}");
+        let result = tokio::task::LocalSet::new()
+            .run_until(async move {
+                tokio::task::spawn_local(async move {
+                    let mut conn = Conn::connect(Driver::Postgres, &connection).await.unwrap();
+                    conn.execute(
+                        "CREATE SCHEMA app; CREATE SCHEMA elsewhere; \
+                         CREATE FUNCTION elsewhere.orphan() RETURNS integer LANGUAGE sql \
+                         IMMUTABLE RETURN 1; CREATE TABLE app.t(id integer); \
+                         CREATE VIEW app.historical AS SELECT id FROM app.t",
+                    )
+                    .await
+                    .unwrap();
+                    let orphan = ObjectIdentity {
+                        class: "pg_proc".into(),
+                        name: vec!["elsewhere".into(), "orphan".into()],
+                        signature: vec![],
+                    };
+                    let plain = capture(&mut conn, &fixture_scope()).await.unwrap();
+                    assert!(
+                        !plain.inputs.contains_key(&orphan),
+                        "the fixture routine is reached by nothing in the scope"
+                    );
+                    let mut scope = fixture_scope();
+                    scope.retained.insert(orphan.clone());
+                    scope.retained.insert(ObjectIdentity {
+                        class: "pg_depend".into(),
+                        name: vec!["n".into()],
+                        signature: vec![
+                            orphan.clone(),
+                            ObjectIdentity {
+                                class: "pg_namespace".into(),
+                                name: vec!["elsewhere".into()],
+                                signature: vec![],
+                            },
+                        ],
+                    });
+                    let retained = capture(&mut conn, &scope).await.unwrap();
+                    assert!(retained.inputs.contains_key(&orphan));
+                })
+                .await
+            })
+            .await;
+        admin
+            .execute(&format!("DROP DATABASE {name} WITH (FORCE)"))
+            .await
+            .unwrap();
+        result.expect("retained-root capture fixture failed after cleanup");
+    }
+}
+
+/// A table's TOAST relation is its out-of-line storage. Its name carries the
+/// table's OID, so a scratch compilation and the target never agree on it,
+/// and no expression binds it: it is not an input. The table itself, which
+/// reached it through an internal dependency, still is.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_tables_toast_storage_is_not_a_capture_input() {
+    for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+        let base = std::env::var(variable).expect("live PostgreSQL fixture setting");
+        let name = format!(
+            "pbps_toast1274_{}",
+            crate::catalog::probe_token().replace('-', "_")
+        );
+        let mut admin = Conn::connect(Driver::Postgres, &base).await.unwrap();
+        admin
+            .execute(&format!("CREATE DATABASE {name}"))
+            .await
+            .unwrap();
+        let connection = format!("{base} dbname={name}");
+        let result = tokio::task::LocalSet::new()
+            .run_until(async move {
+                tokio::task::spawn_local(async move {
+                    let mut conn = Conn::connect(Driver::Postgres, &connection).await.unwrap();
+                    conn.execute(
+                        "CREATE SCHEMA app; CREATE TABLE app.t(id integer, body text); \
+                         CREATE VIEW app.historical AS SELECT id FROM app.t",
+                    )
+                    .await
+                    .unwrap();
+                    let toast = conn
+                        .query(
+                            "SELECT count(*) AS n FROM pg_catalog.pg_class \
+                             WHERE oid = 'app.t'::regclass AND reltoastrelid <> 0",
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        toast[0].try_get::<i64>("n").unwrap(),
+                        Some(1),
+                        "the fixture table has out-of-line storage"
+                    );
+                    let captured = capture(&mut conn, &fixture_scope()).await.unwrap();
+                    let mentions = |id: &ObjectIdentity| format!("{id:?}").contains("\"pg_toast\"");
+                    let storage: Vec<_> =
+                        captured.inputs.keys().filter(|id| mentions(id)).collect();
+                    assert!(storage.is_empty(), "TOAST storage captured: {storage:?}");
+                    assert!(captured.inputs.contains_key(&ObjectIdentity {
+                        class: "pg_class".into(),
+                        name: vec!["app".into(), "t".into()],
+                        signature: vec![],
+                    }));
+                })
+                .await
+            })
+            .await;
+        admin
+            .execute(&format!("DROP DATABASE {name} WITH (FORCE)"))
+            .await
+            .unwrap();
+        result.expect("TOAST capture fixture failed after cleanup");
     }
 }

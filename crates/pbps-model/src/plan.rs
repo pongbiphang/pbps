@@ -164,7 +164,14 @@ use crate::schema::Schema;
 /// key's, a unique constraint's and an index's `storage_parameters` in their
 /// payloads, and `SetIndexStorageParameters`. An older build reading such a
 /// plan would build the index without them.
-pub const CURRENT_VERSION: u32 = 20;
+///
+/// Bumped to 21 for the closing-manifest evidence shape (#1274,
+/// DEC-1274.1): `Qualification::target_environment_after`,
+/// `ObjectTransition::references`, managed-closing placeholders and capture
+/// rule `postgres-catalog-inputs-v2`. A version 20 resolved plan cannot be
+/// read by this build, nor this build's by an older one; the version says
+/// why, and the remedy is a new plan.
+pub const CURRENT_VERSION: u32 = 21;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -623,7 +630,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 20);
+        assert_eq!(CURRENT_VERSION, 21);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads

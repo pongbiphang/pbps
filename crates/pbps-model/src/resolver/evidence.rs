@@ -48,7 +48,10 @@ pub enum ResolverRuntime {
 #[serde(deny_unknown_fields)]
 pub struct Qualification {
     pub rule: String,
+    /// Raw opening target catalog facts, before any approved grant projection.
     pub target_environment: String,
+    /// The same observation after projecting exactly the ordered approved grants.
+    pub target_environment_after: String,
     pub resolver_environment: String,
     pub target_build: String,
     pub resolver_build: String,
@@ -121,7 +124,7 @@ impl ResolverEvidence {
     ) -> Result<Self, EvidenceError> {
         let after = before.project(changes, compiled, &transitions)?;
         let evidence = Self {
-            version: 1,
+            version: 2,
             handling: EvidenceHandling::KeyedFingerprints,
             coverage: BindingCoverage::CreationTimeV1,
             qualification,
@@ -157,7 +160,7 @@ impl ResolverEvidence {
 
     #[allow(clippy::wildcard_enum_match_arm)]
     pub fn validate(&self, changes: &ChangeSet) -> Result<(), EvidenceError> {
-        if self.version != 1
+        if self.version != 2
             || self.qualification.rule.is_empty()
             || self.authorization.rule.is_empty()
         {
@@ -166,6 +169,7 @@ impl ResolverEvidence {
         let q = &self.qualification;
         if [
             &q.target_environment,
+            &q.target_environment_after,
             &q.resolver_environment,
             &q.target_build,
             &q.resolver_build,
@@ -225,47 +229,83 @@ impl ResolverEvidence {
         // surface. Unchanged managed surfaces come from the producer's complete
         // schema inventory; their required membership is pinned by the seal.
         for step in &changes.changes {
-            let surface = match &step.change {
+            let required = match &step.change {
+                Change::CreateTable { name, table, .. } => {
+                    // Owner transitions cover catalog records, not resolution
+                    // membership: every inline binding needs its own observation.
+                    let mut surfaces = Vec::new();
+                    for (column, spec) in &table.columns {
+                        if spec.default.is_some() || spec.generated.is_some() {
+                            surfaces.push(super::Surface::Default(name.column(column)));
+                        }
+                    }
+                    for check in table.checks.keys() {
+                        surfaces.push(super::Surface::Check {
+                            table: name.clone(),
+                            name: check.clone(),
+                        });
+                    }
+                    for (index, spec) in &table.indexes {
+                        if spec.holds_expression() {
+                            surfaces.push(super::Surface::Index {
+                                table: name.clone(),
+                                name: index.clone(),
+                            });
+                        }
+                    }
+                    surfaces
+                }
                 Change::CreateModule { id, .. }
                 | Change::AlterModule { id, .. }
-                | Change::DropModule { id, .. } => Some(super::Surface::Module(id.clone())),
+                | Change::DropModule { id, .. } => vec![super::Surface::Module(id.clone())],
                 // A generation expression is the column's `pg_attrdef` row,
                 // as a default is (DEC-1168.1).
                 Change::AlterColumnDefault { column, .. }
                 | Change::AlterColumnExpression { column, .. } => {
-                    Some(super::Surface::Default(column.clone()))
+                    vec![super::Surface::Default(column.clone())]
                 }
                 Change::AddColumn {
                     table,
                     name,
                     column,
                     ..
-                } if column.default.is_some() => Some(super::Surface::Default(table.column(name))),
+                } if column.default.is_some() || column.generated.is_some() => {
+                    vec![super::Surface::Default(table.column(name))]
+                }
                 Change::AddCheck { table, name, .. } | Change::DropCheck { table, name } => {
-                    Some(super::Surface::Check {
+                    vec![super::Surface::Check {
                         table: table.clone(),
                         name: name.clone(),
-                    })
+                    }]
                 }
                 Change::AddIndex {
                     table, name, index, ..
-                } if index.holds_expression() => Some(super::Surface::Index {
+                } if index.holds_expression() => vec![super::Surface::Index {
                     table: table.clone(),
                     name: name.clone(),
-                }),
-                _ => None,
+                }],
+                _ => Vec::new(),
             };
-            if let Some(surface) = surface
-                && !self.surfaces.iter().any(|s| s.surface == surface)
-            {
-                return Err(EvidenceError::Incomplete);
+            for surface in required {
+                if !self.surfaces.iter().any(|s| s.surface == surface) {
+                    return Err(EvidenceError::Incomplete);
+                }
             }
         }
 
+        // The opening manifest is a complete observation; only the closing
+        // manifest may hold placeholders for the plan's own records.
         if self
             .before
-            .project(changes, &self.after, &self.transitions)?
-            != self.after
+            .prerequisites()
+            .iter()
+            .any(|p| p.is_managed_closing())
+        {
+            return Err(EvidenceError::Incomplete);
+        }
+        if !self
+            .before
+            .closing_matches(changes, &self.after, &self.transitions)?
         {
             return Err(EvidenceError::Projection);
         }
@@ -311,9 +351,15 @@ impl ResolverEvidence {
             if surface.current.is_none() && surface.desired.is_none() {
                 return Err(EvidenceError::Incomplete);
             }
+            // A record the plan installs is not in the closing manifest: its
+            // sealed desired bindings are the expectation itself.
+            let desired = surface
+                .desired
+                .as_ref()
+                .filter(|observed| !installed.contains(&observed.object));
             for (observed, manifest) in [
-                (&surface.current, &self.before),
-                (&surface.desired, &self.after),
+                (surface.current.as_ref(), &self.before),
+                (desired, &self.after),
             ] {
                 if let Some(observed) = observed {
                     let Some(p) = manifest
@@ -402,6 +448,95 @@ mod tests {
         .unwrap()
     }
 
+    /// The engine-compiled desired manifest behind [`plan`]: what scratch
+    /// would capture for the created view, including its fingerprint.
+    pub(super) fn compiled() -> InputManifest {
+        manifest(true)
+    }
+
+    /// The catalog a target shows once the plan has applied: the closing
+    /// manifest with every installed record observed from `compiled`, with
+    /// its real fingerprint, whether or not the closing manifest kept a
+    /// placeholder for it. Fixtures that start a later plan from this state
+    /// need it, because an opening manifest is a complete observation and
+    /// may hold no placeholder.
+    pub(super) fn observed(evidence: &ResolverEvidence, compiled: &InputManifest) -> InputManifest {
+        let installed: BTreeSet<_> = evidence.transitions.iter().flat_map(|t| &t.after).collect();
+        let mut records: Vec<_> = evidence
+            .after
+            .prerequisites()
+            .iter()
+            .filter(|p| !installed.contains(&p.object))
+            .cloned()
+            .collect();
+        records.extend(
+            compiled
+                .prerequisites()
+                .iter()
+                .filter(|p| installed.contains(&p.object))
+                .cloned(),
+        );
+        records.sort_by(|a, b| a.object.cmp(&b.object));
+        let mut json = serde_json::to_value(&evidence.after).unwrap();
+        json["prerequisites"] = serde_json::to_value(records).unwrap();
+        serde_json::from_value(json).unwrap()
+    }
+
+    /// A fresh read reused as a later plan's opening capture, read with an
+    /// opening capture's scope. The closing read rereads every record it
+    /// lists as a retained root; an opening capture keeps only its own.
+    pub(super) fn as_opening(manifest: &InputManifest, opening: &InputManifest) -> InputManifest {
+        let mut json = serde_json::to_value(manifest).unwrap();
+        json["scope"] = serde_json::to_value(opening.scope()).unwrap();
+        serde_json::from_value(json).unwrap()
+    }
+
+    /// The closing manifest's shape (DEC-1274.1): every opening record the
+    /// plan does not remove is kept unchanged, and no installed record is
+    /// predicted. One that is present at all is only the placeholder of its
+    /// compiled record, carrying identity, ownership and bindings.
+    pub(super) fn assert_closing(evidence: &ResolverEvidence, compiled: &InputManifest) {
+        let removed: BTreeSet<_> = evidence
+            .transitions
+            .iter()
+            .flat_map(|t| &t.before)
+            .collect();
+        let installed: BTreeSet<_> = evidence.transitions.iter().flat_map(|t| &t.after).collect();
+        for record in evidence.after.prerequisites() {
+            let expected = if installed.contains(&record.object) {
+                compiled
+                    .prerequisites()
+                    .iter()
+                    .find(|p| p.object == record.object)
+                    .unwrap()
+                    .managed_closing()
+            } else {
+                evidence
+                    .before
+                    .prerequisites()
+                    .iter()
+                    .find(|p| p.object == record.object)
+                    .unwrap()
+                    .clone()
+            };
+            assert_eq!(record, &expected);
+        }
+        for record in evidence.before.prerequisites() {
+            if !removed.contains(&record.object) {
+                assert!(evidence.after.prerequisites().contains(record));
+            }
+        }
+        // The closing read rereads every record the closing manifest lists,
+        // including one no remaining expression reaches.
+        let listed: BTreeSet<_> = evidence
+            .after
+            .prerequisites()
+            .iter()
+            .map(|p| p.object.clone())
+            .collect();
+        assert!(listed.is_subset(&evidence.after.scope().retained));
+    }
+
     pub(super) fn plan() -> SavedPlan {
         let changes = ChangeSet {
             changes: vec![PlannedChange::new(Change::CreateModule {
@@ -419,6 +554,7 @@ mod tests {
             Qualification {
                 rule: "fixture-environment-v1".into(),
                 target_environment: "01".repeat(32),
+                target_environment_after: "01".repeat(32),
                 resolver_environment: "02".repeat(32),
                 target_build: "03".repeat(32),
                 resolver_build: "04".repeat(32),
@@ -447,6 +583,7 @@ mod tests {
                 }),
             }],
             vec![ObjectTransition {
+                references: BTreeSet::new(),
                 surface,
                 before: BTreeSet::new(),
                 after: BTreeSet::from([object("app", "v")]),
@@ -532,7 +669,7 @@ mod tests {
             );
         }
         for (pointer, value) in [
-            ("/analysis/evidence/version", json!(2)),
+            ("/analysis/evidence/version", json!(3)),
             ("/analysis/evidence/coverage", json!("all-runtime-code")),
             ("/analysis/evidence/handling", json!("public")),
             ("/analysis/evidence/qualification/target_build", json!("")),
@@ -569,7 +706,7 @@ mod tests {
         assert_eq!(plan.validate_analysis(), Err(EvidenceError::Projection));
     }
     #[test]
-    fn an_approved_grant_changes_only_its_owned_catalog_properties() {
+    fn an_approved_grant_keeps_its_target_as_an_untouched_input() {
         let template = plan();
         let PlanAnalysis::Resolved(template) = template.analysis else {
             panic!("resolved")
@@ -581,64 +718,50 @@ mod tests {
                 permissions: BTreeSet::from([crate::Permission::Select]),
             })],
         };
-        let before = template.after.clone();
-        let mut json = serde_json::to_value(&before).unwrap();
-        for record in json["prerequisites"].as_array_mut().unwrap() {
-            record["properties"] = json!("ee".repeat(32));
-        }
-        let compiled: InputManifest = serde_json::from_value(json).unwrap();
+        // The view exists now, observed with its real fingerprint.
+        let before = observed(&template, &compiled());
+        let mut authorization = template.authorization.clone();
+        authorization.changes = BTreeSet::from([0]);
+        // ACLs are not fingerprinted (DEC-1274.1): the grant changes no
+        // prerequisite, so it needs no transition and the granted view keeps
+        // its full opening fingerprint for the closing recheck.
+        let evidence = ResolverEvidence::new(
+            &changes,
+            template.qualification.clone(),
+            authorization.clone(),
+            before.clone(),
+            &before,
+            vec![],
+            vec![],
+            OrderingProof::new(&changes, BTreeSet::new()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(evidence.after, before);
+        // A transition cannot turn the grant into permission to replace the
+        // view's fingerprint with a placeholder.
         let transition = ObjectTransition {
+            references: BTreeSet::new(),
             surface: Surface::Module("app.v".parse().unwrap()),
             before: BTreeSet::from([object("app", "v")]),
             after: BTreeSet::from([object("app", "v")]),
         };
-        let mut authorization = template.authorization.clone();
-        authorization.changes = BTreeSet::from([0]);
-        let evidence = ResolverEvidence::new(
-            &changes,
-            template.qualification.clone(),
-            authorization,
-            before.clone(),
-            &compiled,
-            vec![],
-            vec![transition.clone()],
-            OrderingProof::new(&changes, BTreeSet::new()).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            evidence
-                .after
-                .prerequisites()
-                .iter()
-                .find(|p| p.object == object("app", "v"))
-                .unwrap()
-                .properties,
-            "ee".repeat(32)
-        );
-        assert_eq!(
-            evidence
-                .after
-                .prerequisites()
-                .iter()
-                .find(|p| p.object == object("ext", "input"))
-                .unwrap()
-                .properties,
-            "bb".repeat(32)
-        );
-        assert_eq!(evidence.after.membership(), before.membership());
         assert!(
             before
-                .project(&ChangeSet::default(), &compiled, &[transition])
+                .project(&changes, &before, std::slice::from_ref(&transition))
                 .is_err()
         );
-        let mut changed = changes.clone();
-        if let Change::Grant { target, .. } = &mut changed.changes[0].change {
-            *target = "app.other".parse().unwrap();
-        }
         assert!(
-            before
-                .project(&changed, &compiled, &evidence.transitions)
-                .is_err()
+            ResolverEvidence::new(
+                &changes,
+                template.qualification.clone(),
+                authorization,
+                before.clone(),
+                &before,
+                vec![],
+                vec![transition],
+                OrderingProof::new(&changes, BTreeSet::new()).unwrap(),
+            )
+            .is_err()
         );
     }
 
@@ -650,6 +773,204 @@ mod tests {
         };
         evidence.surfaces.clear();
         assert_eq!(plan.validate_analysis(), Err(EvidenceError::Incomplete));
+    }
+
+    fn with_records(manifest: &InputManifest, records: Vec<Prerequisite>) -> InputManifest {
+        let mut records: Vec<_> = manifest
+            .prerequisites()
+            .iter()
+            .filter(|p| !records.iter().any(|r| r.object == p.object))
+            .cloned()
+            .chain(records.iter().cloned())
+            .collect();
+        records.sort_by(|a, b| a.object.cmp(&b.object));
+        let mut json = serde_json::to_value(manifest).unwrap();
+        json["prerequisites"] = serde_json::to_value(records).unwrap();
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn resolved(plan: &SavedPlan) -> ResolverEvidence {
+        let PlanAnalysis::Resolved(evidence) = &plan.analysis else {
+            panic!("resolved")
+        };
+        (**evidence).clone()
+    }
+
+    #[test]
+    fn an_installed_record_nothing_references_is_not_in_the_closing_manifest() {
+        let plan = plan();
+        let template = resolved(&plan);
+        // An engine-named internal record of the view: no binding, member,
+        // lookup or retained address names it, so only the managed
+        // revalidation can check it.
+        let internal = Prerequisite {
+            object: ObjectIdentity {
+                class: "adapter-internal-type".into(),
+                name: vec!["v_rowtype".into()],
+                signature: vec![],
+            },
+            ownership: crate::resolver::ObjectOwnership::Surface(Surface::Module(
+                "app.v".parse().unwrap(),
+            )),
+            canonicalization: "fixture-v1".into(),
+            properties: "dd".repeat(32),
+            bindings: vec![],
+        };
+        let compiled = with_records(&compiled(), vec![internal.clone()]);
+        let mut transitions = template.transitions.clone();
+        transitions[0].after.insert(internal.object.clone());
+        let evidence = ResolverEvidence::new(
+            &plan.changes,
+            template.qualification.clone(),
+            template.authorization.clone(),
+            template.before.clone(),
+            &compiled,
+            template.surfaces.clone(),
+            transitions,
+            template.ordering.clone(),
+        )
+        .unwrap();
+        assert!(
+            !evidence
+                .after
+                .prerequisites()
+                .iter()
+                .any(|p| p.object == internal.object)
+        );
+        assert_closing(&evidence, &compiled);
+        // Its placeholder is not an expectation the plan derives either.
+        let mut extra = evidence.clone();
+        extra.after = with_records(&evidence.after, vec![internal.managed_closing()]);
+        assert_eq!(
+            extra.validate(&plan.changes),
+            Err(EvidenceError::Projection)
+        );
+    }
+
+    #[test]
+    fn a_referenced_installed_record_is_only_a_placeholder() {
+        let plan = plan();
+        let evidence = resolved(&plan);
+        let compiled = compiled();
+        let view = compiled
+            .prerequisites()
+            .iter()
+            .find(|p| p.object == object("app", "v"))
+            .unwrap();
+        // The candidate membership names the created view, so the closing
+        // manifest keeps its identity, ownership and bindings, not its
+        // compiled fingerprint.
+        let closing = evidence
+            .after
+            .prerequisites()
+            .iter()
+            .find(|p| p.object == view.object)
+            .unwrap();
+        assert!(closing.is_managed_closing());
+        assert_eq!(closing, &view.managed_closing());
+        assert_ne!(closing.properties, view.properties);
+        assert_closing(&evidence, &compiled);
+        // A saved closing manifest that predicts the record is refused.
+        let mut predicted = evidence.clone();
+        predicted.after = with_records(&evidence.after, vec![view.clone()]);
+        assert!(predicted.validate(&plan.changes).is_err());
+    }
+
+    #[test]
+    fn the_opening_manifest_cannot_hold_a_placeholder() {
+        let plan = plan();
+        let template = resolved(&plan);
+        let Change::CreateModule { id, module } = plan.changes.changes[0].change.clone() else {
+            panic!("create")
+        };
+        let changes = ChangeSet {
+            changes: vec![PlannedChange::new(Change::AlterModule { id, module })],
+        };
+        let mut evidence = template.clone();
+        evidence.surfaces[0].current = evidence.surfaces[0].desired.clone();
+        evidence.transitions[0].before = evidence.transitions[0].after.clone();
+        evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
+        evidence.before = observed(&template, &compiled());
+        evidence.validate(&changes).unwrap();
+        // The previous plan's closing manifest is no observation of the view:
+        // its placeholder would stand in for the record this plan replaces.
+        evidence.before = template.after.clone();
+        assert_eq!(evidence.validate(&changes), Err(EvidenceError::Incomplete));
+    }
+
+    #[test]
+    fn the_closing_manifest_cannot_add_a_placeholder_the_plan_does_not_install() {
+        let plan = plan();
+        let evidence = resolved(&plan);
+        let external = evidence
+            .before
+            .prerequisites()
+            .iter()
+            .find(|p| p.object == object("ext", "input"))
+            .unwrap();
+        let stray = Prerequisite {
+            object: object("app", "stray"),
+            ..external.clone()
+        };
+        // An untouched target record can neither be swapped for a
+        // placeholder nor joined by one for an object no transition installs.
+        for placeholder in [external.managed_closing(), stray.managed_closing()] {
+            let mut wrong = evidence.clone();
+            wrong.after = with_records(&evidence.after, vec![placeholder]);
+            assert_eq!(
+                wrong.validate(&plan.changes),
+                Err(EvidenceError::Projection)
+            );
+        }
+    }
+
+    #[test]
+    fn creating_an_object_the_target_already_holds_untouched_is_refused() {
+        let plan = plan();
+        let evidence = resolved(&plan);
+        // The opening already holds app.v and no transition removes it, so
+        // the plan's CREATE would install over a kept input.
+        let opening = compiled();
+        assert_eq!(
+            opening.project(&plan.changes, &compiled(), &evidence.transitions),
+            Err(ManifestError::Invalid)
+        );
+        let mut wrong = evidence.clone();
+        wrong.before = opening;
+        assert!(wrong.validate(&plan.changes).is_err());
+    }
+
+    #[test]
+    fn a_placeholder_needs_ownership_its_installing_transition_authorizes() {
+        let plan = plan();
+        let evidence = resolved(&plan);
+        let placeholder = evidence
+            .after
+            .prerequisites()
+            .iter()
+            .find(|p| p.is_managed_closing())
+            .unwrap()
+            .clone();
+        evidence.validate(&plan.changes).unwrap();
+        for ownership in [
+            crate::resolver::ObjectOwnership::Unqualified,
+            crate::resolver::ObjectOwnership::Surface(Surface::Module(
+                "app.other".parse().unwrap(),
+            )),
+        ] {
+            let mut wrong = evidence.clone();
+            wrong.after = with_records(
+                &evidence.after,
+                vec![Prerequisite {
+                    ownership,
+                    ..placeholder.clone()
+                }],
+            );
+            assert_eq!(
+                wrong.validate(&plan.changes),
+                Err(EvidenceError::Projection)
+            );
+        }
     }
 }
 
@@ -664,3 +985,6 @@ mod owner_mutation_scope_tests;
 
 #[cfg(test)]
 mod chained_rename_tests;
+
+#[cfg(test)]
+mod qualification_phase_tests;

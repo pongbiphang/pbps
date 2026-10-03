@@ -29,7 +29,7 @@ pub fn validate_evidence(
     evidence: &pbps_model::resolver::ResolverEvidence,
 ) -> Result<(), pbps_model::resolver::EvidenceError> {
     use pbps_model::resolver::EvidenceError;
-    if evidence.before().adapter() != "postgres-catalog-inputs-v1"
+    if evidence.before().adapter() != capture::INPUT_RULE
         || !matches!(evidence.before().engine_major(), 16 | 18)
         || evidence.qualification().rule != compatibility::RULE
         || evidence.authorization().rule != authorization::RULE

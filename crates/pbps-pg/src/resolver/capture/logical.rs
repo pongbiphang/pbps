@@ -107,13 +107,12 @@ impl Catalog {
         let mut signature = Vec::new();
         for &(field, target) in references {
             let oid = number(row, field)?;
-            // Optional schema on a default ACL means database-wide, not an
-            // unreadable schema. Keep that explicit slot in its identity.
+            // An optional zero reference (a setting for every database or
+            // role) is an explicit slot, not an unreadable object.
             signature.push(if oid == 0 {
                 let optional = matches!(
                     (class, field),
-                    ("pg_default_acl", "defaclnamespace")
-                        | ("pg_db_role_setting", "setdatabase" | "setrole")
+                    ("pg_db_role_setting", "setdatabase" | "setrole")
                         | ("pg_operator", "oprleft" | "oprright")
                         | ("pg_constraint", "conrelid" | "contypid")
                 );
@@ -215,6 +214,20 @@ impl Catalog {
                 self.related(class, row, &[("partrelid", "pg_class")], &[])?
             }
             "pg_rewrite" => self.related(class, row, &[("ev_class", "pg_class")], &["rulename"])?,
+            // A constraint's internal triggers (a foreign key's RI triggers)
+            // are named after their own OID, so the name differs on every
+            // database. Their relation, constraint and function are unique
+            // (measured on PG16/18, including a self-referencing key).
+            "pg_trigger" if internal_constraint_trigger(row)? => self.related(
+                class,
+                row,
+                &[
+                    ("tgrelid", "pg_class"),
+                    ("tgconstraint", "pg_constraint"),
+                    ("tgfoid", "pg_proc"),
+                ],
+                &[],
+            )?,
             "pg_trigger" => self.related(class, row, &[("tgrelid", "pg_class")], &["tgname"])?,
             "pg_policy" => self.related(class, row, &[("polrelid", "pg_class")], &["polname"])?,
             "pg_constraint" => self.related(
@@ -236,15 +249,6 @@ impl Catalog {
                     signature: vec![column],
                 }
             }
-            "pg_default_acl" => self.related(
-                class,
-                row,
-                &[
-                    ("defaclrole", "pg_authid"),
-                    ("defaclnamespace", "pg_namespace"),
-                ],
-                &["defaclobjtype"],
-            )?,
             "pg_auth_members" => self.related(
                 class,
                 row,
@@ -345,6 +349,16 @@ impl Catalog {
             self.object(class, oid)
         }
     }
+}
+
+/// A trigger PostgreSQL created for a constraint, as opposed to a declared
+/// trigger or a user's CREATE CONSTRAINT TRIGGER.
+pub(super) fn internal_constraint_trigger(row: &Row) -> Result<bool> {
+    let internal = row
+        .get("tgisinternal")
+        .and_then(Value::as_bool)
+        .ok_or(Uncovered::MissingObject)?;
+    Ok(internal && number(row, "tgconstraint")? != 0)
 }
 
 pub(super) fn string<'a>(row: &'a Row, field: &str) -> Result<&'a str> {

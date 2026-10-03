@@ -8,7 +8,9 @@ fn surfaces(schema: &Schema) -> BTreeSet<Surface> {
     let mut result = BTreeSet::new();
     for (table, definition) in &schema.tables {
         for (column, spec) in &definition.columns {
-            if spec.default.is_some() {
+            // Generated expressions use the same binding surface as defaults;
+            // omitting them rejects qualified evidence (DEC-1168.1).
+            if spec.default.is_some() || spec.generated.is_some() {
                 result.insert(Surface::Default(table.column(column)));
             }
         }

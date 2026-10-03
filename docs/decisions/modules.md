@@ -1589,3 +1589,42 @@ Pinned by `an_addition_naming_no_created_function_keeps_its_place`,
 `a_new_column_calling_a_rebuilt_function_follows_the_rebuild` and
 `a_new_column_calling_a_function_that_reads_it_is_refused_by_name`
 (`crates/pbps-cli/tests/flow_pg.rs`).
+
+*Amended by [DEC-1274.2](#dec-1274-2): a table the plan creates whose generated
+column calls a function the plan creates or rebuilds follows that create whole,
+instead of being left to the engine.*
+
+<a id="dec-1274-2"></a>
+
+**DEC-1274.2. A new table whose generated column calls a function the plan
+creates or rebuilds follows that create whole, in the plan and on scratch
+(#1274).** DEC-1364.1 left such a table to the engine: a generated column
+cannot leave its `CREATE TABLE` without changing the table's column order, so
+the table stayed ahead of the function and the engine refused it. The
+resolver's scratch compile of the desired namespace failed the same way, even
+for a plan that changed nothing (#1303 review).
+
+`after_their_functions` now holds the whole `CreateTable` as it holds an added
+column: the table waits for the creates its generation text names, by the same
+lexer scan, and every later change that may need it follows it — a module
+naming the table, a foreign key referencing it, a row it receives. The column
+order is the declared one, because the table is not split. A function that
+reads the table it is called from is the cycle DEC-1364.1 already refuses by
+name, with the two-plan remedy.
+
+Scratch reconstruction (DEC-613.1) applies the same rule to its own phases:
+such a table, with what it holds that runs before the modules, joins the
+modules phase after the last function its generation text names; a module ahead
+of it that names the table, or names something so moved, follows it; and a
+foreign key naming it waits for the end of the modules, when every table
+exists. A function the table calls that would itself have to follow the table
+is refused by name.
+
+Pinned by `a_new_table_generating_from_a_new_function_follows_it_whole`
+(`crates/pbps-cli/src/dependents.rs`),
+`a_table_generating_from_a_declared_function_compiles_after_it`
+(`crates/pbps-pg/src/resolver/reconstruct/tests.rs`), and the live
+`a_new_table_generating_from_a_new_function_follows_its_create`
+(`crates/pbps-cli/tests/flow_pg.rs`) and
+`a_table_generating_from_a_declared_function_compiles_on_scratch`
+(`crates/pbps-pg/src/resolver/binding_tests.rs`).

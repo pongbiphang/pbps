@@ -120,3 +120,32 @@ fn catalog_ownership_is_required_and_not_inferred_from_an_object_name() {
         ObjectOwnership::Unqualified
     );
 }
+
+#[test]
+fn a_placeholder_is_named_by_its_canonicalization_and_keeps_no_fingerprint() {
+    let record = fixture().prerequisites()[0].clone();
+    let placeholder = record.managed_closing();
+    assert!(placeholder.is_managed_closing());
+    assert!(!record.is_managed_closing());
+    assert_eq!(
+        (
+            &placeholder.object,
+            &placeholder.ownership,
+            &placeholder.bindings
+        ),
+        (&record.object, &record.ownership, &record.bindings)
+    );
+    let mut value = serde_json::to_value(fixture()).unwrap();
+    value["prerequisites"][0] = serde_json::to_value(&placeholder).unwrap();
+    serde_json::from_value::<InputManifest>(value.clone()).unwrap();
+    // A placeholder that keeps a fingerprint would smuggle a prediction into
+    // the closing manifest. A zero digest under the adapter's own
+    // canonicalization stays an ordinary record, never a placeholder.
+    let mut fingerprinted = value.clone();
+    fingerprinted["prerequisites"][0]["properties"] = json!("04".repeat(32));
+    assert!(serde_json::from_value::<InputManifest>(fingerprinted).is_err());
+    let mut unfingerprinted = value;
+    unfingerprinted["prerequisites"][0]["canonicalization"] = json!("fixture-v1");
+    let decoded = serde_json::from_value::<InputManifest>(unfingerprinted).unwrap();
+    assert!(!decoded.prerequisites()[0].is_managed_closing());
+}

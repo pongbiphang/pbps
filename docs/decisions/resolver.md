@@ -936,6 +936,10 @@ the reading role changes no stored binding. A failed or cancelled compile ends
 the analysis; a second question needs a fresh run.
 
 
+*Amended by [DEC-1274.2](modules.md#dec-1274-2): a table whose generated column
+calls a declared function joins the modules phase after that function, and a
+foreign key naming it waits for the end of the modules.*
+
 <a id="dec-613-2"></a>
 
 **DEC-613.2. A binding verdict holds only where scratch reproduced every
@@ -1097,7 +1101,9 @@ teardown uses the old name, restoration the approved final name, and both keep
 the final owner's strategy. Comparing surface names alone lost these dependent
 rebuilds; PostgreSQL refused the resulting routine drop with `2BP01`.
 
-The expected closing manifest is projected from approved typed changes and
+*Amended by DEC-1274.1: the closing manifest keeps the plan's own records only
+as identity-and-bindings placeholders, not as predicted properties.* The
+expected closing manifest is projected from approved typed changes and
 engine-observed ownership transitions. It preserves untouched external
 properties and changes only the approved objects' properties, candidate
 membership and lookup results; row changes cannot authorize a catalog change.
@@ -1164,3 +1170,119 @@ new name as a known contract, never an unknown name or an admission substitute.
 The fixed fixture selects pinned PG16/PG18 recipes explicitly, defaults to 18,
 and retains the ordinary SQL Server recipe. This does not admit a Podman-native
 daemon, arbitrary layouts, publish the held producer or enable resolved apply.
+
+<a id="dec-1274-1"></a>
+
+**DEC-1274.1. Seal the resolved producer's exact observations under its selected environment key.**
+The key is fixed before the authorized fresh target and scratch reads. The
+producer keeps the captures that justified the binding verdict, seals them
+inside those read boundaries, and returns no capability to rekey a retained
+capture. Managed ownership is proved per catalog record from recorded UIDs
+and kind-specific dependency rules; a reference or automatic dependency alone
+never authorizes a transition. The resolved evidence format is version 2: its
+opening target-environment fingerprint covers complete raw `CatalogFacts`, and
+its closing fingerprint covers the approved grant projection of that same
+observation. Both use the same versioned canonical input and HMAC component,
+so a target-only recheck can compare each phase directly. The final ordered
+grant changes must match the projection request or production refuses.
+
+Authorization metadata is not a binding input, and the producer does not
+predict it. Measured on PostgreSQL 16 and 18, revoking EXECUTE on the chosen
+overload from PUBLIC, giving it to another owner, or revoking every privilege
+on a referenced table and changing its owner leaves the view, default and CHECK
+bindings unchanged. Revoking the deployer's USAGE on an earlier schema does
+change the binding: name lookup skips that schema. Capture rule
+`postgres-catalog-inputs-v2` therefore drops owner and ACL fields, and the
+`pg_shdepend`, `pg_init_privs` and `pg_default_acl` rows, from every
+prerequisite. The deployer's effective schema privileges stay in the
+engine-computed authorization condition. The earlier design fingerprinted that
+metadata, so every transitioned record needed a predicted closing owner, ACL,
+grantor and shared-dependency edge, including the default privileges applied at
+creation. That was a second implementation of PostgreSQL's permission rules: it
+took most of this issue's commits and review findings, and each round surfaced
+another catalog case to model and measure, such as empty default ACLs (#1304).
+The same rule leaves a table's TOAST relation out of the capture, with its
+index, columns and dependency rows. It is out-of-line storage, physical as the
+table's relfilenode already is: no expression binds it, and its name embeds the
+table's OID, so scratch compilation and the target never name it alike.
+Captured, it was an unowned record that a dropped table still listed in the
+closing manifest, and the valid drop failed its recheck.
+
+A rebuild that would drop a routine grant
+option is the ordinary connected rebuild guard's refusal
+(`modules::before_a_rebuild`), not the producer's.
+
+A foreign key's internal RI triggers are named after their own OID, so a
+created or dropped key's triggers could never match between scratch and
+target. Measured on PostgreSQL 16 and 18, each has an internal dependency on its
+constraint, and its relation, constraint and trigger function are unique, a
+self-referencing key included. An internal constraint trigger is identified by
+those three, its name is neither a property nor part of its rendered definition,
+and it belongs to the table surface that owns the constraint.
+
+The closing manifest does not predict what the plan changes. Scratch reproduces
+only what the declarations say; the target also keeps what they do not: names
+PostgreSQL generated when the table had another name (an unnamed primary key
+and its index, an identity sequence, a PostgreSQL 18 NOT NULL constraint; a
+rename keeps all of them, measured on 16 and 18), its physical column order,
+storage and compression settings, a column's stored missing value, relation
+options. Each review round of this issue found another such property, because
+the projection took the plan's own records from scratch and had to correct them
+one case at a time.
+
+The closing check exists to catch a concurrent change to an input the plan did
+not change, a wrong resulting binding, and an authorization change (ADR-0016
+case 22). So the closing manifest keeps every prerequisite the plan does not
+change with its full fingerprint, and keeps each record the plan installs only
+as a placeholder: identity, ownership and bindings, no property fingerprint
+(`MANAGED_CLOSING`), and only when it carries bindings or a kept record,
+candidate member, runtime limitation or signature lookup names it. Candidate
+membership still adds the plan's own members, which are declared names. An
+installed record nobody names, such as an engine-named key or sequence, is left
+out. Its declared properties are the ordinary managed revalidation's to check
+at apply (DECISIONS 423), and a property no declaration states, such as a
+storage setting, does not change a binding. The reader cannot see the compiled
+records, so it checks the opening side of every transition and that the closing
+manifest is exactly the untouched opening records plus placeholders of
+installed records; the closing-side inventory and ownership checks run when the
+plan is sealed. The closing manifest's read scope lists every record it holds as
+a retained root. An untouched record can lose the only expression that reached
+it, as `count` does when a routine's new body no longer calls it, and the
+closing read must still reread it rather than miss it.
+
+Every desired surface that binds something at creation needs its binding
+verdict, including one the target does not hold yet: one the plan creates, or
+relocates through a parent rename. Nothing on the target compares with it, but
+its creation binds against the target's candidates, so the assessment checks
+that scratch reproduced them, as it does for an existing surface, and calls the
+surface `Created` when it did. An unmanaged overload scratch did not
+reconstruct leaves the new surface unresolved, and the plan is refused instead
+of sealing scratch's fallback as the binding. A surface that binds nothing at
+creation, such as a routine whose string body binds only at run time, has no
+lookup a candidate could change, and needs none.
+
+The table is the unit of the closing inventory (#1466). One DDL statement
+reaches past the surface it names: a retype rebuilds the keys and indexes over
+the column, ADD or DROP DEFAULT flips the column's own `atthasdef`, and a rename
+rewrites another table's foreign key, its RI triggers and their dependency
+rows. Each catalog change therefore carries, besides its exact per-surface
+inventory, the rest of every table it touches: the table's whole owned tree,
+and every record a dependency row ties to it or whose identity names one, to a
+fixed point. The adapter proves each tie. The model accepts such a reference
+only on a table-family transition that a catalog change touches, and only for a
+record that a table-family surface owns. A view or routine tied to the table
+keeps its own transition or its full fingerprint, and an unqualified record
+never rides. Referencing still confers no authority anywhere else (DEC-614.2).
+The trade-off: a concurrent writer that changes an undeclared, non-binding
+property of an untouched sibling inside a touched table is no longer caught by
+the closing recheck. Such properties are already the operator's, and the
+ordinary apply guard still compares every declared one (SPEC 7.6).
+
+A GRANT, REVOKE or PUBLIC execution change makes no transition. Owners and ACLs
+are not fingerprinted, so its target's catalog record does not change: it stays
+an untouched input with its full fingerprint, and a concurrent change to it
+still fails the closing recheck. Whether the grant took is the ordinary apply
+guard's to check: it compares every declared grant the plan touches (SPEC 7.6).
+The authorization condition covers only the deployer's schema authorization,
+which is what name lookup depends on; an object grant does not change a
+binding.

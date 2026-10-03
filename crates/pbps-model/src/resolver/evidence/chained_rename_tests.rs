@@ -4,16 +4,77 @@ use crate::resolver::{ObjectOwnership, Surface};
 use crate::{PlannedChange, TableName};
 
 fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, ResolverEvidence) {
-    let (_, mut evidence) = super::transition_tests::rename_endpoints(column);
+    let (fixture_changes, mut evidence, compiled) =
+        super::transition_tests::rename_endpoints(column);
+    // Until sealing, `evidence.after` holds the compiled manifest, as in
+    // `transition_scope_tests::fixture`.
+    evidence.after = compiled;
+    let fixture_parent = column.then(|| {
+        evidence
+            .transitions
+            .iter()
+            .find(|t| matches!(t.surface, Surface::Table(_)))
+            .unwrap()
+            .before
+            .iter()
+            .next()
+            .unwrap()
+            .clone()
+    });
+    let source = match &fixture_changes.changes[0].change {
+        Change::RenameColumn { table, from, .. } => Surface::Column(table.column(from)),
+        Change::RenameTable { from, .. } => Surface::Table(from.clone()),
+        Change::CreateTable { .. }
+        | Change::DropTable { .. }
+        | Change::AddColumn { .. }
+        | Change::AddComputedColumn { .. }
+        | Change::SetReplicaIdentity { .. }
+        | Change::SetStorageParameters { .. }
+        | Change::SetIndexStorageParameters { .. }
+        | Change::DropComputedColumn { .. }
+        | Change::DropColumn { .. }
+        | Change::AlterColumnType { .. }
+        | Change::AlterColumnNullability { .. }
+        | Change::AlterColumnDefault { .. }
+        | Change::AlterColumnExpression { .. }
+        | Change::SetColumnDeprecated { .. }
+        | Change::SetPrimaryKey { .. }
+        | Change::AddUnique { .. }
+        | Change::DropUnique { .. }
+        | Change::AddForeignKey { .. }
+        | Change::DropForeignKey { .. }
+        | Change::AddCheck { .. }
+        | Change::DropCheck { .. }
+        | Change::AddIndex { .. }
+        | Change::DropIndex { .. }
+        | Change::InsertRow { .. }
+        | Change::UpdateRow { .. }
+        | Change::DeleteRow { .. }
+        | Change::SetDataMode { .. }
+        | Change::CreateModule { .. }
+        | Change::AlterModule { .. }
+        | Change::DropModule { .. }
+        | Change::CreateRole { .. }
+        | Change::DropRole { .. }
+        | Change::RenameRole { .. }
+        | Change::Grant { .. }
+        | Change::Revoke { .. }
+        | Change::PublicExecution { .. } => panic!("rename fixture"),
+    };
+    let rename_transition = evidence
+        .transitions
+        .iter()
+        .find(|transition| transition.surface == source)
+        .unwrap();
     let template = evidence
         .before
         .prerequisites()
         .iter()
-        .find(|p| evidence.transitions[0].before.contains(&p.object))
+        .find(|p| rename_transition.before.contains(&p.object))
         .unwrap()
         .clone();
     let old_object = template.object.clone();
-    let new_object = evidence.transitions[0].after.iter().next().unwrap().clone();
+    let new_object = rename_transition.after.iter().next().unwrap().clone();
     let old_table: TableName = "app.old".parse().unwrap();
     let table: TableName = "app.t".parse().unwrap();
     let mut changes = ChangeSet::default();
@@ -81,6 +142,7 @@ fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, Re
     let mut closing = vec![];
     for (from, to) in [("a", "b"), ("b", "c")] {
         let mut transition = ObjectTransition {
+            references: BTreeSet::new(),
             surface: surface(from, false, false),
             before: BTreeSet::new(),
             after: BTreeSet::new(),
@@ -117,6 +179,7 @@ fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, Re
         // A table aggregate contains both column renames and the table's own
         // records, while their endpoint names still belong to different UIDs.
         evidence.transitions = vec![ObjectTransition {
+            references: BTreeSet::new(),
             // The final table label also covers the column changes
             // whose statement-time owner is the renamed table.
             surface: Surface::Table(table),
@@ -133,6 +196,21 @@ fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, Re
         }];
         opening.push(before);
         closing.push(after);
+    } else if column {
+        // The helper's app.v parent is not this chain's app.t parent. Column
+        // renames preserve app.t and need its independent exact inventory.
+        let mut parent = template.clone();
+        parent.object = object("retained-table");
+        parent.ownership = ObjectOwnership::Surface(Surface::Table(table.clone()));
+        parent.bindings.clear();
+        evidence.transitions.push(ObjectTransition {
+            references: BTreeSet::new(),
+            surface: Surface::Table(table),
+            before: BTreeSet::from([parent.object.clone()]),
+            after: BTreeSet::from([parent.object.clone()]),
+        });
+        opening.push(parent.clone());
+        closing.push(parent);
     }
     for (manifest, removed, added) in [
         (&mut evidence.before, old_object, opening),
@@ -141,7 +219,7 @@ fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, Re
         let mut records: Vec<_> = manifest
             .prerequisites()
             .iter()
-            .filter(|p| p.object != removed)
+            .filter(|p| p.object != removed && fixture_parent.as_ref() != Some(&p.object))
             .cloned()
             .collect();
         records.extend(added);
@@ -164,7 +242,7 @@ fn accepts_chain(column: bool, rename_table: bool) {
     for intermediate in [false, true] {
         let (changes, evidence) = chain(column, intermediate, rename_table);
         let projected = seal(&changes, &evidence).expect("valid UID rename chain was refused");
-        assert_eq!(projected.after, evidence.after);
+        super::tests::assert_closing(&projected, &evidence.after);
         let decoded: ResolverEvidence =
             serde_json::from_value(serde_json::to_value(&projected).unwrap()).unwrap();
         decoded.validate(&changes).unwrap();
@@ -188,10 +266,16 @@ fn accepts_chain(column: bool, rename_table: bool) {
                         seal(&changes, &wrong).is_err(),
                         "missing chained rename record accepted"
                     );
-                    assert!(
-                        wrong.validate(&changes).is_err(),
-                        "saved chained rename omission accepted"
-                    );
+                    // The reader holds no compiled records, so only an
+                    // omitted opening record is its to refuse.
+                    if before {
+                        let mut saved = projected.clone();
+                        saved.transitions = wrong.transitions;
+                        assert!(
+                            saved.validate(&changes).is_err(),
+                            "saved chained rename omission accepted"
+                        );
+                    }
                 }
             }
         }

@@ -231,6 +231,14 @@ impl CapturedExecutables {
             .iter()
             .chain(self.required.iter().map(|(_, file)| file))
     }
+    pub(super) fn required_associations(
+        &self,
+        key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+    ) -> Result<String, UnqualifiedProcess> {
+        self.resolution
+            .seal_required_associations(key, &self.required)
+            .map_err(|_| UnqualifiedProcess)
+    }
 }
 
 /// Observe the same complete mapped inventory and loader candidates without

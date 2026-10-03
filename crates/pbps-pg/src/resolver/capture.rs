@@ -80,7 +80,12 @@ pub struct DroppedSignature {
 pub use pbps_db::resolver::capture::{CaptureError, Uncovered};
 
 mod manifest;
-pub use manifest::CapturedInputs;
+mod ownership;
+pub use manifest::{BindingRecord, CapturedInputs, CompiledCapture, SealError};
+
+/// The canonical property rule every sealed PostgreSQL prerequisite uses.
+pub(crate) const INPUT_RULE: &str = properties::RULE;
+pub use ownership::RecordedOwnership;
 
 mod assess;
 pub use assess::{Managed, Paths, assess, managed_scope, scope};
@@ -119,6 +124,69 @@ pub async fn capture_identifying(
     .map_err(CaptureError::Coverage)
 }
 
+/// Capture and seal in the same authorized read. The caller fixes the key
+/// before this read starts; no method on a retained capture can rekey it.
+pub async fn capture_identifying_sealed(
+    connection: &mut impl pbps_db::transport::QueryConnection,
+    scope: &CaptureScope,
+    dropped: &BTreeSet<DroppedSignature>,
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+) -> Result<(CapturedInputs, pbps_model::resolver::InputManifest), CaptureError> {
+    let captured = capture_identifying(connection, scope, dropped).await?;
+    let manifest = captured.seal(key).map_err(|_| CaptureError::Incomplete)?;
+    Ok((captured, manifest))
+}
+
+/// Seal scratch's fresh capture with the role map the qualified run made.
+/// No caller-supplied text rewrite or retained-capture rekey entry is exposed.
+pub async fn capture_identifying_sealed_with_roles(
+    connection: &mut impl pbps_db::transport::QueryConnection,
+    scope: &CaptureScope,
+    dropped: &BTreeSet<DroppedSignature>,
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+    roles: &crate::resolver::authorization::RoleMap,
+) -> Result<(CapturedInputs, pbps_model::resolver::InputManifest), CaptureError> {
+    let captured = capture_identifying(connection, scope, dropped).await?;
+    let manifest = captured
+        .seal_with_roles(key, Some(roles), None)
+        .map_err(|_| CaptureError::Incomplete)?;
+    Ok((captured, manifest))
+}
+
+/// Qualify recorded ownership while the final coherent read still holds its
+/// private relkind/prokind/dependency facts. The key and Schema/IdsFile are
+/// fixed at this producer entry; the returned capture has no rekey method.
+pub async fn capture_identifying_qualified(
+    connection: &mut impl pbps_db::transport::QueryConnection,
+    scope: &CaptureScope,
+    dropped: &BTreeSet<DroppedSignature>,
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+    roles: Option<&crate::resolver::authorization::RoleMap>,
+    recorded: &RecordedOwnership<'_>,
+) -> Result<(CapturedInputs, pbps_model::resolver::InputManifest), CaptureError> {
+    let captured = capture_identifying(connection, scope, dropped).await?;
+    let ownership = ownership::classify(&captured, recorded).map_err(CaptureError::Coverage)?;
+    let manifest = captured
+        .seal_with_roles(key, roles, Some(&ownership))
+        .map_err(|_| CaptureError::Incomplete)?;
+    Ok((captured, manifest))
+}
+
+/// Fix the key, role map and recorded identity roots at the authorized
+/// scratch read. The private result exposes no raw or rekey operation.
+pub async fn capture_identifying_for_plan(
+    connection: &mut impl pbps_db::transport::QueryConnection,
+    scope: &CaptureScope,
+    dropped: &BTreeSet<DroppedSignature>,
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+    roles: &crate::resolver::authorization::RoleMap,
+    recorded: &RecordedOwnership<'_>,
+) -> Result<CompiledCapture, CaptureError> {
+    let captured = capture_identifying(connection, scope, dropped).await?;
+    let ownership = ownership::classify(&captured, recorded).map_err(CaptureError::Coverage)?;
+    Ok(CompiledCapture::new(captured, key, roles, ownership))
+}
+
 /// Read and seal on behalf of the holder of catalog-read authority. A
 /// previously captured result cannot be fingerprinted under a recipient's
 /// chosen key: that would expose its private properties as a guessing oracle.
@@ -129,8 +197,9 @@ pub async fn capture_sealed(
     dropped: &BTreeSet<DroppedSignature>,
     key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
 ) -> Result<pbps_model::resolver::InputManifest, CaptureError> {
-    let captured = capture_identifying(connection, scope, dropped).await?;
-    captured.seal(key).map_err(|_| CaptureError::Incomplete)
+    capture_identifying_sealed(connection, scope, dropped, key)
+        .await
+        .map(|(_, manifest)| manifest)
 }
 
 /// Give the producer of a fresh coherent database read its native-input
