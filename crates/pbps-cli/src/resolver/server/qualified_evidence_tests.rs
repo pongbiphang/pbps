@@ -3919,14 +3919,34 @@ async fn recorded_renames_and_reused_old_spellings_keep_distinct_owned_inventori
             "closing manifest must retain separate owned table inventories for {name}"
         );
     }
+    // The closing manifest keeps an installed record only where something
+    // names it (DEC-1274.1), so the distinct inventories are those of the
+    // transitions: each column the plan leaves is installed by exactly one.
+    let evidence = serde_json::to_value(&result.evidence).unwrap();
+    let installed: Vec<pbps_db::resolver::capture::ObjectIdentity> = evidence["transitions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|t| t["after"].as_array().unwrap().iter())
+        .map(|object| serde_json::from_value(object.clone()).unwrap())
+        .collect();
     for column in [new.column("n"), new.column("id"), old.column("id")] {
-        assert!(
-            after
-                .prerequisites()
+        let identity = pbps_db::resolver::capture::ObjectIdentity {
+            class: "column".into(),
+            name: vec![column.name.clone()],
+            signature: vec![pbps_db::resolver::capture::ObjectIdentity {
+                class: "pg_class".into(),
+                name: vec![cases::SCHEMA.into(), column.table.name.clone()],
+                signature: vec![],
+            }],
+        };
+        assert_eq!(
+            installed
                 .iter()
-                .any(|row| row.object.class == "column"
-                    && row.ownership == ObjectOwnership::Surface(Surface::Column(column.clone()))),
-            "closing manifest must own a distinct catalog column: {column:?}"
+                .filter(|object| **object == identity)
+                .count(),
+            1,
+            "a distinct transition must install the catalog column {column:?}"
         );
     }
     let closing = after.clone();
@@ -5271,13 +5291,33 @@ async fn unnamed_primary_key_case(new_table: bool) {
         name: vec![cases::SCHEMA.into(), "t".into()],
         signature: Vec::new(),
     };
-    let key_records: Vec<_> = closing
-        .prerequisites()
+    // The closing manifest keeps an installed record only where something
+    // names it (DEC-1274.1). What the key owns is the table transition's
+    // exact inventory: what it installs, less what only rides on it.
+    let evidence = serde_json::to_value(&result.evidence).unwrap();
+    // An empty `references` is not serialized at all.
+    let identities = |value: &serde_json::Value| -> Vec<ObjectIdentity> {
+        value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|object| serde_json::from_value(object.clone()).unwrap())
+            .collect()
+    };
+    let transitions = evidence["transitions"].as_array().unwrap();
+    let table_transition = transitions
         .iter()
-        .filter(|row| {
-            row.object.class == "pg_constraint"
-                && row.object.signature.get(1) == Some(&table_id)
-                && row.ownership == ObjectOwnership::Surface(Surface::Table(table_name.clone()))
+        .find(|t| t["surface"] == serde_json::to_value(Surface::Table(table_name.clone())).unwrap())
+        .expect("the key changes its table");
+    let references = identities(&table_transition["references"]);
+    let exact: Vec<ObjectIdentity> = identities(&table_transition["after"])
+        .into_iter()
+        .filter(|object| !references.contains(object))
+        .collect();
+    let key_records: Vec<_> = exact
+        .iter()
+        .filter(|object| {
+            object.class == "pg_constraint" && object.signature.get(1) == Some(&table_id)
         })
         .collect();
     assert_eq!(
@@ -5285,32 +5325,25 @@ async fn unnamed_primary_key_case(new_table: bool) {
         1,
         "the unnamed PK owns one exact table constraint, without sweeping peers"
     );
+    let installed: Vec<ObjectIdentity> = transitions
+        .iter()
+        .flat_map(|t| identities(&t["after"]))
+        .collect();
     if !new_table {
-        let unrelated = closing
-            .prerequisites()
-            .iter()
-            .find(|row| {
-                row.object.class == "pg_constraint"
-                    && row.object.name == ["unrelated_ck"]
-                    && row.object.signature.get(1) == Some(&table_id)
-            })
-            .expect("the unrelated same-parent CHECK is visible in the capture");
-        assert_eq!(
-            unrelated.ownership,
-            ObjectOwnership::Unqualified,
+        assert!(
+            !installed
+                .iter()
+                .any(|object| object.class == "pg_constraint" && object.name == ["unrelated_ck"]),
             "a same-parent constraint of another kind gains no PK authority"
         );
     }
-    let key_name = &key_records[0].object.name[0];
+    let key_name = &key_records[0].name[0];
     let index_id = ObjectIdentity {
         class: "pg_class".into(),
         name: vec![cases::SCHEMA.into(), key_name.clone()],
         signature: Vec::new(),
     };
-    assert!(closing.prerequisites().iter().any(|row| {
-        row.object == index_id
-            && row.ownership == ObjectOwnership::Surface(Surface::Table(table_name.clone()))
-    }));
+    assert!(exact.contains(&index_id), "the key owns its index");
     let mut peer = pbps_db::Conn::connect(
         Driver::Postgres,
         &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
