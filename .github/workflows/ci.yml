@@ -408,10 +408,12 @@ jobs:
         if: matrix.suite == 'flow-programs'
         env:
           PBPS_TEST_PG_CONTAINER: ${{ job.services.postgres.id }}
+          PBPS_TEST_PG_OLD_CONTAINER: ${{ job.services.postgres-old.id }}
       - run: cargo test -p pbps-cli --test flow_pg -- --ignored --test-threads=1 --skip trigger --skip routine --skip function --skip grant
         if: matrix.suite == 'flow-rest'
         env:
           PBPS_TEST_PG_CONTAINER: ${{ job.services.postgres.id }}
+          PBPS_TEST_PG_OLD_CONTAINER: ${{ job.services.postgres-old.id }}
 
   # `plan --dev docker://<image>` starts a throwaway container of its own, and
   # nothing else reaches that code: every other `--dev` test passes a connection

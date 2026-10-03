@@ -7744,6 +7744,238 @@ fn managed_omission_relations_stay_out_of_unmanaged_policy_with_absent_tables() 
     succeeds(d.run(&["verify", "--db", connection]));
 }
 
+/// A plan approved on 16 and carried to 18 with its database is refused on
+/// 18, before any of its DDL runs (issue #571). 18 reads `json_scalar` as a
+/// keyword: the view keeps its old binding through a dump and restore, but its
+/// canonical text gains quotes, so the restored database no longer matches the
+/// recorded baseline (SPEC §§7.3 and 8.2). Planned again there, the bare
+/// declaration would bind to the SQL/JSON constructor instead, which is why
+/// the refusal matters. A dump and restore rather than `pg_upgrade`: the test
+/// needs the old server's own ledger rows and parsed view on the new server,
+/// and both servers' clients are already in their containers.
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB, PBPS_TEST_PG_OLD_DB, PBPS_TEST_PG_CONTAINER and PBPS_TEST_PG_OLD_CONTAINER"]
+fn a_plan_saved_before_a_grammar_upgrade_is_refused_after_the_transfer() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let old_server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    let old_container =
+        std::env::var("PBPS_TEST_PG_OLD_CONTAINER").expect("PBPS_TEST_PG_OLD_CONTAINER");
+    let new_container = std::env::var("PBPS_TEST_PG_CONTAINER").expect("PBPS_TEST_PG_CONTAINER");
+    let new_server = server();
+    on_server(
+        &old_server,
+        "DO $$ BEGIN IF current_setting('server_version_num')::integer >= 170000 THEN RAISE EXCEPTION 'needs pre-17'; END IF; END $$",
+    );
+    on_server(
+        &new_server,
+        "DO $$ BEGIN IF current_setting('server_version_num')::integer < 170000 THEN RAISE EXCEPTION 'needs 17+'; END IF; END $$",
+    );
+    let old = OwnDatabase::new(&old_server, "grammar_upgrade");
+    let new = OwnDatabase::new(&new_server, "grammar_upgrade");
+    on_server(old.connection(), "CREATE SCHEMA app");
+    let d = Demo::new("grammar-upgrade");
+    std::fs::write(
+        d.dir.join("schema/scalar-bigint.yml"),
+        "function: app.json_scalar(bigint)\n\
+         definition: (n bigint) RETURNS integer LANGUAGE sql AS $$ SELECT 42 $$\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/v.yml"),
+        "view: app.v\ndefinition: SELECT json_scalar(7) AS value\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", old.connection()]));
+    succeeds(d.run(&["verify", "--db", old.connection()]));
+    let value = "SELECT value::bigint FROM app.v";
+    assert_eq!(scalar(old.connection(), value), 42);
+
+    // The arriving overload is the only edit; the view's rebuild is the one
+    // the planner adds for an unchanged caller (DECISIONS 420).
+    std::fs::write(
+        d.dir.join("schema/scalar-integer.yml"),
+        "function: app.json_scalar(integer)\n\
+         definition: (n integer) RETURNS integer LANGUAGE sql AS $$ SELECT 99 $$\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        old.connection(),
+        "--out",
+        plan.to_str().unwrap(),
+    ]));
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+    let modules: Vec<_> = saved
+        .changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let pbps_model::Change::CreateModule { id, .. } = &p.change {
+                Some(format!("create {id}"))
+            } else if let pbps_model::Change::AlterModule { id, .. } = &p.change {
+                Some(format!("alter {id}"))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(modules, ["create app.json_scalar(integer)", "alter app.v"]);
+    succeeds(d.run(&["verify", "--db", old.connection()]));
+    // No staged artifact can carry the rebuild at all.
+    let staged = d.run(&["plan", "--db", old.connection(), "--staged"]);
+    assert_eq!(code(&staged), 1, "{}{}", stdout(&staged), stderr(&staged));
+    assert!(
+        stderr(&staged).contains("require a transaction"),
+        "{}",
+        stderr(&staged)
+    );
+
+    // Schema, ledger, ownership and ACLs, as the old server's own client
+    // writes them; nothing is recorded again on the new server.
+    let dump = Command::new("docker")
+        .args([
+            "exec",
+            &old_container,
+            "pg_dump",
+            "-U",
+            "postgres",
+            "-d",
+            &old.name,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        dump.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dump.stderr)
+    );
+    let mut restore = Command::new("docker")
+        .args([
+            "exec",
+            "-i",
+            &new_container,
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            &new.name,
+        ])
+        .args(["-X", "-q", "--set=ON_ERROR_STOP=1"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    restore
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&dump.stdout)
+        .unwrap();
+    let restored = restore.wait_with_output().unwrap();
+    assert!(
+        restored.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    let definition = "SELECT pg_get_viewdef('app.v'::regclass)";
+    assert_eq!(
+        text_of(new.connection(), definition),
+        " SELECT app.\"json_scalar\"((7)::bigint) AS value;"
+    );
+    let unchanged = || {
+        assert_eq!(
+            scalar(new.connection(), value),
+            42,
+            "the old binding was lost"
+        );
+        assert_eq!(
+            scalar(
+                new.connection(),
+                "SELECT count(*) FROM pg_proc WHERE proname = 'json_scalar' \
+                 AND pronamespace = 'app'::regnamespace"
+            ),
+            1,
+            "the arriving overload was created"
+        );
+    };
+    unchanged();
+
+    // The only difference is the view's restated text.
+    let drift = |o: Output| {
+        assert_eq!(code(&o), 2, "{}{}", stdout(&o), stderr(&o));
+        let report = json_output(o);
+        let changes = report["data"]["changes"]["changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 1, "{report}");
+        assert_eq!(changes[0]["op"], "alter_module", "{report}");
+        assert_eq!(changes[0]["id"], "app.v", "{report}");
+        report["data"]["live_checksum"].clone()
+    };
+    let before = drift(d.run(&["verify", "--db", new.connection(), "--format", "json"]));
+
+    let refused = approved_apply(&d, new.connection(), &plan, &[]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("is no longer the database this plan was computed against"),
+        "{}",
+        stderr(&refused)
+    );
+    unchanged();
+    let refused = approved_apply(&d, new.connection(), &plan, &["--staged"]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("is a transactional plan and `--staged` was given"),
+        "{}",
+        stderr(&refused)
+    );
+    unchanged();
+    let after = drift(d.run(&["verify", "--db", new.connection(), "--format", "json"]));
+    assert_eq!(before, after, "a refused apply changed the schema");
+
+    // The same artifact still applies where it was planned, so the refusal
+    // above is the transfer's and not the artifact's.
+    succeeds(approved_apply(&d, old.connection(), &plan, &[]));
+    assert_eq!(scalar(old.connection(), value), 99);
+
+    // And what the bare declaration means on 18.
+    let fresh = OwnDatabase::new(&new_server, "grammar_fresh");
+    on_server(
+        fresh.connection(),
+        "CREATE SCHEMA app; \
+         CREATE FUNCTION app.json_scalar(bigint) RETURNS integer LANGUAGE sql AS 'SELECT 42'; \
+         SET search_path = app; \
+         CREATE VIEW app.v AS SELECT json_scalar(7) AS value",
+    );
+    assert_eq!(
+        text_of(
+            fresh.connection(),
+            "SELECT pg_typeof(value)::text || ' ' || value::text FROM app.v"
+        ),
+        "json 7"
+    );
+}
+
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn unrelated_routine_limitations_do_not_refuse_a_managed_table_or_overload() {

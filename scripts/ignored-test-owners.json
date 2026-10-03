@@ -1130,6 +1130,7 @@
         "a_new_tables_expressions_calling_a_rebuilt_function_follow_it",
         "a_newly_declared_name_the_database_already_uses_is_refused_before_the_plan",
         "a_plan_pinned_under_one_key_is_refused_under_another",
+        "a_plan_saved_before_a_grammar_upgrade_is_refused_after_the_transfer",
         "a_plan_that_must_pin_a_routine_is_refused_without_a_key_and_names_the_remedy",
         "a_reached_table_the_deployment_role_cannot_lock_is_named_in_the_refusal",
         "a_referenced_key_replacement_applies_and_the_next_plan_is_empty",
