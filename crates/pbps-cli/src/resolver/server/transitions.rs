@@ -181,6 +181,21 @@ fn opening_endpoint(
     }
 }
 
+/// The opening spelling of a table a step names: a drop ordered after its
+/// table's rename names the new spelling, while the opening capture owns
+/// the dropped child under the old one. The recorded UID maps between them.
+fn opening_table(
+    tables: &BTreeMap<pbps_model::TableName, pbps_model::Uid>,
+    base: pbps_diff::Side<'_>,
+    table: &pbps_model::TableName,
+) -> pbps_model::TableName {
+    tables
+        .get(table)
+        .and_then(|uid| base.ids.tables.get(uid))
+        .cloned()
+        .unwrap_or_else(|| table.clone())
+}
+
 fn declared(schema: &Schema, surface: &Surface) -> bool {
     match surface {
         Surface::Namespace(_) => true,
@@ -454,13 +469,19 @@ pub(super) fn derive(
                 true,
                 None,
             ),
-            Change::DropCheck { table, name } => {
-                let surface = Surface::Check {
+            Change::DropCheck { table, name } => (
+                Surface::Check {
                     table: table.clone(),
                     name: name.clone(),
-                };
-                (surface.clone(), false, true, false, Some(surface))
-            }
+                },
+                false,
+                true,
+                false,
+                Some(Surface::Check {
+                    table: opening_table(&tables, base, table),
+                    name: name.clone(),
+                }),
+            ),
             Change::AddIndex { table, name, .. } => (
                 Surface::Index {
                     table: table.clone(),
@@ -471,13 +492,19 @@ pub(super) fn derive(
                 true,
                 None,
             ),
-            Change::DropIndex { table, name } => {
-                let surface = Surface::Index {
+            Change::DropIndex { table, name } => (
+                Surface::Index {
                     table: table.clone(),
                     name: name.clone(),
-                };
-                (surface.clone(), false, true, false, Some(surface))
-            }
+                },
+                false,
+                true,
+                false,
+                Some(Surface::Index {
+                    table: opening_table(&tables, base, table),
+                    name: name.clone(),
+                }),
+            ),
             Change::CreateModule { id, .. } => {
                 (Surface::Module(id.clone()), false, false, true, None)
             }
