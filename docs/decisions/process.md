@@ -789,3 +789,25 @@ confirmed merge-group interaction still follows Decision 502's rebase path;
 ordinary cleanup and movement of `master` do not. Validation uses the retained
 failure/recovery sequence and a real successfully enumerated empty-dependent
 closeout, not throwaway production PRs.
+
+<a id="dec-1262-1"></a>
+
+**DEC-1262.1. Module-annotation controls separate versioned execution from
+unconditional owner refusal.** Python 3.14 defers annotation evaluation
+([Python's porting guidance](https://docs.python.org/3.14/whatsnew/3.14.html#pep-649-and-pep-749-deferred-evaluation-of-annotations)).
+The original `annotation: TESTS; __annotations__["annotation"].clear()`
+program clears the selector on earlier versions, but bare-name access raises
+NameError on 3.14+. Retain that exact source with its explicit versioned runtime
+oracle; an execution error must never count as successful selector mutation.
+Accessing the running module object's `__annotations__` attribute forces
+evaluation and retains actual mutation evidence on both 3.12 and 3.14.
+
+Both complete owner sources must be refused on every interpreter at the
+annotation's protected list read, independently of their runtime outcome.
+Disabling only the `list_reads` rule admits each owner, pinning the shared
+closed-form restriction without reviving an annotation effect interpreter.
+The portable mutation control is unconditional; the compatibility branch
+applies only to the original bare-name runtime oracle. These actual-Python
+controls resolve the execution question left separate by DEC-1428.1 and retain
+DEC-1413.1's maintenance-lint boundary. See [test execution](../TEST-EXECUTION.md).
+
