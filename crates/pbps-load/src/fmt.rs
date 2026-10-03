@@ -280,6 +280,10 @@ pub fn render(
             let _ = writeln!(s, "\nreplica_identity: {{index: {}}}", scalar(n));
         }
     }
+    // Only where it is not the default (#1443).
+    if table.unlogged {
+        s.push_str("\nunlogged: true\n");
+    }
     // One parameter a line, by name, each in its canonical spelling, bare:
     // every canonical value is a plain token (`true`, `70`, `0.05`, `auto`),
     // and quoted it would read as text, which is the same value but not
@@ -1075,6 +1079,25 @@ indexes:
         // Negative: neither a list nor a mapping.
         let wrong = "table: public.t\ncolumns:\n  n: {type: int}\nunique:\n  uq: n\n";
         assert!(crate::load_table_str(Path::new("t.yml"), wrong).is_err());
+    }
+
+    /// `unlogged: true` reads back and renders again; the default, a
+    /// permanent table, writes nothing (#1443).
+    #[test]
+    fn an_unlogged_table_round_trips_and_permanence_writes_nothing() {
+        let yaml = "table: public.t\ncolumns:\n  id: {type: int}\n\nunlogged: true\n";
+        let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
+        assert!(t.table.unlogged);
+        let out = render(&t.name, &t.table, &t.intents, None);
+        assert!(out.contains("\nunlogged: true\n"), "{out}");
+        round_trip(&out);
+        let plain = crate::load_table_str(
+            Path::new("t.yml"),
+            "table: public.t\ncolumns:\n  id: {type: int}\n",
+        )
+        .unwrap();
+        assert!(!plain.table.unlogged);
+        assert!(!render(&plain.name, &plain.table, &plain.intents, None).contains("unlogged"));
     }
 
     /// A misspelt identity is an error, not the default: read as absent,

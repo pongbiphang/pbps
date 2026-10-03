@@ -90,6 +90,9 @@ pub struct RawTable {
     /// The TOAST relation's `reloptions`: a `toast.*` parameter, which the
     /// model does not declare (#1441).
     pub toast_reloptions: Vec<String>,
+    /// `relpersistence = 'u'`: an unlogged table (#1443). A temporary one is
+    /// never here; it stays a limitation.
+    pub unlogged: bool,
 }
 
 /// One module, with the text this engine deparses for it.
@@ -796,6 +799,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             );
         let (parameters, unread) = storage_parameters(raw_table);
         table.storage_parameters = parameters;
+        table.unlogged = raw_table.unlogged;
         for detail in unread {
             note(&mut pulled, &name, detail);
         }
@@ -3119,6 +3123,7 @@ mod tests {
                 identity_index: None,
                 reloptions: Vec::new(),
                 toast_reloptions: Vec::new(),
+                unlogged: false,
             }],
             modules: vec![
                 RawModule {
@@ -4064,6 +4069,7 @@ mod tests {
                 identity_index: None,
                 reloptions: Vec::new(),
                 toast_reloptions: Vec::new(),
+                unlogged: false,
             }],
             grants: vec![grant(
                 Some("app_reader"),
@@ -4381,6 +4387,7 @@ mod tests {
             identity_index: None,
             reloptions: Vec::new(),
             toast_reloptions: Vec::new(),
+            unlogged: false,
         }
     }
 
@@ -4878,6 +4885,22 @@ mod tests {
             "{:?}",
             pulled.warnings
         );
+    }
+
+    /// An unlogged table is pulled as one (#1443).
+    #[test]
+    fn an_unlogged_table_is_read_as_unlogged() {
+        for unlogged in [true, false] {
+            let mut t = table(1, "t");
+            t.unlogged = unlogged;
+            let pulled = assemble(&RawCatalog {
+                tables: vec![t],
+                columns: vec![col(1, 1, "a", "integer")],
+                ..RawCatalog::default()
+            });
+            assert!(pulled.limitations.is_empty(), "{:?}", pulled.warnings);
+            assert_eq!(only(&pulled).unlogged, unlogged);
+        }
     }
 
     #[test]

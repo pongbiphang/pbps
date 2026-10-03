@@ -949,6 +949,7 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
             | change @ pbps_model::Change::SetColumnDeprecated { .. }
             | change @ pbps_model::Change::SetPrimaryKey { .. }
             | change @ pbps_model::Change::SetIndexStorageParameters { .. }
+            | change @ pbps_model::Change::SetTablePersistence { .. }
             | change @ pbps_model::Change::SetStorageParameters { .. }
             | change @ pbps_model::Change::SetReplicaIdentity { .. }
             | change @ pbps_model::Change::AddUnique { .. }
@@ -6262,6 +6263,60 @@ fn a_generated_columns_expression_change_is_refused_by_name_before_postgres_17()
     generated_column_flow(&server, "generated-1168-old", false);
 }
 
+/// An unlogged table goes the whole way through the CLI (#1443): pulled as
+/// one, switched to logged without a risk to approve, and back to unlogged
+/// only with `--allow destructive`, since a crash would then empty it; each
+/// verifies, and the next plan is empty.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn an_unlogged_table_switches_through_the_cli_behind_its_risk() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "unlogged-1443");
+    let connection = own.connection().to_owned();
+    on_server(
+        &connection,
+        "CREATE SCHEMA app; \
+         CREATE UNLOGGED TABLE app.t (id integer PRIMARY KEY); \
+         INSERT INTO app.t VALUES (1)",
+    );
+    let d = Demo::new("unlogged-1443");
+    succeeds(d.run(&["pull", "--db", &connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    let path = d.dir.join("schema/app.t.yml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("\nunlogged: true\n"), "{text}");
+    let switch = |unlogged: bool, allow: &[&str]| {
+        let text = std::fs::read_to_string(&path).unwrap();
+        let next = if unlogged {
+            format!("{text}\nunlogged: true\n")
+        } else {
+            text.replace("\nunlogged: true\n", "")
+        };
+        assert_ne!(next, text);
+        std::fs::write(&path, next).unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let plan = d.dir.join("plan.json");
+        succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+        if !allow.is_empty() {
+            let refused = approved_apply(&d, &connection, &plan, &[]);
+            assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+            assert!(
+                stderr(&refused).contains("destructive"),
+                "{}",
+                stderr(&refused)
+            );
+        }
+        succeeds(approved_apply(&d, &connection, &plan, allow));
+        succeeds(d.run(&["verify", "--db", &connection]));
+        let next = succeeds(d.run(&["plan", "--db", &connection]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    };
+    switch(false, &[]);
+    switch(true, &["--allow", "destructive"]);
+}
+
 /// Index storage parameters go the whole way through the CLI (#1442):
 /// pulled with the index, changed in place by one `ALTER INDEX` that
 /// applies and verifies, after which the next plan is empty.
@@ -8224,15 +8279,16 @@ fn unrelated_routine_limitations_do_not_refuse_a_managed_table_or_overload() {
     succeeds(d.run(&["verify", "--db", connection]));
 
     // A real table limitation must still refuse the same managed scope.
-    on_server(connection, "ALTER TABLE app.t SET UNLOGGED");
+    // Row-level security is one; an unlogged table was until #1443 held it.
+    on_server(connection, "ALTER TABLE app.t ENABLE ROW LEVEL SECURITY");
     let refused = d.run(&["plan", "--db", connection]);
     assert_ne!(code(&refused), 0);
     assert!(
-        stderr(&refused).contains("UNLOGGED"),
+        stderr(&refused).contains("row-level security"),
         "{}",
         stderr(&refused)
     );
-    on_server(connection, "ALTER TABLE app.t SET LOGGED");
+    on_server(connection, "ALTER TABLE app.t DISABLE ROW LEVEL SECURITY");
 
     // The exact managed signature becoming unsupported is also a limitation.
     on_server(

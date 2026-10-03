@@ -1995,3 +1995,54 @@ Tests: `an_index_takes_its_own_methods_parameters`,
 (`crates/pbps-cli`); the live
 `index_storage_parameters_round_trip_and_change_in_place` (on 16 and 18) and
 `index_storage_parameters_change_in_place_through_the_cli`.
+
+<a id="dec-1443-1"></a>
+
+**DEC-1443.1. A PostgreSQL table declares `unlogged: true`, and a switch
+between permanent and unlogged is one risk-classified change ordered by the
+foreign keys between the tables it switches (#1443).**
+
+Measured on 16.15 and 18.6, alike:
+
+- `CREATE UNLOGGED TABLE` makes the table, its indexes and the sequence behind
+  an identity or `serial` column unlogged; a switch carries the sequence too.
+- `ALTER TABLE … SET LOGGED` and `SET UNLOGGED` rewrite the table and its
+  indexes (a new `relfilenode`) under `AccessExclusiveLock`, either way.
+- A permanent table may not reference an unlogged one; an unlogged one may
+  reference a permanent one, and a self-reference is fine. So, switched
+  together, the referencing table goes unlogged first and the referenced one
+  logged first; the other way round is refused (`could not change table "pa"
+  to unlogged because it references logged table "ch"`).
+
+**Model.** `Table::unlogged`, `false` for a permanent table. A permanent table
+declaring a foreign key to an unlogged one is refused by name
+(`DiffError::PermanentReferencesUnlogged`). SQL Server refuses the key.
+
+**Plan.** A created table is `CREATE UNLOGGED TABLE`. A switch is one
+`SetTablePersistence`, `ALTER TABLE … SET LOGGED/UNLOGGED`, in class 9: after
+the foreign-key drops of class 2 and before the adds of 13, so only the keys
+that stand are checked. Inside the class it is ordered by each table's depth
+in the declared foreign-key graph, ascending to logged and descending to
+unlogged. Its estimate is a rewrite that reads every row under
+`AccessExclusiveLock`.
+
+**Risk.** To unlogged is `destructive`: from then on a crash or an unclean
+shutdown empties the table, and a standby never has its rows. To logged
+carries none.
+
+**Read.** `relpersistence = 'u'` is held; a temporary table stays a
+limitation, and the ledger's own tables stay refused when unlogged (#836).
+
+**Drift.** A touched table's persistence is held to the before-read unless the
+plan switches it, and then to the plan's value once the run is whole, by uid;
+a created table to its `CREATE`.
+
+Tests: `an_unlogged_table_round_trips_and_permanence_writes_nothing`
+(`crates/pbps-load`); `persistence_switches_follow_the_foreign_keys`
+(`crates/pbps-diff`); `persistence_is_created_and_switched`,
+`a_persistence_switch_is_a_rewrite_under_access_exclusive`,
+`an_unlogged_table_is_read_as_unlogged` (`crates/pbps-pg`);
+`storage_parameters_are_refused_on_sql_server` (`crates/pbps-mssql`);
+`a_persistence_switch_by_someone_else_is_movement` (`crates/pbps-cli`); the
+live `unlogged_tables_round_trip_and_switch_in_foreign_key_order` (on 16 and
+18) and `an_unlogged_table_switches_through_the_cli_behind_its_risk`.

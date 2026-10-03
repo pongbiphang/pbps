@@ -2331,6 +2331,18 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         Change::SetReplicaIdentity { table, to, .. } => {
             one(pg, table, set_replica_identity(table, to.as_ref())?)
         }
+        // Rewrites the table and its indexes, in either direction (#1443).
+        Change::SetTablePersistence {
+            table, unlogged, ..
+        } => one(
+            pg,
+            table,
+            format!(
+                "ALTER TABLE {} SET {};",
+                qualified(table)?,
+                if *unlogged { "UNLOGGED" } else { "LOGGED" }
+            ),
+        ),
         Change::SetIndexStorageParameters {
             table,
             target,
@@ -2863,7 +2875,10 @@ fn create_table(pg: &Postgres, name: &TableName, table: &Table) -> Sql {
         pg,
         name,
         &format!(
-            "CREATE TABLE {q} (\n    {}\n) USING heap{};",
+            "CREATE {}TABLE {q} (\n    {}\n) USING heap{};",
+            // Unlogged from its creation, so it is never written to the log
+            // and switched after (#1443).
+            if table.unlogged { "UNLOGGED " } else { "" },
             body.join(",\n    "),
             // In the `CREATE`, so the table never exists without them (#1441).
             if table.storage_parameters.is_empty() {
@@ -3820,6 +3835,46 @@ mod tests {
             pk.contains("DO $pbps$") && pk.contains("k.contype = 'p'"),
             "{pk}"
         );
+    }
+
+    /// An unlogged table is created so, and a switch is one `ALTER TABLE …
+    /// SET LOGGED/UNLOGGED` (#1443).
+    #[test]
+    fn persistence_is_created_and_switched() {
+        let pg = Postgres::new();
+        let table = name("app", "t");
+        let mut created = Table::default();
+        created
+            .columns
+            .insert("id".into(), Column::new(ty("integer")).not_null());
+        created.unlogged = true;
+        let create = sql_of(
+            &pg,
+            &Change::CreateTable {
+                uid: "t_000000".parse().unwrap(),
+                name: table.clone(),
+                table: Box::new(created),
+            },
+        );
+        assert!(
+            create[0].contains("CREATE UNLOGGED TABLE \"app\".\"t\""),
+            "{create:?}"
+        );
+        for (unlogged, word) in [(true, "UNLOGGED"), (false, "LOGGED")] {
+            let sql = sql_of(
+                &pg,
+                &Change::SetTablePersistence {
+                    uid: "t_000000".parse().unwrap(),
+                    table: table.clone(),
+                    unlogged,
+                },
+            )
+            .join("\n");
+            assert!(
+                sql.contains(&format!("ALTER TABLE \"app\".\"t\" SET {word};")),
+                "{sql}"
+            );
+        }
     }
 
     /// Storage parameters are one `ALTER TABLE` with `SET` and `RESET`, each

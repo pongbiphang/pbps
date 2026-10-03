@@ -80,6 +80,9 @@ use crate::schema::Schema;
 /// PostgreSQL storage parameters (DEC-1442.1). Versions 6 to 15 stay
 /// readable.
 ///
+/// Bumped to 17 when a table gained its PostgreSQL persistence (DEC-1443.1).
+/// Versions 6 to 16 stay readable.
+///
 /// Readers refuse a version they do not understand rather than reading it
 /// partially.
 ///
@@ -98,7 +101,7 @@ use crate::schema::Schema;
 /// order, which can drop a schema-bound dependency before its dependent.
 /// Refused, with the remedy `check_version` already names: re-record it with
 /// `pbps baseline --reason ...`.
-pub const CURRENT_VERSION: u32 = 16;
+pub const CURRENT_VERSION: u32 = 17;
 
 /// The oldest snapshot version this build reads as its own.
 ///
@@ -160,6 +163,11 @@ pub const CURRENT_VERSION: u32 = 16;
 /// Still 6 at version 16, whose index storage parameters an older state
 /// lacks (DEC-1442.2), for the same reason and with the same remedy: an
 /// older reader did not read an index's `reloptions` either.
+///
+/// Still 6 at version 17, whose table persistence an older state lacks
+/// (DEC-1443.2): an older reader left every unlogged table out as a
+/// limitation, so every recorded table was permanent, which is what an
+/// absent `unlogged` reads as.
 pub const OLDEST_READABLE_VERSION: u32 = 6;
 
 /// How this state came about.
@@ -562,7 +570,7 @@ mod tests {
         // the whole story rather than a sample of it; 6 is readable because
         // the field 7 added is one it truly lacks.
         assert_eq!(OLDEST_READABLE_VERSION, 6);
-        assert_eq!(CURRENT_VERSION, 16);
+        assert_eq!(CURRENT_VERSION, 17);
     }
 
     fn schema_with(ty: &str) -> Schema {

@@ -347,6 +347,11 @@ pub struct TableDto {
     #[schemars(with = "BTreeMap<String, StorageValueDto>")]
     pub storage_parameters: BTreeMap<String, Spanned<StorageValueDto>>,
 
+    /// A PostgreSQL `UNLOGGED` table: `true` skips the write-ahead log, so a
+    /// crash empties it. Absent, or `false`, is a permanent table.
+    #[serde(default)]
+    pub unlogged: bool,
+
     /// Declared reference data (ADR-0004). Absent on almost every table: it is
     /// the opt-in that lets the tool touch rows at all.
     #[serde(default)]

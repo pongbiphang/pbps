@@ -1255,7 +1255,8 @@
         "what_calls_a_new_function_follows_its_create",
         "a_replica_identity_moves_to_a_new_index_through_the_cli",
         "storage_parameters_change_through_the_cli",
-        "index_storage_parameters_change_in_place_through_the_cli"
+        "index_storage_parameters_change_in_place_through_the_cli",
+        "an_unlogged_table_switches_through_the_cli_behind_its_risk"
       ]
     },
     {
@@ -1965,6 +1966,7 @@
         "two_overloads_of_one_name_are_two_objects_and_each_drop_names_one",
         "two_pipelines_creating_the_ledger_at_once_both_find_it_there",
         "two_real_ledger_tables_still_pass_the_relkind_confirmation",
+        "unlogged_tables_round_trip_and_switch_in_foreign_key_order",
         "views_with_nondefault_options_are_named_and_default_options_stay_plain",
         "what_the_model_cannot_hold_is_named_and_never_silently_dropped"
       ]

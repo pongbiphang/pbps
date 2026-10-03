@@ -92,6 +92,20 @@ pub enum DiffError {
     )]
     DataWithoutKey { table: TableName },
 
+    /// A permanent table whose foreign key references an unlogged one, which
+    /// PostgreSQL refuses (`constraints on permanent tables may reference only
+    /// permanent tables`, measured on 16 and 18, #1443).
+    #[error(
+        "{table}: its foreign key `{key}` references {target}, which is unlogged, and \
+         PostgreSQL lets only an unlogged table reference an unlogged one. Make {table} \
+         unlogged too, or {target} permanent."
+    )]
+    PermanentReferencesUnlogged {
+        table: TableName,
+        key: String,
+        target: TableName,
+    },
+
     /// A `data:` table whose primary key moved to a different column. The row
     /// keys on each side are values of that side's key column, so the two sets
     /// have nothing in common and matching them by text would update and
@@ -324,6 +338,25 @@ fn diff_partial_rebuilding(
     // Table present on both sides: possibly renamed, and its contents must be
     // compared.
     let renames = renames_of(base, declared);
+    for (name, table) in &declared.schema.tables {
+        if table.unlogged {
+            continue;
+        }
+        for (key, fk) in &table.foreign_keys {
+            if declared
+                .schema
+                .tables
+                .get(&fk.references_table)
+                .is_some_and(|t| t.unlogged)
+            {
+                errs.push(DiffError::PermanentReferencesUnlogged {
+                    table: name.clone(),
+                    key: key.clone(),
+                    target: fk.references_table.clone(),
+                });
+            }
+        }
+    }
     for (uid, declared_name) in declared_tables {
         let Some(base_name) = base_tables.get(uid) else {
             continue;
@@ -374,6 +407,13 @@ fn diff_partial_rebuilding(
         );
         diff_computed(declared_name, base_table, declared_table, &mut changes);
         diff_storage_parameters(uid, declared_name, base_table, declared_table, &mut changes);
+        if base_table.unlogged != declared_table.unlogged {
+            changes.push(Change::SetTablePersistence {
+                uid: uid.clone(),
+                table: declared_name.clone(),
+                unlogged: declared_table.unlogged,
+            });
+        }
         // Rows are compared by column *name* on each side, and a rename in
         // this same plan means the two sides know one column by two names.
         // The uid is what says they are the same column.
@@ -434,6 +474,7 @@ fn diff_partial_rebuilding(
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
+            | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -479,6 +520,7 @@ fn diff_partial_rebuilding(
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
+            | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -628,6 +670,7 @@ fn diff_partial_rebuilding(
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
+            | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -675,6 +718,7 @@ fn diff_partial_rebuilding(
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
+            | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -851,7 +895,62 @@ fn diff_partial_rebuilding(
     // (`order_computed_by_edges`, DEC-1431.1). An offline plan is never
     // applied, and a text scan here took one function for another (#1174
     // review), so the differ moves nothing for it.
+    // How deep each declared table sits in the foreign-key graph: 0 for one
+    // that references no other, else one more than the deepest it does.
+    // Switched to logged, the referenced table goes first, so by depth;
+    // switched to unlogged, the referencing one, so by depth reversed: the
+    // engine refuses either the other way round (measured on 16 and 18,
+    // #1443). Self-references do not count, and a cycle stops at its first
+    // repeat.
+    let depth_of = {
+        fn depth(
+            t: &TableName,
+            schema: &Schema,
+            seen: &mut Vec<TableName>,
+            memo: &mut BTreeMap<TableName, usize>,
+        ) -> usize {
+            if let Some(d) = memo.get(t) {
+                return *d;
+            }
+            if seen.contains(t) {
+                return 0;
+            }
+            seen.push(t.clone());
+            let d = schema.tables.get(t).map_or(0, |table| {
+                table
+                    .foreign_keys
+                    .values()
+                    .filter(|fk| fk.references_table != *t)
+                    .map(|fk| 1 + depth(&fk.references_table, schema, seen, memo))
+                    .max()
+                    .unwrap_or(0)
+            });
+            seen.pop();
+            memo.insert(t.clone(), d);
+            d
+        }
+        let mut memo = BTreeMap::new();
+        let mut depths = BTreeMap::new();
+        for t in declared.schema.tables.keys() {
+            depths.insert(
+                t.clone(),
+                depth(t, declared.schema, &mut Vec::new(), &mut memo),
+            );
+        }
+        depths
+    };
+    let deepest = depth_of.values().copied().max().unwrap_or(0);
     let sort_class = |c: &Change| -> (u8, usize) {
+        if let Change::SetTablePersistence {
+            table, unlogged, ..
+        } = c
+        {
+            let depth = depth_of.get(table).copied().unwrap_or(0);
+            return (
+                COLUMN_ALTERATIONS,
+                10 + if *unlogged { deepest - depth } else { depth },
+            );
+        }
         // A replica identity whose target stands before the plan is set
         // first, under the table's old name: before the drops of class 2 can
         // take its old index, which would leave the table identifying no row
@@ -1272,6 +1371,7 @@ fn recreate_referenced_foreign_keys(
             | Change::Revoke { .. }
             | Change::PublicExecution { .. }
             | Change::SetIndexStorageParameters { .. }
+            | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. } => continue,
         };
@@ -1535,6 +1635,7 @@ fn recreate_retyped_dependents(
         | Change::SetColumnDeprecated { .. }
         | Change::SetPrimaryKey { .. }
         | Change::SetIndexStorageParameters { .. }
+        | Change::SetTablePersistence { .. }
         | Change::SetStorageParameters { .. }
         | Change::SetReplicaIdentity { .. }
         | Change::AddUnique { .. }
@@ -1817,6 +1918,7 @@ fn refuse_computed_dependencies(
                     | Change::SetColumnDeprecated { .. }
                     | Change::SetPrimaryKey { .. }
                     | Change::SetIndexStorageParameters { .. }
+                    | Change::SetTablePersistence { .. }
                     | Change::SetStorageParameters { .. }
                     | Change::SetReplicaIdentity { .. }
                     | Change::AddUnique { .. }
@@ -2704,6 +2806,7 @@ fn dependency_rank(
         | Change::RenameColumn { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::SetIndexStorageParameters { .. }
+        | Change::SetTablePersistence { .. }
         | Change::SetStorageParameters { .. }
         | Change::DropUnique { .. }
         | Change::AddCheck { .. }
@@ -3337,6 +3440,9 @@ fn order_key(c: &Change) -> u8 {
         // Metadata too: no statement reads a storage parameter, and it runs
         // under the table's final name (DEC-1441.1).
         Change::SetStorageParameters { .. } => 10,
+        // After the foreign-key drops of class 2 and before the adds of 13:
+        // the engine checks the keys that stand when it switches (#1443).
+        Change::SetTablePersistence { .. } => COLUMN_ALTERATIONS,
         // In place too, and nothing reads one (DEC-1442.1).
         Change::SetIndexStorageParameters { .. } => 10,
         // Rows arrive once every column they name exists and has its final
@@ -4191,6 +4297,90 @@ mod tests {
         );
         // Negative: the same parameters plan nothing.
         assert!(run(&base, &base, &[]).changes.is_empty());
+    }
+
+    /// A persistence switch is one change, `destructive` to unlogged and
+    /// unclassed back; switched together, linked tables go in the order the
+    /// engine takes (to unlogged, referencing first; to logged, referenced
+    /// first), and a permanent table referencing an unlogged one is refused
+    /// (measured on 16 and 18, #1443).
+    #[test]
+    fn persistence_switches_follow_the_foreign_keys() {
+        let pair = |unlogged: bool| {
+            let mut s = Schema::default();
+            let mut parent = table(&[("id", Column::new(ty("int")).not_null())]);
+            parent.primary_key = Some(PrimaryKey {
+                name: Some("pa_pkey".into()),
+                columns: vec!["id".into()],
+                storage_parameters: Default::default(),
+            });
+            parent.unlogged = unlogged;
+            let mut child = table(&[("pa", Column::new(ty("int")))]);
+            child.foreign_keys.insert(
+                "ch_pa".into(),
+                pbps_model::ForeignKey {
+                    columns: vec!["pa".into()],
+                    references_table: "public.pa".parse().unwrap(),
+                    references_columns: vec!["id".into()],
+                    on_delete: Default::default(),
+                    on_update: Default::default(),
+                },
+            );
+            child.unlogged = unlogged;
+            s.tables.insert("public.pa".parse().unwrap(), parent);
+            s.tables.insert("public.ch".parse().unwrap(), child);
+            s
+        };
+        let order = |from: bool, to: bool| -> Vec<String> {
+            run(&pair(from), &pair(to), &[])
+                .changes
+                .iter()
+                .map(|p| match &p.change {
+                    Change::SetTablePersistence {
+                        table, unlogged, ..
+                    } => format!("{table} {unlogged}"),
+                    other => format!("{other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(order(false, true), ["public.ch true", "public.pa true"]);
+        assert_eq!(order(true, false), ["public.pa false", "public.ch false"]);
+        let cs = run(&pair(false), &pair(true), &[]);
+        assert!(
+            cs.changes[0]
+                .risks
+                .contains(&pbps_model::RiskClass::Destructive)
+        );
+        let cs = run(&pair(true), &pair(false), &[]);
+        assert!(cs.changes[0].risks.is_empty(), "{:?}", cs.changes[0].risks);
+        // Negative: a permanent child of an unlogged parent is refused.
+        let mut mixed = pair(false);
+        mixed
+            .tables
+            .get_mut(&"public.pa".parse::<TableName>().unwrap())
+            .unwrap()
+            .unlogged = true;
+        let base_ids = crate::resolve(&pair(false), &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let ids = crate::resolve(&mixed, &base_ids, &[], &ctx()).unwrap().ids;
+        let errors = diff_partial(
+            Side {
+                schema: &pair(false),
+                ids: &base_ids,
+            },
+            Side {
+                schema: &mixed,
+                ids: &ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .errors;
+        assert!(
+            errors.iter().any(|e| matches!(e, DiffError::PermanentReferencesUnlogged { key, .. } if key == "ch_pa")),
+            "{errors:?}"
+        );
     }
 
     /// One change per table, setting what differs and resetting what the

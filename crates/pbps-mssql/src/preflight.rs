@@ -359,6 +359,7 @@ impl AsStored {
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
                 | Change::SetIndexStorageParameters { .. }
+                | Change::SetTablePersistence { .. }
                 | Change::SetStorageParameters { .. }
                 | Change::SetReplicaIdentity { .. }
                 | Change::AddUnique { .. }
@@ -593,6 +594,7 @@ impl AsStored {
                 | Change::Grant { .. }
                 | Change::Revoke { .. }
                 | Change::SetIndexStorageParameters { .. }
+                | Change::SetTablePersistence { .. }
                 | Change::SetStorageParameters { .. }
                 | Change::SetReplicaIdentity { .. }
                 | Change::PublicExecution { .. } => {}
@@ -1054,6 +1056,7 @@ fn build(
         // would be a second opinion about a statement that will not be
         // written.
         | Change::SetIndexStorageParameters { .. }
+        | Change::SetTablePersistence { .. }
         | Change::SetStorageParameters { .. }
         | Change::SetReplicaIdentity { .. }
         | Change::PublicExecution { .. } => Ok(Vec::new()),

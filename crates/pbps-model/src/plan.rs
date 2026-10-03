@@ -164,7 +164,11 @@ use crate::schema::Schema;
 /// key's, a unique constraint's and an index's `storage_parameters` in their
 /// payloads, and `SetIndexStorageParameters`. An older build reading such a
 /// plan would build the index without them.
-pub const CURRENT_VERSION: u32 = 20;
+///
+/// Bumped to 21 for PostgreSQL unlogged tables (DEC-1443.1): a table's
+/// `unlogged` in a created table's payload, and `SetTablePersistence`. An
+/// older build reading such a plan would create the table permanent.
+pub const CURRENT_VERSION: u32 = 21;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -623,7 +627,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 20);
+        assert_eq!(CURRENT_VERSION, 21);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads

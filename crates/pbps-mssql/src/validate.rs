@@ -476,6 +476,12 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
              them, so remove the block",
         ));
     }
+    if table.unlogged {
+        errs.push(invalid(
+            "`unlogged` is a PostgreSQL table's persistence; SQL Server has no unlogged table, \
+             so remove the line",
+        ));
+    }
     // Index storage parameters are PostgreSQL's too (#1442).
     let keyed = table
         .primary_key
@@ -1189,6 +1195,14 @@ mod tests {
             refused
                 .iter()
                 .any(|m| m.contains("index `ix` declares `storage_parameters`")),
+            "{refused:?}"
+        );
+        // And an unlogged table (#1443).
+        table.indexes.clear();
+        table.unlogged = true;
+        let refused = found(&table);
+        assert!(
+            refused.iter().any(|m| m.contains("`unlogged`")),
             "{refused:?}"
         );
     }

@@ -430,6 +430,14 @@ pub struct Table {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub storage_parameters: BTreeMap<String, String>,
 
+    /// A PostgreSQL `UNLOGGED` table (#1443): its writes skip the
+    /// write-ahead log, so a crash or an unclean shutdown empties it and a
+    /// standby never has its rows. `false`, the default, is a permanent
+    /// table, which every table an older reader recorded was: it left an
+    /// unlogged one out as a limitation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unlogged: bool,
+
     /// Declared reference data (ADR-0004).
     ///
     /// `None` — the overwhelmingly common case — is the opt-in switch being

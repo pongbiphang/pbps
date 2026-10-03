@@ -448,6 +448,10 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             dialect: DIALECT,
             feature: format!("storage parameters on `{table}`, which are PostgreSQL's"),
         }),
+        Change::SetTablePersistence { table, .. } => Err(DialectError::Unsupported {
+            dialect: DIALECT,
+            feature: format!("an unlogged `{table}`, which is PostgreSQL's"),
+        }),
         Change::SetIndexStorageParameters { table, .. } => Err(DialectError::Unsupported {
             dialect: DIALECT,
             feature: format!("index storage parameters on `{table}`, which are PostgreSQL's"),

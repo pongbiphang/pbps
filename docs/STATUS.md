@@ -47,6 +47,11 @@ storage parameters (`fillfactor` and `deduplicate_items` for a B-tree,
 `fastupdate` and `gin_pending_list_limit` for GIN), each changed in place by
 `ALTER INDEX … SET/RESET` and carried by a rebuild (#1442, DEC-1442.1).
 
+A PostgreSQL table declares `unlogged: true`; a switch is one `ALTER TABLE …
+SET LOGGED/UNLOGGED`, ordered by the foreign keys between the tables it
+switches, and `destructive` to unlogged (#1443, DEC-1443.1). Temporary tables
+stay limitations.
+
 A SQL Server column may name its collation (`collation:`); `pull` declares one
 that differs from the database's default, and a collation change is a planned
 `ALTER COLUMN` that rebuilds the keys around it (#1175, DEC-1175.1).
