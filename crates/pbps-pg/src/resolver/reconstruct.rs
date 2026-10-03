@@ -270,6 +270,20 @@ impl Reconstruction {
                         compiled,
                     )?);
                 }
+                // The differ splits every new table's foreign keys out of its
+                // CREATE, so a bootstrap of related tables carries them as
+                // their own changes. A key names only tables and their keys,
+                // so it follows every table, as a key kept inline does.
+                Change::AddForeignKey { table, .. } => {
+                    steps.push(step(
+                        dialect,
+                        Phase::Keys,
+                        &format!("table {table}"),
+                        change,
+                        Vec::new(),
+                        None,
+                    )?);
+                }
                 // None of these changes what a name resolves to.
                 Change::CreateRole { .. }
                 | Change::Grant { .. }
@@ -294,7 +308,6 @@ impl Reconstruction {
                 | Change::SetReplicaIdentity { .. }
                 | Change::AddUnique { .. }
                 | Change::DropUnique { .. }
-                | Change::AddForeignKey { .. }
                 | Change::DropForeignKey { .. }
                 | Change::AddCheck { .. }
                 | Change::DropCheck { .. }

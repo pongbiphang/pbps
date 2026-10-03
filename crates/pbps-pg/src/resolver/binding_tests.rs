@@ -378,6 +378,70 @@ async fn an_unrelated_arriving_routine_leaves_a_view_and_a_capturing_one_rebuild
     }
 }
 
+/// The differ splits a new table's foreign keys out of its CREATE, so the
+/// bootstrap of two related tables carries the key as its own change. Scratch
+/// compiles it after both tables and before the modules, and the analysis
+/// reaches a verdict instead of refusing the namespace.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn related_tables_compile_on_scratch_with_their_foreign_key() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let target = "
+            CREATE TABLE app.p (id integer NOT NULL, CONSTRAINT p_pk PRIMARY KEY (id));
+            CREATE TABLE app.c (id integer, CONSTRAINT c_fk FOREIGN KEY (id) REFERENCES app.p (id));
+            CREATE VIEW app.v AS SELECT id FROM app.c;";
+        let mut parent = pbps_model::Table::default();
+        parent.columns.insert(
+            "id".into(),
+            pbps_model::Column::new("integer".parse().unwrap()).not_null(),
+        );
+        parent.primary_key = Some(pbps_model::PrimaryKey {
+            name: Some("p_pk".into()),
+            columns: vec!["id".into()],
+        });
+        let mut child = pbps_model::Table::default();
+        child.columns.insert(
+            "id".into(),
+            pbps_model::Column::new("integer".parse().unwrap()),
+        );
+        child.foreign_keys.insert(
+            "c_fk".into(),
+            pbps_model::ForeignKey {
+                columns: vec!["id".into()],
+                references_table: "app.p".parse().unwrap(),
+                references_columns: vec!["id".into()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+        let declared = || {
+            Declared::default()
+                .table("app.p", parent.clone())
+                .table("app.c", child.clone())
+                .view("app.v", "SELECT id FROM app.c")
+        };
+        let assessment = analyze(
+            &server,
+            "foreign",
+            Case {
+                schemas: &["app"],
+                extras: &[],
+                target,
+                base: declared(),
+                desired: declared(),
+            },
+        )
+        .await
+        .unwrap_or_else(|refusal| panic!("{variable}: {refusal}"));
+        assert_eq!(
+            only(&assessment, "app", "v"),
+            Verdict::Unaffected,
+            "{variable}"
+        );
+    }
+}
+
 fn numeric_f() -> Declared {
     Declared::default().function(
         "app.f(numeric)",

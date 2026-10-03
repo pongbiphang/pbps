@@ -1661,6 +1661,7 @@
         "resolver::binding_tests::bindings_compare_logical_names_never_object_numbers",
         "resolver::binding_tests::candidates_earlier_on_the_path_capture_and_other_overloads_and_qualified_names_do_not",
         "resolver::binding_tests::every_covered_expression_surface_gets_the_engines_answer",
+        "resolver::binding_tests::related_tables_compile_on_scratch_with_their_foreign_key",
         "resolver::binding_tests::the_observed_historical_binding_is_compared_not_a_fresh_bootstrap_of_the_old_source",
         "resolver::capture::baseline::tests::a_captured_baseline_requires_the_complete_ordinary_ledger_recipe",
         "resolver::capture::metadata_tests::deprecation_keeps_column_bound_modules_and_their_unmanaged_dependents",
