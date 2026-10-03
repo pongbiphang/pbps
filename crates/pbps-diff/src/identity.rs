@@ -487,13 +487,13 @@ struct Claim<'a, T> {
 /// reports each of those as a likely typo too.
 fn contested_rename_claims<T: Ord + Clone + std::fmt::Display>(
     claims: &[Claim<'_, T>],
-) -> (Vec<Blocker>, BTreeSet<String>) {
+) -> Contested {
     let mut out = Vec::new();
-    let mut conflicting_sources = BTreeSet::new();
+    let mut conflicting = Conflicting::default();
     let pass = |side: RenameSide,
                 pick: for<'a> fn(&'a Claim<'_, T>) -> &'a T,
                 out: &mut Vec<Blocker>,
-                conflicting_sources: &mut BTreeSet<String>| {
+                conflicting: &mut Conflicting| {
         let mut grouped: BTreeMap<&T, Vec<&Claim<'_, T>>> = BTreeMap::new();
         for c in claims {
             grouped.entry(pick(c)).or_default().push(c);
@@ -510,7 +510,12 @@ fn contested_rename_claims<T: Ord + Clone + std::fmt::Display>(
             if distinct.len() < 2 {
                 continue;
             }
-            conflicting_sources.extend(group.iter().map(|c| c.source.to_string()));
+            conflicting
+                .sources
+                .extend(group.iter().map(|c| c.source.to_string()));
+            conflicting
+                .targets
+                .extend(group.iter().map(|c| c.target.to_string()));
             out.push(Blocker::ConflictingRenameIntents {
                 side,
                 name: name.to_string(),
@@ -522,15 +527,29 @@ fn contested_rename_claims<T: Ord + Clone + std::fmt::Display>(
         RenameSide::Source,
         |c| &c.source,
         &mut out,
-        &mut conflicting_sources,
+        &mut conflicting,
     );
     pass(
         RenameSide::Target,
         |c| &c.target,
         &mut out,
-        &mut conflicting_sources,
+        &mut conflicting,
     );
-    (out, conflicting_sources)
+    (out, conflicting)
+}
+
+type Contested = (Vec<Blocker>, Conflicting);
+
+/// Both ends of every contested claim, by display name. The conflict blocker
+/// already accounts for them, so neither may reappear as an ambiguity
+/// candidate: whichever claim the matching loop happened to take, the other's
+/// source or target would otherwise be offered to an unrelated object, and
+/// the offer would change with the order the intents were written in (#247
+/// for sources, #580 for targets).
+#[derive(Default)]
+struct Conflicting {
+    sources: BTreeSet<String>,
+    targets: BTreeSet<String>,
 }
 
 /// Whether this intent has already taken effect — its fact is in the ids file.
@@ -671,7 +690,7 @@ fn resolve_roles(
             })
         })
         .collect();
-    let (rename_blockers, conflicting_sources) = contested_rename_claims(&claims);
+    let (rename_blockers, conflicting) = contested_rename_claims(&claims);
     blockers.extend(rename_blockers);
 
     // A target that is already known and still declared is not in `appeared`,
@@ -749,11 +768,16 @@ fn resolve_roles(
 
     // The conflict already accounts for these sources. Offering the losing
     // source again would make ambiguity candidates depend on intent order.
-    disappeared.retain(|role| !conflicting_sources.contains(role));
-    if !appeared.is_empty() && !disappeared.is_empty() {
+    disappeared.retain(|role| !conflicting.sources.contains(role));
+    let candidates: Vec<_> = appeared
+        .iter()
+        .filter(|role| !conflicting.targets.contains(*role))
+        .cloned()
+        .collect();
+    if !candidates.is_empty() && !disappeared.is_empty() {
         blockers.push(Blocker::AmbiguousRoles {
             disappeared: disappeared.into_iter().collect(),
-            appeared: appeared.into_iter().collect(),
+            appeared: candidates,
         });
         return;
     }
@@ -811,7 +835,7 @@ fn resolve_tables(
             })
         })
         .collect();
-    let (rename_blockers, conflicting_sources) = contested_rename_claims(&claims);
+    let (rename_blockers, conflicting) = contested_rename_claims(&claims);
     blockers.extend(rename_blockers);
 
     // Check both sets before the matching loop mutates either one. If the
@@ -877,11 +901,16 @@ fn resolve_tables(
 
     // Keep conflicted sources out of both ambiguity and missing-drop reports;
     // matching one contender above does not make the other a new decision.
-    disappeared.retain(|table| !conflicting_sources.contains(&table.to_string()));
-    if !appeared.is_empty() && !disappeared.is_empty() {
+    disappeared.retain(|table| !conflicting.sources.contains(&table.to_string()));
+    let candidates: Vec<_> = appeared
+        .iter()
+        .filter(|table| !conflicting.targets.contains(&table.to_string()))
+        .cloned()
+        .collect();
+    if !candidates.is_empty() && !disappeared.is_empty() {
         blockers.push(Blocker::AmbiguousTables {
             disappeared: disappeared.into_iter().collect(),
-            appeared: appeared.into_iter().collect(),
+            appeared: candidates,
         });
         return;
     }
@@ -973,7 +1002,7 @@ fn resolve_columns(
                 )
             })
             .collect();
-        let (rename_blockers, conflicting_sources) = contested_rename_claims(&claims);
+        let (rename_blockers, conflicting) = contested_rename_claims(&claims);
         blockers.extend(rename_blockers);
 
         // The target must be checked while both sets still describe the
@@ -1054,13 +1083,25 @@ fn resolve_columns(
 
         // Use the qualified identity recorded by the conflict, before either
         // remaining-source diagnostic can offer it to the operator again.
-        disappeared
-            .retain(|name| !conflicting_sources.contains(&table_name.column(name).to_string()));
-        if !appeared.is_empty() && !disappeared.is_empty() {
+        disappeared.retain(|name| {
+            !conflicting
+                .sources
+                .contains(&table_name.column(name).to_string())
+        });
+        let candidates: Vec<_> = appeared
+            .iter()
+            .filter(|name| {
+                !conflicting
+                    .targets
+                    .contains(&table_name.column(name.as_str()).to_string())
+            })
+            .cloned()
+            .collect();
+        if !candidates.is_empty() && !disappeared.is_empty() {
             blockers.push(Blocker::AmbiguousColumns {
                 table: table_name.clone(),
                 disappeared: disappeared.into_iter().collect(),
-                appeared: appeared.into_iter().collect(),
+                appeared: candidates,
             });
             continue;
         }

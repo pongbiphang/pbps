@@ -485,6 +485,132 @@ mod tests {
         }
     }
 
+    /// The counterpart with the targets contested (#580): one source renamed
+    /// to two names. The matching loop takes one claim, and the other target
+    /// used to be offered to an unrelated disappearing object — a different
+    /// one depending on which intent was written first.
+    #[test]
+    fn conflicted_rename_targets_are_not_offered_beside_unrelated_names() {
+        use std::collections::BTreeSet;
+
+        use pbps_model::{Column, IdsFile, Role, Schema, Table};
+
+        let schema = |names: &[&str]| {
+            let mut schema = Schema::default();
+            let mut columns = Table::default();
+            for name in names {
+                schema
+                    .tables
+                    .insert(TableName::new("dbo", *name), Table::default());
+                columns
+                    .columns
+                    .insert((*name).into(), Column::new("int".parse().unwrap()));
+                schema.roles.insert((*name).into(), Role::default());
+            }
+            schema.tables.insert(table(), columns);
+            schema
+        };
+        let ctx = pbps_diff::Context {
+            operator: "test".into(),
+            today: "2026-09-15".into(),
+        };
+        let intents: Vec<Intent> = ["first", "second"]
+            .into_iter()
+            .flat_map(|to| {
+                [
+                    Intent::RenameTable {
+                        from: TableName::new("dbo", "old"),
+                        to: TableName::new("dbo", to),
+                    },
+                    Intent::RenameColumn {
+                        table: table(),
+                        from: "old".into(),
+                        to: to.into(),
+                    },
+                    Intent::RenameRole {
+                        from: "old".into(),
+                        to: to.into(),
+                    },
+                ]
+            })
+            .collect();
+        let ids = pbps_diff::resolve(&schema(&["old", "other"]), &IdsFile::default(), &[], &ctx)
+            .unwrap()
+            .ids;
+        for spare in [true, false] {
+            // With an unrelated new name, `other` is still asked about, paired
+            // with that name alone. Without one, it has nothing to pair with
+            // and is the ordinary drop that needs a reason.
+            let (after, expected) = if spare {
+                (
+                    vec!["first", "second", "spare"],
+                    vec![
+                        Blocker::AmbiguousTables {
+                            disappeared: vec![TableName::new("dbo", "other")],
+                            appeared: vec![TableName::new("dbo", "spare")],
+                        },
+                        Blocker::AmbiguousColumns {
+                            table: table(),
+                            disappeared: vec!["other".into()],
+                            appeared: vec!["spare".into()],
+                        },
+                        Blocker::AmbiguousRoles {
+                            disappeared: vec!["other".into()],
+                            appeared: vec!["spare".into()],
+                        },
+                    ],
+                )
+            } else {
+                (
+                    vec!["first", "second"],
+                    vec![
+                        Blocker::DropTableNeedsReason {
+                            table: TableName::new("dbo", "other"),
+                        },
+                        Blocker::DropColumnNeedsReason {
+                            column: table().column("other"),
+                        },
+                        Blocker::DropRoleNeedsReason {
+                            role: "other".into(),
+                        },
+                    ],
+                )
+            };
+            for reversed in [false, true] {
+                let mut ordered = intents.clone();
+                if reversed {
+                    ordered.reverse();
+                }
+                let blockers =
+                    pbps_diff::resolve(&schema(&after), &ids, &ordered, &ctx).unwrap_err();
+                let mut conflicts = BTreeSet::new();
+                let mut remaining: Vec<Blocker> = blockers
+                    .iter()
+                    .filter_map(|blocker| {
+                        if let Blocker::ConflictingRenameIntents { side, intents, .. } = blocker {
+                            assert_eq!(*side, pbps_diff::RenameSide::Source);
+                            conflicts.extend(intents.iter().cloned());
+                            None
+                        } else {
+                            Some(blocker.clone())
+                        }
+                    })
+                    .collect();
+                remaining.sort_by_key(|b| format!("{b:?}"));
+                let mut wanted = expected.clone();
+                wanted.sort_by_key(|b| format!("{b:?}"));
+                assert_eq!(conflicts, intents.iter().cloned().collect());
+                assert_eq!(remaining, wanted, "spare={spare} reversed={reversed}");
+                let offered: Vec<Choice> = blockers.iter().flat_map(choices).collect();
+                let wanted_choices: Vec<Choice> = expected.iter().flat_map(choices).collect();
+                assert_eq!(offered.len(), wanted_choices.len(), "{offered:?}");
+                for choice in &wanted_choices {
+                    assert!(offered.contains(choice), "{choice:?} in {offered:?}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn provisional_questions_wait_for_identity_to_be_resolved_again() {
         let ordinary = Blocker::AmbiguousColumns {
