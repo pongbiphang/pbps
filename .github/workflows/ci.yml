@@ -94,6 +94,8 @@ jobs:
       # is the only place it is caught (DEC-671.1).
       - run: python3 scripts/check_decisions_test.py
       - run: python3 scripts/check-decisions.py
+      # The checker `ci-gate` runs on its own `needs` (#637).
+      - run: python3 scripts/check_gate_needs_test.py
       # The dedicated-server fixture's retry decision runs only in the resolver
       # job, as root; this is the one place its logic is tested (DEC-958.1).
       - run: python3 scripts/live_resolver_server_test.py
@@ -610,6 +612,13 @@ jobs:
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
+      # This job is the one required check and only as strong as its `needs`:
+      # a job left out of that list could go red under a green gate. Checked
+      # here rather than in a job the gate waits on, because deleting `needs`
+      # would also drop that wait, and an empty `needs` passes the step below
+      # (#637).
+      - uses: actions/checkout@v7
+      - run: python3 scripts/check_gate_needs.py
       # Through the environment, not `${{ }}` inside `run:`: interpolation
       # would splice the value into the program text.
       - name: every job succeeded
