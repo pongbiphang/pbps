@@ -412,9 +412,13 @@ pub fn planned_estimates(changes: &ChangeSet) -> Vec<(usize, Estimate)> {
 // measured on 17.0.4075.5, #586). Which columns a predicate reads is not in
 // the catalog views without parsing `filter_definition`, so the whole table's
 // filters are treated as unmeasured.
+//
+// SPARSE and FILESTREAM columns are outside the measured matrix too: the
+// matrix creates neither, and a retype that clears SPARSE (as a plain
+// `ALTER COLUMN` does) is no evidence the ordinary storage answer applies.
 const SHAPE: &str = "\
 SELECT CONVERT(int, SERVERPROPERTY('ProductMajorVersion')) AS major,
-       t.is_memory_optimized, t.temporal_type, c.column_id,
+       t.is_memory_optimized, t.temporal_type, c.column_id, c.is_sparse, c.is_filestream,
        (SELECT SUM(p.rows) FROM sys.partitions p WHERE p.object_id=t.object_id AND p.index_id IN (0,1)) AS row_count,
        (SELECT COUNT_BIG(*) FROM sys.partitions p WHERE p.object_id=t.object_id AND p.index_id IN (0,1)) AS partitions,
        (SELECT MAX(p.data_compression) FROM sys.partitions p WHERE p.object_id=t.object_id AND p.index_id IN (0,1)) AS compression,
@@ -492,6 +496,10 @@ pub async fn against(conn: &mut Conn, estimate: &mut Estimate) -> Result<(), DbE
         )
     } else if row.try_get::<i32>("column_id")?.is_none() {
         Some("this database has no visible column by that name to measure")
+    } else if row.try_get::<bool>("is_sparse")? != Some(false)
+        || row.try_get::<bool>("is_filestream")? != Some(false)
+    {
+        Some("this column's SPARSE or FILESTREAM storage has not been measured")
     } else if row.try_get::<bool>("is_memory_optimized")? != Some(false)
         || row.try_get::<u8>("temporal_type")? != Some(0)
         || row.try_get::<bool>("special_index")? != Some(false)

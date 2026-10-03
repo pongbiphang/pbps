@@ -333,6 +333,50 @@ async fn connected_estimates_keep_storage_and_identity_uncertainty_visible() {
     db.drop().await;
 }
 
+/// A SPARSE column is outside the measured matrix, and widening it clears the
+/// flag, so the ordinary-column answer is no evidence for it (#588): its work
+/// stays unknown, while an otherwise equal ordinary column in the same table
+/// keeps the measured answer and both keep the catalog's rows and lock.
+/// FILESTREAM shares the guard but cannot be created here: SQL Server on
+/// Linux, which every live fixture runs, does not support it.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn sparse_columns_keep_column_work_unknown_beside_a_measured_control() {
+    let mut db = TestDb::create("estimate_sparse588").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.t(id int NOT NULL, w int NULL, v int SPARSE NULL); \
+             INSERT dbo.t VALUES(1, 123, 123),(2, NULL, NULL);",
+        )
+        .await
+        .unwrap();
+    for (column, measured) in [("w", true), ("v", false)] {
+        let cs = ChangeSet {
+            changes: vec![retype("dbo.t", column, "int", "bigint")],
+        };
+        let mut e = estimate::planned_estimates(&cs).pop().unwrap().1;
+        estimate::against(&mut db.conn, &mut e).await.unwrap();
+        assert_eq!(
+            !matches!(e.rewrite, Rewrite::Unknown(_)),
+            measured,
+            "{column}: {e:?}"
+        );
+        assert_eq!(
+            !matches!(e.reads, Reads::Unknown(_)),
+            measured,
+            "{column}: {e:?}"
+        );
+        assert_eq!(e.rows, Some(2), "{column}");
+        assert_eq!(e.rows_unknown, None, "{column}");
+        assert_eq!(
+            (e.lock, e.blocks),
+            ("Sch-M", "reads and writes"),
+            "{column}"
+        );
+    }
+    db.drop().await;
+}
+
 /// A filtered index can name the altered column only in its predicate, where
 /// `sys.index_columns` does not list it (#586). The estimate cannot see what
 /// the predicate reads without parsing it, so any filtered index on the table
