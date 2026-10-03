@@ -1470,6 +1470,7 @@
         "estimate_tests::a_clustered_index_change_is_a_rewrite_only_where_the_catalog_says_so",
         "estimate_tests::connected_estimates_keep_storage_and_identity_uncertainty_visible",
         "estimate_tests::nullability_and_storage_boundaries_keep_the_measured_row_paths",
+        "estimate_tests::predicate_only_filtered_indexes_keep_column_work_unknown",
         "estimate_tests::the_estimate_agrees_with_the_catalogues_row_update_and_scan_paths",
         "every_explicitly_referenced_column_needs_its_grant",
         "every_rowstore_layout_round_trips_through_an_empty_database",
