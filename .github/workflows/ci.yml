@@ -231,7 +231,8 @@ jobs:
       # a single row in it. Two tests taking it concurrently make each other
       # fail, and the failure looks like a bug in the lock rather than in the
       # test schedule.
-      - run: cargo test -p pbps-cli --test flow -- --ignored --test-threads=1
+      # Except the one that needs a second edition, which `live-editions` runs.
+      - run: cargo test -p pbps-cli --test flow -- --ignored --test-threads=1 --skip connected_plan_json_reports_unsupported_online_edition_as_a_finding
       # A session killed mid-run (error 596, #669) leaves nothing in the job
       # log about why: the test sees only "the session is in the kill state".
       # The server's own errorlog is where a kill, a severe error or memory
@@ -296,6 +297,13 @@ jobs:
           cargo test -p pbps-mssql --test live -- --ignored \
             a_real_express_target_is_an_edition_limitation | tee edition.log
           grep -q "test result: ok. 1 passed" edition.log
+      # And the CLI's answer to an online strategy Express cannot run (#574).
+      - name: the connected online-edition refusal
+        run: |
+          set -o pipefail
+          cargo test -p pbps-cli --test flow -- --ignored --exact \
+            connected_plan_json_reports_unsupported_online_edition_as_a_finding | tee online.log
+          grep -q "test result: ok. 1 passed" online.log
 
 
   # The PostgreSQL half of SPEC 11.5, and at this phase a small one: the crate

@@ -5696,7 +5696,7 @@ pub fn cmd_plan_db(
         // here. An offline plan has to assume the conservative answer.
         let verdict = crate::engine::edition_verdict(&mut conn, &cs).await?;
         if !verdict.refused_online.is_empty() {
-            bail!(
+            let refusal = format!(
                 "`strategy: online` is declared for {}, and `{}` runs {}, which has no online \
                  index operations.\n\
                  The statement would fail partway through the apply. Remove the hint, or deploy \
@@ -5705,6 +5705,22 @@ pub fn cmd_plan_db(
                 target.label,
                 verdict.runs
             );
+            if json {
+                // An answered question, like the policy refusal above: the
+                // edition was read and it says no (DECISIONS 26, 485). Its own
+                // id rather than `plan.edition` at error severity, which a
+                // consumer could only tell from the advisories by the severity
+                // (#574).
+                findings.push(
+                    crate::output::Finding::error("plan.online-unsupported", refusal.clone())
+                        .remedy(
+                            "remove `strategy: online` from these tables, or deploy to an edition \
+                         with online index operations",
+                        ),
+                );
+                crate::output::Report::plain("plan", findings).emit_json()?;
+            }
+            bail!("{refusal}");
         }
         for w in &verdict.warnings {
             if !json {

@@ -1335,6 +1335,23 @@
     },
     {
       "target": [
+        "pbps-cli",
+        "test",
+        "flow"
+      ],
+      "owner": "editions",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "connected_plan_json_reports_unsupported_online_edition_as_a_finding"
+      ]
+    },
+    {
+      "target": [
         "pbps-mssql",
         "test",
         "live"
