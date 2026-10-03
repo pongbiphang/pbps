@@ -1808,8 +1808,9 @@ whose index it names, new or rebuilt by any pass of the differ. Two places:
   staged checkpoint there could not be resumed (#1467 review).
 
 A created table sets it as its `CREATE`'s last statement, after its indexes;
-where the resolver splits the indexes out of the `CREATE`, an identity on one
-of them is split out after them. The resolver's rule ordering an index
+where the resolver splits the indexes out of the `CREATE`, in the plan and in
+its scratch reconstruction, an identity on one of them is split out after
+them, and the created table is held to that split setting (#1467 review). The resolver's rule ordering an index
 against its table's other changes would put the identity before every add
 and after every drop, so the identity is exempt from it and keeps the
 differ's order.

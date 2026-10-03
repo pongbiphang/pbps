@@ -228,3 +228,53 @@ fn a_change_no_bootstrap_contains_is_refused_by_kind() {
     .unwrap_err();
     assert_eq!(refused, ReconstructError::Unsupported("drop_table".into()));
 }
+
+/// A created table's identity on one of its indexes is a step after that
+/// index, not part of the bare `CREATE`, which would name an index that is
+/// not there yet (#1467 review).
+#[test]
+fn an_index_replica_identity_is_set_after_its_index() {
+    let mut t = Table::default();
+    t.columns.insert(
+        "id".into(),
+        Column::new("integer".parse().unwrap()).not_null(),
+    );
+    t.indexes.insert(
+        "t_id".into(),
+        Index {
+            columns: vec![IndexColumn {
+                key: pbps_model::IndexKey::Column("id".into()),
+                descending: false,
+                opclass: None,
+            }],
+            include: vec![],
+            unique: true,
+            filter: None,
+            method: Default::default(),
+        },
+    );
+    t.replica_identity = Some(pbps_model::ReplicaIdentity::Index("t_id".into()));
+    let bootstrap = [Change::CreateTable {
+        uid: Uid::derived(UidKind::Table, "app.t", 0),
+        name: TableName::new("app", "t"),
+        table: Box::new(t),
+    }];
+    let reconstruction = Reconstruction::new(&crate::Postgres::new(), &bootstrap).unwrap();
+    let phases: Vec<_> = reconstruction
+        .steps
+        .iter()
+        .map(|step| (step.phase, step.declaration.as_str()))
+        .collect();
+    assert_eq!(
+        phases,
+        [
+            (Phase::Tables, "table app.t"),
+            (Phase::Keys, "index t_id on app.t"),
+            (Phase::Keys, "replica identity of app.t"),
+        ]
+    );
+    let table = reconstruction.steps[0].statements.join("\n");
+    assert!(!table.contains("REPLICA IDENTITY"), "{table}");
+    let last = reconstruction.steps[2].statements.join("\n");
+    assert!(last.contains("REPLICA IDENTITY USING INDEX"), "{last}");
+}

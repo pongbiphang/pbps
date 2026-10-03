@@ -2898,6 +2898,9 @@ fn refuse_unplanned_movement(
     // They have no baseline entry, so the comparison below cannot reach them
     // any other way (DECISIONS 181).
     let mut created: BTreeMap<&TableName, &pbps_model::Table> = BTreeMap::new();
+    // And their uids, which a replica identity split out of the `CREATE`
+    // carries (#1467 review).
+    let mut created_uids: BTreeMap<&TableName, &pbps_model::Uid> = BTreeMap::new();
     // The parts this plan puts on a table by a change of its own. A created
     // table's `CREATE` payload is *not* everything it will hold: the differ
     // takes the foreign keys out of it (`std::mem::take`) and emits each as
@@ -3029,8 +3032,9 @@ fn refuse_unplanned_movement(
                 }
             }
         }
-        if let pbps_model::Change::CreateTable { name, table, .. } = &p.change {
+        if let pbps_model::Change::CreateTable { uid, name, table } = &p.change {
             created.insert(name, table.as_ref());
+            created_uids.insert(name, uid);
         }
         if let pbps_model::Change::SetReplicaIdentity { uid, table, to } = &p.change {
             identities.insert(uid, (to.as_ref(), table));
@@ -3462,9 +3466,15 @@ fn refuse_unplanned_movement(
             }
             // The replica identity is the `CREATE`'s last statement (#1444):
             // until then the table reads as the default, which is the plan in
-            // progress; any other identity is the one it ends with.
+            // progress; any other identity is the one it ends with. Where the
+            // resolver split it out of the `CREATE` to follow its index, the
+            // split setting is that one (#1467 review).
+            let target = created_uids
+                .get(now_name)
+                .and_then(|uid| identities.get(uid))
+                .map_or(declared.replica_identity.as_ref(), |(to, _)| *to);
             if (settled.whole() || now.replica_identity.is_some())
-                && declared.replica_identity != now.replica_identity
+                && target != now.replica_identity.as_ref()
             {
                 moved.push(format!(
                     "{now_name} replica identity is not the one this plan's `CREATE TABLE` \
@@ -12114,6 +12124,41 @@ mod tests {
             format!("{e:#}").contains("replica identity is not the one"),
             "{e:#}"
         );
+        // The resolver's split: a `CREATE` without the identity, set by a
+        // later change of the same uid, which is the one it ends with (#1467
+        // review).
+        let mut bare = t.clone();
+        bare.replica_identity = None;
+        let split = pbps_model::ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::CreateTable {
+                    uid: "t_000000".parse().unwrap(),
+                    name: name.clone(),
+                    table: Box::new(bare),
+                }),
+                PlannedChange::new(Change::SetReplicaIdentity {
+                    uid: "t_000000".parse().unwrap(),
+                    table: name.clone(),
+                    to: Some(ReplicaIdentity::Full),
+                }),
+            ],
+        };
+        check(&split, &empty, &schema(None), Settled::SoFar).expect("before the setting");
+        for settled in [Settled::SoFar, Settled::Whole] {
+            check(
+                &split,
+                &empty,
+                &schema(Some(ReplicaIdentity::Full)),
+                settled,
+            )
+            .expect("the split setting");
+        }
+        let e = check(&split, &empty, &schema(None), Settled::Whole).expect_err("never set");
+        assert!(
+            format!("{e:#}").contains("replica identity is not the one"),
+            "{e:#}"
+        );
+
         // A name handoff: `a` becomes `b` while `b` becomes `c`. `b`'s early
         // FULL runs under the name `b`, and `a`'s late NOTHING under its new
         // name `b` too; each table is held to its own (#1467 review).
