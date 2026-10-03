@@ -288,6 +288,7 @@ pub(crate) fn planned_schema_grants(
             | Change::AddComputedColumn { .. }
             | Change::DropComputedColumn { .. }
             | Change::SetReplicaIdentity { .. }
+            | Change::SetStorageParameters { .. }
             | Change::DropColumn { .. }
             | Change::RenameColumn { .. }
             | Change::AlterColumnType { .. }

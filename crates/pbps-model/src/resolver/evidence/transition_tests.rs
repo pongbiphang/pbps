@@ -1341,6 +1341,7 @@ fn aggregate_renames_require_owned_records_at_both_endpoints() {
             | Change::AddColumn { .. }
             | Change::AddComputedColumn { .. }
             | Change::SetReplicaIdentity { .. }
+            | Change::SetStorageParameters { .. }
             | Change::DropComputedColumn { .. }
             | Change::DropColumn { .. }
             | Change::AlterColumnType { .. }
