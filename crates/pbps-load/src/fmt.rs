@@ -947,6 +947,18 @@ indexes:
         round_trip(&out);
         let again = crate::load_table_str(Path::new("t.yml"), &out).unwrap();
         assert_eq!(again.table.storage_parameters, t.table.storage_parameters);
+        // A bare number is read as written too: `7e1` for an integer
+        // parameter is 70, as the engine reads it.
+        let bare = crate::load_table_str(
+            Path::new("t.yml"),
+            "table: public.t\ncolumns:\n  id: {type: int}\nstorage_parameters:\n  fillfactor: 7e1\n  autovacuum_vacuum_scale_factor: 0.050\n",
+        )
+        .unwrap();
+        assert_eq!(bare.table.storage_parameters["fillfactor"], "70");
+        assert_eq!(
+            bare.table.storage_parameters["autovacuum_vacuum_scale_factor"],
+            "0.05"
+        );
         // Negative: an unknown or `toast.*` name, and a value the engine
         // would refuse, are errors, never dropped.
         for line in [
@@ -954,6 +966,9 @@ indexes:
             "  toast.autovacuum_enabled: false",
             "  fillfactor: '08'",
             "  vacuum_index_cleanup: tr",
+            // Bare, a YAML number would already be 0 before it is checked:
+            // the written spelling is what is read (#1477 review).
+            "  autovacuum_vacuum_scale_factor: 1e-400",
         ] {
             let yaml = format!(
                 "table: public.t\ncolumns:\n  id: {{type: int}}\nstorage_parameters:\n{line}\n"

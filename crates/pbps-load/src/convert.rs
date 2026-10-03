@@ -372,10 +372,21 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
 
     let mut storage_parameters = std::collections::BTreeMap::new();
     for (parameter, value) in &dto.storage_parameters {
+        // A number as it is written in the file, not as YAML read it: the
+        // engine reads the spelling, and an `f64` can have lost it (a bare
+        // `1e-400` is already 0, which the engine refuses, #1477 review).
+        let spelled = || {
+            let span = to_span(&value.defined);
+            src.text
+                .get(span.offset()..span.offset() + span.len())
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned)
+        };
         let written = match &value.value {
             StorageValueDto::Bool(b) => b.to_string(),
-            StorageValueDto::Int(i) => i.to_string(),
-            StorageValueDto::Real(r) => r.to_string(),
+            StorageValueDto::Int(i) => spelled().unwrap_or_else(|| i.to_string()),
+            StorageValueDto::Real(r) => spelled().unwrap_or_else(|| r.to_string()),
             StorageValueDto::Text(t) => t.clone(),
         };
         match pbps_model::storage::canonical(parameter, &written) {
