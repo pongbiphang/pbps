@@ -1570,6 +1570,7 @@
       "cases": [
         "catalog::tests::a_failed_canonical_permission_query_restores_both_transaction_scopes",
         "catalog::tests::the_canonical_scope_reads_without_jit_and_hands_back_the_sessions_own",
+        "preflight::tests::probe_intermediates_stay_wide_until_the_final_clamp",
         "resolver::binding_tests::a_body_compiled_before_a_same_named_candidate_is_unresolved",
         "resolver::binding_tests::a_candidate_scratch_did_not_reproduce_leaves_the_surface_unresolved",
         "resolver::binding_tests::a_cast_cannot_change_a_surface_that_resolves_no_call",
