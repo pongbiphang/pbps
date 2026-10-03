@@ -132,6 +132,41 @@ class ClosedFixtures(unittest.TestCase):
                 with self.assertRaisesRegex(audit.InventoryError, construct):
                     self.check(source)
 
+    def test_module_annotations_keep_real_mutation_and_versioned_failure_controls(self):
+        bodies = (
+            'annotation: TESTS\n__annotations__["annotation"].clear()\n',
+            'annotation: TESTS\nimport __main__ as runner\n'
+            'runner.__annotations__["annotation"].clear()\n',
+        )
+        for index, body in enumerate(bodies):
+            with self.subTest(body=body):
+                source = fixture(body)
+                # Runtime annotation evaluation changed in 3.14. The owner
+                # refusal is syntactic and must never inherit that branch
+                # or lose this protected list read (DEC-1262.1).
+                diagnostic = 'runner.py:3: outside closed fixture form: list selector outside iteration TESTS'
+                with self.assertRaises(audit.InventoryError) as raised:
+                    self.check(source)
+                self.assertEqual(str(raised.exception), diagnostic)
+                with patch.object(audit, 'RULES', {key: value for key, value in audit.RULES.items()
+                                                  if key != 'list_reads'}):
+                    self.assertEqual(self.check(source), 1)
+                with self.assertRaises(audit.InventoryError):
+                    self.check(source)
+                if index == 0 and sys.version_info >= (3, 14):
+                    # Preserve the exact bare-name regression as a failure
+                    # control; it supplies no successful mutation evidence.
+                    with self.assertRaises(subprocess.CalledProcessError) as failure:
+                        self.actual(source)
+                    self.assertEqual(failure.exception.returncode, 1)
+                    self.assertEqual(failure.exception.stdout, '')
+                    self.assertRegex(failure.exception.stderr.splitlines()[-1],
+                                     r"^NameError: name '__annotations__' is not defined(?:\.|$)")
+                else:
+                    # Module attribute access forces lazy evaluation on 3.14
+                    # and still exposes the actual mutable selector on 3.12.
+                    self.assertEqual(self.actual(source), [[], True])
+
     def test_unrelated_native_expressions_and_annotations_are_not_interpreted(self):
         for body in ('value = ~0\n', 'value = {1}\n', 'value: int\n',
                      'from __future__ import annotations\n',

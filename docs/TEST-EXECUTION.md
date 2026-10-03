@@ -137,8 +137,16 @@ controls. Generic type-parameter bindings retain their original source as an
 unsupported-syntax control on 3.11 and a binding-rule removal control on 3.12+.
 Independently removing each version boundary must restore its actual-interpreter
 failure, and skipping tagged but eligible rows must fail the execution ledger.
-Syntax eligibility does not establish annotation execution semantics or settle
-the separate module-annotation question in #1262.
+Syntax eligibility does not establish annotation execution semantics. Separate
+module-annotation controls (DEC-1262.1) retain the original bare
+`__annotations__` access: it mutates the selector before 3.14 and raises
+`NameError` on 3.14+. Access through the running module's `__annotations__`
+attribute must actually empty the selector on both versions. Both complete
+owners are refused on every interpreter at the protected list read in the
+annotation; disabling only `list_reads` must admit them. The version branch
+applies only to the original runtime oracle, never the static refusal or the
+portable successful mutation control. Run the integrated suite on actual
+3.12 and 3.14 interpreters when changing these controls.
 
 ## Maintaining the inventory
 
