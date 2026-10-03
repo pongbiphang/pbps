@@ -508,6 +508,62 @@ async fn persisted_inputs_use_the_environment_key_and_never_export_source() {
     }
 }
 
+/// A schema's default privileges depend automatically on it, but default
+/// ACLs are authorization metadata, not binding inputs (DEC-1274.1): their
+/// dependency row is not read, and the capture does not refuse.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_schemas_default_privileges_are_not_a_capture_input() {
+    for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+        let base = std::env::var(variable).expect("live PostgreSQL fixture setting");
+        let name = format!(
+            "pbps_dacl1274_{}",
+            crate::catalog::probe_token().replace('-', "_")
+        );
+        let mut admin = Conn::connect(Driver::Postgres, &base).await.unwrap();
+        admin
+            .execute(&format!("CREATE DATABASE {name}"))
+            .await
+            .unwrap();
+        let connection = format!("{base} dbname={name}");
+        let result = tokio::task::LocalSet::new()
+            .run_until(async move {
+                tokio::task::spawn_local(async move {
+                    let mut conn = Conn::connect(Driver::Postgres, &connection).await.unwrap();
+                    conn.execute(
+                        "CREATE SCHEMA app; CREATE TABLE app.t(id integer); \
+                         CREATE VIEW app.historical AS SELECT id FROM app.t; \
+                         ALTER DEFAULT PRIVILEGES IN SCHEMA app \
+                         GRANT EXECUTE ON ROUTINES TO pg_monitor",
+                    )
+                    .await
+                    .unwrap();
+                    let captured = capture(&mut conn, &fixture_scope())
+                        .await
+                        .expect("default privileges do not refuse the capture");
+                    assert!(
+                        captured
+                            .inputs
+                            .keys()
+                            .all(|id| !format!("{id:?}").contains("pg_default_acl"))
+                    );
+                    assert!(captured.inputs.contains_key(&ObjectIdentity {
+                        class: "pg_class".into(),
+                        name: vec!["app".into(), "t".into()],
+                        signature: vec![],
+                    }));
+                })
+                .await
+            })
+            .await;
+        admin
+            .execute(&format!("DROP DATABASE {name} WITH (FORCE)"))
+            .await
+            .unwrap();
+        result.expect("default-privilege capture fixture failed after cleanup");
+    }
+}
+
 /// A closing read lists every record of its manifest as a retained root, so
 /// a record nothing reaches any more is still read. A retained dependency row
 /// is not a catalog object: it is read with its subject, never refused as
