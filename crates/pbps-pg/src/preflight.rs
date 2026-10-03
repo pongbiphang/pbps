@@ -241,21 +241,47 @@ fn pieces_of(body: &str, clauses: &[String]) -> Vec<String> {
     pieces
 }
 
-/// One integer term, assembled by the engine where it carries a collation mark
+/// One count term, assembled by the engine where it carries a collation mark
 /// and left as it is where it does not.
+///
+/// The decoded value stays `numeric` (#591): an assembled count can exceed
+/// int4, and a cast to `int` here fails with 22003 before the caller's final
+/// [`saturated_count`] clamp is reached, turning a reportable count into an
+/// unchecked probe. Only the clamp narrows.
 ///
 /// [`query_to_xml`](https://www.postgresql.org/docs/18/functions-xml.html) is
 /// this engine's only way to run generated SQL from inside a `SELECT`, and a
 /// probe has to be one `SELECT` (DECISIONS 325). A probe with no collation to
 /// ask about stays readable instead.
-fn assembled_int(term: &str, clauses: &[String]) -> String {
+fn assembled_count(term: &str, clauses: &[String]) -> String {
     if !term.contains(COLLATION_MARK) {
         return term.to_owned();
     }
     format!(
         "COALESCE((SELECT (pg_catalog.xpath('/row/n/text()',
-                              pg_catalog.query_to_xml('SELECT (' || {} || ') AS n', false, true, ''))                 )[1]::text::int), 0)",
+                              pg_catalog.query_to_xml('SELECT (' || {} || ') AS n', false, true, ''))                 )[1]::text::numeric), 0)",
         pieces_of(term, clauses).join(" || ")
+    )
+}
+
+/// How many stored rows of `child_sql` satisfy `condition`, a text expression
+/// split into the pieces the engine concatenates ([`pieces_of`]).
+///
+/// Wide, not clamped (#591): each probe adds this to other terms and clamps
+/// the sum once. A term already narrowed to int4 overflows in that addition
+/// (22003) before the outer [`saturated_count`] runs.
+fn stored_count(child_sql: &str, condition: Vec<String>) -> String {
+    let mut body = vec![value_literal(&format!("{child_sql} AS ch WHERE "))];
+    body.extend(condition);
+    format!(
+        "COALESCE((SELECT (pg_catalog.xpath('/row/n/text()',\n           \
+           pg_catalog.query_to_xml('SELECT (SELECT count(*) FROM '\n             \
+             || CASE WHEN cl.relkind = 'p' THEN '' ELSE 'ONLY ' END\n             \
+             || {} || ') AS n', false, true, '')))[1]::text::numeric\n    \
+         FROM pg_catalog.pg_class cl\n   \
+        WHERE cl.oid = pg_catalog.to_regclass({})), 0)",
+        body.join(" || "),
+        value_literal(child_sql)
     )
 }
 
@@ -2277,24 +2303,8 @@ fn planned_key_probes(
         // row it inserts under the referenced column's collation (DECISIONS
         // 366) — and as it is where it does not, so that a probe with no
         // collation to ask about stays readable.
-        let evaluated = |term: &str| -> String { assembled_int(term, &clauses) };
-        let stored_rows = |body: &str| {
-            let pieces = spliced(body);
-            saturated_count(&format!(
-                "COALESCE((SELECT (pg_catalog.xpath('/row/n/text()',\n           \
-                   pg_catalog.query_to_xml('SELECT (SELECT count(*) FROM '\n             \
-                     || CASE WHEN cl.relkind = 'p' THEN '' ELSE 'ONLY ' END\n             \
-                     || {} || ') AS n', false, true, '')))[1]::text::bigint\n    \
-                 FROM pg_catalog.pg_class cl\n   \
-                WHERE cl.oid = pg_catalog.to_regclass({})), 0)",
-                {
-                    let mut body_pieces = vec![value_literal(&format!("{child_sql} AS ch WHERE "))];
-                    body_pieces.extend(pieces);
-                    body_pieces.join(" || ")
-                },
-                value_literal(&child_sql)
-            ))
-        };
+        let evaluated = |term: &str| -> String { assembled_count(term, &clauses) };
+        let stored_rows = |body: &str| stored_count(&child_sql, spliced(body));
 
         let moved = names.moved.get(&a.child);
         let key_sql = match moved {
@@ -3466,7 +3476,7 @@ fn orphan_probe(
         format!("rows with no matching parent for the new foreign key {name}"),
         format!(
             "SELECT {} AS n;",
-            saturated_count(&assembled_int(&term, &clauses))
+            saturated_count(&assembled_count(&term, &clauses))
         ),
     )])
 }
@@ -4740,5 +4750,72 @@ mod tests {
         // Nothing arrives, so the arrival term is the empty string rather than
         // a `CASE` with no arms, which this engine would refuse to parse.
         assert!(sql.contains("END || ')' || '' || ' AS n' AS stmt"), "{sql}");
+    }
+
+    /// Probe intermediates stay wide until the final clamp (#591). Run on
+    /// both pinned majors through the real generated expressions: an
+    /// engine-assembled count above int4 (and above bigint), and a stored
+    /// count plus an arrival that together pass int4. Each must decode as
+    /// the clamped i32 rather than fail with 22003, and ordinary and zero
+    /// counts must come back unchanged.
+    #[tokio::test]
+    #[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+    async fn probe_intermediates_stay_wide_until_the_final_clamp() {
+        use pbps_db::{Conn, Driver};
+        let clauses = vec!["''".to_owned()];
+        // A mark sends the term through the engine-assembled XML path.
+        let assembled = |value: &str| {
+            assembled_count(
+                &format!("(SELECT {value}){COLLATION_MARK}0{COLLATION_MARK}"),
+                &clauses,
+            )
+        };
+        let table = "pg_temp.pbps_591";
+        let stored = stored_count(table, vec![value_literal("ch.k > 0")]);
+        let cases = [
+            (saturated_count(&assembled("2147483648::bigint")), i32::MAX),
+            (
+                saturated_count(&assembled("99999999999999999999::numeric")),
+                i32::MAX,
+            ),
+            (saturated_count(&assembled("7::bigint")), 7),
+            (saturated_count(&assembled("0::bigint")), 0),
+            (
+                saturated_count(&format!("{stored} + {}::int", i32::MAX)),
+                i32::MAX,
+            ),
+            (saturated_count(&format!("{stored} + 1::int")), 3),
+            (
+                saturated_count(&format!("{stored} + {}", assembled("2147483647::bigint"))),
+                i32::MAX,
+            ),
+        ];
+        for variable in ["PBPS_TEST_PG_DB", "PBPS_TEST_PG_OLD_DB"] {
+            let server = std::env::var(variable).expect(variable);
+            let mut conn = Conn::connect(Driver::Postgres, &server).await.unwrap();
+            conn.execute(&format!(
+                "CREATE TEMP TABLE pbps_591(k int); INSERT INTO {table} VALUES (0), (1), (2)"
+            ))
+            .await
+            .unwrap();
+            for (expression, expected) in &cases {
+                let sql = format!("SELECT {expression} AS n");
+                let rows = conn
+                    .query(&sql)
+                    .await
+                    .unwrap_or_else(|e| panic!("{variable}: {e}\n{sql}"));
+                assert_eq!(
+                    rows[0].try_get::<i32>("n").unwrap(),
+                    Some(*expected),
+                    "{variable}: {sql}"
+                );
+            }
+            let empty = stored_count(table, vec![value_literal("false")]);
+            let rows = conn
+                .query(&format!("SELECT {} AS n", saturated_count(&empty)))
+                .await
+                .unwrap();
+            assert_eq!(rows[0].try_get::<i32>("n").unwrap(), Some(0), "{variable}");
+        }
     }
 }
