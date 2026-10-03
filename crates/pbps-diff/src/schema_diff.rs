@@ -28,8 +28,8 @@ use pbps_model::change::DeleteCause;
 use pbps_model::data::cell;
 use pbps_model::{
     Cell, Change, ChangeSet, ColumnRef, ColumnType, DataMode, GrantTarget, Hints, IdsFile,
-    ModuleId, Permission, PlannedChange, PublicAccess, Renames, RoutineOrigin, Schema, Table,
-    TableName, Uid, Value,
+    ModuleId, Permission, PlannedChange, PublicAccess, Renames, ReplicaIdentity, RoutineOrigin,
+    Schema, Table, TableName, Uid, Value,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -395,6 +395,15 @@ fn diff_partial_rebuilding(
     recreate_retyped_dependents(base, declared, &renames, dialect, &mut changes);
     recreate_referenced_foreign_keys(base, declared, &renames, &mut changes);
     rebind_foreign_keys_to_a_new_occupant(base, declared, &mut changes);
+    // After every pass that drops and re-adds an index: each re-add of the
+    // identity's index loses the identity, and is followed by it again.
+    let early_identity = diff_replica_identity(
+        base.schema,
+        declared.schema,
+        declared_tables,
+        base_tables,
+        &mut changes,
+    );
 
     diff_modules(
         base.schema,
@@ -423,6 +432,7 @@ fn diff_partial_rebuilding(
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
@@ -465,6 +475,7 @@ fn diff_partial_rebuilding(
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
@@ -608,6 +619,7 @@ fn diff_partial_rebuilding(
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
@@ -652,6 +664,7 @@ fn diff_partial_rebuilding(
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
@@ -827,6 +840,15 @@ fn diff_partial_rebuilding(
     // applied, and a text scan here took one function for another (#1174
     // review), so the differ moves nothing for it.
     let sort_class = |c: &Change| -> (u8, usize) {
+        // A replica identity whose target stands before the plan is set
+        // first, under the table's old name: before the drops of class 2 can
+        // take its old index, which would leave the table identifying no row
+        // (DEC-1444.1).
+        if let Change::SetReplicaIdentity { uid, to, .. } = c
+            && early_identity.contains(&(uid.clone(), to.clone()))
+        {
+            return (0, 1);
+        }
         // A tightening of a table whose rows this plan writes or deletes runs
         // after them, at the end of the deletes' class: the rows may be what
         // fills or removes its NULLs, and no row change needs the column NOT
@@ -1236,7 +1258,8 @@ fn recreate_referenced_foreign_keys(
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => continue,
+            | Change::PublicExecution { .. }
+            | Change::SetReplicaIdentity { .. } => continue,
         };
         // PostgreSQL can bind a permutation of a composite candidate key.
         // SQL Server requires its order; a set conservatively covers both.
@@ -1497,6 +1520,7 @@ fn recreate_retyped_dependents(
         | Change::AlterColumnExpression { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::SetPrimaryKey { .. }
+        | Change::SetReplicaIdentity { .. }
         | Change::AddUnique { .. }
         | Change::DropUnique { .. }
         | Change::AddForeignKey { .. }
@@ -1776,6 +1800,7 @@ fn refuse_computed_dependencies(
                     | Change::DropComputedColumn { .. }
                     | Change::SetColumnDeprecated { .. }
                     | Change::SetPrimaryKey { .. }
+                    | Change::SetReplicaIdentity { .. }
                     | Change::AddUnique { .. }
                     | Change::DropUnique { .. }
                     | Change::AddForeignKey { .. }
@@ -1849,6 +1874,97 @@ fn diff_computed(name: &TableName, base: &Table, declared: &Table, changes: &mut
             });
         }
     }
+}
+
+/// A PostgreSQL table's replica identity, for each table on both sides
+/// (DEC-1444.1). Planned where it changes, and where the plan adds the object
+/// whose index it names, new or rebuilt: PostgreSQL lets that index be
+/// dropped and leaves the identity naming nothing, and an index created again
+/// under the same name is not the identity until it is set again (measured on
+/// 16 and 18, #1444).
+///
+/// Returns the changes, by table uid and target, that run before the plan's
+/// drops: those whose target the table can take as it stands, which is every
+/// target the plan does not add, when the columns it is over are NOT NULL
+/// already. The rest wait for the additions of class 13.
+///
+/// One that waits while the plan drops the old identity's index is preceded
+/// by `FULL`, which every table can take: between the drop and the final
+/// setting the table would otherwise identify no row, which the reader leaves
+/// out as unreadable, so a staged checkpoint there could not be resumed
+/// (#1467 review).
+fn diff_replica_identity(
+    base: &Schema,
+    declared: &Schema,
+    declared_tables: &BTreeMap<Uid, TableName>,
+    base_tables: &BTreeMap<Uid, TableName>,
+    changes: &mut Vec<Change>,
+) -> BTreeSet<(Uid, Option<ReplicaIdentity>)> {
+    let mut early = BTreeSet::new();
+    for (uid, declared_name) in declared_tables {
+        let Some(base_name) = base_tables.get(uid) else {
+            continue;
+        };
+        let (Some(was), Some(table)) = (
+            base.tables.get(base_name),
+            declared.tables.get(declared_name),
+        ) else {
+            continue;
+        };
+        let readded = changes.iter().any(|c| match (c, &table.replica_identity) {
+            (
+                Change::SetPrimaryKey {
+                    table: t,
+                    to: Some(_),
+                    ..
+                },
+                Some(ReplicaIdentity::PrimaryKey),
+            ) => t == declared_name,
+            (Change::AddUnique { table: t, name, .. }, Some(ReplicaIdentity::Unique(n)))
+            | (Change::AddIndex { table: t, name, .. }, Some(ReplicaIdentity::Index(n))) => {
+                t == declared_name && name == n
+            }
+            _ => false,
+        });
+        if was.replica_identity == table.replica_identity && !readded {
+            continue;
+        }
+        let mut probe = was.clone();
+        probe.replica_identity.clone_from(&table.replica_identity);
+        let now = !readded && probe.replica_identity_problems().is_empty();
+        let on = |t: &TableName| t == base_name || t == declared_name;
+        let old_index_dropped = changes.iter().any(|c| match (c, &was.replica_identity) {
+            (
+                Change::SetPrimaryKey {
+                    table: t,
+                    from: Some(_),
+                    ..
+                },
+                Some(ReplicaIdentity::PrimaryKey),
+            ) => on(t),
+            (Change::DropUnique { table: t, name }, Some(ReplicaIdentity::Unique(n)))
+            | (Change::DropIndex { table: t, name }, Some(ReplicaIdentity::Index(n))) => {
+                on(t) && name == n
+            }
+            _ => false,
+        });
+        if now {
+            early.insert((uid.clone(), table.replica_identity.clone()));
+        } else if old_index_dropped {
+            early.insert((uid.clone(), Some(ReplicaIdentity::Full)));
+            changes.push(Change::SetReplicaIdentity {
+                uid: uid.clone(),
+                table: base_name.clone(),
+                to: Some(ReplicaIdentity::Full),
+            });
+        }
+        changes.push(Change::SetReplicaIdentity {
+            uid: uid.clone(),
+            table: if now { base_name } else { declared_name }.clone(),
+            to: table.replica_identity.clone(),
+        });
+    }
+    early
 }
 
 fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &mut Vec<Change>) {
@@ -2490,6 +2606,9 @@ fn dependency_rank(
             clustered: true, ..
         } => -1,
         Change::SetPrimaryKey { .. } | Change::AddUnique { .. } | Change::AddIndex { .. } => 0,
+        // After every addition of its class, the index it names among them,
+        // and the foreign keys too: nothing in the class reads it.
+        Change::SetReplicaIdentity { .. } => 2,
         // A foreign key needs the key it references to exist, so it goes last
         // in the addition class and first in the drop class. Measured on the
         // pinned image, both halves are real: added before its key, the engine
@@ -3108,6 +3227,9 @@ fn order_key(c: &Change) -> u8 {
         | Change::AddForeignKey { .. }
         | Change::AddCheck { .. }
         | Change::AddIndex { .. } => 13,
+        // Late, it follows the index it names (DEC-1444.1); `sort_class`
+        // moves the rest to the front.
+        Change::SetReplicaIdentity { .. } => 13,
         Change::CreateModule { .. } | Change::AlterModule { .. } => 14,
         // A grant names an object, so it comes after every object exists —
         // and after the role does.
@@ -3845,6 +3967,116 @@ mod tests {
 
     /// A table with a key, a UNIQUE constraint and an index, clustered on
     /// whichever `layout` names (#1178).
+    /// `public.t` with unique indexes `ix_code` over a NOT NULL column and
+    /// `ix_v` over a nullable one, and the given identity.
+    fn identified_by(identity: Option<pbps_model::ReplicaIdentity>) -> Table {
+        let unique_on = |column: &str| Index {
+            columns: vec![IndexColumn {
+                key: pbps_model::IndexKey::Column(column.into()),
+                descending: false,
+                opclass: None,
+            }],
+            include: Vec::new(),
+            unique: true,
+            filter: None,
+            method: Default::default(),
+        };
+        let mut t = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("code", Column::new(ty("int")).not_null()),
+            ("v", Column::new(ty("int"))),
+        ]);
+        t.indexes.insert("ix_code".into(), unique_on("code"));
+        t.indexes.insert("ix_v".into(), unique_on("v"));
+        t.replica_identity = identity;
+        t
+    }
+
+    /// The order of a plan's replica identity against its index changes, by
+    /// the rule of DEC-1444.1: first, at (0, 1), where the table can take
+    /// the target as it stands, which is before the old identity's index is
+    /// dropped; last in class 13 where the plan adds the index it names, new
+    /// or rebuilt, or makes its columns NOT NULL. Unchanged and not rebuilt,
+    /// it is not planned at all.
+    #[test]
+    fn a_replica_identity_is_set_before_its_old_index_goes_and_after_its_new_one_comes() {
+        use pbps_model::ReplicaIdentity as R;
+        let shown = |cs: &ChangeSet| -> Vec<String> {
+            cs.changes
+                .iter()
+                .map(|p| match &p.change {
+                    Change::SetReplicaIdentity { table, to, .. } => format!(
+                        "identity {table} {}",
+                        to.as_ref()
+                            .map_or("default".to_owned(), ToString::to_string)
+                    ),
+                    Change::AddIndex { name, .. } => format!("add {name}"),
+                    Change::DropIndex { name, .. } => format!("drop {name}"),
+                    Change::AlterColumnNullability { column, .. } => {
+                        format!("tighten {}", column.name)
+                    }
+                    other => format!("{other:?}"),
+                })
+                .collect()
+        };
+        let plan = |was: Table, now: Table| {
+            shown(&run(
+                &schema_of("public.t", was),
+                &schema_of("public.t", now),
+                &[],
+            ))
+        };
+
+        // The old identity's index is dropped: the identity moves first.
+        let mut gone = identified_by(Some(R::Full));
+        gone.indexes.remove("ix_code");
+        assert_eq!(
+            plan(identified_by(Some(R::Index("ix_code".into()))), gone),
+            ["identity public.t full", "drop ix_code"]
+        );
+
+        // Its index rebuilt: FULL first, which the table can always take,
+        // so no read between the drop and the add finds it identifying no
+        // row; then dropped, added, and the identity set again (#1467
+        // review).
+        let mut rebuilt = identified_by(Some(R::Index("ix_code".into())));
+        rebuilt.indexes.get_mut("ix_code").unwrap().columns[0].descending = true;
+        assert_eq!(
+            plan(identified_by(Some(R::Index("ix_code".into()))), rebuilt),
+            [
+                "identity public.t full",
+                "drop ix_code",
+                "add ix_code",
+                "identity public.t {index: ix_code}"
+            ]
+        );
+
+        // A new index, and one over a column this plan makes NOT NULL: after.
+        let mut new = identified_by(Some(R::Index("ix_new".into())));
+        new.indexes
+            .insert("ix_new".into(), new.indexes["ix_code"].clone());
+        assert_eq!(
+            plan(identified_by(None), new),
+            ["add ix_new", "identity public.t {index: ix_new}"]
+        );
+        let mut tightened = identified_by(Some(R::Index("ix_v".into())));
+        tightened.columns.get_mut("v").unwrap().nullable = false;
+        assert_eq!(
+            plan(identified_by(None), tightened),
+            ["tighten v", "identity public.t {index: ix_v}"]
+        );
+
+        // Negative: unchanged and not rebuilt, nothing is planned; a change
+        // elsewhere in the table does not restate it.
+        let mut elsewhere = identified_by(Some(R::Index("ix_code".into())));
+        elsewhere.indexes.get_mut("ix_v").unwrap().columns[0].descending = true;
+        assert_eq!(
+            plan(identified_by(Some(R::Index("ix_code".into()))), elsewhere),
+            ["drop ix_v", "add ix_v"]
+        );
+        assert!(plan(identified_by(Some(R::Full)), identified_by(Some(R::Full))).is_empty());
+    }
+
     fn clustered_on(layout: Option<pbps_model::Clustered>) -> Table {
         let mut t = table(&[
             ("id", Column::new(ty("int")).not_null()),

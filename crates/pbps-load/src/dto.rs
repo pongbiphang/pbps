@@ -332,6 +332,13 @@ pub struct TableDto {
     #[serde(default)]
     pub clustered: Option<ClusteredDto>,
 
+    /// What logical replication carries to name an old row, on PostgreSQL:
+    /// `full`, `nothing`, `primary_key`, `{unique: <constraint>}` or
+    /// `{index: <index>}`. Absent means the default: the primary key, or
+    /// nothing without one.
+    #[serde(default)]
+    pub replica_identity: Option<ReplicaIdentityDto>,
+
     /// Declared reference data (ADR-0004). Absent on almost every table: it is
     /// the opt-in that lets the tool touch rows at all.
     #[serde(default)]
@@ -465,6 +472,23 @@ pub enum PrimaryKeyDto {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClusteredDto {
     Heap,
+    Unique(String),
+    Index(String),
+}
+
+// A mirror of `pbps_model::ReplicaIdentity`, for the reason `ClusteredDto`
+// is one, and tagged by kind for the same reason.
+
+/// A PostgreSQL replica identity other than the default: every old column
+/// (`full`), none (`nothing`), or the index of the primary key
+/// (`primary_key`), of the named UNIQUE constraint (`{unique: <name>}`) or
+/// the named unique index (`{index: <name>}`).
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReplicaIdentityDto {
+    Full,
+    Nothing,
+    PrimaryKey,
     Unique(String),
     Index(String),
 }

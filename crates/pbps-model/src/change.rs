@@ -22,8 +22,8 @@ use crate::module::{Module, ModuleId, ModuleKind, ObjectName, RoutineId};
 use crate::name::{ColumnRef, TableName};
 use crate::role::{GrantTarget, Permission};
 use crate::schema::{
-    CheckConstraint, Collation, Column, ComputedColumn, ForeignKey, Index, PrimaryKey, Table,
-    UniqueConstraint,
+    CheckConstraint, Collation, Column, ComputedColumn, ForeignKey, Index, PrimaryKey,
+    ReplicaIdentity, Table, UniqueConstraint,
 };
 use crate::strategy::Strategy;
 use crate::types::ColumnType;
@@ -302,6 +302,16 @@ pub enum Change {
         uid: Uid,
         column: ColumnRef,
         reason: Option<String>,
+    },
+
+    /// A PostgreSQL table's replica identity (#1444): `ALTER TABLE …
+    /// REPLICA IDENTITY …`, with `None` for `DEFAULT`. Planned where the
+    /// declared identity differs from the database's, and again wherever the
+    /// plan re-adds the index it names, which a drop loses (DEC-1444.1).
+    SetReplicaIdentity {
+        uid: Uid,
+        table: TableName,
+        to: Option<ReplicaIdentity>,
     },
 
     // Constraints and indexes are always drop + add, never modified in place —
@@ -1013,6 +1023,7 @@ impl Change {
             Change::AddColumn { table, .. }
             | Change::RenameColumn { table, .. }
             | Change::SetPrimaryKey { table, .. }
+            | Change::SetReplicaIdentity { table, .. }
             | Change::AddUnique { table, .. }
             | Change::DropUnique { table, .. }
             | Change::AddForeignKey { table, .. }
@@ -1085,6 +1096,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
@@ -1195,6 +1207,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
@@ -1256,6 +1269,7 @@ impl Change {
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
@@ -1358,6 +1372,7 @@ impl Change {
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
@@ -1414,6 +1429,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
@@ -1488,6 +1504,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
@@ -1539,6 +1556,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
@@ -1586,6 +1604,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
@@ -1674,6 +1693,7 @@ impl Change {
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
@@ -1732,6 +1752,7 @@ impl Change {
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
@@ -1873,7 +1894,8 @@ impl Change {
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => None,
+            | Change::PublicExecution { .. }
+            | Change::SetReplicaIdentity { .. } => None,
         }
     }
 
@@ -1900,6 +1922,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
@@ -1953,6 +1976,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
@@ -1994,6 +2018,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
             | Change::AddForeignKey { .. }
@@ -2169,7 +2194,11 @@ impl Change {
             | Change::InsertRow { .. }
             | Change::SetDataMode { .. }
             // Creating a role grants nothing by itself.
-            | Change::CreateRole { .. } => {}
+            | Change::CreateRole { .. }
+            // A replica identity changes what logical replication carries to
+            // name an old row, not a row or an access: no class here gates it
+            // (DEC-1444.1).
+            | Change::SetReplicaIdentity { .. } => {}
         }
         r
     }

@@ -438,6 +438,12 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
         // granted, which is the silent wrong answer
         // `DialectError::Unsupported` exists to prevent — and the decision to
         // *keep* a default this engine never grants is just as wrong a claim.
+        // `validate` refuses the field on this engine; a change that carries
+        // it anyway came from somewhere else and has no statement here.
+        Change::SetReplicaIdentity { table, .. } => Err(DialectError::Unsupported {
+            dialect: DIALECT,
+            feature: format!("a replica identity on `{table}`, which is PostgreSQL's"),
+        }),
         Change::PublicExecution { routine, .. } => Err(DialectError::Unsupported {
             dialect: DIALECT,
             feature: format!(

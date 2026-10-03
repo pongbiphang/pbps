@@ -128,6 +128,14 @@ impl Reconstruction {
                     let checks = std::mem::take(&mut bare.checks);
                     let indexes = std::mem::take(&mut bare.indexes);
                     let keys = std::mem::take(&mut bare.foreign_keys);
+                    // An identity on one of those indexes waits for it, as
+                    // in the resolver's own split (#1467 review).
+                    let identity = matches!(
+                        bare.replica_identity,
+                        Some(pbps_model::ReplicaIdentity::Index(_))
+                    )
+                    .then(|| bare.replica_identity.take())
+                    .flatten();
                     let mut defaults = Vec::new();
                     for (column, spec) in &mut bare.columns {
                         if let Some(default) = spec.default.take() {
@@ -219,6 +227,22 @@ impl Reconstruction {
                             None,
                         )?);
                     }
+                    // Over plain NOT NULL columns, so with the indexes of
+                    // `Keys` and after them.
+                    if identity.is_some() {
+                        steps.push(step(
+                            dialect,
+                            Phase::Keys,
+                            &format!("replica identity of {name}"),
+                            &Change::SetReplicaIdentity {
+                                uid: uid.clone(),
+                                table: name.clone(),
+                                to: identity,
+                            },
+                            Vec::new(),
+                            None,
+                        )?);
+                    }
                 }
                 Change::CreateModule { id, module } => {
                     // A trigger is named by nothing and names its function
@@ -265,6 +289,7 @@ impl Reconstruction {
                 | Change::AlterColumnExpression { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
+                | Change::SetReplicaIdentity { .. }
                 | Change::AddUnique { .. }
                 | Change::DropUnique { .. }
                 | Change::AddForeignKey { .. }

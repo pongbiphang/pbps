@@ -168,6 +168,14 @@ pub(super) fn changes(
                 let mut bare = (**table).clone();
                 let checks = std::mem::take(&mut bare.checks);
                 let indexes = std::mem::take(&mut bare.indexes);
+                // An identity on one of those indexes waits for it: the
+                // `CREATE` would set it before the index exists (#1444).
+                let identity = matches!(
+                    bare.replica_identity,
+                    Some(pbps_model::ReplicaIdentity::Index(_))
+                )
+                .then(|| bare.replica_identity.take())
+                .flatten();
                 let mut defaults = Vec::new();
                 for (column, spec) in &mut bare.columns {
                     if let Some(default) = spec.default.take() {
@@ -206,6 +214,13 @@ pub(super) fn changes(
                     name: index,
                     index: Box::new(spec),
                 }));
+                if identity.is_some() {
+                    parts.push(Change::SetReplicaIdentity {
+                        uid: uid.clone(),
+                        table: name.clone(),
+                        to: identity,
+                    });
+                }
                 parts
             }
             Change::AlterModule { id, module } if dialect.rebuilds_modules() => vec![

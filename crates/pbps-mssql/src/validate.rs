@@ -464,6 +464,12 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
     let mut errs = Vec::new();
     errs.extend(table.constraint_name_conflicts().into_iter().map(invalid));
     errs.extend(table.clustered_problems().into_iter().map(invalid));
+    if table.replica_identity.is_some() {
+        errs.push(invalid(
+            "`replica_identity` is a PostgreSQL logical-replication setting; SQL Server has no \
+             replica identity, so remove the line",
+        ));
+    }
 
     for part in [&name.schema, &name.name] {
         if let Err(e) = ident::quote(part) {
@@ -1075,6 +1081,29 @@ mod tests {
         let refused = found(&table);
         assert!(
             refused.iter().any(|m| m.contains("generated column")),
+            "{refused:?}"
+        );
+    }
+
+    /// A replica identity is PostgreSQL's, and is refused on SQL Server by
+    /// name; a table without one is unchanged (#1444).
+    #[test]
+    fn a_replica_identity_is_refused_on_sql_server() {
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("a".into(), Column::new("int".parse().unwrap()));
+        let found = |t: &Table| {
+            super::table(&"dbo.t".parse().unwrap(), t)
+                .into_iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(found(&table).is_empty());
+        table.replica_identity = Some(pbps_model::ReplicaIdentity::Full);
+        let refused = found(&table);
+        assert!(
+            refused.iter().any(|m| m.contains("`replica_identity`")),
             "{refused:?}"
         );
     }

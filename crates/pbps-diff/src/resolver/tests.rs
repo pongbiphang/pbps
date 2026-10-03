@@ -619,6 +619,159 @@ fn splitting_table_creation_preserves_the_declared_index_layout() {
     }
 }
 
+/// A created table's identity on one of its indexes is set after that index,
+/// which the split takes out of the `CREATE`; one on no index stays in the
+/// `CREATE` (#1444).
+#[test]
+fn splitting_table_creation_sets_an_index_identity_after_its_index() {
+    use pbps_model::{Hints, IdsFile, Index, IndexColumn, ReplicaIdentity, Schema};
+    for identity in [ReplicaIdentity::Index("ix".into()), ReplicaIdentity::Full] {
+        let base = Schema::default();
+        let old_ids = IdsFile::default();
+        let mut desired = tables();
+        for table in desired.tables.values_mut() {
+            table.columns.get_mut("id").unwrap().nullable = false;
+            table.indexes.insert(
+                "ix".into(),
+                Index {
+                    columns: vec![IndexColumn {
+                        key: pbps_model::IndexKey::Column("id".into()),
+                        descending: false,
+                        opclass: None,
+                    }],
+                    include: vec![],
+                    unique: true,
+                    filter: None,
+                    method: Default::default(),
+                },
+            );
+            table.replica_identity = Some(identity.clone());
+        }
+        let wanted_ids = ids(&desired, &old_ids);
+        let ordered = plan(
+            crate::Side {
+                schema: &base,
+                ids: &old_ids,
+            },
+            crate::Side {
+                schema: &desired,
+                ids: &wanted_ids,
+            },
+            &Hints::default(),
+            &[],
+            &pbps_dialect::MinimalDialect,
+        )
+        .unwrap();
+        let steps = &ordered.changes.changes;
+        for name in ["app.a", "app.z"] {
+            let name: pbps_model::TableName = name.parse().unwrap();
+            let created = steps.iter().find_map(|p| {
+                if let Change::CreateTable { name: n, table, .. } = &p.change
+                    && *n == name
+                {
+                    Some(table)
+                } else {
+                    None
+                }
+            });
+            let set = steps.iter().position(
+                |p| matches!(&p.change, Change::SetReplicaIdentity { table, .. } if *table == name),
+            );
+            let index = steps.iter().position(
+                |p| matches!(&p.change, Change::AddIndex { table, .. } if *table == name),
+            );
+            if identity == ReplicaIdentity::Full {
+                assert_eq!(
+                    created.unwrap().replica_identity,
+                    Some(ReplicaIdentity::Full)
+                );
+                assert_eq!(set, None, "{steps:#?}");
+            } else {
+                assert_eq!(created.unwrap().replica_identity, None);
+                assert!(index.unwrap() < set.unwrap(), "{steps:#?}");
+            }
+        }
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+}
+
+/// An existing table's identity moved off an index the plan drops is set
+/// before the drop, as the differ ordered it, and one moved to an index the
+/// plan adds after the add: the resolver keeps both (#1444).
+#[test]
+fn a_replica_identity_keeps_its_order_against_its_tables_indexes() {
+    use pbps_model::{Hints, Index, IndexColumn, ReplicaIdentity, Schema};
+    let unique_on_id = || Index {
+        columns: vec![IndexColumn {
+            key: pbps_model::IndexKey::Column("id".into()),
+            descending: false,
+            opclass: None,
+        }],
+        include: vec![],
+        unique: true,
+        filter: None,
+        method: Default::default(),
+    };
+    let with = |index: &str, identity: Option<ReplicaIdentity>| {
+        let mut schema = tables();
+        for table in schema.tables.values_mut() {
+            table.columns.get_mut("id").unwrap().nullable = false;
+            table.indexes.insert(index.into(), unique_on_id());
+            table.replica_identity = identity.clone();
+        }
+        schema
+    };
+    let order = |base: &Schema, desired: &Schema| -> Vec<String> {
+        let base_ids = ids(base, &pbps_model::IdsFile::default());
+        let wanted_ids = ids(desired, &base_ids);
+        let ordered = plan(
+            crate::Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            crate::Side {
+                schema: desired,
+                ids: &wanted_ids,
+            },
+            &Hints::default(),
+            &[],
+            &pbps_dialect::MinimalDialect,
+        )
+        .unwrap();
+        ordered.proof.validate(&ordered.changes).unwrap();
+        ordered
+            .changes
+            .changes
+            .iter()
+            .filter(|p| p.change.table() == Some(&"app.a".parse().unwrap()))
+            .map(|p| {
+                if let Change::AddIndex { name, .. } = &p.change {
+                    format!("add {name}")
+                } else if let Change::DropIndex { name, .. } = &p.change {
+                    format!("drop {name}")
+                } else if matches!(p.change, Change::SetReplicaIdentity { .. }) {
+                    "identity".to_owned()
+                } else {
+                    format!("{:?}", p.change)
+                }
+            })
+            .collect()
+    };
+    let old = with("ix_old", Some(ReplicaIdentity::Index("ix_old".into())));
+    assert_eq!(
+        order(&old, &with("ix_new", Some(ReplicaIdentity::Full))),
+        ["identity", "drop ix_old", "add ix_new"]
+    );
+    assert_eq!(
+        order(
+            &old,
+            &with("ix_new", Some(ReplicaIdentity::Index("ix_new".into())))
+        ),
+        // FULL in between, while neither index is there.
+        ["identity", "drop ix_old", "add ix_new", "identity"]
+    );
+}
+
 #[test]
 fn new_table_indexes_are_offline_while_existing_table_indexes_keep_the_requested_strategy() {
     use pbps_model::{Hints, IdsFile, Index, IndexColumn, Schema, Strategy};

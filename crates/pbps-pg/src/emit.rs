@@ -51,8 +51,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use pbps_dialect::{Created, DialectError, Statement};
 use pbps_model::{
     Cell, Change, Column, ColumnType, ForeignKey, GrantTarget, Index, Module, ModuleId, ModuleKind,
-    Permission, PrimaryKey, PublicAccess, ReferentialAction, RoutineArg, Row, RowKey, Strategy,
-    Table, TableName, UniqueConstraint, Value,
+    Permission, PrimaryKey, PublicAccess, ReferentialAction, ReplicaIdentity, RoutineArg, Row,
+    RowKey, Strategy, Table, TableName, UniqueConstraint, Value,
 };
 
 use crate::types::DIALECT;
@@ -2301,6 +2301,9 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         // rather than a statement that pretends to do something.
         Change::SetColumnDeprecated { .. } => Ok(Vec::new()),
 
+        Change::SetReplicaIdentity { table, to, .. } => {
+            one(pg, table, set_replica_identity(table, to.as_ref())?)
+        }
         Change::SetPrimaryKey {
             table,
             from,
@@ -2810,7 +2813,57 @@ fn create_table(pg: &Postgres, name: &TableName, table: &Table) -> Sql {
             &create_index(name, n, idx, Strategy::default())?,
         )?);
     }
+    // Last: the index it may name is the last statement above (#1444).
+    if table.replica_identity.is_some() {
+        out.push(on(
+            pg,
+            name,
+            &set_replica_identity(name, table.replica_identity.as_ref())?,
+        )?);
+    }
     Ok(out)
+}
+
+/// `ALTER TABLE … REPLICA IDENTITY …` (#1444, DEC-1444.1).
+///
+/// The primary key's index is found when the statement runs, by a `DO`
+/// block, for the reason [`drop_primary_key`] gives: an unnamed key's index
+/// is named by the server, `_pkey` or `_pkey1` after a collision, and a
+/// pulled one carries no name. A table with no key there formats a NULL
+/// identifier, which the engine refuses, rather than setting nothing.
+fn set_replica_identity(
+    table: &TableName,
+    to: Option<&ReplicaIdentity>,
+) -> Result<String, DialectError> {
+    let q = qualified(table)?;
+    Ok(match to {
+        None => format!("ALTER TABLE {q} REPLICA IDENTITY DEFAULT;"),
+        Some(ReplicaIdentity::Full) => format!("ALTER TABLE {q} REPLICA IDENTITY FULL;"),
+        Some(ReplicaIdentity::Nothing) => format!("ALTER TABLE {q} REPLICA IDENTITY NOTHING;"),
+        // A UNIQUE constraint's index carries the constraint's name.
+        Some(ReplicaIdentity::Unique(n) | ReplicaIdentity::Index(n)) => format!(
+            "ALTER TABLE {q} REPLICA IDENTITY USING INDEX {};",
+            quote(n)?
+        ),
+        // Both interpolations in literal position, as in `drop_primary_key`.
+        Some(ReplicaIdentity::PrimaryKey) => {
+            let body = format!(
+                "DECLARE ix name := (SELECT i.relname FROM pg_catalog.pg_constraint k\n\
+                 \x20                    JOIN pg_catalog.pg_class i ON i.oid = k.conindid\n\
+                 \x20                    WHERE k.conrelid = {}::pg_catalog.regclass AND k.contype = 'p');\n\
+                 BEGIN\n\
+                 \x20   EXECUTE pg_catalog.format({}, ix);\n\
+                 END",
+                literal(&q),
+                literal(&format!(
+                    "ALTER TABLE {} REPLICA IDENTITY USING INDEX %I",
+                    q.replace('%', "%%")
+                ))
+            );
+            let tag = dollar_tag(&body);
+            format!("DO {tag}\n{body}\n{tag};")
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3526,6 +3579,114 @@ mod tests {
     /// A layout only SQL Server has reaches this emitter only by a path that
     /// skipped `validate`; it is refused, never emitted as an ordinary key or
     /// index (#1178). The same changes without it emit as before.
+    /// Each identity spells its statement. The primary key's index is found
+    /// by a `DO` block when it runs, as an unnamed key's drop is, and a name
+    /// that would close the dollar quote cannot (#1444). A created table sets
+    /// its identity last, after the index it names.
+    #[test]
+    fn every_replica_identity_spells_its_statement() {
+        use pbps_model::ReplicaIdentity as R;
+        let pg = Postgres::new();
+        let table = name("app", "t");
+        let set = |to: Option<R>| {
+            sql_of(
+                &pg,
+                &Change::SetReplicaIdentity {
+                    uid: "t_000000".parse().unwrap(),
+                    table: table.clone(),
+                    to,
+                },
+            )
+            .join("\n")
+        };
+        for (to, says) in [
+            (None, "ALTER TABLE \"app\".\"t\" REPLICA IDENTITY DEFAULT;"),
+            (
+                Some(R::Full),
+                "ALTER TABLE \"app\".\"t\" REPLICA IDENTITY FULL;",
+            ),
+            (
+                Some(R::Nothing),
+                "ALTER TABLE \"app\".\"t\" REPLICA IDENTITY NOTHING;",
+            ),
+            (
+                Some(R::Index("t ix".into())),
+                "ALTER TABLE \"app\".\"t\" REPLICA IDENTITY USING INDEX \"t ix\";",
+            ),
+            (
+                Some(R::Unique("t_uq".into())),
+                "ALTER TABLE \"app\".\"t\" REPLICA IDENTITY USING INDEX \"t_uq\";",
+            ),
+        ] {
+            let sql = set(to.clone());
+            assert!(sql.contains(says), "{to:?}: {sql}");
+        }
+        let key = set(Some(R::PrimaryKey));
+        assert!(key.contains("DO $pbps$"), "{key}");
+        assert!(key.contains("k.contype = 'p'"), "{key}");
+        assert!(key.contains("REPLICA IDENTITY USING INDEX %I"), "{key}");
+        // A table whose name holds the tag picks another one.
+        let odd = sql_of(
+            &pg,
+            &Change::SetReplicaIdentity {
+                uid: "t_000000".parse().unwrap(),
+                table: name("app", "x$pbps$y"),
+                to: Some(R::PrimaryKey),
+            },
+        )
+        .join("\n");
+        assert!(odd.contains("DO $pbps1$"), "{odd}");
+
+        let mut created = Table::default();
+        created
+            .columns
+            .insert("id".into(), Column::new(ty("integer")).not_null());
+        created.indexes.insert(
+            "t_ix".into(),
+            pbps_model::Index {
+                columns: vec![IndexColumn {
+                    key: pbps_model::IndexKey::Column("id".into()),
+                    descending: false,
+                    opclass: None,
+                }],
+                include: vec![],
+                unique: true,
+                filter: None,
+                method: Default::default(),
+            },
+        );
+        created.replica_identity = Some(R::Index("t_ix".into()));
+        let create = sql_of(
+            &pg,
+            &Change::CreateTable {
+                uid: "t_000000".parse().unwrap(),
+                name: table.clone(),
+                table: Box::new(created.clone()),
+            },
+        );
+        let at = |needle: &str| {
+            create
+                .iter()
+                .position(|s| s.contains(needle))
+                .expect(needle)
+        };
+        assert!(
+            at("CREATE UNIQUE INDEX") < at("REPLICA IDENTITY USING INDEX"),
+            "{create:?}"
+        );
+        // Negative: the default writes no statement.
+        created.replica_identity = None;
+        let plain = sql_of(
+            &pg,
+            &Change::CreateTable {
+                uid: "t_000000".parse().unwrap(),
+                name: table,
+                table: Box::new(created),
+            },
+        );
+        assert!(!plain.join("\n").contains("REPLICA IDENTITY"), "{plain:?}");
+    }
+
     #[test]
     fn a_clustered_or_nonclustered_change_is_refused_here() {
         let pg = Postgres::new();

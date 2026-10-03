@@ -377,6 +377,7 @@ impl Unchecked {
             Change::AddColumn { table, name, .. } => {
                 format!("new NOT NULL column {}", table.column(name))
             }
+            Change::SetReplicaIdentity { table, .. } => format!("replica identity of {table}"),
             Change::AlterColumnNullability { column, .. } => format!("NOT NULL column {column}"),
             Change::AddComputedColumn { table, name, .. } => {
                 format!("new computed column {}", table.column(name))

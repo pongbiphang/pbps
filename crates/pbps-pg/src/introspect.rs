@@ -63,7 +63,7 @@ use std::str::FromStr;
 use pbps_model::{
     CheckConstraint, Column, ColumnRef, ColumnType, ForeignKey, Identity, Index, IndexColumn,
     IndexMethod, Module, ModuleId, ModuleKind, ObjectName, PrimaryKey, ReferentialAction,
-    RoutineArg, RoutineId, Table, TableName, UniqueConstraint,
+    ReplicaIdentity, RoutineArg, RoutineId, Table, TableName, UniqueConstraint,
 };
 
 use crate::types;
@@ -80,6 +80,11 @@ pub struct RawTable {
     pub oid: i64,
     pub schema: String,
     pub name: String,
+    /// `relreplident`: `d` default, `f` full, `n` nothing, `i` an index.
+    pub replica_identity: char,
+    /// The index marked `indisreplident`, for `i`. The reader leaves out a
+    /// table with `i` and no such index (#1444).
+    pub identity_index: Option<i64>,
 }
 
 /// One module, with the text this engine deparses for it.
@@ -774,6 +779,13 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             }
         }
 
+        table.replica_identity =
+            replica_identity(raw_table, &raw.constraints, &raw.indexes, &table).unwrap_or_else(
+                |detail| {
+                    note(&mut pulled, &name, detail);
+                    None
+                },
+            );
         pulled.schema.tables.insert(name, table);
     }
 
@@ -1853,6 +1865,67 @@ fn survives_the_declaration(ty: &ColumnType) -> bool {
 /// one a plan that recreates an identity would get.
 const DEFAULT_SEQUENCE_CACHE: i64 = 1;
 
+/// A table's replica identity, from `relreplident` and the index marked
+/// `indisreplident`, as the object of `table` that owns that index (#1444).
+///
+/// An identity on an index the pull left out is an error, which the caller
+/// notes, and never the default: the table would be read as identifying old
+/// rows by its key, and a plan from that reading would set it so.
+fn replica_identity(
+    raw_table: &RawTable,
+    constraints: &[RawConstraint],
+    indexes: &[RawIndex],
+    table: &Table,
+) -> Result<Option<ReplicaIdentity>, String> {
+    Ok(Some(match raw_table.replica_identity {
+        'd' => return Ok(None),
+        'f' => ReplicaIdentity::Full,
+        'n' => ReplicaIdentity::Nothing,
+        'i' => {
+            let oid = raw_table.identity_index;
+            // Only a key's or a unique constraint's own index: a foreign key's
+            // `conindid` is the index it references, which on a
+            // self-referencing table is this table's own key (#1467 review).
+            let owner = constraints.iter().find(|c| {
+                c.table_oid == raw_table.oid
+                    && matches!(c.kind, 'p' | 'u')
+                    && c.index_oid.is_some()
+                    && c.index_oid == oid
+            });
+            let identity = match owner {
+                Some(c) if c.kind == 'p' => ReplicaIdentity::PrimaryKey,
+                Some(c) => ReplicaIdentity::Unique(c.name.clone()),
+                None => match indexes.iter().find(|i| Some(i.oid) == oid) {
+                    Some(i) => ReplicaIdentity::Index(i.name.clone()),
+                    None => {
+                        return Err(
+                            "its `REPLICA IDENTITY` names an index this read cannot see".to_owned()
+                        );
+                    }
+                },
+            };
+            let held = match &identity {
+                ReplicaIdentity::PrimaryKey => table.primary_key.is_some(),
+                ReplicaIdentity::Unique(n) => table.unique.contains_key(n),
+                ReplicaIdentity::Index(n) => table.indexes.contains_key(n),
+                ReplicaIdentity::Full | ReplicaIdentity::Nothing => true,
+            };
+            if !held {
+                return Err(format!(
+                    "its `REPLICA IDENTITY` is `{identity}`, which this pull leaves out, so the \
+                     identity cannot be declared"
+                ));
+            }
+            identity
+        }
+        other => {
+            return Err(format!(
+                "its `relreplident` is `{other}`, which this reader does not know"
+            ));
+        }
+    }))
+}
+
 /// [`note`], for the arms that are expressions rather than blocks. Always
 /// `false`: a constraint that earns a warning here is one that was left out.
 fn note_false(pulled: &mut Pulled, table: &TableName, detail: String) -> bool {
@@ -2922,6 +2995,8 @@ mod tests {
                 oid: 10,
                 schema: "app".to_owned(),
                 name: "customer".to_owned(),
+                replica_identity: 'd',
+                identity_index: None,
             }],
             modules: vec![
                 RawModule {
@@ -3863,6 +3938,8 @@ mod tests {
                 oid: 11,
                 schema: "app".to_owned(),
                 name: "sales(archive)".to_owned(),
+                replica_identity: 'd',
+                identity_index: None,
             }],
             grants: vec![grant(
                 Some("app_reader"),
@@ -4176,6 +4253,8 @@ mod tests {
             oid,
             schema: "app".to_owned(),
             name: name.to_owned(),
+            replica_identity: 'd',
+            identity_index: None,
         }
     }
 
@@ -4506,6 +4585,85 @@ mod tests {
     /// An index this model cannot hold is named and left out, never quietly
     /// turned into an ordinary one — a `gin` index read back as a btree is a
     /// plan that drops it and builds the wrong thing.
+    /// The identity is read as the object owning the index the catalog marks
+    /// `indisreplident`: the key, a unique constraint, or an index, each by
+    /// its declared name; `f` and `n` as themselves; `d` as nothing to say
+    /// (#1444).
+    #[test]
+    fn a_replica_identity_is_read_as_the_object_owning_its_index() {
+        let catalog = |kind: char, identity_index: Option<i64>| {
+            let mut pk = constraint(1, "t_pk", 'p');
+            pk.columns = vec![1];
+            pk.index_oid = Some(50);
+            let mut uq = constraint(1, "t_uq", 'u');
+            uq.columns = vec![2];
+            uq.index_oid = Some(52);
+            let mut pk_ix = index(50, 1, "t_pk");
+            pk_ix.unique = true;
+            pk_ix.primary = true;
+            let mut uq_ix = index(52, 1, "t_uq");
+            uq_ix.unique = true;
+            uq_ix.columns = vec![2];
+            let mut ix = index(51, 1, "t_ix");
+            ix.unique = true;
+            let mut t = table(1, "t");
+            t.replica_identity = kind;
+            t.identity_index = identity_index;
+            RawCatalog {
+                tables: vec![t],
+                columns: vec![col(1, 1, "a", "integer"), col(1, 2, "b", "integer")],
+                constraints: vec![pk, uq],
+                indexes: vec![pk_ix, ix, uq_ix],
+                ..RawCatalog::default()
+            }
+        };
+        for (kind, index, expected) in [
+            ('d', None, None),
+            ('f', None, Some(ReplicaIdentity::Full)),
+            ('n', None, Some(ReplicaIdentity::Nothing)),
+            ('i', Some(50), Some(ReplicaIdentity::PrimaryKey)),
+            ('i', Some(52), Some(ReplicaIdentity::Unique("t_uq".into()))),
+            ('i', Some(51), Some(ReplicaIdentity::Index("t_ix".into()))),
+        ] {
+            let pulled = assemble(&catalog(kind, index));
+            assert!(
+                pulled.limitations.is_empty(),
+                "{kind} {index:?}: {:?}",
+                pulled.warnings
+            );
+            assert_eq!(only(&pulled).replica_identity, expected, "{kind} {index:?}");
+        }
+        // A self-referencing foreign key names the key's index too, and
+        // sorts first: the identity is still the key's (#1467 review).
+        let mut self_ref = catalog('i', Some(50));
+        let mut fk = constraint(1, "a_fk", 'f');
+        fk.columns = vec![2];
+        fk.ref_columns = vec![1];
+        fk.ref_table = Some(1);
+        fk.index_oid = Some(50);
+        self_ref.constraints.insert(0, fk);
+        let pulled = assemble(&self_ref);
+        assert_eq!(
+            only(&pulled).replica_identity,
+            Some(ReplicaIdentity::PrimaryKey)
+        );
+        // Negative: an index this read did not see, and one the pull left
+        // out, are named, never read as the default.
+        let pulled = assemble(&catalog('i', Some(99)));
+        assert_eq!(pulled.limitations.len(), 1);
+        assert_eq!(only(&pulled).replica_identity, None);
+        let mut left_out = catalog('i', Some(51));
+        left_out.indexes[1].method = "hash".to_owned();
+        let pulled = assemble(&left_out);
+        assert_eq!(pulled.limitations.len(), 2, "{:?}", pulled.warnings);
+        assert!(
+            pulled
+                .warnings
+                .iter()
+                .any(|w| w.contains("which this pull leaves out"))
+        );
+    }
+
     #[test]
     fn an_index_the_model_cannot_hold_is_named_and_left_out() {
         for (name, mutate) in [
