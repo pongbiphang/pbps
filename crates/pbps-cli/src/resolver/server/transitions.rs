@@ -452,7 +452,24 @@ pub(super) fn derive(
                     Some(Surface::Default(prior)),
                 )
             }
+            // A standalone index's parameters are its own row, as the model
+            // scopes them; a key's or unique constraint's are the table's.
+            Change::SetIndexStorageParameters {
+                table,
+                target: pbps_model::IndexPart::Index(name),
+                ..
+            } => (
+                Surface::Index {
+                    table: table.clone(),
+                    name: name.clone(),
+                },
+                false,
+                true,
+                true,
+                None,
+            ),
             Change::SetPrimaryKey { table, .. }
+            | Change::SetIndexStorageParameters { table, .. }
             | Change::SetReplicaIdentity { table, .. }
             | Change::SetStorageParameters { table, .. }
             | Change::AddUnique { table, .. }

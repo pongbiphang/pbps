@@ -2294,6 +2294,7 @@ fn a_child_dropped_after_its_tables_rename_keeps_its_opening_inventory() {
             unique: false,
             filter: None,
             method: Default::default(),
+            storage_parameters: Default::default(),
         },
     );
     let mut base = Schema::default();
@@ -4795,6 +4796,7 @@ async fn referenced_rename_case(column: bool) {
         parent_table.primary_key = Some(pbps_model::PrimaryKey {
             name: Some("p_pk".into()),
             columns: vec![key.into()],
+            storage_parameters: Default::default(),
         });
         let mut child_table = review_table();
         child_table.foreign_keys.insert(
@@ -4977,6 +4979,7 @@ async fn table_edit_case(edit: &str) {
         table.primary_key = Some(pbps_model::PrimaryKey {
             name: Some("t_pk".into()),
             columns: vec!["n".into()],
+            storage_parameters: Default::default(),
         });
         table.indexes.insert(
             "t_ix".into(),
@@ -4990,6 +4993,7 @@ async fn table_edit_case(edit: &str) {
                 unique: false,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
         let mut schema = Schema::default();
@@ -5074,6 +5078,7 @@ async fn key_check_case(include_key: bool) {
         table.primary_key = Some(pbps_model::PrimaryKey {
             name: Some("t_named_pk".into()),
             columns: vec!["n".into()],
+            storage_parameters: Default::default(),
         });
     }
     table.checks.insert(
@@ -5269,6 +5274,7 @@ async fn unnamed_primary_key_case(new_table: bool) {
     keyed.primary_key = Some(pbps_model::PrimaryKey {
         name: None,
         columns: vec!["n".into()],
+        storage_parameters: Default::default(),
     });
     desired.tables.insert(table_name.clone(), keyed);
     let inputs = Inputs::from_pair((base, desired));
@@ -5443,6 +5449,7 @@ async fn adding_index_keeps_existing_table_metadata_and_sets_the_engine_index_fl
                 unique: false,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
     let inputs = Inputs::from_pair((base, desired));
