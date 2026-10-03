@@ -65,6 +65,7 @@ pub(super) fn column_ownership_schema() -> Schema {
             unique: false,
             filter: None,
             method: Default::default(),
+            storage_parameters: Default::default(),
         },
     );
     schema
@@ -149,6 +150,7 @@ pub(super) fn empty_cross_kind_pair() -> (Schema, Schema) {
             unique: false,
             filter: Some("id >= pbps_evidence1274.f()".into()),
             method: Default::default(),
+            storage_parameters: Default::default(),
         },
     );
     desired
@@ -224,6 +226,7 @@ pub(super) fn pair_with_cross_kind_surfaces() -> (Schema, Schema) {
             unique: false,
             filter: Some("c > f(1)".into()),
             method: Default::default(),
+            storage_parameters: Default::default(),
         },
     );
     base.tables

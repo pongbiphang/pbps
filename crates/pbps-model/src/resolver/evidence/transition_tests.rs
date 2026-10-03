@@ -1342,6 +1342,7 @@ fn aggregate_renames_require_owned_records_at_both_endpoints() {
             | Change::AddComputedColumn { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::SetStorageParameters { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::DropComputedColumn { .. }
             | Change::DropColumn { .. }
             | Change::AlterColumnType { .. }
@@ -1944,6 +1945,7 @@ mod inline_binding_floor {
                     unique: false,
                     filter,
                     method: Default::default(),
+                    storage_parameters: Default::default(),
                 },
             );
         }

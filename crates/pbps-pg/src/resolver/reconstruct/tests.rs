@@ -231,6 +231,7 @@ fn a_split_foreign_key_follows_every_table() {
     keyed.primary_key = Some(pbps_model::PrimaryKey {
         name: Some("p_pk".into()),
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
     let mut referencing = Table::default();
     referencing.columns.insert(
@@ -325,6 +326,7 @@ fn a_table_generating_from_a_declared_function_compiles_after_it() {
                 unique: false,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
         let mut plain = Table::default();
@@ -346,6 +348,7 @@ fn a_table_generating_from_a_declared_function_compiles_after_it() {
             "n_id".into(),
             pbps_model::UniqueConstraint {
                 columns: vec!["id".into()],
+                storage_parameters: Default::default(),
             },
         );
         let mut schema = Schema::default();

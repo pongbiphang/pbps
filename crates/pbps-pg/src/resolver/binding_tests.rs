@@ -399,6 +399,7 @@ async fn related_tables_compile_on_scratch_with_their_foreign_key() {
         parent.primary_key = Some(pbps_model::PrimaryKey {
             name: Some("p_pk".into()),
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         let mut child = pbps_model::Table::default();
         child.columns.insert(
