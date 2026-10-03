@@ -3061,6 +3061,32 @@ fn exact(
     (keep(&transition.before), keep(&transition.after))
 }
 
+/// `records` with `object` binding a call: a surface a candidate could
+/// change, which needs its verdict (the fixture's records bind nothing).
+fn with_binding(
+    records: &[pbps_pg::resolver::capture::BindingRecord],
+    object: &pbps_db::resolver::capture::ObjectIdentity,
+) -> Vec<pbps_pg::resolver::capture::BindingRecord> {
+    records
+        .iter()
+        .cloned()
+        .map(|mut record| {
+            if &record.object == object {
+                record.bindings.push(pbps_model::resolver::Binding {
+                    node: "FuncExpr".into(),
+                    path: vec!["expr".into()],
+                    target: pbps_db::resolver::capture::ObjectIdentity {
+                        class: "pg_proc".into(),
+                        name: vec!["app".into(), "f".into()],
+                        signature: vec![],
+                    },
+                });
+            }
+            record
+        })
+        .collect()
+}
+
 fn generation_objects(
     table: &pbps_model::TableName,
     column: &str,
@@ -3484,8 +3510,9 @@ fn existing_generated_surfaces_require_both_records_and_a_resolved_binding_verdi
             condition: "test binding is unqualified",
         }),
     ] {
+        let bound = with_binding(&records, &generated);
         assert!(matches!(
-            super::resolution::from_records(&schema, &schema, &records, &records, &verdict),
+            super::resolution::from_records(&schema, &schema, &bound, &bound, &verdict),
             Err(Error::Binding(_))
         ));
     }
@@ -3554,8 +3581,9 @@ fn a_created_surface_requires_its_candidate_verdict() {
             condition: "a same-named candidate on the target was not reconstructed on scratch",
         }),
     ] {
+        let bound = with_binding(&records, &generated);
         assert!(matches!(
-            super::resolution::from_records(&empty, &schema, &[], &records, &assessment(verdict)),
+            super::resolution::from_records(&empty, &schema, &[], &bound, &assessment(verdict)),
             Err(Error::Binding(_))
         ));
     }
@@ -3569,6 +3597,38 @@ fn a_created_surface_requires_its_candidate_verdict() {
         ),
         Err(Error::Binding(_))
     ));
+}
+
+/// A surface that binds nothing at creation, such as a routine whose string
+/// body binds only at run time, has no lookup a candidate could change, so
+/// the assessment gives it no verdict and resolution needs none: created or
+/// kept. One that binds something still needs its verdict.
+#[test]
+fn a_surface_binding_nothing_at_creation_needs_no_verdict() {
+    use pbps_pg::resolver::capture::{Assessment, Verdict};
+
+    let table = pbps_model::TableName::new("app", "t");
+    let schema = generation_schema(&table);
+    let records = generation_records(&table, "g");
+    let [_, generated, ..] = generation_objects(&table, "g");
+    let [_, ordinary, ..] = generation_objects(&table, "d");
+    let bindingless = records.clone();
+    let binding = with_binding(&records, &generated);
+    let empty = Schema::default();
+    for (base, opening, verdict) in [
+        (&empty, &[][..], Verdict::Created),
+        (&schema, &bindingless[..], Verdict::Unaffected),
+    ] {
+        let assessment = Assessment {
+            surfaces: BTreeMap::from([(ordinary.clone(), verdict)]),
+            ..Assessment::default()
+        };
+        super::resolution::from_records(base, &schema, opening, &bindingless, &assessment).unwrap();
+        assert!(matches!(
+            super::resolution::from_records(base, &schema, opening, &binding, &assessment),
+            Err(Error::Binding(_))
+        ));
+    }
 }
 
 /// The explicit ordered extra is an input to ordinary bootstrap, qualification,
