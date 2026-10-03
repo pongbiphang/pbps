@@ -333,6 +333,60 @@ async fn connected_estimates_keep_storage_and_identity_uncertainty_visible() {
     db.drop().await;
 }
 
+/// A filtered index can name the altered column only in its predicate, where
+/// `sys.index_columns` does not list it (#586). The estimate cannot see what
+/// the predicate reads without parsing it, so any filtered index on the table
+/// leaves the column work unknown; the row count, lock and blocking are still
+/// what the catalog says.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn predicate_only_filtered_indexes_keep_column_work_unknown() {
+    let mut db = TestDb::create("estimate_filter586").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.t(id int NOT NULL, v varchar(5) NULL); \
+             INSERT dbo.t VALUES(1, NULL),(2, 'x');",
+        )
+        .await
+        .unwrap();
+    let cs = ChangeSet {
+        changes: vec![retype("dbo.t", "v", "varchar(5)", "varchar(10)")],
+    };
+    for (context, measured) in [
+        ("", true),
+        ("CREATE INDEX ix ON dbo.t(id)", true),
+        (
+            "DROP INDEX ix ON dbo.t; CREATE INDEX ix ON dbo.t(id) WHERE v IS NOT NULL",
+            false,
+        ),
+        ("DROP INDEX ix ON dbo.t", true),
+    ] {
+        if !context.is_empty() {
+            db.conn.execute(context).await.unwrap();
+        }
+        let mut e = estimate::planned_estimates(&cs).pop().unwrap().1;
+        estimate::against(&mut db.conn, &mut e).await.unwrap();
+        if measured {
+            assert_eq!(
+                (e.rewrite, e.reads),
+                (Rewrite::No, Reads::Nothing),
+                "{context}"
+            );
+        } else {
+            assert!(matches!(e.rewrite, Rewrite::Unknown(_)), "{context}: {e:?}");
+            assert!(matches!(e.reads, Reads::Unknown(_)), "{context}: {e:?}");
+        }
+        assert_eq!(e.rows, Some(2), "{context}");
+        assert_eq!(e.rows_unknown, None, "{context}");
+        assert_eq!(
+            (e.lock, e.blocks),
+            ("Sch-M", "reads and writes"),
+            "{context}"
+        );
+    }
+    db.drop().await;
+}
+
 /// A layout change's two halves are estimated from what they do to the
 /// stored rows (#1178). Building the clustered index rewrites the table;
 /// dropping an index-backed object does only when the catalog says it is

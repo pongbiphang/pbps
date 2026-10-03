@@ -405,6 +405,13 @@ pub fn planned_estimates(changes: &ChangeSet) -> Vec<(usize, Estimate)> {
 
 // Catalog views suffice for the product. Diagnostic update/log counters belong
 // to the live measurement only, so planning needs no server-performance grant.
+//
+// Any filtered index counts as dependency context, whichever columns it lists:
+// a column read only in the predicate is absent from `sys.index_columns`, yet
+// the engine refuses to widen it while the index stands (5074 and 4922,
+// measured on 17.0.4075.5, #586). Which columns a predicate reads is not in
+// the catalog views without parsing `filter_definition`, so the whole table's
+// filters are treated as unmeasured.
 const SHAPE: &str = "\
 SELECT CONVERT(int, SERVERPROPERTY('ProductMajorVersion')) AS major,
        t.is_memory_optimized, t.temporal_type, c.column_id,
@@ -415,6 +422,7 @@ SELECT CONVERT(int, SERVERPROPERTY('ProductMajorVersion')) AS major,
                          THEN 1 ELSE 0 END) AS special_index,
        CONVERT(bit, CASE WHEN EXISTS (SELECT 1 FROM sys.index_columns i WHERE i.object_id=t.object_id AND i.column_id=c.column_id)
                           OR EXISTS (SELECT 1 FROM sys.check_constraints k WHERE k.parent_object_id=t.object_id)
+                          OR EXISTS (SELECT 1 FROM sys.indexes i WHERE i.object_id=t.object_id AND i.has_filter=1)
                           OR EXISTS (SELECT 1 FROM sys.foreign_key_columns f WHERE (f.parent_object_id=t.object_id AND f.parent_column_id=c.column_id)
                                       OR (f.referenced_object_id=t.object_id AND f.referenced_column_id=c.column_id))
                          THEN 1 ELSE 0 END) AS dependencies
