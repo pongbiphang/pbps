@@ -115,43 +115,77 @@ fn whole_bool(word: &str) -> Option<bool> {
     }
 }
 
-/// C's `strtol` with base 0, as PostgreSQL's `parse_int` calls it:
-/// surrounding whitespace, a sign, then `0x` hexadecimal, a leading `0`
-/// octal, or decimal, and nothing after.
+/// PostgreSQL's `parse_int`: C's `strtol` with base 0 (surrounding
+/// whitespace, a sign, then `0x` hexadecimal, a leading `0` octal, or
+/// decimal), and where that stops at `.`, `e` or `E`, the whole value read
+/// again as a real and rounded half to even, as `rint` does: `70.5` is 70
+/// and `7e1` is 70 (measured on 16 and 18, #1477 review).
 fn parse_int(value: &str) -> Option<i64> {
     let v = value.trim();
-    let (negative, digits) = match v.as_bytes().first()? {
+    let (integer, rest) = strtol(v)?;
+    if rest.is_empty() {
+        return Some(integer);
+    }
+    if !rest.starts_with(['.', 'e', 'E']) {
+        return None;
+    }
+    // A hexadecimal real (`0x46.0`) is `strtod`'s too; `parse_real` reads
+    // no hexadecimal, so such a value is refused rather than misread.
+    let real = parse_real(v)?.round_ties_even();
+    (real >= i64::MIN as f64 && real <= i64::MAX as f64).then_some(real as i64)
+}
+
+/// C's `strtol(…, 0)` over `v`: the value read and what follows it, or
+/// `None` where no digit was read or the value overflows.
+fn strtol(v: &str) -> Option<(i64, &str)> {
+    let (negative, unsigned) = match v.as_bytes().first()? {
         b'-' => (true, &v[1..]),
         b'+' => (false, &v[1..]),
         _ => (false, v),
     };
-    let magnitude = if let Some(hex) = digits
+    let hex = unsigned
         .strip_prefix("0x")
-        .or_else(|| digits.strip_prefix("0X"))
-    {
-        i64::from_str_radix(hex, 16).ok()?
-    } else if digits.len() > 1 && digits.starts_with('0') {
-        i64::from_str_radix(&digits[1..], 8).ok()?
-    } else {
-        // `from_str_radix` takes a sign; the sign was taken above.
-        if !digits.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        digits.parse::<i64>().ok()?
+        .or_else(|| unsigned.strip_prefix("0X"))
+        .filter(|h| h.starts_with(|c: char| c.is_ascii_hexdigit()));
+    let (radix, digits) = match hex {
+        Some(h) => (16, h),
+        None if unsigned.starts_with('0') => (8, unsigned),
+        None => (10, unsigned),
     };
-    Some(if negative { -magnitude } else { magnitude })
+    let end = digits
+        .find(|c: char| !c.is_digit(radix))
+        .unwrap_or(digits.len());
+    if end == 0 {
+        return None;
+    }
+    let mut magnitude: i64 = 0;
+    for c in digits[..end].chars() {
+        let d = i64::from(c.to_digit(radix)?);
+        magnitude = magnitude.checked_mul(i64::from(radix))?.checked_add(d)?;
+    }
+    Some((
+        if negative { -magnitude } else { magnitude },
+        &digits[end..],
+    ))
 }
 
-/// A decimal real, as `strtod` reads it. The hexadecimal and infinite forms
-/// `strtod` also takes are not read: no bound of these parameters admits
-/// infinity, and a hexadecimal one is left to fail where it is read, as a
-/// value this reader cannot spell.
+/// A decimal real, as `strtod` reads it, refused where `strtod` sets
+/// `ERANGE`: an overflow, and an underflow to zero or below the smallest
+/// normal value, which the engine refuses rather than reading as 0 (measured
+/// on 16 and 18, #1477 review). The hexadecimal and infinite forms `strtod`
+/// also takes are not read: no bound of these parameters admits infinity,
+/// and a hexadecimal one is left to fail where it is read, as a value this
+/// reader cannot spell.
 fn parse_real(value: &str) -> Option<f64> {
     let v = value.trim();
     if v.is_empty() || v.contains(['x', 'X', 'n', 'N', 'i', 'I']) {
         return None;
     }
-    v.parse::<f64>().ok().filter(|r| r.is_finite())
+    let real = v.parse::<f64>().ok().filter(|r| r.is_finite())?;
+    let mantissa = v.split(['e', 'E']).next().unwrap_or_default();
+    let written_nonzero = mantissa.contains(|c: char| ('1'..='9').contains(&c));
+    let underflow = (real == 0.0 && written_nonzero) || (real != 0.0 && !real.is_normal());
+    (!underflow).then_some(real)
 }
 
 #[cfg(test)]
@@ -190,6 +224,15 @@ mod tests {
                 &["0", "-0", "-0.0", "0e5"][..],
                 "0",
             ),
+            // An integer `strtol` stops short of at `.` or `e` is read again
+            // as a real and rounded half to even, as `parse_int` does:
+            // `70.5` is 70 (measured on 16 and 18, #1477 review).
+            (
+                "fillfactor",
+                &["70.0", "7e1", "70.5", "070.0", "69.5"][..],
+                "70",
+            ),
+            ("fillfactor", &["71.5"][..], "72"),
             (
                 "vacuum_index_cleanup",
                 &["on", "TRUE", "yes", "1"][..],
@@ -227,6 +270,13 @@ mod tests {
             ("autovacuum_vacuum_scale_factor", "inf"),
             ("autovacuum_vacuum_scale_factor", "0x1p-3"),
             ("vacuum_index_cleanup", "tr"),
+            // `strtod` underflow, which the engine refuses rather than reading
+            // as 0 (#1477 review).
+            ("autovacuum_vacuum_scale_factor", "1e-400"),
+            ("autovacuum_vacuum_scale_factor", "1e-320"),
+            // Neither a fraction nor an exponent where `strtol` stopped.
+            ("fillfactor", "70x"),
+            ("fillfactor", "08.5"),
         ] {
             assert!(canonical(name, value).is_err(), "{name}={value}");
         }

@@ -462,6 +462,28 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             )
         }
 
+        // Nothing is rebuilt or read; the lock is the strongest any of its
+        // parameters takes, measured on 16 and 18: `user_catalog_table`,
+        // set or reset, takes `AccessExclusiveLock`, every other listed
+        // parameter `ShareUpdateExclusiveLock` (#1477 review).
+        Change::SetStorageParameters {
+            table, set, reset, ..
+        } => {
+            let catalog =
+                set.contains_key("user_catalog_table") || reset.contains("user_catalog_table");
+            e(
+                format!("setting storage parameters of {table}"),
+                table,
+                Rewrite::No,
+                Reads::Nothing,
+                if catalog {
+                    Lock::AccessExclusive
+                } else {
+                    Lock::ShareUpdateExclusive
+                },
+            )
+        }
+
         // The case ADR-0012's Limits name outright: nothing is rebuilt and
         // every row is read anyway. Measured, 100,000 of them.
         Change::AlterColumnNullability {
@@ -686,7 +708,6 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         | Change::RenameRole { .. }
         | Change::Grant { .. }
         | Change::Revoke { .. }
-        | Change::SetStorageParameters { .. }
         | Change::SetReplicaIdentity { .. }
         | Change::PublicExecution { .. } => None,
     }
@@ -840,6 +861,40 @@ mod tests {
 
     fn tname(s: &str) -> TableName {
         s.parse().expect("a table name")
+    }
+
+    /// A storage parameter change rebuilds and reads nothing, and takes the
+    /// strongest lock among its parameters: `user_catalog_table` takes
+    /// `AccessExclusiveLock`, the rest `ShareUpdateExclusiveLock` (#1477
+    /// review).
+    #[test]
+    fn a_storage_parameter_change_takes_its_strongest_parameters_lock() {
+        let change = |set: &[&str], reset: &[&str]| Change::SetStorageParameters {
+            uid: "t_000000".parse().unwrap(),
+            table: tname("app.t"),
+            set: set
+                .iter()
+                .map(|k| ((*k).to_owned(), "true".to_owned()))
+                .collect(),
+            reset: reset.iter().map(|k| (*k).to_owned()).collect(),
+        };
+        let lock = |c: &Change| {
+            let e = estimate(c, Strategy::default()).expect("an estimate");
+            assert!(matches!(e.rewrite, Rewrite::No) && matches!(e.reads, Reads::Nothing));
+            e.lock
+        };
+        assert!(matches!(
+            lock(&change(&["autovacuum_enabled"], &["fillfactor"])),
+            Lock::ShareUpdateExclusive
+        ));
+        assert!(matches!(
+            lock(&change(&["user_catalog_table"], &[])),
+            Lock::AccessExclusive
+        ));
+        assert!(matches!(
+            lock(&change(&["autovacuum_enabled"], &["user_catalog_table"])),
+            Lock::AccessExclusive
+        ));
     }
 
     #[test]

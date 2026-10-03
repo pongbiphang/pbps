@@ -1869,8 +1869,12 @@ Measured on 16.15 and 18.6, alike:
 - `pg_class.reloptions` keeps the spelling it was given, and the engine
   parses it with C's rules: booleans by `parse_bool` (`of` is false, `o` is
   refused), integers by `strtol(…, 0)` (`070` is octal 56, `0x14` is 20,
-  `08` is refused), reals by `strtod`, and `vacuum_index_cleanup` takes
-  `auto` or a whole boolean word in any case.
+  `08` is refused) and, where that stops at `.` or `e`, again as a real
+  rounded half to even (`70.5` and `7e1` are 70), reals by `strtod`, which
+  refuses an underflow (`1e-320`) rather than reading 0, and
+  `vacuum_index_cleanup` takes `auto` or a whole boolean word in any case.
+- `user_catalog_table`, set or reset, takes `AccessExclusiveLock`; every
+  other listed parameter takes `ShareUpdateExclusiveLock`.
 - Out-of-range values and unknown names are refused by the engine.
 - `toast.*` parameters live on the TOAST relation's `reloptions`, without
   the prefix, and a table with no TOAST relation discards them silently.
@@ -1889,7 +1893,8 @@ is one `SetStorageParameters`, one `ALTER TABLE … SET (…), RESET (…)`, wit
 only what differs; a parameter left alone is not restated. One statement, so
 a staged read never finds half of it. Class 10, with the metadata: no
 statement reads one, and it runs under the table's final name. No risk
-class: none rewrites the table.
+class: none rewrites the table. Its cost estimate rebuilds and reads
+nothing, and names the strongest lock among its parameters (#1477 review).
 
 **Read.** What the model cannot declare is named, never dropped: a name
 outside the list, a value the engine's rules read but this reader cannot
