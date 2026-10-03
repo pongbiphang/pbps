@@ -442,6 +442,60 @@ async fn related_tables_compile_on_scratch_with_their_foreign_key() {
     }
 }
 
+/// A table whose generated column calls a declared function compiles on
+/// scratch after that function, as the ordinary plan creates it (DEC-1364.1),
+/// so even an unchanged schema reaches a verdict instead of failing to
+/// compile the table before its function exists.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_table_generating_from_a_declared_function_compiles_on_scratch() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let target = "
+            CREATE FUNCTION app.f(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1;
+            CREATE TABLE app.n (id integer, g integer GENERATED ALWAYS AS (app.f(id)) STORED);
+            CREATE VIEW app.v AS SELECT g FROM app.n;";
+        let mut table = pbps_model::Table::default();
+        table.columns.insert(
+            "id".into(),
+            pbps_model::Column::new("integer".parse().unwrap()),
+        );
+        let mut generated = pbps_model::Column::new("integer".parse().unwrap());
+        generated.generated = Some(pbps_model::Generated {
+            expression: "app.f(id)".into(),
+            stored: true,
+        });
+        table.columns.insert("g".into(), generated);
+        let declared = || {
+            Declared::default()
+                .function(
+                    "app.f(integer)",
+                    "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1",
+                )
+                .table("app.n", table.clone())
+                .view("app.v", "SELECT g FROM app.n")
+        };
+        let assessment = analyze(
+            &server,
+            "generated",
+            Case {
+                schemas: &["app"],
+                extras: &[],
+                target,
+                base: declared(),
+                desired: declared(),
+            },
+        )
+        .await
+        .unwrap_or_else(|refusal| panic!("{variable}: {refusal}"));
+        assert_eq!(
+            only(&assessment, "app", "v"),
+            Verdict::Unaffected,
+            "{variable}"
+        );
+    }
+}
+
 fn numeric_f() -> Declared {
     Declared::default().function(
         "app.f(numeric)",

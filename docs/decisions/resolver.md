@@ -936,6 +936,10 @@ the reading role changes no stored binding. A failed or cancelled compile ends
 the analysis; a second question needs a fresh run.
 
 
+*Amended by [DEC-1274.2](modules.md#dec-1274-2): a table whose generated column
+calls a declared function joins the modules phase after that function, and a
+foreign key naming it waits for the end of the modules.*
+
 <a id="dec-613-2"></a>
 
 **DEC-613.2. A binding verdict holds only where scratch reproduced every

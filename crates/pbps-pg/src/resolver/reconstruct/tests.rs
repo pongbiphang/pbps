@@ -288,6 +288,158 @@ fn a_split_foreign_key_follows_every_table() {
     );
 }
 
+/// A table whose generated column calls a declared function cannot have
+/// the column split out without changing its column order, so the table
+/// follows the function on scratch, as in the ordinary plan (DEC-1364.1):
+/// its plain index with it, a view naming it after it, and a foreign key
+/// naming it once every module exists. A table generating from nothing
+/// declared keeps its place, and a function that needs the table it is
+/// called from is refused by name.
+#[test]
+fn a_table_generating_from_a_declared_function_compiles_after_it() {
+    use pbps_model::{Column, ForeignKey, Generated, Index, IndexColumn, IndexKey, Module, Schema};
+    let generated = |expression: &str| {
+        let mut column = Column::new("integer".parse().unwrap());
+        column.generated = Some(Generated {
+            expression: expression.into(),
+            stored: true,
+        });
+        column
+    };
+    let schema = |reads_table: bool| {
+        let mut n = Table::default();
+        n.columns.insert(
+            "id".into(),
+            Column::new("integer".parse().unwrap()).not_null(),
+        );
+        n.columns.insert("g".into(), generated("app.f(id)"));
+        n.indexes.insert(
+            "n_ix".into(),
+            Index {
+                columns: vec![IndexColumn {
+                    key: IndexKey::Column("id".into()),
+                    descending: false,
+                    opclass: None,
+                }],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: Default::default(),
+            },
+        );
+        let mut plain = Table::default();
+        plain
+            .columns
+            .insert("id".into(), Column::new("integer".parse().unwrap()));
+        plain.columns.insert("g".into(), generated("id * 2"));
+        plain.foreign_keys.insert(
+            "plain_fk".into(),
+            ForeignKey {
+                columns: vec!["id".into()],
+                references_table: TableName::new("app", "n"),
+                references_columns: vec!["id".into()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+        n.unique.insert(
+            "n_id".into(),
+            pbps_model::UniqueConstraint {
+                columns: vec!["id".into()],
+            },
+        );
+        let mut schema = Schema::default();
+        schema.tables.insert(TableName::new("app", "n"), n);
+        schema.tables.insert(TableName::new("app", "plain"), plain);
+        let body = if reads_table {
+            "(integer) RETURNS integer LANGUAGE sql IMMUTABLE BEGIN ATOMIC SELECT count(*)::integer FROM app.n; END"
+        } else {
+            "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1"
+        };
+        schema.modules.insert(
+            "app.f(integer)".parse().unwrap(),
+            Module {
+                kind: ModuleKind::Function,
+                description: None,
+                definition: body.into(),
+            },
+        );
+        schema.modules.insert(
+            "app.v".parse().unwrap(),
+            Module {
+                kind: ModuleKind::View,
+                description: None,
+                definition: "SELECT g FROM app.n".into(),
+            },
+        );
+        schema
+    };
+    let bootstrap = |schema: &Schema| {
+        let ids = pbps_diff::resolve(
+            schema,
+            &pbps_model::IdsFile::default(),
+            &[],
+            &pbps_diff::Context {
+                operator: "1274-test".into(),
+                today: "2026-10-03".into(),
+            },
+        )
+        .unwrap()
+        .ids;
+        let empty = Schema::default();
+        pbps_diff::diff(
+            pbps_diff::Side {
+                schema: &empty,
+                ids: &pbps_model::IdsFile::default(),
+            },
+            pbps_diff::Side { schema, ids: &ids },
+            &crate::Postgres::new(),
+            &pbps_model::Hints::default(),
+        )
+        .unwrap()
+        .changes
+        .into_iter()
+        .map(|planned| planned.change)
+        .collect::<Vec<_>>()
+    };
+    let reconstruction =
+        Reconstruction::new(&crate::Postgres::new(), &bootstrap(&schema(false))).unwrap();
+    let order: Vec<_> = reconstruction
+        .steps
+        .iter()
+        .map(|step| (step.phase, step.declaration.as_str()))
+        .collect();
+    let at = |declaration: &str| {
+        order
+            .iter()
+            .position(|(_, d)| *d == declaration)
+            .unwrap_or_else(|| panic!("{declaration} missing from {order:?}"))
+    };
+    assert!(
+        at("function app.f(integer)") < at("table app.n"),
+        "{order:?}"
+    );
+    assert!(at("table app.n") < at("index n_ix on app.n"), "{order:?}");
+    assert!(at("table app.n") < at("view app.v"), "{order:?}");
+    let key = order
+        .iter()
+        .rposition(|(_, d)| *d == "table app.plain")
+        .unwrap();
+    assert!(
+        at("view app.v") < key,
+        "the key waits for every module: {order:?}"
+    );
+    assert_eq!(order[key].0, Phase::Modules, "{order:?}");
+    assert_eq!(
+        order[at("table app.plain")],
+        (Phase::Tables, "table app.plain")
+    );
+    assert_eq!(
+        Reconstruction::new(&crate::Postgres::new(), &bootstrap(&schema(true))).unwrap_err(),
+        ReconstructError::Cycle("table app.n".into())
+    );
+}
+
 /// A plan that drops, renames or alters is not a bootstrap, and building a
 /// namespace from one would reproduce neither side.
 #[test]
