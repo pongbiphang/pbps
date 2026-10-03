@@ -17480,6 +17480,166 @@ fn connected_plan_json_keeps_edition_warnings_without_duplicate_prose() {
     );
 }
 
+/// An online strategy the target's edition cannot run is an answered refusal,
+/// so connected JSON reports it as one finding, exit 2, and writes nothing
+/// (#574). The edition was read and said no; `plan.failed` would say the
+/// question could not be asked. The same declarations plan on an edition that
+/// has online index operations, and without the hint on this one.
+#[test]
+#[ignore = "needs SQL Server Express and an online-capable edition; set PBPS_TEST_EXPRESS_DB and PBPS_TEST_DB"]
+fn connected_plan_json_reports_unsupported_online_edition_as_a_finding() {
+    let express = std::env::var("PBPS_TEST_EXPRESS_DB").expect("PBPS_TEST_EXPRESS_DB is not set");
+    let capable = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let online = |connection: &str| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut conn = connect_live(connection).await.unwrap();
+                pbps_mssql::edition::edition(&mut conn)
+                    .await
+                    .unwrap()
+                    .supports_online()
+            })
+    };
+    assert!(
+        !online(&express),
+        "PBPS_TEST_EXPRESS_DB must lack online index operations"
+    );
+    assert!(
+        online(&capable),
+        "PBPS_TEST_DB must have online index operations"
+    );
+    let limited = OwnDatabase::new(&express, "online_edition");
+    let full = OwnDatabase::new(&capable, "online_edition");
+
+    let d = Demo::new("online-edition");
+    let table = |name: &str, online: bool| {
+        let strategy = if online {
+            "strategy:\n  online: true\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            d.dir.join(format!("schema/dbo.{name}.yml")),
+            format!(
+                "table: dbo.{name}\n{strategy}columns:\n  id: {{type: int, nullable: false}}\n\
+                 indexes:\n  ix_{name}_id:\n    columns: [id]\n"
+            ),
+        )
+        .unwrap();
+    };
+    for name in ["t", "u"] {
+        std::fs::write(
+            d.dir.join(format!("schema/dbo.{name}.yml")),
+            format!("table: dbo.{name}\ncolumns:\n  id: {{type: int, nullable: false}}\n"),
+        )
+        .unwrap();
+    }
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    for db in [&limited, &full] {
+        let o = d.run(&["bootstrap", "--db", db.connection()]);
+        assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    }
+    for name in ["t", "u"] {
+        table(name, true);
+    }
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+
+    let plan = d.dir.join("online-plan.json");
+    let sql = d.dir.join("online-plan.sql");
+    let connected = |connection: &str, json: bool| {
+        let mut args = vec![
+            "plan",
+            "--db",
+            connection,
+            "--out",
+            plan.to_str().unwrap(),
+            "--sql",
+            sql.to_str().unwrap(),
+        ];
+        if json {
+            args.extend(["--format", "json"]);
+        }
+        d.run(&args)
+    };
+    std::fs::write(&plan, "earlier plan").unwrap();
+    std::fs::write(&sql, "earlier sql").unwrap();
+    let untouched = || {
+        assert_eq!(std::fs::read_to_string(&plan).unwrap(), "earlier plan");
+        assert_eq!(std::fs::read_to_string(&sql).unwrap(), "earlier sql");
+    };
+
+    let o = connected(limited.connection(), true);
+    assert_eq!(code(&o), 2, "{}{}", stdout(&o), stderr(&o));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&o))
+        .unwrap_or_else(|e| panic!("one JSON document ({e}): {}", stdout(&o)));
+    assert_eq!(report["command"], "plan", "{report}");
+    assert_eq!(report["result"], "findings", "{report}");
+    let findings = report["findings"].as_array().unwrap();
+    let errors: Vec<_> = findings
+        .iter()
+        .filter(|f| f["severity"] == "error")
+        .collect();
+    assert_eq!(errors.len(), 1, "{report}");
+    let refusal = errors[0];
+    assert_eq!(refusal["id"], "plan.online-unsupported", "{report}");
+    let message = refusal["message"].as_str().unwrap();
+    for named in ["dbo.t", "dbo.u", "Express"] {
+        assert!(message.contains(named), "{named}: {message}");
+    }
+    assert!(
+        refusal["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("strategy: online"),
+        "{report}"
+    );
+    assert!(
+        !findings.iter().any(|f| f["id"] == "plan.failed"),
+        "{report}"
+    );
+    assert!(stderr(&o).is_empty(), "{}", stderr(&o));
+    untouched();
+
+    // Human output keeps its sentence and its exit.
+    let o = connected(limited.connection(), false);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("which has no online index operations"),
+        "{}",
+        stderr(&o)
+    );
+    untouched();
+
+    // An edition with online index operations plans the same declarations.
+    let o = connected(full.connection(), true);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(report["result"], "ok", "{report}");
+    assert!(
+        std::fs::read_to_string(&sql)
+            .unwrap()
+            .contains("ONLINE = ON"),
+        "{}",
+        std::fs::read_to_string(&sql).unwrap()
+    );
+
+    // And this one plans them without the hint.
+    for name in ["t", "u"] {
+        table(name, false);
+    }
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let o = connected(limited.connection(), true);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(report["result"], "ok", "{report}");
+}
+
 /// A declared child row the plan does not name stays where it is, and the
 /// parent delete that would take it out is refused — with a retype of both key
 /// endpoints in the same plan, and without (issue #502).
