@@ -406,6 +406,7 @@ impl Declared {
                 | Change::AlterColumnNullability { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
+                | Change::SetIndexStorageParameters { .. }
                 | Change::SetStorageParameters { .. }
                 | Change::SetReplicaIdentity { .. }
                 | Change::AddUnique { .. }
@@ -564,6 +565,7 @@ mod tests {
                 unique: false,
                 filter: Some("n > 0".to_owned()),
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
         table.indexes.insert(
@@ -578,6 +580,7 @@ mod tests {
                 unique: false,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
         table
@@ -627,6 +630,7 @@ mod tests {
             unique: false,
             filter: None,
             method: Default::default(),
+            storage_parameters: Default::default(),
         };
         let mut declared = schema();
         declared

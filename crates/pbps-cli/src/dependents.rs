@@ -648,7 +648,11 @@ pub(crate) fn weave(
             break;
         }
     }
-    Ok(cs.changes.len() - before)
+    let added = cs.changes.len() - before;
+    // A rebuild woven in here carries the index's declared parameters in its
+    // `CREATE`, as the differ's own do (#1483 review).
+    pbps_model::change::drop_parameter_changes_of_rebuilt_indexes(&mut cs.changes, |p| &p.change);
+    Ok(added)
 }
 
 fn is_generated(holds: &Holds) -> bool {
@@ -1569,6 +1573,7 @@ mod tests {
                 unique: filter.is_none(),
                 filter: filter.map(Into::into),
                 method: Default::default(),
+                storage_parameters: Default::default(),
             }),
             clustered: false,
         }
@@ -1648,6 +1653,7 @@ mod tests {
             name: format!("uq_{column}"),
             constraint: pbps_model::UniqueConstraint {
                 columns: vec![column.to_owned()],
+                storage_parameters: Default::default(),
             },
             clustered: false,
         };
@@ -1849,6 +1855,7 @@ mod tests {
                     unique: filter.is_none(),
                     filter: filter.map(Into::into),
                     method: Default::default(),
+                    storage_parameters: Default::default(),
                 },
             );
         }
@@ -2438,6 +2445,68 @@ mod tests {
         assert!(
             !moved(update("n", pbps_model::Cell::Default("app.f(1)".into()))),
             "an update that sets `n` back to its default"
+        );
+    }
+
+    /// An expression index the weave rebuilds around a function takes its
+    /// declared parameters in its `CREATE`, so a change to them the plan
+    /// carried is dropped: run beside the rebuild it would alter an index the
+    /// plan has dropped, and a staged checkpoint would refuse the plan (#1483
+    /// review).
+    #[test]
+    fn a_woven_index_rebuild_takes_over_its_parameter_change() {
+        let (mut s, ids) = declared();
+        let t = TableName::new("app", "t");
+        s.tables.get_mut(&t).unwrap().indexes.insert(
+            "ix_f".into(),
+            pbps_model::Index {
+                columns: vec![pbps_model::IndexColumn {
+                    key: pbps_model::IndexKey::Expression("app.f(id)".into()),
+                    descending: false,
+                    opclass: None,
+                }],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: Default::default(),
+                storage_parameters: [("fillfactor".to_owned(), "80".to_owned())].into(),
+            },
+        );
+        let parameters = Change::SetIndexStorageParameters {
+            table: t.clone(),
+            target: pbps_model::IndexPart::Index("ix_f".into()),
+            method: Default::default(),
+            set: [("fillfactor".to_owned(), "80".to_owned())].into(),
+            reset: Default::default(),
+        };
+        let mut cs = plan(vec![parameters, alter(&s, "app.f(integer)")]);
+        let found = BTreeMap::from([(
+            id("app.f(integer)"),
+            vec![part(
+                Part::Index("ix_f".into()),
+                "index ix_f on table app.t",
+            )],
+        )]);
+        weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).unwrap();
+        assert!(
+            !cs.changes
+                .iter()
+                .any(|p| matches!(p.change, Change::SetIndexStorageParameters { .. })),
+            "{:?}",
+            rendered(&cs)
+        );
+        let added = cs.changes.iter().find_map(|p| {
+            if let Change::AddIndex { index, .. } = &p.change {
+                Some(index.storage_parameters.clone())
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            added,
+            Some([("fillfactor".to_owned(), "80".to_owned())].into()),
+            "{:?}",
+            rendered(&cs)
         );
     }
 

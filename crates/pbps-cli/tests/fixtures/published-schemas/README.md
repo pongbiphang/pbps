@@ -50,3 +50,4 @@ DECISIONS 465).
 - `23/` adds a table's `computed:` (issue #1174).
 - `24/` adds a table's `replica_identity:` (issue #1444).
 - `25/` adds a table's `storage_parameters:` (issue #1441).
+- `26/` adds index, key and unique-constraint `storage_parameters:` (issue #1442).

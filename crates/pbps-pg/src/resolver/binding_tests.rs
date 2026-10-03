@@ -648,6 +648,7 @@ async fn every_covered_expression_surface_gets_the_engines_answer() {
                     unique: false,
                     filter: Some("c > f(1)".into()),
                     method: Default::default(),
+                    storage_parameters: Default::default(),
                 },
             );
             numeric_f()
@@ -1295,6 +1296,7 @@ async fn a_module_naming_an_index_is_refused_for_its_oid_alias_constant() {
                     unique: false,
                     filter: None,
                     method: Default::default(),
+                    storage_parameters: Default::default(),
                 },
             );
             Declared::default()
@@ -1694,6 +1696,7 @@ async fn a_later_object_of_another_kind_is_no_candidate() {
                     // A predicate keeps the index after every module.
                     filter: Some("c > 0".into()),
                     method: Default::default(),
+                    storage_parameters: Default::default(),
                 },
             );
             Declared::default()
@@ -1988,6 +1991,7 @@ async fn a_later_object_outside_the_path_is_no_candidate() {
                     // A predicate keeps the index after every module.
                     filter: Some("id > 0".into()),
                     method: Default::default(),
+                    storage_parameters: Default::default(),
                 },
             );
             Declared::default()
@@ -2371,6 +2375,7 @@ async fn a_managed_index_does_not_account_for_a_same_named_type() {
                     unique: false,
                     filter: None,
                     method: Default::default(),
+                    storage_parameters: Default::default(),
                 },
             );
             Declared::default()

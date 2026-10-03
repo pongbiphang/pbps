@@ -231,6 +231,7 @@ async fn throwing_signed_defaults_do_not_break_explicit_row_reads() {
         table.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         let read = |key| {
             pbps_mssql::rows::query(
@@ -321,6 +322,7 @@ async fn signed_defaults_are_compared_as_the_column_stores_them() {
         table.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         for (key, at_default) in [("1", false), ("2", true), ("3", default == "NULL")] {
             let query = pbps_mssql::rows::query(
@@ -413,6 +415,7 @@ async fn a_cell_the_columns_collation_calls_equal_to_its_default_is_still_drift(
     table.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
 
     for (key, at_default, stored) in [("a", false, "New"), ("b", true, "new")] {
@@ -492,6 +495,7 @@ async fn a_variant_that_renders_like_its_default_is_still_drift() {
     table.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
     for (key, at_default) in [("1", true), ("2", false)] {
         let query = pbps_mssql::rows::query(
@@ -564,6 +568,7 @@ async fn a_spatial_cell_whose_srid_alone_differs_from_its_default_is_still_drift
         table.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         for (key, at_default) in [("1", true), ("2", false)] {
             let query = pbps_mssql::rows::query(
@@ -653,6 +658,7 @@ async fn a_type_with_no_native_equality_is_read_back_against_its_default() {
         table.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         for (key, at_default) in [("1", true), ("2", false)] {
             let query = pbps_mssql::rows::query(
@@ -749,6 +755,7 @@ async fn an_unassignable_signed_default_is_unknown_not_null() {
         table.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         for key in ["1", "2"] {
             let query = pbps_mssql::rows::query(
@@ -1158,6 +1165,7 @@ fn rich_schema() -> Schema {
     region.primary_key = Some(PrimaryKey {
         name: Some("pk_region".into()),
         columns: vec!["region_id".into()],
+        storage_parameters: Default::default(),
     });
 
     let mut customer = Table::default();
@@ -1189,11 +1197,13 @@ fn rich_schema() -> Schema {
     customer.primary_key = Some(PrimaryKey {
         name: Some("pk_customer".into()),
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
     customer.unique.insert(
         "uq_customer_email".into(),
         UniqueConstraint {
             columns: vec!["email".into()],
+            storage_parameters: Default::default(),
         },
     );
     customer.foreign_keys.insert(
@@ -1232,6 +1242,7 @@ fn rich_schema() -> Schema {
             unique: false,
             filter: Some("[region_id] IS NOT NULL".into()),
             method: Default::default(),
+            storage_parameters: Default::default(),
         },
     );
 
@@ -1388,6 +1399,7 @@ async fn applying_a_planned_migration_converges_on_the_target() {
             "uq_customer_email".into(),
             UniqueConstraint {
                 columns: vec!["contact_email".into()],
+                storage_parameters: Default::default(),
             },
         );
         customer.columns["amount"].ty = ty("decimal(19,4)");
@@ -1408,6 +1420,7 @@ async fn applying_a_planned_migration_converges_on_the_target() {
                 unique: false,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
     }
@@ -2474,6 +2487,7 @@ async fn a_new_column_s_planned_values_are_keyed_under_its_collation() {
             "uq_t_label".into(),
             UniqueConstraint {
                 columns: vec!["label".into()],
+                storage_parameters: Default::default(),
             },
         );
         let row = |v: &str| {
@@ -2543,6 +2557,7 @@ async fn a_literal_is_converted_under_the_utf8_column_it_is_compared_with() {
         t.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["code".to_owned()],
+            storage_parameters: Default::default(),
         });
         // `tag` left to its default.
         t.data = Some(TableData {
@@ -2630,6 +2645,7 @@ async fn a_key_between_created_tables_is_probed_under_their_declared_collation()
         parent.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["code".to_owned()],
+            storage_parameters: Default::default(),
         });
         parent.data = Some(TableData {
             mode: DataMode::Exact,
@@ -2643,6 +2659,7 @@ async fn a_key_between_created_tables_is_probed_under_their_declared_collation()
         child.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["id".to_owned()],
+            storage_parameters: Default::default(),
         });
         child.foreign_keys.insert(
             "fk_c_p".into(),
@@ -2783,6 +2800,7 @@ async fn an_added_column_s_default_is_assigned_under_its_collation() {
         parent.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["code".to_owned()],
+            storage_parameters: Default::default(),
         });
         parent.data = Some(TableData {
             mode: DataMode::Exact,
@@ -2850,6 +2868,7 @@ async fn a_value_is_spelled_under_its_columns_collation() {
     t.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".to_owned()],
+        storage_parameters: Default::default(),
     });
     t.data = Some(TableData {
         mode: DataMode::Exact,
@@ -2931,6 +2950,7 @@ async fn a_key_of_a_type_with_no_collation_is_grouped_without_one() {
         t.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["code".to_owned()],
+            storage_parameters: Default::default(),
         });
         t.data = Some(TableData {
             mode: DataMode::Exact,
@@ -3031,6 +3051,7 @@ async fn a_clustered_key_meeting_an_undeclared_clustered_index_is_refused() {
                 to: Some(PrimaryKey {
                     name: Some("pk_s".into()),
                     columns: vec!["id".into()],
+                    storage_parameters: Default::default(),
                 }),
                 nonclustered: false,
             },
@@ -5055,6 +5076,7 @@ async fn preflight_probes_count_what_the_engine_would_refuse() {
                 name: "uq_customer_id".into(),
                 constraint: UniqueConstraint {
                     columns: vec!["id".into()],
+                    storage_parameters: Default::default(),
                 },
                 clustered: false,
             }),
@@ -5885,6 +5907,7 @@ async fn a_unique_index_is_probed_and_a_filtered_one_only_over_the_rows_it_keeps
             unique,
             filter: filter.map(str::to_owned),
             method: Default::default(),
+            storage_parameters: Default::default(),
         }),
         clustered: false,
     };
@@ -6035,6 +6058,7 @@ async fn a_filtered_predicate_reads_a_retyped_column_through_the_type_it_has_now
                         unique: true,
                         filter: Some("flag = '01'".into()),
                         method: Default::default(),
+                        storage_parameters: Default::default(),
                     }),
                     clustered: false,
                 }),
@@ -6078,6 +6102,7 @@ async fn a_key_probe_counts_the_rows_the_plan_will_leave() {
         name: "uq_email".into(),
         constraint: UniqueConstraint {
             columns: vec!["email".into()],
+            storage_parameters: Default::default(),
         },
         clustered: false,
     });
@@ -6165,6 +6190,7 @@ async fn probes_over_a_column_this_plan_adds_run_and_count_what_the_engine_refus
         name: "uq_region".into(),
         constraint: UniqueConstraint {
             columns: vec!["region_id".into()],
+            storage_parameters: Default::default(),
         },
         clustered: false,
     });
@@ -6705,6 +6731,7 @@ fn declared_table(mode: pbps_model::DataMode, columns: &[&str]) -> pbps_mssql::d
         primary_key: Some(pbps_model::schema::PrimaryKey {
             name: None,
             columns: vec!["code".to_owned()],
+            storage_parameters: Default::default(),
         }),
         data: Some(pbps_model::TableData {
             mode,
@@ -9109,6 +9136,7 @@ async fn reference_data_reaches_the_engine_in_an_order_it_accepts() {
     status.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".to_owned()],
+        storage_parameters: Default::default(),
     });
     status.data = Some(TableData {
         mode: DataMode::Exact,
@@ -9133,6 +9161,7 @@ async fn reference_data_reaches_the_engine_in_an_order_it_accepts() {
     kind.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["id".to_owned()],
+        storage_parameters: Default::default(),
     });
     kind.foreign_keys.insert(
         "fk_kind_status".to_owned(),
@@ -9350,6 +9379,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     status.primary_key = Some(PrimaryKey {
         name: Some("pk_status".to_owned()),
         columns: vec!["code".to_owned()],
+        storage_parameters: Default::default(),
     });
     status.data = Some(TableData {
         mode: DataMode::Exact,
@@ -9382,6 +9412,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     kind.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["id".to_owned()],
+        storage_parameters: Default::default(),
     });
     kind.foreign_keys.insert(
         "fk_kind_status".to_owned(),
@@ -10544,6 +10575,7 @@ async fn key_collisions_are_judged_by_the_key_column_s_own_collation() {
         t.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["code".to_owned()],
+            storage_parameters: Default::default(),
         });
         t.data = Some(TableData {
             mode: DataMode::Exact,
@@ -11308,6 +11340,7 @@ async fn finite_floats_render_round_trip_and_keep_row_guards_effective() {
         table.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         table.data = Some(TableData {
             mode: DataMode::Exact,
@@ -11402,6 +11435,7 @@ async fn money_reads_back_with_the_four_decimals_it_holds() {
     t.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["id".to_owned()],
+        storage_parameters: Default::default(),
     });
     // The engine's own spelling, which the spelling probe already forces a
     // declaration to use (101): four decimals, always.
@@ -11492,6 +11526,7 @@ async fn an_explicit_default_stays_explicit_and_a_volatile_default_is_never_run(
     t.primary_key = Some(PrimaryKey {
         name: Some("pk_t".to_owned()),
         columns: vec!["id".to_owned()],
+        storage_parameters: Default::default(),
     });
     let rows = |cells: &[(&str, &[(&str, Value)])]| -> std::collections::BTreeMap<RowKey, Row> {
         cells
@@ -11624,6 +11659,7 @@ async fn a_declared_key_keeps_its_spelling_when_the_engine_spells_it_differently
         t.primary_key = Some(PrimaryKey {
             name: Some("pk_k".to_owned()),
             columns: vec!["id".to_owned()],
+            storage_parameters: Default::default(),
         });
         t.data = Some(TableData {
             mode,
@@ -11875,6 +11911,7 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
     customer.primary_key = Some(PrimaryKey {
         name: Some("pk_customer".to_owned()),
         columns: vec!["id".to_owned()],
+        storage_parameters: Default::default(),
     });
     let mut reader = Role::default();
     reader.grants.insert(
@@ -12591,6 +12628,7 @@ async fn a_row_write_across_a_retyped_column_still_holds_the_recorded_row() {
         t.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["code".to_owned()],
+            storage_parameters: Default::default(),
         });
         t.data = Some(TableData {
             mode: DataMode::Exact,
@@ -13500,6 +13538,7 @@ async fn trailing_default_comments_preserve_row_default_answers() {
     table.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
     for (key, at_default) in [("1", true), ("2", false), ("3", false)] {
         let query = pbps_mssql::rows::query(
@@ -13588,6 +13627,7 @@ async fn an_expression_ending_in_a_line_comment_still_applies() {
     t.primary_key = Some(PrimaryKey {
         name: Some("pk_commented".into()),
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
     t.checks.insert(
         "ck_commented_amount".into(),
@@ -13607,6 +13647,7 @@ async fn an_expression_ending_in_a_line_comment_still_applies() {
             unique: false,
             filter: Some("[status] IS NOT NULL -- only the set ones".into()),
             method: Default::default(),
+            storage_parameters: Default::default(),
         },
     );
     let mut declared = Schema::default();
@@ -14706,6 +14747,7 @@ async fn constraint_name_validation_preserves_legal_index_sharing() {
             unique: false,
             filter: None,
             method: Default::default(),
+            storage_parameters: Default::default(),
         },
     );
     assert!(Mssql.validate_table(&name, &table).is_empty());
@@ -15426,11 +15468,13 @@ fn retype_dependency_plans_preserve_identity_and_do_not_duplicate_explicit_chang
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["n".into()],
+        storage_parameters: Default::default(),
     });
     parent.unique.insert(
         "uq".into(),
         UniqueConstraint {
             columns: vec!["n".into()],
+            storage_parameters: Default::default(),
         },
     );
     parent.checks.insert(
@@ -15730,6 +15774,7 @@ async fn a_child_this_plan_sets_to_null_is_not_counted_against_its_parents_delet
     p.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     let mut c = p.clone();
     c.columns
@@ -15894,6 +15939,7 @@ async fn a_dropped_columns_name_is_free_before_the_rename_that_reuses_it() {
         t.primary_key = Some(PrimaryKey {
             name: Some("pk_s".to_owned()),
             columns: vec!["code".to_owned()],
+            storage_parameters: Default::default(),
         });
         t
     };

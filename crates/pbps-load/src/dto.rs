@@ -314,7 +314,7 @@ pub struct TableDto {
     pub primary_key: Option<PrimaryKeyDto>,
 
     #[serde(default)]
-    pub unique: BTreeMap<String, Vec<String>>,
+    pub unique: BTreeMap<String, UniqueDto>,
 
     #[serde(default)]
     pub foreign_keys: BTreeMap<String, ForeignKeyDto>,
@@ -459,11 +459,95 @@ const fn yes() -> bool {
 /// The named form is not there for looks: when `pbps pull` reverse-generates from
 /// an existing database, losing the original constraint name would make the next
 /// diff want to rename it.
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum PrimaryKeyDto {
     Columns(Vec<String>),
-    Named { name: String, columns: Vec<String> },
+    Spec(PrimaryKeySpecDto),
+}
+
+/// A primary key written out: its columns, and optionally its constraint
+/// name and its index's storage parameters (PostgreSQL B-tree:
+/// `fillfactor`, `deduplicate_items`).
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PrimaryKeySpecDto {
+    #[serde(default)]
+    pub name: Option<String>,
+    pub columns: Vec<String>,
+    #[serde(default)]
+    #[schemars(with = "BTreeMap<String, StorageValueDto>")]
+    pub storage_parameters: BTreeMap<String, Spanned<StorageValueDto>>,
+}
+
+/// A UNIQUE constraint: its column list, or written out with its index's
+/// storage parameters (PostgreSQL B-tree: `fillfactor`,
+/// `deduplicate_items`).
+#[derive(Debug, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum UniqueDto {
+    Columns(Vec<String>),
+    Spec(UniqueSpecDto),
+}
+
+// A list or a mapping, read by hand rather than `#[serde(untagged)]`, which
+// buffers the value without a type first: a column named `n`, `y` or `on`
+// then reads as a YAML boolean and matches neither variant (#1442; the trap
+// `IndexKeyDto` documents). Here the list's entries are asked for as
+// strings, and a mapping is read as the spec it is.
+macro_rules! list_or_spec {
+    ($dto:ident, $spec:ident, $what:literal) => {
+        impl<'de> serde::Deserialize<'de> for $dto {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                struct V;
+                impl<'de> serde::de::Visitor<'de> for V {
+                    type Value = $dto;
+                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        f.write_str($what)
+                    }
+                    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                        self,
+                        mut seq: A,
+                    ) -> Result<$dto, A::Error> {
+                        let mut columns = Vec::new();
+                        while let Some(column) = seq.next_element::<String>()? {
+                            columns.push(column);
+                        }
+                        Ok($dto::Columns(columns))
+                    }
+                    fn visit_map<A: serde::de::MapAccess<'de>>(
+                        self,
+                        map: A,
+                    ) -> Result<$dto, A::Error> {
+                        serde::Deserialize::deserialize(
+                            serde::de::value::MapAccessDeserializer::new(map),
+                        )
+                        .map($dto::Spec)
+                    }
+                }
+                d.deserialize_any(V)
+            }
+        }
+    };
+}
+list_or_spec!(
+    PrimaryKeyDto,
+    PrimaryKeySpecDto,
+    "a column list, or a mapping of `columns:` with optional `name:` and `storage_parameters:`"
+);
+list_or_spec!(
+    UniqueDto,
+    UniqueSpecDto,
+    "a column list, or a mapping of `columns:` and `storage_parameters:`"
+);
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UniqueSpecDto {
+    pub columns: Vec<String>,
+    #[serde(default)]
+    #[schemars(with = "BTreeMap<String, StorageValueDto>")]
+    pub storage_parameters: BTreeMap<String, Spanned<StorageValueDto>>,
 }
 
 // A mirror of `pbps_model::Clustered`, which keeps `JsonSchema` off the model
@@ -589,6 +673,13 @@ pub struct IndexDto {
     /// means) or `gin` (PostgreSQL, over `jsonb` columns).
     #[serde(default)]
     pub method: pbps_model::IndexMethod,
+
+    /// The index's storage parameters, by its method (PostgreSQL): a B-tree
+    /// takes `fillfactor` and `deduplicate_items`, a GIN index `fastupdate`
+    /// and `gin_pending_list_limit`.
+    #[serde(default)]
+    #[schemars(with = "BTreeMap<String, StorageValueDto>")]
+    pub storage_parameters: BTreeMap<String, Spanned<StorageValueDto>>,
 }
 
 /// One index key under `keys:`: a column or an expression, and which of the

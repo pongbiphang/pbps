@@ -29,7 +29,7 @@ The differ sorts every planned change by, in order:
    | 7 | `CreateTable` |
    | 8 | `AddColumn` |
    | 9 (`COLUMN_ALTERATIONS`) | `AlterColumnType`, `AlterColumnNullability`, `AlterColumnDefault`, `AlterColumnExpression`; `AddComputedColumn` at the class's end (9, 3) |
-   | 10 | `SetColumnDeprecated`; P: `SetStorageParameters` |
+   | 10 | `SetColumnDeprecated`; P: `SetStorageParameters`, `SetIndexStorageParameters` |
    | 11 | `InsertRow`, `UpdateRow` |
    | 12 | `DeleteRow` |
    | 13 | `SetPrimaryKey { to: Some }`, `AddUnique`, `AddForeignKey`, `AddCheck`, `AddIndex`; P: the other `SetReplicaIdentity`, last |
@@ -161,6 +161,7 @@ requirement is common to all of them, so it is listed once,
 | `AddComputedColumn` | 9 (9, 3) | S: the columns it reads, in their final type. Functions it calls exist (one this plan creates is refused by name) | A computed column at the end of its table (DEC-1174.1) |
 | `SetColumnDeprecated` | 10 | Nothing | Metadata only |
 | `SetStorageParameters` | 10 | P: the table, under its final name. Nothing reads a storage parameter | The table's heap storage parameters; no rewrite (DEC-1441.1) |
+| `SetIndexStorageParameters` | 10 | P: the index, which stands: one the plan adds or rebuilds takes its parameters in its `CREATE` instead | An index's storage parameters, in place; no rebuild (DEC-1442.1) |
 | `InsertRow`, `UpdateRow` | 11 | The columns written, defaults the row takes, parent rows | Rows |
 | `DeleteRow` | 12 | Child rows moved away or cascaded | Removes a row |
 | `SetPrimaryKey { to: Some }`, `AddUnique`, `AddIndex` | 13 | Columns, NOT NULL, unique data; a clustered index first | A key or index |

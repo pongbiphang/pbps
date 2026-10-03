@@ -310,7 +310,23 @@ fn changed_owners(change: &Change) -> Option<(Vec<OwnerScope>, bool, bool)> {
         Change::AlterColumnExpression { column, .. } => {
             (Exact(Surface::Default(column.clone())), true, true)
         }
+        // A standalone index's parameters are its own catalog row, as its
+        // creation is; a key's or a unique constraint's index is the table's
+        // constraint surface, as their changes are (#1442, #1483 review).
+        Change::SetIndexStorageParameters {
+            table,
+            target: crate::change::IndexPart::Index(name),
+            ..
+        } => (
+            Exact(Surface::Index {
+                table: table.clone(),
+                name: name.clone(),
+            }),
+            true,
+            true,
+        ),
         Change::SetPrimaryKey { table, .. }
+        | Change::SetIndexStorageParameters { table, .. }
         | Change::SetStorageParameters { table, .. }
         | Change::SetReplicaIdentity { table, .. }
         | Change::AddUnique { table, .. }
@@ -490,6 +506,7 @@ pub(super) fn touches(c: &Change, surface: &Surface) -> bool {
         }
         Surface::Index { table, name } => {
             matches!(c, Change::AddIndex { table: t, name: n, .. } | Change::DropIndex { table: t, name: n } if t == table && n == name)
+                || matches!(c, Change::SetIndexStorageParameters { table: t, target: crate::change::IndexPart::Index(n), .. } if t == table && n == name)
         }
         Surface::Module(id) => {
             c.module_id() == Some(id)
@@ -525,4 +542,45 @@ fn changes_catalog(c: &Change) -> bool {
             | Change::RenameRole { .. }
             | Change::DropRole { .. }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{IndexMethod, IndexPart, TableName};
+
+    fn set(target: IndexPart) -> Change {
+        Change::SetIndexStorageParameters {
+            table: TableName::new("app", "t"),
+            target,
+            method: IndexMethod::Btree,
+            set: [("fillfactor".to_owned(), "80".to_owned())].into(),
+            reset: BTreeSet::new(),
+        }
+    }
+
+    /// A standalone index's parameters are its own surface's, as its
+    /// creation is, so a resolver-backed plan that changes only them
+    /// projects; a key's or a unique constraint's are the table's
+    /// constraint surface (#1442, #1483 review).
+    #[test]
+    fn an_index_parameter_change_owns_the_index_surface() {
+        let index = Surface::Index {
+            table: TableName::new("app", "t"),
+            name: "ix".into(),
+        };
+        let owners = |c: &Change| changed_owners(c).expect("an owned change").0;
+        assert!(matches!(
+            owners(&set(IndexPart::Index("ix".into()))).as_slice(),
+            [OwnerScope::Exact(s)] if *s == index
+        ));
+        assert!(touches(&set(IndexPart::Index("ix".into())), &index));
+        assert!(matches!(
+            owners(&set(IndexPart::PrimaryKey)).as_slice(),
+            [OwnerScope::Exact(Surface::Table(_))]
+        ));
+        // Negative: another index's surface, and a key's change.
+        assert!(!touches(&set(IndexPart::Index("other".into())), &index));
+        assert!(!touches(&set(IndexPart::PrimaryKey), &index));
+    }
 }

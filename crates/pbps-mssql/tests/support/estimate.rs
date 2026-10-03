@@ -452,6 +452,7 @@ async fn a_clustered_index_change_is_a_rewrite_only_where_the_catalog_says_so() 
     let key = pbps_model::PrimaryKey {
         name: Some("pk_l".into()),
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     };
     let index = |column: &str| pbps_model::Index {
         columns: vec![pbps_model::IndexColumn {
@@ -463,6 +464,7 @@ async fn a_clustered_index_change_is_a_rewrite_only_where_the_catalog_says_so() 
         unique: false,
         filter: None,
         method: Default::default(),
+        storage_parameters: Default::default(),
     };
     let cs = ChangeSet {
         changes: vec![

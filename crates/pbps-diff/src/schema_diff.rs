@@ -27,9 +27,9 @@ use pbps_dialect::Dialect;
 use pbps_model::change::DeleteCause;
 use pbps_model::data::cell;
 use pbps_model::{
-    Cell, Change, ChangeSet, ColumnRef, ColumnType, DataMode, GrantTarget, Hints, IdsFile,
-    ModuleId, Permission, PlannedChange, PublicAccess, Renames, ReplicaIdentity, RoutineOrigin,
-    Schema, Table, TableName, Uid, Value,
+    Cell, Change, ChangeSet, ColumnRef, ColumnType, DataMode, GrantTarget, Hints, IdsFile, Index,
+    IndexMethod, IndexPart, ModuleId, Permission, PlannedChange, PrimaryKey, PublicAccess, Renames,
+    ReplicaIdentity, RoutineOrigin, Schema, Table, TableName, Uid, UniqueConstraint, Value,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -433,6 +433,7 @@ fn diff_partial_rebuilding(
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -477,6 +478,7 @@ fn diff_partial_rebuilding(
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -526,6 +528,9 @@ fn diff_partial_rebuilding(
     // it is pure computation over the changes already built, and a caller that
     // is going to *report* the partial set needs it sorted and classified
     // exactly as a plan would be.
+    // After every pass that rebuilds an index: its `CREATE` carries the
+    // declared parameters (#1483 review).
+    pbps_model::change::drop_parameter_changes_of_rebuilt_indexes(&mut changes, |c| c);
     let mut planned: Vec<PlannedChange> = changes.into_iter().map(PlannedChange::new).collect();
     for p in &mut planned {
         p.risks = dialect.change_risks(&p.change);
@@ -622,6 +627,7 @@ fn diff_partial_rebuilding(
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -668,6 +674,7 @@ fn diff_partial_rebuilding(
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1264,6 +1271,7 @@ fn recreate_referenced_foreign_keys(
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::PublicExecution { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. } => continue,
         };
@@ -1526,6 +1534,7 @@ fn recreate_retyped_dependents(
         | Change::AlterColumnExpression { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::SetPrimaryKey { .. }
+        | Change::SetIndexStorageParameters { .. }
         | Change::SetStorageParameters { .. }
         | Change::SetReplicaIdentity { .. }
         | Change::AddUnique { .. }
@@ -1807,6 +1816,7 @@ fn refuse_computed_dependencies(
                     | Change::DropComputedColumn { .. }
                     | Change::SetColumnDeprecated { .. }
                     | Change::SetPrimaryKey { .. }
+                    | Change::SetIndexStorageParameters { .. }
                     | Change::SetStorageParameters { .. }
                     | Change::SetReplicaIdentity { .. }
                     | Change::AddUnique { .. }
@@ -2009,6 +2019,44 @@ fn diff_replica_identity(
 }
 
 fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &mut Vec<Change>) {
+    // Storage parameters change in place, every supported one of both
+    // methods (measured on 16 and 18), so a part is rebuilt only where it
+    // differs otherwise; a difference in them alone is one `ALTER INDEX`
+    // (DEC-1442.1). A rebuilt part carries its declared ones in its `CREATE`.
+    fn bare<T: Clone>(part: &T, strip: impl Fn(&mut T)) -> T {
+        let mut part = part.clone();
+        strip(&mut part);
+        part
+    }
+    let pk_bare = |pk: &PrimaryKey| bare(pk, |p| p.storage_parameters.clear());
+    let unique_bare = |u: &UniqueConstraint| bare(u, |u| u.storage_parameters.clear());
+    let index_bare = |ix: &Index| bare(ix, |ix| ix.storage_parameters.clear());
+    let parameters = |target: IndexPart,
+                      method: IndexMethod,
+                      was: &BTreeMap<String, String>,
+                      now: &BTreeMap<String, String>,
+                      changes: &mut Vec<Change>| {
+        let set: BTreeMap<String, String> = now
+            .iter()
+            .filter(|(k, v)| was.get(*k) != Some(*v))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let reset: BTreeSet<String> = was
+            .keys()
+            .filter(|k| !now.contains_key(*k))
+            .cloned()
+            .collect();
+        if !set.is_empty() || !reset.is_empty() {
+            changes.push(Change::SetIndexStorageParameters {
+                table: name.clone(),
+                target,
+                method,
+                set,
+                reset,
+            });
+        }
+    };
+
     // A declaration that leaves the key unnamed (`primary_key: [id]`) leaves
     // the name to the engine, and the engine invents one (`PK__t__357D...`)
     // that the recorded state then carries. Comparing names there would
@@ -2026,10 +2074,20 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
     // replaced like any other changed key (#1178).
     let pk_differs = match (&base.primary_key, &declared.primary_key) {
         (Some(b), Some(d)) if d.name.is_none() => b.columns != d.columns,
+        (Some(b), Some(d)) => pk_bare(b) != pk_bare(d),
         (b, d) => b != d,
     } || (base.primary_key.is_some()
         && declared.primary_key.is_some()
         && base.primary_key_is_clustered() != declared.primary_key_is_clustered());
+    if !pk_differs && let (Some(b), Some(d)) = (&base.primary_key, &declared.primary_key) {
+        parameters(
+            IndexPart::PrimaryKey,
+            IndexMethod::Btree,
+            &b.storage_parameters,
+            &d.storage_parameters,
+            changes,
+        );
+    }
     if pk_differs {
         // A key that is *replaced* is emitted as two changes: the old one's
         // drop, and the new one's add. One change carrying both directions can
@@ -2114,6 +2172,19 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
     // the clustered one is rebuilt, for the reason a key is above.
     for (n, c) in &declared.unique {
         let clustered = declared.unique_is_clustered(n);
+        if let Some(b) = base.unique.get(n)
+            && unique_bare(b) == unique_bare(c)
+            && base.unique_is_clustered(n) == clustered
+        {
+            parameters(
+                IndexPart::Unique(n.clone()),
+                IndexMethod::Btree,
+                &b.storage_parameters,
+                &c.storage_parameters,
+                changes,
+            );
+            continue;
+        }
         if base.unique.get(n) != Some(c) || base.unique_is_clustered(n) != clustered {
             if base.unique.contains_key(n) {
                 changes.push(Change::DropUnique {
@@ -2142,6 +2213,19 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
 
     for (n, ix) in &declared.indexes {
         let clustered = declared.index_is_clustered(n);
+        if let Some(b) = base.indexes.get(n)
+            && index_bare(b) == index_bare(ix)
+            && base.index_is_clustered(n) == clustered
+        {
+            parameters(
+                IndexPart::Index(n.clone()),
+                ix.method,
+                &b.storage_parameters,
+                &ix.storage_parameters,
+                changes,
+            );
+            continue;
+        }
         if base.indexes.get(n) != Some(ix) || base.index_is_clustered(n) != clustered {
             if base.indexes.contains_key(n) {
                 changes.push(Change::DropIndex {
@@ -2619,6 +2703,7 @@ fn dependency_rank(
         | Change::DropColumn { .. }
         | Change::RenameColumn { .. }
         | Change::SetColumnDeprecated { .. }
+        | Change::SetIndexStorageParameters { .. }
         | Change::SetStorageParameters { .. }
         | Change::DropUnique { .. }
         | Change::AddCheck { .. }
@@ -3252,6 +3337,8 @@ fn order_key(c: &Change) -> u8 {
         // Metadata too: no statement reads a storage parameter, and it runs
         // under the table's final name (DEC-1441.1).
         Change::SetStorageParameters { .. } => 10,
+        // In place too, and nothing reads one (DEC-1442.1).
+        Change::SetIndexStorageParameters { .. } => 10,
         // Rows arrive once every column they name exists and has its final
         // type, and before the constraints below: ADR-0004's "create table ->
         // insert rows -> add the foreign key that references them".
@@ -3604,6 +3691,7 @@ mod tests {
                     unique: false,
                     filter: None,
                     method: Default::default(),
+                    storage_parameters: Default::default(),
                 },
             );
             schema_of("dbo.t", t)
@@ -3835,6 +3923,7 @@ mod tests {
             unique: false,
             filter: None,
             method: Default::default(),
+            storage_parameters: Default::default(),
         };
         let shaped = |nullable: bool, v: &str| {
             let col = |t: &str| {
@@ -3863,6 +3952,7 @@ mod tests {
                 "uq_u".into(),
                 UniqueConstraint {
                     columns: vec!["u".into()],
+                    storage_parameters: Default::default(),
                 },
             );
             t.checks.insert(
@@ -3921,11 +4011,13 @@ mod tests {
             t.primary_key = Some(PrimaryKey {
                 name: Some("pk_t".into()),
                 columns: vec!["id".into()],
+                storage_parameters: Default::default(),
             });
             t.unique.insert(
                 "uq_code".into(),
                 UniqueConstraint {
                     columns: vec!["code".into()],
+                    storage_parameters: Default::default(),
                 },
             );
             t.checks.insert(
@@ -4012,6 +4104,95 @@ mod tests {
 
     /// A table with a key, a UNIQUE constraint and an index, clustered on
     /// whichever `layout` names (#1178).
+    /// An index's, a unique constraint's or a key's parameters alone change
+    /// in place, one `SetIndexStorageParameters` each and no rebuild; a part
+    /// that changes otherwise is rebuilt with its declared parameters in its
+    /// `CREATE` (#1442).
+    #[test]
+    fn index_parameters_change_in_place_and_ride_a_rebuild() {
+        let with = |ix_params: &[(&str, &str)], pk_params: &[(&str, &str)], descending: bool| {
+            let mut t = table(&[
+                ("id", Column::new(ty("int")).not_null()),
+                ("v", Column::new(ty("int"))),
+            ]);
+            let map = |p: &[(&str, &str)]| {
+                p.iter()
+                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                    .collect()
+            };
+            t.primary_key = Some(PrimaryKey {
+                name: Some("t_pkey".into()),
+                columns: vec!["id".into()],
+                storage_parameters: map(pk_params),
+            });
+            t.indexes.insert(
+                "ix_v".into(),
+                Index {
+                    columns: vec![IndexColumn {
+                        key: pbps_model::IndexKey::Column("v".into()),
+                        descending,
+                        opclass: None,
+                    }],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                    method: Default::default(),
+                    storage_parameters: map(ix_params),
+                },
+            );
+            schema_of("public.t", t)
+        };
+        let base = with(&[("fillfactor", "70")], &[], false);
+        let cs = run(
+            &base,
+            &with(
+                &[("deduplicate_items", "false")],
+                &[("fillfactor", "80")],
+                false,
+            ),
+            &[],
+        );
+        let shown: Vec<String> = cs
+            .changes
+            .iter()
+            .map(|p| match &p.change {
+                Change::SetIndexStorageParameters {
+                    target, set, reset, ..
+                } => {
+                    format!("{target:?} set {set:?} reset {reset:?}")
+                }
+                other => format!("{other:?}"),
+            })
+            .collect();
+        // Their order between them is a tie, and none is needed.
+        let mut shown = shown;
+        shown.sort();
+        assert_eq!(
+            shown,
+            [
+                r#"Index("ix_v") set {"deduplicate_items": "false"} reset {"fillfactor"}"#,
+                r#"PrimaryKey set {"fillfactor": "80"} reset {}"#,
+            ]
+        );
+        // A definition change rebuilds, and the `CREATE` carries them.
+        let cs = run(&base, &with(&[("fillfactor", "70")], &[], true), &[]);
+        let added = cs.changes.iter().find_map(|p| match &p.change {
+            Change::AddIndex { index, .. } => Some(index.storage_parameters.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            added,
+            Some([("fillfactor".to_owned(), "70".to_owned())].into())
+        );
+        assert!(
+            !cs.changes
+                .iter()
+                .any(|p| matches!(p.change, Change::SetIndexStorageParameters { .. }))
+        );
+        // Negative: the same parameters plan nothing.
+        assert!(run(&base, &base, &[]).changes.is_empty());
+    }
+
     /// One change per table, setting what differs and resetting what the
     /// declaration drops; a parameter left alone is not restated, and an
     /// unchanged set plans nothing (#1441).
@@ -4072,6 +4253,7 @@ mod tests {
             unique: true,
             filter: None,
             method: Default::default(),
+            storage_parameters: Default::default(),
         };
         let mut t = table(&[
             ("id", Column::new(ty("int")).not_null()),
@@ -4178,11 +4360,13 @@ mod tests {
         t.primary_key = Some(PrimaryKey {
             name: Some("pk_t".into()),
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         t.unique.insert(
             "uq_code".into(),
             UniqueConstraint {
                 columns: vec!["code".into()],
+                storage_parameters: Default::default(),
             },
         );
         t.indexes.insert(
@@ -4197,6 +4381,7 @@ mod tests {
                 unique: false,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
         t.clustered = layout;
@@ -4491,6 +4676,7 @@ mod tests {
         t.primary_key = Some(pbps_model::PrimaryKey {
             name: None,
             columns: vec!["code".to_owned()],
+            storage_parameters: Default::default(),
         });
         t.data = Some(pbps_model::TableData {
             mode,
@@ -4621,6 +4807,7 @@ mod tests {
                 "uq_label".into(),
                 UniqueConstraint {
                     columns: vec!["label".into()],
+                    storage_parameters: Default::default(),
                 },
             );
             t.checks.insert(
@@ -5054,6 +5241,7 @@ mod tests {
                     unique: false,
                     filter: Some("n > 0".to_owned()),
                     method: Default::default(),
+                    storage_parameters: Default::default(),
                 },
             );
             t
@@ -5373,6 +5561,7 @@ mod tests {
         declared_t.primary_key = Some(pbps_model::PrimaryKey {
             name: None,
             columns: vec!["label".to_owned()],
+            storage_parameters: Default::default(),
         });
         // The rows now key on `label`, and say nothing about `code`.
         declared_t.columns.get_mut("code").unwrap().nullable = true;
@@ -5423,6 +5612,7 @@ mod tests {
         declared_t.primary_key = Some(pbps_model::PrimaryKey {
             name: None,
             columns: vec!["kode".to_owned()],
+            storage_parameters: Default::default(),
         });
         declared_t.data.as_mut().unwrap().rows = [(
             pbps_model::RowKey::from("new"),
@@ -7880,6 +8070,7 @@ mod tests {
         base_t.primary_key = Some(pbps_model::PrimaryKey {
             name: Some("pk_t".to_owned()),
             columns: vec!["id".to_owned()],
+            storage_parameters: Default::default(),
         });
         let base = schema_of("dbo.t", base_t);
         let declared = schema_of("dbo.t", table(&[("id", Column::new(ty("int")))]));
@@ -8007,6 +8198,7 @@ mod tests {
         base_t.primary_key = Some(pbps_model::PrimaryKey {
             name: Some("pk_t".to_owned()),
             columns: vec!["id".to_owned()],
+            storage_parameters: Default::default(),
         });
         let base = schema_of("dbo.t", base_t);
         // The declaration replaces the key, adds the column the new key names,
@@ -8019,6 +8211,7 @@ mod tests {
         declared_t.primary_key = Some(pbps_model::PrimaryKey {
             name: Some("pk_t".to_owned()),
             columns: vec!["other".to_owned()],
+            storage_parameters: Default::default(),
         });
         let declared = schema_of("dbo.t", declared_t);
 
@@ -8326,6 +8519,7 @@ mod tests {
             unique: false,
             filter: None,
             method: Default::default(),
+            storage_parameters: Default::default(),
         };
         let mut base_t = table(&[("a", Column::new(ty("int"))), ("b", Column::new(ty("int")))]);
         base_t.indexes.insert("ix_t".into(), ix("a"));
@@ -8361,6 +8555,7 @@ mod tests {
     fn unique(columns: &[&str]) -> UniqueConstraint {
         UniqueConstraint {
             columns: columns.iter().map(|c| (*c).to_string()).collect(),
+            storage_parameters: Default::default(),
         }
     }
 
@@ -8382,6 +8577,7 @@ mod tests {
                 parent.primary_key = Some(PrimaryKey {
                     name: Some("old_key".into()),
                     columns: vec!["id".into()],
+                    storage_parameters: Default::default(),
                 });
             } else if kind == "index" {
                 parent.indexes.insert(
@@ -8396,6 +8592,7 @@ mod tests {
                         unique: true,
                         filter: None,
                         method: Default::default(),
+                        storage_parameters: Default::default(),
                     },
                 );
             } else {
@@ -8489,6 +8686,7 @@ mod tests {
             parent.primary_key = Some(PrimaryKey {
                 name: Some("parent_pk".into()),
                 columns: vec!["id".into()],
+                storage_parameters: Default::default(),
             });
             parent.indexes.insert(
                 "old_index".into(),
@@ -8502,6 +8700,7 @@ mod tests {
                     unique,
                     filter: filter.map(str::to_owned),
                     method: Default::default(),
+                    storage_parameters: Default::default(),
                 },
             );
             let mut child = sku_table();
@@ -8675,6 +8874,7 @@ mod tests {
                 unique: true,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
         let mut order_line = sku_table();
@@ -8773,6 +8973,7 @@ mod tests {
         base_t.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         let mut want_t = table(&[
             ("cust_id", Column::new(ty("int"))),
@@ -8781,6 +8982,7 @@ mod tests {
         want_t.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["cust_id".into()],
+            storage_parameters: Default::default(),
         });
 
         let cs = run(
@@ -8821,6 +9023,7 @@ mod tests {
                 unique: false,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
         base_t.unique.insert("uq_t_old".into(), unique(&["old"]));
@@ -8842,6 +9045,7 @@ mod tests {
                 unique: false,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
         want_t.unique.insert("uq_t_old".into(), unique(&["new"]));
@@ -9027,6 +9231,7 @@ mod tests {
             unique: false,
             filter: Some(format!("[{column}] IS NOT NULL")),
             method: Default::default(),
+            storage_parameters: Default::default(),
         };
         let mut base_t = table(&[
             ("id", Column::new(ty("int"))),
@@ -9270,6 +9475,7 @@ mod tests {
                 unique: false,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
         let base = two_tables(("app.old", old_t.clone()), ("app.other", other_base));
@@ -9369,6 +9575,7 @@ mod tests {
                 unique: false,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
         let bare = table(&[("id", Column::new(ty("int")))]);
@@ -9780,6 +9987,7 @@ mod tests {
                 unique: false,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
         let base = schema_of("app.old", old_t);
@@ -9829,6 +10037,7 @@ mod tests {
                 unique: false,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
         let base = two_tables(("s1.old", old_t.clone()), ("s2.sibling", sibling_base));
@@ -9872,6 +10081,7 @@ mod tests {
                 unique: false,
                 filter: Some("id > 0".into()),
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
         let base = schema_of("s1.old", old_t);
@@ -9935,6 +10145,7 @@ mod tests {
                 owner.primary_key = Some(PrimaryKey {
                     name: Some("target".into()),
                     columns: vec!["id".into()],
+                    storage_parameters: Default::default(),
                 });
             } else {
                 owner.unique.insert("target".into(), unique(&["id"]));
@@ -10093,6 +10304,7 @@ mod tests {
                 unique: false,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
         let want_t = table(&[("new", Column::new(ty("int")))]);
@@ -11999,11 +12211,13 @@ mod tests {
         base_t.primary_key = Some(pbps_model::PrimaryKey {
             name: Some("PK__t__357D4CF8312E0151".to_owned()),
             columns: vec!["id".to_owned()],
+            storage_parameters: Default::default(),
         });
         let mut declared_t = base_t.clone();
         declared_t.primary_key = Some(pbps_model::PrimaryKey {
             name: None,
             columns: vec!["id".to_owned()],
+            storage_parameters: Default::default(),
         });
         let mut changes = Vec::new();
         diff_constraints(
@@ -12018,6 +12232,7 @@ mod tests {
         declared_t.primary_key = Some(pbps_model::PrimaryKey {
             name: None,
             columns: vec!["other".to_owned()],
+            storage_parameters: Default::default(),
         });
         let mut changes = Vec::new();
         diff_constraints(
@@ -12039,6 +12254,7 @@ mod tests {
         declared_t.primary_key = Some(pbps_model::PrimaryKey {
             name: Some("pk_t".to_owned()),
             columns: vec!["id".to_owned()],
+            storage_parameters: Default::default(),
         });
         let mut changes = Vec::new();
         diff_constraints(

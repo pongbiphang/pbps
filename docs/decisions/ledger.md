@@ -1135,3 +1135,11 @@ oldest readable version would force that on every environment, to catch a
 case the drift check already catches. A plan is read at its own version
 only, and an older build reading a version 19 plan would create a table
 without its parameters.
+
+<a id="dec-1442-2"></a>
+
+**DEC-1442.2. State version 16 adds index storage parameters and still reads
+6 to 15; plan version 20 turns 19 away.** As with a table's (DEC-1441.2), an
+older reader did not read an index's `reloptions`, so an older state of a
+tuned index reads as drift that `verify` names, and `baseline` re-records it.
+An older build reading a version 20 plan would build the index without them.

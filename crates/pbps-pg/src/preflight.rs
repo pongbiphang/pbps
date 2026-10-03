@@ -782,6 +782,7 @@ impl AsStored {
                 | Change::RenameRole { .. }
                 | Change::Grant { .. }
                 | Change::Revoke { .. }
+                | Change::SetIndexStorageParameters { .. }
                 | Change::SetStorageParameters { .. }
                 | Change::SetReplicaIdentity { .. }
                 | Change::PublicExecution { .. } => {}
@@ -3372,6 +3373,7 @@ fn build(
         | Change::RenameRole { .. }
         | Change::Grant { .. }
         | Change::Revoke { .. }
+        | Change::SetIndexStorageParameters { .. }
         | Change::SetStorageParameters { .. }
         | Change::SetReplicaIdentity { .. }
         | Change::PublicExecution { .. } => Ok(Vec::new()),
@@ -3594,6 +3596,7 @@ pub(crate) fn probes(changes: &ChangeSet) -> Preflight {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -3722,6 +3725,7 @@ mod tests {
                 name: "uq".into(),
                 constraint: pbps_model::UniqueConstraint {
                     columns: columns.clone(),
+                    storage_parameters: Default::default(),
                 },
                 clustered: false,
             },
@@ -3738,6 +3742,7 @@ mod tests {
                     unique: true,
                     filter: None,
                     method: Default::default(),
+                    storage_parameters: Default::default(),
                 }),
                 clustered: false,
             },
@@ -3747,6 +3752,7 @@ mod tests {
                 to: Some(pbps_model::PrimaryKey {
                     name: None,
                     columns: columns.clone(),
+                    storage_parameters: Default::default(),
                 }),
                 nonclustered: false,
             },
@@ -3832,6 +3838,7 @@ mod tests {
             name: format!("uq_{column}"),
             constraint: pbps_model::UniqueConstraint {
                 columns: vec![column.to_owned()],
+                storage_parameters: Default::default(),
             },
             clustered: false,
         };
@@ -3924,6 +3931,7 @@ mod tests {
                     name: "uq".into(),
                     constraint: pbps_model::UniqueConstraint {
                         columns: vec!["v".into()],
+                        storage_parameters: Default::default(),
                     },
                     clustered: false,
                 },
@@ -3943,6 +3951,7 @@ mod tests {
                         unique: true,
                         filter: None,
                         method: Default::default(),
+                        storage_parameters: Default::default(),
                     }),
                     clustered: false,
                 },
@@ -3955,6 +3964,7 @@ mod tests {
                     to: Some(pbps_model::PrimaryKey {
                         name: None,
                         columns: vec!["v".into()],
+                        storage_parameters: Default::default(),
                     }),
                     nonclustered: false,
                 },

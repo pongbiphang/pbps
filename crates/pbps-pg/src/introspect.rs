@@ -279,6 +279,9 @@ pub struct RawIndex {
     /// Whether any key column is indexed under a collation that is not the
     /// column's own — `COLLATE "C"`.
     pub nondefault_collation: bool,
+    /// The index's `reloptions`, each `name=value` as the engine keeps it
+    /// (#1442).
+    pub reloptions: Vec<String>,
 }
 
 /// Everything one pull read, before any of it is interpreted.
@@ -793,6 +796,49 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             );
         let (parameters, unread) = storage_parameters(raw_table);
         table.storage_parameters = parameters;
+        for detail in unread {
+            note(&mut pulled, &name, detail);
+        }
+        // Each index's own, by its method, for the key's and each unique
+        // constraint's index as for a standalone one (#1442).
+        let options_of = |oid: Option<i64>| {
+            raw.indexes
+                .iter()
+                .find(|i| Some(i.oid) == oid)
+                .map_or(&[][..], |i| i.reloptions.as_slice())
+        };
+        let mut unread = Vec::new();
+        for constraint in constraints_by_table
+            .get(&raw_table.oid)
+            .map_or(&[][..], Vec::as_slice)
+        {
+            let options = options_of(constraint.index_oid);
+            let what = format!("constraint `{}`", constraint.name);
+            let target = match constraint.kind {
+                'p' => table
+                    .primary_key
+                    .as_mut()
+                    .map(|pk| &mut pk.storage_parameters),
+                'u' => table
+                    .unique
+                    .get_mut(&constraint.name)
+                    .map(|u| &mut u.storage_parameters),
+                _ => None,
+            };
+            if let Some(target) = target {
+                *target = index_parameters(IndexMethod::Btree, options, &what, &mut unread);
+            }
+        }
+        for index in indexes_by_table
+            .get(&raw_table.oid)
+            .map_or(&[][..], Vec::as_slice)
+        {
+            if let Some(declared) = table.indexes.get_mut(&index.name) {
+                let what = format!("index `{}`", index.name);
+                declared.storage_parameters =
+                    index_parameters(declared.method, &index.reloptions, &what, &mut unread);
+            }
+        }
         for detail in unread {
             note(&mut pulled, &name, detail);
         }
@@ -1966,6 +2012,34 @@ fn storage_parameters(raw_table: &RawTable) -> (BTreeMap<String, String>, Vec<St
     (parameters, unread)
 }
 
+/// An index's storage parameters in canonical spelling, by `method`, with
+/// what the model cannot declare of them pushed to `unread`, named (#1442).
+fn index_parameters(
+    method: IndexMethod,
+    reloptions: &[String],
+    what: &str,
+    unread: &mut Vec<String>,
+) -> BTreeMap<String, String> {
+    let mut parameters = BTreeMap::new();
+    for option in reloptions {
+        let Some((name, value)) = option.split_once('=') else {
+            unread.push(format!(
+                "{what} carries the storage option `{option}`, which names no value"
+            ));
+            continue;
+        };
+        match pbps_model::storage::canonical_index(method, name, value) {
+            Ok(canonical) => {
+                parameters.insert(name.to_owned(), canonical);
+            }
+            Err(why) => unread.push(format!(
+                "{what}: its storage parameters cannot be declared: {why}"
+            )),
+        }
+    }
+    parameters
+}
+
 /// [`note`], for the arms that are expressions rather than blocks. Always
 /// `false`: a constraint that earns a warning here is one that was left out.
 fn note_false(pulled: &mut Pulled, table: &TableName, detail: String) -> bool {
@@ -2356,6 +2430,7 @@ fn add_constraint(
                 table.primary_key = Some(PrimaryKey {
                     name: Some(raw.name.clone()),
                     columns,
+                    storage_parameters: Default::default(),
                 });
                 true
             }
@@ -2367,9 +2442,13 @@ fn add_constraint(
 
         'u' => match parts.names(&raw.columns) {
             Ok(columns) => {
-                table
-                    .unique
-                    .insert(raw.name.clone(), UniqueConstraint { columns });
+                table.unique.insert(
+                    raw.name.clone(),
+                    UniqueConstraint {
+                        columns,
+                        storage_parameters: Default::default(),
+                    },
+                );
                 true
             }
             Err(attnum) => {
@@ -2836,6 +2915,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
             // Verbatim: see this module's own documentation.
             filter: raw.filter.clone(),
             method,
+            storage_parameters: Default::default(),
         },
     );
     true
@@ -4364,6 +4444,7 @@ mod tests {
             key_classes: vec![String::new()],
             key_texts: vec![String::new()],
             nondefault_collation: false,
+            reloptions: Vec::new(),
         }
     }
 
@@ -4754,6 +4835,49 @@ mod tests {
                 .any(|w| w.contains("toast.autovacuum_enabled"))
         );
         assert_eq!(only(&pulled).storage_parameters.len(), 1);
+    }
+
+    /// An index's, a key's and a unique constraint's parameters are read in
+    /// canonical spelling by the index's method; another method's is named
+    /// (#1442).
+    #[test]
+    fn index_storage_parameters_are_read_by_the_indexs_method() {
+        let catalog = |pk_options: &[&str], ix_options: &[&str]| {
+            let mut pk = constraint(1, "t_pk", 'p');
+            pk.columns = vec![1];
+            pk.index_oid = Some(50);
+            let mut pk_ix = index(50, 1, "t_pk");
+            pk_ix.unique = true;
+            pk_ix.primary = true;
+            pk_ix.reloptions = pk_options.iter().map(|s| (*s).to_owned()).collect();
+            let mut ix = index(51, 1, "t_ix");
+            ix.reloptions = ix_options.iter().map(|s| (*s).to_owned()).collect();
+            RawCatalog {
+                tables: vec![table(1, "t")],
+                columns: vec![col(1, 1, "a", "integer")],
+                constraints: vec![pk],
+                indexes: vec![pk_ix, ix],
+                ..RawCatalog::default()
+            }
+        };
+        let pulled = assemble(&catalog(&["fillfactor=070"], &["deduplicate_items=of"]));
+        assert!(pulled.limitations.is_empty(), "{:?}", pulled.warnings);
+        let t = only(&pulled);
+        assert_eq!(
+            t.primary_key.as_ref().unwrap().storage_parameters["fillfactor"],
+            "56"
+        );
+        assert_eq!(
+            t.indexes["t_ix"].storage_parameters["deduplicate_items"],
+            "false"
+        );
+        let pulled = assemble(&catalog(&[], &["fastupdate=off"]));
+        assert_eq!(pulled.limitations.len(), 1, "{:?}", pulled.warnings);
+        assert!(
+            pulled.warnings[0].contains("index `t_ix`"),
+            "{:?}",
+            pulled.warnings
+        );
     }
 
     #[test]

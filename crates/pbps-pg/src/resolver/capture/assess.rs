@@ -751,6 +751,7 @@ mod tests {
                 unique: false,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
         let mut with_index = pbps_model::Schema::default();

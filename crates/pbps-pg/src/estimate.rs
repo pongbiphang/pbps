@@ -462,6 +462,35 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             )
         }
 
+        // In place, on the index alone (measured on 16 and 18): nothing is
+        // rebuilt or read, and the lock is the method's. A B-tree's
+        // parameters take `ShareUpdateExclusiveLock`; a GIN index's take
+        // `AccessExclusiveLock`, which holds every write to the table, since
+        // each writes the index, until it commits (#1442).
+        Change::SetIndexStorageParameters {
+            table,
+            target,
+            method,
+            ..
+        } => {
+            let of = match target {
+                pbps_model::IndexPart::PrimaryKey => "the primary key's index".to_owned(),
+                pbps_model::IndexPart::Unique(n) | pbps_model::IndexPart::Index(n) => {
+                    format!("index {n}")
+                }
+            };
+            e(
+                format!("setting storage parameters of {of} on {table}"),
+                table,
+                Rewrite::No,
+                Reads::Nothing,
+                match method {
+                    pbps_model::IndexMethod::Btree => Lock::ShareUpdateExclusive,
+                    pbps_model::IndexMethod::Gin => Lock::AccessExclusive,
+                },
+            )
+        }
+
         // Nothing is rebuilt or read; the lock is the strongest any of its
         // parameters takes, measured on 16 and 18: `user_catalog_table`,
         // set or reset, takes `AccessExclusiveLock`, every other listed
@@ -863,6 +892,25 @@ mod tests {
         s.parse().expect("a table name")
     }
 
+    /// An index's parameters change in place, reading nothing; a B-tree's
+    /// take `ShareUpdateExclusiveLock`, a GIN index's `AccessExclusiveLock`
+    /// (measured on 16 and 18, #1442).
+    #[test]
+    fn an_index_parameter_change_takes_its_methods_lock() {
+        let change = |method| Change::SetIndexStorageParameters {
+            table: tname("app.t"),
+            target: pbps_model::IndexPart::Index("ix".into()),
+            method,
+            set: [("fillfactor".to_owned(), "70".to_owned())].into(),
+            reset: Default::default(),
+        };
+        let e = estimate(&change(pbps_model::IndexMethod::Btree), Strategy::default()).unwrap();
+        assert!(matches!(e.rewrite, Rewrite::No) && matches!(e.reads, Reads::Nothing));
+        assert!(matches!(e.lock, Lock::ShareUpdateExclusive));
+        let e = estimate(&change(pbps_model::IndexMethod::Gin), Strategy::default()).unwrap();
+        assert!(matches!(e.lock, Lock::AccessExclusive));
+    }
+
     /// A storage parameter change rebuilds and reads nothing, and takes the
     /// strongest lock among its parameters: `user_catalog_table` takes
     /// `AccessExclusiveLock`, the rest `ShareUpdateExclusiveLock` (#1477
@@ -914,6 +962,7 @@ mod tests {
                     unique: false,
                     filter: None,
                     method: Default::default(),
+                    storage_parameters: Default::default(),
                 }),
                 clustered: false,
             });
@@ -1101,6 +1150,7 @@ mod tests {
                     unique: false,
                     filter: None,
                     method: Default::default(),
+                    storage_parameters: Default::default(),
                 }),
                 clustered: false,
             })
@@ -1514,6 +1564,7 @@ mod tests {
                 unique: false,
                 filter: filter.map(str::to_owned),
                 method: Default::default(),
+                storage_parameters: Default::default(),
             }),
             clustered: false,
         };

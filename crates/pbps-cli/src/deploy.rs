@@ -2636,6 +2636,10 @@ fn index_as_declared(declared: &pbps_model::Index, now: &pbps_model::Index) -> b
         && declared.unique == now.unique
         && declared.filter.is_some() == now.filter.is_some()
         && declared.method == now.method
+        // Both canonical (#1442), so compared outright: another session's
+        // `ALTER INDEX … SET` after the creation is not this plan's (#1483
+        // review).
+        && declared.storage_parameters == now.storage_parameters
 }
 
 /// Whether an index key read back is the one declared: a column by its name,
@@ -2664,6 +2668,8 @@ fn primary_key_as_declared(
             .name
             .as_ref()
             .is_some_and(|n| Some(n) != now.name.as_ref())
+        // As an index's (#1442, #1483 review).
+        && declared.storage_parameters == now.storage_parameters
 }
 
 /// Whether a part read back is the one the plan adds it as, or `None` where
@@ -2688,7 +2694,8 @@ fn part_as_planned(
             primary_key_as_declared(was, table.primary_key.as_ref()?)
                 && table.primary_key_is_clustered() == clustered
         }
-        // A unique constraint is nothing but its columns and its layout.
+        // A unique constraint is nothing but its columns, its index's
+        // storage parameters (#1442) and its layout.
         PartDefinition::Unique(was, clustered) => {
             table.unique.get(name)? == was && table.unique_is_clustered(name) == clustered
         }
@@ -2948,6 +2955,15 @@ fn refuse_unplanned_movement(
         &'a TableName,
     );
     let mut storage_changes: BTreeMap<&pbps_model::Uid, StorageSetting<'_>> = BTreeMap::new();
+    // Index parameters the plan sets in place: the table, under its final
+    // name, which part, and what it sets and resets (#1442).
+    type IndexSetting<'a> = (
+        &'a TableName,
+        &'a pbps_model::IndexPart,
+        &'a BTreeMap<String, String>,
+        &'a BTreeSet<String>,
+    );
+    let mut index_storage_changes: Vec<IndexSetting<'_>> = Vec::new();
     // Each renamed table's uid, by its old and new names.
     let mut renamed_uids: BTreeMap<&pbps_model::Uid, (&TableName, &TableName)> = BTreeMap::new();
     // The defaults a change of this plan's own sets, by column. A created
@@ -3057,6 +3073,36 @@ fn refuse_unplanned_movement(
         } = &p.change
         {
             storage_changes.insert(uid, (set, reset, table));
+        }
+        // An index's parameters set in place change its part as an index
+        // change does, so the part is this plan's (#1442); what it leaves is
+        // held at the close, below.
+        if let pbps_model::Change::SetIndexStorageParameters {
+            table,
+            target,
+            set,
+            reset,
+            ..
+        } = &p.change
+        {
+            index_storage_changes.push((table, target, set, reset));
+            match target {
+                pbps_model::IndexPart::PrimaryKey => {
+                    keys.insert(table);
+                }
+                pbps_model::IndexPart::Unique(n) => {
+                    constraints
+                        .entry(table)
+                        .or_default()
+                        .insert((pbps_model::Part::Unique, n.as_str()));
+                }
+                pbps_model::IndexPart::Index(n) => {
+                    constraints
+                        .entry(table)
+                        .or_default()
+                        .insert((pbps_model::Part::Index, n.as_str()));
+                }
+            }
         }
         if let pbps_model::Change::AlterColumnDefault { column, to, .. } = &p.change {
             set_defaults.insert((&column.table, column.name.as_str()), to.as_ref());
@@ -3749,6 +3795,65 @@ fn refuse_unplanned_movement(
                     "{now_name} storage parameters are not the ones this plan leaves"
                 ));
             }
+            // An index whose parameters the plan sets in place, held once
+            // the run is whole to the before-read with only that change
+            // applied, the whole part and not its parameters alone: its part
+            // is excused above, as an index change's is, so a session that
+            // drops it, or recreates it under its name with another
+            // definition, after the plan's `ALTER INDEX` would otherwise be
+            // recorded as the plan's result (#1442, #1483 review).
+            //
+            // Mid-run it is held too, to either side of that statement: a
+            // staged checkpoint that recorded another definition would be
+            // the before-read the next checkpoint and the close compare
+            // against, and accept (#1483 review).
+            for (table, target, set, reset) in &index_storage_changes {
+                if *table != now_name {
+                    continue;
+                }
+                let apply = |parameters: &mut BTreeMap<String, String>| {
+                    parameters.retain(|k, _| !reset.contains(k));
+                    parameters.extend(set.iter().map(|(k, v)| (k.clone(), v.clone())));
+                };
+                // `None` where the before-read has no such part: the plan was
+                // made against something else, which the parts' own
+                // comparison answers for.
+                let (what, held) = match target {
+                    pbps_model::IndexPart::PrimaryKey => (
+                        "primary key".to_owned(),
+                        was.primary_key.as_ref().map(|w| {
+                            let mut expected = w.clone();
+                            apply(&mut expected.storage_parameters);
+                            let left = now.primary_key.as_ref();
+                            left == Some(&expected) || (!settled.whole() && left == Some(w))
+                        }),
+                    ),
+                    pbps_model::IndexPart::Unique(n) => (
+                        format!("unique `{n}`"),
+                        was.unique.get(n).map(|w| {
+                            let mut expected = w.clone();
+                            apply(&mut expected.storage_parameters);
+                            let left = now.unique.get(n);
+                            left == Some(&expected) || (!settled.whole() && left == Some(w))
+                        }),
+                    ),
+                    pbps_model::IndexPart::Index(n) => (
+                        format!("index `{n}`"),
+                        was.indexes.get(n).map(|w| {
+                            let mut expected = w.clone();
+                            apply(&mut expected.storage_parameters);
+                            let left = now.indexes.get(n);
+                            left == Some(&expected) || (!settled.whole() && left == Some(w))
+                        }),
+                    ),
+                };
+                if held == Some(false) {
+                    moved.push(format!(
+                        "{now_name} {what} is not the one this plan leaves: its index storage \
+                         parameters set, and nothing else changed"
+                    ));
+                }
+            }
             // And which of them holds the rows (#1178). Every part can read
             // back unchanged while another session moves the clustered index
             // between them, so the layout is compared on its own. The plan
@@ -3861,6 +3966,7 @@ fn refuse_unplanned_movement(
                         | pbps_model::Change::Grant { .. }
                         | pbps_model::Change::Revoke { .. }
                         | pbps_model::Change::PublicExecution { .. }
+                        | pbps_model::Change::SetIndexStorageParameters { .. }
                         | pbps_model::Change::SetStorageParameters { .. }
                         | pbps_model::Change::SetReplicaIdentity { .. } => {}
                     }
@@ -8323,6 +8429,7 @@ mod tests {
                         from: Some(pbps_model::PrimaryKey {
                             name: None,
                             columns: vec!["id".into()],
+                            storage_parameters: Default::default(),
                         }),
                         to: None,
                         nonclustered: false,
@@ -8341,6 +8448,7 @@ mod tests {
                 from: Some(pbps_model::PrimaryKey {
                     name: Some("x".into()),
                     columns: vec!["id".into()],
+                    storage_parameters: Default::default(),
                 }),
                 to,
                 nonclustered: false,
@@ -8350,6 +8458,7 @@ mod tests {
             Some(pbps_model::PrimaryKey {
                 name: Some("pk_new".into()),
                 columns: vec!["id".into()],
+                storage_parameters: Default::default(),
             })
         };
         let pk = || occupant("primary key constraint", Some(&old));
@@ -8792,6 +8901,7 @@ mod tests {
                 name: "uq_added".into(),
                 constraint: pbps_model::UniqueConstraint {
                     columns: vec!["id".into()],
+                    storage_parameters: Default::default(),
                 },
                 clustered: false,
             }),
@@ -8998,6 +9108,7 @@ mod tests {
                 name: name.into(),
                 constraint: UniqueConstraint {
                     columns: vec!["n".into()],
+                    storage_parameters: Default::default(),
                 },
                 clustered: false,
             })
@@ -9009,6 +9120,7 @@ mod tests {
                 to: Some(PrimaryKey {
                     name: name.map(str::to_owned),
                     columns: vec!["n".into()],
+                    storage_parameters: Default::default(),
                 }),
                 nonclustered: false,
             })
@@ -9330,6 +9442,7 @@ mod tests {
                 from: Some(pbps_model::PrimaryKey {
                     name: name.map(Into::into),
                     columns: vec!["id".into()],
+                    storage_parameters: Default::default(),
                 }),
                 to: None,
                 nonclustered: false,
@@ -9428,6 +9541,7 @@ mod tests {
                 from: Some(pbps_model::PrimaryKey {
                     name: None,
                     columns: vec!["id".into()],
+                    storage_parameters: Default::default(),
                 }),
                 to: None,
                 nonclustered: false,
@@ -10911,6 +11025,7 @@ mod tests {
                 primary_key: Some(PrimaryKey {
                     name: Some("pk_t".into()),
                     columns: vec![pk.into()],
+                    storage_parameters: Default::default(),
                 }),
                 ..Default::default()
             };
@@ -10918,6 +11033,7 @@ mod tests {
                 "uq_t".into(),
                 pbps_model::UniqueConstraint {
                     columns: vec![ix.into()],
+                    storage_parameters: Default::default(),
                 },
             );
             let mut s = Schema::default();
@@ -11006,6 +11122,7 @@ mod tests {
                 "uq_t".into(),
                 pbps_model::UniqueConstraint {
                     columns: vec!["elsewhere".into()],
+                    storage_parameters: Default::default(),
                 },
             );
         let e = refuse_unplanned_movement(
@@ -11354,6 +11471,7 @@ mod tests {
                         unique: false,
                         filter: None,
                         method: Default::default(),
+                        storage_parameters: Default::default(),
                     },
                 );
             }
@@ -11474,6 +11592,7 @@ mod tests {
                         unique: false,
                         filter: None,
                         method: Default::default(),
+                        storage_parameters: Default::default(),
                     }),
                     clustered: false,
                 },
@@ -12041,6 +12160,7 @@ mod tests {
             unique,
             filter: filter.map(Into::into),
             method: Default::default(),
+            storage_parameters: Default::default(),
         };
         let planned_index = index("id", false, Some("id > 0"));
         let changes = pbps_model::ChangeSet {
@@ -12093,6 +12213,176 @@ mod tests {
                 assert!(format!("{e:#}").contains("index `ix`"), "{other:?}: {e:#}");
             }
         }
+    }
+
+    /// An index the plan adds, and a created table's key, are held to their
+    /// declared storage parameters too: another session's `ALTER INDEX …
+    /// SET` after the creation is movement, not the plan's result (#1483
+    /// review).
+    #[test]
+    fn a_created_index_is_held_to_its_declared_parameters() {
+        use pbps_model::{Change, Column, Index, IndexColumn, PlannedChange, PrimaryKey, Table};
+        let name = TableName::new("app", "t");
+        let fill = |v: &str| -> BTreeMap<String, String> {
+            [("fillfactor".to_owned(), v.to_owned())].into()
+        };
+        let index = |v: &str| Index {
+            columns: vec![IndexColumn {
+                key: pbps_model::IndexKey::Column("id".into()),
+                descending: false,
+                opclass: None,
+            }],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: fill(v),
+        };
+        let table = |ix: Option<&str>, pk: &str| {
+            let mut t = Table::default();
+            t.columns.insert(
+                "id".into(),
+                Column::new("integer".parse().unwrap()).not_null(),
+            );
+            t.primary_key = Some(PrimaryKey {
+                name: Some("t_pkey".into()),
+                columns: vec!["id".into()],
+                storage_parameters: fill(pk),
+            });
+            if let Some(v) = ix {
+                t.indexes.insert("ix".into(), index(v));
+            }
+            t
+        };
+        let schema = |t: Table| Schema {
+            tables: [(name.clone(), t)].into(),
+            ..Default::default()
+        };
+        let adding = pbps_model::ChangeSet {
+            changes: vec![PlannedChange::new(Change::AddIndex {
+                table: name.clone(),
+                name: "ix".into(),
+                index: Box::new(index("70")),
+                clustered: false,
+            })],
+        };
+        let check = |plan: &pbps_model::ChangeSet, before: &Schema, after: &Schema| {
+            refuse_unplanned_movement(
+                &pbps_pg::Postgres::new(),
+                plan,
+                before,
+                after,
+                "test",
+                Settled::Whole,
+            )
+        };
+        let before = schema(table(None, "80"));
+        check(&adding, &before, &schema(table(Some("70"), "80"))).expect("as added");
+        let e = check(&adding, &before, &schema(table(Some("90"), "80"))).expect_err("set after");
+        assert!(format!("{e:#}").contains("index `ix`"), "{e:#}");
+
+        let creating = pbps_model::ChangeSet {
+            changes: vec![PlannedChange::new(Change::CreateTable {
+                uid: "t_000000".parse().unwrap(),
+                name: name.clone(),
+                table: Box::new(table(None, "80")),
+            })],
+        };
+        let empty = Schema::default();
+        check(&creating, &empty, &schema(table(None, "80"))).expect("as created");
+        let e = check(&creating, &empty, &schema(table(None, "90"))).expect_err("set after");
+        assert!(format!("{e:#}").contains("primary key"), "{e:#}");
+    }
+
+    /// An index's parameters the plan sets in place are held once the run is
+    /// whole to the before-read with its change applied: its part is
+    /// excused, as an index change's is, and another session's value after
+    /// the plan's is movement (#1442).
+    #[test]
+    fn index_storage_parameters_the_plan_sets_are_held_at_the_close() {
+        use pbps_model::{Change, Column, Index, IndexColumn, PlannedChange, Table};
+        let name = TableName::new("app", "t");
+        let schema = |fillfactor: &str| {
+            let mut t = Table::default();
+            t.columns.insert(
+                "id".into(),
+                Column::new("integer".parse().unwrap()).not_null(),
+            );
+            t.indexes.insert(
+                "ix".into(),
+                Index {
+                    columns: vec![IndexColumn {
+                        key: pbps_model::IndexKey::Column("id".into()),
+                        descending: false,
+                        opclass: None,
+                    }],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                    method: Default::default(),
+                    storage_parameters: [("fillfactor".to_owned(), fillfactor.to_owned())].into(),
+                },
+            );
+            Schema {
+                tables: [(name.clone(), t)].into(),
+                ..Default::default()
+            }
+        };
+        let setting = pbps_model::ChangeSet {
+            changes: vec![PlannedChange::new(Change::SetIndexStorageParameters {
+                table: name.clone(),
+                target: pbps_model::IndexPart::Index("ix".into()),
+                method: Default::default(),
+                set: [("fillfactor".to_owned(), "80".to_owned())].into(),
+                reset: Default::default(),
+            })],
+        };
+        let check = |after: &Schema, settled| {
+            refuse_unplanned_movement(
+                &pbps_pg::Postgres::new(),
+                &setting,
+                &schema("70"),
+                after,
+                "test",
+                settled,
+            )
+        };
+        check(&schema("80"), Settled::Whole).expect("the plan's own");
+        check(&schema("70"), Settled::SoFar).expect("not run yet");
+        let e = check(&schema("90"), Settled::Whole).expect_err("another session's");
+        assert!(
+            format!("{e:#}").contains("index storage parameters"),
+            "{e:#}"
+        );
+        // The whole index is held, not only its parameters: dropped, or
+        // recreated under its name with another definition, after the plan's
+        // `ALTER INDEX`, it is movement (#1483 review).
+        let mut dropped = schema("80");
+        dropped.tables.get_mut(&name).unwrap().indexes.clear();
+        let e = check(&dropped, Settled::Whole).expect_err("dropped");
+        assert!(format!("{e:#}").contains("`ix`"), "{e:#}");
+        let mut redefined = schema("80");
+        redefined
+            .tables
+            .get_mut(&name)
+            .unwrap()
+            .indexes
+            .get_mut("ix")
+            .unwrap()
+            .columns[0]
+            .descending = true;
+        let e = check(&redefined, Settled::Whole).expect_err("redefined");
+        assert!(format!("{e:#}").contains("`ix`"), "{e:#}");
+        // At a staged checkpoint too: before the plan's statement or after
+        // it, never another definition, so no checkpoint records one for
+        // the next read to compare against (#1483 review).
+        check(&schema("80"), Settled::SoFar).expect("after the statement");
+        let e = check(&redefined, Settled::SoFar).expect_err("redefined mid-run");
+        assert!(format!("{e:#}").contains("`ix`"), "{e:#}");
+        let e = check(&dropped, Settled::SoFar).expect_err("dropped mid-run");
+        assert!(format!("{e:#}").contains("`ix`"), "{e:#}");
+        let e = check(&schema("90"), Settled::SoFar).expect_err("neither side mid-run");
+        assert!(format!("{e:#}").contains("`ix`"), "{e:#}");
     }
 
     /// Storage parameters are held across an apply (#1441): another
@@ -12440,6 +12730,7 @@ mod tests {
         t.primary_key = Some(pbps_model::PrimaryKey {
             name: Some("pk_t".into()),
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         let ix = Index {
             columns: vec![IndexColumn {
@@ -12451,6 +12742,7 @@ mod tests {
             unique: false,
             filter: None,
             method: Default::default(),
+            storage_parameters: Default::default(),
         };
         t.indexes.insert("ix".into(), ix.clone());
         let schema = |layout: Option<Clustered>| {
@@ -12602,11 +12894,13 @@ mod tests {
         created.primary_key = Some(PrimaryKey {
             name: Some("pk_t".into()),
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         created.unique.insert(
             "uq_code".into(),
             pbps_model::UniqueConstraint {
                 columns: vec!["code".into()],
+                storage_parameters: Default::default(),
             },
         );
         created.clustered = Some(Clustered::Unique("uq_code".into()));
@@ -12733,6 +13027,7 @@ mod tests {
             "uq".into(),
             UniqueConstraint {
                 columns: vec!["id".into()],
+                storage_parameters: Default::default(),
             },
         );
         declared.foreign_keys.insert(
@@ -12763,6 +13058,7 @@ mod tests {
                 unique: false,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
         let changes = pbps_model::ChangeSet {
@@ -13003,6 +13299,7 @@ mod tests {
                 unique: false,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
         let e = refuse_unplanned_movement(
@@ -13115,6 +13412,7 @@ mod tests {
                     unique: false,
                     filter: filter.map(str::to_owned),
                     method: Default::default(),
+                    storage_parameters: Default::default(),
                 },
             );
             t
@@ -13148,6 +13446,7 @@ mod tests {
             t.primary_key = Some(pbps_model::PrimaryKey {
                 name: name.map(str::to_owned),
                 columns: columns.iter().map(|c| (*c).to_owned()).collect(),
+                storage_parameters: Default::default(),
             });
             t
         };
@@ -13200,6 +13499,7 @@ mod tests {
                 "uq_new".to_owned(),
                 pbps_model::UniqueConstraint {
                     columns: columns.iter().map(|c| (*c).to_owned()).collect(),
+                    storage_parameters: Default::default(),
                 },
             );
             t
@@ -13604,6 +13904,7 @@ mod tests {
             unique,
             filter: None,
             method: Default::default(),
+            storage_parameters: Default::default(),
         };
         let schema_with = |unique: bool| {
             let mut t = pbps_model::Table::default();
@@ -13683,6 +13984,7 @@ mod tests {
                                 unique: false,
                                 filter: None,
                                 method: Default::default(),
+                                storage_parameters: Default::default(),
                             },
                         );
                         Change::DropIndex {
@@ -13695,6 +13997,7 @@ mod tests {
                             "gone".into(),
                             UniqueConstraint {
                                 columns: vec!["id".into()],
+                                storage_parameters: Default::default(),
                             },
                         );
                         Change::DropUnique {
@@ -13722,6 +14025,7 @@ mod tests {
                         let key = PrimaryKey {
                             name: Some("gone".into()),
                             columns: vec!["id".into()],
+                            storage_parameters: Default::default(),
                         };
                         original.primary_key = Some(key.clone());
                         Change::SetPrimaryKey {
@@ -13827,6 +14131,7 @@ mod tests {
                     "unplanned".into(),
                     UniqueConstraint {
                         columns: vec!["id".into()],
+                        storage_parameters: Default::default(),
                     },
                 );
                 assert!(
@@ -14386,6 +14691,7 @@ mod tests {
         t.primary_key = Some(pbps_model::PrimaryKey {
             name: None,
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         declared.tables.insert(table.clone(), t);
         let change = |name: &str| {
@@ -14462,6 +14768,7 @@ mod tests {
         t.primary_key = Some(pbps_model::PrimaryKey {
             name: None,
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         // Keyed by the live name, as `tables_under` leaves it.
         let mut declared = Schema::default();
@@ -15334,13 +15641,16 @@ mod tests {
             unique,
             filter: None,
             method: Default::default(),
+            storage_parameters: Default::default(),
         };
         let unique = |on: &str| pbps_model::UniqueConstraint {
             columns: vec![on.to_owned()],
+            storage_parameters: Default::default(),
         };
         let key = |on: &str| pbps_model::PrimaryKey {
             name: None,
             columns: vec![on.to_owned()],
+            storage_parameters: Default::default(),
         };
         let fk =
             |to: &TableName, on_delete: pbps_model::ReferentialAction| pbps_model::ForeignKey {
@@ -15548,6 +15858,7 @@ mod tests {
                 t.primary_key = Some(pbps_model::PrimaryKey {
                     name: Some("PK__t__3213E83F".to_owned()),
                     columns: vec!["id".to_owned()],
+                    storage_parameters: Default::default(),
                 });
             }),
         )

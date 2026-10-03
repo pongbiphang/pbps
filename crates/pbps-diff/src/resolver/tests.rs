@@ -576,6 +576,7 @@ fn splitting_table_creation_preserves_the_declared_index_layout() {
                     unique: false,
                     filter: None,
                     method: Default::default(),
+                    storage_parameters: Default::default(),
                 },
             );
             table.clustered = clustered.then(|| Clustered::Index("ix".into()));
@@ -643,6 +644,7 @@ fn splitting_table_creation_sets_an_index_identity_after_its_index() {
                     unique: true,
                     filter: None,
                     method: Default::default(),
+                    storage_parameters: Default::default(),
                 },
             );
             table.replica_identity = Some(identity.clone());
@@ -711,6 +713,7 @@ fn a_replica_identity_keeps_its_order_against_its_tables_indexes() {
         unique: true,
         filter: None,
         method: Default::default(),
+        storage_parameters: Default::default(),
     };
     let with = |index: &str, identity: Option<ReplicaIdentity>| {
         let mut schema = tables();
@@ -798,6 +801,7 @@ fn new_table_indexes_are_offline_while_existing_table_indexes_keep_the_requested
                         unique: false,
                         filter: None,
                         method: Default::default(),
+                        storage_parameters: Default::default(),
                     },
                 );
                 hints.strategies.insert(name.clone(), Strategy { online });

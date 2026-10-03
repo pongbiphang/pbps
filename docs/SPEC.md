@@ -238,6 +238,12 @@ indexes:
   Each value is compared as the engine reads it, so `off`, `false` and `0`
   are one value. `toast.*` parameters are not declared, and one on a pulled
   table is reported; SQL Server refuses the key (DEC-1441.1).
+- **An index, a primary key and a unique constraint declare their index's
+  `storage_parameters`** by its method: a B-tree's `fillfactor` and
+  `deduplicate_items`, a GIN index's `fastupdate` and
+  `gin_pending_list_limit`. A unique constraint takes them in its mapping form
+  `{columns: […], storage_parameters: {…}}`. Each changes in place; SQL
+  Server refuses them (DEC-1442.1).
 - **An index key is `column [opclass] [asc|desc]`**, in PostgreSQL's order, and
   `method:` names the access method only where it is not the default `btree`.
   An absent class is the method's default for the column's type. The first

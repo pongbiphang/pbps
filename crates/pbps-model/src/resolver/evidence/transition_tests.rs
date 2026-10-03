@@ -345,6 +345,7 @@ fn removing_a_predicate_can_retain_the_plain_index_catalog_record() {
             unique: false,
             filter: None,
             method: Default::default(),
+            storage_parameters: Default::default(),
         }),
     }));
     evidence.transitions[0].after = evidence.transitions[0].before.clone();

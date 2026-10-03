@@ -2747,6 +2747,7 @@ async fn a_gin_index_over_jsonb_round_trips_and_changes_as_a_typed_plan() {
             unique: false,
             filter: None,
             method: IndexMethod::Btree,
+            storage_parameters: Default::default(),
         },
     );
     let replaced = plan(&after, &ids, &ordinary, &ids);
@@ -3267,6 +3268,166 @@ async fn storage_parameters_round_trip_and_change_as_a_typed_plan() {
     );
 }
 
+/// Index storage parameters, on a key's, a unique constraint's, a B-tree's
+/// and a GIN index, round-trip in canonical spelling (#1442). A change to
+/// them alone is one in-place `ALTER INDEX` each that applies; an index
+/// rebuilt for its definition keeps them, never dropped on recreate; a
+/// parameter the model cannot declare is named.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn index_storage_parameters_round_trip_and_change_in_place() {
+    use pbps_model::Change;
+    let s = emit_schema("isp1442");
+    let t = TableName::new(&s, "t");
+    let params = |m: &std::collections::BTreeMap<String, String>| -> Vec<(String, String)> {
+        m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    };
+    let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
+        list.iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    };
+
+    let mut source = TestDb::create("isp1442_src").await;
+    fresh(&mut source, &s).await;
+    source
+        .execute(&format!(
+            "CREATE TABLE {s}.t (id integer, k integer, j jsonb,
+                 CONSTRAINT t_pkey PRIMARY KEY (id) WITH (fillfactor = '070'),
+                 CONSTRAINT t_k UNIQUE (k) WITH (deduplicate_items = of));
+             CREATE INDEX t_ix ON {s}.t (k) WITH (fillfactor = '7e1');
+             CREATE INDEX t_gin ON {s}.t USING gin (j) WITH (fastupdate = off, gin_pending_list_limit = 1024);"
+        ))
+        .await
+        .expect("the source table");
+    let read = pull(&mut source).await;
+    let limitations = ours_limitations(&read, &s);
+    let pulled = ours_only(&read, &s);
+    drop_schema(&mut source, &s).await;
+    source.drop().await;
+    assert!(limitations.is_empty(), "{limitations:?}");
+    let table = &pulled.tables[&t];
+    assert_eq!(
+        params(&table.primary_key.as_ref().unwrap().storage_parameters),
+        pairs(&[("fillfactor", "56")])
+    );
+    assert_eq!(
+        params(&table.unique["t_k"].storage_parameters),
+        pairs(&[("deduplicate_items", "false")])
+    );
+    assert_eq!(
+        params(&table.indexes["t_ix"].storage_parameters),
+        pairs(&[("fillfactor", "70")])
+    );
+    assert_eq!(
+        params(&table.indexes["t_gin"].storage_parameters),
+        pairs(&[("fastupdate", "false"), ("gin_pending_list_limit", "1024")])
+    );
+
+    let ids = mint_ids(&pulled, &IdsFile::default(), &[]);
+    let mut target = TestDb::create("isp1442_dst").await;
+    fresh(&mut target, &s).await;
+    apply(
+        &mut target,
+        &Postgres::new(),
+        &plan(&Schema::default(), &IdsFile::default(), &pulled, &ids),
+    )
+    .await;
+    let rebuilt = ours_only(&pull(&mut target).await, &s);
+    assert_eq!(rebuilt, pulled);
+    assert!(plan(&rebuilt, &ids, &pulled, &ids).is_empty());
+
+    // In place: one change per part, no drop.
+    let mut changed = pulled.clone();
+    {
+        let table = changed.tables.get_mut(&t).unwrap();
+        table
+            .primary_key
+            .as_mut()
+            .unwrap()
+            .storage_parameters
+            .insert("fillfactor".into(), "90".into());
+        table
+            .unique
+            .get_mut("t_k")
+            .unwrap()
+            .storage_parameters
+            .clear();
+        table
+            .indexes
+            .get_mut("t_gin")
+            .unwrap()
+            .storage_parameters
+            .remove("gin_pending_list_limit");
+    }
+    let step = plan(&rebuilt, &ids, &changed, &ids);
+    assert_eq!(step.changes.len(), 3, "{step:#?}");
+    assert!(
+        step.changes
+            .iter()
+            .all(|p| matches!(p.change, Change::SetIndexStorageParameters { .. })),
+        "{step:#?}"
+    );
+    apply(&mut target, &Postgres::new(), &step).await;
+    let after = ours_only(&pull(&mut target).await, &s);
+    assert_eq!(after, changed);
+    assert!(plan(&after, &ids, &changed, &ids).is_empty());
+
+    // Rebuilt for its definition (descending now): the index keeps them.
+    let mut redefined = changed.clone();
+    redefined
+        .tables
+        .get_mut(&t)
+        .unwrap()
+        .indexes
+        .get_mut("t_ix")
+        .unwrap()
+        .columns[0]
+        .descending = true;
+    let step = plan(&after, &ids, &redefined, &ids);
+    assert!(
+        step.changes
+            .iter()
+            .any(|p| matches!(p.change, Change::DropIndex { .. })),
+        "{step:#?}"
+    );
+    apply(&mut target, &Postgres::new(), &step).await;
+    let recreated = ours_only(&pull(&mut target).await, &s);
+    assert_eq!(
+        params(&recreated.tables[&t].indexes["t_ix"].storage_parameters),
+        pairs(&[("fillfactor", "70")])
+    );
+    assert_eq!(recreated, redefined);
+
+    // Changed by hand: the next plan sets it back, so the comparison saw it.
+    target
+        .execute(&format!("ALTER INDEX {s}.t_ix SET (fillfactor = 60);"))
+        .await
+        .expect("a hand change");
+    let drifted = ours_only(&pull(&mut target).await, &s);
+    assert!(!plan(&drifted, &ids, &redefined, &ids).is_empty());
+
+    // Every parameter of a B-tree and a GIN index is declarable; an index of
+    // a method the model does not hold, parameters and all, is named.
+    target
+        .execute(&format!(
+            "CREATE TABLE {s}.g (id integer PRIMARY KEY, p point);
+             CREATE INDEX g_gist ON {s}.g USING gist (p) WITH (buffering = on);"
+        ))
+        .await
+        .expect("a GiST index");
+    let read = pull(&mut target).await;
+    let limitations = ours_limitations(&read, &s);
+    assert!(
+        limitations
+            .iter()
+            .any(|l| format!("{l:?}").contains("g_gist")),
+        "{limitations:?}"
+    );
+    drop_schema(&mut target, &s).await;
+    target.drop().await;
+}
+
 /// Emits and executes every change of a plan, in plan order.
 ///
 /// One statement at a time through [`Conn::execute`], which is what `apply`
@@ -3371,6 +3532,7 @@ fn rich_schema(s: &str) -> Schema {
     region.primary_key = Some(PrimaryKey {
         name: Some("pk_region".into()),
         columns: vec!["region_id".into()],
+        storage_parameters: Default::default(),
     });
 
     let mut customer = Table::default();
@@ -3402,11 +3564,13 @@ fn rich_schema(s: &str) -> Schema {
     customer.primary_key = Some(PrimaryKey {
         name: Some("pk_customer".into()),
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
     customer.unique.insert(
         "uq_customer_email".into(),
         UniqueConstraint {
             columns: vec!["email".into()],
+            storage_parameters: Default::default(),
         },
     );
     customer.foreign_keys.insert(
@@ -3444,6 +3608,7 @@ fn rich_schema(s: &str) -> Schema {
             unique: false,
             filter: Some("(region_id IS NOT NULL)".into()),
             method: Default::default(),
+            storage_parameters: Default::default(),
         },
     );
 
@@ -3557,6 +3722,7 @@ async fn a_table_already_there_gains_a_column_a_key_a_unique_an_index_and_a_fore
     parent.primary_key = Some(PrimaryKey {
         name: Some("pk_parent".into()),
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     let mut child = Table::default();
     child
@@ -3592,11 +3758,13 @@ async fn a_table_already_there_gains_a_column_a_key_a_unique_an_index_and_a_fore
         child.primary_key = Some(PrimaryKey {
             name: Some("pk_child".into()),
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         child.unique.insert(
             "uq_child_parent".into(),
             UniqueConstraint {
                 columns: vec!["parent_code".into()],
+                storage_parameters: Default::default(),
             },
         );
         child.indexes.insert(
@@ -3611,6 +3779,7 @@ async fn a_table_already_there_gains_a_column_a_key_a_unique_an_index_and_a_fore
                 unique: false,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
         child.foreign_keys.insert(
@@ -3788,6 +3957,7 @@ async fn an_unqualified_name_in_a_declared_expression_binds_through_the_write_pa
             unique: false,
             filter: Some("floorish(id) > 0".into()),
             method: Default::default(),
+            storage_parameters: Default::default(),
         },
     );
     let mut declared = Schema::default();
@@ -3913,6 +4083,7 @@ async fn a_declared_expression_that_ends_in_a_comment_still_runs() {
             unique: false,
             filter: Some("n > 0 -- the reason for the filter".into()),
             method: Default::default(),
+            storage_parameters: Default::default(),
         },
     );
     let mut declared = Schema::default();
@@ -4093,6 +4264,7 @@ async fn an_online_index_is_built_concurrently_and_says_it_leaves_the_transactio
         unique: false,
         filter: None,
         method: Default::default(),
+        storage_parameters: Default::default(),
     };
     let filtered = Index {
         filter: Some("(n IS NOT NULL)".into()),
@@ -4425,6 +4597,7 @@ async fn a_nullable_primary_key_column_is_refused_because_this_engine_would_not(
     table.primary_key = Some(PrimaryKey {
         name: Some("pk".into()),
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
     let problems = Postgres::new().validate_table(&TableName::new(&s, "t"), &table);
     assert_eq!(problems.len(), 1, "{problems:?}");
@@ -4614,6 +4787,7 @@ async fn a_row_key_holding_a_nul_is_refused_by_this_engine_and_is_not_exempt_off
         table.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["code".into()],
+            storage_parameters: Default::default(),
         });
         table.data = Some(pbps_model::TableData {
             mode: pbps_model::DataMode::Exact,
@@ -4689,12 +4863,17 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
                     table.primary_key = Some(PrimaryKey {
                         name: Some("pk".into()),
                         columns,
+                        storage_parameters: Default::default(),
                     })
                 }
                 "unique" => {
-                    table
-                        .unique
-                        .insert("uq".into(), UniqueConstraint { columns });
+                    table.unique.insert(
+                        "uq".into(),
+                        UniqueConstraint {
+                            columns,
+                            storage_parameters: Default::default(),
+                        },
+                    );
                 }
                 "index" => {
                     table.indexes.insert(
@@ -4712,6 +4891,7 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
                             unique: false,
                             filter: None,
                             method: Default::default(),
+                            storage_parameters: Default::default(),
                         },
                     );
                 }
@@ -4791,6 +4971,7 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
                 unique: false,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
         cases.push((format!("include {code:?}"), table, code));
@@ -4832,6 +5013,7 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
                         unique: false,
                         filter: Some(expression.into()),
                         method: Default::default(),
+                        storage_parameters: Default::default(),
                     },
                 );
             } else {
@@ -4863,12 +5045,17 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
                     table.primary_key = Some(PrimaryKey {
                         name: Some("pk".into()),
                         columns,
+                        storage_parameters: Default::default(),
                     })
                 }
                 "unique" => {
-                    table
-                        .unique
-                        .insert("uq".into(), UniqueConstraint { columns });
+                    table.unique.insert(
+                        "uq".into(),
+                        UniqueConstraint {
+                            columns,
+                            storage_parameters: Default::default(),
+                        },
+                    );
                 }
                 _ => {
                     let (keys, include) = if kind == "include" {
@@ -4891,6 +5078,7 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
                             unique: false,
                             filter: None,
                             method: Default::default(),
+                            storage_parameters: Default::default(),
                         },
                     );
                 }
@@ -4932,6 +5120,7 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
         table.primary_key = Some(PrimaryKey {
             name: Some("pk".into()),
             columns: vec!["a".into()],
+            storage_parameters: Default::default(),
         });
         cases.push((format!("key type {declared}"), table, None));
     }
@@ -4958,6 +5147,7 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
                 unique: false,
                 filter: Some(expression.into()),
                 method: Default::default(),
+                storage_parameters: Default::default(),
             },
         );
         cases.push((format!("non-ASCII expression {expression:?}"), table, None));
@@ -5040,6 +5230,7 @@ async fn installed_default_operator_classes_can_make_json_keys_valid() {
     parent.primary_key = Some(PrimaryKey {
         name: Some("pk".into()),
         columns: vec!["j".into()],
+        storage_parameters: Default::default(),
     });
     let mut child = Table::default();
     child.columns.insert("j".into(), Column::new(ty("json")));
@@ -5047,6 +5238,7 @@ async fn installed_default_operator_classes_can_make_json_keys_valid() {
         "uq".into(),
         UniqueConstraint {
             columns: vec!["j".into()],
+            storage_parameters: Default::default(),
         },
     );
     child.indexes.insert(
@@ -5061,6 +5253,7 @@ async fn installed_default_operator_classes_can_make_json_keys_valid() {
             unique: false,
             filter: None,
             method: Default::default(),
+            storage_parameters: Default::default(),
         },
     );
     child.foreign_keys.insert(
@@ -5179,6 +5372,7 @@ async fn an_unnamed_primary_key_is_dropped_by_the_name_the_catalog_holds() {
                 from: Some(PrimaryKey {
                     name: None,
                     columns: vec!["id".into()],
+                    storage_parameters: Default::default(),
                 }),
                 to: None,
                 nonclustered: false,
@@ -5229,6 +5423,7 @@ async fn a_migration_that_renames_widens_retypes_and_drops_converges() {
     t.primary_key = Some(PrimaryKey {
         name: Some("pk_t".into()),
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
     t.checks.insert(
         "ck_n".into(),
@@ -5248,6 +5443,7 @@ async fn a_migration_that_renames_widens_retypes_and_drops_converges() {
             unique: false,
             filter: None,
             method: Default::default(),
+            storage_parameters: Default::default(),
         },
     );
     a.tables.insert(TableName::new(&s, "t"), t);
@@ -5656,6 +5852,7 @@ async fn a_key_given_up_leaves_before_its_column_is_relaxed() {
     with_key.primary_key = Some(pbps_model::PrimaryKey {
         name: Some("pk_t".into()),
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
     let mut a = Schema::default();
     a.tables.insert(table.clone(), with_key);
@@ -5715,6 +5912,7 @@ async fn a_key_is_replaced_around_the_columns_both_of_its_shapes_name() {
     before.primary_key = Some(pbps_model::PrimaryKey {
         name: Some("pk_t".into()),
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
     let mut a = Schema::default();
     a.tables.insert(table.clone(), before);
@@ -5729,6 +5927,7 @@ async fn a_key_is_replaced_around_the_columns_both_of_its_shapes_name() {
     after.primary_key = Some(pbps_model::PrimaryKey {
         name: Some("pk_t".into()),
         columns: vec!["other".into()],
+        storage_parameters: Default::default(),
     });
     let mut b = Schema::default();
     b.tables.insert(table.clone(), after);
@@ -5924,6 +6123,7 @@ async fn a_dropped_columns_name_is_free_before_the_rename_that_reuses_it() {
         t.primary_key = Some(PrimaryKey {
             name: Some("pk_s".to_owned()),
             columns: vec!["code".to_owned()],
+            storage_parameters: Default::default(),
         });
         t
     };
@@ -7345,6 +7545,7 @@ async fn doctor_reads_a_real_version_and_a_permission_set_ownership_decides() {
     table.primary_key = Some(pbps_model::PrimaryKey {
         name: None,
         columns: vec!["id".to_owned()],
+        storage_parameters: Default::default(),
     });
     with_data(
         &mut table,
@@ -8896,6 +9097,7 @@ fn schema_with_modules(s: &str) -> Schema {
     t.primary_key = Some(PrimaryKey {
         name: Some("pk_t".into()),
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
     schema.tables.insert(TableName::new(s, "t"), t);
 
@@ -13796,6 +13998,7 @@ async fn declared_rows_reach_the_engine_and_read_back_as_declared() {
     table.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     with_data(
         &mut table,
@@ -13889,6 +14092,7 @@ async fn a_hand_edited_row_is_seen_and_the_update_holds_what_the_plan_recorded()
     table.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     with_data(
         &mut table,
@@ -13983,6 +14187,7 @@ async fn a_data_table_with_columns_named_like_the_row_blocks_variables_is_writte
     table.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     let cells = |n: i64| {
         row(&[
@@ -14090,6 +14295,7 @@ async fn the_pre_delete_probe_counts_a_foreign_key_this_engine_never_stopped_enf
     table.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     let mut declared = Schema::default();
     declared.tables.insert(name.clone(), table);
@@ -14201,6 +14407,7 @@ async fn an_identity_keyed_data_block_is_refused_and_the_hazard_is_measured() {
     table.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
     with_data(
         &mut table,
@@ -14251,6 +14458,7 @@ async fn a_backslash_and_a_bytea_mean_one_thing_under_either_string_setting() {
     table.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     // Two characters, a backslash and an `n`, which `off` would fold into one
     // newline; and two bytes, which `off` would store as three.
@@ -14349,6 +14557,7 @@ async fn two_keys_a_collation_calls_one_row_are_found_by_the_engine_and_not_offl
         table.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["code".into()],
+            storage_parameters: Default::default(),
         });
         with_data(
             &mut table,
@@ -14452,6 +14661,7 @@ async fn a_value_the_engine_spells_differently_is_refused_before_it_is_written()
     table.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     with_data(
         &mut table,
@@ -14498,6 +14708,7 @@ async fn a_value_the_engine_spells_differently_is_refused_before_it_is_written()
     single.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     with_data(
         &mut single,
@@ -14569,6 +14780,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
     table.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     with_data(
         &mut table,
@@ -14660,6 +14872,7 @@ async fn a_child_row_that_arrives_after_the_probe_is_not_cascaded_away() {
     table.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     with_data(
         &mut table,
@@ -14745,6 +14958,7 @@ async fn a_cell_left_to_a_default_is_compared_as_the_column_stores_it() {
     table.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     with_data(
         &mut table,
@@ -14820,6 +15034,7 @@ async fn a_child_this_plan_sets_to_null_is_not_counted_against_its_parents_delet
     p.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     let mut c = Table::default();
     c.columns
@@ -14828,6 +15043,7 @@ async fn a_child_this_plan_sets_to_null_is_not_counted_against_its_parents_delet
     c.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     c.foreign_keys.insert(
         "fk_child".into(),
@@ -14955,6 +15171,7 @@ async fn a_referencing_row_the_session_cannot_see_refuses_the_delete() {
     table.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     with_data(
         &mut table,
@@ -15120,6 +15337,7 @@ async fn a_cell_a_collation_calls_equal_to_its_default_is_still_drift() {
     table.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     // The declaration omits `label`, which is what "leave it at its default"
     // is spelled as. The stored `New` is therefore drift.
@@ -15200,6 +15418,7 @@ async fn a_row_that_references_only_itself_can_be_deleted() {
     table.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     table.foreign_keys.insert(
         "node_parent_fkey".into(),
@@ -15318,6 +15537,7 @@ async fn a_write_to_a_default_no_probe_can_evaluate_is_refused_where_a_key_spans
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     with_data(
         &mut parent,
@@ -15337,6 +15557,7 @@ async fn a_write_to_a_default_no_probe_can_evaluate_is_refused_where_a_key_spans
         t.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         if keyed {
             t.foreign_keys.insert(
@@ -15476,6 +15697,7 @@ async fn a_json_cell_at_its_default_is_told_from_a_hand_edited_one() {
     table.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     with_data(&mut table, DataMode::Exact, &[("a", row(&[]))]);
     let mut declared = Schema::default();
@@ -15562,6 +15784,7 @@ async fn a_trigger_that_respells_the_written_key_rolls_the_statement_back() {
     table.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     with_data(
         &mut table,
@@ -15676,6 +15899,7 @@ async fn a_referencing_relation_is_counted_only_where_its_key_reaches() {
     table.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     with_data(
         &mut table,
@@ -15814,11 +16038,13 @@ async fn an_unprobeable_default_beside_a_null_in_the_same_key_refuses_nothing() 
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     parent.unique.insert(
         "parent_xy".into(),
         UniqueConstraint {
             columns: vec!["x".into(), "y".into()],
+            storage_parameters: Default::default(),
         },
     );
     // No rows declared, so both stored rows are undeclared and the plan
@@ -15837,6 +16063,7 @@ async fn an_unprobeable_default_beside_a_null_in_the_same_key_refuses_nothing() 
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
     child.foreign_keys.insert(
         "child_ab".into(),
@@ -15937,6 +16164,7 @@ async fn a_referencing_table_the_session_cannot_read_refuses_the_delete() {
     table.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     with_data(
         &mut table,
@@ -16019,6 +16247,7 @@ async fn a_child_left_to_a_null_default_is_not_counted_against_its_parents_delet
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     with_data(
         &mut parent,
@@ -16036,6 +16265,7 @@ async fn a_child_left_to_a_null_default_is_not_counted_against_its_parents_delet
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     child.foreign_keys.insert(
         "child_parent_fkey".into(),
@@ -16127,6 +16357,7 @@ async fn a_foreign_key_this_plan_adds_is_counted_before_the_delete_that_would_br
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     with_data(
         &mut parent,
@@ -16144,6 +16375,7 @@ async fn a_foreign_key_this_plan_adds_is_counted_before_the_delete_that_would_br
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     // The key is declared and not in the database: this plan adds it.
     child.foreign_keys.insert(
@@ -16343,6 +16575,7 @@ async fn narrowed_integer_key(from: &str, to: &str, overflow: i64) {
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     with_data(
         &mut parent,
@@ -16358,6 +16591,7 @@ async fn narrowed_integer_key(from: &str, to: &str, overflow: i64) {
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     // The key is declared and not in the database: this plan adds it, over a
     // column the same plan narrows.
@@ -16520,6 +16754,7 @@ async fn a_narrowed_parent_column_is_probed_without_raising_on_either_alias() {
         parent.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["code".into()],
+            storage_parameters: Default::default(),
         });
         with_data(&mut parent, DataMode::Exact, rows);
         parent
@@ -16534,6 +16769,7 @@ async fn a_narrowed_parent_column_is_probed_without_raising_on_either_alias() {
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     // Declared and not in the database, so this plan adds it — which is what
     // gives the key a probe of its own to carry the guard.
@@ -16681,6 +16917,7 @@ async fn a_foreign_key_this_plan_adds_on_a_narrowing_pair_still_counts_a_row_who
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     // The plan deletes parent row `3`, keeping only `2`.
     with_data(
@@ -16699,6 +16936,7 @@ async fn a_foreign_key_this_plan_adds_on_a_narrowing_pair_still_counts_a_row_who
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     child.foreign_keys.insert(
         "child_parent_fkey".into(),
@@ -16848,6 +17086,7 @@ async fn narrowing_projection_counts_rounding_collisions_without_losing_nulls() 
                 name: "uq_projection".into(),
                 constraint: pbps_model::UniqueConstraint {
                     columns: vec!["v".into()],
+                    storage_parameters: Default::default(),
                 },
                 clustered: false,
             },
@@ -16864,6 +17103,7 @@ async fn narrowing_projection_counts_rounding_collisions_without_losing_nulls() 
                     unique: true,
                     filter: None,
                     method: Default::default(),
+                    storage_parameters: Default::default(),
                 }),
                 clustered: false,
             },
@@ -16873,6 +17113,7 @@ async fn narrowing_projection_counts_rounding_collisions_without_losing_nulls() 
                 to: Some(PrimaryKey {
                     name: Some("uq_projection".into()),
                     columns: vec!["v".into()],
+                    storage_parameters: Default::default(),
                 }),
                 nonclustered: false,
             },
@@ -17056,6 +17297,7 @@ async fn narrowing_projection_keeps_inserted_and_updated_rows_in_composite_keys(
                 name: "uq_projection".into(),
                 constraint: pbps_model::UniqueConstraint {
                     columns: vec!["v".into(), "tag".into()],
+                    storage_parameters: Default::default(),
                 },
                 clustered: false,
             },
@@ -17137,6 +17379,7 @@ async fn a_key_this_plan_adds_on_a_column_it_adds_counts_the_backfilled_rows() {
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     with_data(
         &mut parent,
@@ -17154,6 +17397,7 @@ async fn a_key_this_plan_adds_on_a_column_it_adds_counts_the_backfilled_rows() {
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     child.foreign_keys.insert(
         "child_parent_fkey".into(),
@@ -17314,11 +17558,13 @@ async fn a_row_updated_to_a_null_beside_an_unprobeable_default_leaves_the_count(
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     parent.unique.insert(
         "parent_xy".into(),
         UniqueConstraint {
             columns: vec!["x".into(), "y".into()],
+            storage_parameters: Default::default(),
         },
     );
     with_data(&mut parent, DataMode::Exact, &[]);
@@ -17334,6 +17580,7 @@ async fn a_row_updated_to_a_null_beside_an_unprobeable_default_leaves_the_count(
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
     child.foreign_keys.insert(
         "child_ab".into(),
@@ -17459,11 +17706,13 @@ async fn a_key_into_a_column_this_plan_adds_to_the_parent_counts_against_its_bac
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     parent.unique.insert(
         "parent_alt".into(),
         UniqueConstraint {
             columns: vec!["alt".into()],
+            storage_parameters: Default::default(),
         },
     );
     with_data(&mut parent, DataMode::Exact, &[]);
@@ -17476,6 +17725,7 @@ async fn a_key_into_a_column_this_plan_adds_to_the_parent_counts_against_its_bac
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     child.foreign_keys.insert(
         "child_ref".into(),
@@ -17579,11 +17829,13 @@ async fn an_omitted_cell_with_no_default_is_a_null_the_probe_knows() {
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     parent.unique.insert(
         "parent_xy".into(),
         UniqueConstraint {
             columns: vec!["x".into(), "y".into()],
+            storage_parameters: Default::default(),
         },
     );
     with_data(&mut parent, DataMode::Exact, &[]);
@@ -17599,6 +17851,7 @@ async fn an_omitted_cell_with_no_default_is_a_null_the_probe_knows() {
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
     child.foreign_keys.insert(
         "child_ab".into(),
@@ -17678,11 +17931,13 @@ async fn a_typed_null_backfill_is_a_null_beside_an_unprobeable_one() {
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     parent.unique.insert(
         "parent_xy".into(),
         UniqueConstraint {
             columns: vec!["x".into(), "y".into()],
+            storage_parameters: Default::default(),
         },
     );
     with_data(&mut parent, DataMode::Exact, &[]);
@@ -17700,6 +17955,7 @@ async fn a_typed_null_backfill_is_a_null_beside_an_unprobeable_one() {
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
     child.foreign_keys.insert(
         "child_ab".into(),
@@ -17784,11 +18040,13 @@ async fn a_surviving_parent_row_is_the_row_this_plan_leaves_there() {
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     parent.unique.insert(
         "parent_alt".into(),
         UniqueConstraint {
             columns: vec!["alt".into()],
+            storage_parameters: Default::default(),
         },
     );
     // `keep` survives, moved off the backfilled value: nothing is left for
@@ -17813,6 +18071,7 @@ async fn a_surviving_parent_row_is_the_row_this_plan_leaves_there() {
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     child.foreign_keys.insert(
         "child_ref".into(),
@@ -17953,11 +18212,13 @@ async fn a_backfilled_literal_is_compared_through_its_columns_type() {
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     parent.unique.insert(
         "parent_on_day".into(),
         UniqueConstraint {
             columns: vec!["on_day".into()],
+            storage_parameters: Default::default(),
         },
     );
     with_data(&mut parent, DataMode::Exact, &[]);
@@ -17972,6 +18233,7 @@ async fn a_backfilled_literal_is_compared_through_its_columns_type() {
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     child.foreign_keys.insert(
         "child_day".into(),
@@ -18080,6 +18342,7 @@ async fn an_identity_column_this_plan_adds_is_a_backfill_no_probe_can_evaluate()
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     with_data(
         &mut parent,
@@ -18100,6 +18363,7 @@ async fn an_identity_column_this_plan_adds_is_a_backfill_no_probe_can_evaluate()
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     child.foreign_keys.insert(
         "child_pid".into(),
@@ -18202,11 +18466,13 @@ async fn a_key_this_plan_adds_on_a_column_it_retypes_compares_the_converted_valu
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     parent.unique.insert(
         "parent_amount".into(),
         UniqueConstraint {
             columns: vec!["amount".into()],
+            storage_parameters: Default::default(),
         },
     );
     with_data(
@@ -18225,6 +18491,7 @@ async fn a_key_this_plan_adds_on_a_column_it_retypes_compares_the_converted_valu
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     child.foreign_keys.insert(
         "child_amount".into(),
@@ -18324,6 +18591,7 @@ async fn a_column_grant_that_covers_the_count_is_enough_to_count() {
     table.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     with_data(
         &mut table,
@@ -18408,11 +18676,13 @@ async fn a_retyped_survivor_that_holds_the_converted_value_is_a_survivor() {
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     parent.unique.insert(
         "parent_amount".into(),
         UniqueConstraint {
             columns: vec!["amount".into()],
+            storage_parameters: Default::default(),
         },
     );
     with_data(
@@ -18431,6 +18701,7 @@ async fn a_retyped_survivor_that_holds_the_converted_value_is_a_survivor() {
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     child.foreign_keys.insert(
         "child_amount".into(),
@@ -18530,11 +18801,13 @@ async fn an_inserted_survivor_and_an_arriving_child_meet_through_the_columns_typ
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     parent.unique.insert(
         "parent_amt".into(),
         UniqueConstraint {
             columns: vec!["amt".into()],
+            storage_parameters: Default::default(),
         },
     );
     with_data(
@@ -18568,6 +18841,7 @@ async fn an_inserted_survivor_and_an_arriving_child_meet_through_the_columns_typ
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     child.foreign_keys.insert(
         "child_amt".into(),
@@ -18667,6 +18941,7 @@ async fn a_referencing_table_in_a_schema_the_session_cannot_use_refuses_the_dele
     table.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     with_data(
         &mut table,
@@ -18765,6 +19040,7 @@ async fn a_child_this_plan_creates_arrives_on_the_parent_before_its_key_exists()
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     with_data(
         &mut parent,
@@ -18782,6 +19058,7 @@ async fn a_child_this_plan_creates_arrives_on_the_parent_before_its_key_exists()
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     child.foreign_keys.insert(
         "child_parent_fkey".into(),
@@ -18892,11 +19169,13 @@ async fn an_insert_leaving_a_key_column_to_an_identity_is_refused() {
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     parent.unique.insert(
         "parent_code_x".into(),
         UniqueConstraint {
             columns: vec!["code".into(), "x".into()],
+            storage_parameters: Default::default(),
         },
     );
     with_data(
@@ -18925,6 +19204,7 @@ async fn an_insert_leaving_a_key_column_to_an_identity_is_refused() {
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     child.foreign_keys.insert(
         "child_seq_x".into(),
@@ -19055,6 +19335,7 @@ async fn a_key_whose_delete_action_is_switched_off_is_not_counted() {
     table.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     with_data(
         &mut table,
@@ -19142,11 +19423,13 @@ async fn a_planned_key_on_unchanged_columns_sees_the_survivor_too() {
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     parent.unique.insert(
         "parent_grp".into(),
         UniqueConstraint {
             columns: vec!["grp".into()],
+            storage_parameters: Default::default(),
         },
     );
     with_data(
@@ -19163,6 +19446,7 @@ async fn a_planned_key_on_unchanged_columns_sees_the_survivor_too() {
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     child.foreign_keys.insert(
         "child_grp".into(),
@@ -19260,11 +19544,13 @@ async fn a_row_arriving_against_an_unprobeable_parent_backfill_is_refused() {
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     parent.unique.insert(
         "parent_alt".into(),
         UniqueConstraint {
             columns: vec!["alt".into()],
+            storage_parameters: Default::default(),
         },
     );
     with_data(
@@ -19283,6 +19569,7 @@ async fn a_row_arriving_against_an_unprobeable_parent_backfill_is_refused() {
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     child.foreign_keys.insert(
         "child_ref".into(),
@@ -19400,6 +19687,7 @@ async fn a_policy_on_a_partition_does_not_refuse_a_delete_counted_through_its_pa
     table.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     with_data(
         &mut table,
@@ -19497,11 +19785,13 @@ async fn a_row_spelling_a_value_over_a_null_backfill_is_refused_on_its_own_tuple
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     parent.unique.insert(
         "parent_alt".into(),
         UniqueConstraint {
             columns: vec!["alt".into()],
+            storage_parameters: Default::default(),
         },
     );
     with_data(
@@ -19520,6 +19810,7 @@ async fn a_row_spelling_a_value_over_a_null_backfill_is_refused_on_its_own_tuple
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     child.foreign_keys.insert(
         "child_ref".into(),
@@ -19638,11 +19929,13 @@ async fn a_stored_row_holding_null_in_the_key_is_not_refused_for_a_backfill_it_n
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     parent.unique.insert(
         "parent_pid".into(),
         UniqueConstraint {
             columns: vec!["pid".into()],
+            storage_parameters: Default::default(),
         },
     );
     with_data(
@@ -19661,6 +19954,7 @@ async fn a_stored_row_holding_null_in_the_key_is_not_refused_for_a_backfill_it_n
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     child.foreign_keys.insert(
         "child_ref".into(),
@@ -19780,11 +20074,13 @@ async fn a_null_an_update_leaves_alone_is_a_null_of_the_tuple_it_writes() {
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     parent.unique.insert(
         "parent_xy".into(),
         UniqueConstraint {
             columns: vec!["x".into(), "y".into()],
+            storage_parameters: Default::default(),
         },
     );
     with_data(&mut parent, DataMode::Exact, &[]);
@@ -19800,6 +20096,7 @@ async fn a_null_an_update_leaves_alone_is_a_null_of_the_tuple_it_writes() {
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
     child.foreign_keys.insert(
         "child_ab".into(),
@@ -19932,11 +20229,13 @@ async fn a_null_an_update_leaves_alone_decides_for_a_key_this_plan_adds_too() {
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     parent.unique.insert(
         "parent_xy".into(),
         UniqueConstraint {
             columns: vec!["x".into(), "y".into()],
+            storage_parameters: Default::default(),
         },
     );
     with_data(
@@ -19963,6 +20262,7 @@ async fn a_null_an_update_leaves_alone_decides_for_a_key_this_plan_adds_too() {
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
     child.foreign_keys.insert(
         "child_ab".into(),
@@ -20082,6 +20382,7 @@ async fn a_default_cast_from_null_is_the_null_the_row_is_left_to() {
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     with_data(
         &mut parent,
@@ -20099,6 +20400,7 @@ async fn a_default_cast_from_null_is_the_null_the_row_is_left_to() {
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
     child.foreign_keys.insert(
         "child_ref".into(),
@@ -20270,6 +20572,7 @@ async fn a_null_default_is_one_this_engine_does_not_keep() {
     t.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     let pg = Postgres::new();
     let mut refused: Vec<String> = pg
@@ -20410,6 +20713,7 @@ async fn a_child_collated_differently_from_its_parent_is_still_counted() {
     table.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     with_data(
         &mut table,
@@ -20484,11 +20788,13 @@ async fn an_inserted_survivor_meets_an_arriving_child_under_the_referenced_colla
         parent.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         parent.unique.insert(
             "parent_code".into(),
             UniqueConstraint {
                 columns: vec!["code".into()],
+                storage_parameters: Default::default(),
             },
         );
         with_data(
@@ -20505,6 +20811,7 @@ async fn an_inserted_survivor_meets_an_arriving_child_under_the_referenced_colla
         child.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         child.foreign_keys.insert(
             "child_ref".into(),
@@ -20633,6 +20940,7 @@ async fn a_planned_key_across_collations_is_counted_under_the_referenced_collati
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     with_data(
         &mut parent,
@@ -20648,6 +20956,7 @@ async fn a_planned_key_across_collations_is_counted_under_the_referenced_collati
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
     child.foreign_keys.insert(
         "child_ref".into(),
@@ -20976,11 +21285,13 @@ async fn a_parent_whose_referenced_columns_the_session_cannot_read_refuses_the_d
     table.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     table.unique.insert(
         "parent_alt_key".into(),
         UniqueConstraint {
             columns: vec!["alt".into()],
+            storage_parameters: Default::default(),
         },
     );
     with_data(
@@ -21077,6 +21388,7 @@ async fn a_default_spelled_as_an_escape_string_is_the_literal_it_is() {
         parent.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["code".into()],
+            storage_parameters: Default::default(),
         });
         with_data(
             &mut parent,
@@ -21096,6 +21408,7 @@ async fn a_default_spelled_as_an_escape_string_is_the_literal_it_is() {
         child.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         child.foreign_keys.insert(
             "child_ref".into(),
@@ -21266,6 +21579,7 @@ async fn a_default_spelled_as_a_number_in_any_base_is_the_constant_it_is() {
         parent.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["code".into()],
+            storage_parameters: Default::default(),
         });
         with_data(
             &mut parent,
@@ -21282,6 +21596,7 @@ async fn a_default_spelled_as_a_number_in_any_base_is_the_constant_it_is() {
         child.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         child.foreign_keys.insert(
             "child_ref".into(),
@@ -23013,6 +23328,7 @@ async fn preflight_probes_count_the_rows_this_engine_would_refuse() {
             name: "uq_customer_id".into(),
             constraint: UniqueConstraint {
                 columns: vec!["id".into()],
+                storage_parameters: Default::default(),
             },
             clustered: false,
         },
@@ -23130,6 +23446,7 @@ async fn a_key_into_a_created_empty_parent_counts_every_reference_the_child_hold
     declared.primary_key = Some(PrimaryKey {
         name: Some("pk_status".into()),
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     let changes = [
         Change::CreateTable {
@@ -23260,6 +23577,7 @@ async fn nulls_are_distinct_under_this_engines_unique_and_the_count_says_so() {
         name: "uq_a".into(),
         constraint: UniqueConstraint {
             columns: vec!["a".into()],
+            storage_parameters: Default::default(),
         },
         clustered: false,
     };
@@ -23268,6 +23586,7 @@ async fn nulls_are_distinct_under_this_engines_unique_and_the_count_says_so() {
         name: "uq_ab".into(),
         constraint: UniqueConstraint {
             columns: vec!["a".into(), "b".into()],
+            storage_parameters: Default::default(),
         },
         clustered: false,
     };
@@ -23515,6 +23834,7 @@ async fn a_plan_that_supplies_the_parent_row_first_is_not_refused_for_its_absenc
     region.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
+        storage_parameters: Default::default(),
     });
     let mut customer = Table::default();
     customer
@@ -23526,6 +23846,7 @@ async fn a_plan_that_supplies_the_parent_row_first_is_not_refused_for_its_absenc
     customer.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
     customer.foreign_keys.insert(
         "fk_customer_region".into(),
@@ -24293,6 +24614,7 @@ async fn a_generated_fallback_is_the_one_the_engine_uses_and_order_decides_it() 
     keyed.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
     let pg = Postgres::new();
     let first = pg.implicit_relation_names(&TableName::new(&s, long('x')), &keyed)[0]
@@ -24477,6 +24799,7 @@ async fn groups_sharing_a_fallback_push_the_later_group_past_it() {
     keyed.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
     let pg = Postgres::new();
     let first = |group| {
@@ -24577,6 +24900,7 @@ async fn the_generated_relation_names_are_the_ones_the_engine_uses() {
         declared.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         let mut predicted: Vec<String> = pg
             .implicit_relation_names(&TableName::new(&s, &table), &declared)
@@ -25614,6 +25938,7 @@ async fn the_lock_each_statement_takes_is_the_one_the_estimate_names() {
                     unique: false,
                     filter: Some("v > 0".into()),
                     method: Default::default(),
+                    storage_parameters: Default::default(),
                 }),
                 clustered: false,
             },
@@ -25637,6 +25962,7 @@ async fn the_lock_each_statement_takes_is_the_one_the_estimate_names() {
                     unique: false,
                     filter: None,
                     method: Default::default(),
+                    storage_parameters: Default::default(),
                 }),
                 clustered: false,
             },
@@ -25891,6 +26217,7 @@ async fn a_table_this_plan_creates_is_not_reported_as_missing() {
     parent.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
 
     let child_name = TableName::new(&s, "child");
@@ -25904,6 +26231,7 @@ async fn a_table_this_plan_creates_is_not_reported_as_missing() {
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
     child.foreign_keys.insert(
         "child_parent".into(),
@@ -26240,6 +26568,7 @@ async fn estimate_provenance_does_not_measure_a_vacated_names_old_identity() {
     table.primary_key = Some(PrimaryKey {
         name: Some("pk_original".into()),
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
     let mut base = Schema::default();
     base.tables.insert(old.clone(), table.clone());
@@ -26699,6 +27028,7 @@ async fn a_key_between_two_created_tables_is_compared_as_the_engine_compares_it(
         p.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         with_data(&mut p, DataMode::Exact, &[("1.0", row(&[]))]);
 
@@ -26708,6 +27038,7 @@ async fn a_key_between_two_created_tables_is_compared_as_the_engine_compares_it(
         c.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         c.foreign_keys.insert(
             "fk_child".into(),
@@ -27461,6 +27792,7 @@ fn schema_103(tables: usize, modules: usize) -> Schema {
         t.primary_key = Some(PrimaryKey {
             name: Some(format!("pk_t{i}")),
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         schema
             .tables
@@ -28167,6 +28499,7 @@ async fn constraint_name_validation_preserves_legal_index_sharing() {
             unique: false,
             filter: None,
             method: Default::default(),
+            storage_parameters: Default::default(),
         },
     );
     assert!(Postgres::new().validate_table(&name, &table).is_empty());
@@ -28364,6 +28697,7 @@ async fn concurrent_build_recovery_preserves_existing_objects_and_quotes_its_own
                         unique,
                         filter: None,
                         method: Default::default(),
+                        storage_parameters: Default::default(),
                     }),
                     clustered: false,
                 },
@@ -29102,6 +29436,7 @@ fn doctor_data_table(rows: &[(&str, Row)]) -> Table {
     table.primary_key = Some(pbps_model::PrimaryKey {
         name: None,
         columns: vec!["id".into()],
+        storage_parameters: Default::default(),
     });
     with_data(&mut table, DataMode::Ensure, rows);
     table

@@ -948,6 +948,7 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
             | change @ pbps_model::Change::AlterColumnExpression { .. }
             | change @ pbps_model::Change::SetColumnDeprecated { .. }
             | change @ pbps_model::Change::SetPrimaryKey { .. }
+            | change @ pbps_model::Change::SetIndexStorageParameters { .. }
             | change @ pbps_model::Change::SetStorageParameters { .. }
             | change @ pbps_model::Change::SetReplicaIdentity { .. }
             | change @ pbps_model::Change::AddUnique { .. }
@@ -6259,6 +6260,65 @@ fn a_generated_columns_expression_change_is_refused_by_name_before_postgres_17()
         "DO $$ BEGIN IF current_setting('server_version_num')::integer >= 170000 THEN RAISE EXCEPTION 'this regression needs a pre-17 server'; END IF; END $$",
     );
     generated_column_flow(&server, "generated-1168-old", false);
+}
+
+/// Index storage parameters go the whole way through the CLI (#1442):
+/// pulled with the index, changed in place by one `ALTER INDEX` that
+/// applies and verifies, after which the next plan is empty.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn index_storage_parameters_change_in_place_through_the_cli() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "index-params-1442");
+    let connection = own.connection().to_owned();
+    on_server(
+        &connection,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.t (id integer PRIMARY KEY, k integer); \
+         CREATE INDEX t_k ON app.t (k) WITH (fillfactor = 70); \
+         INSERT INTO app.t VALUES (1, 10)",
+    );
+    let d = Demo::new("index-params-1442");
+    succeeds(d.run(&["pull", "--db", &connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    let path = d.dir.join("schema/app.t.yml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let pulled = "    storage_parameters: {fillfactor: 70}\n";
+    assert!(text.contains(pulled), "{text}");
+    std::fs::write(
+        &path,
+        text.replace(
+            pulled,
+            "    storage_parameters: {deduplicate_items: false, fillfactor: 80}\n",
+        ),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        &connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    assert!(
+        script.contains(
+            "ALTER INDEX \"app\".\"t_k\" SET (deduplicate_items = 'false', fillfactor = '80');"
+        ),
+        "{script}"
+    );
+    assert!(!script.contains("DROP INDEX"), "{script}");
+    succeeds(approved_apply(&d, &connection, &plan, &[]));
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
 }
 
 /// Storage parameters go the whole way through the CLI (#1441): pulled in

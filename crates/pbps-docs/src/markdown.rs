@@ -262,6 +262,7 @@ mod tests {
         t.primary_key = Some(PrimaryKey {
             name: Some("pk_customer".into()),
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         let mut s = Schema::default();
         s.tables.insert(TableName::new("dbo", "customer"), t);

@@ -22,7 +22,7 @@ use crate::module::{Module, ModuleId, ModuleKind, ObjectName, RoutineId};
 use crate::name::{ColumnRef, TableName};
 use crate::role::{GrantTarget, Permission};
 use crate::schema::{
-    CheckConstraint, Collation, Column, ComputedColumn, ForeignKey, Index, PrimaryKey,
+    CheckConstraint, Collation, Column, ComputedColumn, ForeignKey, Index, IndexMethod, PrimaryKey,
     ReplicaIdentity, Table, UniqueConstraint,
 };
 use crate::strategy::Strategy;
@@ -321,6 +321,19 @@ pub enum Change {
     SetStorageParameters {
         uid: Uid,
         table: TableName,
+        set: BTreeMap<String, String>,
+        reset: BTreeSet<String>,
+    },
+
+    /// A PostgreSQL index's storage parameters (#1442): `ALTER INDEX … SET
+    /// (…), RESET (…)`, in place, which every supported parameter of both
+    /// methods is (measured on 16 and 18). Only what changes; an index
+    /// rebuilt for another reason carries its parameters in its `CREATE`
+    /// (DEC-1442.1).
+    SetIndexStorageParameters {
+        table: TableName,
+        target: IndexPart,
+        method: IndexMethod,
         set: BTreeMap<String, String>,
         reset: BTreeSet<String>,
     },
@@ -785,6 +798,50 @@ pub enum Part {
     Computed,
 }
 
+/// Drops each `SetIndexStorageParameters` whose part the same plan creates
+/// again: an `AddIndex`, `AddUnique` or adding `SetPrimaryKey` carries the
+/// declared parameters in its `CREATE`, and an `ALTER INDEX` beside it would
+/// run while the index is dropped, or be held at a staged checkpoint to an
+/// index the plan has taken away (#1483 review). The differ calls it after
+/// its rebuild passes, and the connected plan after it weaves rebuilds in.
+// The complement creates no index part.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub fn drop_parameter_changes_of_rebuilt_indexes<T>(
+    changes: &mut Vec<T>,
+    change: impl Fn(&T) -> &Change,
+) {
+    let rebuilt: BTreeSet<(TableName, IndexPart)> = changes
+        .iter()
+        .filter_map(|c| match change(c) {
+            Change::AddIndex { table, name, .. } => {
+                Some((table.clone(), IndexPart::Index(name.clone())))
+            }
+            Change::AddUnique { table, name, .. } => {
+                Some((table.clone(), IndexPart::Unique(name.clone())))
+            }
+            Change::SetPrimaryKey {
+                table, to: Some(_), ..
+            } => Some((table.clone(), IndexPart::PrimaryKey)),
+            _ => None,
+        })
+        .collect();
+    changes.retain(|c| {
+        !matches!(change(c), Change::SetIndexStorageParameters { table, target, .. }
+            if rebuilt.contains(&(table.clone(), target.clone())))
+    });
+}
+
+/// The index whose storage parameters a [`Change::SetIndexStorageParameters`]
+/// sets: the primary key's, a unique constraint's (which carries the
+/// constraint's name), or a standalone index's (#1442).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexPart {
+    PrimaryKey,
+    Unique(String),
+    Index(String),
+}
+
 /// One named part of a table, and what this plan leaves there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartChange<'a> {
@@ -1034,6 +1091,7 @@ impl Change {
             Change::AddColumn { table, .. }
             | Change::RenameColumn { table, .. }
             | Change::SetPrimaryKey { table, .. }
+            | Change::SetIndexStorageParameters { table, .. }
             | Change::SetStorageParameters { table, .. }
             | Change::SetReplicaIdentity { table, .. }
             | Change::AddUnique { table, .. }
@@ -1108,6 +1166,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1220,6 +1279,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1283,6 +1343,7 @@ impl Change {
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1387,6 +1448,7 @@ impl Change {
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1445,6 +1507,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1521,6 +1584,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1574,6 +1638,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1623,6 +1688,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1713,6 +1779,7 @@ impl Change {
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1773,6 +1840,7 @@ impl Change {
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1917,6 +1985,7 @@ impl Change {
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::PublicExecution { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. } => None,
         }
@@ -1945,6 +2014,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -2000,6 +2070,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -2043,6 +2114,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -2228,6 +2300,7 @@ impl Change {
             // Nor do storage parameters, which change how the engine stores
             // and vacuums the rows, not the rows: none rewrites the table
             // (DEC-1441.1).
+            | Change::SetIndexStorageParameters { .. }
             | Change::SetStorageParameters { .. } => {}
         }
         r
@@ -2333,6 +2406,55 @@ impl ChangeSet {
 
 #[cfg(test)]
 mod tests {
+
+    /// A part the plan creates again takes its parameters in its `CREATE`,
+    /// so a separate change to them is dropped; one on a part left standing
+    /// is kept (#1483 review).
+    #[test]
+    fn a_rebuilt_indexs_parameter_change_is_dropped() {
+        let t: TableName = "app.t".parse().unwrap();
+        let set = |target: IndexPart| Change::SetIndexStorageParameters {
+            table: t.clone(),
+            target,
+            method: IndexMethod::Btree,
+            set: [("fillfactor".to_owned(), "80".to_owned())].into(),
+            reset: BTreeSet::new(),
+        };
+        let mut changes = vec![
+            set(IndexPart::Index("ix".into())),
+            Change::DropIndex {
+                table: t.clone(),
+                name: "ix".into(),
+            },
+            Change::AddIndex {
+                table: t.clone(),
+                name: "ix".into(),
+                index: Box::new(Index {
+                    columns: Vec::new(),
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                    method: IndexMethod::Btree,
+                    storage_parameters: BTreeMap::new(),
+                }),
+                clustered: false,
+            },
+            set(IndexPart::Index("other".into())),
+            set(IndexPart::PrimaryKey),
+        ];
+        drop_parameter_changes_of_rebuilt_indexes(&mut changes, |c| c);
+        let left: Vec<&Change> = changes
+            .iter()
+            .filter(|c| matches!(c, Change::SetIndexStorageParameters { .. }))
+            .collect();
+        assert_eq!(
+            left,
+            [
+                &set(IndexPart::Index("other".into())),
+                &set(IndexPart::PrimaryKey)
+            ]
+        );
+    }
     use super::*;
 
     /// `--allow` names a class and the gate explains it; a class that gained a
@@ -2726,6 +2848,7 @@ mod tests {
                 unique,
                 filter: None,
                 method: Default::default(),
+                storage_parameters: Default::default(),
             }),
             clustered: false,
         };

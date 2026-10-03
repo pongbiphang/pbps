@@ -235,6 +235,7 @@ mod tests {
         table.primary_key = Some(PrimaryKey {
             name: None,
             columns: vec!["id".into()],
+            storage_parameters: Default::default(),
         });
         table.data = Some(TableData {
             mode: DataMode::Ensure,

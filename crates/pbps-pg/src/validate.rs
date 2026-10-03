@@ -787,6 +787,7 @@ mod tests {
                 unique: false,
                 filter: None,
                 method,
+                storage_parameters: Default::default(),
             },
         );
         table
