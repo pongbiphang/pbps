@@ -2259,6 +2259,152 @@ fn an_object_grant_after_a_same_name_replacement_names_the_replacement() {
     }
 }
 
+/// One DDL statement reaches past its own surface: a retype rebuilds the
+/// index over the column, and a default change flips the column's own flag.
+/// The table is the unit of the closing inventory (#1466): its whole tree
+/// rides on the edit as references, while an untouched table's records, a
+/// view tied to the table and an unqualified record never do.
+#[test]
+fn a_column_edit_carries_its_whole_table_and_nothing_beyond_it() {
+    use pbps_db::resolver::capture::ObjectIdentity;
+    use pbps_model::{Column, PlannedChange, Table};
+    use pbps_pg::resolver::capture::BindingRecord;
+    use std::collections::BTreeSet;
+
+    let edited: pbps_model::TableName = "app.t".parse().unwrap();
+    let untouched: pbps_model::TableName = "app.u".parse().unwrap();
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("n".into(), Column::new("integer".parse().unwrap()));
+    let mut schema = Schema::default();
+    schema.tables.insert(edited.clone(), table.clone());
+    schema.tables.insert(untouched.clone(), table);
+    let ids = ids(&schema, &IdsFile::default());
+    let relation = |name: &pbps_model::TableName| ObjectIdentity {
+        class: "pg_class".into(),
+        name: vec![name.schema.clone(), name.name.clone()],
+        signature: vec![],
+    };
+    let column = |name: &pbps_model::TableName| ObjectIdentity {
+        class: "column".into(),
+        name: vec!["n".into()],
+        signature: vec![relation(name)],
+    };
+    let owned = |object: ObjectIdentity, surface: Option<Surface>| BindingRecord {
+        object,
+        ownership: surface.map_or(ObjectOwnership::Unqualified, ObjectOwnership::Surface),
+        bindings: vec![],
+    };
+    let index = |name: &pbps_model::TableName| ObjectIdentity {
+        class: "pg_class".into(),
+        name: vec![name.schema.clone(), format!("{}_ix", name.name)],
+        signature: vec![],
+    };
+    let view = ObjectIdentity {
+        class: "pg_rewrite".into(),
+        name: vec!["_RETURN".into()],
+        signature: vec![],
+    };
+    let view_edge = ObjectIdentity {
+        class: "pg_depend".into(),
+        name: vec!["n".into()],
+        signature: vec![view.clone(), column(&edited)],
+    };
+    let stranger = ObjectIdentity {
+        class: "pg_depend".into(),
+        name: vec!["n".into()],
+        signature: vec![
+            ObjectIdentity {
+                class: "pg_class".into(),
+                name: vec!["app".into(), "unmanaged".into()],
+                signature: vec![],
+            },
+            relation(&edited),
+        ],
+    };
+    let mut records = Vec::new();
+    for name in [&edited, &untouched] {
+        records.push(owned(relation(name), Some(Surface::Table(name.clone()))));
+        records.push(owned(column(name), Some(Surface::Column(name.column("n")))));
+        records.push(owned(
+            index(name),
+            Some(Surface::Index {
+                table: name.clone(),
+                name: "ix".into(),
+            }),
+        ));
+    }
+    let routine = Surface::Module("app.v".parse().unwrap());
+    records.push(owned(view.clone(), Some(routine.clone())));
+    records.push(owned(view_edge.clone(), Some(routine)));
+    records.push(owned(stranger.clone(), None));
+    let uid = ids.column_uid(&edited.column("n")).unwrap().clone();
+    let retype = Change::AlterColumnType {
+        uid: uid.clone(),
+        column: edited.column("n"),
+        from: "integer".parse().unwrap(),
+        to: "bigint".parse().unwrap(),
+        from_nullable: true,
+        to_nullable: true,
+        from_collation: None,
+        to_collation: None,
+    };
+    let default = Change::AlterColumnDefault {
+        uid,
+        column: edited.column("n"),
+        from: None,
+        to: Some("1".into()),
+    };
+    let tree = BTreeSet::from([relation(&edited), column(&edited), index(&edited)]);
+    for change in [retype, default] {
+        let side = pbps_diff::Side {
+            schema: &schema,
+            ids: &ids,
+        };
+        let transitions = super::transitions::derive(
+            &ChangeSet {
+                changes: vec![PlannedChange::new(change)],
+            },
+            side,
+            side,
+            &records,
+            &records,
+        )
+        .unwrap();
+        for side in [
+            transitions
+                .iter()
+                .flat_map(|t| &t.before)
+                .collect::<BTreeSet<_>>(),
+            transitions
+                .iter()
+                .flat_map(|t| &t.after)
+                .collect::<BTreeSet<_>>(),
+        ] {
+            for object in &tree {
+                assert!(side.contains(object), "{object:?} is not inventoried");
+            }
+            for object in [
+                relation(&untouched),
+                column(&untouched),
+                index(&untouched),
+                view.clone(),
+                view_edge.clone(),
+                stranger.clone(),
+            ] {
+                assert!(!side.contains(&object), "{object:?} rode on the edit");
+            }
+        }
+        assert!(
+            transitions
+                .iter()
+                .flat_map(|t| &t.references)
+                .all(|object| tree.contains(object))
+        );
+    }
+}
+
 /// A foreign key on another table names the renamed table through its
 /// dependency row, its RI trigger on the renamed table and its own triggers.
 /// The rename carries exactly those, on both sides; another record of the
@@ -2753,6 +2899,23 @@ fn generation_schema(table: &pbps_model::TableName) -> Schema {
     schema
 }
 
+/// A transition's exact, authority-bearing inventory: what remains once the
+/// records that only ride on the touched table (#1466) are set aside.
+fn exact(
+    transition: &pbps_model::resolver::ObjectTransition,
+) -> (
+    BTreeSet<pbps_db::resolver::capture::ObjectIdentity>,
+    BTreeSet<pbps_db::resolver::capture::ObjectIdentity>,
+) {
+    let keep = |side: &BTreeSet<_>| {
+        side.iter()
+            .filter(|object| !transition.references.contains(*object))
+            .cloned()
+            .collect()
+    };
+    (keep(&transition.before), keep(&transition.after))
+}
+
 fn generation_objects(
     table: &pbps_model::TableName,
     column: &str,
@@ -2904,15 +3067,15 @@ fn generated_expression_transitions_keep_exact_inventory_and_recorded_rename_ide
         let [new_column, after, new_owner, new_reference] =
             generation_objects(&final_table, final_name);
         assert_eq!(
-            expression.before,
+            exact(expression).0,
             BTreeSet::from([before, old_owner, old_reference])
         );
         assert_eq!(
-            expression.after,
+            exact(expression).1,
             BTreeSet::from([after, new_owner, new_reference])
         );
-        assert!(!expression.before.contains(&old_column));
-        assert!(!expression.after.contains(&new_column));
+        assert!(!exact(expression).0.contains(&old_column));
+        assert!(!exact(expression).1.contains(&new_column));
         for opening in [true, false] {
             let claimed: Vec<_> = transitions
                 .iter()
@@ -3027,16 +3190,16 @@ fn create_and_add_stored_generation_keep_the_attrdef_child_inventory() {
         .unwrap();
         assert_eq!(transitions.len(), if create { 1 } else { 2 });
         let child = transitions.iter().find(|t| t.surface == surface).unwrap();
-        assert!(child.before.is_empty());
-        assert_eq!(child.after, expected);
+        assert!(exact(child).0.is_empty());
+        assert_eq!(exact(child).1, expected);
         if !create {
             let parent = transitions
                 .iter()
                 .find(|t| t.surface == Surface::Table(table.clone()))
                 .unwrap();
             let relation = generation_objects(&table, "g")[0].signature[0].clone();
-            assert_eq!(parent.before, BTreeSet::from([relation.clone()]));
-            assert_eq!(parent.after, BTreeSet::from([relation]));
+            assert_eq!(exact(parent).0, BTreeSet::from([relation.clone()]));
+            assert_eq!(exact(parent).1, BTreeSet::from([relation]));
         }
     }
 }
@@ -4379,6 +4542,97 @@ async fn dropping_a_table_with_toast_storage_closes_on_the_actual_catalog() {
     assert_review_closing_matches_target(&mut target, &closing, &key).await;
     target.check().await.unwrap();
     setup(&[]).await;
+}
+
+/// A column edit reaches past its own surface: ADD or DROP DEFAULT flips the
+/// column's own `atthasdef`, and a retype rebuilds the primary key and index
+/// over the column. The edited table's whole tree rides on the edit (#1466),
+/// so each plan seals and closes on the real catalog.
+async fn table_edit_case(edit: &str) {
+    let mut setup_sql = vec![
+        "CREATE SCHEMA pbps_evidence1274",
+        "CREATE TABLE pbps_evidence1274.t (n integer NOT NULL, CONSTRAINT t_pk PRIMARY KEY (n))",
+        "CREATE INDEX t_ix ON pbps_evidence1274.t (n)",
+    ];
+    if edit == "drop-default" {
+        setup_sql.push("ALTER TABLE pbps_evidence1274.t ALTER COLUMN n SET DEFAULT 1");
+    }
+    setup(&setup_sql).await;
+    let name: pbps_model::TableName = "pbps_evidence1274.t".parse().unwrap();
+    let declared = |ty: &str, default: Option<&str>| {
+        let mut table = pbps_model::Table::default();
+        let mut column = pbps_model::Column::new(ty.parse().unwrap()).not_null();
+        column.default = default.map(Into::into);
+        table.columns.insert("n".into(), column);
+        table.primary_key = Some(pbps_model::PrimaryKey {
+            name: Some("t_pk".into()),
+            columns: vec!["n".into()],
+        });
+        table.indexes.insert(
+            "t_ix".into(),
+            pbps_model::Index {
+                columns: vec![pbps_model::IndexColumn {
+                    key: pbps_model::IndexKey::Column("n".into()),
+                    descending: false,
+                    opclass: None,
+                }],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: Default::default(),
+            },
+        );
+        let mut schema = Schema::default();
+        schema.tables.insert(name.clone(), table);
+        schema
+    };
+    let (base, desired) = match edit {
+        "add-default" => (declared("integer", None), declared("integer", Some("1"))),
+        "drop-default" => (declared("integer", Some("1")), declared("integer", None)),
+        _ => (declared("integer", None), declared("bigint", None)),
+    };
+    let inputs = Inputs::from_pair((base, desired));
+    let key = ProjectKey::new(true);
+    let mut owned = Some(ObservedContainers::begin());
+    let mut target = target().await;
+    let mut run = open(Profile::Container, &mut target).await;
+    let result = review_plan(&mut target, &mut run, &mut owned, &inputs, &key).await;
+    assert!(result.changes.changes.iter().any(|step| match edit {
+        "retype" => matches!(&step.change, Change::AlterColumnType { column, .. }
+            if column == &name.column("n")),
+        _ => matches!(&step.change, Change::AlterColumnDefault { column, .. }
+            if column == &name.column("n")),
+    }));
+    let closing = result.evidence.after().clone();
+    let mut peer = pbps_db::Conn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    execute_plan(&mut peer, &result.changes).await;
+    drop(peer);
+    assert_review_closing_matches_target(&mut target, &closing, &key).await;
+    target.check().await.unwrap();
+    setup(&[]).await;
+}
+
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn adding_a_default_carries_the_columns_own_flag() {
+    table_edit_case("add-default").await;
+}
+
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn dropping_a_default_carries_the_columns_own_flag() {
+    table_edit_case("drop-default").await;
+}
+
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn a_retype_carries_the_key_and_index_it_rebuilds() {
+    table_edit_case("retype").await;
 }
 
 /// ADD CONSTRAINT changes the table in place. Its target owner and ACLs are
@@ -5813,11 +6067,19 @@ mod column_vector_parent {
                 .iter()
                 .find(|t| t.surface == Surface::Table(table.clone()))
                 .unwrap();
-            assert_eq!(parent.before, BTreeSet::from([relation.clone()]), "{kind}");
-            assert_eq!(parent.after, BTreeSet::from([relation.clone()]), "{kind}");
+            assert_eq!(
+                exact(parent).0,
+                BTreeSet::from([relation.clone()]),
+                "{kind}"
+            );
+            assert_eq!(
+                exact(parent).1,
+                BTreeSet::from([relation.clone()]),
+                "{kind}"
+            );
             let column = transitions.iter().find(|t| t.surface == surface).unwrap();
-            assert_eq!(column.before, before, "{kind}");
-            assert_eq!(column.after, after, "{kind}");
+            assert_eq!(exact(column).0, before, "{kind}");
+            assert_eq!(exact(column).1, after, "{kind}");
             for inventory in [
                 transitions
                     .iter()
@@ -5980,8 +6242,10 @@ mod column_vector_parent {
             assert_eq!(transitions.len(), 1);
             assert!(!matches!(transitions[0].surface, Surface::Table(_)));
             let relation = generation_objects(&table, "g")[0].signature[0].clone();
-            assert!(!transitions[0].before.contains(&relation));
-            assert!(!transitions[0].after.contains(&relation));
+            assert!(!exact(&transitions[0]).0.contains(&relation));
+            assert!(!exact(&transitions[0]).1.contains(&relation));
+            // The table still rides as a reference: the edit touches it.
+            assert!(transitions[0].references.contains(&relation));
         }
     }
 }
