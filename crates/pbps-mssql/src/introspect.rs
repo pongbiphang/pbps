@@ -698,9 +698,13 @@ fn action(code: u8) -> ReferentialAction {
     }
 }
 
-fn extend_unavailable_modules<'a>(
+/// Generic over how an edge is held so that a test can count every read of
+/// one: production passes `&RawObjectDependency`, and the regression passes a
+/// wrapper whose dereference is counted. Counting only iterator pulls missed
+/// an implementation that collected the edges once and rescanned them (#579).
+fn extend_unavailable_modules<D: std::ops::Deref<Target = RawObjectDependency>>(
     modules: &[RawModule],
-    dependencies: impl IntoIterator<Item = &'a RawObjectDependency>,
+    dependencies: impl IntoIterator<Item = D>,
     unavailable: &mut BTreeSet<i32>,
 ) {
     let bound: BTreeSet<_> = modules
@@ -710,11 +714,15 @@ fn extend_unavailable_modules<'a>(
         .collect();
     let mut dependents: BTreeMap<i32, Vec<i32>> = BTreeMap::new();
     for dependency in dependencies {
-        if bound.contains(&dependency.referencing_object_id) {
+        let RawObjectDependency {
+            referencing_object_id,
+            referenced_object_id,
+        } = *dependency;
+        if bound.contains(&referencing_object_id) {
             dependents
-                .entry(dependency.referenced_object_id)
+                .entry(referenced_object_id)
                 .or_default()
-                .push(dependency.referencing_object_id);
+                .push(referencing_object_id);
         }
     }
 
@@ -3520,13 +3528,31 @@ mod module_tests {
                 referenced_object_id,
             },
         ));
+        // Counts every read of an edge, not only its pull from the iterator:
+        // an implementation that collected the edges once and rescanned them
+        // pulls each once and reads each once per pass (#579).
+        struct Observed<'a> {
+            edge: &'a RawObjectDependency,
+            reads: &'a Cell<usize>,
+        }
+        impl std::ops::Deref for Observed<'_> {
+            type Target = RawObjectDependency;
+            fn deref(&self) -> &RawObjectDependency {
+                self.reads.set(self.reads.get() + 1);
+                self.edge
+            }
+        }
         let visits: Vec<_> = dependencies.iter().map(|_| Cell::new(0)).collect();
+        let reads: Vec<_> = dependencies.iter().map(|_| Cell::new(0)).collect();
         let mut unavailable = BTreeSet::from([1]);
         extend_unavailable_modules(
             &modules,
-            dependencies.iter().enumerate().map(|(index, dependency)| {
+            dependencies.iter().enumerate().map(|(index, edge)| {
                 visits[index].set(visits[index].get() + 1);
-                dependency
+                Observed {
+                    edge,
+                    reads: &reads[index],
+                }
             }),
             &mut unavailable,
         );
@@ -3534,8 +3560,17 @@ mod module_tests {
         assert_eq!(unavailable, (1..=65).collect());
         assert!(
             visits.iter().all(|count| count.get() == 1),
-            "each catalog edge must be read once: {visits:?}"
+            "each catalog edge must be pulled once: {visits:?}"
         );
+        assert!(
+            reads.iter().all(|count| count.get() == 1),
+            "each catalog edge must be read once: {reads:?}"
+        );
+
+        // The production shape, on the same input, reaches the same set.
+        let mut unavailable = BTreeSet::from([1]);
+        extend_unavailable_modules(&modules, &dependencies, &mut unavailable);
+        assert_eq!(unavailable, (1..=65).collect());
     }
 
     #[test]
