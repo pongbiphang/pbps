@@ -508,6 +508,75 @@ async fn persisted_inputs_use_the_environment_key_and_never_export_source() {
     }
 }
 
+/// A closing read lists every record of its manifest as a retained root, so
+/// a record nothing reaches any more is still read. A retained dependency row
+/// is not a catalog object: it is read with its subject, never refused as
+/// an absent root.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn retained_roots_are_read_even_when_nothing_reaches_them() {
+    for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+        let base = std::env::var(variable).expect("live PostgreSQL fixture setting");
+        let name = format!(
+            "pbps_retain1274_{}",
+            crate::catalog::probe_token().replace('-', "_")
+        );
+        let mut admin = Conn::connect(Driver::Postgres, &base).await.unwrap();
+        admin
+            .execute(&format!("CREATE DATABASE {name}"))
+            .await
+            .unwrap();
+        let connection = format!("{base} dbname={name}");
+        let result = tokio::task::LocalSet::new()
+            .run_until(async move {
+                tokio::task::spawn_local(async move {
+                    let mut conn = Conn::connect(Driver::Postgres, &connection).await.unwrap();
+                    conn.execute(
+                        "CREATE SCHEMA app; CREATE SCHEMA elsewhere; \
+                         CREATE FUNCTION elsewhere.orphan() RETURNS integer LANGUAGE sql \
+                         IMMUTABLE RETURN 1; CREATE TABLE app.t(id integer); \
+                         CREATE VIEW app.historical AS SELECT id FROM app.t",
+                    )
+                    .await
+                    .unwrap();
+                    let orphan = ObjectIdentity {
+                        class: "pg_proc".into(),
+                        name: vec!["elsewhere".into(), "orphan".into()],
+                        signature: vec![],
+                    };
+                    let plain = capture(&mut conn, &fixture_scope()).await.unwrap();
+                    assert!(
+                        !plain.inputs.contains_key(&orphan),
+                        "the fixture routine is reached by nothing in the scope"
+                    );
+                    let mut scope = fixture_scope();
+                    scope.retained.insert(orphan.clone());
+                    scope.retained.insert(ObjectIdentity {
+                        class: "pg_depend".into(),
+                        name: vec!["n".into()],
+                        signature: vec![
+                            orphan.clone(),
+                            ObjectIdentity {
+                                class: "pg_namespace".into(),
+                                name: vec!["elsewhere".into()],
+                                signature: vec![],
+                            },
+                        ],
+                    });
+                    let retained = capture(&mut conn, &scope).await.unwrap();
+                    assert!(retained.inputs.contains_key(&orphan));
+                })
+                .await
+            })
+            .await;
+        admin
+            .execute(&format!("DROP DATABASE {name} WITH (FORCE)"))
+            .await
+            .unwrap();
+        result.expect("retained-root capture fixture failed after cleanup");
+    }
+}
+
 /// A table's TOAST relation is its out-of-line storage. Its name carries the
 /// table's OID, so a scratch compilation and the target never agree on it,
 /// and no expression binds it: it is not an input. The table itself, which

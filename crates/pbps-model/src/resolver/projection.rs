@@ -224,11 +224,18 @@ impl InputManifest {
             pending.extend(placeholder.bindings.iter().map(|b| b.target.clone()));
             objects.insert(object, placeholder.clone());
         }
+        // The closing read must reread every record this manifest lists, even
+        // one the plan's changes no longer reach: a routine whose new body no
+        // longer calls `count` leaves `count` untouched but unreached. Each
+        // record is a retained root, so a vanished one fails the read instead
+        // of reading as absent.
+        let mut scope = self.scope().clone();
+        scope.retained.extend(objects.keys().cloned());
         Self::new(
             self.adapter().into(),
             self.engine_major(),
             self.key_id().into(),
-            self.scope().clone(),
+            scope,
             self.baseline().into(),
             self.session().into(),
             objects.into_values().collect(),

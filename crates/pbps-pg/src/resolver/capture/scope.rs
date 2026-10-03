@@ -109,6 +109,11 @@ pub(super) fn prepare(
         }
     }
     for object in &scope.retained {
+        // A dependency row is not a catalog object; it is read when its
+        // subject is, below.
+        if object.class == "pg_depend" {
+            continue;
+        }
         builder.add(object.clone())?;
     }
     for candidate in &scope.candidates {

@@ -1241,7 +1241,10 @@ storage setting, does not change a binding. The reader cannot see the compiled
 records, so it checks the opening side of every transition and that the closing
 manifest is exactly the untouched opening records plus placeholders of
 installed records; the closing-side inventory and ownership checks run when the
-plan is sealed.
+plan is sealed. The closing manifest's read scope lists every record it holds as
+a retained root. An untouched record can lose the only expression that reached
+it, as `count` does when a routine's new body no longer calls it, and the
+closing read must still reread it rather than miss it.
 
 The table is the unit of the closing inventory (#1466). One DDL statement
 reaches past the surface it names: a retype rebuilds the keys and indexes over

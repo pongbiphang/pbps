@@ -26,7 +26,10 @@ fn drop_fixture(change: Change, surface: Surface) -> (ChangeSet, ResolverEvidenc
     };
     // The view the fixture plan created opens this plan observed with its
     // real fingerprint: an opening manifest never holds a placeholder.
-    evidence.after = super::tests::observed(&evidence, &super::tests::compiled());
+    evidence.after = super::tests::as_opening(
+        &super::tests::observed(&evidence, &super::tests::compiled()),
+        &evidence.before,
+    );
     std::mem::swap(&mut evidence.before, &mut evidence.after);
     let observation = &mut evidence.surfaces[0];
     std::mem::swap(&mut observation.current, &mut observation.desired);
@@ -2320,6 +2323,13 @@ mod column_vector_parent {
                 json["prerequisites"] = serde_json::to_value(records).unwrap();
                 *manifest = serde_json::from_value(json).unwrap();
             }
+            // The closing read rereads every record its manifest lists.
+            let mut json = serde_json::to_value(&excessive.after).unwrap();
+            json["scope"]["retained"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::to_value(&object).unwrap());
+            excessive.after = serde_json::from_value(json).unwrap();
             excessive.validate(&changes).unwrap();
             excessive.transitions[parent].before.insert(object.clone());
             excessive.transitions[parent].after.insert(object);

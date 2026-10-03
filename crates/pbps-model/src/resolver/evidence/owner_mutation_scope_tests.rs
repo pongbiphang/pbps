@@ -95,7 +95,10 @@ fn table_authorization_mutations_leave_every_fingerprint_untouched() {
         evidence.transitions.clear();
         let sealed = seal(&changes, &evidence).expect("a grant needs no transition");
         sealed.validate(&changes).unwrap();
-        assert_eq!(sealed.after, evidence.before);
+        assert_eq!(
+            sealed.after.prerequisites(),
+            evidence.before.prerequisites()
+        );
     }
 }
 
