@@ -330,6 +330,23 @@ pub(super) fn field(class: &str, name: &str, kind: &str) -> Result<Field> {
     }
 }
 
+/// An internal constraint trigger's definition without its OID-bearing name.
+/// Only the name token of the `CREATE CONSTRAINT TRIGGER` prefix is
+/// replaced: the same spelling elsewhere, such as a relation named after a
+/// trigger, is the relation's and stays. `pg_get_triggerdef` quotes the name
+/// as an identifier, so `RI_ConstraintTrigger_...` always appears quoted
+/// (measured on 16 and 18); any other shape refuses.
+fn without_trigger_name(rendered: &str, name: &str) -> Result<String> {
+    const PREFIX: &str = "CREATE CONSTRAINT TRIGGER ";
+    let rest = rendered.strip_prefix(PREFIX).ok_or(Uncovered::Definition)?;
+    let quoted = format!("\"{}\"", name.replace('"', "\"\""));
+    let tail = [quoted.as_str(), name]
+        .into_iter()
+        .find_map(|token| rest.strip_prefix(token)?.strip_prefix(' '))
+        .ok_or(Uncovered::Definition)?;
+    Ok(format!("{PREFIX}<internal constraint trigger> {tail}"))
+}
+
 fn reference(catalog: &Catalog, class: &str, value: &Value) -> Result<Value> {
     let oid = value
         .as_u64()
@@ -426,10 +443,7 @@ pub(super) fn normalize(
         if oid_named {
             let name = logical::string(row, "tgname")?;
             let rendered = definition.as_str().ok_or(Uncovered::Definition)?;
-            if rendered.matches(name).count() != 1 {
-                return Err(Uncovered::Definition);
-            }
-            definition = Value::String(rendered.replace(name, "<internal constraint trigger>"));
+            definition = Value::String(without_trigger_name(rendered, name)?);
         }
         output.insert("engine_definition".to_owned(), definition);
     }
@@ -562,6 +576,35 @@ mod tests {
         assert_eq!(field("pg_proc", "future_ref", "oid"), Err(Uncovered::Field));
         assert_eq!(fields("pg_proc", 17), Err(Uncovered::Version));
         assert_eq!(fields("pg_future", 18), Err(Uncovered::Class));
+    }
+
+    /// Only the trigger's own name token is normalized, as
+    /// `pg_get_triggerdef` renders it on 16 and 18. A relation spelled like
+    /// the trigger keeps its spelling, and a definition of any other shape
+    /// is refused rather than half-normalized.
+    #[test]
+    fn only_the_internal_trigger_name_token_is_normalized() {
+        let name = "RI_ConstraintTrigger_a_1780903";
+        let rendered = |relation: &str| {
+            format!(
+                "CREATE CONSTRAINT TRIGGER \"{name}\" AFTER DELETE ON app.\"{relation}\" \
+                 FROM app.c NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW \
+                 EXECUTE FUNCTION \"RI_FKey_noaction_del\"()"
+            )
+        };
+        assert_eq!(
+            without_trigger_name(&rendered("p"), name).unwrap(),
+            rendered("p").replace(&format!("\"{name}\""), "<internal constraint trigger>")
+        );
+        let collided = without_trigger_name(&rendered(name), name).unwrap();
+        assert!(collided.starts_with("CREATE CONSTRAINT TRIGGER <internal constraint trigger> "));
+        assert!(collided.contains(&format!("ON app.\"{name}\"")));
+        for wrong in [
+            rendered("p").replace("CREATE CONSTRAINT", "CREATE"),
+            rendered("p").replace(name, "RI_ConstraintTrigger_a_1"),
+        ] {
+            assert!(without_trigger_name(&wrong, name).is_err(), "{wrong}");
+        }
     }
 
     #[test]
