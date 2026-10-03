@@ -3631,6 +3631,106 @@ fn a_surface_binding_nothing_at_creation_needs_no_verdict() {
     }
 }
 
+/// A plan that renames a table and its column, then removes the column's
+/// default and the table's check, names the removals by the new spelling,
+/// while the opening capture holds them under the old one. Each removed
+/// surface is resolved by its opening record and named as its removal names
+/// it, through the recorded UIDs; a surface the plan keeps is not moved.
+#[test]
+fn a_surface_removed_after_its_rename_is_named_as_its_removal_names_it() {
+    use pbps_db::resolver::capture::ObjectIdentity;
+    use pbps_model::{CheckConstraint, Column, Table};
+    use pbps_pg::resolver::capture::{Assessment, BindingRecord};
+
+    let old: pbps_model::TableName = "app.t".parse().unwrap();
+    let new: pbps_model::TableName = "app.u".parse().unwrap();
+    let mut table = Table::default();
+    let mut id = Column::new("integer".parse().unwrap());
+    id.default = Some("0".into());
+    table.columns.insert("id".into(), id);
+    table.checks.insert(
+        "c".into(),
+        CheckConstraint {
+            expression: "id > 0".into(),
+        },
+    );
+    let mut base = Schema::default();
+    base.tables.insert(old.clone(), table);
+    let base_ids = ids(&base, &IdsFile::default());
+    let mut bare = Table::default();
+    bare.columns
+        .insert("n".into(), Column::new("integer".parse().unwrap()));
+    let mut desired = Schema::default();
+    desired.tables.insert(new.clone(), bare);
+    let mut desired_ids = base_ids.clone();
+    desired_ids.rename_table(&old, &new);
+    let uid = base_ids.column_uid(&old.column("id")).unwrap();
+    desired_ids.columns.get_mut(uid).unwrap().name = "n".into();
+    let relation = ObjectIdentity {
+        class: "pg_class".into(),
+        name: vec!["app".into(), "t".into()],
+        signature: vec![],
+    };
+    let record = |class: &str, name: &str, surface: Surface| BindingRecord {
+        object: ObjectIdentity {
+            class: class.into(),
+            name: vec![name.into()],
+            signature: vec![relation.clone()],
+        },
+        ownership: ObjectOwnership::Surface(surface),
+        bindings: vec![],
+    };
+    let check = Surface::Check {
+        table: old.clone(),
+        name: "c".into(),
+    };
+    let default = Surface::Default(old.column("id"));
+    let opening = vec![
+        record("pg_constraint", "c", check.clone()),
+        record("pg_attrdef", "id", default.clone()),
+    ];
+    let resolutions = super::resolution::from_sides(
+        pbps_diff::Side {
+            schema: &base,
+            ids: &base_ids,
+        },
+        pbps_diff::Side {
+            schema: &desired,
+            ids: &desired_ids,
+        },
+        &opening,
+        &[],
+        &Assessment::default(),
+    )
+    .unwrap();
+    let named: Vec<_> = resolutions.iter().map(|r| r.surface.clone()).collect();
+    assert_eq!(
+        named,
+        [
+            Surface::Default(new.column("n")),
+            Surface::Check {
+                table: new.clone(),
+                name: "c".into(),
+            },
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+    );
+    assert!(
+        resolutions
+            .iter()
+            .all(|r| r.current.is_some() && r.desired.is_none())
+    );
+    // Without the recorded identities the removals keep the old spelling,
+    // which the removal changes do not name.
+    let unmapped =
+        super::resolution::from_records(&base, &desired, &opening, &[], &Assessment::default())
+            .unwrap();
+    assert!(unmapped.iter().any(|r| r.surface == check));
+}
+
 /// The explicit ordered extra is an input to ordinary bootstrap, qualification,
 /// scratch compilation and final planning, not a value inferred from the
 /// target session's transient search_path.
