@@ -109,16 +109,11 @@ fn physical_attributes(
         .filter(|id| id.class == "column" && id.signature.first() == Some(parent))
     {
         let fail = || Uncovered::object(child, "physical attribute provenance is unreadable");
-        let number = *capture.attribute_numbers.get(child).ok_or_else(&fail)?;
-        let input = capture.inputs.get(child).ok_or_else(&fail)?;
-        let relation: ObjectIdentity = serde_json::from_value(
-            input
-                .properties
-                .get("attrelid")
-                .cloned()
-                .ok_or_else(&fail)?,
-        )
-        .map_err(|_| fail())?;
+        let number = *capture.attribute_numbers.get(child).ok_or_else(fail)?;
+        let input = capture.inputs.get(child).ok_or_else(fail)?;
+        let relation: ObjectIdentity =
+            serde_json::from_value(input.properties.get("attrelid").cloned().ok_or_else(fail)?)
+                .map_err(|_| fail())?;
         if number == 0
             || child.signature.len() != 1
             || child.name.len() != 1
@@ -338,13 +333,13 @@ pub(super) fn classify(
             })?;
             let fail =
                 || Uncovered::object(&constraint, "primary key index provenance is unreadable");
-            let constraint_row = capture.inputs.get(&constraint).ok_or_else(&fail)?;
+            let constraint_row = capture.inputs.get(&constraint).ok_or_else(fail)?;
             let parent: ObjectIdentity = serde_json::from_value(
                 constraint_row
                     .properties
                     .get("conrelid")
                     .cloned()
-                    .ok_or_else(&fail)?,
+                    .ok_or_else(fail)?,
             )
             .map_err(|_| fail())?;
             let index: ObjectIdentity = serde_json::from_value(
@@ -352,12 +347,12 @@ pub(super) fn classify(
                     .properties
                     .get("conindid")
                     .cloned()
-                    .ok_or_else(&fail)?,
+                    .ok_or_else(fail)?,
             )
             .map_err(|_| fail())?;
-            let index_row = capture.inputs.get(&index).ok_or_else(&fail)?;
+            let index_row = capture.inputs.get(&index).ok_or_else(fail)?;
             let metadata = identity("pg_index", Vec::new(), vec![index.clone()]);
-            let metadata_row = capture.inputs.get(&metadata).ok_or_else(&fail)?;
+            let metadata_row = capture.inputs.get(&metadata).ok_or_else(fail)?;
             if parent != table_id
                 || index.class != "pg_class"
                 || !matches!(
