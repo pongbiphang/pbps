@@ -51,6 +51,19 @@ class GateNeeds(unittest.TestCase):
         )
         self.assertEqual(gn.problems(text), ["`gate.needs` is missing job `extra`"])
 
+    def test_a_commented_or_quoted_job_key_is_still_a_job(self):
+        for key in ("extra: # Linux-only", '"extra":', "'extra':  # quoted"):
+            text = WORKFLOW.replace(
+                "  gate:\n", f"  {key}\n    steps:\n      - run: echo extra\n\n  gate:\n"
+            )
+            self.assertEqual(gn.problems(text), ["`gate.needs` is missing job `extra`"], key)
+
+    def test_an_unreadable_job_declaration_fails_rather_than_folding(self):
+        text = WORKFLOW.replace(
+            "  gate:\n", "  extra : {}\n\n  gate:\n"
+        )
+        self.assertEqual(gn.problems(text), ["unrecognized job declaration: 'extra : {}'"])
+
     def test_a_service_or_step_key_is_not_a_job(self):
         # `mssql:` under `services:` is indented deeper than a job key.
         self.assertNotIn("mssql", gn.jobs(WORKFLOW))

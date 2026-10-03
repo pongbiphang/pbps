@@ -10,7 +10,10 @@ dropped together with `needs` when someone deletes it. It reads the workflow
 as text rather than through a YAML library, because that job installs
 nothing beyond a checkout. The two shapes it reads
 are the ones ci.yml uses: a job is a two-space-indented key directly under
-`jobs:`, and the gate's `needs` is one flow-style list.
+`jobs:`, and the gate's `needs` is one flow-style list. Every two-space line
+under `jobs:` must read as a job key (optionally quoted, optionally with a
+comment), and anything else fails: a declaration the reader skipped would
+fold that job into the previous one and hide it from the comparison.
 """
 
 import re
@@ -21,8 +24,14 @@ WORKFLOW = Path(__file__).resolve().parent.parent / ".github/workflows/ci.yml"
 GATE = "gate"
 
 
+JOB_KEY = re.compile(r"""  (["']?)([A-Za-z0-9_-]+)\1:\s*(#.*)?""")
+
+
 def jobs(text):
-    """Every job key, in order, with the lines that belong to it."""
+    """Every job key, in order, with the lines that belong to it.
+
+    Raises ValueError on a two-space line under `jobs:` that is not a job key.
+    """
     found, current, inside = {}, None, False
     for line in text.splitlines():
         if line.startswith("jobs:"):
@@ -32,9 +41,11 @@ def jobs(text):
             continue
         if line and not line.startswith((" ", "#")):
             break
-        key = re.fullmatch(r"  ([A-Za-z0-9_-]+):\s*", line)
-        if key:
-            current = key.group(1)
+        if line.startswith("  ") and not line.startswith("   ") and not line.lstrip().startswith("#"):
+            key = JOB_KEY.fullmatch(line)
+            if not key:
+                raise ValueError(f"unrecognized job declaration: {line.strip()!r}")
+            current = key.group(2)
             found[current] = []
         elif current is not None:
             found[current].append(line)
@@ -51,7 +62,10 @@ def gate_needs(lines):
 
 
 def problems(text):
-    found = jobs(text)
+    try:
+        found = jobs(text)
+    except ValueError as error:
+        return [str(error)]
     if GATE not in found:
         return [f"no `{GATE}` job"]
     needs = gate_needs(found[GATE])
