@@ -58,6 +58,11 @@ class GateNeeds(unittest.TestCase):
             )
             self.assertEqual(gn.problems(text), ["`gate.needs` is missing job `extra`"], key)
 
+    def test_an_indented_blank_line_is_not_a_declaration(self):
+        for blank in ("  ", "    ", "  \t", "\t"):
+            text = WORKFLOW.replace("\n\n  live:\n", f"\n{blank}\n  live:\n")
+            self.assertEqual(gn.problems(text), [], repr(blank))
+
     def test_an_unreadable_job_declaration_fails_rather_than_folding(self):
         text = WORKFLOW.replace(
             "  gate:\n", "  extra : {}\n\n  gate:\n"

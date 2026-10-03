@@ -39,9 +39,15 @@ def jobs(text):
             continue
         if not inside:
             continue
-        if line and not line.startswith((" ", "#")):
+        # A blank line may keep its indentation (spaces or a tab), and a
+        # comment is no key; neither may end the section or declare a job.
+        if not line.strip() or line.lstrip().startswith("#"):
+            if current is not None:
+                found[current].append(line)
+            continue
+        if not line.startswith(" "):
             break
-        if line.startswith("  ") and not line.startswith("   ") and not line.lstrip().startswith("#"):
+        if line.startswith("  ") and not line.startswith("   "):
             key = JOB_KEY.fullmatch(line)
             if not key:
                 raise ValueError(f"unrecognized job declaration: {line.strip()!r}")
