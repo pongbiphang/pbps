@@ -2313,6 +2313,12 @@ Three traps sat inside the fix, and each of them is a measurement:
   set is safe; a failed read is not empty. Delete only after the actual merge,
   never with `gh pr merge --delete-branch` while enqueueing. Do not rebase merely
   for cleanup, and keep each dependent's existing review/current-head CI gates.
+  An open-only post-delete scan still misses a dependent created after the
+  final enumeration and then closed by deletion. DEC-1458.1 adds an operation
+  window, a complete repository-wide `state=all` scan and recorded-ID reads.
+  Newly discovered parent dependents fail closeout; unchanged PRs demonstrably
+  closed before the window do not. Ambiguous association or an incomplete read
+  stops local cleanup, and recovery must not overwrite a recreated foreign ref.
 
 ## A pre-delete count includes the row its statement removes
 

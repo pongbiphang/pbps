@@ -110,8 +110,12 @@ and merge order.
   PR's base by the primary agent, while the upstream branch still exists.
   Follow the closeout verification in the review reference: enumerate all
   dependents, record their heads and expected remaining diffs, verify OPEN/base/
-  unchanged head/diff before deletion, then reverify after deletion. Never rely
-  on automatic retargeting (DEC-1228.1). Refresh each dependent's existing review
+  unchanged head/diff before deletion, then reverify after deletion. Record the
+  operation window and complete the repository-wide `state=all` post-delete
+  scan, including late-created closed dependents and base-ref history when
+  needed; an open-only scan cannot authorize local cleanup (DEC-1458.1).
+  Never rely on automatic retargeting (DEC-1228.1). Refresh each dependent's
+  existing review
   and current-head CI gates before enqueueing. Do not rebase merely for this
   base change or because `master` moved. Two things do
   need you, and both begin by rebasing onto current `master`, because neither
@@ -157,8 +161,12 @@ After an actual merge, verify the intended issue closed and capture the merge
 commit. The primary agent must complete §7 of the review reference before
 cleaning the remote head, local branch and worktree: explicitly retarget and
 verify dependents first, including a successfully enumerated empty set, then
-verify them again after deletion. Retain the parent branch if any read or check
-fails. Update dependent agents, and report
+verify them again after deletion, completing the operation-window/all-state
+check for newly discovered dependents. An unchanged PR demonstrably closed
+before the window is not a failure; incomplete or ambiguous evidence is.
+Retain the parent branch before deletion if any check fails; after deletion,
+stop local cleanup and follow the exact-owned-ref recovery without overwriting
+a changed or foreign ref. Update dependent agents, and report
 the review count and any explicitly deferred findings. If the merge touched
 `Cargo.toml`, `Cargo.lock`, `deny.toml`, or the dependency-audit workflow, wait
 for the dependency audit; a failure becomes the next task before any free slot

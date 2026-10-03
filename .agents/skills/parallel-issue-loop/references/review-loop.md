@@ -173,7 +173,10 @@ merged on the second roll.
 After an actual merge, verify the PR state, merge commit, and issue closure.
 The primary agent owns this ordered closeout (DEC-1228.1):
 
-1. Enumerate all open PRs based on the merged head branch, completing pagination.
+1. Start the operation window and record the owned parent ref/head/base.
+   Complete an initial repository-wide `state=all` scan, retaining the IDs,
+   states, bases, heads and closure times of already closed parent dependents.
+   Enumerate all open PRs based on the merged head branch, completing pagination.
    Record each dependent's head and expected remaining diff after removing the
    parent's already merged work. Failed or incomplete reads are not empty sets.
 2. While the parent branch exists, explicitly change each dependent's base to
@@ -183,9 +186,28 @@ The primary agent owns this ordered closeout (DEC-1228.1):
 3. Re-enumerate immediately before deleting the owned remote head; newly found
    dependents must pass steps 1–2. A successfully verified empty set requires no
    base changes. Delete only after these checks, then reverify the recorded
-   dependents and enumeration before removing the local branch and worktree.
+   dependents and complete step 4 before removing the local branch and worktree.
    Treat unexpected closure or a changed head, base or diff as failed closeout.
-4. Refresh each dependent's existing review and current-head CI evidence after
+4. Retain the deletion request and confirmation times; confirmed deletion ends
+   the window started in step 1. Complete a
+   repository-wide `state=all` PR scan after deletion, with every page, and
+   re-read the recorded dependents by ID even after their bases changed.
+   Inspect every PR created within the window, including timestamp boundary
+   cases. Establish parent association from its base-ref history when its
+   current base alone cannot decide; unavailable history is not proof that it
+   was unrelated. A newly discovered parent-dependent PR fails closeout even
+   if it is now closed or already has the intended base. Retain its observed
+   state/base/head/diff; do not invent an earlier head or expected patch.
+   Inspect commit provenance and expected remaining work before recovery.
+   An unchanged older PR demonstrably closed before the window is not a
+   closeout failure. Failed, incomplete or ambiguous evidence stops local
+   cleanup. To restore a deleted parent, use an atomic missing-ref lease for
+   the exact recorded owned head; a recreated changed or foreign ref must
+   never be overwritten. Reopen, explicitly retarget and verify affected
+   dependents, then repeat the checks before retrying deletion (DEC-1458.1).
+   A successfully verified empty set needs no retargeting, but both the
+   pre-delete enumeration and this all-state check must succeed.
+5. Refresh each dependent's existing review and current-head CI evidence after
    its base change before enqueueing it. An unchanged head does not excuse
    missing required checks or dismissed reviews.
 
