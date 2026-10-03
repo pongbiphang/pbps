@@ -381,6 +381,7 @@ impl Unchecked {
             Change::SetStorageParameters { table, .. } => {
                 format!("storage parameters of {table}")
             }
+            Change::SetTablePersistence { table, .. } => format!("persistence of {table}"),
             Change::SetIndexStorageParameters { table, .. } => {
                 format!("index storage parameters on {table}")
             }

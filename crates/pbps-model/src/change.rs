@@ -325,6 +325,17 @@ pub enum Change {
         reset: BTreeSet<String>,
     },
 
+    /// A PostgreSQL table switched between permanent and `UNLOGGED` (#1443):
+    /// `ALTER TABLE … SET LOGGED` or `SET UNLOGGED`, which rewrites the table
+    /// and its indexes under `AccessExclusiveLock` in either direction
+    /// (measured on 16 and 18). Ordered by the foreign keys between the
+    /// tables it switches (DEC-1443.1).
+    SetTablePersistence {
+        uid: Uid,
+        table: TableName,
+        unlogged: bool,
+    },
+
     /// A PostgreSQL index's storage parameters (#1442): `ALTER INDEX … SET
     /// (…), RESET (…)`, in place, which every supported parameter of both
     /// methods is (measured on 16 and 18). Only what changes; an index
@@ -1092,6 +1103,7 @@ impl Change {
             | Change::RenameColumn { table, .. }
             | Change::SetPrimaryKey { table, .. }
             | Change::SetIndexStorageParameters { table, .. }
+            | Change::SetTablePersistence { table, .. }
             | Change::SetStorageParameters { table, .. }
             | Change::SetReplicaIdentity { table, .. }
             | Change::AddUnique { table, .. }
@@ -1167,6 +1179,7 @@ impl Change {
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
+            | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1280,6 +1293,7 @@ impl Change {
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
+            | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1344,6 +1358,7 @@ impl Change {
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
+            | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1449,6 +1464,7 @@ impl Change {
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
+            | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1508,6 +1524,7 @@ impl Change {
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
+            | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1585,6 +1602,7 @@ impl Change {
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
+            | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1639,6 +1657,7 @@ impl Change {
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
+            | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1689,6 +1708,7 @@ impl Change {
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
+            | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1780,6 +1800,7 @@ impl Change {
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
+            | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1841,6 +1862,7 @@ impl Change {
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
+            | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1986,6 +2008,7 @@ impl Change {
             | Change::Revoke { .. }
             | Change::PublicExecution { .. }
             | Change::SetIndexStorageParameters { .. }
+            | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. } => None,
         }
@@ -2015,6 +2038,7 @@ impl Change {
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
+            | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -2071,6 +2095,7 @@ impl Change {
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
+            | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -2115,6 +2140,7 @@ impl Change {
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
+            | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -2220,6 +2246,14 @@ impl Change {
             }
             Change::DeleteRow { .. } => {
                 r.insert(RiskClass::DataDelete);
+            }
+            // An unlogged table is emptied by a crash or an unclean shutdown
+            // and never reaches a standby: switching to it puts the rows at
+            // that risk from then on. Switching back carries none (#1443).
+            Change::SetTablePersistence { unlogged, .. } => {
+                if *unlogged {
+                    r.insert(RiskClass::Destructive);
+                }
             }
             Change::AddColumn { column, .. } => {
                 // Existing rows have no value for a newly added column. The

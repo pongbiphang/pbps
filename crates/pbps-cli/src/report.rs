@@ -333,6 +333,7 @@ fn role_of(change: &Change) -> Option<&str> {
         | Change::SetColumnDeprecated { .. }
         | Change::SetPrimaryKey { .. }
         | Change::SetIndexStorageParameters { .. }
+        | Change::SetTablePersistence { .. }
         | Change::SetStorageParameters { .. }
         | Change::SetReplicaIdentity { .. }
         | Change::AddUnique { .. }
@@ -384,6 +385,7 @@ fn renames(cs: &ChangeSet) -> Renames {
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
+            | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -702,6 +704,9 @@ pub fn describe(c: &Change) -> String {
             Some(pk) => format!("~ primary key -> ({})", pk.columns.join(", ")),
             None => "- drop primary key".to_owned(),
         },
+        Change::SetTablePersistence { unlogged, .. } => {
+            if *unlogged { "~ unlogged" } else { "~ logged" }.to_owned()
+        }
         Change::SetIndexStorageParameters {
             target, set, reset, ..
         } => {

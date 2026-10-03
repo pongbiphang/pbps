@@ -28,7 +28,7 @@ The differ sorts every planned change by, in order:
    | 6 | `DropTable` |
    | 7 | `CreateTable` |
    | 8 | `AddColumn` |
-   | 9 (`COLUMN_ALTERATIONS`) | `AlterColumnType`, `AlterColumnNullability`, `AlterColumnDefault`, `AlterColumnExpression`; `AddComputedColumn` at the class's end (9, 3) |
+   | 9 (`COLUMN_ALTERATIONS`) | `AlterColumnType`, `AlterColumnNullability`, `AlterColumnDefault`, `AlterColumnExpression`; `AddComputedColumn` at the class's end (9, 3); P: `SetTablePersistence` after it, by the foreign-key graph |
    | 10 | `SetColumnDeprecated`; P: `SetStorageParameters`, `SetIndexStorageParameters` |
    | 11 | `InsertRow`, `UpdateRow` |
    | 12 | `DeleteRow` |
@@ -160,6 +160,7 @@ requirement is common to all of them, so it is listed once,
 | `AlterColumnExpression` | 9 | P: its inputs, a relaxation of its own column. Functions it calls: *content* | Recomputed stored values |
 | `AddComputedColumn` | 9 (9, 3) | S: the columns it reads, in their final type. Functions it calls exist (one this plan creates is refused by name) | A computed column at the end of its table (DEC-1174.1) |
 | `SetColumnDeprecated` | 10 | Nothing | Metadata only |
+| `SetTablePersistence` | 9 (9, 10 + depth) | P: the foreign keys that stand: to logged, the tables it references logged first; to unlogged, the tables referencing it unlogged first (refused the other way round, measured) | Rewrites the table and its indexes under `AccessExclusiveLock` (DEC-1443.1) |
 | `SetStorageParameters` | 10 | P: the table, under its final name. Nothing reads a storage parameter | The table's heap storage parameters; no rewrite (DEC-1441.1) |
 | `SetIndexStorageParameters` | 10 | P: the index, which stands: one the plan adds or rebuilds takes its parameters in its `CREATE` instead | An index's storage parameters, in place; no rebuild (DEC-1442.1) |
 | `InsertRow`, `UpdateRow` | 11 | The columns written, defaults the row takes, parent rows | Rows |

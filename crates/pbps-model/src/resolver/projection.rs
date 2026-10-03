@@ -327,6 +327,7 @@ fn changed_owners(change: &Change) -> Option<(Vec<OwnerScope>, bool, bool)> {
         ),
         Change::SetPrimaryKey { table, .. }
         | Change::SetIndexStorageParameters { table, .. }
+        | Change::SetTablePersistence { table, .. }
         | Change::SetStorageParameters { table, .. }
         | Change::SetReplicaIdentity { table, .. }
         | Change::AddUnique { table, .. }

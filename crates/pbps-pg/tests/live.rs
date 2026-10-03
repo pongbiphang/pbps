@@ -2056,7 +2056,6 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
              -- row-level security not enabled.
              CREATE TABLE {s}.forced (id integer);
              ALTER TABLE {s}.forced FORCE ROW LEVEL SECURITY;
-             CREATE UNLOGGED TABLE {s}.volatile_ (id integer);
              CREATE TABLE {s}.collated (a text, b text COLLATE \"C\",
                  c varchar(20), d varchar(20));
              CREATE INDEX collated_pat ON {s}.collated (a text_pattern_ops);
@@ -2107,9 +2106,10 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
              -- because the table reader and the limitation reader are two
              -- readers and each had to be told: neither is this project's.
              CREATE TABLE {s}.theirs_table (id integer PRIMARY KEY);
-             CREATE UNLOGGED TABLE {s}.theirs_unlogged (id integer);
+             CREATE TABLE {s}.theirs_secured (id integer);
+             ALTER TABLE {s}.theirs_secured ENABLE ROW LEVEL SECURITY;
              ALTER EXTENSION btree_gist ADD TABLE {s}.theirs_table;
-             ALTER EXTENSION btree_gist ADD TABLE {s}.theirs_unlogged;
+             ALTER EXTENSION btree_gist ADD TABLE {s}.theirs_secured;
              CREATE TABLE {s}.temporal (
                  id integer, valid daterange,
                  CONSTRAINT temporal_pk PRIMARY KEY (id, valid WITHOUT OVERLAPS));
@@ -2221,8 +2221,6 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         "row-level security",
         "not in force",
         "FORCE ROW LEVEL SECURITY",
-        // A table that does not survive a crash.
-        "UNLOGGED",
         // A collation that decides which values compare equal. Named down to
         // the column and out to the collation itself: the operator-class
         // message says `COLLATE` too, and the table is named schema-qualified,
@@ -2298,10 +2296,10 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
     // refuses every command for a limitation whose name is in the managed set,
     // so an extension object colliding with a declared name would refuse a
     // plan that is correct. A materialized view and an aggregate are the two
-    // kinds the unheld reader reports; `theirs_unlogged` is the fourth thing
+    // kinds the unheld reader reports; `theirs_secured` is the fourth thing
     // that reader names — a table of a kind the model does not hold — and it
     // is an extension's before it is unheld.
-    for theirs in ["theirs_mv", "theirs_agg", "theirs_unlogged"] {
+    for theirs in ["theirs_mv", "theirs_agg", "theirs_secured"] {
         assert!(
             !all.contains(theirs),
             "`{s}.{theirs}` belongs to an extension and is nobody's declaration:\n{all}"
@@ -2556,7 +2554,7 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
             pbps_model::TableName::new(&s, "unenforced"),
         ],
         "the partitioned table, the inheritance child, the row-level-secured \
-         table, the UNLOGGED table and this tool's own tables are not in the \
+         table and this tool's own tables are not in the \
          pull"
     );
 
@@ -2586,7 +2584,6 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
             pbps_model::TableName::new(&s, "rewritten"),
             pbps_model::TableName::new(&s, "shaped"),
             pbps_model::TableName::new(&s, "unspellable"),
-            pbps_model::TableName::new(&s, "volatile_"),
         ],
         "a limitation about a table that is in the pull must name it, and the \
          tables left out whole must each earn one"
@@ -3424,6 +3421,133 @@ async fn index_storage_parameters_round_trip_and_change_in_place() {
             .any(|l| format!("{l:?}").contains("g_gist")),
         "{limitations:?}"
     );
+    drop_schema(&mut target, &s).await;
+    target.drop().await;
+}
+
+/// Unlogged tables round-trip, and switch both ways as typed plans that
+/// apply, linked tables in the order the engine takes: to logged, the
+/// referenced first; to unlogged, the referencing first (#1443). A
+/// recreate keeps them unlogged, never permanent.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn unlogged_tables_round_trip_and_switch_in_foreign_key_order() {
+    use pbps_model::Change;
+    let s = emit_schema("ul1443");
+    let pa = TableName::new(&s, "pa");
+    let ch = TableName::new(&s, "ch");
+
+    let mut source = TestDb::create("ul1443_src").await;
+    fresh(&mut source, &s).await;
+    source
+        .execute(&format!(
+            "CREATE UNLOGGED TABLE {s}.pa (id integer PRIMARY KEY);
+             CREATE UNLOGGED TABLE {s}.ch (id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                                           pa integer CONSTRAINT ch_pa REFERENCES {s}.pa (id));
+             CREATE INDEX ch_pa_ix ON {s}.ch (pa);"
+        ))
+        .await
+        .expect("the source tables");
+    let read = pull(&mut source).await;
+    let limitations = ours_limitations(&read, &s);
+    let pulled = ours_only(&read, &s);
+    drop_schema(&mut source, &s).await;
+    source.drop().await;
+    assert!(limitations.is_empty(), "{limitations:?}");
+    assert!(pulled.tables[&pa].unlogged && pulled.tables[&ch].unlogged);
+
+    let ids = mint_ids(&pulled, &IdsFile::default(), &[]);
+    let mut target = TestDb::create("ul1443_dst").await;
+    fresh(&mut target, &s).await;
+    apply(
+        &mut target,
+        &Postgres::new(),
+        &plan(&Schema::default(), &IdsFile::default(), &pulled, &ids),
+    )
+    .await;
+    target
+        .execute(&format!(
+            "INSERT INTO {s}.pa VALUES (1); INSERT INTO {s}.ch (pa) VALUES (1);"
+        ))
+        .await
+        .expect("rows");
+    let rebuilt = ours_only(&pull(&mut target).await, &s);
+    assert_eq!(rebuilt, pulled);
+    assert!(plan(&rebuilt, &ids, &pulled, &ids).is_empty());
+
+    let switched = |unlogged: bool| {
+        let mut schema = pulled.clone();
+        for t in [&pa, &ch] {
+            schema.tables.get_mut(t).unwrap().unlogged = unlogged;
+        }
+        schema
+    };
+    let order = |step: &pbps_model::ChangeSet| -> Vec<TableName> {
+        step.changes
+            .iter()
+            .filter_map(|p| {
+                if let Change::SetTablePersistence { table, .. } = &p.change {
+                    Some(table.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    for (unlogged, first, second) in [(false, &pa, &ch), (true, &ch, &pa)] {
+        let current = ours_only(&pull(&mut target).await, &s);
+        let wanted = switched(unlogged);
+        let step = plan(&current, &ids, &wanted, &ids);
+        assert_eq!(order(&step), [first.clone(), second.clone()], "{step:#?}");
+        apply(&mut target, &Postgres::new(), &step).await;
+        let after = ours_only(&pull(&mut target).await, &s);
+        assert_eq!(after, wanted);
+        assert!(plan(&after, &ids, &wanted, &ids).is_empty());
+    }
+    let rows = target
+        .query(&format!("SELECT count(*)::int8 AS n FROM {s}.ch"))
+        .await
+        .expect("rows kept");
+    let n: Option<i64> = rows[0].try_get("n").unwrap();
+    drop_schema(&mut target, &s).await;
+    target.drop().await;
+    assert_eq!(n, Some(1));
+}
+
+/// Two tables referencing each other switch persistence together, each way,
+/// as plans that apply: the keys inside the cycle are dropped around the
+/// switches and added back, since no order between them works (#1488
+/// review).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn a_foreign_key_cycle_switches_persistence_together() {
+    let s = emit_schema("cyc1488");
+    let mut target = TestDb::create("cyc1488").await;
+    fresh(&mut target, &s).await;
+    target
+        .execute(&format!(
+            "CREATE TABLE {s}.a (id integer PRIMARY KEY, b integer);
+             CREATE TABLE {s}.b (id integer PRIMARY KEY, a integer CONSTRAINT b_a REFERENCES {s}.a (id));
+             ALTER TABLE {s}.a ADD CONSTRAINT a_b FOREIGN KEY (b) REFERENCES {s}.b (id);
+             INSERT INTO {s}.a VALUES (1, NULL); INSERT INTO {s}.b VALUES (1, 1);
+             UPDATE {s}.a SET b = 1;"
+        ))
+        .await
+        .expect("the cycle");
+    let pulled = ours_only(&pull(&mut target).await, &s);
+    let ids = mint_ids(&pulled, &IdsFile::default(), &[]);
+    for unlogged in [true, false] {
+        let current = ours_only(&pull(&mut target).await, &s);
+        let mut wanted = current.clone();
+        for t in wanted.tables.values_mut() {
+            t.unlogged = unlogged;
+        }
+        let step = plan(&current, &ids, &wanted, &ids);
+        apply(&mut target, &Postgres::new(), &step).await;
+        let after = ours_only(&pull(&mut target).await, &s);
+        assert_eq!(after, wanted, "{step:#?}");
+        assert!(plan(&after, &ids, &wanted, &ids).is_empty());
+    }
     drop_schema(&mut target, &s).await;
     target.drop().await;
 }
@@ -12987,7 +13111,7 @@ async fn a_rule_on_the_view_is_named_and_refused_because_the_rebuild_would_lose_
 }
 
 /// A trigger on a relation the table reader leaves out — a partitioned table,
-/// an `UNLOGGED` one — came back in the pull without the relation it is on, and
+/// a row-level-secured one — came back in the pull without the relation it is on, and
 /// `check_names` refused the whole schema: a pull nothing could load. Measured,
 /// the engine allows a trigger on both. The trigger is left out with its
 /// relation now, and named beside it rather than silently gone.
@@ -13010,7 +13134,10 @@ async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_nam
         format!(
             "CREATE TRIGGER audit BEFORE INSERT ON {s}.part FOR EACH ROW EXECUTE FUNCTION {s}.tg()"
         ),
-        format!("CREATE UNLOGGED TABLE {s}.scratch (id int)"),
+        // Row-level security keeps it out of the pull; an unlogged table did
+        // until #1443 held it.
+        format!("CREATE TABLE {s}.scratch (id int)"),
+        format!("ALTER TABLE {s}.scratch ENABLE ROW LEVEL SECURITY"),
         format!(
             "CREATE TRIGGER audit BEFORE INSERT ON {s}.scratch FOR EACH ROW EXECUTE FUNCTION \
              {s}.tg()"

@@ -809,6 +809,7 @@ impl AsStored {
                 | Change::Grant { .. }
                 | Change::Revoke { .. }
                 | Change::SetIndexStorageParameters { .. }
+                | Change::SetTablePersistence { .. }
                 | Change::SetStorageParameters { .. }
                 | Change::SetReplicaIdentity { .. }
                 | Change::PublicExecution { .. } => {}
@@ -3384,6 +3385,7 @@ fn build(
         | Change::Grant { .. }
         | Change::Revoke { .. }
         | Change::SetIndexStorageParameters { .. }
+        | Change::SetTablePersistence { .. }
         | Change::SetStorageParameters { .. }
         | Change::SetReplicaIdentity { .. }
         | Change::PublicExecution { .. } => Ok(Vec::new()),
@@ -3607,6 +3609,7 @@ pub(crate) fn probes(changes: &ChangeSet) -> Preflight {
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
+            | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }

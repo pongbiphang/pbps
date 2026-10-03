@@ -51,3 +51,4 @@ DECISIONS 465).
 - `24/` adds a table's `replica_identity:` (issue #1444).
 - `25/` adds a table's `storage_parameters:` (issue #1441).
 - `26/` adds index, key and unique-constraint `storage_parameters:` (issue #1442).
+- `27/` adds a table's `unlogged:` (issue #1443).

@@ -244,6 +244,9 @@ indexes:
   `gin_pending_list_limit`. A unique constraint takes them in its mapping form
   `{columns: […], storage_parameters: {…}}`. Each changes in place; SQL
   Server refuses them (DEC-1442.1).
+- **`unlogged: true` makes a PostgreSQL table `UNLOGGED`**, emptied by a crash
+  and never on a standby. Switching to it is `destructive`; a permanent table
+  may not reference an unlogged one; SQL Server refuses the key (DEC-1443.1).
 - **An index key is `column [opclass] [asc|desc]`**, in PostgreSQL's order, and
   `method:` names the access method only where it is not the default `btree`.
   An absent class is the method's default for the column's type. The first

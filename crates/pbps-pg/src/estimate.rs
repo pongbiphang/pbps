@@ -462,6 +462,21 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             )
         }
 
+        // A rewrite of the table and its indexes under `AccessExclusiveLock`,
+        // in either direction (measured on 16 and 18, #1443).
+        Change::SetTablePersistence {
+            table, unlogged, ..
+        } => e(
+            format!(
+                "switching {table} to {}",
+                if *unlogged { "unlogged" } else { "logged" }
+            ),
+            table,
+            Rewrite::Yes,
+            Reads::EveryRow,
+            Lock::AccessExclusive,
+        ),
+
         // In place, on the index alone (measured on 16 and 18): nothing is
         // rebuilt or read, and the lock is the method's. A B-tree's
         // parameters take `ShareUpdateExclusiveLock`; a GIN index's take
@@ -890,6 +905,25 @@ mod tests {
 
     fn tname(s: &str) -> TableName {
         s.parse().expect("a table name")
+    }
+
+    /// A persistence switch rewrites the table, reading every row, under
+    /// `AccessExclusiveLock`, in either direction (measured, #1443).
+    #[test]
+    fn a_persistence_switch_is_a_rewrite_under_access_exclusive() {
+        for unlogged in [true, false] {
+            let e = estimate(
+                &Change::SetTablePersistence {
+                    uid: "t_000000".parse().unwrap(),
+                    table: tname("app.t"),
+                    unlogged,
+                },
+                Strategy::default(),
+            )
+            .unwrap();
+            assert!(matches!(e.rewrite, Rewrite::Yes) && matches!(e.reads, Reads::EveryRow));
+            assert!(matches!(e.lock, Lock::AccessExclusive));
+        }
     }
 
     /// An index's parameters change in place, reading nothing; a B-tree's

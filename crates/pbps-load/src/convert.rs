@@ -457,6 +457,7 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
                     ReplicaIdentityDto::Index(name) => ReplicaIdentity::Index(name),
                 }),
                 storage_parameters,
+                unlogged: dto.unlogged,
             },
             intents,
             strategy: dto.strategy.map(|s| Strategy { online: s.online }),

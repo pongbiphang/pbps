@@ -2955,6 +2955,9 @@ fn refuse_unplanned_movement(
         &'a TableName,
     );
     let mut storage_changes: BTreeMap<&pbps_model::Uid, StorageSetting<'_>> = BTreeMap::new();
+    // The tables whose persistence this plan switches, by uid: to what, and
+    // the name it runs under, which is the table's final one (#1443).
+    let mut persistence_changes: BTreeMap<&pbps_model::Uid, (bool, &TableName)> = BTreeMap::new();
     // Index parameters the plan sets in place: the table, under its final
     // name, which part, and what it sets and resets (#1442).
     type IndexSetting<'a> = (
@@ -3073,6 +3076,14 @@ fn refuse_unplanned_movement(
         } = &p.change
         {
             storage_changes.insert(uid, (set, reset, table));
+        }
+        if let pbps_model::Change::SetTablePersistence {
+            uid,
+            table,
+            unlogged,
+        } = &p.change
+        {
+            persistence_changes.insert(uid, (*unlogged, table));
         }
         // An index's parameters set in place change its part as an index
         // change does, so the part is this plan's (#1442); what it leaves is
@@ -3546,6 +3557,18 @@ fn refuse_unplanned_movement(
                      declares"
                 ));
             }
+            // In the `CREATE` itself, so held from the first read that finds
+            // the table (#1443).
+            if declared.unlogged != now.unlogged {
+                moved.push(format!(
+                    "{now_name} is not {} as this plan's `CREATE TABLE` declares",
+                    if declared.unlogged {
+                        "unlogged"
+                    } else {
+                        "logged"
+                    }
+                ));
+            }
             // In the `CREATE` itself (`WITH`), so held from the first read
             // that finds the table (#1441).
             if declared.storage_parameters != now.storage_parameters {
@@ -3795,6 +3818,29 @@ fn refuse_unplanned_movement(
                     "{now_name} storage parameters are not the ones this plan leaves"
                 ));
             }
+            // Its persistence, the same way (#1443): unswitched, it is held
+            // to the before-read; switched, to the plan's value once the run
+            // is whole, either side being the plan in progress before then.
+            let planned_persistence =
+                persistence_changes
+                    .iter()
+                    .find_map(|(uid, (unlogged, ran))| {
+                        let ours = match renamed_uids.get(uid) {
+                            Some((from, to)) => *from == name && *to == now_name,
+                            None => *ran == name && name == now_name,
+                        };
+                        ours.then_some(*unlogged)
+                    });
+            let persistence_moved = match planned_persistence {
+                None => was.unlogged != now.unlogged,
+                Some(unlogged) => settled.whole() && now.unlogged != unlogged,
+            };
+            if persistence_moved {
+                moved.push(format!(
+                    "{now_name} is {} and this plan does not leave it so",
+                    if now.unlogged { "unlogged" } else { "logged" }
+                ));
+            }
             // An index whose parameters the plan sets in place, held once
             // the run is whole to the before-read with only that change
             // applied, the whole part and not its parameters alone: its part
@@ -3967,6 +4013,7 @@ fn refuse_unplanned_movement(
                         | pbps_model::Change::Revoke { .. }
                         | pbps_model::Change::PublicExecution { .. }
                         | pbps_model::Change::SetIndexStorageParameters { .. }
+                        | pbps_model::Change::SetTablePersistence { .. }
                         | pbps_model::Change::SetStorageParameters { .. }
                         | pbps_model::Change::SetReplicaIdentity { .. } => {}
                     }
@@ -12383,6 +12430,70 @@ mod tests {
         assert!(format!("{e:#}").contains("`ix`"), "{e:#}");
         let e = check(&schema("90"), Settled::SoFar).expect_err("neither side mid-run");
         assert!(format!("{e:#}").contains("`ix`"), "{e:#}");
+    }
+
+    /// A table's persistence is held across an apply (#1443): another
+    /// session's switch on a touched table is movement; the plan's own is
+    /// held once the run is whole; a created table is held to its `CREATE`.
+    #[test]
+    fn a_persistence_switch_by_someone_else_is_movement() {
+        use pbps_model::{Change, Column, PlannedChange, Table};
+        let name = TableName::new("app", "t");
+        let schema = |unlogged: bool| {
+            let mut t = Table::default();
+            t.columns.insert(
+                "id".into(),
+                Column::new("integer".parse().unwrap()).not_null(),
+            );
+            t.unlogged = unlogged;
+            Schema {
+                tables: [(name.clone(), t)].into(),
+                ..Default::default()
+            }
+        };
+        let check = |plan: &pbps_model::ChangeSet, before: &Schema, after: &Schema, settled| {
+            refuse_unplanned_movement(
+                &pbps_pg::Postgres::new(),
+                plan,
+                before,
+                after,
+                "test",
+                settled,
+            )
+        };
+        let nothing = pbps_model::ChangeSet {
+            changes: Vec::new(),
+        };
+        check(&nothing, &schema(false), &schema(false), Settled::Whole).expect("unchanged");
+        let e = check(&nothing, &schema(false), &schema(true), Settled::SoFar)
+            .expect_err("switched by another");
+        assert!(format!("{e:#}").contains("app.t"), "{e:#}");
+        let switching = pbps_model::ChangeSet {
+            changes: vec![PlannedChange::new(Change::SetTablePersistence {
+                uid: "t_000000".parse().unwrap(),
+                table: name.clone(),
+                unlogged: true,
+            })],
+        };
+        check(&switching, &schema(false), &schema(true), Settled::Whole).expect("the plan's own");
+        check(&switching, &schema(false), &schema(false), Settled::SoFar).expect("not run yet");
+        let e = check(&switching, &schema(false), &schema(false), Settled::Whole)
+            .expect_err("never run");
+        assert!(format!("{e:#}").contains("logged"), "{e:#}");
+        let mut declared = schema(true).tables.remove(&name).unwrap();
+        declared.unlogged = true;
+        let creating = pbps_model::ChangeSet {
+            changes: vec![PlannedChange::new(Change::CreateTable {
+                uid: "t_000000".parse().unwrap(),
+                name: name.clone(),
+                table: Box::new(declared),
+            })],
+        };
+        let empty = Schema::default();
+        check(&creating, &empty, &schema(true), Settled::SoFar).expect("as created");
+        let e =
+            check(&creating, &empty, &schema(false), Settled::SoFar).expect_err("not as created");
+        assert!(format!("{e:#}").contains("unlogged"), "{e:#}");
     }
 
     /// Storage parameters are held across an apply (#1441): another

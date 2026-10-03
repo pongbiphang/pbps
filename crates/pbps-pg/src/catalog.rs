@@ -131,6 +131,7 @@ fn tables_query() -> String {
             c.relreplident::text AS replica_identity,
             COALESCE((SELECT x.indexrelid::int8 FROM pg_catalog.pg_index x
                        WHERE x.indrelid = c.oid AND x.indisreplident), 0) AS identity_index,
+            c.relpersistence::text AS persistence,
             COALESCE(c.reloptions, '{{}}'::text[]) AS reloptions,
             COALESCE((SELECT tc.reloptions FROM pg_catalog.pg_class tc
                        WHERE tc.oid = c.reltoastrelid), '{{}}'::text[]) AS toast_reloptions
@@ -170,7 +171,7 @@ const ORDINARY_TABLE: &str = concat!(
         AND NOT c.relrowsecurity
         AND NOT c.relforcerowsecurity
         AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_policy p WHERE p.polrelid = c.oid)
-        AND c.relpersistence = 'p'
+        AND c.relpersistence IN ('p', 'u')
         AND NOT ",
     identity_names_no_index!(),
     "
@@ -452,7 +453,7 @@ fn partitioned_query() -> String {
                       OR c.relforcerowsecurity
                       OR EXISTS (SELECT 1 FROM pg_catalog.pg_policy p
                                   WHERE p.polrelid = c.oid)
-                      OR c.relpersistence <> 'p'
+                      OR c.relpersistence NOT IN ('p', 'u')
                       OR {IDENTITY_NAMES_NO_INDEX}
                       OR c.relhasrules
                       OR c.reloftype <> 0
@@ -957,7 +958,6 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
                  them silently and enabling row-level security afterwards would leave the table \
                  open"
             }
-            "r" if text(row, "persistence")? == "u" => "an UNLOGGED table",
             "r" if text(row, "persistence")? == "t" => "a temporary table",
             // Every replica identity is declared (#1444) but one that names
             // an index which is gone: see `IDENTITY_NAMES_NO_INDEX`.
@@ -1017,6 +1017,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             },
             reloptions: strings(row, "reloptions")?,
             toast_reloptions: strings(row, "toast_reloptions")?,
+            unlogged: text(row, "persistence")? == "u",
         });
     }
     for row in batch.get("columns").ok_or_else(|| missing("columns"))? {

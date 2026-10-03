@@ -1143,3 +1143,12 @@ without its parameters.
 older reader did not read an index's `reloptions`, so an older state of a
 tuned index reads as drift that `verify` names, and `baseline` re-records it.
 An older build reading a version 20 plan would build the index without them.
+
+<a id="dec-1443-2"></a>
+
+**DEC-1443.2. State version 17 adds a table's persistence and still reads 6
+to 16; plan version 21 turns 20 away.** An absent `unlogged` is a permanent
+table, which is what every table an older reader recorded was: it left an
+unlogged one out as a limitation, and no recorder accepts a managed table
+carrying one. An older build reading a version 21 plan would create the
+table permanent.
