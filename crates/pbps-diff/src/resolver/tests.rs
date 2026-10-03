@@ -767,7 +767,8 @@ fn a_replica_identity_keeps_its_order_against_its_tables_indexes() {
             &old,
             &with("ix_new", Some(ReplicaIdentity::Index("ix_new".into())))
         ),
-        ["drop ix_old", "add ix_new", "identity"]
+        // FULL in between, while neither index is there.
+        ["identity", "drop ix_old", "add ix_new", "identity"]
     );
 }
 

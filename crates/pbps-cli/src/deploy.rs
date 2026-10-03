@@ -2927,9 +2927,10 @@ fn refuse_unplanned_movement(
     let mut constraints: BTreeMap<&TableName, BTreeSet<(pbps_model::Part, &str)>> = BTreeMap::new();
     let mut keys: BTreeSet<&TableName> = BTreeSet::new();
     // The tables whose replica identity this plan sets, by the name the
-    // change runs under: the old one ahead of the renames, the new one after
-    // the additions (DEC-1444.1).
-    let mut identities: BTreeSet<&TableName> = BTreeSet::new();
+    // change runs under — the old one ahead of the renames, the new one after
+    // the additions (DEC-1444.1) — with the last value it sets.
+    let mut identities: BTreeMap<&TableName, Option<&pbps_model::ReplicaIdentity>> =
+        BTreeMap::new();
     // The defaults a change of this plan's own sets, by column. A created
     // table's column may have its default taken out of the `CREATE` and set
     // after a function the plan rebuilds (#1027, DEC-942.1), so the payload
@@ -3024,8 +3025,8 @@ fn refuse_unplanned_movement(
         if let pbps_model::Change::CreateTable { name, table, .. } = &p.change {
             created.insert(name, table.as_ref());
         }
-        if let pbps_model::Change::SetReplicaIdentity { table, .. } = &p.change {
-            identities.insert(table);
+        if let pbps_model::Change::SetReplicaIdentity { table, to, .. } = &p.change {
+            identities.insert(table, to.as_ref());
         }
         if let pbps_model::Change::AlterColumnDefault { column, to, .. } = &p.change {
             set_defaults.insert((&column.table, column.name.as_str()), to.as_ref());
@@ -3649,14 +3650,23 @@ fn refuse_unplanned_movement(
                 m,
             );
             // The replica identity, which every part can read back unchanged
-            // around: excused only where this plan sets it (#1444).
-            if was.replica_identity != now.replica_identity
-                && !identities.contains(name)
-                && !identities.contains(now_name)
-            {
-                moved.push(format!(
-                    "{now_name} replica identity changed, and no change of this plan sets it"
-                ));
+            // around (#1444). Where this plan sets it, any value is the plan in
+            // progress until the run is whole, and then it must be the last one
+            // the plan sets: another session's after the plan's is movement
+            // (#1467 review). The new name first, which the last setting runs
+            // under unless it ran ahead of a rename.
+            match identities.get(now_name).or_else(|| identities.get(name)) {
+                None if was.replica_identity != now.replica_identity => {
+                    moved.push(format!(
+                        "{now_name} replica identity changed, and no change of this plan sets it"
+                    ));
+                }
+                Some(planned) if settled.whole() && now.replica_identity.as_ref() != *planned => {
+                    moved.push(format!(
+                        "{now_name} replica identity is not the one this plan sets"
+                    ));
+                }
+                None | Some(_) => {}
             }
             // And which of them holds the rows (#1178). Every part can read
             // back unchanged while another session moves the clustered index
@@ -12023,6 +12033,36 @@ mod tests {
             Settled::SoFar,
         )
         .expect("the plan's own setting");
+        // Once the run is whole it must be the plan's value: another session's
+        // after the plan's is movement, though any value mid-run is the plan in
+        // progress (#1467 review).
+        check(
+            &setting,
+            &schema(None),
+            &schema(Some(ReplicaIdentity::Full)),
+            Settled::Whole,
+        )
+        .expect("the plan's value at the close");
+        check(
+            &setting,
+            &schema(None),
+            &schema(Some(ReplicaIdentity::Nothing)),
+            Settled::SoFar,
+        )
+        .expect("mid-run");
+        for closing in [Settled::Whole, Settled::Closing] {
+            let e = check(
+                &setting,
+                &schema(None),
+                &schema(Some(ReplicaIdentity::Nothing)),
+                closing,
+            )
+            .expect_err("another session's value after the plan's");
+            assert!(
+                format!("{e:#}").contains("not the one this plan sets"),
+                "{e:#}"
+            );
+        }
 
         // Created: the default mid-run is the plan in progress; another
         // identity, or the default once the run is whole, is not.

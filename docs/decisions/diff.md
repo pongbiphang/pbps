@@ -1801,8 +1801,11 @@ whose index it names, new or rebuilt by any pass of the differ. Two places:
   2, so an identity moved off an index the plan drops never leaves the table
   identifying no row.
 - Otherwise last in class 13, after the index it names and after the NOT NULL
-  of class 9. An identity moved to a new index while its old one is dropped
-  identifies no row between the two, inside the plan.
+  of class 9. Where the plan drops the old identity's index too — a rebuild,
+  or a move to a new index — `FULL` is set first, at (0, 1): every table can
+  take it, so no read between the drop and the final setting finds the table
+  identifying no row. The reader leaves such a table out as unreadable, so a
+  staged checkpoint there could not be resumed (#1467 review).
 
 A created table sets it as its `CREATE`'s last statement, after its indexes;
 where the resolver splits the indexes out of the `CREATE`, an identity on one
@@ -1823,11 +1826,17 @@ the publication's to manage, and pbps does not manage publications.
 **Read.** A table is held whatever its identity, except one whose `USING
 INDEX` names no index: that is not `nothing`, which someone chose, and no
 declaration spells it, so the table is left out and named. An identity on an
-index the pull leaves out is named too, and never read as the default.
+index the pull leaves out is named too, and never read as the default. The
+index's owner is a primary key or unique constraint only: a foreign key's
+`conindid` is the index it references, which on a self-referencing table is
+the table's own key (#1467 review).
 
 **Drift.** A touched table's identity that changes across an apply is
-movement unless the plan sets it; a created table is held to its declared
-identity once it shows one or the run is whole.
+movement unless the plan sets it. Where it does, any value mid-run is the plan
+in progress, and once the run is whole it must be the last value the plan
+sets: another session's after the plan's is movement (#1467 review). A
+created table is held to its declared identity once it shows one or the run
+is whole.
 
 Tests:
 

@@ -844,8 +844,8 @@ fn diff_partial_rebuilding(
         // first, under the table's old name: before the drops of class 2 can
         // take its old index, which would leave the table identifying no row
         // (DEC-1444.1).
-        if let Change::SetReplicaIdentity { uid, .. } = c
-            && early_identity.contains(uid)
+        if let Change::SetReplicaIdentity { uid, to, .. } = c
+            && early_identity.contains(&(uid.clone(), to.clone()))
         {
             return (0, 1);
         }
@@ -1883,17 +1883,23 @@ fn diff_computed(name: &TableName, base: &Table, declared: &Table, changes: &mut
 /// under the same name is not the identity until it is set again (measured on
 /// 16 and 18, #1444).
 ///
-/// Returns the tables, by uid, whose change can run before the plan's drops:
-/// those whose target the table can take as it stands, which is every
+/// Returns the changes, by table uid and target, that run before the plan's
+/// drops: those whose target the table can take as it stands, which is every
 /// target the plan does not add, when the columns it is over are NOT NULL
 /// already. The rest wait for the additions of class 13.
+///
+/// One that waits while the plan drops the old identity's index is preceded
+/// by `FULL`, which every table can take: between the drop and the final
+/// setting the table would otherwise identify no row, which the reader leaves
+/// out as unreadable, so a staged checkpoint there could not be resumed
+/// (#1467 review).
 fn diff_replica_identity(
     base: &Schema,
     declared: &Schema,
     declared_tables: &BTreeMap<Uid, TableName>,
     base_tables: &BTreeMap<Uid, TableName>,
     changes: &mut Vec<Change>,
-) -> BTreeSet<Uid> {
+) -> BTreeSet<(Uid, Option<ReplicaIdentity>)> {
     let mut early = BTreeSet::new();
     for (uid, declared_name) in declared_tables {
         let Some(base_name) = base_tables.get(uid) else {
@@ -1926,8 +1932,31 @@ fn diff_replica_identity(
         let mut probe = was.clone();
         probe.replica_identity.clone_from(&table.replica_identity);
         let now = !readded && probe.replica_identity_problems().is_empty();
+        let on = |t: &TableName| t == base_name || t == declared_name;
+        let old_index_dropped = changes.iter().any(|c| match (c, &was.replica_identity) {
+            (
+                Change::SetPrimaryKey {
+                    table: t,
+                    from: Some(_),
+                    ..
+                },
+                Some(ReplicaIdentity::PrimaryKey),
+            ) => on(t),
+            (Change::DropUnique { table: t, name }, Some(ReplicaIdentity::Unique(n)))
+            | (Change::DropIndex { table: t, name }, Some(ReplicaIdentity::Index(n))) => {
+                on(t) && name == n
+            }
+            _ => false,
+        });
         if now {
-            early.insert(uid.clone());
+            early.insert((uid.clone(), table.replica_identity.clone()));
+        } else if old_index_dropped {
+            early.insert((uid.clone(), Some(ReplicaIdentity::Full)));
+            changes.push(Change::SetReplicaIdentity {
+                uid: uid.clone(),
+                table: base_name.clone(),
+                to: Some(ReplicaIdentity::Full),
+            });
         }
         changes.push(Change::SetReplicaIdentity {
             uid: uid.clone(),
@@ -4006,12 +4035,16 @@ mod tests {
             ["identity public.t full", "drop ix_code"]
         );
 
-        // Its index rebuilt: dropped, added, and the identity set again.
+        // Its index rebuilt: FULL first, which the table can always take,
+        // so no read between the drop and the add finds it identifying no
+        // row; then dropped, added, and the identity set again (#1467
+        // review).
         let mut rebuilt = identified_by(Some(R::Index("ix_code".into())));
         rebuilt.indexes.get_mut("ix_code").unwrap().columns[0].descending = true;
         assert_eq!(
             plan(identified_by(Some(R::Index("ix_code".into()))), rebuilt),
             [
+                "identity public.t full",
                 "drop ix_code",
                 "add ix_code",
                 "identity public.t {index: ix_code}"

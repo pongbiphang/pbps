@@ -1883,19 +1883,18 @@ fn replica_identity(
         'n' => ReplicaIdentity::Nothing,
         'i' => {
             let oid = raw_table.identity_index;
+            // Only a key's or a unique constraint's own index: a foreign key's
+            // `conindid` is the index it references, which on a
+            // self-referencing table is this table's own key (#1467 review).
             let owner = constraints.iter().find(|c| {
-                c.table_oid == raw_table.oid && c.index_oid.is_some() && c.index_oid == oid
+                c.table_oid == raw_table.oid
+                    && matches!(c.kind, 'p' | 'u')
+                    && c.index_oid.is_some()
+                    && c.index_oid == oid
             });
             let identity = match owner {
                 Some(c) if c.kind == 'p' => ReplicaIdentity::PrimaryKey,
-                Some(c) if c.kind == 'u' => ReplicaIdentity::Unique(c.name.clone()),
-                Some(c) => {
-                    return Err(format!(
-                        "its `REPLICA IDENTITY` is the index of constraint `{}`, which this model \
-                         does not take as one",
-                        c.name
-                    ));
-                }
+                Some(c) => ReplicaIdentity::Unique(c.name.clone()),
                 None => match indexes.iter().find(|i| Some(i.oid) == oid) {
                     Some(i) => ReplicaIdentity::Index(i.name.clone()),
                     None => {
@@ -4634,6 +4633,20 @@ mod tests {
             );
             assert_eq!(only(&pulled).replica_identity, expected, "{kind} {index:?}");
         }
+        // A self-referencing foreign key names the key's index too, and
+        // sorts first: the identity is still the key's (#1467 review).
+        let mut self_ref = catalog('i', Some(50));
+        let mut fk = constraint(1, "a_fk", 'f');
+        fk.columns = vec![2];
+        fk.ref_columns = vec![1];
+        fk.ref_table = Some(1);
+        fk.index_oid = Some(50);
+        self_ref.constraints.insert(0, fk);
+        let pulled = assemble(&self_ref);
+        assert_eq!(
+            only(&pulled).replica_identity,
+            Some(ReplicaIdentity::PrimaryKey)
+        );
         // Negative: an index this read did not see, and one the pull left
         // out, are named, never read as the default.
         let pulled = assemble(&catalog('i', Some(99)));

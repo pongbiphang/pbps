@@ -3103,9 +3103,20 @@ async fn every_replica_identity_round_trips_and_moves_as_a_typed_plan() {
         let n = t(n);
         move |c: &Change| matches!(c, Change::SetReplicaIdentity { table, .. } if *table == n)
     };
+    // `indexed`: FULL before its old index goes, its new index, then the
+    // identity on it (#1467 review).
+    let last = step
+        .changes
+        .iter()
+        .rposition(|p| identity_of("indexed")(&p.change))
+        .unwrap();
     assert!(
-        at(&|c| matches!(c, Change::AddIndex { name, .. } if name == "indexed_id"))
-            < at(&identity_of("indexed")),
+        at(&|c| matches!(c, Change::AddIndex { name, .. } if name == "indexed_id")) < last,
+        "{step:#?}"
+    );
+    assert!(
+        at(&identity_of("indexed"))
+            < at(&|c| matches!(c, Change::DropIndex { name, .. } if name == "indexed_code")),
         "{step:#?}"
     );
     assert!(
