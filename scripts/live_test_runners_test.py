@@ -82,7 +82,7 @@ class LiveExecution(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 native.native_tests("/owned/tests", {"PBPS_NATIVE_DRIVER": "pg"}, producer_only=True)
         self.assertEqual([call.args[3] for call in run.call_args_list], native.PRODUCER_TESTS)
-        self.assertEqual(run.call_count, 33)
+        self.assertEqual(run.call_count, 34)
 
     def test_focused_generation_runs_only_the_case_for_the_selected_pg_major(self):
         completed = subprocess.CompletedProcess([], 0, "test result: ok. 1 passed\n")
@@ -103,7 +103,7 @@ class LiveExecution(unittest.TestCase):
     def test_normal_pg_execution_keeps_all_old_cases_and_only_its_generation_case(self):
         completed = subprocess.CompletedProcess([], 0, "test result: ok. 1 passed\n")
         every = native.NATIVE_TESTS + native.PRODUCER_TESTS + native.GENERATION_TESTS
-        self.assertEqual(len(every), 49)
+        self.assertEqual(len(every), 50)
         for major, selected, opposite in (
             ("16", native.PG16_GENERATION_TEST, native.PG18_GENERATION_TEST),
             ("18", native.PG18_GENERATION_TEST, native.PG16_GENERATION_TEST),
@@ -115,7 +115,7 @@ class LiveExecution(unittest.TestCase):
                         native.native_tests("/owned/tests", env)
                 names = [call.args[3] for call in run.call_args_list]
                 self.assertEqual(names, every[:-2] + [selected])
-                self.assertEqual(len(names), 48)
+                self.assertEqual(len(names), 49)
                 self.assertNotIn(opposite, names)
 
     def test_focused_generation_refuses_missing_or_unknown_major_and_non_pg(self):

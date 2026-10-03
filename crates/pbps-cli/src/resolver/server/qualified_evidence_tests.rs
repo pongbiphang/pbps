@@ -4325,6 +4325,62 @@ async fn renaming_a_referenced_column_carries_the_foreign_key_that_names_it() {
     referenced_rename_case(true).await;
 }
 
+/// A table with a text column has a TOAST relation PostgreSQL drops with
+/// it. That storage is not a capture input, so dropping the table seals and
+/// closes on the real catalog instead of keeping records the drop removed.
+#[tokio::test]
+#[ignore = "requires pinned native PostgreSQL target and owned Docker fixture"]
+async fn dropping_a_table_with_toast_storage_closes_on_the_actual_catalog() {
+    setup(&[
+        "CREATE SCHEMA pbps_evidence1274",
+        "CREATE TABLE pbps_evidence1274.t (n integer NOT NULL, body text)",
+        "CREATE TABLE pbps_evidence1274.kept (n integer NOT NULL, body text)",
+    ])
+    .await;
+    let dropped: pbps_model::TableName = "pbps_evidence1274.t".parse().unwrap();
+    let kept: pbps_model::TableName = "pbps_evidence1274.kept".parse().unwrap();
+    let mut table = review_table();
+    table.columns.insert(
+        "body".into(),
+        pbps_model::Column::new("text".parse().unwrap()),
+    );
+    let mut base = Schema::default();
+    base.tables.insert(dropped.clone(), table.clone());
+    base.tables.insert(kept.clone(), table);
+    let mut desired = base.clone();
+    desired.tables.remove(&dropped);
+    let inputs = Inputs::from_pair((base, desired));
+    let key = ProjectKey::new(true);
+    let mut owned = Some(ObservedContainers::begin());
+    let mut target = target().await;
+    let mut run = open(Profile::Container, &mut target).await;
+    let result = review_plan(&mut target, &mut run, &mut owned, &inputs, &key).await;
+    assert!(result.changes.changes.iter().any(|step| {
+        matches!(&step.change, Change::DropTable { name, .. } if name == &dropped)
+    }));
+    let closing = result.evidence.after().clone();
+    for manifest in [result.evidence.before(), &closing] {
+        assert!(
+            manifest
+                .prerequisites()
+                .iter()
+                .all(|row| !format!("{:?}", row.object).contains("\"pg_toast\"")),
+            "TOAST storage is not sealed"
+        );
+    }
+    let mut peer = pbps_db::Conn::connect(
+        Driver::Postgres,
+        &std::env::var("PBPS_NATIVE_CONNECTION").unwrap(),
+    )
+    .await
+    .unwrap();
+    execute_plan(&mut peer, &result.changes).await;
+    drop(peer);
+    assert_review_closing_matches_target(&mut target, &closing, &key).await;
+    target.check().await.unwrap();
+    setup(&[]).await;
+}
+
 /// ADD CONSTRAINT changes the table in place. Its target owner and ACLs are
 /// not replaced by those of the scratch table used to compile the plan.
 async fn key_check_case(include_key: bool) {

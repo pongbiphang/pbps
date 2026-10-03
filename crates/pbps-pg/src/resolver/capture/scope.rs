@@ -335,6 +335,29 @@ impl Builder<'_> {
         Ok(())
     }
 
+    /// Whether a dependency row's dependent is a TOAST relation. A table's
+    /// out-of-line storage is physical, as its relfilenode is: no expression
+    /// binds it, and its name carries the table's OID, so it differs between
+    /// the target and scratch. It and everything under it stay out of the
+    /// capture (DEC-1274.1).
+    fn toast(&self, row: &Row) -> Result<bool, ()> {
+        let relation = |field| logical::number(row, field).map_err(|_| ());
+        let class = self
+            .catalog
+            .row("pg_class", relation("classid")?)
+            .map_err(|_| ())?;
+        if logical::string(class, "relname").map_err(|_| ())? != "pg_class"
+            || logical::signed(row, "objsubid").map_err(|_| ())? != 0
+        {
+            return Ok(false);
+        }
+        let dependent = self
+            .catalog
+            .row("pg_class", relation("objid")?)
+            .map_err(|_| ())?;
+        Ok(logical::string(dependent, "relkind").map_err(|_| ())? == "t")
+    }
+
     fn dependencies(&mut self) -> Result<(), Uncovered> {
         for &class in &["pg_depend"] {
             for row in &self.catalog.rows[class] {
@@ -364,7 +387,7 @@ impl Builder<'_> {
                         .as_ref()
                         .is_ok_and(|id| self.result.members.contains_key(id));
                 }
-                if !selected {
+                if !selected || self.toast(row).map_err(|_| fail())? {
                     continue;
                 }
                 let (identity, properties) =

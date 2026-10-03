@@ -64,6 +64,7 @@ PRODUCER_TESTS = [
     "resolver::server::qualified_evidence_tests::a_dropped_routine_seals_its_closing_signature_lookup",
     "resolver::server::qualified_evidence_tests::renaming_a_referenced_table_carries_the_foreign_key_that_names_it",
     "resolver::server::qualified_evidence_tests::renaming_a_referenced_column_carries_the_foreign_key_that_names_it",
+    "resolver::server::qualified_evidence_tests::dropping_a_table_with_toast_storage_closes_on_the_actual_catalog",
     "resolver::server::qualified_evidence_tests::newly_created_routines_under_target_default_privileges_close_on_the_actual_catalog",
     "resolver::server::qualified_evidence_tests::a_new_routine_created_by_an_ordinary_deployer_closes_on_the_actual_catalog",
     "resolver::server::qualified_evidence_tests::an_explicit_extra_schema_changes_only_the_unqualified_lookup_in_the_final_plan",

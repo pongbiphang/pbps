@@ -98,7 +98,10 @@ not read as prerequisites (DEC-1274.1). The deployer's effective privileges,
 which do change name lookup, are the separate authorization condition. Public
 `pg_roles` supplies role facts without reading password verifiers from
 `pg_authid`. A constraint's internal triggers, whose names embed
-their OID, are identified by relation, constraint and trigger function.
+their OID, are identified by relation, constraint and trigger function. A
+table's TOAST relation, whose name embeds the table's OID, is out-of-line
+storage that no expression binds: it and its index, columns and dependency rows
+are physical bookkeeping and stay out of the closure (DEC-1274.1).
 
 Actual stored node trees supply creation-time bindings, including pinned
 builtins that `pg_depend` omits. Qualified surfaces include views, SQL-standard
