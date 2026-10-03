@@ -334,9 +334,9 @@ jobs:
           POSTGRES_DB: pbps_test
         ports:
           - 54320:5432
-        # This image has a health check hook, so no wait loop stands in for one.
+        # TCP excludes the socket-only initialization server (#1471).
         options: >-
-          --health-cmd "pg_isready -U postgres -d pbps_test"
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres -d pbps_test"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
@@ -359,7 +359,7 @@ jobs:
         ports:
           - 54321:5432
         options: >-
-          --health-cmd "pg_isready -U postgres -d pbps_test"
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres -d pbps_test"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
