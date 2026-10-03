@@ -32,18 +32,83 @@
 //! The differ keeps its over-approximating refusals as an offline screen,
 //! where a false yes costs a second plan; the moves are only here.
 
+use std::collections::BTreeSet;
+
 use pbps_model::{Change, ChangeSet, PlannedChange, TableName};
 use pbps_mssql::catalog::ExpressionEdge;
 
-/// A fold under which two spellings may name one object: SQL Server compares
-/// names under the database's collation, which a plan does not know, and the
-/// common ones ignore case. Only ever widens a match.
-fn same(a: &str, b: &str) -> bool {
-    a.to_lowercase() == b.to_lowercase()
+/// Which spellings name one object, as the database's catalog collation
+/// says: a fold in Rust would join `dbo.f` and `dbo.F` in a case-sensitive
+/// database, and part `café` from `cafe` in an accent-insensitive one (#1455
+/// review). Asked of the engine once, over every name the edges and the plan
+/// hold.
+#[derive(Debug, Default)]
+pub(crate) struct Alike(BTreeSet<(String, String)>);
+
+impl Alike {
+    /// From the pairs the engine reads as one name.
+    pub(crate) fn from_pairs(pairs: impl IntoIterator<Item = (String, String)>) -> Self {
+        Self(pairs.into_iter().collect())
+    }
+
+    fn same(&self, a: &str, b: &str) -> bool {
+        a == b
+            || self.0.contains(&(a.to_owned(), b.to_owned()))
+            || self.0.contains(&(b.to_owned(), a.to_owned()))
+    }
+
+    fn object(&self, a: &TableName, b: &TableName) -> bool {
+        self.same(&a.schema, &b.schema) && self.same(&a.name, &b.name)
+    }
 }
 
-fn same_object(a: &TableName, b: &TableName) -> bool {
-    same(&a.schema, &b.schema) && same(&a.name, &b.name)
+/// Every name an edge or the plan's changes spell, for [`Alike`].
+// The complement names nothing an expression edge can: no computed column,
+// no column one reads, its table, or a module.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub(crate) fn spellings(cs: &ChangeSet, edges: &[ExpressionEdge]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let object = |t: &TableName, out: &mut BTreeSet<String>| {
+        out.insert(t.schema.clone());
+        out.insert(t.name.clone());
+    };
+    for e in edges {
+        object(&e.from, &mut out);
+        object(&e.to, &mut out);
+        out.extend(e.from_column.iter().chain(&e.to_column).cloned());
+    }
+    for p in &cs.changes {
+        match &p.change {
+            Change::RenameTable { from, to, .. } => {
+                object(from, &mut out);
+                object(to, &mut out);
+            }
+            Change::RenameColumn {
+                table, from, to, ..
+            } => {
+                object(table, &mut out);
+                out.insert(from.clone());
+                out.insert(to.clone());
+            }
+            Change::DropColumn { column, .. }
+            | Change::AlterColumnType { column, .. }
+            | Change::AlterColumnNullability { column, .. } => {
+                object(&column.table, &mut out);
+                out.insert(column.name.clone());
+            }
+            Change::AddComputedColumn { table, name, .. }
+            | Change::DropComputedColumn { table, name, .. } => {
+                object(table, &mut out);
+                out.insert(name.clone());
+            }
+            Change::DropTable { name, .. } => object(name, &mut out),
+            Change::AlterModule { id, .. } | Change::DropModule { id, .. } => {
+                object(&id.object_name(), &mut out);
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// The plan's names, back to the catalog's: the edges were stored under the
@@ -120,6 +185,7 @@ fn input_change(
 pub(crate) fn order_by_edges(
     cs: &mut ChangeSet,
     edges: &[ExpressionEdge],
+    alike: &Alike,
 ) -> Result<usize, String> {
     let names = CatalogNames::of(cs);
     // A computed column by its catalog table and name.
@@ -143,9 +209,9 @@ pub(crate) fn order_by_edges(
     }
     let is = |list: &[(TableName, String)], table: &TableName, column: &str| {
         list.iter()
-            .any(|(t, c)| same_object(t, table) && same(c, column))
+            .any(|(t, c)| alike.object(t, table) && alike.same(c, column))
     };
-    let table_gone = |table: &TableName| tables_dropped.iter().any(|t| same_object(t, table));
+    let table_gone = |table: &TableName| tables_dropped.iter().any(|t| alike.object(t, table));
     // There before the plan and there throughout.
     let standing = |table: &TableName, column: &str| {
         !table_gone(table) && !is(&dropped, table, column) && !is(&added, table, column)
@@ -157,9 +223,11 @@ pub(crate) fn order_by_edges(
         if let Some((table, column, what)) = input_change(&p.change, &names) {
             for e in computed_edges() {
                 let computed = e.from_column.as_deref().unwrap_or_default();
-                if same_object(&e.from, &table)
-                    && same_object(&e.to, &table)
-                    && e.to_column.as_deref().is_some_and(|c| same(c, &column))
+                if alike.object(&e.from, &table)
+                    && alike.object(&e.to, &table)
+                    && e.to_column
+                        .as_deref()
+                        .is_some_and(|c| alike.same(c, &column))
                     && standing(&table, computed)
                 {
                     refused.push(format!(
@@ -185,7 +253,7 @@ pub(crate) fn order_by_edges(
                 // Dropped, for good or to add again, the column is out of the
                 // way first: the function's drop is moved after it below, and
                 // its alter runs in class 14, after the drop's class 2.
-                if same_object(&e.to, &function) && standing(&e.from, computed) {
+                if alike.object(&e.to, &function) && standing(&e.from, computed) {
                     refused.push(format!(
                         "computed column {}.{computed} calls `{function}`, which this plan {what}, \
                          and SQL Server refuses that while the column calls it. Apply the \
@@ -200,9 +268,9 @@ pub(crate) fn order_by_edges(
             for e in edges {
                 if e.from_column.is_none()
                     && e.from_schema_bound
-                    && same_object(&e.to, &table)
-                    && e.to_column.as_deref().is_some_and(|c| same(c, name))
-                    && !modules_dropped.iter().any(|m| same_object(m, &e.from))
+                    && alike.object(&e.to, &table)
+                    && e.to_column.as_deref().is_some_and(|c| alike.same(c, name))
+                    && !modules_dropped.iter().any(|m| alike.object(m, &e.from))
                 {
                     refused.push(format!(
                         "computed column {table}.{name} is dropped by this plan, and the \
@@ -219,7 +287,7 @@ pub(crate) fn order_by_edges(
         refused.dedup();
         return Err(refused.join("\n"));
     }
-    release(cs, edges, &names)
+    release(cs, edges, &names, alike)
 }
 
 /// Moves each function drop to right after the last removal of a computed
@@ -228,6 +296,7 @@ fn release(
     cs: &mut ChangeSet,
     edges: &[ExpressionEdge],
     names: &CatalogNames,
+    alike: &Alike,
 ) -> Result<usize, String> {
     // What a change drops, by its catalog name: a module or a table.
     let drops = |change: &Change| -> Option<TableName> {
@@ -243,11 +312,11 @@ fn release(
     let releases = |change: &Change, function: &TableName| {
         edges.iter().any(|e| {
             e.from_column.is_some()
-                && same_object(&e.to, function)
+                && alike.object(&e.to, function)
                 && (matches!(change, Change::DropComputedColumn { table, name, .. }
-                    if same_object(&names.table(table), &e.from)
-                        && e.from_column.as_deref().is_some_and(|c| same(c, name)))
-                    || matches!(change, Change::DropTable { name, .. } if same_object(name, &e.from)))
+                    if alike.object(&names.table(table), &e.from)
+                        && e.from_column.as_deref().is_some_and(|c| alike.same(c, name)))
+                    || matches!(change, Change::DropTable { name, .. } if alike.object(name, &e.from)))
         })
     };
     let mut moved = 0;
@@ -277,8 +346,8 @@ fn release(
                     edges.iter().any(|e| {
                         e.from_column.is_none()
                             && e.from_schema_bound
-                            && same_object(&e.from, &dependent)
-                            && same_object(&e.to, &object)
+                            && alike.object(&e.from, &dependent)
+                            && alike.object(&e.to, &object)
                     })
                 })
             });
@@ -383,7 +452,7 @@ mod tests {
 
     fn order(changes: Vec<PlannedChange>, edges: &[ExpressionEdge]) -> Result<Vec<String>, String> {
         let mut cs = ChangeSet { changes };
-        order_by_edges(&mut cs, edges)?;
+        order_by_edges(&mut cs, edges, &Alike::default())?;
         Ok(cs
             .changes
             .iter()
@@ -435,6 +504,28 @@ mod tests {
         assert!(at("dbo.u") < at("dbo.f"), "{ran:?}");
         assert!(at("dbo.f") < at("dbo.g"), "{ran:?}");
         assert!(at("dbo.f") < at("dbo.lookup"), "{ran:?}");
+    }
+
+    /// Names are one where the catalog's collation says so, and only there:
+    /// in a case-sensitive database column `A` is not the `a` a computed
+    /// column reads, and its retype is not refused (#1455 review).
+    #[test]
+    fn names_match_by_the_catalogs_collation_not_a_fold() {
+        let reads = [computed_edge("dbo.t", "c", "dbo.t", Some("a"))];
+        let drop_upper = || {
+            PlannedChange::new(Change::DropColumn {
+                uid: "c_000000".parse().unwrap(),
+                column: t("dbo.t").column("A"),
+            })
+        };
+        let sensitive = Alike::default();
+        let mut cs = ChangeSet {
+            changes: vec![drop_upper()],
+        };
+        assert_eq!(order_by_edges(&mut cs, &reads, &sensitive), Ok(0));
+        let insensitive = Alike::from_pairs([("a".to_owned(), "A".to_owned())]);
+        let e = order_by_edges(&mut cs, &reads, &insensitive).unwrap_err();
+        assert!(e.contains("reads `A`"), "{e}");
     }
 
     /// The refusals, each by the catalog's edge and so by the engine's

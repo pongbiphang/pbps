@@ -620,7 +620,19 @@ pub async fn order_computed_by_edges(conn: &mut Conn, cs: &mut ChangeSet) -> any
     if edges.is_empty() {
         return Ok(());
     }
-    crate::computed_order::order_by_edges(cs, &edges)
+    // One group: whether two strings are one name is the collation's, not
+    // the kind of object they name.
+    let spellings: Vec<String> = crate::computed_order::spellings(cs, &edges)
+        .into_iter()
+        .collect();
+    let grouped: Vec<(usize, String)> = spellings.iter().map(|s| (0, s.clone())).collect();
+    let alike = crate::computed_order::Alike::from_pairs(
+        pbps_mssql::catalog::column_names_alike(conn, &grouped)
+            .await?
+            .into_iter()
+            .map(|(a, b)| (spellings[a].clone(), spellings[b].clone())),
+    );
+    crate::computed_order::order_by_edges(cs, &edges, &alike)
         .map(|_| ())
         .map_err(|why| anyhow::anyhow!("computed_dependencies (SQL Server): {why}"))
 }

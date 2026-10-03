@@ -1737,6 +1737,11 @@ rename walk of DEC-1366.1:
   expression's, which is gone before the function changes. What the new
   expression calls has no edge yet, and the differ's screen reads it.
 
+The pass matches the plan's names to the edges' under the catalog's own
+collation (`column_names_alike`), not a case fold: a case-sensitive database
+keeps `A` and `a` apart, and an accent-insensitive one joins `cafe` and
+`café`.
+
 The differ keeps its over-approximating refusals as an offline screen, where
 a false yes costs a second plan. It no longer moves a function's drop, and it
 no longer refuses on the word `schemabinding`. An offline plan is never
