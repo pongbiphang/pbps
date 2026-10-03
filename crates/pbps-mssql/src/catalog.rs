@@ -695,6 +695,104 @@ pub async fn matching_table_names(
     Ok(found)
 }
 
+/// One edge of `sys.sql_expression_dependencies` (#1431): what an object's
+/// stored text names, as the engine resolved it when it stored the text.
+///
+/// The engine's own answer, by object id, where a text scan answers by
+/// spelling: it tells `dbo.f` from `x.f`, reads `[cafe]` as the column it
+/// binds under the collation, and knows which modules are schema-bound
+/// (measured on 17.0, comment on #1431).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpressionEdge {
+    /// The referencing object: a table for a computed column's edge, or a
+    /// module.
+    pub from: TableName,
+    /// The computed column whose expression this is, for a table's edge.
+    pub from_column: Option<String>,
+    /// Whether the referencing module is `WITH SCHEMABINDING`
+    /// (`sys.sql_modules.is_schema_bound`). False for a table's edge.
+    pub from_schema_bound: bool,
+    /// The referenced object.
+    pub to: TableName,
+    /// The referenced column, where the edge names one.
+    pub to_column: Option<String>,
+    /// The referenced object's `sys.objects.type`, trimmed: `U` for a table,
+    /// `FN` for a scalar function, `V` for a view.
+    pub to_kind: String,
+}
+
+/// Every edge whose referencing or referenced object is one of `objects`
+/// (#1431). An edge whose referenced object the engine did not resolve has
+/// no id to join, and is not one: a computed column cannot name an object
+/// the engine has not resolved.
+///
+/// Only a computed column's edge or a module's: a filtered index (class 7)
+/// and filtered statistics (9) record edges too, with an index or stats id
+/// in `referencing_minor_id` that `COL_NAME` would read as some column, and
+/// a check constraint is an object of its own (measured on 17.0).
+pub async fn expression_edges(
+    conn: &mut Conn,
+    objects: &[TableName],
+) -> Result<Vec<ExpressionEdge>, DbError> {
+    if objects.is_empty() {
+        return Ok(Vec::new());
+    }
+    let values = objects
+        .iter()
+        .map(|n| {
+            format!(
+                "({}, {})",
+                crate::ident::literal(&n.schema),
+                crate::ident::literal(&n.name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT rs.name AS from_schema, ro.name AS from_name,
+                cc.name AS from_column,
+                CONVERT(bit, ISNULL(m.is_schema_bound, 0)) AS from_schema_bound,
+                es.name AS to_schema, eo.name AS to_name,
+                CASE WHEN d.referenced_minor_id > 0
+                     THEN COL_NAME(d.referenced_id, d.referenced_minor_id) END AS to_column,
+                RTRIM(CONVERT(nvarchar(2), eo.type)) AS to_kind
+           FROM sys.sql_expression_dependencies d
+           JOIN sys.objects ro ON ro.object_id = d.referencing_id
+           JOIN sys.schemas rs ON rs.schema_id = ro.schema_id
+           JOIN sys.objects eo ON eo.object_id = d.referenced_id
+           JOIN sys.schemas es ON es.schema_id = eo.schema_id
+           LEFT JOIN sys.sql_modules m ON m.object_id = d.referencing_id
+           LEFT JOIN sys.computed_columns cc
+             ON cc.object_id = d.referencing_id AND cc.column_id = d.referencing_minor_id
+          WHERE d.referencing_class = 1 AND d.referenced_class = 1
+            AND (cc.column_id IS NOT NULL OR (m.object_id IS NOT NULL AND d.referencing_minor_id = 0))
+            AND EXISTS (SELECT 1 FROM (VALUES {values}) AS w(schema_name, object_name)
+                         WHERE (w.schema_name = rs.name COLLATE CATALOG_DEFAULT
+                                AND w.object_name = ro.name COLLATE CATALOG_DEFAULT)
+                            OR (w.schema_name = es.name COLLATE CATALOG_DEFAULT
+                                AND w.object_name = eo.name COLLATE CATALOG_DEFAULT))
+          ORDER BY rs.name, ro.name, from_column, es.name, eo.name, to_column;"
+    );
+    let mut out = Vec::new();
+    for row in conn.query(&sql).await? {
+        out.push(ExpressionEdge {
+            from: TableName::new(
+                get::<&str>(&row, "from_schema")?,
+                get::<&str>(&row, "from_name")?,
+            ),
+            from_column: opt::<&str>(&row, "from_column")?.map(str::to_owned),
+            from_schema_bound: get(&row, "from_schema_bound")?,
+            to: TableName::new(
+                get::<&str>(&row, "to_schema")?,
+                get::<&str>(&row, "to_name")?,
+            ),
+            to_column: opt::<&str>(&row, "to_column")?.map(str::to_owned),
+            to_kind: get::<&str>(&row, "to_kind")?.to_owned(),
+        });
+    }
+    Ok(out)
+}
+
 /// An object at a name a plan creates (#1077). SQL Server keeps tables,
 /// views, routines, triggers, sequences, synonyms and constraints in one
 /// `sys.objects` namespace per schema, so `CREATE TABLE` at any of their

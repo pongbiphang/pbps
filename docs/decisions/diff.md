@@ -1632,13 +1632,10 @@ both act as a part does, an index's place in the drift check included:
 - In the connected scheduler of DEC-1366.1, its drop is a drop on a table, as
   an index's is. It is addressed by the table's name at the point where it
   runs.
-- A module drop of a function a computed column may call, where the plan
-  removes that computed column, moves from class 0 to right after the last
-  removal. That is (2, 5) after the column's own drop, and (6, 2) after its
-  table's drop, which takes the column with it. Dropping the function while
-  the column stands is 3729, and module drops otherwise run first. What the
-  moved module names among the plan's other module drops moves with it, such
-  as a function a schema-bound one calls, and the drop rank keeps it behind.
+- A module drop of a function a computed column calls, where the plan
+  removes that computed column, runs after the removal. The connected plan
+  moves it by the catalog's own edges (DEC-1431.1); the differ moves nothing
+  for it.
 
 The drop is `destructive`, as an index drop is: the values are derived, but
 the object is gone. The add carries no risk. A persisted add is unchecked in
@@ -1656,10 +1653,10 @@ One the plan adds, new or again, comes at (9, 3), after every input change.
   where the column stands or is added again in the same plan: either way it
   calls the module when the module changes (#1421). Only one the plan drops
   for good is out of the way first, with the module's drop moved after it.
-- So is a plan that drops a computed column, for good or to add it again,
-  while a schema-bound module that may read it stands (4922). One the plan
-  drops goes first, in class 0. Rebuilding such a module around the change
-  belongs with #1431.
+- A plan that drops a computed column under a schema-bound module that
+  reads it (4922) is refused by the connected plan, by
+  `sys.sql_modules.is_schema_bound` (DEC-1431.1). The word in a module's
+  text is no proof of the clause (#1439).
 - So is a computed column that may call a module the same plan creates,
   whether by `ADD` or inside a `CREATE TABLE` (#1421). The module is created
   in class 14, after the table (7) and the column (9).
@@ -1672,15 +1669,14 @@ nothing else, so a view or procedure that shares a name the expression uses is
 never what it calls. It is matched by its schema-qualified name
 (`Dialect::may_name_qualified`), because SQL Server calls a scalar function
 only by a two-part name, so `x.f` is not taken for `dbo.f`. Ordering by text
-is the class design #1431 replaces with the catalog's own edges on a connected
-plan. It looks for a delimited name's escaped
+is the class DEC-1431.1 replaces with the catalog's own edges on a connected
+plan; the offline refusals stay as a screen. It looks for a delimited name's escaped
 spelling too: `a]b` is stored as `[a]]b]`. Its case fold can only make more
 names equal. `İ` folds to `i` without the combining dot, and `ı` to `i`,
 because a Turkish collation binds `[i]` to `İ`. Accent-, width- and
 kana-insensitive equivalences are a collation's, which no textual fold
-closes. Their structural answer is the catalog's own edges on a connected
-plan (#1426). Until then the engine refuses such a plan inside its
-transaction. A key over a computed column is
+closes. The connected plan answers them with the catalog's own edges
+(DEC-1431.1, #1426). A key over a computed column is
 refused by validation (#1419).
 
 **Drift.** The drift check compares computed columns as named parts, and holds a
@@ -1706,3 +1702,67 @@ Pinned by:
 - the live `computed_columns_round_trip_and_change_through_the_cli`
   (`crates/pbps-cli/tests/flow.rs`).
 
+<a id="dec-1431-1"></a>
+
+**DEC-1431.1. A connected SQL Server plan orders and refuses computed columns
+by the catalog's own expression edges, not by text (#1431; absorbs #1426,
+#1432, #1437, #1439).**
+
+**Context.** DEC-1174.1 decided offline, by text, which column a computed
+column reads and which function it calls. A text match answers by spelling,
+and #1423's review found it wrong in one shape after another: `dbo.f` for
+`x.f`, a view sharing a column's name, `[cafe]` binding `café` under an
+accent-insensitive collation, `f]x` stored as `[f]]x]`, and the word
+`schemabinding` taken for the clause. Each was patched, and each patch had a
+next case.
+
+**Decision.** A connected SQL Server plan reads
+`sys.sql_expression_dependencies` for the tables and modules it touches
+(`pbps_mssql::catalog::expression_edges`). Each edge is the engine's own
+binding, by object id: computed column to column, computed column to
+function, and module to what it is bound to, with
+`sys.sql_modules.is_schema_bound`. From those edges, in
+`order_computed_by_edges`, after `release_generated_inputs` and before the
+rename walk of DEC-1366.1:
+
+- A function's drop moves to right after the last change that removes a
+  computed column calling it: the column's drop, or its table's (3729
+  otherwise). A drop of something a moved drop is schema-bound to, a
+  function or a table, moves after it (#1432).
+- Refused by name: a rename, drop, retype or nullability change of a column a
+  standing computed column reads (15336, 4922); an alter or drop of a
+  function a standing computed column calls (3729); a computed column's drop
+  under a schema-bound module the plan leaves standing (4922). A column the
+  plan drops and adds again is not standing: its edge is the old
+  expression's, which is gone before the function changes. What the new
+  expression calls has no edge yet, and the differ's screen reads it.
+
+The pass matches the plan's names to the edges' under the catalog's own
+collation (`column_names_alike`), not a case fold: a case-sensitive database
+keeps `A` and `a` apart, and an accent-insensitive one joins `cafe` and
+`café`.
+
+The differ keeps its over-approximating refusals as an offline screen, where
+a false yes costs a second plan. It no longer moves a function's drop, and it
+no longer refuses on the word `schemabinding`. An offline plan is never
+applied (SPEC §7.3), so its order is not the one that runs.
+
+**Why not keep patching the text match.** The cases are as many as a
+collation's equivalences and the forms a name can take. The engine already
+resolved each name when it stored the text, so asking it closes the class.
+
+**Why no second check at apply.** The edges follow from tables, computed
+columns and module text, which the plan's drift check already holds the
+database to (SPEC §7.6). A database where they changed is drift.
+
+**Measured** on SQL Server 17.0: every edge from a computed column to a column
+or function names the column exactly (`café`, not `[cafe]`) and the function
+with its schema, with `is_schema_bound_reference = 1`; a module's edges name
+tables, functions and columns it reads.
+
+**Tests.** `a_function_drop_follows_the_removal_of_what_calls_it`,
+`what_a_released_function_is_bound_to_follows_it`,
+`the_edges_refuse_what_the_engine_would` (`crates/pbps-cli`); the live
+`computed_function_drops_follow_the_catalogs_edges` and
+`the_catalogs_edges_refuse_what_the_engine_would`
+(`crates/pbps-cli/tests/flow.rs`).

@@ -83,18 +83,6 @@ pub enum DiffError {
         change: &'static str,
     },
 
-    /// A plan that drops a SQL Server computed column, or changes and so
-    /// drops and re-adds it, while a schema-bound module that may read it
-    /// stands: the engine refuses the drop (4922, measured on 17.0, #1174
-    /// review). A module the plan drops goes first, in class 0, and is not
-    /// this.
-    #[error(
-        "computed column {computed} is dropped by this plan, and the schema-bound {module} may \
-         read it. Drop {module}, or recreate it without SCHEMABINDING, in a plan of its own \
-         first, then this one."
-    )]
-    ComputedReadBySchemaBound { computed: ColumnRef, module: String },
-
     /// A `data:` block on a table whose primary key cannot key its rows
     /// (ADR-0004). `validate` says the same thing against the file and the
     /// line; this is here so that a differ reached another way never quietly
@@ -833,84 +821,12 @@ fn diff_partial_rebuilding(
         .iter()
         .filter_map(|p| row_table(&p.change).cloned())
         .collect();
-    // The modules a computed column this plan removes may call: dropping one
-    // while the column stands is refused (3729, measured on 17.0), and module
-    // drops are class 0, ahead of the column's removal. So each goes right
-    // after the last removal that releases it: at (2, 5) after a computed
-    // column's drop at (2, 4), and at (6, 2) after its table's drop in class
-    // 6, which takes the column with it (#1174 review).
-    let mut released_module_at: BTreeMap<ModuleId, (u8, usize)> = BTreeMap::new();
-    for p in &planned {
-        let (expressions, at): (Vec<&str>, (u8, usize)) =
-            if let Change::DropComputedColumn { computed, .. } = &p.change {
-                (vec![computed.expression.as_str()], (2, 5))
-            } else if let Change::DropTable { name, .. } = &p.change {
-                (
-                    base.schema
-                        .tables
-                        .get(name)
-                        .into_iter()
-                        .flat_map(|t| t.computed.values().map(|c| c.expression.as_str()))
-                        .collect(),
-                    (order_key(&p.change), 2),
-                )
-            } else {
-                continue;
-            };
-        for module in &planned {
-            // Only a function: a computed column calls nothing else, and a
-            // view or procedure that shares a column's name is not released
-            // by it (#1174 review).
-            if let Change::DropModule { id, .. } = &module.change
-                && base
-                    .schema
-                    .modules
-                    .get(id)
-                    .is_some_and(|m| m.kind == pbps_model::ModuleKind::Function)
-                && expressions.iter().any(|e| {
-                    let at = id.object_name();
-                    dialect.may_name_qualified(e, &at.schema, &at.name)
-                })
-            {
-                let slot = released_module_at.entry(id.clone()).or_insert(at);
-                *slot = (*slot).max(at);
-            }
-        }
-    }
-    // And what a moved module needs, with it: a module this plan drops that
-    // the moved one's definition names (a schema-bound function over
-    // another) cannot go first, in class 0, while the moved one still stands.
-    // The chain moves into the same slot, where the drop rank keeps the
-    // dependent ahead of what it depends on (#1174 review).
-    let mut pending: Vec<ModuleId> = released_module_at.keys().cloned().collect();
-    while let Some(moved) = pending.pop() {
-        let (Some(at), Some(module)) = (
-            released_module_at.get(&moved).copied(),
-            base.schema.modules.get(&moved),
-        ) else {
-            continue;
-        };
-        for p in &planned {
-            if let Change::DropModule { id, .. } = &p.change
-                && *id != moved
-                && pbps_model::module::references_with(
-                    &module.definition,
-                    &id.object_name(),
-                    &lexis,
-                )
-                && released_module_at.get(id).is_none_or(|was| *was < at)
-            {
-                released_module_at.insert(id.clone(), at);
-                pending.push(id.clone());
-            }
-        }
-    }
+    // A function a computed column calls is dropped after the column, by a
+    // connected plan's pass over the catalog's own edges
+    // (`order_computed_by_edges`, DEC-1431.1). An offline plan is never
+    // applied, and a text scan here took one function for another (#1174
+    // review), so the differ moves nothing for it.
     let sort_class = |c: &Change| -> (u8, usize) {
-        if let Change::DropModule { id, .. } = c
-            && let Some(at) = released_module_at.get(id)
-        {
-            return *at;
-        }
         // A tightening of a table whose rows this plan writes or deletes runs
         // after them, at the end of the deletes' class: the rows may be what
         // fills or removes its NULLs, and no row change needs the column NOT
@@ -1812,30 +1728,9 @@ fn refuse_computed_dependencies(
                     if t == table && created.computed.contains_key(name))
         })
     };
-    // A computed column this plan drops, for good or to add again, under a
-    // schema-bound module that may read it and that the plan leaves standing.
-    let module_dropped = |id: &ModuleId| {
-        changes
-            .iter()
-            .any(|c| matches!(c, Change::DropModule { id: d, .. } if d == id))
-    };
-    for change in changes {
-        let Change::DropComputedColumn { table, name, .. } = change else {
-            continue;
-        };
-        for (id, module) in &base.modules {
-            if dialect.may_name(&module.definition, "schemabinding")
-                && !module_dropped(id)
-                && dialect.may_name(&module.definition, &table.name)
-                && dialect.may_name(&module.definition, name)
-            {
-                errs.push(DiffError::ComputedReadBySchemaBound {
-                    computed: table.column(name),
-                    module: id.object_name().to_string(),
-                });
-            }
-        }
-    }
+    // A schema-bound module over a computed column the plan drops is the
+    // catalog's to name (`sys.sql_modules.is_schema_bound`, DEC-1431.1): the
+    // word in a module's text is no proof of the clause (#1439).
     for (table_name, table) in &declared.tables {
         for (name, computed) in &table.computed {
             // Standing: there before the plan and there throughout. One the
@@ -3726,8 +3621,9 @@ mod tests {
                 DiffError::ComputedFunctionChanged { change, .. } if *change == "creates")),
             "{errors:?}"
         );
-        // Dropped together with the module it calls: no refusal, and the
-        // module's drop comes after the column's (3729 otherwise).
+        // Dropped together with the module it calls: no refusal offline. The
+        // order between them is the connected pass's, by the catalog's edges
+        // (DEC-1431.1).
         let neither = schema_of(
             "dbo.t",
             table(&[
@@ -3736,113 +3632,6 @@ mod tests {
             ]),
         );
         assert!(errors_of(&calls("one"), &neither, &[]).is_empty());
-        let k = kinds(&run(&calls("one"), &neither, &[]));
-        let at = |kind: &str| {
-            k.iter()
-                .position(|x| x == kind)
-                .unwrap_or_else(|| panic!("{kind}: {k:?}"))
-        };
-        assert!(at("DropComputedColumn") < at("DropModule"), "{k:?}");
-        // The same when the column goes with its table (#1174 review).
-        let k = kinds(&run(
-            &calls("one"),
-            &Schema::default(),
-            &[Intent::DropTable {
-                table: "dbo.t".parse().unwrap(),
-                reason: "gone".into(),
-            }],
-        ));
-        let at = |kind: &str| {
-            k.iter()
-                .position(|x| x == kind)
-                .unwrap_or_else(|| panic!("{kind}: {k:?}"))
-        };
-        assert!(at("DropTable") < at("DropModule"), "{k:?}");
-        // A module the moved one depends on moves with it, behind it: the
-        // column, then `f`, then the `g` that `f` names (#1174 review).
-        let chain = with_functions(
-            shaped(Column::new(ty("int")), "dbo.f(a2)"),
-            &[("dbo.f", "SELECT dbo.g(1)"), ("dbo.g", "SELECT 1")],
-        );
-        let order: Vec<String> = run(&chain, &neither, &[])
-            .changes
-            .iter()
-            .filter_map(|p| match &p.change {
-                Change::DropComputedColumn { name, .. } => Some(name.clone()),
-                Change::DropModule { id, .. } => Some(id.object_name().name),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(order, ["c", "f", "g"]);
-        // Negative: a view that shares the name of a column it reads is not
-        // what it calls, and keeps its place ahead of the table's drop
-        // (#1174 review).
-        let viewed = with_modules(
-            shaped(Column::new(ty("int")), "a2 * 2"),
-            &[("dbo.a2", "SELECT 1")],
-        );
-        let k = kinds(&run(
-            &viewed,
-            &Schema::default(),
-            &[Intent::DropTable {
-                table: "dbo.t".parse().unwrap(),
-                reason: "gone".into(),
-            }],
-        ));
-        let at = |kind: &str| {
-            k.iter()
-                .position(|x| x == kind)
-                .unwrap_or_else(|| panic!("{kind}: {k:?}"))
-        };
-        assert!(at("DropModule") < at("DropTable"), "{k:?}");
-        // A function of the same leaf name in another schema is not the one
-        // it calls: only `x.f` moves after the table's drop (#1174 review).
-        let two = with_functions(
-            shaped(Column::new(ty("int")), "x.f(a2)"),
-            &[("x.f", "one"), ("dbo.f", "one")],
-        );
-        let order: Vec<String> = run(
-            &two,
-            &Schema::default(),
-            &[Intent::DropTable {
-                table: "dbo.t".parse().unwrap(),
-                reason: "gone".into(),
-            }],
-        )
-        .changes
-        .iter()
-        .filter_map(|p| match &p.change {
-            Change::DropTable { .. } => Some("table".to_owned()),
-            Change::DropModule { id, .. } => Some(id.object_name().to_string()),
-            _ => None,
-        })
-        .collect();
-        assert_eq!(order, ["dbo.f", "table", "x.f"]);
-        // A schema-bound module over the computed column refuses its drop or
-        // its change while the module stands, and not once the plan drops the
-        // module too (#1174 review).
-        let bound = |expression: &str, keep_view: bool| {
-            let schema = shaped(Column::new(ty("int")), expression);
-            if keep_view {
-                with_modules(
-                    schema,
-                    &[(
-                        "dbo.v",
-                        "CREATE VIEW dbo.v WITH SCHEMABINDING AS SELECT c FROM dbo.t",
-                    )],
-                )
-            } else {
-                schema
-            }
-        };
-        let errors = errors_of(&bound("a2 * 2", true), &bound("a2 * 3", true), &[]);
-        assert!(
-            errors.iter().any(|e| matches!(e,
-                DiffError::ComputedReadBySchemaBound { module, .. } if module == "dbo.v")),
-            "{errors:?}"
-        );
-        let errors = errors_of(&bound("a2 * 2", true), &bound("a2 * 3", false), &[]);
-        assert!(errors.is_empty(), "{errors:?}");
         // Nor is such a view's alter refused.
         let view = |definition: &str| {
             with_modules(
