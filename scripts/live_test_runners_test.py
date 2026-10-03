@@ -102,7 +102,8 @@ class LiveExecution(unittest.TestCase):
 
     def test_normal_pg_execution_keeps_all_old_cases_and_only_its_generation_case(self):
         completed = subprocess.CompletedProcess([], 0, "test result: ok. 1 passed\n")
-        self.assertEqual(len(native.NATIVE_TESTS), 49)
+        every = native.NATIVE_TESTS + native.PRODUCER_TESTS + native.GENERATION_TESTS
+        self.assertEqual(len(every), 49)
         for major, selected, opposite in (
             ("16", native.PG16_GENERATION_TEST, native.PG18_GENERATION_TEST),
             ("18", native.PG18_GENERATION_TEST, native.PG16_GENERATION_TEST),
@@ -113,7 +114,7 @@ class LiveExecution(unittest.TestCase):
                     with contextlib.redirect_stdout(io.StringIO()):
                         native.native_tests("/owned/tests", env)
                 names = [call.args[3] for call in run.call_args_list]
-                self.assertEqual(names, native.NATIVE_TESTS[:-2] + [selected])
+                self.assertEqual(names, every[:-2] + [selected])
                 self.assertEqual(len(names), 48)
                 self.assertNotIn(opposite, names)
 

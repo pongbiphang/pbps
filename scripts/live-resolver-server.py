@@ -40,36 +40,39 @@ MARKER = "pbps_marker_preexisting"
 ENGINE_UID = {"pg": 999, "mssql": 10001}
 EXECUTABLE = {"pg": "postgres", "mssql": "sqlservr"}
 QUIET = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+LIVE = "resolver::server::live_tests::"
+# Full test names, as PRODUCER_TESTS's are: the ignored-test inventory reads
+# one selector per file, TESTS + PRODUCER_TESTS, with no common prefix.
 TESTS = [
-    "admission_recovery::failed_admission_names_every_unconfirmed_forwarder",
-    "admission_recovery::a_cancelled_step_leaves_its_admin_session_to_cleanup",
-    "forwarder_mqueue::every_session_qualifies_its_forwarders_mqueue_before_returning",
-    "forwarder_mqueue::a_foreign_forwarder_mqueue_discards_each_live_view_permanently",
-    "host_files::host_file_loss_refuses_admission_and_discards_live_analysis",
-    "uts::kernel_name_loss_refuses_admission_and_discards_each_live_view",
-    "pseudo::foreign_pseudo_roots_refuse_admission_and_discard_live_analysis",
-    "a_supported_dedicated_server_compiles_declarations_and_removes_only_its_own_resources",
-    "pg16_storage::the_supplied_storage_layout_admits_its_observed_major_and_survives_live_checks",
-    "guard_limits::guard_restoration_distinguishes_process_exit_from_live_cleanup_failure",
-    "guard_limits::every_forwarder_guard_requires_effective_descriptor_evidence",
+    "resolver::server::live_tests::admission_recovery::failed_admission_names_every_unconfirmed_forwarder",
+    "resolver::server::live_tests::admission_recovery::a_cancelled_step_leaves_its_admin_session_to_cleanup",
+    "resolver::server::live_tests::forwarder_mqueue::every_session_qualifies_its_forwarders_mqueue_before_returning",
+    "resolver::server::live_tests::forwarder_mqueue::a_foreign_forwarder_mqueue_discards_each_live_view_permanently",
+    "resolver::server::live_tests::host_files::host_file_loss_refuses_admission_and_discards_live_analysis",
+    "resolver::server::live_tests::uts::kernel_name_loss_refuses_admission_and_discards_each_live_view",
+    "resolver::server::live_tests::pseudo::foreign_pseudo_roots_refuse_admission_and_discard_live_analysis",
+    "resolver::server::live_tests::a_supported_dedicated_server_compiles_declarations_and_removes_only_its_own_resources",
+    "resolver::server::live_tests::pg16_storage::the_supplied_storage_layout_admits_its_observed_major_and_survives_live_checks",
+    "resolver::server::live_tests::guard_limits::guard_restoration_distinguishes_process_exit_from_live_cleanup_failure",
+    "resolver::server::live_tests::guard_limits::every_forwarder_guard_requires_effective_descriptor_evidence",
     # PostgreSQL analysis-scope qualification (#610); no-ops on SQL Server (#611).
-    "a_run_qualifies_its_analysis_scope_against_the_target",
-    "a_server_inside_the_target_instance_is_refused_before_any_scratch_resource",
+    "resolver::server::live_tests::a_run_qualifies_its_analysis_scope_against_the_target",
+    "resolver::server::live_tests::a_server_inside_the_target_instance_is_refused_before_any_scratch_resource",
     # Desired-binding resolution through a qualified run (#613); SQL Server
     # is refused by name until its adapter exists (#619, #620).
-    "bindings::a_qualified_run_resolves_desired_bindings_against_the_target",
+    "resolver::server::live_tests::bindings::a_qualified_run_resolves_desired_bindings_against_the_target",
     # Runs with the exposed control started; see below.
-    "an_unimplemented_profile_or_an_exposed_runtime_is_refused_by_name",
-    "a_session_this_run_did_not_open_invalidates_it_even_after_it_closed",
-    "a_session_present_at_admission_is_refused_rather_than_counted",
-    "a_removed_statistics_row_cannot_pay_for_an_intruding_session",
+    "resolver::server::live_tests::an_unimplemented_profile_or_an_exposed_runtime_is_refused_by_name",
+    "resolver::server::live_tests::a_session_this_run_did_not_open_invalidates_it_even_after_it_closed",
+    "resolver::server::live_tests::a_session_present_at_admission_is_refused_rather_than_counted",
+    "resolver::server::live_tests::a_removed_statistics_row_cannot_pay_for_an_intruding_session",
     # Runs with a deliberate intruder in the engine's namespaces; see below.
-    "a_process_the_engine_did_not_start_refuses_its_namespaces",
+    "resolver::server::live_tests::a_process_the_engine_did_not_start_refuses_its_namespaces",
     # Runs with a container joined to the engine's network namespace.
-    "a_container_joined_to_the_engines_network_refuses_the_run",
-    "replacing_or_dropping_the_target_binding_discards_the_run",
+    "resolver::server::live_tests::a_container_joined_to_the_engines_network_refuses_the_run",
+    "resolver::server::live_tests::replacing_or_dropping_the_target_binding_discards_the_run",
     # Stops the supplied server under a live run, so it is last.
-    "an_unconfirmed_cleanup_reports_only_the_run_owned_names",
+    "resolver::server::live_tests::an_unconfirmed_cleanup_reports_only_the_run_owned_names",
 ]
 # New producer cases live beside the unchanged supplied-server tests.
 PRODUCER_TESTS = [
@@ -443,19 +446,19 @@ def fixture(args, binary, root, owned):
         SSL_CERT_DIR=str(root / "empty-ca"),
         PATH="/pbps-no-external-tools",
     )
-    exposing = "an_unimplemented_profile_or_an_exposed_runtime_is_refused_by_name"
-    intruding = "a_process_the_engine_did_not_start_refuses_its_namespaces"
-    joining = "a_container_joined_to_the_engines_network_refuses_the_run"
-    uts = "uts::kernel_name_loss_refuses_admission_and_discards_each_live_view"
+    exposing = LIVE + "an_unimplemented_profile_or_an_exposed_runtime_is_refused_by_name"
+    intruding = LIVE + "a_process_the_engine_did_not_start_refuses_its_namespaces"
+    joining = LIVE + "a_container_joined_to_the_engines_network_refuses_the_run"
+    uts = LIVE + "uts::kernel_name_loss_refuses_admission_and_discards_each_live_view"
     selected_tests = [test for test in TESTS if engine == "pg" or test !=
-                      "pg16_storage::the_supplied_storage_layout_admits_its_observed_major_and_survives_live_checks"]
+                      LIVE + "pg16_storage::the_supplied_storage_layout_admits_its_observed_major_and_survives_live_checks"]
     cases = [(test, empty) for test in selected_tests for empty in ([False, True] if test == uts else [False])]
     cases.extend([(test, False) for test in PRODUCER_TESTS if engine == "pg"])
     if args.producer_only:
         cases = [(test, False) for test in PRODUCER_TESTS]
     # The legacy cleanup case stops this same supplied engine. Keep it last
     # so every producer can still acquire its qualified administrative view.
-    terminal_cleanup = "an_unconfirmed_cleanup_reports_only_the_run_owned_names"
+    terminal_cleanup = LIVE + "an_unconfirmed_cleanup_reports_only_the_run_owned_names"
     cases = [case for case in cases if case[0] != terminal_cleanup] + [
         case for case in cases if case[0] == terminal_cleanup
     ]
@@ -488,20 +491,17 @@ def fixture(args, binary, root, owned):
             run("docker", "run", "-d", "--name", joined, "--pull", "never",
                 "--network", "container:" + supplied, "--entrypoint", "/bin/sleep",
                 fixture_image(engine, pg_major), "120", **QUIET)
-        command = [binary, "--ignored", "--exact",
-                   f"resolver::server::live_tests::{test}", "--nocapture"]
-        if test in PRODUCER_TESTS:
-            command[3] = test
+        command = [binary, "--ignored", "--exact", test, "--nocapture"]
         selected = dict(os.environ, **environment)
         if empty:
             selected["PBPS_SERVER_ENDPOINT"] = endpoint(empty_server, pg_major)
         selected["PBPS_SERVER_EMPTY_RUNTIME_FILES"] = "1" if empty else "0"
-        if test.startswith("guard_limits::"):
+        if test.startswith(LIVE + "guard_limits::"):
             # Only this test's observer view hides an owned guard's limits.
             command = ["/usr/bin/unshare", "--mount", "--propagation", "private", "--", *command]
             selected["PBPS_LIMITS_PRIVATE_PROC_FIXTURE"] = "1"
             selected["PBPS_LIMITS_PARENT_MOUNT_NAMESPACE"] = os.readlink("/proc/self/ns/mnt")
-        if test.startswith("admission_recovery::"):
+        if test.startswith(LIVE + "admission_recovery::"):
             # Socket unavailability is confined to this observer's mount view.
             command = ["/usr/bin/unshare", "--mount", "--propagation", "private", "--", *command]
             selected["PBPS_ADMISSION_RECOVERY_FIXTURE"] = "1"

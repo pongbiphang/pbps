@@ -86,7 +86,7 @@ NATIVE_TESTS = [DAEMON_TEST, TARGET_TEST, FACTORY_TEST, RECIPE_TEST, ANALYSIS_TE
                 INVALIDATION_TEST, CANCELLATION_TEST, DEADLINE_TEST,
                 ADMIN_RECOVERY_TEST, SCRATCH_RECOVERY_TEST, JANITOR_RECOVERY_TEST,
                 SQL_RECOVERY_CLOSE_TEST, SQL_RECOVERY_DISCARD_TEST,
-                SQL_RECOVERY_CANCEL_TEST] + PRODUCER_TESTS + GENERATION_TESTS
+                SQL_RECOVERY_CANCEL_TEST]
 QUIET = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
 DOCKER_SOCKET = "/var/run/docker.sock"
 
@@ -116,14 +116,27 @@ def native_tests(binary, env, producer_only=False, generation_only=False):
             raise RuntimeError("generation-only requires PBPS_NATIVE_PG_MAJOR=16 or 18")
     # The daemon/proxy case needs the same disposable root host as the factory;
     # the ordinary library run only compiles it and leaves it ignored.
-    for test in GENERATION_TESTS if generation_only else PRODUCER_TESTS if producer_only else NATIVE_TESTS:
-        if test in (RECIPE_TEST, ANALYSIS_TEST, INVALIDATION_TEST, CANCELLATION_TEST,
-                    DEADLINE_TEST, ADMIN_RECOVERY_TEST, SCRATCH_RECOVERY_TEST,
-                    JANITOR_RECOVERY_TEST, SQL_RECOVERY_CLOSE_TEST,
-                    SQL_RECOVERY_DISCARD_TEST, SQL_RECOVERY_CANCEL_TEST,
-                    *PRODUCER_TESTS) and env.get("PBPS_NATIVE_DRIVER") != "pg":
+    # The ignored-test inventory admits a selector list only as an iteration
+    # source, so each mode copies the lists it runs by iterating them.
+    if generation_only:
+        selected = [test for test in GENERATION_TESTS]
+    elif producer_only:
+        selected = [test for test in PRODUCER_TESTS]
+    else:
+        selected = [test for test in NATIVE_TESTS]
+        selected += [test for test in PRODUCER_TESTS]
+        selected += [test for test in GENERATION_TESTS]
+    producers = {test for test in PRODUCER_TESTS}
+    generations = {test for test in GENERATION_TESTS}
+    for test in selected:
+        if (test in producers or test in (
+                RECIPE_TEST, ANALYSIS_TEST, INVALIDATION_TEST, CANCELLATION_TEST,
+                DEADLINE_TEST, ADMIN_RECOVERY_TEST, SCRATCH_RECOVERY_TEST,
+                JANITOR_RECOVERY_TEST, SQL_RECOVERY_CLOSE_TEST,
+                SQL_RECOVERY_DISCARD_TEST, SQL_RECOVERY_CANCEL_TEST,
+        )) and env.get("PBPS_NATIVE_DRIVER") != "pg":
             continue
-        if test in GENERATION_TESTS:
+        if test in generations:
             major = "18" if test == PG18_GENERATION_TEST else "16"
             # Each case verifies the actual major; selection alone is not proof.
             if env.get("PBPS_NATIVE_DRIVER") != "pg" or env.get("PBPS_NATIVE_PG_MAJOR") != major:

@@ -328,6 +328,14 @@ pub(super) fn derive(
                 let final_column = final_column(uid, &table.column(name), desired);
                 (Surface::Column(final_column), true, false, true, None)
             }
+            // A computed column is SQL Server's (#1174), and PostgreSQL
+            // evidence has no transition for it; refuse rather than seal a
+            // plan whose column no inventory covers.
+            Change::AddComputedColumn { .. } | Change::DropComputedColumn { .. } => {
+                return Err(Error::Binding(
+                    "a computed column has no PostgreSQL resolver transition".into(),
+                ));
+            }
             Change::DropColumn { uid, column, .. } => (
                 Surface::Column(column.clone()),
                 true,

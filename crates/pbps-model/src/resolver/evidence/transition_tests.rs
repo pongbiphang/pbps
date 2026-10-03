@@ -539,8 +539,10 @@ fn owner_coverage(
         .unwrap();
     evidence.validate(&changes).unwrap();
     super::tests::assert_closing(&evidence, &compiled);
-    // A table label alone does not prove its independent parent inventory.
-    if matches!(owner, Surface::Column(_)) {
+    // A table label alone does not prove a vector edit's independent parent
+    // inventory. A computed column has no vector parent (#1174): a table
+    // label over its records covers exactly the same records.
+    if vector_edit && matches!(owner, Surface::Column(_)) {
         let mut aggregate = evidence.clone();
         let owner_transition = evidence
             .transitions
@@ -559,7 +561,7 @@ fn owner_coverage(
     // A surface that is its own only record, as a computed column is (it has
     // no default under it, #1174), has no child to substitute for it.
     if owner_object == child_object {
-        return (changes, valid);
+        return (changes, valid, compiled);
     }
     let child_only = BTreeSet::from([child_object]);
     evidence.transitions = vec![ObjectTransition {
@@ -1340,6 +1342,8 @@ fn aggregate_renames_require_owned_records_at_both_endpoints() {
             Change::CreateTable { .. }
             | Change::DropTable { .. }
             | Change::AddColumn { .. }
+            | Change::AddComputedColumn { .. }
+            | Change::DropComputedColumn { .. }
             | Change::DropColumn { .. }
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
@@ -1736,7 +1740,7 @@ fn a_computed_column_add_or_drop_is_a_projected_column_lifecycle() {
             false,
         ),
     ] {
-        let (changes, evidence) = owner_coverage(
+        let (changes, evidence, compiled) = owner_coverage(
             change,
             Surface::Column(table.column("n")),
             Surface::Column(table.column("n")),
@@ -1744,7 +1748,7 @@ fn a_computed_column_add_or_drop_is_a_projected_column_lifecycle() {
         );
         evidence
             .before
-            .project(&changes, &evidence.after, &evidence.transitions)
+            .project(&changes, &compiled, &evidence.transitions)
             .expect("a computed column's lifecycle projects");
     }
 }

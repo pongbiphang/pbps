@@ -120,8 +120,8 @@ class TheRunningProbe(unittest.TestCase):
             server.run = real
 
 
-STORAGE_CASE = "pg16_storage::the_supplied_storage_layout_admits_its_observed_major_and_survives_live_checks"
-LEGACY_CASE = "a_supported_dedicated_server_compiles_declarations_and_removes_only_its_own_resources"
+STORAGE_CASE = "resolver::server::live_tests::pg16_storage::the_supplied_storage_layout_admits_its_observed_major_and_survives_live_checks"
+LEGACY_CASE = "resolver::server::live_tests::a_supported_dedicated_server_compiles_declarations_and_removes_only_its_own_resources"
 PG_IMAGES = {
     16: "postgres@sha256:485935f94cc7165afa896978809c37b592dc07f0a37d2c8f645f12412d0212c8",
     18: "postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280",
@@ -188,8 +188,8 @@ class TheFixedStorageRecipe(unittest.TestCase):
                 self.assertNotIn(f"/usr/lib/postgresql/{18 if major == 16 else 16}/bin/", boot)
                 selected = [(args, kwargs) for args, kwargs in commands if "--exact" in args]
                 self.assertEqual([args[args.index("--exact") + 1] for args, _ in selected], [
-                    "resolver::server::live_tests::" + LEGACY_CASE,
-                    "resolver::server::live_tests::" + STORAGE_CASE,
+                    LEGACY_CASE,
+                    STORAGE_CASE,
                 ])
                 for _, kwargs in selected:
                     self.assertEqual(kwargs["env"]["PBPS_SERVER_PG_MAJOR"], str(major))
@@ -209,7 +209,7 @@ class TheFixedStorageRecipe(unittest.TestCase):
         self.assertNotIn("initdb", create[-1])
         selected = [(args, kwargs) for args, kwargs in commands if "--exact" in args]
         self.assertEqual([args[args.index("--exact") + 1] for args, _ in selected], [
-            "resolver::server::live_tests::" + LEGACY_CASE,
+            LEGACY_CASE,
         ])
         self.assertIn("profile=linux-dedicated-v1 ", selected[0][1]["env"]["PBPS_SERVER_ENDPOINT"])
 
