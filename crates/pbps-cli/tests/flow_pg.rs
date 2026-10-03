@@ -12880,11 +12880,34 @@ fn a_reached_table_the_deployment_role_cannot_lock_is_named_in_the_refusal() {
 /// An action uses ONLY on a regular table but still reaches every partition.
 /// Keep the lock privilege bar at the named relation and retain the engine's
 /// recursive partition lock, including the FK's concurrent-attach protection.
+/// Run on both pinned majors (#590): DECISIONS 489 measured these lock
+/// semantics on 16 and 18, and each variant checks which one it reached, so
+/// two runs against one endpoint cannot pass for version coverage.
 #[test]
-#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+#[ignore = "needs PostgreSQL 17 or later; set PBPS_TEST_PG_DB"]
 fn referential_action_locks_exclude_plain_children_and_hold_partitions() {
-    use pbps_dialect::{Dialect, RowOperation, RowWrite};
     let admin = server();
+    on_server(
+        &admin,
+        "DO $$ BEGIN IF current_setting('server_version_num')::integer < 170000 THEN RAISE EXCEPTION 'this regression needs the current server; PostgreSQL 16 has its own variant'; END IF; END $$",
+    );
+    referential_action_locks(&admin);
+}
+
+#[test]
+#[ignore = "needs PostgreSQL 16; set PBPS_TEST_PG_OLD_DB"]
+fn referential_action_locks_exclude_plain_children_and_hold_partitions_before_postgres_17() {
+    let admin = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    on_server(
+        &admin,
+        "DO $$ BEGIN IF current_setting('server_version_num')::integer >= 170000 THEN RAISE EXCEPTION 'this regression needs a pre-17 server'; END IF; END $$",
+    );
+    referential_action_locks(&admin);
+}
+
+fn referential_action_locks(admin: &str) {
+    use pbps_dialect::{Dialect, RowOperation, RowWrite};
+    let admin = admin.to_owned();
     let deployer = format!("pbps_action_locks_{}", std::process::id());
     let _roles = ClusterRoles {
         server: admin.clone(),
