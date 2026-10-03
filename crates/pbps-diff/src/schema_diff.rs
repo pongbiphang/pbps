@@ -373,6 +373,7 @@ fn diff_partial_rebuilding(
             &mut changes,
         );
         diff_computed(declared_name, base_table, declared_table, &mut changes);
+        diff_storage_parameters(uid, declared_name, base_table, declared_table, &mut changes);
         // Rows are compared by column *name* on each side, and a rename in
         // this same plan means the two sides know one column by two names.
         // The uid is what says they are the same column.
@@ -432,6 +433,7 @@ fn diff_partial_rebuilding(
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -475,6 +477,7 @@ fn diff_partial_rebuilding(
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -619,6 +622,7 @@ fn diff_partial_rebuilding(
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -664,6 +668,7 @@ fn diff_partial_rebuilding(
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -1259,6 +1264,7 @@ fn recreate_referenced_foreign_keys(
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::PublicExecution { .. }
+            | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. } => continue,
         };
         // PostgreSQL can bind a permutation of a composite candidate key.
@@ -1520,6 +1526,7 @@ fn recreate_retyped_dependents(
         | Change::AlterColumnExpression { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::SetPrimaryKey { .. }
+        | Change::SetStorageParameters { .. }
         | Change::SetReplicaIdentity { .. }
         | Change::AddUnique { .. }
         | Change::DropUnique { .. }
@@ -1800,6 +1807,7 @@ fn refuse_computed_dependencies(
                     | Change::DropComputedColumn { .. }
                     | Change::SetColumnDeprecated { .. }
                     | Change::SetPrimaryKey { .. }
+                    | Change::SetStorageParameters { .. }
                     | Change::SetReplicaIdentity { .. }
                     | Change::AddUnique { .. }
                     | Change::DropUnique { .. }
@@ -1873,6 +1881,39 @@ fn diff_computed(name: &TableName, base: &Table, declared: &Table, changes: &mut
                 computed: wanted.clone(),
             });
         }
+    }
+}
+
+/// A PostgreSQL table's heap storage parameters (DEC-1441.1): one change
+/// setting each declared value that differs from the base's, and resetting
+/// each the base has and the declaration does not. Both sides are canonical,
+/// so a respelling is no change.
+fn diff_storage_parameters(
+    uid: &Uid,
+    name: &TableName,
+    base: &Table,
+    declared: &Table,
+    changes: &mut Vec<Change>,
+) {
+    let set: BTreeMap<String, String> = declared
+        .storage_parameters
+        .iter()
+        .filter(|(k, v)| base.storage_parameters.get(*k) != Some(*v))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let reset: BTreeSet<String> = base
+        .storage_parameters
+        .keys()
+        .filter(|k| !declared.storage_parameters.contains_key(*k))
+        .cloned()
+        .collect();
+    if !set.is_empty() || !reset.is_empty() {
+        changes.push(Change::SetStorageParameters {
+            uid: uid.clone(),
+            table: name.clone(),
+            set,
+            reset,
+        });
     }
 }
 
@@ -2578,6 +2619,7 @@ fn dependency_rank(
         | Change::DropColumn { .. }
         | Change::RenameColumn { .. }
         | Change::SetColumnDeprecated { .. }
+        | Change::SetStorageParameters { .. }
         | Change::DropUnique { .. }
         | Change::AddCheck { .. }
         | Change::DropCheck { .. }
@@ -3207,6 +3249,9 @@ fn order_key(c: &Change) -> u8 {
         // the indexes and checks of class 13 that may be over it (#1174).
         Change::AddComputedColumn { .. } => COLUMN_ALTERATIONS,
         Change::SetColumnDeprecated { .. } => 10,
+        // Metadata too: no statement reads a storage parameter, and it runs
+        // under the table's final name (DEC-1441.1).
+        Change::SetStorageParameters { .. } => 10,
         // Rows arrive once every column they name exists and has its final
         // type, and before the constraints below: ADR-0004's "create table ->
         // insert rows -> add the foreign key that references them".
@@ -3967,6 +4012,53 @@ mod tests {
 
     /// A table with a key, a UNIQUE constraint and an index, clustered on
     /// whichever `layout` names (#1178).
+    /// One change per table, setting what differs and resetting what the
+    /// declaration drops; a parameter left alone is not restated, and an
+    /// unchanged set plans nothing (#1441).
+    #[test]
+    fn storage_parameters_set_what_differs_and_reset_what_goes() {
+        let with = |pairs: &[(&str, &str)]| {
+            let mut t = table(&[("id", Column::new(ty("int")).not_null())]);
+            t.storage_parameters = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            schema_of("public.t", t)
+        };
+        let base = with(&[
+            ("fillfactor", "70"),
+            ("autovacuum_enabled", "false"),
+            ("parallel_workers", "2"),
+        ]);
+        let cs = run(
+            &base,
+            &with(&[
+                ("fillfactor", "80"),
+                ("parallel_workers", "2"),
+                ("vacuum_truncate", "false"),
+            ]),
+            &[],
+        );
+        let [p] = cs.changes.as_slice() else {
+            panic!("{cs:#?}");
+        };
+        let Change::SetStorageParameters { set, reset, .. } = &p.change else {
+            panic!("{cs:#?}");
+        };
+        assert_eq!(
+            set.iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect::<Vec<_>>(),
+            [("fillfactor", "80"), ("vacuum_truncate", "false")]
+        );
+        assert_eq!(
+            reset.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["autovacuum_enabled"]
+        );
+        // Negative: the same parameters plan nothing.
+        assert!(run(&base, &base, &[]).changes.is_empty());
+    }
+
     /// `public.t` with unique indexes `ix_code` over a NOT NULL column and
     /// `ix_v` over a nullable one, and the given identity.
     fn identified_by(identity: Option<pbps_model::ReplicaIdentity>) -> Table {

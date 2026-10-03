@@ -470,6 +470,12 @@ pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
              replica identity, so remove the line",
         ));
     }
+    if !table.storage_parameters.is_empty() {
+        errs.push(invalid(
+            "`storage_parameters` are PostgreSQL heap parameters; SQL Server takes none of \
+             them, so remove the block",
+        ));
+    }
 
     for part in [&name.schema, &name.name] {
         if let Err(e) = ident::quote(part) {
@@ -1104,6 +1110,31 @@ mod tests {
         let refused = found(&table);
         assert!(
             refused.iter().any(|m| m.contains("`replica_identity`")),
+            "{refused:?}"
+        );
+    }
+
+    /// Storage parameters are PostgreSQL's, and are refused on SQL Server by
+    /// name (#1441).
+    #[test]
+    fn storage_parameters_are_refused_on_sql_server() {
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("a".into(), Column::new("int".parse().unwrap()));
+        let found = |t: &Table| {
+            super::table(&"dbo.t".parse().unwrap(), t)
+                .into_iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(found(&table).is_empty());
+        table
+            .storage_parameters
+            .insert("fillfactor".into(), "70".into());
+        let refused = found(&table);
+        assert!(
+            refused.iter().any(|m| m.contains("`storage_parameters`")),
             "{refused:?}"
         );
     }

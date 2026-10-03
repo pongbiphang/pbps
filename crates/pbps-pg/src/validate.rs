@@ -67,6 +67,7 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
         ));
     }
     found.extend(table.replica_identity_problems().into_iter().map(invalid));
+    found.extend(table.storage_parameter_problems().into_iter().map(invalid));
     if let Some(pk) = &table.primary_key {
         found.extend(key_columns("primary key", &pk.columns, table, true));
     }

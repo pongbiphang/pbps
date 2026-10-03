@@ -233,6 +233,11 @@ indexes:
   the constraint or unique index whose index it is. Absent means `DEFAULT`.
   The index must be unique, not partial, over NOT NULL columns; SQL Server
   refuses the key (DEC-1444.1).
+- **`storage_parameters` holds a PostgreSQL table's heap parameters** by
+  name, from a closed list: `{fillfactor: 70, autovacuum_enabled: false}`.
+  Each value is compared as the engine reads it, so `off`, `false` and `0`
+  are one value. `toast.*` parameters are not declared, and one on a pulled
+  table is reported; SQL Server refuses the key (DEC-1441.1).
 - **An index key is `column [opclass] [asc|desc]`**, in PostgreSQL's order, and
   `method:` names the access method only where it is not the default `btree`.
   An absent class is the method's default for the column's type. The first

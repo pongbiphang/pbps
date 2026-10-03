@@ -124,6 +124,7 @@ pub async fn key_drop_blockers(
                 | Change::AlterColumnExpression { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
+                | Change::SetStorageParameters { .. }
                 | Change::SetReplicaIdentity { .. }
                 | Change::AddUnique { .. }
                 | Change::AddForeignKey { .. }
@@ -283,6 +284,7 @@ pub async fn key_drop_blockers(
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -469,6 +471,7 @@ pub fn rename_targets(changes: &pbps_model::ChangeSet) -> Vec<RenameTarget> {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }

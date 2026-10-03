@@ -245,6 +245,16 @@ pub fn render(
             let _ = writeln!(s, "\nreplica_identity: {{index: {}}}", scalar(n));
         }
     }
+    // One parameter a line, by name, each in its canonical spelling, bare:
+    // every canonical value is a plain token (`true`, `70`, `0.05`, `auto`),
+    // and quoted it would read as text, which is the same value but not
+    // what anyone writes (#1441).
+    if !table.storage_parameters.is_empty() {
+        s.push_str("\nstorage_parameters:\n");
+        for (name, value) in &table.storage_parameters {
+            let _ = writeln!(s, "  {}: {value}", scalar(name));
+        }
+    }
 
     // Last, and after the constraints, because it is the only block that is
     // about the table's contents rather than its shape — and on a lookup table
@@ -910,6 +920,64 @@ indexes:
         let t = crate::load_table_str(Path::new("t.yml"), base).unwrap();
         assert_eq!(t.table.replica_identity, None);
         assert!(!render(&t.name, &t.table, &t.intents, None).contains("replica_identity"));
+    }
+
+    /// Storage parameters read back in their canonical spelling, whatever
+    /// spelling was written, and render to that spelling (#1441).
+    #[test]
+    fn storage_parameters_read_back_canonical_and_round_trip() {
+        let yaml = "table: public.t\ncolumns:\n  id: {type: int}\n\nstorage_parameters:\n  autovacuum_enabled: off\n  autovacuum_vacuum_scale_factor: 1e-2\n  fillfactor: '070'\n  vacuum_index_cleanup: 'TRUE'\n";
+        let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
+        let read: Vec<(&str, &str)> = t
+            .table
+            .storage_parameters
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ("autovacuum_enabled", "false"),
+                ("autovacuum_vacuum_scale_factor", "0.01"),
+                ("fillfactor", "56"),
+                ("vacuum_index_cleanup", "on"),
+            ]
+        );
+        let out = render(&t.name, &t.table, &t.intents, None);
+        round_trip(&out);
+        let again = crate::load_table_str(Path::new("t.yml"), &out).unwrap();
+        assert_eq!(again.table.storage_parameters, t.table.storage_parameters);
+        // A bare number is read as written too: `7e1` for an integer
+        // parameter is 70, as the engine reads it.
+        let bare = crate::load_table_str(
+            Path::new("t.yml"),
+            "table: public.t\ncolumns:\n  id: {type: int}\nstorage_parameters:\n  fillfactor: 7e1\n  autovacuum_vacuum_scale_factor: 0.050\n",
+        )
+        .unwrap();
+        assert_eq!(bare.table.storage_parameters["fillfactor"], "70");
+        assert_eq!(
+            bare.table.storage_parameters["autovacuum_vacuum_scale_factor"],
+            "0.05"
+        );
+        // Negative: an unknown or `toast.*` name, and a value the engine
+        // would refuse, are errors, never dropped.
+        for line in [
+            "  bogus: 1",
+            "  toast.autovacuum_enabled: false",
+            "  fillfactor: '08'",
+            "  vacuum_index_cleanup: tr",
+            // Bare, a YAML number would already be 0 before it is checked:
+            // the written spelling is what is read (#1477 review).
+            "  autovacuum_vacuum_scale_factor: 1e-400",
+        ] {
+            let yaml = format!(
+                "table: public.t\ncolumns:\n  id: {{type: int}}\nstorage_parameters:\n{line}\n"
+            );
+            assert!(
+                crate::load_table_str(Path::new("t.yml"), &yaml).is_err(),
+                "{line}"
+            );
+        }
     }
 
     /// A misspelt identity is an error, not the default: read as absent,

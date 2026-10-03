@@ -3159,6 +3159,114 @@ async fn every_replica_identity_round_trips_and_moves_as_a_typed_plan() {
     assert_eq!(last, rebuilt_index);
 }
 
+/// Storage parameters round-trip in their canonical spelling, whatever the
+/// engine kept, and change as one typed plan that applies (#1441). A value
+/// changed by hand is a difference the next plan sees, never one the
+/// comparison skips; a `toast.*` parameter is named, not dropped.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn storage_parameters_round_trip_and_change_as_a_typed_plan() {
+    use pbps_model::Change;
+    let s = emit_schema("sp1441");
+    let t = TableName::new(&s, "t");
+    let params = |schema: &Schema| -> Vec<(String, String)> {
+        schema.tables[&t]
+            .storage_parameters
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    };
+    let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
+        list.iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    };
+
+    let mut source = TestDb::create("sp1441_src").await;
+    fresh(&mut source, &s).await;
+    source
+        .execute(&format!(
+            "CREATE TABLE {s}.t (id integer PRIMARY KEY, body text)
+               WITH (fillfactor = '0x46', autovacuum_enabled = off,
+                     autovacuum_vacuum_scale_factor = '1e-2', vacuum_index_cleanup = 'TRUE');"
+        ))
+        .await
+        .expect("the source table");
+    let read = pull(&mut source).await;
+    let limitations = ours_limitations(&read, &s);
+    let pulled = ours_only(&read, &s);
+    drop_schema(&mut source, &s).await;
+    source.drop().await;
+    assert!(limitations.is_empty(), "{limitations:?}");
+    assert_eq!(
+        params(&pulled),
+        pairs(&[
+            ("autovacuum_enabled", "false"),
+            ("autovacuum_vacuum_scale_factor", "0.01"),
+            ("fillfactor", "70"),
+            ("vacuum_index_cleanup", "on"),
+        ])
+    );
+
+    let ids = mint_ids(&pulled, &IdsFile::default(), &[]);
+    let mut target = TestDb::create("sp1441_dst").await;
+    fresh(&mut target, &s).await;
+    apply(
+        &mut target,
+        &Postgres::new(),
+        &plan(&Schema::default(), &IdsFile::default(), &pulled, &ids),
+    )
+    .await;
+    let rebuilt = ours_only(&pull(&mut target).await, &s);
+    assert_eq!(rebuilt, pulled);
+    assert!(plan(&rebuilt, &ids, &pulled, &ids).is_empty());
+
+    // Set, change and reset in one change.
+    let mut changed = pulled.clone();
+    {
+        let p = &mut changed.tables.get_mut(&t).unwrap().storage_parameters;
+        p.insert("fillfactor".into(), "80".into());
+        p.remove("autovacuum_enabled");
+        p.insert("parallel_workers".into(), "2".into());
+    }
+    let step = plan(&rebuilt, &ids, &changed, &ids);
+    assert!(
+        matches!(step.changes.as_slice(), [p] if matches!(p.change, Change::SetStorageParameters { .. })),
+        "{step:#?}"
+    );
+    apply(&mut target, &Postgres::new(), &step).await;
+    let after = ours_only(&pull(&mut target).await, &s);
+    assert_eq!(after, changed);
+    assert!(plan(&after, &ids, &changed, &ids).is_empty());
+
+    // Changed by hand: the next plan sets it back, so the comparison saw it.
+    target
+        .execute(&format!("ALTER TABLE {s}.t SET (fillfactor = 90);"))
+        .await
+        .expect("a hand change");
+    let drifted = ours_only(&pull(&mut target).await, &s);
+    assert_ne!(drifted, changed);
+    assert!(!plan(&drifted, &ids, &changed, &ids).is_empty());
+
+    // A TOAST parameter is named, not dropped.
+    target
+        .execute(&format!(
+            "ALTER TABLE {s}.t SET (toast.autovacuum_enabled = false);"
+        ))
+        .await
+        .expect("a TOAST parameter");
+    let read = pull(&mut target).await;
+    let limitations = ours_limitations(&read, &s);
+    drop_schema(&mut target, &s).await;
+    target.drop().await;
+    assert!(
+        limitations
+            .iter()
+            .any(|l| format!("{l:?}").contains("toast.autovacuum_enabled")),
+        "{limitations:?}"
+    );
+}
+
 /// Emits and executes every change of a plan, in plan order.
 ///
 /// One statement at a time through [`Conn::execute`], which is what `apply`

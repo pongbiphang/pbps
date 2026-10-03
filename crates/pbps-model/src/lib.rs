@@ -38,6 +38,7 @@ pub mod resolver;
 pub mod role;
 pub mod schema;
 pub mod state;
+pub mod storage;
 pub mod strategy;
 pub mod types;
 pub mod uid;

@@ -209,6 +209,7 @@ pub async fn drop_blockers(
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::AddForeignKey { .. }
@@ -337,6 +338,7 @@ fn stored(
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -488,6 +490,7 @@ async fn removal(
         | Change::AlterColumnDefault { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::SetPrimaryKey { .. }
+        | Change::SetStorageParameters { .. }
         | Change::SetReplicaIdentity { .. }
         | Change::AddUnique { .. }
         | Change::AddForeignKey { .. }

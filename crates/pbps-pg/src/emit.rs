@@ -2304,6 +2304,36 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         Change::SetReplicaIdentity { table, to, .. } => {
             one(pg, table, set_replica_identity(table, to.as_ref())?)
         }
+        Change::SetStorageParameters {
+            table, set, reset, ..
+        } => {
+            // One statement with both subcommands, so no read between them
+            // finds half the change: a staged checkpoint holds the table to
+            // its old parameters or its new ones (#1441).
+            let mut actions = Vec::new();
+            if !set.is_empty() {
+                actions.push(format!("SET ({})", storage_list(set)?));
+            }
+            if !reset.is_empty() {
+                let names = reset
+                    .iter()
+                    .map(|name| {
+                        if pbps_model::storage::table_kind(name).is_none() {
+                            return Err(invalid(format!(
+                                "`{name}` is not a table storage parameter this model declares"
+                            )));
+                        }
+                        Ok(name.as_str())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                actions.push(format!("RESET ({})", names.join(", ")));
+            }
+            one(
+                pg,
+                table,
+                format!("ALTER TABLE {} {};", qualified(table)?, actions.join(", ")),
+            )
+        }
         Change::SetPrimaryKey {
             table,
             from,
@@ -2773,8 +2803,14 @@ fn create_table(pg: &Postgres, name: &TableName, table: &Table) -> Sql {
         pg,
         name,
         &format!(
-            "CREATE TABLE {q} (\n    {}\n) USING heap;",
-            body.join(",\n    ")
+            "CREATE TABLE {q} (\n    {}\n) USING heap{};",
+            body.join(",\n    "),
+            // In the `CREATE`, so the table never exists without them (#1441).
+            if table.storage_parameters.is_empty() {
+                String::new()
+            } else {
+                format!(" WITH ({})", storage_list(&table.storage_parameters)?)
+            }
         ),
     )?];
 
@@ -2822,6 +2858,27 @@ fn create_table(pg: &Postgres, name: &TableName, table: &Table) -> Sql {
         )?);
     }
     Ok(out)
+}
+
+/// `name = 'value', …` for `WITH (…)` and `SET (…)` (#1441, DEC-1441.1).
+///
+/// A name outside the closed list is refused rather than written: it reaches
+/// here only from a plan that skipped validation, and it is spliced into the
+/// statement bare. Each value goes as a literal, which the engine parses as
+/// it would the bare word.
+fn storage_list(parameters: &BTreeMap<String, String>) -> Result<String, DialectError> {
+    parameters
+        .iter()
+        .map(|(name, value)| {
+            if pbps_model::storage::table_kind(name).is_none() {
+                return Err(invalid(format!(
+                    "`{name}` is not a table storage parameter this model declares"
+                )));
+            }
+            Ok(format!("{name} = {}", literal(value)))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|list| list.join(", "))
 }
 
 /// `ALTER TABLE … REPLICA IDENTITY …` (#1444, DEC-1444.1).
@@ -3579,6 +3636,76 @@ mod tests {
     /// A layout only SQL Server has reaches this emitter only by a path that
     /// skipped `validate`; it is refused, never emitted as an ordinary key or
     /// index (#1178). The same changes without it emit as before.
+    /// Storage parameters are one `ALTER TABLE` with `SET` and `RESET`, each
+    /// value a literal, and a created table takes them in its `CREATE` (`WITH`).
+    /// A name outside the list is refused, never spliced in (#1441).
+    #[test]
+    fn storage_parameters_are_one_statement_and_part_of_create() {
+        let pg = Postgres::new();
+        let table = name("app", "t");
+        let change = |set: &[(&str, &str)], reset: &[&str]| Change::SetStorageParameters {
+            uid: "t_000000".parse().unwrap(),
+            table: table.clone(),
+            set: set
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+            reset: reset.iter().map(|k| (*k).to_owned()).collect(),
+        };
+        let sql = sql_of(
+            &pg,
+            &change(&[("fillfactor", "80")], &["autovacuum_enabled"]),
+        )
+        .join("\n");
+        assert!(
+            sql.contains(
+                "ALTER TABLE \"app\".\"t\" SET (fillfactor = '80'), RESET (autovacuum_enabled);"
+            ),
+            "{sql}"
+        );
+        assert_eq!(sql_of(&pg, &change(&[], &["fillfactor"])).len(), 1);
+        let e = pg
+            .emit(
+                &change(&[("fillfactor = 1); DROP TABLE x; --", "1")], &[]),
+                Strategy::default(),
+            )
+            .expect_err("an unlisted name");
+        assert!(
+            e.to_string().contains("not a table storage parameter"),
+            "{e}"
+        );
+
+        let mut created = Table::default();
+        created
+            .columns
+            .insert("id".into(), Column::new(ty("integer")).not_null());
+        created
+            .storage_parameters
+            .insert("fillfactor".into(), "70".into());
+        let create = sql_of(
+            &pg,
+            &Change::CreateTable {
+                uid: "t_000000".parse().unwrap(),
+                name: table.clone(),
+                table: Box::new(created.clone()),
+            },
+        );
+        assert!(
+            create[0].contains(") USING heap WITH (fillfactor = '70');"),
+            "{create:?}"
+        );
+        created.storage_parameters.clear();
+        let plain = sql_of(
+            &pg,
+            &Change::CreateTable {
+                uid: "t_000000".parse().unwrap(),
+                name: table,
+                table: Box::new(created),
+            },
+        );
+        assert!(plain[0].contains(") USING heap;"), "{plain:?}");
+    }
+
     /// Each identity spells its statement. The primary key's index is found
     /// by a `DO` block when it runs, as an unnamed key's drop is, and a name
     /// that would close the dollar quote cannot (#1444). A created table sets

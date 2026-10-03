@@ -358,6 +358,7 @@ impl AsStored {
                 | Change::AlterColumnExpression { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
+                | Change::SetStorageParameters { .. }
                 | Change::SetReplicaIdentity { .. }
                 | Change::AddUnique { .. }
                 | Change::DropUnique { .. }
@@ -590,6 +591,7 @@ impl AsStored {
                 | Change::RenameRole { .. }
                 | Change::Grant { .. }
                 | Change::Revoke { .. }
+                | Change::SetStorageParameters { .. }
                 | Change::SetReplicaIdentity { .. }
                 | Change::PublicExecution { .. } => {}
             }
@@ -1049,6 +1051,7 @@ fn build(
         // This dialect never produces one and `emit` refuses it; a probe
         // would be a second opinion about a statement that will not be
         // written.
+        | Change::SetStorageParameters { .. }
         | Change::SetReplicaIdentity { .. }
         | Change::PublicExecution { .. } => Ok(Vec::new()),
 

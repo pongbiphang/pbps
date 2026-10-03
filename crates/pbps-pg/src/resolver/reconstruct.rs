@@ -289,6 +289,7 @@ impl Reconstruction {
                 | Change::AlterColumnExpression { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
+                | Change::SetStorageParameters { .. }
                 | Change::SetReplicaIdentity { .. }
                 | Change::AddUnique { .. }
                 | Change::DropUnique { .. }
