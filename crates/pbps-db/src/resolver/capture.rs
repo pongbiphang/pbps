@@ -37,11 +37,16 @@ pub enum Verdict {
     Unaffected,
     /// A fresh creation binds differently; the object must be rebuilt.
     Rebuild,
+    /// The target holds no such object yet: the plan creates it, or gives
+    /// it a new identity, and scratch reproduced every candidate its
+    /// creation could bind.
+    Created,
     /// No sound answer: the condition names what is missing.
     Unresolved { condition: &'static str },
 }
 
-/// The comparison of every managed surface both captures hold.
+/// The comparison of every managed surface both captures hold, and the
+/// candidate check of every one only scratch holds.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Assessment {
     pub surfaces: std::collections::BTreeMap<ObjectIdentity, Verdict>,

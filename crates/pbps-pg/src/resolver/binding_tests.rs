@@ -929,6 +929,54 @@ async fn a_candidate_scratch_did_not_reproduce_leaves_the_surface_unresolved() {
     }
 }
 
+/// A view the plan creates has no target record to compare, but its call
+/// binds against the target's candidates when it is created. An unmanaged
+/// overload elsewhere on the path that scratch did not reconstruct leaves the
+/// new view unresolved, as it does an existing one; without it, the view is
+/// `Created` (#1303 review).
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_created_surface_is_unresolved_by_a_candidate_scratch_did_not_reproduce() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        for (tag, target, verdict) in [
+            (
+                "created_unmanaged",
+                "CREATE FUNCTION app.f(numeric) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;
+                 CREATE FUNCTION util.f(integer) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;",
+                None,
+            ),
+            (
+                "created_faithful",
+                "CREATE FUNCTION app.f(numeric) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;",
+                Some(Verdict::Created),
+            ),
+        ] {
+            let assessment = analyze(
+                &server,
+                tag,
+                Case {
+                    schemas: &["app", "util"],
+                    extras: &["util"],
+                    target,
+                    base: numeric_f(),
+                    desired: numeric_f().view("app.v", "SELECT f(1) AS x"),
+                },
+            )
+            .await
+            .unwrap();
+            let found = only(&assessment, "app", "v");
+            match verdict {
+                Some(expected) => assert_eq!(found, expected, "{variable} {tag}"),
+                None => assert!(
+                    matches!(&found, Verdict::Unresolved { condition } if condition.contains("not reconstructed")),
+                    "{variable} {tag}: {found:?}"
+                ),
+            }
+        }
+    }
+}
+
 /// An overload the plan drops is never compiled, so it is identified from its
 /// declared signature, and only that identity is it. The target keeping it
 /// leaves the view's verdict standing; the target having lost it and gained
