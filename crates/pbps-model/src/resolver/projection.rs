@@ -14,11 +14,14 @@ pub struct ObjectTransition {
     pub surface: Surface,
     pub before: BTreeSet<ObjectIdentity>,
     pub after: BTreeSet<ObjectIdentity>,
-    /// Records owned by another managed surface that a rename carries
-    /// because they reference the renamed object: a foreign key pointing at a
-    /// renamed table, its RI triggers and dependency rows. PostgreSQL rewrites
-    /// them in place. Only a rename may carry them, and only with qualified
-    /// ownership; the adapter proves the reference (DEC-1274.1).
+    /// Records of a touched table's tree, or tied to it by a dependency, that
+    /// no narrower surface of this plan inventories: a sibling index a retype
+    /// rebuilds, the column whose default flag a default change flips, a
+    /// foreign key on another table that a rename rewrites. One DDL statement
+    /// reaches past its own surface, so the table is the unit of the closing
+    /// inventory (DEC-1274.1, #1466). Only a table-family transition a
+    /// catalog change touches may list them, and only table-family records;
+    /// the adapter proves each tie.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub references: BTreeSet<ObjectIdentity>,
 }
@@ -422,10 +425,23 @@ fn authorized(
     })
 }
 
-/// A record another managed surface owns may ride on a rename that rewrites
-/// its reference (DEC-1274.1): the transition must list it as a reference,
-/// a rename must touch the transition's surface, and the record's ownership
-/// must be qualified. Any other reference still confers no authority.
+/// A table-family surface: a table and what hangs off it.
+fn table_family(surface: &Surface) -> bool {
+    matches!(
+        surface,
+        Surface::Table(_)
+            | Surface::Column(_)
+            | Surface::Default(_)
+            | Surface::Check { .. }
+            | Surface::Index { .. }
+    )
+}
+
+/// A record of a touched table's tree, or tied to it, may ride on that
+/// table's transition (DEC-1274.1, #1466): the transition must list it as a
+/// reference, be a table-family surface a catalog change touches, and the
+/// record must be owned by a table-family surface. A routine, view,
+/// namespace or unqualified record never rides.
 fn carried_reference(
     changes: &ChangeSet,
     transition: &ObjectTransition,
@@ -433,13 +449,12 @@ fn carried_reference(
     ownership: &ObjectOwnership,
 ) -> bool {
     transition.references.contains(object)
-        && matches!(ownership, ObjectOwnership::Surface(_))
+        && table_family(&transition.surface)
+        && matches!(ownership, ObjectOwnership::Surface(owner) if table_family(owner))
         && changes.changes.iter().enumerate().any(|(index, step)| {
-            matches!(
-                step.change,
-                Change::RenameTable { .. } | Change::RenameColumn { .. }
-            ) && (touches(&step.change, &transition.surface)
-                || vector_transition_matches(&step.change, changes, index, &transition.surface))
+            changes_catalog(&step.change)
+                && (touches(&step.change, &transition.surface)
+                    || vector_transition_matches(&step.change, changes, index, &transition.surface))
         })
 }
 

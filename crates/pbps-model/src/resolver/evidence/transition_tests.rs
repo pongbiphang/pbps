@@ -881,10 +881,11 @@ fn plain_table_renames_require_opening_and_closing_inventories() {
 }
 
 /// A foreign key on another table that points at a renamed table is
-/// rewritten in place by PostgreSQL. A rename may carry it as a reference;
-/// no other change may, and an unqualified record never rides along.
+/// rewritten in place by PostgreSQL. The touched table's transition may carry
+/// it as a listed reference of a table-family owner; an unlisted, unqualified
+/// or routine-owned record never rides along (#1466).
 #[test]
-fn a_rename_can_carry_another_tables_reference_and_nothing_else_can() {
+fn a_touched_tables_transition_carries_only_listed_table_family_references() {
     for column in [false, true] {
         let (changes, evidence, compiled) = rename_endpoints(column);
         let rename = evidence
@@ -958,23 +959,16 @@ fn a_rename_can_carry_another_tables_reference_and_nothing_else_can() {
                 "{case} rode on the rename (column={column})"
             );
         }
-        // The same listed reference on a non-rename change is refused.
-        let mut no_rename = carried.clone();
-        let other = ChangeSet {
-            changes: vec![PlannedChange::new(Change::DropCheck {
-                table: "app.v".parse().unwrap(),
-                name: "positive".into(),
-            })],
-        };
-        no_rename.transitions[rename].surface = Surface::Check {
-            table: "app.v".parse().unwrap(),
-            name: "positive".into(),
-        };
+        // Only the owner differs from the accepted case: a routine's record
+        // is not part of any table's tree and confers no table authority.
+        let routine = ObjectOwnership::Surface(Surface::Module("app.f()".parse().unwrap()));
+        let (wrong, wrong_compiled) = carry(routine, true);
         assert!(
-            no_rename
+            wrong
                 .before
-                .project(&other, &carried_compiled, &no_rename.transitions)
-                .is_err()
+                .project(&changes, &wrong_compiled, &wrong.transitions)
+                .is_err(),
+            "a routine-owned reference rode on the table (column={column})"
         );
     }
 }

@@ -62,50 +62,68 @@ fn mentions(object: &ObjectIdentity, set: &BTreeSet<ObjectIdentity>) -> bool {
         .any(|part| set.contains(part) || mentions(part, set))
 }
 
-/// Records another managed surface owns that name a renamed object: those a
-/// dependency row ties to it (a foreign key on another table), then, to a
-/// fixed point, every record whose identity names one already found (that
-/// key's RI triggers on either table and their dependency rows). PostgreSQL
-/// rewrites them in place, so the rename carries them (DEC-1274.1). An
-/// unqualified record is never carried; one another transition inventories
-/// stays there.
-fn referencing(
-    records: &[BindingRecord],
-    renamed: &BTreeSet<ObjectIdentity>,
-    taken: &BTreeSet<ObjectIdentity>,
-) -> BTreeSet<ObjectIdentity> {
-    let mut found: BTreeSet<ObjectIdentity> = records
-        .iter()
-        .filter(|entry| entry.object.class == "pg_depend")
-        .filter(|entry| {
-            entry
-                .object
-                .signature
-                .get(1)
-                .is_some_and(|referenced| renamed.contains(referenced))
-        })
-        .filter_map(|entry| entry.object.signature.first().cloned())
-        .collect();
+/// `seed` and every record tied to it: those a dependency row ties to a
+/// record already reached (a foreign key on another table that points at
+/// the seed), then, to a fixed point, every record whose identity names one
+/// (that key's RI triggers on either table and their dependency rows).
+fn reach(records: &[BindingRecord], seed: &BTreeSet<ObjectIdentity>) -> BTreeSet<ObjectIdentity> {
+    let mut found = seed.clone();
     loop {
         let size = found.len();
-        let named: BTreeSet<_> = renamed.union(&found).cloned().collect();
-        found.extend(
-            records
-                .iter()
-                .filter(|entry| mentions(&entry.object, &named))
-                .map(|entry| entry.object.clone()),
-        );
+        let dependents: Vec<_> = records
+            .iter()
+            .filter(|entry| entry.object.class == "pg_depend")
+            .filter(|entry| {
+                entry
+                    .object
+                    .signature
+                    .get(1)
+                    .is_some_and(|referenced| found.contains(referenced))
+            })
+            .filter_map(|entry| entry.object.signature.first().cloned())
+            .collect();
+        found.extend(dependents);
+        let named: Vec<_> = records
+            .iter()
+            .filter(|entry| mentions(&entry.object, &found))
+            .map(|entry| entry.object.clone())
+            .collect();
+        found.extend(named);
         if found.len() == size {
-            break;
+            return found;
         }
     }
+}
+
+/// The table a table-family surface hangs off.
+fn table_of(surface: &Surface) -> Option<&pbps_model::TableName> {
+    match surface {
+        Surface::Table(table) | Surface::Check { table, .. } | Surface::Index { table, .. } => {
+            Some(table)
+        }
+        Surface::Column(column) | Surface::Default(column) => Some(&column.table),
+        Surface::Namespace(_) | Surface::Module(_) => None,
+    }
+}
+
+/// A touched table's tree and what a dependency ties to it, less what
+/// another transition already inventories. Only records a table-family
+/// surface owns ride; a view or routine tied to the table keeps its own
+/// transition or its full fingerprint, and an unqualified record never
+/// rides (DEC-1274.1, #1466).
+fn sweep(
+    records: &[BindingRecord],
+    tree: &BTreeSet<ObjectIdentity>,
+    taken: &BTreeSet<ObjectIdentity>,
+) -> BTreeSet<ObjectIdentity> {
+    let reached = reach(records, tree);
     records
         .iter()
         .filter(|entry| {
-            found.contains(&entry.object)
-                && matches!(entry.ownership, ObjectOwnership::Surface(_))
-                && !renamed.contains(&entry.object)
+            reached.contains(&entry.object)
                 && !taken.contains(&entry.object)
+                && matches!(&entry.ownership, ObjectOwnership::Surface(owner)
+                    if table_of(owner).is_some())
         })
         .map(|entry| entry.object.clone())
         .collect()
@@ -264,7 +282,8 @@ pub(super) fn derive(
                 .entry(Surface::Table(final_table.clone()))
                 .or_default();
             // Keep the parent exact: adding it must not grant authority over
-            // other columns, defaults, checks or independent indexes.
+            // other columns, defaults, checks or independent indexes. They
+            // still ride on the table as references, below (#1466).
             entry.opening = true;
             entry.closing = true;
             entry.dropped_before.extend(prior);
@@ -560,25 +579,31 @@ pub(super) fn derive(
             .after
             .retain(|object| !child_after.contains(object));
     }
-    let renames: BTreeSet<Surface> = changes
-        .changes
-        .iter()
-        .filter_map(|step| {
-            if let Change::RenameTable { uid, to, .. } = &step.change {
-                Some(Surface::Table(
-                    final_tables.get(uid).cloned().unwrap_or_else(|| to.clone()),
-                ))
-            } else if let Change::RenameColumn { uid, table, to, .. } = &step.change {
-                Some(Surface::Column(final_column(
-                    uid,
-                    &table.column(to),
-                    desired,
-                )))
-            } else {
-                None
-            }
-        })
-        .collect();
+    // One DDL statement reaches past its own surface: a retype rebuilds a
+    // covering index, a default change flips the column's flag, a rename
+    // rewrites another table's foreign key. The table is the unit of the
+    // closing inventory (#1466): each touched table's whole tree, and what a
+    // dependency ties to it, rides on one of its transitions as references.
+    // The exact per-surface inventories above still carry the authority.
+    let mut anchors: BTreeMap<pbps_model::TableName, usize> = BTreeMap::new();
+    let mut openings: BTreeMap<pbps_model::TableName, BTreeSet<pbps_model::TableName>> =
+        BTreeMap::new();
+    for (index, transition) in transitions.iter().enumerate() {
+        let Some(table) = table_of(&transition.surface) else {
+            continue;
+        };
+        let anchor = anchors.entry(table.clone()).or_insert(index);
+        if transition.surface == Surface::Table(table.clone()) {
+            *anchor = index;
+        }
+        openings.entry(table.clone()).or_default().extend(
+            opening_endpoints[index]
+                .iter()
+                .filter_map(table_of)
+                .filter(|name| base.schema.tables.contains_key(*name))
+                .cloned(),
+        );
+    }
     let mut taken_before: BTreeSet<_> = transitions
         .iter()
         .flat_map(|t| t.before.iter().cloned())
@@ -587,14 +612,23 @@ pub(super) fn derive(
         .iter()
         .flat_map(|t| t.after.iter().cloned())
         .collect();
-    for transition in &mut transitions {
-        if !renames.contains(&transition.surface) {
-            continue;
-        }
-        let before = referencing(opening, &transition.before, &taken_before);
-        let after = referencing(compiled, &transition.after, &taken_after);
+    for (table, anchor) in anchors {
+        let opening_tree: BTreeSet<_> = openings
+            .get(&table)
+            .into_iter()
+            .flatten()
+            .flat_map(|name| inventory(opening, &Surface::Table(name.clone()), true))
+            .collect();
+        let compiled_tree = if desired.schema.tables.contains_key(&table) {
+            inventory(compiled, &Surface::Table(table.clone()), true)
+        } else {
+            BTreeSet::new()
+        };
+        let before = sweep(opening, &opening_tree, &taken_before);
+        let after = sweep(compiled, &compiled_tree, &taken_after);
         taken_before.extend(before.iter().cloned());
         taken_after.extend(after.iter().cloned());
+        let transition = &mut transitions[anchor];
         transition.references.extend(before.iter().cloned());
         transition.references.extend(after.iter().cloned());
         transition.before.extend(before);

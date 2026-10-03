@@ -1243,15 +1243,22 @@ manifest is exactly the untouched opening records plus placeholders of
 installed records; the closing-side inventory and ownership checks run when the
 plan is sealed.
 
-A rename may also carry records another managed surface owns, when they name
-the renamed table or column: a foreign key on another table, its RI triggers on
-both tables and their dependency rows. PostgreSQL rewrites them in place, and
-the differ keeps the key, so their closing state cannot be the opening one.
-The adapter proves each reference: a dependency row ties the record to the
-renamed object, or its identity names one already carried. The transition lists
-them as references, and the model accepts a reference only on a transition a
-rename touches, and only with qualified ownership. Referencing still confers
-no authority anywhere else (DEC-614.2).
+The table is the unit of the closing inventory (#1466). One DDL statement
+reaches past the surface it names: a retype rebuilds the keys and indexes over
+the column, ADD or DROP DEFAULT flips the column's own `atthasdef`, and a rename
+rewrites another table's foreign key, its RI triggers and their dependency
+rows. Each catalog change therefore carries, besides its exact per-surface
+inventory, the rest of every table it touches: the table's whole owned tree,
+and every record a dependency row ties to it or whose identity names one, to a
+fixed point. The adapter proves each tie. The model accepts such a reference
+only on a table-family transition that a catalog change touches, and only for a
+record that a table-family surface owns. A view or routine tied to the table
+keeps its own transition or its full fingerprint, and an unqualified record
+never rides. Referencing still confers no authority anywhere else (DEC-614.2).
+The trade-off: a concurrent writer that changes an undeclared, non-binding
+property of an untouched sibling inside a touched table is no longer caught by
+the closing recheck. Such properties are already the operator's, and the
+ordinary apply guard still compares every declared one (SPEC 7.6).
 
 A GRANT, REVOKE or PUBLIC execution change makes no transition. Owners and ACLs
 are not fingerprinted, so its target's catalog record does not change: it stays
