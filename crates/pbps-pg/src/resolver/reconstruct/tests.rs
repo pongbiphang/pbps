@@ -216,6 +216,78 @@ fn a_later_object_shadows_only_what_it_could_be_resolved_as() {
     assert!(!Nameable::Type.shadows("pg_proc", false));
 }
 
+/// The differ splits a new table's foreign keys out of its CREATE, so a
+/// bootstrap of related tables carries each as its own change. It is a key
+/// like one kept inline: it follows every table and precedes the modules.
+#[test]
+fn a_split_foreign_key_follows_every_table() {
+    let parent = TableName::new("app", "p");
+    let child = TableName::new("app", "c");
+    let mut keyed = Table::default();
+    keyed.columns.insert(
+        "id".into(),
+        pbps_model::Column::new("integer".parse().unwrap()).not_null(),
+    );
+    keyed.primary_key = Some(pbps_model::PrimaryKey {
+        name: Some("p_pk".into()),
+        columns: vec!["id".into()],
+    });
+    let mut referencing = Table::default();
+    referencing.columns.insert(
+        "id".into(),
+        pbps_model::Column::new("integer".parse().unwrap()),
+    );
+    let bootstrap = vec![
+        Change::CreateTable {
+            uid: Uid::generate(UidKind::Table),
+            name: child.clone(),
+            table: Box::new(referencing),
+        },
+        Change::CreateTable {
+            uid: Uid::generate(UidKind::Table),
+            name: parent.clone(),
+            table: Box::new(keyed),
+        },
+        Change::AddForeignKey {
+            table: child,
+            name: "c_fk".into(),
+            constraint: Box::new(pbps_model::ForeignKey {
+                columns: vec!["id".into()],
+                references_table: parent,
+                references_columns: vec!["id".into()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            }),
+        },
+        module(
+            "app.f()",
+            ModuleKind::Function,
+            "() RETURNS integer LANGUAGE sql RETURN 1",
+        ),
+    ];
+    let reconstruction = Reconstruction::new(&crate::Postgres::new(), &bootstrap).unwrap();
+    let phases: Vec<_> = reconstruction
+        .steps
+        .iter()
+        .map(|step| (step.phase, step.declaration.as_str()))
+        .collect();
+    assert_eq!(
+        phases,
+        [
+            (Phase::Tables, "table app.c"),
+            (Phase::Tables, "table app.p"),
+            (Phase::Keys, "table app.c"),
+            (Phase::Modules, "function app.f()"),
+        ]
+    );
+    assert!(
+        reconstruction.steps[2]
+            .statements
+            .join("\n")
+            .contains("REFERENCES")
+    );
+}
+
 /// A plan that drops, renames or alters is not a bootstrap, and building a
 /// namespace from one would reproduce neither side.
 #[test]
