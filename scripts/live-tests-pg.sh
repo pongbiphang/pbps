@@ -69,6 +69,9 @@ export PBPS_TEST_PG_DB="host=localhost port=$PORT user=postgres password=$PASSWO
 export PBPS_TEST_PG_OLD_DB="host=localhost port=$OLD_PORT user=postgres password=$PASSWORD dbname=$DB sslmode=disable"
 # The script-output regression uses this server's psql, including its lexer.
 export PBPS_TEST_PG_CONTAINER="$NAME"
+# The grammar-upgrade regression carries a database from the old server to
+# this one with the old server's own `pg_dump` (issue #571).
+export PBPS_TEST_PG_OLD_CONTAINER="$OLD_NAME"
 
 # One of these tests waits out `pbps_db::CONNECT_TIMEOUT` on purpose — a
 # firewall that drops rather than refuses is a category of its own, and thirty
