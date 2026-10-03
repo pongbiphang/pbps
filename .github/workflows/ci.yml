@@ -257,6 +257,11 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Built before the fixture runs: it points `SSL_CERT_FILE` at its own
+      # disposable CA for every `cargo test` it starts, so a cargo that still
+      # had to download a crate would fail to verify crates.io instead of
+      # testing the hop. In `live` an earlier step had always built it.
+      - run: cargo test -p pbps-db --test live_transport --no-run
       - run: python3 scripts/live-transport.py mssql
       # The fixture removes its container on success, failure and SIGTERM. A
       # cancelled job still loses the runner, so this checks the paths that
