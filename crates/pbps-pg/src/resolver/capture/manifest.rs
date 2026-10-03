@@ -369,7 +369,7 @@ impl CapturedInputs {
                         signature: query.spelled.clone(),
                         search_path: query.path.clone(),
                         kind: query.kind.into(),
-                        resolved: resolved.as_ref().map(&normalized).transpose()?,
+                        resolved: resolved.as_ref().map(normalized).transpose()?,
                     })
                 })
                 .collect::<Result<_, ManifestError>>()?,
