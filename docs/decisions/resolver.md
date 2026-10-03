@@ -1250,14 +1250,16 @@ a retained root. An untouched record can lose the only expression that reached
 it, as `count` does when a routine's new body no longer calls it, and the
 closing read must still reread it rather than miss it.
 
-Every desired surface needs its binding verdict, including one the target does
-not hold yet: one the plan creates, or relocates through a parent rename.
-Nothing on the target compares with it, but its creation binds against the
-target's candidates, so the assessment checks that scratch reproduced them, as
-it does for an existing surface, and calls the surface `Created` when it did.
-An unmanaged overload scratch did not reconstruct leaves the new surface
-unresolved, and the plan is refused instead of sealing scratch's fallback as
-the binding.
+Every desired surface that binds something at creation needs its binding
+verdict, including one the target does not hold yet: one the plan creates, or
+relocates through a parent rename. Nothing on the target compares with it, but
+its creation binds against the target's candidates, so the assessment checks
+that scratch reproduced them, as it does for an existing surface, and calls the
+surface `Created` when it did. An unmanaged overload scratch did not
+reconstruct leaves the new surface unresolved, and the plan is refused instead
+of sealing scratch's fallback as the binding. A surface that binds nothing at
+creation, such as a routine whose string body binds only at run time, has no
+lookup a candidate could change, and needs none.
 
 The table is the unit of the closing inventory (#1466). One DDL statement
 reaches past the surface it names: a retype rebuilds the keys and indexes over

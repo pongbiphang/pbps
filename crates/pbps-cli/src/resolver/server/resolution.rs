@@ -129,6 +129,11 @@ pub(super) fn from_records(
             match assessment.surfaces.get(&desired.object) {
                 Some(Verdict::Unaffected | Verdict::Rebuild) => {}
                 Some(Verdict::Created) if !kept => {}
+                // A surface that binds nothing at creation, such as a
+                // routine whose string body binds only at run time, has no
+                // lookup a candidate could change: the assessment gives it
+                // no verdict, for the same reason (#1303 review).
+                None if desired.bindings.is_empty() => {}
                 Some(Verdict::Unresolved { condition }) => {
                     return Err(Error::Binding(format!(
                         "the declared surface is unresolved: {condition}"
