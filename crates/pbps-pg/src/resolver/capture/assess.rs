@@ -443,13 +443,15 @@ pub fn assess(
     };
     let mut assessment = Assessment::default();
     for (object, input) in surfaces(desired) {
-        let Some(current) = target.inputs.get(object) else {
-            continue;
-        };
+        // A surface the target does not hold yet is created by the plan, or
+        // given a new identity. Nothing on the target to compare, but its
+        // creation binds against the target's candidates just the same, so
+        // scratch must have reproduced them (#1303 review).
+        let current = target.inputs.get(object);
         let verdict = if input
             .bindings
             .iter()
-            .chain(&current.bindings)
+            .chain(current.into_iter().flat_map(|current| &current.bindings))
             .any(|binding| binding.target.class == "pg_authid")
         {
             Verdict::Unresolved {
@@ -466,10 +468,14 @@ pub fn assess(
             Verdict::Unresolved {
                 condition: "the declaration was compiled before an object sharing a name it bound",
             }
-        } else if input.bindings == current.bindings {
-            Verdict::Unaffected
+        } else if let Some(current) = current {
+            if input.bindings == current.bindings {
+                Verdict::Unaffected
+            } else {
+                Verdict::Rebuild
+            }
         } else {
-            Verdict::Rebuild
+            Verdict::Created
         };
         assessment.surfaces.insert(object.clone(), verdict);
     }

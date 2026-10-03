@@ -1634,6 +1634,7 @@
         "resolver::binding_tests::a_cast_cannot_change_a_surface_that_resolves_no_call",
         "resolver::binding_tests::a_clipped_array_type_name_is_read_back",
         "resolver::binding_tests::a_common_type_the_operands_decide_is_no_named_candidate",
+        "resolver::binding_tests::a_created_surface_is_unresolved_by_a_candidate_scratch_did_not_reproduce",
         "resolver::binding_tests::a_ctes_output_types_are_no_named_candidates",
         "resolver::binding_tests::a_dropped_overload_is_held_by_its_declared_identity_not_by_a_count",
         "resolver::binding_tests::a_dropped_signature_is_rechecked_with_its_capture",

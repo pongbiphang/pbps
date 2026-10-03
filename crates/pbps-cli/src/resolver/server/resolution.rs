@@ -118,17 +118,23 @@ pub(super) fn from_records(
             .contains(surface)
             .then(|| bound(compiled, surface))
             .transpose()?;
-        if let (Some(current), Some(desired)) = (&current, &desired)
-            && current.object == desired.object
-        {
-            match assessment.surfaces.get(&current.object) {
+        // Every desired surface needs its verdict: one the target holds
+        // under the same identity is compared, and one it does not hold yet
+        // (created, or relocated by a parent rename) has its candidates
+        // checked, since its creation binds against the target's.
+        if let Some(desired) = &desired {
+            let kept = current
+                .as_ref()
+                .is_some_and(|current| current.object == desired.object);
+            match assessment.surfaces.get(&desired.object) {
                 Some(Verdict::Unaffected | Verdict::Rebuild) => {}
+                Some(Verdict::Created) if !kept => {}
                 Some(Verdict::Unresolved { condition }) => {
                     return Err(Error::Binding(format!(
                         "the declared surface is unresolved: {condition}"
                     )));
                 }
-                None => {
+                Some(Verdict::Created) | None => {
                     return Err(Error::Binding(
                         "the declared surface lacks its binding verdict".into(),
                     ));

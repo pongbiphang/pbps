@@ -3379,7 +3379,18 @@ fn generated_creation_surfaces_require_unique_qualified_attrdef_records() {
                 ordinary.clone(),
                 pbps_pg::resolver::capture::Verdict::Unaffected,
             );
+        } else {
+            // A surface the target does not hold yet carries the candidate
+            // check's verdict, as the assessment gives it.
+            assessment.surfaces.insert(
+                ordinary.clone(),
+                pbps_pg::resolver::capture::Verdict::Created,
+            );
         }
+        assessment.surfaces.insert(
+            generated.clone(),
+            pbps_pg::resolver::capture::Verdict::Created,
+        );
         let resolutions =
             super::resolution::from_records(&base, &desired, &opening, &compiled, &assessment)
                 .unwrap();
@@ -3500,6 +3511,64 @@ fn existing_generated_surfaces_require_both_records_and_a_resolved_binding_verdi
             Err(Error::Binding(_))
         ));
     }
+}
+
+/// A surface the plan creates has no target record to compare, but its
+/// creation binds against the target's candidates, so it needs the
+/// candidate check's verdict too. `Created` is accepted only where the target
+/// does not hold the surface; an unresolved or absent verdict refuses, and
+/// `Created` for a surface both sides hold is no comparison at all.
+#[test]
+fn a_created_surface_requires_its_candidate_verdict() {
+    use pbps_pg::resolver::capture::{Assessment, Verdict};
+
+    let table = pbps_model::TableName::new("app", "t");
+    let schema = generation_schema(&table);
+    let records = generation_records(&table, "g");
+    let [_, generated, ..] = generation_objects(&table, "g");
+    let [_, ordinary, ..] = generation_objects(&table, "d");
+    let assessment = |verdict: Option<Verdict>| Assessment {
+        surfaces: [(ordinary.clone(), Verdict::Created)]
+            .into_iter()
+            .chain(verdict.map(|verdict| (generated.clone(), verdict)))
+            .collect(),
+        ..Assessment::default()
+    };
+    let empty = Schema::default();
+    let created = super::resolution::from_records(
+        &empty,
+        &schema,
+        &[],
+        &records,
+        &assessment(Some(Verdict::Created)),
+    )
+    .unwrap();
+    assert!(
+        created
+            .iter()
+            .all(|resolved| resolved.current.is_none() && resolved.desired.is_some())
+    );
+    for verdict in [
+        None,
+        Some(Verdict::Unresolved {
+            condition: "a same-named candidate on the target was not reconstructed on scratch",
+        }),
+    ] {
+        assert!(matches!(
+            super::resolution::from_records(&empty, &schema, &[], &records, &assessment(verdict)),
+            Err(Error::Binding(_))
+        ));
+    }
+    assert!(matches!(
+        super::resolution::from_records(
+            &schema,
+            &schema,
+            &records,
+            &records,
+            &assessment(Some(Verdict::Created)),
+        ),
+        Err(Error::Binding(_))
+    ));
 }
 
 /// The explicit ordered extra is an input to ordinary bootstrap, qualification,
