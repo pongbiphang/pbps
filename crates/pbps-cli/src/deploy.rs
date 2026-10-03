@@ -2938,6 +2938,16 @@ fn refuse_unplanned_movement(
         &pbps_model::Uid,
         (Option<&pbps_model::ReplicaIdentity>, &TableName),
     > = BTreeMap::new();
+    // The tables whose storage parameters this plan sets, by uid: what it
+    // sets and resets, and the name it runs under, which is the table's
+    // final one (#1441).
+    // What it sets, what it resets, and the name it runs under.
+    type StorageSetting<'a> = (
+        &'a BTreeMap<String, String>,
+        &'a BTreeSet<String>,
+        &'a TableName,
+    );
+    let mut storage_changes: BTreeMap<&pbps_model::Uid, StorageSetting<'_>> = BTreeMap::new();
     // Each renamed table's uid, by its old and new names.
     let mut renamed_uids: BTreeMap<&pbps_model::Uid, (&TableName, &TableName)> = BTreeMap::new();
     // The defaults a change of this plan's own sets, by column. A created
@@ -3038,6 +3048,15 @@ fn refuse_unplanned_movement(
         }
         if let pbps_model::Change::SetReplicaIdentity { uid, table, to } = &p.change {
             identities.insert(uid, (to.as_ref(), table));
+        }
+        if let pbps_model::Change::SetStorageParameters {
+            uid,
+            table,
+            set,
+            reset,
+        } = &p.change
+        {
+            storage_changes.insert(uid, (set, reset, table));
         }
         if let pbps_model::Change::AlterColumnDefault { column, to, .. } = &p.change {
             set_defaults.insert((&column.table, column.name.as_str()), to.as_ref());
@@ -3481,6 +3500,14 @@ fn refuse_unplanned_movement(
                      declares"
                 ));
             }
+            // In the `CREATE` itself (`WITH`), so held from the first read
+            // that finds the table (#1441).
+            if declared.storage_parameters != now.storage_parameters {
+                moved.push(format!(
+                    "{now_name} storage parameters are not the ones this plan's `CREATE TABLE` \
+                     declares"
+                ));
+            }
             if settled.whole() && declared.primary_key.is_some() && now.primary_key.is_none() {
                 moved.push(format!(
                     "{now_name} has no primary key, and this plan's `CREATE TABLE` declares one"
@@ -3692,6 +3719,36 @@ fn refuse_unplanned_movement(
                 }
                 None | Some(_) => {}
             }
+            // Storage parameters, the same way (#1441): the plan's own setting
+            // is the before-read with its `set` applied and its `reset`
+            // removed, held once the run is whole; mid-run the table may hold
+            // either. Found by uid, through the rename that runs from this
+            // name to that, as the identity is.
+            let planned_storage = storage_changes.iter().find_map(|(uid, (set, reset, ran))| {
+                let ours = match renamed_uids.get(uid) {
+                    Some((from, to)) => *from == name && *to == now_name,
+                    None => *ran == name && name == now_name,
+                };
+                ours.then(|| {
+                    let mut expected = was.storage_parameters.clone();
+                    expected.retain(|k, _| !reset.contains(k));
+                    expected.extend(set.iter().map(|(k, v)| (k.clone(), v.clone())));
+                    expected
+                })
+            });
+            let storage_moved = match &planned_storage {
+                None => was.storage_parameters != now.storage_parameters,
+                Some(expected) if settled.whole() => *expected != now.storage_parameters,
+                Some(expected) => {
+                    now.storage_parameters != *expected
+                        && now.storage_parameters != was.storage_parameters
+                }
+            };
+            if storage_moved {
+                moved.push(format!(
+                    "{now_name} storage parameters are not the ones this plan leaves"
+                ));
+            }
             // And which of them holds the rows (#1178). Every part can read
             // back unchanged while another session moves the clustered index
             // between them, so the layout is compared on its own. The plan
@@ -3804,6 +3861,7 @@ fn refuse_unplanned_movement(
                         | pbps_model::Change::Grant { .. }
                         | pbps_model::Change::Revoke { .. }
                         | pbps_model::Change::PublicExecution { .. }
+                        | pbps_model::Change::SetStorageParameters { .. }
                         | pbps_model::Change::SetReplicaIdentity { .. } => {}
                     }
                 }
@@ -12019,6 +12077,99 @@ mod tests {
                 assert!(format!("{e:#}").contains("index `ix`"), "{other:?}: {e:#}");
             }
         }
+    }
+
+    /// Storage parameters are held across an apply (#1441): another
+    /// session's change on a touched table is movement; the plan's own is
+    /// held once the run is whole and either side of it is fine mid-run; a
+    /// created table is held to its `CREATE` from the first read.
+    #[test]
+    fn storage_parameters_moved_by_someone_else_are_movement() {
+        use pbps_model::{Change, Column, PlannedChange, Table};
+        let name = TableName::new("app", "t");
+        let mut t = Table::default();
+        t.columns.insert(
+            "id".into(),
+            Column::new("integer".parse().unwrap()).not_null(),
+        );
+        let schema = |pairs: &[(&str, &str)]| {
+            let mut t = t.clone();
+            t.storage_parameters = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            Schema {
+                tables: [(name.clone(), t)].into(),
+                ..Default::default()
+            }
+        };
+        let check = |plan: &pbps_model::ChangeSet, before: &Schema, after: &Schema, settled| {
+            refuse_unplanned_movement(
+                &pbps_pg::Postgres::new(),
+                plan,
+                before,
+                after,
+                "test",
+                settled,
+            )
+        };
+        let unrelated = pbps_model::ChangeSet {
+            changes: vec![PlannedChange::new(Change::AddCheck {
+                table: name.clone(),
+                name: "ck".into(),
+                constraint: pbps_model::CheckConstraint {
+                    expression: "id > 0".into(),
+                },
+            })],
+        };
+        let was = schema(&[("fillfactor", "70"), ("autovacuum_enabled", "false")]);
+        check(&unrelated, &was, &was, Settled::SoFar).expect("unchanged");
+        let e = check(
+            &unrelated,
+            &was,
+            &schema(&[("fillfactor", "70")]),
+            Settled::SoFar,
+        )
+        .expect_err("another session reset one");
+        assert!(format!("{e:#}").contains("storage parameters"), "{e:#}");
+
+        let setting = pbps_model::ChangeSet {
+            changes: vec![PlannedChange::new(Change::SetStorageParameters {
+                uid: "t_000000".parse().unwrap(),
+                table: name.clone(),
+                set: [("fillfactor".to_owned(), "80".to_owned())].into(),
+                reset: ["autovacuum_enabled".to_owned()].into(),
+            })],
+        };
+        let after = schema(&[("fillfactor", "80")]);
+        check(&setting, &was, &after, Settled::Whole).expect("the plan's own");
+        check(&setting, &was, &was, Settled::SoFar).expect("not run yet");
+        let e = check(&setting, &was, &was, Settled::Whole).expect_err("never run");
+        assert!(format!("{e:#}").contains("storage parameters"), "{e:#}");
+        let e = check(
+            &setting,
+            &was,
+            &schema(&[("fillfactor", "90")]),
+            Settled::SoFar,
+        )
+        .expect_err("neither side of the plan");
+        assert!(format!("{e:#}").contains("storage parameters"), "{e:#}");
+
+        let mut declared = t.clone();
+        declared
+            .storage_parameters
+            .insert("fillfactor".into(), "80".into());
+        let creating = pbps_model::ChangeSet {
+            changes: vec![PlannedChange::new(Change::CreateTable {
+                uid: "t_000000".parse().unwrap(),
+                name: name.clone(),
+                table: Box::new(declared),
+            })],
+        };
+        let empty = Schema::default();
+        check(&creating, &empty, &after, Settled::SoFar).expect("as created");
+        let e = check(&creating, &empty, &schema(&[]), Settled::SoFar).expect_err("not as created");
+        assert!(format!("{e:#}").contains("storage parameters"), "{e:#}");
     }
 
     /// A touched table is held to its replica identity, which every part can

@@ -190,6 +190,25 @@ impl Table {
         matches!(&self.clustered, Some(Clustered::Index(n)) if n == name)
     }
 
+    /// Why this table's [`Table::storage_parameters`] cannot be what they
+    /// say: a name outside the closed list, or a value not in its canonical
+    /// spelling, which a loaded declaration always is and a hand-edited
+    /// state or plan may not be (#1441).
+    pub fn storage_parameter_problems(&self) -> Vec<String> {
+        self.storage_parameters
+            .iter()
+            .filter_map(
+                |(name, value)| match crate::storage::canonical(name, value) {
+                    Ok(canonical) if canonical == *value => None,
+                    Ok(canonical) => Some(format!(
+                        "storage parameter `{name}` is `{value}`, which is spelled `{canonical}`"
+                    )),
+                    Err(why) => Some(why),
+                },
+            )
+            .collect()
+    }
+
     /// Why this table's [`Table::replica_identity`] cannot be what it says:
     /// PostgreSQL takes as the identity only the index of a key, a unique
     /// constraint, or a unique index that is not partial, over columns that
@@ -375,6 +394,14 @@ pub struct Table {
     /// without the field reads as `None` truthfully.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replica_identity: Option<ReplicaIdentity>,
+
+    /// A PostgreSQL table's heap storage parameters (#1441), by name, each
+    /// in its canonical spelling ([`crate::storage::canonical`]): the
+    /// engine keeps whatever spelling it was given, and several read as one
+    /// value. Empty is every parameter at its default, which is what an
+    /// older reader recorded for every table: it did not read them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub storage_parameters: BTreeMap<String, String>,
 
     /// Declared reference data (ADR-0004).
     ///
@@ -1229,6 +1256,25 @@ mod tests {
         t.primary_key = None;
         t.replica_identity = Some(ReplicaIdentity::PrimaryKey);
         assert!(t.replica_identity_problems()[0].contains("names nothing"));
+    }
+
+    /// A storage parameter holds a listed name and its canonical spelling;
+    /// a hand-edited state or plan with anything else is refused by name
+    /// (#1441).
+    #[test]
+    fn a_storage_parameter_must_be_listed_and_canonical() {
+        let mut t = sample();
+        for (name, value) in [("fillfactor", "70"), ("autovacuum_enabled", "false")] {
+            t.storage_parameters.insert(name.into(), value.into());
+        }
+        assert!(t.storage_parameter_problems().is_empty());
+        t.storage_parameters
+            .insert("fillfactor".into(), "070".into());
+        assert!(t.storage_parameter_problems()[0].contains("spelled `56`"));
+        t.storage_parameters
+            .insert("fillfactor".into(), "70".into());
+        t.storage_parameters.insert("bogus".into(), "1".into());
+        assert!(t.storage_parameter_problems()[0].contains("`bogus`"));
     }
 
     /// A snapshot or plan from before the field reads as the default layout,

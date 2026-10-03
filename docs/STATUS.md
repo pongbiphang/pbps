@@ -35,6 +35,13 @@ again wherever it rebuilds the index it names (#1444, DEC-1444.1). A `USING
 INDEX` identity whose index was dropped stays a limitation. SQL Server refuses
 the field.
 
+A PostgreSQL table declares its heap storage parameters with
+`storage_parameters:` (a closed list: `fillfactor`, the heap `autovacuum_*`
+settings, `parallel_workers`, `toast_tuple_target`, `vacuum_index_cleanup`,
+`vacuum_truncate` and others), compared by value, and a change is one
+`ALTER TABLE … SET/RESET` (#1441, DEC-1441.1). `toast.*` parameters stay
+limitations. SQL Server refuses the field.
+
 A SQL Server column may name its collation (`collation:`); `pull` declares one
 that differs from the database's default, and a collation change is a planned
 `ALTER COLUMN` that rebuilds the keys around it (#1175, DEC-1175.1).

@@ -314,6 +314,17 @@ pub enum Change {
         to: Option<ReplicaIdentity>,
     },
 
+    /// A PostgreSQL table's heap storage parameters (#1441): `ALTER TABLE …
+    /// SET (…)` for `set`, in canonical spelling, and `RESET (…)` for
+    /// `reset`. Only what changes: a parameter the plan leaves alone is not
+    /// restated (DEC-1441.1).
+    SetStorageParameters {
+        uid: Uid,
+        table: TableName,
+        set: BTreeMap<String, String>,
+        reset: BTreeSet<String>,
+    },
+
     // Constraints and indexes are always drop + add, never modified in place —
     // that is how the database itself implements it, and pretending otherwise
     // would only give the emitter one more path that can fail.
@@ -1023,6 +1034,7 @@ impl Change {
             Change::AddColumn { table, .. }
             | Change::RenameColumn { table, .. }
             | Change::SetPrimaryKey { table, .. }
+            | Change::SetStorageParameters { table, .. }
             | Change::SetReplicaIdentity { table, .. }
             | Change::AddUnique { table, .. }
             | Change::DropUnique { table, .. }
@@ -1096,6 +1108,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -1207,6 +1220,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -1269,6 +1283,7 @@ impl Change {
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -1372,6 +1387,7 @@ impl Change {
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -1429,6 +1445,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -1504,6 +1521,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -1556,6 +1574,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -1604,6 +1623,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -1693,6 +1713,7 @@ impl Change {
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -1752,6 +1773,7 @@ impl Change {
             | Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -1895,6 +1917,7 @@ impl Change {
             | Change::Grant { .. }
             | Change::Revoke { .. }
             | Change::PublicExecution { .. }
+            | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. } => None,
         }
     }
@@ -1922,6 +1945,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -1976,6 +2000,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -2018,6 +2043,7 @@ impl Change {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -2198,7 +2224,11 @@ impl Change {
             // A replica identity changes what logical replication carries to
             // name an old row, not a row or an access: no class here gates it
             // (DEC-1444.1).
-            | Change::SetReplicaIdentity { .. } => {}
+            | Change::SetReplicaIdentity { .. }
+            // Nor do storage parameters, which change how the engine stores
+            // and vacuums the rows, not the rows: none rewrites the table
+            // (DEC-1441.1).
+            | Change::SetStorageParameters { .. } => {}
         }
         r
     }

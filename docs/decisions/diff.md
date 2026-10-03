@@ -1857,3 +1857,68 @@ Tests:
   (`crates/pbps-pg/tests/live.rs`, on 16 and 18) and
   `a_replica_identity_moves_to_a_new_index_through_the_cli`
   (`crates/pbps-cli/tests/flow_pg.rs`).
+
+<a id="dec-1441-1"></a>
+
+**DEC-1441.1. A PostgreSQL table declares its heap storage parameters under
+`storage_parameters:`, from a closed list, each held in one canonical
+spelling (#1441).**
+
+Measured on 16.15 and 18.6, alike:
+
+- `pg_class.reloptions` keeps the spelling it was given, and the engine
+  parses it with C's rules: booleans by `parse_bool` (`of` is false, `o` is
+  refused), integers by `strtol(…, 0)` (`070` is octal 56, `0x14` is 20,
+  `08` is refused), reals by `strtod`, and `vacuum_index_cleanup` takes
+  `auto` or a whole boolean word in any case.
+- Out-of-range values and unknown names are refused by the engine.
+- `toast.*` parameters live on the TOAST relation's `reloptions`, without
+  the prefix, and a table with no TOAST relation discards them silently.
+
+**Model.** `Table::storage_parameters`, a map from a closed list of heap
+parameters (`pbps_model::storage::TABLE_PARAMETERS`) to each value's
+canonical spelling: `true`/`false`, a decimal integer, the shortest decimal
+of a real, `auto`/`on`/`off`. Both sides are put in it by the engine's own
+rules (`storage::canonical`): the loader for the declaration, the reader for
+`reloptions`. So a respelling is no change, and text is never compared. Two
+parameters are 18's; a 16 server refuses them when the plan runs, inside its
+transaction. SQL Server refuses the key.
+
+**Plan.** A created table takes them in its `CREATE` (`WITH (…)`). A change
+is one `SetStorageParameters`, one `ALTER TABLE … SET (…), RESET (…)`, with
+only what differs; a parameter left alone is not restated. One statement, so
+a staged read never finds half of it. Class 10, with the metadata: no
+statement reads one, and it runs under the table's final name. No risk
+class: none rewrites the table.
+
+**Read.** What the model cannot declare is named, never dropped: a name
+outside the list, a value the engine's rules read but this reader cannot
+spell (a hexadecimal real), and any `toast.*` parameter. Each is a
+limitation of its table, which keeps the table out of every command, so no
+plan overwrites what it did not read.
+
+**Why not `toast.*`.** A declared one on a table without a TOAST relation
+would be discarded by the engine and planned again by every run. Holding it
+needs a check that the table has one, which is follow-up scope.
+
+**Drift.** A touched table's parameters that change across an apply are
+movement unless the plan sets them; where it does, the before-read with the
+plan's `set` and `reset` applied is held once the run is whole, by the
+table's uid, as the replica identity is (DEC-1444.1). A created table is held
+to its `CREATE` from the first read that finds it.
+
+Tests:
+
+- `every_spelling_the_engine_reads_alike_is_one_value`,
+  `a_name_or_value_the_engine_would_not_take_is_refused`,
+  `a_storage_parameter_must_be_listed_and_canonical` (`crates/pbps-model`);
+- `storage_parameters_read_back_canonical_and_round_trip` (`crates/pbps-load`);
+- `storage_parameters_set_what_differs_and_reset_what_goes` (`crates/pbps-diff`);
+- `storage_parameters_are_one_statement_and_part_of_create`,
+  `storage_parameters_are_read_canonical_and_the_rest_is_named` (`crates/pbps-pg`);
+- `storage_parameters_are_refused_on_sql_server` (`crates/pbps-mssql`);
+- `storage_parameters_moved_by_someone_else_are_movement` (`crates/pbps-cli`);
+- the live `storage_parameters_round_trip_and_change_as_a_typed_plan`
+  (`crates/pbps-pg/tests/live.rs`, on 16 and 18) and
+  `storage_parameters_change_through_the_cli`
+  (`crates/pbps-cli/tests/flow_pg.rs`).

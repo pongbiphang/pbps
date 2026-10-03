@@ -130,7 +130,10 @@ fn tables_query() -> String {
         "SELECT c.oid::int8 AS oid, n.nspname AS schema_name, c.relname AS table_name,
             c.relreplident::text AS replica_identity,
             COALESCE((SELECT x.indexrelid::int8 FROM pg_catalog.pg_index x
-                       WHERE x.indrelid = c.oid AND x.indisreplident), 0) AS identity_index
+                       WHERE x.indrelid = c.oid AND x.indisreplident), 0) AS identity_index,
+            COALESCE(c.reloptions, '{{}}'::text[]) AS reloptions,
+            COALESCE((SELECT tc.reloptions FROM pg_catalog.pg_class tc
+                       WHERE tc.oid = c.reltoastrelid), '{{}}'::text[]) AS toast_reloptions
        FROM pg_catalog.pg_class c
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
       WHERE {ORDINARY_TABLE}
@@ -1011,6 +1014,8 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
                 let oid = number(row, "identity_index")?;
                 (oid != 0).then_some(oid)
             },
+            reloptions: strings(row, "reloptions")?,
+            toast_reloptions: strings(row, "toast_reloptions")?,
         });
     }
     for row in batch.get("columns").ok_or_else(|| missing("columns"))? {

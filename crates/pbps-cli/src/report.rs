@@ -332,6 +332,7 @@ fn role_of(change: &Change) -> Option<&str> {
         | Change::AlterColumnExpression { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::SetPrimaryKey { .. }
+        | Change::SetStorageParameters { .. }
         | Change::SetReplicaIdentity { .. }
         | Change::AddUnique { .. }
         | Change::DropUnique { .. }
@@ -381,6 +382,7 @@ fn renames(cs: &ChangeSet) -> Renames {
             | Change::AlterColumnExpression { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
+            | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -698,6 +700,11 @@ pub fn describe(c: &Change) -> String {
             Some(pk) => format!("~ primary key -> ({})", pk.columns.join(", ")),
             None => "- drop primary key".to_owned(),
         },
+        Change::SetStorageParameters { set, reset, .. } => {
+            let mut parts: Vec<String> = set.iter().map(|(k, v)| format!("{k} = {v}")).collect();
+            parts.extend(reset.iter().map(|k| format!("{k} reset")));
+            format!("~ storage parameters: {}", parts.join(", "))
+        }
         Change::SetReplicaIdentity { to, .. } => match to {
             Some(identity) => format!("~ replica identity -> {identity}"),
             None => "~ replica identity -> default".to_owned(),

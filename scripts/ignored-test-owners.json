@@ -1253,7 +1253,8 @@
         "update_of_generated_columns_follows_their_source_columns",
         "update_of_triggers_only_guard_columns_the_statement_can_fire",
         "what_calls_a_new_function_follows_its_create",
-        "a_replica_identity_moves_to_a_new_index_through_the_cli"
+        "a_replica_identity_moves_to_a_new_index_through_the_cli",
+        "storage_parameters_change_through_the_cli"
       ]
     },
     {
@@ -1906,6 +1907,7 @@
         "resolver_tests::scope610::scope_facts_read_the_deployers_own_visibility_and_leave_the_session_untouched",
         "resolver_tests::scope610::the_rule_refuses_version_and_collation_differences_between_real_servers_and_verifies_a_matching_side",
         "routine_lock_timeouts_are_errors_and_leave_the_callers_transaction_usable",
+        "storage_parameters_round_trip_and_change_as_a_typed_plan",
         "structural_declarations_and_the_engine_agree_on_refusals_and_legal_repetitions",
         "temporal_modifiers_keep_the_engine_bounds_and_do_not_shorten_the_calendar",
         "temporary_relations_and_types_follow_the_declared_write_path",

@@ -49,3 +49,4 @@ DECISIONS 465).
 - `22/` adds a column's `generated:` (issue #1168).
 - `23/` adds a table's `computed:` (issue #1174).
 - `24/` adds a table's `replica_identity:` (issue #1444).
+- `25/` adds a table's `storage_parameters:` (issue #1441).

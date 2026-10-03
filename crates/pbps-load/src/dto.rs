@@ -339,6 +339,14 @@ pub struct TableDto {
     #[serde(default)]
     pub replica_identity: Option<ReplicaIdentityDto>,
 
+    /// PostgreSQL heap storage parameters, by name: `fillfactor: 70`,
+    /// `autovacuum_enabled: false`, `autovacuum_vacuum_scale_factor: 0.05`,
+    /// `vacuum_index_cleanup: auto`. Absent is every parameter at its
+    /// default.
+    #[serde(default)]
+    #[schemars(with = "BTreeMap<String, StorageValueDto>")]
+    pub storage_parameters: BTreeMap<String, Spanned<StorageValueDto>>,
+
     /// Declared reference data (ADR-0004). Absent on almost every table: it is
     /// the opt-in that lets the tool touch rows at all.
     #[serde(default)]
@@ -474,6 +482,19 @@ pub enum ClusteredDto {
     Heap,
     Unique(String),
     Index(String),
+}
+
+/// A storage parameter's value as written. Any of the four, since the
+/// parameters are booleans, integers, reals and one word list; `convert`
+/// reads each into its canonical spelling by the engine's own rules, so
+/// `off`, `false` and `0` are one value (DEC-1441.1).
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum StorageValueDto {
+    Bool(bool),
+    Int(i64),
+    Real(f64),
+    Text(String),
 }
 
 // A mirror of `pbps_model::ReplicaIdentity`, for the reason `ClusteredDto`

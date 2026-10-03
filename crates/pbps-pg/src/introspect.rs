@@ -85,6 +85,11 @@ pub struct RawTable {
     /// The index marked `indisreplident`, for `i`. The reader leaves out a
     /// table with `i` and no such index (#1444).
     pub identity_index: Option<i64>,
+    /// `reloptions`, each `name=value` as the engine keeps it (#1441).
+    pub reloptions: Vec<String>,
+    /// The TOAST relation's `reloptions`: a `toast.*` parameter, which the
+    /// model does not declare (#1441).
+    pub toast_reloptions: Vec<String>,
 }
 
 /// One module, with the text this engine deparses for it.
@@ -786,6 +791,11 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     None
                 },
             );
+        let (parameters, unread) = storage_parameters(raw_table);
+        table.storage_parameters = parameters;
+        for detail in unread {
+            note(&mut pulled, &name, detail);
+        }
         pulled.schema.tables.insert(name, table);
     }
 
@@ -1926,6 +1936,36 @@ fn replica_identity(
     }))
 }
 
+/// A table's heap storage parameters in canonical spelling, and what the
+/// model cannot declare of them, named (#1441, DEC-1441.1): a name outside
+/// the closed list, a value the engine's own rules would not read the way
+/// this reader can, and any `toast.*` parameter. Never dropped: the caller
+/// notes each, which keeps the table out of every command until it is
+/// resolved, so no plan overwrites what it could not read.
+fn storage_parameters(raw_table: &RawTable) -> (BTreeMap<String, String>, Vec<String>) {
+    let mut parameters = BTreeMap::new();
+    let mut unread = Vec::new();
+    for option in &raw_table.reloptions {
+        let Some((name, value)) = option.split_once('=') else {
+            unread.push(format!("its storage option `{option}` names no value"));
+            continue;
+        };
+        match pbps_model::storage::canonical(name, value) {
+            Ok(canonical) => {
+                parameters.insert(name.to_owned(), canonical);
+            }
+            Err(why) => unread.push(format!("its storage parameters cannot be declared: {why}")),
+        }
+    }
+    for option in &raw_table.toast_reloptions {
+        unread.push(format!(
+            "its TOAST table carries `toast.{option}`, which the declarations do not hold \
+             (a table without a TOAST relation would silently lose one)"
+        ));
+    }
+    (parameters, unread)
+}
+
 /// [`note`], for the arms that are expressions rather than blocks. Always
 /// `false`: a constraint that earns a warning here is one that was left out.
 fn note_false(pulled: &mut Pulled, table: &TableName, detail: String) -> bool {
@@ -2997,6 +3037,8 @@ mod tests {
                 name: "customer".to_owned(),
                 replica_identity: 'd',
                 identity_index: None,
+                reloptions: Vec::new(),
+                toast_reloptions: Vec::new(),
             }],
             modules: vec![
                 RawModule {
@@ -3940,6 +3982,8 @@ mod tests {
                 name: "sales(archive)".to_owned(),
                 replica_identity: 'd',
                 identity_index: None,
+                reloptions: Vec::new(),
+                toast_reloptions: Vec::new(),
             }],
             grants: vec![grant(
                 Some("app_reader"),
@@ -4255,6 +4299,8 @@ mod tests {
             name: name.to_owned(),
             replica_identity: 'd',
             identity_index: None,
+            reloptions: Vec::new(),
+            toast_reloptions: Vec::new(),
         }
     }
 
@@ -4662,6 +4708,52 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("which this pull leaves out"))
         );
+    }
+
+    /// Storage parameters are read in their canonical spelling, whatever the
+    /// engine kept; a name outside the list and a `toast.*` parameter are
+    /// each named, never dropped (#1441).
+    #[test]
+    fn storage_parameters_are_read_canonical_and_the_rest_is_named() {
+        let catalog = |reloptions: &[&str], toast: &[&str]| {
+            let mut t = table(1, "t");
+            t.reloptions = reloptions.iter().map(|s| (*s).to_owned()).collect();
+            t.toast_reloptions = toast.iter().map(|s| (*s).to_owned()).collect();
+            RawCatalog {
+                tables: vec![t],
+                columns: vec![col(1, 1, "a", "integer")],
+                ..RawCatalog::default()
+            }
+        };
+        let pulled = assemble(&catalog(&["fillfactor=070", "autovacuum_enabled=off"], &[]));
+        assert!(pulled.limitations.is_empty(), "{:?}", pulled.warnings);
+        let read: Vec<(&str, &str)> = only(&pulled)
+            .storage_parameters
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(
+            read,
+            [("autovacuum_enabled", "false"), ("fillfactor", "56")]
+        );
+        // Negative: an unknown name, a value this reader cannot spell, and a
+        // TOAST parameter, each named.
+        let pulled = assemble(&catalog(
+            &[
+                "fillfactor=70",
+                "bogus=1",
+                "autovacuum_vacuum_scale_factor=0x1p-3",
+            ],
+            &["autovacuum_enabled=false"],
+        ));
+        assert_eq!(pulled.limitations.len(), 3, "{:?}", pulled.warnings);
+        assert!(
+            pulled
+                .warnings
+                .iter()
+                .any(|w| w.contains("toast.autovacuum_enabled"))
+        );
+        assert_eq!(only(&pulled).storage_parameters.len(), 1);
     }
 
     #[test]

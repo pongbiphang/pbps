@@ -311,6 +311,7 @@ fn changed_owners(change: &Change) -> Option<(Vec<OwnerScope>, bool, bool)> {
             (Exact(Surface::Default(column.clone())), true, true)
         }
         Change::SetPrimaryKey { table, .. }
+        | Change::SetStorageParameters { table, .. }
         | Change::SetReplicaIdentity { table, .. }
         | Change::AddUnique { table, .. }
         | Change::DropUnique { table, .. }

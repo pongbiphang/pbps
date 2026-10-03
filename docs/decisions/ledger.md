@@ -1121,3 +1121,17 @@ identity was left out of the pull as a limitation, and no recorder accepts a
 managed table carrying one. A plan is read at its own version only, and an
 older build reading a version 18 plan would create a table without the
 identity it was reviewed with, so the version is what refuses it there.
+
+<a id="dec-1441-2"></a>
+
+**DEC-1441.2. State version 15 adds a table's storage parameters and still
+reads 6 to 14; plan version 19 turns 18 away.** Unlike the replica identity
+(DEC-1444.2), an absent value is not always a true reading of an older
+state: the older reader did not read `reloptions` at all, so a tuned table
+was recorded without them. It is not silent. The live read now carries them,
+so the drift check stops the next plan and `verify` names the table, as with
+the clustered layout of DEC-1178.2; re-recording is `baseline`. Raising the
+oldest readable version would force that on every environment, to catch a
+case the drift check already catches. A plan is read at its own version
+only, and an older build reading a version 19 plan would create a table
+without its parameters.

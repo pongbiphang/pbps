@@ -73,6 +73,9 @@ use crate::schema::Schema;
 /// Bumped to 14 when a table gained its PostgreSQL replica identity
 /// (DEC-1444.1). Versions 6 to 13 stay readable.
 ///
+/// Bumped to 15 when a table gained its PostgreSQL storage parameters
+/// (DEC-1441.1). Versions 6 to 14 stay readable.
+///
 /// Readers refuse a version they do not understand rather than reading it
 /// partially.
 ///
@@ -91,7 +94,7 @@ use crate::schema::Schema;
 /// order, which can drop a schema-bound dependency before its dependent.
 /// Refused, with the remedy `check_version` already names: re-record it with
 /// `pbps baseline --reason ...`.
-pub const CURRENT_VERSION: u32 = 14;
+pub const CURRENT_VERSION: u32 = 15;
 
 /// The oldest snapshot version this build reads as its own.
 ///
@@ -142,6 +145,13 @@ pub const CURRENT_VERSION: u32 = 14;
 /// (DEC-1444.1): an older reader left every table whose identity was not the
 /// default out as a limitation, so every recorded table had the default,
 /// which is what an absent identity reads as.
+///
+/// Still 6 at version 15, whose storage parameters an older state lacks
+/// (DEC-1441.2). Here absence is not always a true reading: an older reader
+/// did not read `reloptions` at all, so a tuned table was recorded without
+/// them. It is not silent: the live read now carries them, so the drift
+/// check stops the next plan and `verify` names the table, as with the
+/// clustered layout of DEC-1178.2. Re-recording is `baseline`.
 pub const OLDEST_READABLE_VERSION: u32 = 6;
 
 /// How this state came about.
@@ -544,7 +554,7 @@ mod tests {
         // the whole story rather than a sample of it; 6 is readable because
         // the field 7 added is one it truly lacks.
         assert_eq!(OLDEST_READABLE_VERSION, 6);
-        assert_eq!(CURRENT_VERSION, 14);
+        assert_eq!(CURRENT_VERSION, 15);
     }
 
     fn schema_with(ty: &str) -> Schema {

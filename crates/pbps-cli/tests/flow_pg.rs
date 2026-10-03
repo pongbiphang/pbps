@@ -948,6 +948,7 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
             | change @ pbps_model::Change::AlterColumnExpression { .. }
             | change @ pbps_model::Change::SetColumnDeprecated { .. }
             | change @ pbps_model::Change::SetPrimaryKey { .. }
+            | change @ pbps_model::Change::SetStorageParameters { .. }
             | change @ pbps_model::Change::SetReplicaIdentity { .. }
             | change @ pbps_model::Change::AddUnique { .. }
             | change @ pbps_model::Change::DropUnique { .. }
@@ -6258,6 +6259,86 @@ fn a_generated_columns_expression_change_is_refused_by_name_before_postgres_17()
         "DO $$ BEGIN IF current_setting('server_version_num')::integer >= 170000 THEN RAISE EXCEPTION 'this regression needs a pre-17 server'; END IF; END $$",
     );
     generated_column_flow(&server, "generated-1168-old", false);
+}
+
+/// Storage parameters go the whole way through the CLI (#1441): pulled in
+/// canonical spelling, changed (set, changed and reset) by one typed plan that
+/// applies, after which the next plan is empty. A parameter reset by hand is
+/// drift, and one the model cannot declare is reported by the next command,
+/// never overwritten.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn storage_parameters_change_through_the_cli() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "storage-params-1441");
+    let connection = own.connection().to_owned();
+    on_server(
+        &connection,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.t (id integer PRIMARY KEY, body text) \
+           WITH (fillfactor = 70, autovacuum_enabled = off); \
+         INSERT INTO app.t VALUES (1, 'a')",
+    );
+    let d = Demo::new("storage-params-1441");
+    succeeds(d.run(&["pull", "--db", &connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    let path = d.dir.join("schema/app.t.yml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let pulled = "storage_parameters:\n  autovacuum_enabled: false\n  fillfactor: 70\n";
+    assert!(text.contains(pulled), "{text}");
+    std::fs::write(
+        &path,
+        text.replace(
+            pulled,
+            "storage_parameters:\n  fillfactor: 80\n  parallel_workers: 2\n",
+        ),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        &connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    assert!(
+        script.contains(
+            "SET (fillfactor = '80', parallel_workers = '2'), RESET (autovacuum_enabled);"
+        ),
+        "{script}"
+    );
+    succeeds(approved_apply(&d, &connection, &plan, &[]));
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
+    // Reset by hand: drift, named by `verify`.
+    on_server(&connection, "ALTER TABLE app.t RESET (fillfactor)");
+    let drifted = d.run(&["plan", "--db", &connection]);
+    assert_ne!(code(&drifted), 0, "{}", stdout(&drifted));
+    let verified = d.run(&["verify", "--db", &connection]);
+    assert_ne!(code(&verified), 0, "{}", stdout(&verified));
+    let said = format!("{}{}", stdout(&verified), stderr(&verified));
+    assert!(said.contains("app.t"), "{said}");
+
+    // A parameter the model cannot declare: reported, and nothing planned
+    // over it.
+    on_server(
+        &connection,
+        "ALTER TABLE app.t SET (fillfactor = 80, toast.autovacuum_enabled = false)",
+    );
+    let refused = d.run(&["plan", "--db", &connection]);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    let said = format!("{}{}", stdout(&refused), stderr(&refused));
+    assert!(said.contains("toast.autovacuum_enabled"), "{said}");
 }
 
 /// A replica identity goes the whole way through the CLI (#1444). Pulled as

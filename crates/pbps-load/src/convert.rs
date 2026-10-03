@@ -15,8 +15,8 @@ use pbps_model::{
 };
 
 use crate::dto::{
-    ClusteredDto, DataDto, ModuleDto, PrimaryKeyDto, ReplicaIdentityDto, RoleDto, TableDto,
-    ValueDto,
+    ClusteredDto, DataDto, ModuleDto, PrimaryKeyDto, ReplicaIdentityDto, RoleDto, StorageValueDto,
+    TableDto, ValueDto,
 };
 use crate::error::{LoadError, SourceFile, to_span};
 
@@ -370,6 +370,33 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
         None => None,
     };
 
+    let mut storage_parameters = std::collections::BTreeMap::new();
+    for (parameter, value) in &dto.storage_parameters {
+        let written = match &value.value {
+            StorageValueDto::Bool(b) => b.to_string(),
+            StorageValueDto::Int(i) => i.to_string(),
+            StorageValueDto::Real(r) => r.to_string(),
+            StorageValueDto::Text(t) => t.clone(),
+        };
+        match pbps_model::storage::canonical(parameter, &written) {
+            Ok(canonical) => {
+                storage_parameters.insert(parameter.clone(), canonical);
+            }
+            Err(why) => errs.push(
+                LoadError::semantic(
+                    src,
+                    to_span(&value.defined),
+                    format!("invalid storage parameter: {why}"),
+                    "here",
+                )
+                .with_help(
+                    "a PostgreSQL heap storage parameter such as `fillfactor: 70` or \
+                     `autovacuum_enabled: false`; `toast.*` parameters are not declared",
+                ),
+            ),
+        }
+    }
+
     match (name, errs.is_empty()) {
         (Some(name), true) => Ok(LoadedTable {
             name,
@@ -408,6 +435,7 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
                     ReplicaIdentityDto::Unique(name) => ReplicaIdentity::Unique(name),
                     ReplicaIdentityDto::Index(name) => ReplicaIdentity::Index(name),
                 }),
+                storage_parameters,
             },
             intents,
             strategy: dto.strategy.map(|s| Strategy { online: s.online }),
