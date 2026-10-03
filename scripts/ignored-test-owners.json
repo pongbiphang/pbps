@@ -1235,6 +1235,7 @@
         "recorded_triggers_run_but_their_names_cannot_authorize_replacements",
         "reference_data_applies_pulls_defaults_and_refuses_rows_arriving_after_the_plan",
         "referential_action_locks_exclude_plain_children_and_hold_partitions",
+        "referential_action_locks_exclude_plain_children_and_hold_partitions_before_postgres_17",
         "referential_actions_cannot_reach_an_unapproved_trigger",
         "rename_order_pg::saved_rename_dependencies_apply_and_record_only_surviving_objects",
         "resolver_selection_is_lazy_and_obeys_cli_environment_project_precedence",
