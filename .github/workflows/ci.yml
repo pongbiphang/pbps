@@ -84,7 +84,7 @@ jobs:
     needs: approve
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
@@ -110,11 +110,11 @@ jobs:
     needs: lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - uses: dtolnay/rust-toolchain@stable
@@ -141,11 +141,11 @@ jobs:
     needs: lint
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - uses: dtolnay/rust-toolchain@stable
@@ -182,7 +182,7 @@ jobs:
     env:
       PBPS_TEST_DB: "Server=localhost,14330;User Id=sa;Password=Pbps!Ci12345;TrustServerCertificate=true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # The service has no health check hook here; the loop stands in for one.
@@ -263,7 +263,7 @@ jobs:
       PBPS_TEST_DB: "Server=localhost,14330;User Id=sa;Password=Pbps!Ci12345;TrustServerCertificate=true"
       PBPS_TEST_EXPRESS_DB: "Server=localhost,14331;User Id=sa;Password=Pbps!Ci12345;TrustServerCertificate=true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: start the two SQL Servers, one after the other
@@ -367,7 +367,7 @@ jobs:
       PBPS_TEST_PG_DB: "host=localhost port=54320 user=postgres password=Pbps!Ci12345 dbname=pbps_test sslmode=disable"
       PBPS_TEST_PG_OLD_DB: "host=localhost port=54321 user=postgres password=Pbps!Ci12345 dbname=pbps_test sslmode=disable"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       # Keyed by variant: each builds different targets, and under one key
       # the first to finish would save a cache the other three cannot use.
@@ -428,7 +428,7 @@ jobs:
     env:
       PBPS_TEST_DEV_IMAGE: mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: plan --dev docker://
@@ -461,7 +461,7 @@ jobs:
         engine: [pg, mssql]
         half: [first, second]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       # Keyed by half: the first also builds the test profile its container
       # fixtures run under, and the second does not.
@@ -527,7 +527,7 @@ jobs:
     needs: lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.89.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace

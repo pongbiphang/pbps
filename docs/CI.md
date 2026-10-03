@@ -185,7 +185,7 @@ jobs:
     env:
       PBPS_BASE_SHA: ${{ github.event.pull_request.base.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0          # `plan --since` needs history, not a shallow clone
       # `toolchain:` is named rather than left to the action's default, which
@@ -206,7 +206,7 @@ jobs:
 
       - name: preview for the reviewer
         run: pbps plan --since "$PBPS_BASE_SHA" --out preview.json --sql preview.sql
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: preview
           path: |
@@ -229,7 +229,7 @@ jobs:
     # including the actions that check out, install a toolchain and build —
     # none of which needs a database. See "Who can reach the credential".
     steps:
-      - uses: actions/checkout@v4          # pin to a full commit SHA; see below
+      - uses: actions/checkout@v7          # pin to a full commit SHA; see below
         with: { fetch-depth: 0 }
       # No third-party action in a job that will hold the credential: the
       # runner's own stable toolchain builds it. See "Who can reach the
@@ -249,7 +249,7 @@ jobs:
         run: pbps plan --env prod --out plan.json --sql plan.sql
       - name: what the approver reads
         run: pbps explain --plan plan.json      # offline: no credential needed
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: plan
           path: |
@@ -268,7 +268,7 @@ jobs:
       ALLOW: ${{ inputs.allow }}
     steps:
       # Dispatch from the same `prod-v*` tag the plan was computed on.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with: { fetch-depth: 0 }
       # No third-party action in a job that will hold the credential: the
       # runner's own stable toolchain builds it. See "Who can reach the
@@ -288,7 +288,7 @@ jobs:
             echo "run $PLAN_RUN planned $plan_sha; this dispatch is at $GITHUB_SHA" >&2
             exit 1
           fi
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: plan
           run-id: ${{ inputs.plan_run }}
@@ -331,7 +331,7 @@ jobs:
     # As in `plan`: the credential is on the one step that deploys, not on the
     # job that also builds.
     steps:
-      - uses: actions/checkout@v4          # pin to a full commit SHA; see below
+      - uses: actions/checkout@v7          # pin to a full commit SHA; see below
         with: { fetch-depth: 0 }
       # No third-party action in a job that will hold the credential: the
       # runner's own stable toolchain builds it. See "Who can reach the
@@ -352,7 +352,7 @@ jobs:
             echo "run $PLAN_RUN planned $plan_sha; this dispatch is at $GITHUB_SHA" >&2
             exit 1
           fi
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: plan
           run-id: ${{ inputs.plan_run }}
@@ -429,7 +429,7 @@ which holds no secret and builds pull-request code anyway.
 
 **Pin what remains to a full commit SHA** before this goes near production
 ([GitHub's hardening guide](https://docs.github.com/en/actions/how-tos/security-for-github-actions/security-guides/security-hardening-for-github-actions#using-third-party-actions)):
-`@v4` is a mutable pointer, and even a first-party action is a moving target
+`@v7` is a mutable pointer, and even a first-party action is a moving target
 under a tag. The examples carry tags so they run as pasted — the one concession
 of that kind in this file, stated here rather than left to be discovered, and
 narrowed by the paragraph above to the actions that never meet the credential.
@@ -683,7 +683,7 @@ jobs:
     # only ever reads. See "Who can reach the credential".
     environment: monitoring
     steps:
-      - uses: actions/checkout@v4          # pin to a full commit SHA; see below
+      - uses: actions/checkout@v7          # pin to a full commit SHA; see below
         with: { fetch-depth: 0 }
       # No third-party action in a job that will hold the credential: the
       # runner's own stable toolchain builds it. See "Who can reach the
