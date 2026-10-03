@@ -128,7 +128,7 @@ observations, not persisted plan evidence. Engine `resolver::discover` functions
 own catalog SQL and candidate-family suggestions; CLI `engine` dispatches and
 `doctor` renders. Discovery has no verified state, provisions nothing and
 does not select dependencies. Its partial inventory cannot be reused as an
-ADR-0016 coherent evidence capture (DECISIONS 491).
+ADR-0016 coherent evidence capture (DECISIONS 492).
 
 Named resolver configuration lives in `pbps-config::resolver`. Its tagged source
 profiles and pure precedence lookup contain credential-variable names only.
