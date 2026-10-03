@@ -507,3 +507,66 @@ async fn persisted_inputs_use_the_environment_key_and_never_export_source() {
         result.expect("sealing API fixture failed after cleanup");
     }
 }
+
+/// A table's TOAST relation is its out-of-line storage. Its name carries the
+/// table's OID, so a scratch compilation and the target never agree on it,
+/// and no expression binds it: it is not an input. The table itself, which
+/// reached it through an internal dependency, still is.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_tables_toast_storage_is_not_a_capture_input() {
+    for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+        let base = std::env::var(variable).expect("live PostgreSQL fixture setting");
+        let name = format!(
+            "pbps_toast1274_{}",
+            crate::catalog::probe_token().replace('-', "_")
+        );
+        let mut admin = Conn::connect(Driver::Postgres, &base).await.unwrap();
+        admin
+            .execute(&format!("CREATE DATABASE {name}"))
+            .await
+            .unwrap();
+        let connection = format!("{base} dbname={name}");
+        let result = tokio::task::LocalSet::new()
+            .run_until(async move {
+                tokio::task::spawn_local(async move {
+                    let mut conn = Conn::connect(Driver::Postgres, &connection).await.unwrap();
+                    conn.execute(
+                        "CREATE SCHEMA app; CREATE TABLE app.t(id integer, body text); \
+                         CREATE VIEW app.historical AS SELECT id FROM app.t",
+                    )
+                    .await
+                    .unwrap();
+                    let toast = conn
+                        .query(
+                            "SELECT count(*) AS n FROM pg_catalog.pg_class \
+                             WHERE oid = 'app.t'::regclass AND reltoastrelid <> 0",
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        toast[0].try_get::<i64>("n").unwrap(),
+                        Some(1),
+                        "the fixture table has out-of-line storage"
+                    );
+                    let captured = capture(&mut conn, &fixture_scope()).await.unwrap();
+                    let mentions = |id: &ObjectIdentity| format!("{id:?}").contains("\"pg_toast\"");
+                    let storage: Vec<_> =
+                        captured.inputs.keys().filter(|id| mentions(id)).collect();
+                    assert!(storage.is_empty(), "TOAST storage captured: {storage:?}");
+                    assert!(captured.inputs.contains_key(&ObjectIdentity {
+                        class: "pg_class".into(),
+                        name: vec!["app".into(), "t".into()],
+                        signature: vec![],
+                    }));
+                })
+                .await
+            })
+            .await;
+        admin
+            .execute(&format!("DROP DATABASE {name} WITH (FORCE)"))
+            .await
+            .unwrap();
+        result.expect("TOAST capture fixture failed after cleanup");
+    }
+}

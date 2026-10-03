@@ -1197,6 +1197,13 @@ grantor and shared-dependency edge, including the default privileges applied at
 creation. That was a second implementation of PostgreSQL's permission rules: it
 took most of this issue's commits and review findings, and each round surfaced
 another catalog case to model and measure, such as empty default ACLs (#1304).
+The same rule leaves a table's TOAST relation out of the capture, with its
+index, columns and dependency rows. It is out-of-line storage, physical as the
+table's relfilenode already is: no expression binds it, and its name embeds the
+table's OID, so scratch compilation and the target never name it alike.
+Captured, it was an unowned record that a dropped table still listed in the
+closing manifest, and the valid drop failed its recheck.
+
 A rebuild that would drop a routine grant
 option is the ordinary connected rebuild guard's refusal
 (`modules::before_a_rebuild`), not the producer's.
