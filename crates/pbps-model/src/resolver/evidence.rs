@@ -482,6 +482,15 @@ mod tests {
         serde_json::from_value(json).unwrap()
     }
 
+    /// A fresh read reused as a later plan's opening capture, read with an
+    /// opening capture's scope. The closing read rereads every record it
+    /// lists as a retained root; an opening capture keeps only its own.
+    pub(super) fn as_opening(manifest: &InputManifest, opening: &InputManifest) -> InputManifest {
+        let mut json = serde_json::to_value(manifest).unwrap();
+        json["scope"] = serde_json::to_value(opening.scope()).unwrap();
+        serde_json::from_value(json).unwrap()
+    }
+
     /// The closing manifest's shape (DEC-1274.1): every opening record the
     /// plan does not remove is kept unchanged, and no installed record is
     /// predicted. One that is present at all is only the placeholder of its
@@ -517,6 +526,15 @@ mod tests {
                 assert!(evidence.after.prerequisites().contains(record));
             }
         }
+        // The closing read rereads every record the closing manifest lists,
+        // including one no remaining expression reaches.
+        let listed: BTreeSet<_> = evidence
+            .after
+            .prerequisites()
+            .iter()
+            .map(|p| p.object.clone())
+            .collect();
+        assert!(listed.is_subset(&evidence.after.scope().retained));
     }
 
     pub(super) fn plan() -> SavedPlan {
