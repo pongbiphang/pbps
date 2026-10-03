@@ -4657,7 +4657,23 @@ async fn dropping_a_table_with_toast_storage_closes_on_the_actual_catalog() {
     base.tables.insert(kept.clone(), table);
     let mut desired = base.clone();
     desired.tables.remove(&dropped);
-    let inputs = Inputs::from_pair((base, desired));
+    // A drop is a human's recorded intent, never inferred from absence.
+    let base_ids = ids(&base, &IdsFile::default());
+    let desired_ids = pbps_diff::resolve(
+        &desired,
+        &base_ids,
+        &[pbps_model::Intent::DropTable {
+            table: dropped.clone(),
+            reason: "retired with its out-of-line storage".into(),
+        }],
+        &pbps_diff::Context {
+            operator: "1274-test".into(),
+            today: "2026-10-03".into(),
+        },
+    )
+    .unwrap()
+    .ids;
+    let inputs = Inputs::with_ids(base, desired, base_ids, desired_ids);
     let key = ProjectKey::new(true);
     let mut owned = Some(ObservedContainers::begin());
     let mut target = target().await;
