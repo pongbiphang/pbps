@@ -419,7 +419,7 @@ folded into the role.
 | Change | Size |
 |---|---|
 | `Permission` includes `usage`, `create`, `truncate`, `trigger`, `maintain`; unsupported words are dialect-refused | An enum and a `validate_role` table |
-| `GrantTarget::Object` names a function by signature | The `ModuleId` of [ADR-0009](ADR-0009-postgres-modules.md) |
+| `GrantTarget::Routine(RoutineId)` names one function or procedure overload by signature; name-only targets stay `GrantTarget::Object(ObjectName)` | The `RoutineId` that `ModuleId::Routine` of [ADR-0009](ADR-0009-postgres-modules.md) also carries |
 | Role *existence* is a dialect capability rather than a given | A trait method; SQL Server keeps today's answer |
 | PostgreSQL catalog read-back, ACL expansion, unexpressible reporting | Implemented in `pbps-pg`; step 6 and its amendment below record the measured scope |
 
