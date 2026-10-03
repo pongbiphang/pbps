@@ -28356,6 +28356,229 @@ async fn doctor_adopted_revoke_requires_the_original_grantor() {
     );
 }
 
+/// #565: among inherited candidates the engine selects the nearest, so a
+/// unique nearest one decides who can revoke an adopted ACL entry. Four
+/// tables, each with its own owner `o`, grant-option holder `b`, and an
+/// entry for the managed recipient issued by `o`:
+///
+/// - `near`: the deployer inherits `o` directly and `b` through `h`. `o` is
+///   nearest, so the entry is revocable, and an actual `REVOKE` removes it.
+/// - `far`: `b` directly, `o` through `h`. `b` is nearest and did not issue
+///   the entry: a gap, and the `REVOKE` leaves it.
+/// - `tied`: `o` and `b` both directly. Same depth, so still ambiguous.
+/// - `cut`: `o` granted `WITH INHERIT FALSE`, `b` through `h`. `o` is no
+///   candidate at all, so `b` is nearest: a gap, and the entry stays.
+///
+/// Doctor and the catalog read share the predicate; both are asked, before
+/// any `REVOKE` runs.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn the_nearest_inherited_grantor_decides_an_adopted_revoke() {
+    let mut db = TestDb::create("nearest565").await;
+    let (deployer, mut theirs) = grant_deployer(&mut db, "near565_d").await;
+    let recipient = least_privilege_role(&mut db, "near565_r").await;
+    let mut roles = vec![recipient.clone(), deployer.clone()];
+    for (table, shape) in [("near", 0), ("far", 1), ("tied", 2), ("cut", 3)] {
+        let o = least_privilege_role(&mut db, &format!("near565_{table}_o")).await;
+        let h = least_privilege_role(&mut db, &format!("near565_{table}_h")).await;
+        let b = least_privilege_role(&mut db, &format!("near565_{table}_b")).await;
+        let memberships = match shape {
+            0 => format!("GRANT {o} TO {deployer}; GRANT {h} TO {deployer}; GRANT {b} TO {h};"),
+            1 => format!("GRANT {b} TO {deployer}; GRANT {h} TO {deployer}; GRANT {o} TO {h};"),
+            2 => format!("GRANT {o} TO {deployer}; GRANT {b} TO {deployer};"),
+            _ => format!(
+                "GRANT {o} TO {deployer} WITH INHERIT FALSE; GRANT {h} TO {deployer}; \
+                 GRANT {b} TO {h};"
+            ),
+        };
+        db.conn
+            .execute(&format!(
+                "CREATE TABLE public.{table}(id integer);
+                 ALTER TABLE public.{table} OWNER TO {o};
+                 SET ROLE {o};
+                 GRANT SELECT ON public.{table} TO {b} WITH GRANT OPTION;
+                 GRANT SELECT ON public.{table} TO {recipient};
+                 RESET ROLE;
+                 {memberships}"
+            ))
+            .await
+            .unwrap();
+        roles.extend([o, h, b]);
+    }
+    let grants = pbps_db::doctor::GrantTargets {
+        roles: vec![recipient.clone()],
+        managed_tables: ["near", "far", "tied", "cut"]
+            .iter()
+            .map(|t| format!("public.{t}").parse().unwrap())
+            .collect(),
+        ..Default::default()
+    };
+    let gaps = doctor::missing(&grant_diagnosis(&mut theirs, &grants).await);
+    let gap_on = |table: &str| {
+        gaps.iter()
+            .any(|g| g.securable() == format!("TABLE \"public\".\"{table}\""))
+    };
+    let pulled = pbps_pg::catalog::introspect(&mut theirs).await.unwrap();
+    let unrevocable_on = |table: &str| {
+        pulled.unrevocable.iter().any(|u| {
+            u.role == recipient
+                && matches!(&u.target, pbps_model::GrantTarget::Object(o) if o.name == table)
+        })
+    };
+    let mut left = std::collections::BTreeMap::new();
+    for table in ["near", "far", "tied", "cut"] {
+        theirs
+            .execute(&format!("REVOKE SELECT ON public.{table} FROM {recipient}"))
+            .await
+            .unwrap();
+        let still = truth(
+            &mut db.conn,
+            &format!(
+                "SELECT EXISTS (SELECT FROM pg_class c CROSS JOIN LATERAL aclexplode(c.relacl) a
+                 WHERE c.oid = 'public.{table}'::regclass AND a.grantee = '{recipient}'::regrole)"
+            ),
+        )
+        .await;
+        left.insert(table, still);
+    }
+    for role in &roles {
+        cleanup_role(&mut db, role).await;
+    }
+    db.drop().await;
+
+    assert!(!gap_on("near"), "{gaps:?}");
+    assert!(!unrevocable_on("near"), "{:?}", pulled.unrevocable);
+    assert!(
+        !left["near"],
+        "the nearest owner's REVOKE removes its entry"
+    );
+    for table in ["far", "cut"] {
+        assert!(gap_on(table), "{table}: {gaps:?}");
+        assert!(unrevocable_on(table), "{table}: {:?}", pulled.unrevocable);
+        assert!(left[table], "{table}: the nearer holder's REVOKE leaves it");
+    }
+    assert!(gap_on("tied"), "{gaps:?}");
+    assert!(unrevocable_on("tied"), "{:?}", pulled.unrevocable);
+}
+
+/// The nearest-grantor walk visits each role once per depth, and has no
+/// depth cutoff of its own (review of #1422). In both shapes a grant-option
+/// holder sits one membership beyond the owner, so two candidates compete and
+/// the walk must run; the owner is the unique nearest, so its entry is
+/// revocable and the `REVOKE` removes it:
+///
+/// - `deep`: the owner 70 inheritable memberships away, past any fixed cap.
+/// - `diamond`: 24 levels of two roles, each inheriting both of the next.
+///   That is 2^24 paths, which a walk listing paths cannot finish in time.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn a_deep_or_diamond_membership_graph_still_finds_the_nearest_grantor() {
+    let mut db = TestDb::create("graph565").await;
+    let (deployer, mut theirs) = grant_deployer(&mut db, "graph565_d").await;
+    let recipient = least_privilege_role(&mut db, "graph565_r").await;
+    let pid = std::process::id();
+    let mut made: Vec<String> = Vec::new();
+    let mut sql = String::new();
+    let mut role = |name: String, sql: &mut String| {
+        sql.push_str(&format!("CREATE ROLE {name} NOLOGIN; "));
+        made.push(name.clone());
+        name
+    };
+    // The chain: deployer -> c1 -> ... -> c70 -> owner.
+    let deep_owner = role(format!("pbps_g565_deep_o_{pid}"), &mut sql);
+    let mut above = deployer.clone();
+    for level in 1..=70 {
+        let next = role(format!("pbps_g565_c{level}_{pid}"), &mut sql);
+        sql.push_str(&format!("GRANT {next} TO {above}; "));
+        above = next;
+    }
+    sql.push_str(&format!("GRANT {deep_owner} TO {above}; "));
+    // The diamond: deployer -> {a1, b1} -> ... -> {a24, b24} -> owner.
+    let diamond_owner = role(format!("pbps_g565_dia_o_{pid}"), &mut sql);
+    let mut level_above = vec![deployer.clone()];
+    for level in 1..=24 {
+        let pair = vec![
+            role(format!("pbps_g565_a{level}_{pid}"), &mut sql),
+            role(format!("pbps_g565_b{level}_{pid}"), &mut sql),
+        ];
+        for upper in &level_above {
+            for lower in &pair {
+                sql.push_str(&format!("GRANT {lower} TO {upper}; "));
+            }
+        }
+        level_above = pair;
+    }
+    for upper in &level_above {
+        sql.push_str(&format!("GRANT {diamond_owner} TO {upper}; "));
+    }
+    for (table, owner) in [("deep", &deep_owner), ("diamond", &diamond_owner)] {
+        // A second candidate, one membership beyond the owner.
+        let holder = role(format!("pbps_g565_{table}_b_{pid}"), &mut sql);
+        sql.push_str(&format!(
+            "GRANT {holder} TO {owner}; \
+             CREATE TABLE public.{table}(id integer); \
+             ALTER TABLE public.{table} OWNER TO {owner}; \
+             SET ROLE {owner}; \
+             GRANT SELECT ON public.{table} TO {holder} WITH GRANT OPTION; \
+             GRANT SELECT ON public.{table} TO {recipient}; RESET ROLE; "
+        ));
+    }
+    db.conn.execute(&sql).await.unwrap();
+    let grants = pbps_db::doctor::GrantTargets {
+        roles: vec![recipient.clone()],
+        managed_tables: ["deep", "diamond"]
+            .iter()
+            .map(|t| format!("public.{t}").parse().unwrap())
+            .collect(),
+        ..Default::default()
+    };
+    let in_time = std::time::Duration::from_secs(60);
+    let gaps = doctor::missing(
+        &tokio::time::timeout(in_time, grant_diagnosis(&mut theirs, &grants))
+            .await
+            .expect("doctor answers within a minute on a diamond graph"),
+    );
+    let pulled = tokio::time::timeout(in_time, pbps_pg::catalog::introspect(&mut theirs))
+        .await
+        .expect("the catalog read answers within a minute on a diamond graph")
+        .unwrap();
+    let mut removed = Vec::new();
+    for table in ["deep", "diamond"] {
+        theirs
+            .execute(&format!("REVOKE SELECT ON public.{table} FROM {recipient}"))
+            .await
+            .unwrap();
+        removed.push(
+            !truth(
+                &mut db.conn,
+                &format!(
+                    "SELECT EXISTS (SELECT FROM pg_class c CROSS JOIN LATERAL aclexplode(c.relacl) a
+                     WHERE c.oid = 'public.{table}'::regclass AND a.grantee = '{recipient}'::regrole)"
+                ),
+            )
+            .await,
+        );
+    }
+    db.conn
+        .execute("DROP TABLE public.deep, public.diamond")
+        .await
+        .unwrap();
+    for name in made.iter().rev() {
+        db.conn.execute(&format!("DROP ROLE {name}")).await.unwrap();
+    }
+    for role in [&recipient, &deployer] {
+        cleanup_role(&mut db, role).await;
+    }
+    db.drop().await;
+    assert!(gaps.is_empty(), "{gaps:?}");
+    assert!(
+        !pulled.unrevocable.iter().any(|u| u.role == recipient),
+        "{:?}",
+        pulled.unrevocable
+    );
+    assert_eq!(removed, [true, true], "each owner's entry is removed");
+}
+
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 async fn doctor_routine_grants_use_canonical_types_and_restore_the_search_path() {

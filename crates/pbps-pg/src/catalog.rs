@@ -1363,7 +1363,8 @@ fn grants_query() -> String {
         "COALESCE(n.nspacl, pg_catalog.acldefault('n'::\"char\", n.nspowner))",
     );
     format!(
-        "SELECT n.nspname AS schema_name, c.relname AS object_name,
+        "WITH RECURSIVE {MEMBERSHIP_DEPTHS}
+         SELECT n.nspname AS schema_name, c.relname AS object_name,
                 'rel' AS source, c.relkind::text AS kind,
                 NULL::int8 AS routine_oid, NULL::text AS column_name,
                 CASE WHEN a.grantee = 0 THEN NULL
@@ -1505,12 +1506,27 @@ fn owners_query() -> String {
 /// An effective grant option answers `GRANT`, not `REVOKE`: PostgreSQL only
 /// changes the entries attributed to the grantor it selects. Owner and
 /// superuser act as the owner; otherwise the current role wins when it holds a
-/// **direct** option, and a **unique inherited** option is sufficient too —
-/// measured on 18.6, `ih_deploy` inheriting `ih_mid` and holding no direct
-/// option of its own revoked `ih_reader=r/ih_mid`, while the same revoke with
-/// a competing direct option in place removed nothing and reported success.
-/// Competing inherited paths need explicit role selection, because PostgreSQL
-/// does not promise which one wins (DECISIONS 483).
+/// **direct** option, and a **nearest unique inherited** option is
+/// sufficient too — measured on 18.6, `ih_deploy` inheriting `ih_mid` and
+/// holding no direct option of its own revoked `ih_reader=r/ih_mid`, while the
+/// same revoke with a competing direct option in place removed nothing and
+/// reported success.
+///
+/// Among inherited candidates the engine takes the **nearest**: it walks the
+/// inheritable memberships breadth first from the current role (with the
+/// database owner's implicit `pg_database_owner`) and selects the first role
+/// holding the option (`select_best_grantor`). So a unique candidate at the
+/// least depth wins. Measured on 18 and 16, a deployer inheriting the owner
+/// directly and a grant-option holder through one more role revoked the
+/// owner's entry (#565). Candidates sharing the least depth are still
+/// ambiguous: the walk's order within one depth is the catalog's, and
+/// PostgreSQL does not promise it (DECISIONS 483). A candidate whose depth the
+/// walk does not find declines the selection rather than being left out,
+/// since leaving out a nearer competitor would let a farther role look
+/// nearest (DEC-565.1).
+///
+/// The depths come from [`MEMBERSHIP_DEPTHS`], which the caller's statement
+/// declares once, rather than from a walk inside this expression (#1422).
 ///
 /// One original grantor per grantee, target **and privilege** as well: a
 /// `REVOKE` removes only the entries its selected grantor put there, so
@@ -1524,27 +1540,66 @@ fn owners_query() -> String {
 /// #251).
 ///
 /// `owner` and `acl` are the catalog columns of the securable in the caller's
-/// query; the caller supplies `me` as a `pg_roles` row for `current_user`.
+/// query; the caller supplies `me` as a `pg_roles` row for `current_user`,
+/// and declares [`MEMBERSHIP_DEPTHS`] in its `WITH RECURSIVE`.
 pub(crate) fn revocable_by_current_role(owner: &str, acl: &str) -> String {
+    // The inherited candidates, each with its least depth from the statement's
+    // `member_depth` (NULL where the walk found none).
+    let candidates = format!(
+        "SELECT k.oid, d.depth, min(d.depth) OVER () AS nearest FROM (
+             SELECT {owner} AS oid WHERE pg_catalog.pg_has_role(me.oid, {owner}, 'USAGE')
+             UNION
+             SELECT opt.grantee FROM pg_catalog.aclexplode({acl}) opt
+              WHERE opt.is_grantable AND opt.privilege_type = a.privilege_type
+                AND opt.grantee <> 0
+                AND pg_catalog.pg_has_role(me.oid, opt.grantee, 'USAGE')
+           ) k LEFT JOIN member_depth d ON d.oid = k.oid"
+    );
     format!(
         "COALESCE(a.grantor = CASE
              WHEN me.rolsuper OR me.oid = {owner} THEN {owner}
              WHEN EXISTS (SELECT FROM pg_catalog.aclexplode({acl}) own
                  WHERE own.grantee = me.oid AND own.is_grantable
                    AND own.privilege_type = a.privilege_type) THEN me.oid
-             ELSE (SELECT min(candidate.oid::bigint)::oid FROM (
-                 SELECT {owner} AS oid WHERE pg_catalog.pg_has_role(me.oid, {owner}, 'USAGE')
-                 UNION
-                 SELECT opt.grantee FROM pg_catalog.aclexplode({acl}) opt
-                  WHERE opt.is_grantable AND opt.privilege_type = a.privilege_type
-                    AND opt.grantee <> 0
-                    AND pg_catalog.pg_has_role(me.oid, opt.grantee, 'USAGE')
-             ) candidate HAVING count(*) = 1)
+             ELSE (SELECT CASE
+                     WHEN count(*) = 1 THEN min(n.oid::bigint)::oid
+                     WHEN NOT bool_or(n.depth IS NULL)
+                      AND count(*) FILTER (WHERE n.depth = n.nearest) = 1
+                       THEN (min(n.oid::bigint) FILTER (WHERE n.depth = n.nearest))::oid
+                   END
+                     FROM ({candidates}) n)
          END, false) AND (SELECT count(DISTINCT grantor)
              FROM pg_catalog.aclexplode({acl})
             WHERE grantee = a.grantee AND privilege_type = a.privilege_type) = 1"
     )
 }
+
+/// The `WITH RECURSIVE` members [`revocable_by_current_role`] reads: every
+/// role the current role reaches through inheritable memberships (with the
+/// database owner's implicit `pg_database_owner`), at its least depth.
+///
+/// Computed once per statement and joined per ACL row. Written inside each
+/// row's expression instead, the planner multiplied the recursive walk's cost
+/// by every ACL row, the estimate crossed `jit_above_cost`, and every catalog
+/// read paid about 450 ms of JIT compilation on 18 (CI on #1422). One row
+/// per role and depth keeps a graph of repeated diamonds to roles × depth
+/// rows, and the bound is the number of roles, which no acyclic membership
+/// path can exceed.
+pub(crate) const MEMBERSHIP_DEPTHS: &str = "\
+member_reach(oid, depth) AS (
+    SELECT r.oid, 0 FROM pg_catalog.pg_roles r WHERE r.rolname = current_user
+    UNION
+    SELECT e.roleid, r.depth + 1 FROM member_reach r
+      JOIN (SELECT m.member, m.roleid FROM pg_catalog.pg_auth_members m
+             WHERE m.inherit_option
+            UNION ALL
+            SELECT d.datdba, 'pg_database_owner'::pg_catalog.regrole::oid
+              FROM pg_catalog.pg_database d
+             WHERE d.datname = pg_catalog.current_database()) e
+        ON e.member = r.oid
+     WHERE r.depth < (SELECT count(*) FROM pg_catalog.pg_roles)),
+member_depth AS MATERIALIZED (
+    SELECT oid, min(depth) AS depth FROM member_reach GROUP BY oid)";
 
 const NOT_AN_INDEX_OR_TOAST: &str = "c.relkind NOT IN ('i', 'I', 't')";
 

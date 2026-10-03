@@ -771,3 +771,43 @@ The live regressions are `doctor_requires_alter_only_until_the_existing_ledger_i
 (SQL Server) and `doctor_requires_ownership_only_until_the_existing_ledger_is_migrated`
 (PostgreSQL). Each shows the gap on an unmigrated ledger and its absence once
 the ledger is migrated.
+
+<a id="dec-565-1"></a>
+
+**DEC-565.1. Among inherited grantor candidates, a unique nearest one is the
+grantor a `REVOKE` selects.** DECISIONS 483 treated every competition between
+inherited candidates as ambiguous. That is right within one depth and too
+conservative across depths. PostgreSQL's `select_best_grantor` walks the
+current role's inheritable memberships breadth first, with the database
+owner's implicit `pg_database_owner`, and takes the first role that holds the
+option.
+
+Measured on 18 and 16: a deployer inheriting the table owner directly, and a
+grant-option holder through one more role, revoked the owner's entry, while
+doctor and the catalog read reported a gap. `revocable_by_current_role` now
+computes each candidate's least depth and accepts a candidate only when it is
+alone at the least depth.
+
+What stays as it was:
+
+- The owner, superuser and direct-option branches still come first.
+- Candidates sharing the least depth are still ambiguous, because the walk's
+  order within one depth is the catalog's (DECISIONS 483).
+- A candidate the walk gives no depth declines the whole selection rather
+  than being left out, since dropping a nearer competitor would make a farther
+  role look nearest.
+- A membership granted `WITH INHERIT FALSE` is no path at all.
+- The walk keeps one row per role and depth, so a graph of repeated diamonds
+  costs roles times depth rather than one row per path. It has no fixed depth
+  cap: it is bounded by the number of roles, which no acyclic membership path
+  can exceed.
+- The walk runs once per statement, as a `WITH RECURSIVE` member the query
+  declares, and each ACL row only looks its candidates up. Inside each row's
+  expression, the planner charged the walk once per ACL row; the estimate
+  crossed `jit_above_cost`, and every catalog read paid about 450 ms of JIT
+  compilation on 18, which slowed the live CI shards several times over.
+
+The live regression is `the_nearest_inherited_grantor_decides_an_adopted_revoke`.
+It asks doctor and the catalog read, then checks each case with an actual
+`REVOKE` and an ACL readback: owner nearer, holder nearer, a tie, and a
+non-inheritable owner.
