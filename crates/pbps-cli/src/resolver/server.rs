@@ -2179,9 +2179,9 @@ impl ScratchRun {
                 .planning_records()
                 .map_err(|error| Error::Binding(error.to_string()))?;
             let (base_side, desired_side) = planning.expect("qualified planning sides");
-            let surfaces = resolution::from_records(
-                base_side.schema,
-                desired_side.schema,
+            let surfaces = resolution::from_sides(
+                base_side,
+                desired_side,
                 &resolution::records(opening),
                 &records,
                 &assessment,
