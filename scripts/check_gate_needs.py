@@ -5,8 +5,10 @@
 a job missing from that list runs, goes red, and the gate stays green. A
 comment cannot keep the list complete; this check can.
 
-It reads the workflow as text rather than through a YAML library, because the
-`lint` job runs it before any dependency is installed. The two shapes it reads
+It runs in `ci-gate` itself, because a check in a job the gate waits on is
+dropped together with `needs` when someone deletes it. It reads the workflow
+as text rather than through a YAML library, because that job installs
+nothing beyond a checkout. The two shapes it reads
 are the ones ci.yml uses: a job is a two-space-indented key directly under
 `jobs:`, and the gate's `needs` is one flow-style list.
 """

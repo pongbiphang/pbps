@@ -63,6 +63,12 @@ class GateNeeds(unittest.TestCase):
         text = WORKFLOW.replace("needs: [lint, live]", "needs:\n      - lint\n      - live")
         self.assertEqual(gn.problems(text), ["`gate.needs` is not one `[a, b, ...]` list"])
 
+    def test_a_gate_with_no_needs_fails_rather_than_passing(self):
+        # Without `needs` the gate waits on nothing and its own success check
+        # passes on an empty set, so the checker is the only thing left.
+        text = WORKFLOW.replace("    needs: [lint, live]\n", "")
+        self.assertEqual(gn.problems(text), ["`gate.needs` is not one `[a, b, ...]` list"])
+
     def test_a_missing_gate_fails_rather_than_passing(self):
         text = WORKFLOW.replace("  gate:\n", "  other:\n")
         self.assertEqual(gn.problems(text), ["no `gate` job"])
