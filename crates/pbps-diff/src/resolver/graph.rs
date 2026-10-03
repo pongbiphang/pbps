@@ -7,13 +7,17 @@ use std::collections::BTreeSet;
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(super) fn provides(c: &Change) -> BTreeSet<Surface> {
     match c {
+        // A generation expression stays in its CREATE TABLE, where its place
+        // in the column order is; a default is split out (prepare.rs). Either
+        // way the step that writes it provides its `pg_attrdef` surface, so a
+        // function it calls is ordered first (DEC-1168.1, DEC-1274.2).
         Change::CreateTable { name, table, .. } => std::iter::once(Surface::Table(name.clone()))
-            .chain(
-                table
-                    .columns
-                    .keys()
-                    .map(|n| Surface::Column(name.column(n))),
-            )
+            .chain(table.columns.iter().flat_map(|(n, column)| {
+                std::iter::once(Surface::Column(name.column(n))).chain(
+                    (column.default.is_some() || column.generated.is_some())
+                        .then(|| Surface::Default(name.column(n))),
+                )
+            }))
             .collect(),
         Change::AddColumn {
             table,
@@ -22,7 +26,7 @@ pub(super) fn provides(c: &Change) -> BTreeSet<Surface> {
             ..
         } => {
             let mut set = BTreeSet::from([Surface::Column(table.column(name))]);
-            if column.default.is_some() {
+            if column.default.is_some() || column.generated.is_some() {
                 set.insert(Surface::Default(table.column(name)));
             }
             set
@@ -31,7 +35,10 @@ pub(super) fn provides(c: &Change) -> BTreeSet<Surface> {
             column,
             to: Some(_),
             ..
-        } => BTreeSet::from([Surface::Default(column.clone())]),
+        }
+        | Change::AlterColumnExpression { column, .. } => {
+            BTreeSet::from([Surface::Default(column.clone())])
+        }
         Change::CreateModule { id, .. } | Change::AlterModule { id, .. } => {
             BTreeSet::from([Surface::Module(id.clone())])
         }
@@ -356,7 +363,9 @@ pub(super) fn constraints(
             for input in &desired.managed_inputs {
                 for (i, surfaces) in made.iter().enumerate() {
                     if surfaces.contains(input) {
-                        for &create in &creates {
+                        // A table's generation expression reads columns the
+                        // same CREATE TABLE makes: no step precedes itself.
+                        for &create in creates.iter().filter(|&&create| create != i) {
                             edge(i, create, OrderReason::Binding);
                         }
                     }
