@@ -798,6 +798,39 @@ pub enum Part {
     Computed,
 }
 
+/// Drops each `SetIndexStorageParameters` whose part the same plan creates
+/// again: an `AddIndex`, `AddUnique` or adding `SetPrimaryKey` carries the
+/// declared parameters in its `CREATE`, and an `ALTER INDEX` beside it would
+/// run while the index is dropped, or be held at a staged checkpoint to an
+/// index the plan has taken away (#1483 review). The differ calls it after
+/// its rebuild passes, and the connected plan after it weaves rebuilds in.
+// The complement creates no index part.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub fn drop_parameter_changes_of_rebuilt_indexes<T>(
+    changes: &mut Vec<T>,
+    change: impl Fn(&T) -> &Change,
+) {
+    let rebuilt: BTreeSet<(TableName, IndexPart)> = changes
+        .iter()
+        .filter_map(|c| match change(c) {
+            Change::AddIndex { table, name, .. } => {
+                Some((table.clone(), IndexPart::Index(name.clone())))
+            }
+            Change::AddUnique { table, name, .. } => {
+                Some((table.clone(), IndexPart::Unique(name.clone())))
+            }
+            Change::SetPrimaryKey {
+                table, to: Some(_), ..
+            } => Some((table.clone(), IndexPart::PrimaryKey)),
+            _ => None,
+        })
+        .collect();
+    changes.retain(|c| {
+        !matches!(change(c), Change::SetIndexStorageParameters { table, target, .. }
+            if rebuilt.contains(&(table.clone(), target.clone())))
+    });
+}
+
 /// The index whose storage parameters a [`Change::SetIndexStorageParameters`]
 /// sets: the primary key's, a unique constraint's (which carries the
 /// constraint's name), or a standalone index's (#1442).
@@ -2373,6 +2406,55 @@ impl ChangeSet {
 
 #[cfg(test)]
 mod tests {
+
+    /// A part the plan creates again takes its parameters in its `CREATE`,
+    /// so a separate change to them is dropped; one on a part left standing
+    /// is kept (#1483 review).
+    #[test]
+    fn a_rebuilt_indexs_parameter_change_is_dropped() {
+        let t: TableName = "app.t".parse().unwrap();
+        let set = |target: IndexPart| Change::SetIndexStorageParameters {
+            table: t.clone(),
+            target,
+            method: IndexMethod::Btree,
+            set: [("fillfactor".to_owned(), "80".to_owned())].into(),
+            reset: BTreeSet::new(),
+        };
+        let mut changes = vec![
+            set(IndexPart::Index("ix".into())),
+            Change::DropIndex {
+                table: t.clone(),
+                name: "ix".into(),
+            },
+            Change::AddIndex {
+                table: t.clone(),
+                name: "ix".into(),
+                index: Box::new(Index {
+                    columns: Vec::new(),
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                    method: IndexMethod::Btree,
+                    storage_parameters: BTreeMap::new(),
+                }),
+                clustered: false,
+            },
+            set(IndexPart::Index("other".into())),
+            set(IndexPart::PrimaryKey),
+        ];
+        drop_parameter_changes_of_rebuilt_indexes(&mut changes, |c| c);
+        let left: Vec<&Change> = changes
+            .iter()
+            .filter(|c| matches!(c, Change::SetIndexStorageParameters { .. }))
+            .collect();
+        assert_eq!(
+            left,
+            [
+                &set(IndexPart::Index("other".into())),
+                &set(IndexPart::PrimaryKey)
+            ]
+        );
+    }
     use super::*;
 
     /// `--allow` names a class and the gate explains it; a class that gained a

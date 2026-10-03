@@ -1964,7 +1964,9 @@ SET (…), RESET (…)`, in class 10, with an estimate that reads nothing and
 names the method's lock. The key's index is found by a `DO` block when it
 runs, as its drop is, since a declared key need not be named. A part rebuilt
 for its definition carries its declared parameters in its `CREATE`, so none
-is lost on recreate.
+is lost on recreate, and a parameter change for a part the plan rebuilds is
+dropped, whichever pass rebuilt it: the differ's, or a rebuild woven around a
+function (#1483 review).
 
 **Read.** From each index's `reloptions`, the key's and a unique
 constraint's through `conindid`. A name outside its method's list, or a value

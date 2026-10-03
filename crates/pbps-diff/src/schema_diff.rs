@@ -528,6 +528,9 @@ fn diff_partial_rebuilding(
     // it is pure computation over the changes already built, and a caller that
     // is going to *report* the partial set needs it sorted and classified
     // exactly as a plan would be.
+    // After every pass that rebuilds an index: its `CREATE` carries the
+    // declared parameters (#1483 review).
+    pbps_model::change::drop_parameter_changes_of_rebuilt_indexes(&mut changes, |c| c);
     let mut planned: Vec<PlannedChange> = changes.into_iter().map(PlannedChange::new).collect();
     for p in &mut planned {
         p.risks = dialect.change_risks(&p.change);
