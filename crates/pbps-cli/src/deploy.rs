@@ -3788,36 +3788,54 @@ fn refuse_unplanned_movement(
                     "{now_name} storage parameters are not the ones this plan leaves"
                 ));
             }
-            // An index's parameters the plan sets in place, held once the
-            // run is whole to the before-read with its `set` and `reset`
-            // applied: its part is excused above, as an index change's is,
-            // and a session's change after the plan's would otherwise be
-            // recorded as the plan's (#1442).
+            // An index whose parameters the plan sets in place, held once
+            // the run is whole to the before-read with only that change
+            // applied, the whole part and not its parameters alone: its part
+            // is excused above, as an index change's is, so a session that
+            // drops it, or recreates it under its name with another
+            // definition, after the plan's `ALTER INDEX` would otherwise be
+            // recorded as the plan's result (#1442, #1483 review).
             for (table, target, set, reset) in &index_storage_changes {
                 if *table != now_name || !settled.whole() {
                     continue;
                 }
-                let of = |t: &pbps_model::Table| -> Option<BTreeMap<String, String>> {
-                    match target {
-                        pbps_model::IndexPart::PrimaryKey => {
-                            t.primary_key.as_ref().map(|k| k.storage_parameters.clone())
-                        }
-                        pbps_model::IndexPart::Unique(n) => {
-                            t.unique.get(n).map(|u| u.storage_parameters.clone())
-                        }
-                        pbps_model::IndexPart::Index(n) => {
-                            t.indexes.get(n).map(|ix| ix.storage_parameters.clone())
-                        }
-                    }
+                let apply = |parameters: &mut BTreeMap<String, String>| {
+                    parameters.retain(|k, _| !reset.contains(k));
+                    parameters.extend(set.iter().map(|(k, v)| (k.clone(), v.clone())));
                 };
-                let (Some(mut expected), Some(left)) = (of(was), of(now)) else {
-                    continue;
+                // `None` where the before-read has no such part: the plan was
+                // made against something else, which the parts' own
+                // comparison answers for.
+                let (what, held) = match target {
+                    pbps_model::IndexPart::PrimaryKey => (
+                        "primary key".to_owned(),
+                        was.primary_key.as_ref().map(|w| {
+                            let mut expected = w.clone();
+                            apply(&mut expected.storage_parameters);
+                            now.primary_key.as_ref() == Some(&expected)
+                        }),
+                    ),
+                    pbps_model::IndexPart::Unique(n) => (
+                        format!("unique `{n}`"),
+                        was.unique.get(n).map(|w| {
+                            let mut expected = w.clone();
+                            apply(&mut expected.storage_parameters);
+                            now.unique.get(n) == Some(&expected)
+                        }),
+                    ),
+                    pbps_model::IndexPart::Index(n) => (
+                        format!("index `{n}`"),
+                        was.indexes.get(n).map(|w| {
+                            let mut expected = w.clone();
+                            apply(&mut expected.storage_parameters);
+                            now.indexes.get(n) == Some(&expected)
+                        }),
+                    ),
                 };
-                expected.retain(|k, _| !reset.contains(k));
-                expected.extend(set.iter().map(|(k, v)| (k.clone(), v.clone())));
-                if expected != left {
+                if held == Some(false) {
                     moved.push(format!(
-                        "{now_name} index storage parameters are not the ones this plan leaves"
+                        "{now_name} {what} is not the one this plan leaves: its index storage \
+                         parameters set, and nothing else changed"
                     ));
                 }
             }
@@ -12242,6 +12260,25 @@ mod tests {
             format!("{e:#}").contains("index storage parameters"),
             "{e:#}"
         );
+        // The whole index is held, not only its parameters: dropped, or
+        // recreated under its name with another definition, after the plan's
+        // `ALTER INDEX`, it is movement (#1483 review).
+        let mut dropped = schema("80");
+        dropped.tables.get_mut(&name).unwrap().indexes.clear();
+        let e = check(&dropped, Settled::Whole).expect_err("dropped");
+        assert!(format!("{e:#}").contains("`ix`"), "{e:#}");
+        let mut redefined = schema("80");
+        redefined
+            .tables
+            .get_mut(&name)
+            .unwrap()
+            .indexes
+            .get_mut("ix")
+            .unwrap()
+            .columns[0]
+            .descending = true;
+        let e = check(&redefined, Settled::Whole).expect_err("redefined");
+        assert!(format!("{e:#}").contains("`ix`"), "{e:#}");
     }
 
     /// Storage parameters are held across an apply (#1441): another
