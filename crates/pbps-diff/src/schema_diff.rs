@@ -436,6 +436,7 @@ fn diff_partial_rebuilding(
     recreate_retyped_dependents(base, declared, &renames, dialect, &mut changes);
     recreate_referenced_foreign_keys(base, declared, &renames, &mut changes);
     rebind_foreign_keys_to_a_new_occupant(base, declared, &mut changes);
+    unlink_cycles_around_persistence_switches(declared.schema, &mut changes);
     // After every pass that drops and re-adds an index: each re-add of the
     // identity's index loses the identity, and is followed by it again.
     let early_identity = diff_replica_identity(
@@ -900,42 +901,40 @@ fn diff_partial_rebuilding(
     // Switched to logged, the referenced table goes first, so by depth;
     // switched to unlogged, the referencing one, so by depth reversed: the
     // engine refuses either the other way round (measured on 16 and 18,
-    // #1443). Self-references do not count, and a cycle stops at its first
-    // repeat.
+    // #1443). Self-references do not count, nor the keys inside a cycle,
+    // which are dropped around the switches (#1488 review).
+    let components = foreign_key_components(declared.schema);
     let depth_of = {
         fn depth(
             t: &TableName,
             schema: &Schema,
-            seen: &mut Vec<TableName>,
+            components: &BTreeMap<TableName, TableName>,
             memo: &mut BTreeMap<TableName, usize>,
         ) -> usize {
             if let Some(d) = memo.get(t) {
                 return *d;
             }
-            if seen.contains(t) {
-                return 0;
-            }
-            seen.push(t.clone());
             let d = schema.tables.get(t).map_or(0, |table| {
                 table
                     .foreign_keys
                     .values()
-                    .filter(|fk| fk.references_table != *t)
-                    .map(|fk| 1 + depth(&fk.references_table, schema, seen, memo))
+                    // Not within its own cycle, whose keys are dropped
+                    // around the switches: what is left is acyclic.
+                    .filter(|fk| {
+                        fk.references_table != *t
+                            && components.get(&fk.references_table) != components.get(t)
+                    })
+                    .map(|fk| 1 + depth(&fk.references_table, schema, components, memo))
                     .max()
                     .unwrap_or(0)
             });
-            seen.pop();
             memo.insert(t.clone(), d);
             d
         }
         let mut memo = BTreeMap::new();
         let mut depths = BTreeMap::new();
         for t in declared.schema.tables.keys() {
-            depths.insert(
-                t.clone(),
-                depth(t, declared.schema, &mut Vec::new(), &mut memo),
-            );
+            depths.insert(t.clone(), depth(t, declared.schema, &components, &mut memo));
         }
         depths
     };
@@ -1994,6 +1993,100 @@ fn diff_computed(name: &TableName, base: &Table, declared: &Table, changes: &mut
             });
         }
     }
+}
+
+/// Each declared table's strongly connected component in the foreign-key
+/// graph, by the component's least member: tables that reach each other
+/// through foreign keys share one. Self-references do not count.
+fn foreign_key_components(schema: &Schema) -> BTreeMap<TableName, TableName> {
+    let edges = |t: &TableName| -> Vec<TableName> {
+        schema.tables.get(t).map_or_else(Vec::new, |table| {
+            table
+                .foreign_keys
+                .values()
+                .map(|fk| fk.references_table.clone())
+                .filter(|to| to != t && schema.tables.contains_key(to))
+                .collect()
+        })
+    };
+    // Which tables each table reaches; two share a component where each
+    // reaches the other. Quadratic, over a schema's tables, once a plan.
+    let mut reach: BTreeMap<TableName, BTreeSet<TableName>> = BTreeMap::new();
+    for t in schema.tables.keys() {
+        let mut seen = BTreeSet::new();
+        let mut stack = edges(t);
+        while let Some(next) = stack.pop() {
+            if seen.insert(next.clone()) {
+                stack.extend(edges(&next));
+            }
+        }
+        reach.insert(t.clone(), seen);
+    }
+    schema
+        .tables
+        .keys()
+        .map(|t| {
+            let least = schema
+                .tables
+                .keys()
+                .find(|u| *u == t || (reach[t].contains(*u) && reach[*u].contains(t)))
+                .unwrap_or(t);
+            (t.clone(), least.clone())
+        })
+        .collect()
+}
+
+/// Foreign keys inside a cycle of tables the plan switches between permanent
+/// and unlogged, dropped before the switches and added back after them
+/// (#1488 review). Inside a cycle no order works: whichever table switches
+/// first breaks a key of the other, permanent referencing unlogged. A valid
+/// declaration gives a cycle's tables one persistence (a permanent table
+/// referencing an unlogged one is refused), so they switch together. A key
+/// the plan already adds, new or rebuilt, stands neither side of the switch
+/// and is left alone.
+fn unlink_cycles_around_persistence_switches(declared: &Schema, changes: &mut Vec<Change>) {
+    let switching: BTreeSet<TableName> = changes
+        .iter()
+        .filter_map(|c| {
+            if let Change::SetTablePersistence { table, .. } = c {
+                Some(table.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    if switching.len() < 2 {
+        return;
+    }
+    let components = foreign_key_components(declared);
+    let mut unlinked = Vec::new();
+    for (name, table) in &declared.tables {
+        if !switching.contains(name) {
+            continue;
+        }
+        for (key, fk) in &table.foreign_keys {
+            let to = &fk.references_table;
+            let in_cycle = to != name
+                && switching.contains(to)
+                && components.contains_key(name)
+                && components.get(name) == components.get(to);
+            let added = changes.iter().any(|c| {
+                matches!(c, Change::AddForeignKey { table: t, name: n, .. } if t == name && n == key)
+            });
+            if in_cycle && !added {
+                unlinked.push(Change::DropForeignKey {
+                    table: name.clone(),
+                    name: key.clone(),
+                });
+                unlinked.push(Change::AddForeignKey {
+                    table: name.clone(),
+                    name: key.clone(),
+                    constraint: Box::new(fk.clone()),
+                });
+            }
+        }
+    }
+    changes.extend(unlinked);
 }
 
 /// A PostgreSQL table's heap storage parameters (DEC-1441.1): one change
@@ -4380,6 +4473,86 @@ mod tests {
         assert!(
             errors.iter().any(|e| matches!(e, DiffError::PermanentReferencesUnlogged { key, .. } if key == "ch_pa")),
             "{errors:?}"
+        );
+    }
+
+    /// Tables referencing each other in a cycle have no order to switch in:
+    /// whichever goes first breaks the other's key. The keys inside the
+    /// cycle are dropped before the switches and added back after, and the
+    /// tables outside it keep their order (#1488 review).
+    #[test]
+    fn a_foreign_key_cycle_is_unlinked_around_its_persistence_switch() {
+        let fk = |to: &str, column: &str| pbps_model::ForeignKey {
+            columns: vec![column.into()],
+            references_table: to.parse().unwrap(),
+            references_columns: vec!["id".into()],
+            on_delete: Default::default(),
+            on_update: Default::default(),
+        };
+        let cycle = |unlogged: bool| {
+            let mut s = Schema::default();
+            for (name, other) in [("public.a", "public.b"), ("public.b", "public.a")] {
+                let mut t = table(&[
+                    ("id", Column::new(ty("int")).not_null()),
+                    ("other", Column::new(ty("int"))),
+                ]);
+                t.primary_key = Some(PrimaryKey {
+                    name: None,
+                    columns: vec!["id".into()],
+                    storage_parameters: Default::default(),
+                });
+                t.foreign_keys
+                    .insert(format!("{}_other", &name[7..]), fk(other, "other"));
+                t.unlogged = unlogged;
+                s.tables.insert(name.parse().unwrap(), t);
+            }
+            s
+        };
+        let cs = run(&cycle(false), &cycle(true), &[]);
+        let at = |pred: &dyn Fn(&Change) -> bool| -> Vec<usize> {
+            cs.changes
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| pred(&p.change))
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let drops = at(&|c| matches!(c, Change::DropForeignKey { .. }));
+        let switches = at(&|c| matches!(c, Change::SetTablePersistence { .. }));
+        let adds = at(&|c| matches!(c, Change::AddForeignKey { .. }));
+        assert_eq!(
+            (drops.len(), switches.len(), adds.len()),
+            (2, 2, 2),
+            "{:?}",
+            kinds(&cs)
+        );
+        assert!(
+            drops.iter().max() < switches.iter().min(),
+            "{:?}",
+            kinds(&cs)
+        );
+        assert!(
+            switches.iter().max() < adds.iter().min(),
+            "{:?}",
+            kinds(&cs)
+        );
+        // Negative: a chain, not a cycle, keeps its keys and its order.
+        let chain = |unlogged: bool| {
+            let mut s = cycle(unlogged);
+            s.tables
+                .get_mut(&"public.a".parse::<TableName>().unwrap())
+                .unwrap()
+                .foreign_keys
+                .clear();
+            s
+        };
+        let cs = run(&chain(false), &chain(true), &[]);
+        assert!(
+            !cs.changes
+                .iter()
+                .any(|p| matches!(p.change, Change::DropForeignKey { .. })),
+            "{:?}",
+            kinds(&cs)
         );
     }
 

@@ -2023,7 +2023,11 @@ declaring a foreign key to an unlogged one is refused by name
 the foreign-key drops of class 2 and before the adds of 13, so only the keys
 that stand are checked. Inside the class it is ordered by each table's depth
 in the declared foreign-key graph, ascending to logged and descending to
-unlogged. Its estimate is a rewrite that reads every row under
+unlogged. Tables that reference each other in a cycle have no such order,
+since whichever switches first breaks a key of the other, so the keys inside
+the cycle are dropped before the switches and added back after them; a valid
+declaration gives a cycle one persistence, so its tables switch together
+(#1488 review). Its estimate is a rewrite that reads every row under
 `AccessExclusiveLock`.
 
 **Risk.** To unlogged is `destructive`: from then on a crash or an unclean

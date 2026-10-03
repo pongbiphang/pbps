@@ -3514,6 +3514,44 @@ async fn unlogged_tables_round_trip_and_switch_in_foreign_key_order() {
     assert_eq!(n, Some(1));
 }
 
+/// Two tables referencing each other switch persistence together, each way,
+/// as plans that apply: the keys inside the cycle are dropped around the
+/// switches and added back, since no order between them works (#1488
+/// review).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn a_foreign_key_cycle_switches_persistence_together() {
+    let s = emit_schema("cyc1488");
+    let mut target = TestDb::create("cyc1488").await;
+    fresh(&mut target, &s).await;
+    target
+        .execute(&format!(
+            "CREATE TABLE {s}.a (id integer PRIMARY KEY, b integer);
+             CREATE TABLE {s}.b (id integer PRIMARY KEY, a integer CONSTRAINT b_a REFERENCES {s}.a (id));
+             ALTER TABLE {s}.a ADD CONSTRAINT a_b FOREIGN KEY (b) REFERENCES {s}.b (id);
+             INSERT INTO {s}.a VALUES (1, NULL); INSERT INTO {s}.b VALUES (1, 1);
+             UPDATE {s}.a SET b = 1;"
+        ))
+        .await
+        .expect("the cycle");
+    let pulled = ours_only(&pull(&mut target).await, &s);
+    let ids = mint_ids(&pulled, &IdsFile::default(), &[]);
+    for unlogged in [true, false] {
+        let current = ours_only(&pull(&mut target).await, &s);
+        let mut wanted = current.clone();
+        for t in wanted.tables.values_mut() {
+            t.unlogged = unlogged;
+        }
+        let step = plan(&current, &ids, &wanted, &ids);
+        apply(&mut target, &Postgres::new(), &step).await;
+        let after = ours_only(&pull(&mut target).await, &s);
+        assert_eq!(after, wanted, "{step:#?}");
+        assert!(plan(&after, &ids, &wanted, &ids).is_empty());
+    }
+    drop_schema(&mut target, &s).await;
+    target.drop().await;
+}
+
 /// Emits and executes every change of a plan, in plan order.
 ///
 /// One statement at a time through [`Conn::execute`], which is what `apply`

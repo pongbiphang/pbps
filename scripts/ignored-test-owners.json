@@ -1702,6 +1702,7 @@
         "a_dropped_columns_name_is_free_before_the_rename_that_reuses_it",
         "a_dropped_connection_times_out_rather_than_reading_as_a_typo",
         "a_float_on_the_boundary_is_judged_as_the_engine_judges_it",
+        "a_foreign_key_cycle_switches_persistence_together",
         "a_foreign_key_into_a_partitioned_table_asks_for_the_grants_that_key_needs",
         "a_foreign_key_onto_an_ordinary_ledger_table_refuses_prune_and_unlock",
         "a_foreign_key_this_plan_adds_is_counted_before_the_delete_that_would_break_it",
