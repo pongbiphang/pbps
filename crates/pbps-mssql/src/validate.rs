@@ -998,6 +998,22 @@ fn system_time(name: &TableName, table: &Table, st: &pbps_model::SystemTime) -> 
                 "`system_time` names `{name}` itself as its history table; name another table"
             )));
         }
+        // The engine keeps history for at most 1000 years, in any unit
+        // (13749 beyond, measured on 17.0 by bisection).
+        if let Some(r) = &v.retention {
+            let most = match r.unit {
+                pbps_model::RetentionUnit::Day => 365_242,
+                pbps_model::RetentionUnit::Week => 52_177,
+                pbps_model::RetentionUnit::Month => 12_000,
+                pbps_model::RetentionUnit::Year => 1_000,
+            };
+            if r.count > most {
+                errs.push(invalid(format!(
+                    "a history retention of {r} is longer than SQL Server keeps: at most 1000 \
+                     years, which is {most} in this unit"
+                )));
+            }
+        }
     }
     errs
 }
@@ -1311,12 +1327,18 @@ mod tests {
                 .map(|e| e.to_string())
                 .collect::<Vec<_>>()
         };
-        assert!(found(&valid()).is_empty(), "{:?}", found(&valid()));
         fn st(t: &mut Table) -> &mut SystemTime {
             t.system_time.as_mut().unwrap()
         }
+        assert!(found(&valid()).is_empty(), "{:?}", found(&valid()));
+        // The longest retention the engine takes, in each unit, is valid.
+        for longest in ["365242 days", "52177 weeks", "12000 months", "1000 years"] {
+            let mut t = valid();
+            st(&mut t).versioning.as_mut().unwrap().retention = Some(longest.parse().unwrap());
+            assert!(found(&t).is_empty(), "{longest}: {:?}", found(&t));
+        }
         type Break = fn(&mut Table);
-        let cases: [(Break, &str); 8] = [
+        let cases: [(Break, &str); 10] = [
             (|t| st(t).end = "vf".into(), "as both the start and the end"),
             (|t| st(t).end = "missing".into(), "no column of that name"),
             (
@@ -1348,6 +1370,20 @@ mod tests {
             (
                 |t| st(t).versioning.as_mut().unwrap().history = "dbo.t".parse().unwrap(),
                 "itself as its history table",
+            ),
+            (
+                |t| {
+                    st(t).versioning.as_mut().unwrap().retention =
+                        Some("365243 days".parse().unwrap())
+                },
+                "longer than SQL Server keeps",
+            ),
+            (
+                |t| {
+                    st(t).versioning.as_mut().unwrap().retention =
+                        Some("2147483648 days".parse().unwrap())
+                },
+                "which is 365242 in this unit",
             ),
             (
                 |t| {

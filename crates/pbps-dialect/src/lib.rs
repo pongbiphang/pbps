@@ -2634,12 +2634,41 @@ pub fn check_module_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String>
 }
 
 /// Whether a system-versioned table's history (#1176) takes a name something
-/// else in the declaration holds: a table, another table's history, or a
-/// module the engine keeps beside tables. The history is a table in the
-/// database, in the schema's one namespace, though no declaration lists it
-/// as one, so `CREATE TABLE … HISTORY_TABLE` would meet the other object
-/// mid-apply.
+/// else in the declaration holds: another table's history, or any object the
+/// engine keeps beside tables. That is a table, a module of a kind that shares
+/// the namespace, and, where constraints share it too, a named constraint or
+/// one the engine names itself. The history is a table in the database, in
+/// the schema's one namespace, though no declaration lists it as one, so
+/// `CREATE TABLE … HISTORY_TABLE` would meet the other object mid-apply.
 pub fn check_history_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> {
+    // Every name the declaration puts in that namespace, with what holds it.
+    let mut held: BTreeMap<TableName, String> = BTreeMap::new();
+    for name in schema.tables.keys() {
+        held.insert(name.clone(), "a table".to_owned());
+    }
+    for (id, module) in &schema.modules {
+        if dialect.shares_namespace_with_tables(module.kind) {
+            held.insert(id.object_name(), format!("a {}", module.kind));
+        }
+    }
+    if dialect.constraints_share_namespace_with_tables() {
+        for (table_name, table) in &schema.tables {
+            let named = table
+                .primary_key
+                .iter()
+                .filter_map(|pk| pk.name.clone())
+                .chain(table.unique.keys().cloned())
+                .chain(table.foreign_keys.keys().cloned())
+                .chain(table.checks.keys().cloned())
+                .chain(dialect.generated_constraint_names(table_name, table));
+            for name in named {
+                held.insert(
+                    TableName::new(table_name.schema.clone(), name),
+                    format!("a constraint of `{table_name}`"),
+                );
+            }
+        }
+    }
     let mut problems = Vec::new();
     let mut histories: BTreeMap<&TableName, &TableName> = BTreeMap::new();
     for (table, versioning) in schema.tables.iter().filter_map(|(name, t)| {
@@ -2649,10 +2678,12 @@ pub fn check_history_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String
             .map(|v| (name, v))
     }) {
         let history = &versioning.history;
-        if schema.tables.contains_key(history) {
+        if let Some(what) = held.get(history) {
             problems.push(format!(
-                "`{table}` names `{history}` as its history table, which is also declared as a \
-                 table; the history is created with `{table}`, so name it something else"
+                "`{table}` names `{history}` as its history table, which is also declared as \
+                 {what}; {} keeps them in one namespace per schema, and the history is created \
+                 with `{table}`, so name it something else",
+                dialect.name()
             ));
         }
         if let Some(first) = histories.insert(history, table) {
@@ -2660,17 +2691,6 @@ pub fn check_history_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String
                 "`{first}` and `{table}` both name `{history}` as their history table; each \
                  system-versioned table needs its own"
             ));
-        }
-        for (id, module) in &schema.modules {
-            if dialect.shares_namespace_with_tables(module.kind) && &id.object_name() == history {
-                problems.push(format!(
-                    "`{table}` names `{history}` as its history table, which is also declared \
-                     as a {}; {} keeps tables and {}s in one namespace per schema",
-                    module.kind,
-                    dialect.name(),
-                    module.kind
-                ));
-            }
         }
     }
     problems
@@ -3821,10 +3841,27 @@ mod tests {
         period_only.system_time.as_mut().unwrap().versioning = None;
         schema.tables.insert("app.p".parse().unwrap(), period_only);
         assert!(check_history_names(&schema, &MinimalDialect).is_empty());
+        // A named constraint takes a name there too, where the engine says so.
+        schema
+            .tables
+            .get_mut(&"app.other".parse().unwrap())
+            .unwrap()
+            .checks
+            .insert(
+                "ck_other".into(),
+                pbps_model::CheckConstraint {
+                    expression: "1 = 1".into(),
+                },
+            );
+        assert!(check_history_names(&schema, &MinimalDialect).is_empty());
         for (history, says) in [
             ("app.other", "also declared as a table"),
             ("hist.a_history", "both name `hist.a_history`"),
             ("app.v", "also declared as a view"),
+            (
+                "app.ck_other",
+                "also declared as a constraint of `app.other`",
+            ),
         ] {
             let mut clash = schema.clone();
             clash
