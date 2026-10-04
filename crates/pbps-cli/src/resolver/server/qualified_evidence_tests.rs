@@ -604,6 +604,7 @@ async fn the_production_run_connects_with_the_callers_driver() {
         ),
         "{refused:?}"
     );
+    assert!(refused.to_string().contains("Encrypt=true"), "{refused}");
 }
 
 async fn close(run: &mut ScratchRun, owned: &mut Option<ObservedContainers>) {

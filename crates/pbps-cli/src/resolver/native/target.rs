@@ -57,9 +57,12 @@ pub enum NativeTargetError {
 /// Why a target connection did not become a native target binding (#1514).
 #[derive(Debug, thiserror::Error)]
 pub enum TargetConnectError {
+    /// Either engine's verified connection: the remedy names both, since
+    /// the caller chose the driver (#1514 review).
     #[error(
-        "the target connection must verify its server (PostgreSQL `sslmode=require` with a \
-         trusted root): {0}"
+        "the target connection must verify its server's certificate and name (PostgreSQL: \
+         `sslmode=require` or no `sslmode`; SQL Server: `Encrypt=true` with certificate \
+         validation): {0}"
     )]
     Connect(pbps_db::DbError),
     #[error(transparent)]
