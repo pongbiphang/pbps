@@ -1479,8 +1479,6 @@ mod generated_surface_coverage {
             current: Some(bound("pg_constraint", "app.x.c", &[], "int4gt")),
             desired: None,
         };
-        // Coverage alone: the ordering graph keys its same-table rule by
-        // name, so a reused name is a separate, deferred limit.
         let base_side = crate::Side {
             schema: &base,
             ids: &before_ids,
@@ -1495,5 +1493,137 @@ mod generated_surface_coverage {
             super::super::prepare::coverage(base_side, desired_side, &[removed(&a)]),
             Err(super::super::Error::Coverage(_))
         ));
+
+        // The ordering graph tells the two tables apart by recorded UID, not
+        // by the name they share in turn: the dropped table goes first, with
+        // its check, then the rename, then the renamed table's check.
+        let ordered = super::plan(
+            base_side,
+            desired_side,
+            &Hints::default(),
+            &[removed(&a), removed(&b)],
+            &pbps_dialect::MinimalDialect,
+        )
+        .unwrap();
+        let steps = &ordered.changes.changes;
+        let position = |f: &dyn Fn(&Change) -> bool| {
+            steps
+                .iter()
+                .position(|p| f(&p.change))
+                .unwrap_or_else(|| panic!("missing from {steps:?}"))
+        };
+        let dropped_table =
+            position(&|c| matches!(c, Change::DropTable { uid, .. } if uid == &dropped));
+        let rename = position(&|c| matches!(c, Change::RenameTable { .. }));
+        let check = position(&|c| matches!(c, Change::DropCheck { table, .. } if table == &a));
+        assert!(dropped_table < rename, "{steps:?}");
+        assert!(rename < check, "{steps:?}");
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    /// Two tables swap names while each generation expression keeps its own
+    /// binding. Each observation holds the opening record under its base
+    /// spelling and the compiled one under its desired spelling, so one
+    /// spelling pairs two different tables; the rebuild check pairs them
+    /// through recorded UIDs, and a rename-only swap rewrites nothing
+    /// (DEC-1498.1).
+    #[test]
+    fn swapped_table_names_pair_bindings_through_recorded_uids() {
+        let (id, module) = routine();
+        let a: pbps_model::TableName = "app.a".parse().unwrap();
+        let b: pbps_model::TableName = "app.b".parse().unwrap();
+        let mut base = Schema::default();
+        base.modules.insert(id.clone(), module);
+        base.tables.insert(a.clone(), table(Some("app.f(a)")));
+        base.tables.insert(b.clone(), table(Some("app.f(a)")));
+        let before_ids = ids(&base, &IdsFile::default());
+        let desired = base.clone();
+        let mut after_ids = before_ids.clone();
+        let (ua, ub) = (
+            before_ids.table_uid(&a).unwrap().clone(),
+            before_ids.table_uid(&b).unwrap().clone(),
+        );
+        after_ids.tables.insert(ua.clone(), b.clone());
+        after_ids.tables.insert(ub.clone(), a.clone());
+        for column in after_ids.columns.values_mut() {
+            column.table = if column.table == a {
+                b.clone()
+            } else {
+                a.clone()
+            };
+        }
+        let function = Surface::Module(id);
+        let g = |table: &str| Surface::Default(format!("{table}.g").parse().unwrap());
+        let attrdef = |binds: &str| {
+            Some(bound(
+                "pg_attrdef",
+                "app.x.g",
+                std::slice::from_ref(&function),
+                binds,
+            ))
+        };
+        // The old app.a binds f and the old app.b binds f_exact. `old_a_binds`
+        // is what the old app.a binds under its new name, app.b.
+        let plan = |old_a_binds: &str| {
+            let observations = [
+                SurfaceResolution {
+                    surface: g("app.a"),
+                    current: attrdef("f"),
+                    desired: attrdef("f_exact"),
+                },
+                SurfaceResolution {
+                    surface: g("app.b"),
+                    current: attrdef("f_exact"),
+                    desired: attrdef(old_a_binds),
+                },
+                SurfaceResolution {
+                    surface: function.clone(),
+                    current: Some(bound("pg_proc", "app.f", &[], "int4in")),
+                    desired: Some(bound("pg_proc", "app.f", &[], "int4in")),
+                },
+            ];
+            super::plan(
+                crate::Side {
+                    schema: &base,
+                    ids: &before_ids,
+                },
+                crate::Side {
+                    schema: &desired,
+                    ids: &after_ids,
+                },
+                &Hints::default(),
+                &observations,
+                &pbps_dialect::MinimalDialect,
+            )
+            .unwrap()
+        };
+        let rewritten = |ordered: &Ordered| -> Vec<pbps_model::ColumnRef> {
+            ordered
+                .changes
+                .changes
+                .iter()
+                .filter_map(|p| {
+                    if let Change::AlterColumnExpression { column, .. } = &p.change {
+                        Some(column.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        let unchanged = plan("f");
+        assert!(
+            unchanged
+                .changes
+                .changes
+                .iter()
+                .any(|p| matches!(p.change, Change::RenameTable { .. }))
+        );
+        assert_eq!(rewritten(&unchanged), Vec::new(), "a rename-only swap");
+        unchanged.proof.validate(&unchanged.changes).unwrap();
+        // The old app.a rebinds: only it is rebuilt, under its new name.
+        let rebound = plan("f_exact");
+        assert_eq!(rewritten(&rebound), vec!["app.b.g".parse().unwrap()]);
+        rebound.proof.validate(&rebound.changes).unwrap();
     }
 }

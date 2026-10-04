@@ -144,6 +144,38 @@ pub(super) fn constraints(
             surfaces
         })
         .collect();
+    // The table each step changes, by recorded UID. A step spells a table as
+    // it is named where the differ placed the step: by the latest earlier
+    // rename to that name or creation under it, otherwise by the base table.
+    // A dropped table's name taken by a renamed one is two tables
+    // (DEC-1498.1).
+    let owners: Vec<Option<&pbps_model::Uid>> = steps
+        .iter()
+        .enumerate()
+        .map(|(k, c)| match c {
+            Change::CreateTable { uid, .. }
+            | Change::DropTable { uid, .. }
+            | Change::RenameTable { uid, .. } => Some(uid),
+            other => other.table().and_then(|t| {
+                steps[..k]
+                    .iter()
+                    .rev()
+                    .find_map(|earlier| match earlier {
+                        Change::RenameTable { uid, to, .. } if to == t => Some(uid),
+                        Change::CreateTable { uid, name, .. } if name == t => Some(uid),
+                        _ => None,
+                    })
+                    .or_else(|| base.ids.table_uid(t))
+                    .or_else(|| desired.ids.table_uid(t))
+            }),
+        })
+        .collect();
+    // Same name is not enough when both UIDs are known: only a false edge
+    // between two tables that share a name in turn is ever dropped.
+    let same_table = |i: usize, j: usize| match (owners[i], owners[j]) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    };
     let mut edges = BTreeSet::new();
     let mut edge = |before, after, reason| {
         edges.insert(OrderEdge {
@@ -229,12 +261,14 @@ pub(super) fn constraints(
             if expression(change).is_some()
                 && let Change::RenameTable { to, .. } = other
                 && change.table() == Some(to)
+                && same_table(i, j)
             {
                 edge(j, i, OrderReason::Identity);
             }
             if let (Some(t), Some(u), Some(install)) =
                 (change.table(), other.table(), expression(change))
                 && t == u
+                && same_table(i, j)
                 && expression(other).is_none()
                 // A replica identity follows the index it names and goes
                 // ahead of the old identity's index's drop, as the differ
@@ -260,6 +294,7 @@ pub(super) fn constraints(
             }
             if let (Some(false), Some(true)) = (expression(change), expression(other))
                 && change.table() == other.table()
+                && same_table(i, j)
             {
                 edge(i, j, OrderReason::Restoration);
             }

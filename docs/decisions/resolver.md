@@ -1286,3 +1286,28 @@ guard's to check: it compares every declared grant the plan touches (SPEC 7.6).
 The authorization condition covers only the deployer's schema authorization,
 which is what name lookup depends on; an object grant does not change a
 binding.
+
+<a id="dec-1498-1"></a>
+
+**DEC-1498.1. The resolver's ordering graph tells tables apart by recorded UID, and an observation keeps each side under its own spelling.**
+
+A plan can give a table's name to another table: it drops `app.a` and renames
+`app.b` to `app.a`. The graph's same-table rules (an expression change follows
+its table's rename; a removal precedes its table's drop; a removal precedes the
+restoration it makes room for) compared names, so the renamed table's check
+removal read as a change to the dropped table, and the three rules closed a
+cycle no order has. Each step's table is now its recorded UID. A step spells a
+table as it is named where the differ placed the step, so the UID is that of
+the latest earlier rename to the name or creation under it, and otherwise the
+base table's. A rule fires only when the names match and, where both UIDs are
+known, the UIDs match too. This only removes the false edges between two tables
+that share a name in turn; it adds none.
+
+The observations need no such re-keying (#1499). A `SurfaceResolution` holds
+the opening record under the surface's base spelling and the compiled record
+under its desired spelling. When names swap, one spelling therefore pairs two
+tables. That is the contract coverage checks: the base surfaces under their
+removal spellings, and the desired surfaces as they are. The rebuild check
+reads it through recorded UIDs, comparing the opening record of a base surface
+with the compiled record of the surface it becomes (`forward`). Pairing the
+records inside one observation by UID would make that check map twice.
