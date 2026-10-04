@@ -277,16 +277,22 @@ pub(super) fn constraints(
             {
                 edge(j, i, OrderReason::Identity);
             }
-            // A default spelled by its column's final name follows that
-            // column's rename, as an expression change follows its table's
-            // and as the ordinary plan orders it (docs/ORDERING.md,
-            // `RenameColumn` before later changes naming the column; #1292).
-            // The removal-first rule below would address the column by a
-            // name it does not have yet.
+            // A default spelled by its column's final name follows the
+            // renames that give the column that name: its own rename into the
+            // name, and another column's rename out of it. So an expression
+            // change follows its table's rename, and the ordinary plan orders
+            // `RenameColumn` before later changes naming the column
+            // (docs/ORDERING.md; #1292). The column is read by its UID, not
+            // by a name two columns hold in turn. The removal-first rule below
+            // would address the name before the column holds it.
             let renamed_into = matches!(
                 (change, other),
-                (Change::AlterColumnDefault { column, .. }, Change::RenameColumn { table, to, .. })
-                    if column == &table.column(to)
+                (
+                    Change::AlterColumnDefault { uid, column, .. },
+                    Change::RenameColumn { uid: renamed, table, from, to, .. },
+                ) if column.table == *table
+                    && ((renamed == uid && column.name == *to)
+                        || (renamed != uid && column.name == *from))
             ) && same_table(i, j);
             if renamed_into {
                 edge(j, i, OrderReason::Identity);

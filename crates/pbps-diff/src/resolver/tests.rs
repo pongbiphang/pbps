@@ -1944,4 +1944,113 @@ mod generated_surface_coverage {
         assert_eq!(removal(&kept), None, "{:?}", kept.changes.changes);
         kept.proof.validate(&kept.changes).unwrap();
     }
+
+    /// Column renames chain in one table, `b` to `c` and then `a` to `b`. A
+    /// default removal spelled `b` by its column's final name follows both
+    /// renames. A teardown of the old `b`'s default, spelled `b` by its base
+    /// name, precedes both. Each removal is read through its column's UID,
+    /// not the name the two columns share in turn (#1292).
+    #[test]
+    fn a_default_removal_in_a_column_rename_chain_reads_its_column_uid() {
+        let t: pbps_model::TableName = "app.t".parse().unwrap();
+        let column = |default: Option<&str>| {
+            let mut c = Column::new("int".parse().unwrap());
+            c.default = default.map(Into::into);
+            c
+        };
+        let schema = |columns: &[(&str, Option<&str>)]| {
+            let mut table = Table::default();
+            for (name, default) in columns {
+                table.columns.insert((*name).into(), column(*default));
+            }
+            let mut schema = Schema::default();
+            schema.tables.insert(t.clone(), table);
+            schema
+        };
+        let plan =
+            |label: &str, base: &Schema, desired: &Schema, observations: &[SurfaceResolution]| {
+                let before_ids = ids(base, &IdsFile::default());
+                let mut after_ids = before_ids.clone();
+                let a = before_ids.column_uid(&t.column("a")).unwrap().clone();
+                let b = before_ids.column_uid(&t.column("b")).unwrap().clone();
+                after_ids.columns.get_mut(&b).unwrap().name = "c".into();
+                after_ids.columns.get_mut(&a).unwrap().name = "b".into();
+                super::plan(
+                    crate::Side {
+                        schema: base,
+                        ids: &before_ids,
+                    },
+                    crate::Side {
+                        schema: desired,
+                        ids: &after_ids,
+                    },
+                    &Hints::default(),
+                    observations,
+                    &pbps_dialect::MinimalDialect,
+                )
+                .unwrap_or_else(|error| panic!("{label}: {error:?}"))
+            };
+        let position = |ordered: &Ordered, f: &dyn Fn(&Change) -> bool| {
+            ordered
+                .changes
+                .changes
+                .iter()
+                .position(|p| f(&p.change))
+                .unwrap_or_else(|| panic!("missing from {:?}", ordered.changes.changes))
+        };
+        let rename = |from: &'static str| move |c: &Change| matches!(c, Change::RenameColumn { from: f, .. } if f == from);
+        let removal = |c: &Change| matches!(c, Change::AlterColumnDefault { to: None, .. });
+        let attrdef = |binds: &str| Some(bound("pg_attrdef", "app.t.d", &[], binds));
+
+        // The old `a` loses its default under its final name `b`.
+        let removed = plan(
+            "final-spelled removal",
+            &schema(&[("a", Some("1")), ("b", None)]),
+            &schema(&[("b", None), ("c", None)]),
+            &[SurfaceResolution {
+                surface: Surface::Default(t.column("b")),
+                current: attrdef("int4in"),
+                desired: None,
+            }],
+        );
+        let at = position(&removed, &removal);
+        assert!(
+            position(&removed, &rename("b")) < at,
+            "{:?}",
+            removed.changes.changes
+        );
+        assert!(
+            position(&removed, &rename("a")) < at,
+            "{:?}",
+            removed.changes.changes
+        );
+        removed.proof.validate(&removed.changes).unwrap();
+
+        // The old `b` keeps its default but rebinds: its teardown is spelled
+        // `b` by its base name and runs before `b` is renamed to `c`.
+        let rebound = plan(
+            "base-spelled teardown",
+            &schema(&[("a", None), ("b", Some("1"))]),
+            &schema(&[("b", None), ("c", Some("1"))]),
+            &[
+                SurfaceResolution {
+                    surface: Surface::Default(t.column("b")),
+                    current: attrdef("f"),
+                    desired: None,
+                },
+                SurfaceResolution {
+                    surface: Surface::Default(t.column("c")),
+                    current: None,
+                    desired: attrdef("f_exact"),
+                },
+            ],
+        );
+        let teardown = position(&rebound, &removal);
+        assert!(
+            teardown < position(&rebound, &rename("b")),
+            "{:?}",
+            rebound.changes.changes
+        );
+        rebound.proof.validate(&rebound.changes).unwrap();
+    }
 }
