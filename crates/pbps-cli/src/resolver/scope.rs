@@ -290,6 +290,7 @@ pub(crate) fn planned_schema_grants(
             | Change::SetReplicaIdentity { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetIndexStorageParameters { .. }
+            | Change::SetTablePersistence { .. }
             | Change::DropColumn { .. }
             | Change::RenameColumn { .. }
             | Change::AlterColumnType { .. }

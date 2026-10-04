@@ -30,6 +30,7 @@ fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, Re
         | Change::AddComputedColumn { .. }
         | Change::SetReplicaIdentity { .. }
         | Change::SetStorageParameters { .. }
+        | Change::SetTablePersistence { .. }
         | Change::SetIndexStorageParameters { .. }
         | Change::DropComputedColumn { .. }
         | Change::DropColumn { .. }

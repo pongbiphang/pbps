@@ -470,6 +470,7 @@ pub(super) fn derive(
             ),
             Change::SetPrimaryKey { table, .. }
             | Change::SetIndexStorageParameters { table, .. }
+            | Change::SetTablePersistence { table, .. }
             | Change::SetReplicaIdentity { table, .. }
             | Change::SetStorageParameters { table, .. }
             | Change::AddUnique { table, .. }
