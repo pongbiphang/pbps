@@ -153,10 +153,6 @@ impl NativeTarget {
             .map(|state| state.lease.service())
             .ok_or(UnqualifiedProcess)
     }
-    /// A configured PID selects the live service and its procfs view. The
-    /// observed connected holder must have a positive parent relation to that
-    /// service; a namespace peer or PID label alone cannot qualify a backend.
-    /// Trusted provisioning excludes hostile socket sharing (DECISIONS 533).
     /// Connects to the selected target and binds it to the engine service
     /// holding the connection's server end on this host. The service is
     /// found from the connection, never named by configuration (DEC-1514.1).
@@ -171,6 +167,13 @@ impl NativeTarget {
         Ok(Self::establish(connection, service).await?)
     }
 
+    /// Binds a connection to the service the caller selected, by PID, with
+    /// its procfs view. [`Self::connect`] selects it from the connection;
+    /// fixtures name it directly. The PID selects and asserts nothing: the
+    /// observed connected holder must have a positive parent relation to that
+    /// service, and a namespace peer or PID label alone cannot qualify a
+    /// backend. Trusted provisioning excludes hostile socket sharing
+    /// (DECISIONS 533).
     pub async fn establish(
         mut connection: PeerVerifiedConn,
         service_pid: u32,

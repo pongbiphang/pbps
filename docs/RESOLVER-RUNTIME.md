@@ -18,11 +18,13 @@ separately binds the selected target service to its connected backend.
 observer on the same kernel. The API's actual Unix peer must be a live,
 root-installed Docker daemon, reached through a protected root-owned socket
 path. A root-owned proxy is insufficient. The target adapter accepts direct
-loopback verified TLS whose actual server socket belongs to the selected
-engine service or an observed descendant. A configured PID selects that
-service and its qualified procfs view; it does not assert identity. A shared
-host PID namespace entails a host-wide observation, including unrelated
-process descriptor tables; a private namespace keeps this view small. Database names, credentials and aliases do not establish
+loopback verified TLS whose actual server socket belongs to the selected engine
+service or an observed descendant. That service is found from the connection
+itself, the sole holder of its server end and that holder's ancestors running
+the same executable, and no configuration names it (DEC-1514.1); the selection
+asserts no identity. A shared host PID namespace entails a host-wide
+observation, including unrelated process descriptor tables; a private namespace
+keeps this view small. Database names, credentials and aliases do not establish
 instance separation.
 
 Systemd socket activation (`dockerd -H fd://`) is supported with its protected
