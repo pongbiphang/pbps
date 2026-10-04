@@ -1879,7 +1879,11 @@ fn refuse_temporal_changes(
     }
     // A table this plan creates is created with every change it splits out
     // of the `CREATE` (its foreign keys, #1501 review): those are the
-    // creation, not a change to a table that stands.
+    // creation, not a change to a table that stands. By the change, not by
+    // the base: a new table may take the name of one the plan renames or
+    // drops. Whatever drops or renames a table at that name is still asked
+    // about below, so a temporal table dropped and recreated under its own
+    // name is still refused.
     let created: BTreeSet<&TableName> = changes
         .iter()
         .filter_map(|c| {
@@ -1889,26 +1893,41 @@ fn refuse_temporal_changes(
                 None
             }
         })
-        .filter(|name| !base.schema.tables.contains_key(*name))
         .collect();
     // A grant or a trigger on the table is not a change to the pair, and
     // `table()` names neither; a rename is reached by both of its names.
     for change in changes {
+        let ends_a_table = matches!(
+            change,
+            Change::DropTable { .. } | Change::RenameTable { .. }
+        );
         if matches!(change, Change::CreateTable { .. })
-            || change.table().is_some_and(|t| created.contains(t))
+            || (!ends_a_table && change.table().is_some_and(|t| created.contains(t)))
         {
             continue;
         }
-        let renamed_to = if let Change::RenameTable { to, .. } = change {
-            Some(to)
+        // A drop or a rename acts on the table the base has at that name, and
+        // a rename brings it to the declared one: asked of those sides, so the
+        // ordinary table a new temporal one replaces may still go.
+        let asked: Vec<&TableName> = if let Change::DropTable { name, .. } = change {
+            vec![name]
+                .into_iter()
+                .filter(|n| temporal(base.schema, n))
+                .collect()
+        } else if let Change::RenameTable { from, to, .. } = change {
+            [(from, base.schema), (to, declared.schema)]
+                .into_iter()
+                .filter(|(n, side)| temporal(side, n))
+                .map(|(n, _)| n)
+                .collect()
         } else {
-            None
+            change
+                .table()
+                .into_iter()
+                .filter(|n| temporal(base.schema, n) || temporal(declared.schema, n))
+                .collect()
         };
-        for name in change.table().into_iter().chain(renamed_to) {
-            if temporal(base.schema, name) || temporal(declared.schema, name) {
-                refused.insert(name.clone());
-            }
-        }
+        refused.extend(asked.into_iter().cloned());
     }
     errs.extend(
         refused
@@ -4648,6 +4667,87 @@ mod tests {
             kinds(&created).contains(&"AddForeignKey".to_owned()),
             "{:?}",
             kinds(&created)
+        );
+        // And under the name of an ordinary table an earlier revision of the
+        // same plan dropped: the new table has a uid of its own.
+        let mut ordinary = keyed.clone();
+        ordinary.tables.insert(
+            "app.t".parse().unwrap(),
+            table(&[("id", Column::new(ty("int")).not_null())]),
+        );
+        let mut vacated = keyed.clone();
+        vacated
+            .tables
+            .remove(&"app.t".parse::<TableName>().unwrap());
+        let base_ids = crate::resolve(&ordinary, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let between = crate::resolve(
+            &vacated,
+            &base_ids,
+            &[Intent::DropTable {
+                table: "app.t".parse().unwrap(),
+                reason: "replaced".into(),
+            }],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let reused_ids = crate::resolve(&keyed, &between, &[], &ctx()).unwrap().ids;
+        let reused = diff(
+            Side {
+                schema: &ordinary,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &keyed,
+                ids: &reused_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .expect("a create under a name an earlier revision dropped is planned");
+        assert!(
+            kinds(&reused).contains(&"DropTable".to_owned())
+                && kinds(&reused).contains(&"AddForeignKey".to_owned()),
+            "{:?}",
+            kinds(&reused)
+        );
+        // Negative: a temporal table dropped and created again under its own
+        // name is still a drop of a temporal table.
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let between = crate::resolve(
+            &Schema::default(),
+            &base_ids,
+            &[Intent::DropTable {
+                table: "app.t".parse().unwrap(),
+                reason: "replaced".into(),
+            }],
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let again_ids = crate::resolve(&base, &between, &[], &ctx()).unwrap().ids;
+        let errors = diff(
+            Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &base,
+                ids: &again_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .expect_err("a temporal table dropped and recreated is refused");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, DiffError::TemporalTableChange { .. })),
+            "{errors:?}"
         );
         // Unchanged, nothing to plan.
         assert!(outcome(&base, &base, &[]).unwrap().changes.is_empty());
