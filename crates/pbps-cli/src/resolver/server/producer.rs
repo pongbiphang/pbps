@@ -269,6 +269,30 @@ impl ScratchRun {
     }
 }
 
+#[cfg(test)]
+mod released_tests {
+    use super::{Error, ProduceError, released};
+
+    /// A cleanup that succeeded leaves nothing to name, whatever the refusal
+    /// listed before it ran; a failed one names only what it could not
+    /// confirm (#1514 review).
+    #[test]
+    fn only_unconfirmed_cleanup_is_reported_after_a_refusal() {
+        assert!(matches!(
+            released(Error::Scratch, None),
+            ProduceError::Run(Error::Scratch)
+        ));
+        assert!(matches!(
+            released(Error::Scratch, Some(Vec::new())),
+            ProduceError::Run(Error::Scratch)
+        ));
+        let ProduceError::Cleanup(names) = released(Error::Scratch, Some(vec!["db".into()])) else {
+            panic!("an unconfirmed cleanup is named");
+        };
+        assert_eq!(names, ["db"]);
+    }
+}
+
 /// The native Docker daemon's socket. Only a root-owned socket closed to
 /// other users is admitted (`LocalApi::connect_native`); a rootless or
 /// proxied daemon needs its own measured profile (RESOLVER-RUNTIME).
@@ -378,6 +402,16 @@ pub(crate) async fn produce_with(
     }
 }
 
+/// A refusal after its runtime's cleanup ran. The refusal's own recovery
+/// names were the obligations before that cleanup; only what the cleanup
+/// itself could not confirm may remain, so only those are reported.
+fn released(cause: Error, cleanup: Option<Vec<String>>) -> ProduceError {
+    match cleanup {
+        Some(names) if !names.is_empty() => ProduceError::Cleanup(names),
+        Some(_) | None => ProduceError::Run(cause),
+    }
+}
+
 /// The profile's scratch run. A refusal after the runtime started releases
 /// it before returning, as the run's own close would.
 async fn open_run(
@@ -408,18 +442,14 @@ async fn open_run(
                     })?;
             match candidate.open_scratch(recipe).await {
                 Ok(run) => Ok(run),
-                Err(refused) => match candidate.close().await {
-                    Ok(()) => Err(refused.into()),
-                    Err(failure) => {
-                        let mut names = refused.recovery_names;
-                        names.extend(failure.recovery_names);
-                        Err(if names.is_empty() {
-                            ProduceError::Run(refused.cause)
-                        } else {
-                            ProduceError::Cleanup(names)
-                        })
-                    }
-                },
+                Err(refused) => Err(released(
+                    refused.cause,
+                    candidate
+                        .close()
+                        .await
+                        .err()
+                        .map(|failure| failure.recovery_names),
+                )),
             }
         }
         ResolverProfile::Server { .. } => {
@@ -428,18 +458,14 @@ async fn open_run(
             let mut server = super::DedicatedServer::admit(endpoint, target).await?;
             match server.open_scratch(recipe).await {
                 Ok(run) => Ok(run),
-                Err(refused) => match server.discard().await {
-                    Ok(()) => Err(refused.into()),
-                    Err(failure) => {
-                        let mut names = refused.recovery_names;
-                        names.extend(failure.recovery_names);
-                        Err(if names.is_empty() {
-                            ProduceError::Run(refused.cause)
-                        } else {
-                            ProduceError::Cleanup(names)
-                        })
-                    }
-                },
+                Err(refused) => Err(released(
+                    refused.cause,
+                    server
+                        .discard()
+                        .await
+                        .err()
+                        .map(|failure| failure.recovery_names),
+                )),
             }
         }
     }
