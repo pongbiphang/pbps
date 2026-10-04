@@ -1716,21 +1716,43 @@ fn pinned_scopes(recorded: &DataScopes, planned: &DataScopes) -> DataScopes {
     out
 }
 
-/// Refuses, before anything runs, a role name another database principal
-/// holds: users, roles and application roles share one namespace, and a
-/// `CREATE ROLE` or `ALTER ROLE ... WITH NAME` onto a taken name fails
-/// after everything ordered before it has run (DECISIONS 118).
-///
-/// `wanted` are the names the plan's remaining statements create or rename
-/// to; `vacated` the ones they drop or rename away, which are free for
-/// this purpose. The engine decides which names are the same, under the
-/// database's collation — `Shadow` is `shadow` to most databases and not
-/// to a string comparison here (DECISIONS 119).
+/// The history names a plan's `CREATE TABLE`s take that something in the
+/// database still holds when that `CREATE` runs (#1176): each table, its
+/// history, and the occupant. Ordered as the `sys.objects` walk orders the
+/// plan, so an object the plan drops or renames away first frees the name, as
+/// it does at plan time (#1501 review).
+fn blocking_history_occupants<'a>(
+    cs: &pbps_model::ChangeSet,
+    held: &'a [pbps_mssql::catalog::NameOccupant],
+) -> Vec<(TableName, TableName, &'a pbps_mssql::catalog::NameOccupant)> {
+    let histories: BTreeMap<&TableName, &TableName> = cs
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let pbps_model::Change::CreateTable { name, table, .. } = &p.change {
+                let v = table.system_time.as_ref()?.versioning.as_ref()?;
+                Some((&v.history, name))
+            } else {
+                None
+            }
+        })
+        .collect();
+    held.iter()
+        .filter_map(|o| {
+            let table = histories.get(&o.wanted)?;
+            let facts = NameFacts::new(std::slice::from_ref(o), &[]);
+            let mut walk = Walk::new(&facts);
+            walk.run(&cs.changes);
+            (!walk.is_clear()).then(|| ((*table).clone(), o.wanted.clone(), o))
+        })
+        .collect()
+}
+
 /// Refuses a plan whose `CREATE TABLE` names, as a system-versioned table's
-/// history, a name the database already holds (#1176). Not left to the
-/// engine: given an existing table whose columns match, SQL Server takes it
-/// as the history, rows, layout and all, where any other `CREATE` would be
-/// refused (measured on 17.0).
+/// history, a name the database still holds when it runs (#1176). Not left
+/// to the engine: given an existing table whose columns match, SQL Server
+/// takes it as the history, rows, layout and all, where any other `CREATE`
+/// would be refused (measured on 17.0).
 async fn refuse_taken_history_names(
     conn: &mut Conn,
     cs: &pbps_model::ChangeSet,
@@ -1739,32 +1761,37 @@ async fn refuse_taken_history_names(
     if conn.driver() != pbps_db::Driver::Mssql {
         return Ok(());
     }
-    let histories: Vec<(&TableName, &TableName)> = cs
+    let names: Vec<TableName> = cs
         .changes
         .iter()
         .filter_map(|p| {
-            if let pbps_model::Change::CreateTable { name, table, .. } = &p.change {
-                let v = table.system_time.as_ref()?.versioning.as_ref()?;
-                Some((name, &v.history))
+            if let pbps_model::Change::CreateTable { table, .. } = &p.change {
+                Some(
+                    table
+                        .system_time
+                        .as_ref()?
+                        .versioning
+                        .as_ref()?
+                        .history
+                        .clone(),
+                )
             } else {
                 None
             }
         })
         .collect();
-    if histories.is_empty() {
+    if names.is_empty() {
         return Ok(());
     }
-    let names: Vec<TableName> = histories.iter().map(|(_, h)| (*h).clone()).collect();
     let held = pbps_mssql::catalog::object_name_occupants(conn, &names, &[]).await?;
-    let taken: Vec<String> = held
-        .iter()
-        .filter_map(|o| {
-            let (table, history) = histories.iter().find(|(_, h)| **h == o.wanted)?;
-            Some(format!(
+    let taken: Vec<String> = blocking_history_occupants(cs, &held)
+        .into_iter()
+        .map(|(table, history, o)| {
+            format!(
                 "{table} names {history} as its history table, and the database already has {} \
                  `{}`",
                 o.kind, o.name
-            ))
+            )
         })
         .collect();
     if taken.is_empty() {
@@ -1779,6 +1806,16 @@ async fn refuse_taken_history_names(
     );
 }
 
+/// Refuses, before anything runs, a role name another database principal
+/// holds: users, roles and application roles share one namespace, and a
+/// `CREATE ROLE` or `ALTER ROLE ... WITH NAME` onto a taken name fails
+/// after everything ordered before it has run (DECISIONS 118).
+///
+/// `wanted` are the names the plan's remaining statements create or rename
+/// to; `vacated` the ones they drop or rename away, which are free for
+/// this purpose. The engine decides which names are the same, under the
+/// database's collation — `Shadow` is `shadow` to most databases and not
+/// to a string comparison here (DECISIONS 119).
 async fn refuse_taken_role_names(
     conn: &mut Conn,
     wanted: &[String],
@@ -8368,6 +8405,75 @@ mod tests {
         assert!(e.contains("check constraint `s2.New` on `s2.new`"), "{e}");
         refuse_occupied_objects_under(&moved, &[check], &[], "prod")
             .expect("two names where the database reads them as two");
+    }
+
+    /// A history name the database holds blocks the `CREATE` only if it is
+    /// still held when that runs: a table the plan drops or renames away
+    /// first frees it, as the plan-time walk agrees (#1501 review). A name no
+    /// history takes is not this check's.
+    #[test]
+    fn a_history_occupant_blocks_unless_the_plan_frees_it_first() {
+        use pbps_model::{Change, ChangeSet, PlannedChange};
+        use pbps_mssql::catalog::NameOccupant;
+        let history = TableName::new("dbo", "old_history");
+        let uid = |n: &str| pbps_model::Uid::derived(pbps_model::UidKind::Table, n, 0);
+        let create = PlannedChange::new(Change::CreateTable {
+            uid: uid("dbo.t"),
+            name: TableName::new("dbo", "t"),
+            table: Box::new(pbps_model::Table {
+                system_time: Some(pbps_model::SystemTime {
+                    start: "vf".into(),
+                    end: "vt".into(),
+                    hidden: false,
+                    versioning: Some(pbps_model::SystemVersioning {
+                        history: history.clone(),
+                        retention: None,
+                    }),
+                }),
+                ..Default::default()
+            }),
+        });
+        let at = |name: &TableName| NameOccupant {
+            wanted: name.clone(),
+            name: name.clone(),
+            kind: "user table".into(),
+            parent: None,
+            parent_column: None,
+        };
+        let held = [at(&history)];
+        let blocking = |changes: Vec<PlannedChange>| {
+            blocking_history_occupants(&ChangeSet { changes }, &held)
+                .into_iter()
+                .map(|(t, h, _)| (t.to_string(), h.to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            blocking(vec![create.clone()]),
+            [("dbo.t".to_owned(), "dbo.old_history".to_owned())]
+        );
+        let dropped = PlannedChange::new(Change::DropTable {
+            uid: uid("dbo.old_history"),
+            name: history.clone(),
+        });
+        assert!(blocking(vec![dropped, create.clone()]).is_empty());
+        let renamed = PlannedChange::new(Change::RenameTable {
+            uid: uid("dbo.old_history"),
+            from: history.clone(),
+            to: TableName::new("dbo", "archived"),
+            defaults: Vec::new(),
+        });
+        assert!(blocking(vec![renamed, create.clone()]).is_empty());
+        // Negative: an occupant of a name no history takes.
+        let other = [at(&TableName::new("dbo", "elsewhere"))];
+        assert!(
+            blocking_history_occupants(
+                &ChangeSet {
+                    changes: vec![create]
+                },
+                &other
+            )
+            .is_empty()
+        );
     }
 
     #[test]
