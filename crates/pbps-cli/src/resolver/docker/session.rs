@@ -375,7 +375,9 @@ impl CandidateSession {
         )
         .map_err(|cause| (failure(cause), false))?;
         // Inside the deadline too: the launch is a create, a start and their
-        // inspects, and the login's own bound below starts only after it.
+        // inspects, and the login's own bound below starts only after it. No
+        // request is issued past the deadline; one already sent may finish
+        // after it and is cleaned up (see `start_launch_by`).
         let control = CandidateRun::start_launch_by(
             deadline,
             api,
