@@ -816,14 +816,29 @@ struct Declared {
 /// consulted for its foreign-key additions and dropped, and an addition counts
 /// only when the key's own definition changed ([`redefined`]).
 ///
-/// `None` when the declarations do not load, the environment has recorded no
-/// state, or the differ cannot express a change. The caller then keeps every
+/// `None` when the declarations do not load, a rename annotation is still
+/// pending, the environment has recorded no state, or the differ cannot express
+/// a change. The caller then keeps every
 /// declared key, which over-demands on the safe side (DECISIONS 513).
 fn surviving_keys(
     declared: &Declared,
     entry: &pbps_db::LedgerEntry,
 ) -> Option<pbps_db::doctor::DeclaredKeys> {
     let loaded = declared.loaded.as_ref()?;
+    // A `renamed_from` the checked-in ids have not absorbed yet is a rename
+    // the next `plan` resolves before it diffs, and this diff would not: the
+    // stale ids read the renamed key as a new one and drop it from the set,
+    // which withholds a demand the real plan needs (review on #1510). Such a
+    // project is left to the full declared set until `plan` has run.
+    if loaded.intents.iter().any(|intent| {
+        !pbps_diff::intent_is_absorbed(
+            intent,
+            &declared.ids,
+            pbps_diff::RenameSource::of(intent, &loaded.schema),
+        )
+    }) {
+        return None;
+    }
     let snapshot = &entry.snapshot;
     // What was declared when each object was last written, as a connected plan
     // compares against (ADR-0013 §4), and the recorded `depends_on:` edges of
@@ -1553,6 +1568,41 @@ mod tests {
         assert!(
             renamed.get(&moved).is_some_and(|t| t.contains(&target)),
             "{renamed:?}"
+        );
+        // The same rename spelled as a pending `renamed_from` the ids have not
+        // absorbed: the differ alone would read a new key, so nothing is
+        // narrowed until `plan` has resolved it (review on #1510).
+        let pending = loaded_from(&[
+            parent.clone(),
+            (
+                "c.yml",
+                "table: dst.c\ncolumns:\n  id: {type: int}\n  p2: {type: int, renamed_from: p}\n  \
+                 q: {type: int}\nforeign_keys:\n  fk_c_p:\n    columns: [p2]\n    \
+                 references: app.p(id)\n"
+                    .to_owned(),
+            ),
+        ]);
+        assert!(
+            !pending.intents.is_empty(),
+            "the annotation must become an intent"
+        );
+        assert!(
+            surviving_keys(
+                &Declared {
+                    schemas: Vec::new(),
+                    tables: Vec::new(),
+                    referenced: Vec::new(),
+                    referenced_columns: Default::default(),
+                    declared_keys: Default::default(),
+                    granted: Default::default(),
+                    data: Default::default(),
+                    ids: ids("dst", "p"),
+                    loaded: Some(pending),
+                    dialect: pbps_config::DialectName::Mssql,
+                },
+                &entry,
+            )
+            .is_none()
         );
         // A different referencing column: dropped before the delete, re-added
         // after it, so nothing reads the child through it.

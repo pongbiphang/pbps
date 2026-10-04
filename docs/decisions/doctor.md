@@ -845,10 +845,14 @@ Normalization never changes a key's columns, target or actions, so it cannot
 pass the second test. Anything the uids cannot map counts as unchanged.
 
 Nothing is planned for use and no plan file is read. The change set is
-consulted for its foreign-key additions only. When the declarations do not
-load, the environment has recorded no state, the ledger cannot be read or the
-differ refuses, every declared key is kept, which is DECISIONS 513's safe
-over-demand. Two unit tests cover this.
+consulted for its foreign-key additions only. In each of the following cases
+every declared key is kept, which is DECISIONS 513's safe over-demand:
+- the declarations do not load;
+- a `renamed_from` is still pending, one the checked-in ids have not absorbed
+  and the next `plan` would resolve before it diffs;
+- the environment has recorded no state;
+- the ledger cannot be read;
+- the differ refuses. Two unit tests cover this.
 `only_keys_the_plan_does_not_re_add_survive_the_deletes` covers an unchanged
 key, a referencing column renamed through its uid, and a changed referencing
 column; only the last one leaves the surviving set.
