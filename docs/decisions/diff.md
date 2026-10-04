@@ -2140,8 +2140,11 @@ is reported as one on an object outside the model.
 declaration lists it:
 
 - validation refuses another history or any object the declaration puts in
-  that namespace: a table, a module, a named constraint or a generated
-  default constraint;
+  that namespace: a table, a module, or a named constraint. A generated
+  default's names are not reserved, because `CREATE TABLE` takes only the first
+  and only a later rename the fallback. A default already at either is the
+  connected walk's, and the plan's own creation fails safely in its
+  transaction;
 - `plan --db` reads it and refuses an occupant, through the `sys.objects`
   walk;
 - `bootstrap` refuses an occupant before anything runs, since the engine

@@ -362,6 +362,46 @@ mod tests {
         }
     }
 
+    /// A history named after a generated default's fallback name is not
+    /// refused offline (#1501 review): `CREATE TABLE` names the default by its
+    /// first choice, and only a later rename uses the fallback. A default
+    /// parked there, or one at the first choice, is the connected walk's,
+    /// where the plan's own creation fails safely in its transaction.
+    #[test]
+    fn a_history_named_like_a_generated_default_is_not_refused_offline() {
+        let name: pbps_model::TableName = "dbo.t".parse().unwrap();
+        let mut t = Table::default();
+        t.columns.insert(
+            "c".into(),
+            pbps_model::Column {
+                default: Some("0".into()),
+                ..pbps_model::Column::new("int".parse().unwrap())
+            },
+        );
+        for history in [
+            emit::fallback_default_constraint_name(&name, "c"),
+            emit::default_constraint_name(&name, "c"),
+        ] {
+            let versioned = Table {
+                system_time: Some(pbps_model::SystemTime {
+                    start: "vf".into(),
+                    end: "vt".into(),
+                    hidden: false,
+                    versioning: Some(pbps_model::SystemVersioning {
+                        history: pbps_model::TableName::new("dbo", &history),
+                        retention: None,
+                    }),
+                }),
+                ..Default::default()
+            };
+            let mut schema = pbps_model::Schema::default();
+            schema.tables.insert(name.clone(), t.clone());
+            schema.tables.insert("dbo.v".parse().unwrap(), versioned);
+            let problems = pbps_dialect::check_history_names(&schema, &Mssql);
+            assert!(problems.is_empty(), "{history}: {problems:?}");
+        }
+    }
+
     /// A history named after one of the ledger's tables is refused like a
     /// table of that name, for the same reason; the same names elsewhere stay
     /// the project's (#1176).

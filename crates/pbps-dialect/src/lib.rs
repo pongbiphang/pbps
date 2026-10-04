@@ -2636,10 +2636,15 @@ pub fn check_module_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String>
 /// Whether a system-versioned table's history (#1176) takes a name something
 /// else in the declaration holds: another table's history, or any object the
 /// engine keeps beside tables. That is a table, a module of a kind that shares
-/// the namespace, and, where constraints share it too, a named constraint or
-/// one the engine names itself. The history is a table in the database, in
-/// the schema's one namespace, though no declaration lists it as one, so
-/// `CREATE TABLE … HISTORY_TABLE` would meet the other object mid-apply.
+/// the namespace, and, where constraints share it too, a named constraint.
+/// The history is a table in the database, in the schema's one namespace,
+/// though no declaration lists it as one, so its creation would meet the other
+/// object mid-apply.
+///
+/// Not a generated default's names (#1501 review): of the two
+/// [`Dialect::generated_constraint_names`] gives, `CREATE TABLE` takes the
+/// first and only a later rename the fallback, so reserving both refuses a
+/// valid plan. A default already parked at either is the connected walk's.
 pub fn check_history_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> {
     // Every name the declaration puts in that namespace, with what holds it.
     let mut held: BTreeMap<TableName, String> = BTreeMap::new();
@@ -2659,8 +2664,7 @@ pub fn check_history_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String
                 .filter_map(|pk| pk.name.clone())
                 .chain(table.unique.keys().cloned())
                 .chain(table.foreign_keys.keys().cloned())
-                .chain(table.checks.keys().cloned())
-                .chain(dialect.generated_constraint_names(table_name, table));
+                .chain(table.checks.keys().cloned());
             for name in named {
                 held.insert(
                     TableName::new(table_name.schema.clone(), name),
