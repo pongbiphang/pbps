@@ -2530,16 +2530,22 @@ fn a_system_versioned_table_round_trips_through_the_cli() {
     ok(&again.run(&["pull", "--db", target.connection()]));
     assert_eq!(file(&again), file(&d));
 
-    // Negative: a column added to it is refused by name before anything
-    // connects, rather than planned with history side effects.
+    // Negative: a NOT NULL column added to it is refused by name before
+    // anything connects, rather than planned with history side effects; a
+    // nullable one is the change it takes (#1177).
     let path = d.dir.join("schema/dbo.t.yml");
-    let added = pulled.replacen("  vf:\n", "  note:\n    type: int\n  vf:\n", 1);
+    let added = pulled.replacen(
+        "  vf:\n",
+        "  note:\n    type: int\n    nullable: false\n  vf:\n",
+        1,
+    );
     assert_ne!(added, pulled, "{pulled}");
     std::fs::write(&path, added).unwrap();
     let o = d.run(&["plan"]);
     assert_ne!(code(&o), 0, "{}", stdout(&o));
     assert!(
-        stderr(&o).contains("dbo.t has `system_time`"),
+        stderr(&o).contains("dbo.t has `system_time`")
+            && stderr(&o).contains("add a NOT NULL column"),
         "{}",
         stderr(&o)
     );
@@ -2742,6 +2748,156 @@ fn a_history_schema_the_database_spells_otherwise_is_refused() {
     on_server(
         own.connection(),
         "IF OBJECT_ID('dbo.t') IS NOT NULL THROW 50000, 'bootstrap ran', 1;",
+    );
+}
+
+/// A nullable column added to a populated system-versioned table, with a
+/// schema-bound view over it, goes the whole way through the CLI (#1177):
+/// a saved plan applies, the engine adds the column to the history beside
+/// the table with versioning left on, every history row keeps its values and
+/// its period, `verify` is clean and the next plan is empty. A saved plan that
+/// meets the pair changed since it was planned (its retention, out of band)
+/// is refused before any DDL.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_nullable_column_is_added_to_a_populated_temporal_table() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "temporal1177_add");
+    on_server(
+        own.connection(),
+        "CREATE TABLE dbo.t (id int NOT NULL CONSTRAINT pk_t PRIMARY KEY, v int NULL,
+             vf datetime2 GENERATED ALWAYS AS ROW START NOT NULL,
+             vt datetime2 GENERATED ALWAYS AS ROW END NOT NULL,
+             PERIOD FOR SYSTEM_TIME (vf, vt))
+         WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.t_history,
+                                       HISTORY_RETENTION_PERIOD = 6 MONTHS));
+         INSERT dbo.t (id, v) VALUES (1, 1), (2, 2);
+         UPDATE dbo.t SET v = v + 10;
+         DELETE dbo.t WHERE id = 2;",
+    );
+    on_server(
+        own.connection(),
+        "CREATE VIEW dbo.v_t WITH SCHEMABINDING AS SELECT id, v FROM dbo.t;",
+    );
+    // The history as it stands, every row with its period, kept beside the
+    // database in a property no declaration reads, to compare after.
+    on_server(
+        own.connection(),
+        "IF (SELECT COUNT(*) FROM dbo.t_history) <> 3 THROW 50000, 'not three versions', 1;
+         DECLARE @sum int = (SELECT CHECKSUM_AGG(CHECKSUM(id, v, vf, vt)) FROM dbo.t_history);
+         EXEC sp_addextendedproperty N'history1177', @sum;",
+    );
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let d = Demo::new("temporal1177-add");
+    ok(&d.run(&["pull", "--db", own.connection()]));
+    d.commit();
+    ok(&d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]));
+    let path = d.dir.join("schema/dbo.t.yml");
+    let pulled = std::fs::read_to_string(&path).unwrap();
+    let added = pulled.replacen(
+        "  vf:\n",
+        "  note:\n    type: int\n    default: \"5\"\n  vf:\n",
+        1,
+    );
+    assert_ne!(added, pulled, "{pulled}");
+    std::fs::write(&path, added).unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let plan = |name: &str| {
+        let path = d.dir.join(name);
+        ok(&d.run(&[
+            "plan",
+            "--db",
+            own.connection(),
+            "--out",
+            path.to_str().unwrap(),
+        ]));
+        path
+    };
+    let apply = |path: &std::path::Path| {
+        let checksum = plan_checksum(path);
+        d.run(&[
+            "apply",
+            "--db",
+            own.connection(),
+            "--plan",
+            path.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+        ])
+    };
+
+    let fresh = plan("plan.json");
+    let applied = apply(&fresh);
+    ok(&applied);
+    assert!(
+        stdout(&applied).contains("Applied 1 change"),
+        "{}",
+        stdout(&applied)
+    );
+    on_server(
+        own.connection(),
+        "IF (SELECT temporal_type FROM sys.tables WHERE name = 't') <> 2
+             OR (SELECT history_retention_period FROM sys.tables WHERE name = 't') <> 6
+             THROW 50000, 'versioning or retention moved', 1;
+         IF COL_LENGTH('dbo.t', 'note') IS NULL THROW 50000, 'the table has no note', 1;
+         IF COL_LENGTH('dbo.t_history', 'note') IS NULL
+             THROW 50000, 'the history has no note', 1;
+         IF OBJECT_ID('dbo.v_t') IS NULL THROW 50000, 'the view is gone', 1;",
+    );
+    // In a batch of its own: it names the new column, which a batch compiled
+    // before the column existed could not.
+    on_server(
+        own.connection(),
+        "IF EXISTS (SELECT 1 FROM dbo.t_history WHERE note IS NOT NULL)
+             OR EXISTS (SELECT 1 FROM dbo.t WHERE note IS NOT NULL)
+             THROW 50000, 'an existing row has a note', 1;",
+    );
+    on_server(
+        own.connection(),
+        "IF (SELECT COUNT(*) FROM dbo.t_history) <> 3
+             OR (SELECT CHECKSUM_AGG(CHECKSUM(id, v, vf, vt)) FROM dbo.t_history)
+                <> CONVERT(int, (SELECT value FROM sys.extended_properties
+                                  WHERE class = 0 AND name = N'history1177'))
+             THROW 50000, 'a history row moved', 1;",
+    );
+    ok(&d.run(&["verify", "--db", own.connection()]));
+    let o = d.run(&["plan", "--db", own.connection()]);
+    ok(&o);
+    assert!(stdout(&o).contains("No changes"), "{}", stdout(&o));
+    // A row written now gets the default, and its old version the history.
+    on_server(
+        own.connection(),
+        "INSERT dbo.t (id, v) VALUES (3, 3);
+         UPDATE dbo.t SET v = 4 WHERE id = 3;
+         IF (SELECT note FROM dbo.t WHERE id = 3) <> 5
+             OR (SELECT note FROM dbo.t_history WHERE id = 3) <> 5
+             THROW 50000, 'the default did not apply', 1;",
+    );
+    // Stale: a second nullable column, planned, and then the pair changed
+    // out of band before the saved plan is applied. Refused before any DDL.
+    let path = d.dir.join("schema/dbo.t.yml");
+    let now = std::fs::read_to_string(&path).unwrap();
+    let again = now.replacen("  vf:\n", "  later:\n    type: int\n  vf:\n", 1);
+    assert_ne!(again, now, "{now}");
+    std::fs::write(&path, again).unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let stale = plan("stale.json");
+    on_server(
+        own.connection(),
+        "ALTER TABLE dbo.t SET (SYSTEM_VERSIONING = ON (HISTORY_RETENTION_PERIOD = 1 YEAR));",
+    );
+    let refused = apply(&stale);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        stderr(&refused).contains("no longer the database this plan was computed against"),
+        "{}",
+        stderr(&refused)
+    );
+    on_server(
+        own.connection(),
+        "IF COL_LENGTH('dbo.t', 'later') IS NOT NULL THROW 50000, 'DDL ran', 1;",
     );
 }
 

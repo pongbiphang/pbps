@@ -2180,7 +2180,7 @@ name longer than 124 characters is refused.
 
 **Changes.** Creating the table is one statement, so the engine builds the
 history. Every other change to a table with `system_time` on either side is
-refused by name until #1177. This covers:
+refused by name until #1177, which admits the first one (DEC-1177.1). This covers:
 
 - a difference in `system_time` itself, which no change carries and which
   would otherwise plan nothing;
@@ -2192,4 +2192,35 @@ refused by name until #1177. This covers:
 
 A grant or a trigger on the table, and a change to another table referencing
 it, are not changes to the pair.
+
+<a id="dec-1177-1"></a>
+
+**DEC-1177.1. The one change admitted to a table with `system_time` is adding
+a nullable column; every other change is still refused, and the refusal names
+each one (#1177).**
+
+Measured on 17.0.4075.5, on a populated versioned table:
+
+- `ALTER TABLE … ADD <column> NULL`, with or without a default, adds the column
+  to the history as well, in place. Both sides are nullable, and every
+  existing row of both reads NULL.
+- The history gains no default constraint, versioning stays on, and the
+  retention is unchanged.
+- Every history row keeps its values and its period. A schema-bound view over
+  the table is undisturbed.
+- No toggle of versioning is involved, so none of the OFF/ON choreography the
+  feasibility review measured is admitted.
+
+That is the whole of what is admitted: an `AddColumn` whose column is nullable,
+on a table that keeps its `system_time`. A period column is declared through
+`system_time`, whose difference stays refused. Adding a NOT NULL column stays
+refused, because with a default it writes that default into every history row.
+So does every other kind of change, each named in the refusal by its kind.
+
+What makes the admitted change safe is not new. The apply refuses a saved plan
+whose recorded pair has moved since it was computed, before any DDL. The
+closing read holds the table's `system_time` to the before-read, and reads the
+pair only while the history still mirrors the table, so a column the engine
+did not add to the history leaves the pair a limitation that refuses the
+recording. The estimate stays unmeasured for a temporal table, as it is.
 

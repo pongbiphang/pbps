@@ -56,7 +56,9 @@ A SQL Server table declares `system_time:`, its period and its system
 versioning into a history table that is part of it. `pull` reads a pair whose
 history has the layout the engine builds, and writes out a history name the
 engine chose. Any other layout leaves the pair out by name. Such a table is
-created whole; changing one is #1177 (#1176, DEC-1176.1).
+created whole, and gains a nullable column in place, its history with it;
+every other change to one is refused by name (#1176, #1177, DEC-1176.1,
+DEC-1177.1).
 
 A SQL Server column may name its collation (`collation:`); `pull` declares one
 that differs from the database's default, and a collation change is a planned
