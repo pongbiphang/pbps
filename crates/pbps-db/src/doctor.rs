@@ -51,10 +51,12 @@ pub struct Ask<'a> {
     /// alike — [`Ask::referenced`] is the second half of it, kept apart
     /// because the two are asked about at different securables.
     ///
-    /// This is how a `doctor` that never looks at a plan reads a key the next
-    /// apply takes away: the catalog has a key the declarations do not name,
-    /// so a `DropForeignKey` is coming, and the demands that key would have
-    /// carried are not made (DECISIONS 513).
+    /// This is how `doctor` reads a key the next apply takes away: the catalog
+    /// has a key this map does not name, so a `DropForeignKey` runs before the
+    /// deletes and the demands that key would have carried are not made
+    /// (DECISIONS 513). Where the environment's recorded state lets the
+    /// differ answer, a declared key the plan drops and *re-adds* is left out
+    /// too, since it is just as absent while the deletes run (DEC-678.1).
     pub declared_keys: &'a DeclaredKeys,
 }
 

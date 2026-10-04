@@ -811,3 +811,32 @@ The live regression is `the_nearest_inherited_grantor_decides_an_adopted_revoke`
 It asks doctor and the catalog read, then checks each case with an actual
 `REVOKE` and an ACL readback: owner nearer, holder nearer, a tie, and a
 non-inheritable owner.
+
+<a id="dec-678-1"></a>
+
+**DEC-678.1. Which declared keys survive the deletes is the differ's answer,
+asked in memory.** DECISIONS 513 demands a moved delete-count child's
+destination only while its declaration still names a key into a removable
+parent. That narrows by *target*, not by key. A key into the same parent whose
+definition changed (its columns, its action or its name) is a `DropForeignKey`
+(`order_key` 2) and an `AddForeignKey` (13) either side of the `DeleteRow`
+(12). The delete guard therefore finds no child through it, and the demand was
+a `GRANT` nothing would spend (#678).
+
+Telling the two apart needs the differ's own comparison, made after it
+resolves renames through the uids. A comparison by spelling reads every
+renamed table or column as a dropped key, which is the permissive mistake.
+Re-deriving that resolution inside `doctor` would contradict DECISIONS 38,
+which says `doctor` reimplements nothing, and it would drift from the planner.
+So `doctor` runs `pbps_diff::diff` in memory, per environment: the recorded
+snapshot (overlaid with what was declared, as a connected plan does) against
+the declarations and the project's ids. A declared key the change set *adds*
+is left out of the keys handed on; every other declared key stays.
+
+Nothing is planned for use and no plan file is read. The change set is
+consulted for its foreign-key additions only. When the declarations do not
+load, the environment has recorded no state, the ledger cannot be read or the
+differ refuses, every declared key is kept, which is DECISIONS 513's safe
+over-demand. The unit test `only_keys_the_plan_does_not_re_add_survive_the_deletes`
+covers an unchanged key, a referencing column renamed through its uid, and a
+changed referencing column. Only the last one leaves the surviving set.

@@ -306,6 +306,8 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
         data: data_tables(project),
         schemas: managed_schemas,
         ids,
+        loaded: crate::load_quiet(project).ok(),
+        dialect: project.config.dialect,
     };
 
     if !project.ids_file().exists() {
@@ -793,6 +795,81 @@ struct Declared {
     /// (uid -> its name there) and looks the two maps up together (DECISIONS
     /// 439).
     ids: pbps_model::IdsFile,
+    /// The declarations themselves, for the one question only the differ can
+    /// answer: which declared keys the next apply drops and re-adds
+    /// ([`surviving_keys`]). `None` when they do not load.
+    loaded: Option<pbps_load::Loaded>,
+    dialect: pbps_config::DialectName,
+}
+
+/// The declared foreign keys still in place when the next apply's row deletes
+/// run, by the table that holds them (#678, DEC-678.1).
+///
+/// A declared key the plan *adds* is not there yet: a key whose definition
+/// changed — its columns, its action, its name — is a `DropForeignKey`
+/// (`order_key` 2) and an `AddForeignKey` (13) either side of the `DeleteRow`
+/// (12), so the delete guard finds no child through it. Which declared keys
+/// those are is the differ's comparison, made after it resolves every rename
+/// through the uids, so it is asked rather than re-derived: the environment's
+/// recorded state against the declarations, exactly as a connected plan diffs
+/// them. Nothing is planned for use and no plan file is read; the change set
+/// is consulted for its foreign-key additions and dropped.
+///
+/// `None` when the declarations do not load, the environment has recorded no
+/// state, or the differ cannot express a change. The caller then keeps every
+/// declared key, which over-demands on the safe side (DECISIONS 513).
+fn surviving_keys(
+    declared: &Declared,
+    entry: &pbps_db::LedgerEntry,
+) -> Option<pbps_db::doctor::DeclaredKeys> {
+    let loaded = declared.loaded.as_ref()?;
+    let snapshot = &entry.snapshot;
+    // What was declared when each object was last written, as a connected plan
+    // compares against (ADR-0013 §4), and the recorded `depends_on:` edges of
+    // modules the declarations no longer hold.
+    let base = snapshot.declared.overlay(&snapshot.schema);
+    let mut hints = loaded.hints.clone();
+    for (name, dependencies) in &snapshot.module_deps {
+        if !loaded.schema.modules.contains_key(name) {
+            hints.module_deps.insert(name.clone(), dependencies.clone());
+        }
+    }
+    let dialect = crate::dialect_for(declared.dialect);
+    let changes = pbps_diff::diff(
+        pbps_diff::Side {
+            schema: &base,
+            ids: &snapshot.ids,
+        },
+        pbps_diff::Side {
+            schema: &loaded.schema,
+            ids: &declared.ids,
+        },
+        dialect.as_ref(),
+        &hints,
+    )
+    .ok()?;
+    let added: std::collections::BTreeSet<(&pbps_model::TableName, &str)> = changes
+        .changes
+        .iter()
+        .filter_map(|planned| {
+            if let pbps_model::Change::AddForeignKey { table, name, .. } = &planned.change {
+                Some((table, name.as_str()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let mut keys = pbps_db::doctor::DeclaredKeys::new();
+    for (table_name, table) in &loaded.schema.tables {
+        for (key_name, key) in &table.foreign_keys {
+            if !added.contains(&(table_name, key_name.as_str())) {
+                keys.entry(table_name.clone())
+                    .or_default()
+                    .insert(key.references_table.clone());
+            }
+        }
+    }
+    Some(keys)
 }
 
 /// Everything one environment can be asked without writing to it.
@@ -857,6 +934,13 @@ async fn examine(
         Ok(problems) => problems,
         Err(e) => vec![format!("the ledger tables could not be checked: {e}")],
     };
+    // The keys still present when the deletes run, where the differ can say;
+    // every declared key otherwise. An unreadable ledger is not "nothing
+    // survives": it falls back to the over-demand, never to an all-clear.
+    let surviving = match crate::engine::latest(&mut conn).await {
+        Ok(Some(entry)) => surviving_keys(declared, &entry),
+        _ => None,
+    };
     let ask = pbps_db::doctor::Ask {
         managed_schemas: &declared.schemas,
         managed_tables: &declared.tables,
@@ -864,7 +948,7 @@ async fn examine(
         referenced_columns: &declared.referenced_columns,
         granted: &declared.granted,
         data: &declared.data,
-        declared_keys: &declared.declared_keys,
+        declared_keys: surviving.as_ref().unwrap_or(&declared.declared_keys),
     };
     match crate::engine::permissions(&mut conn, &declared.ids, &ask).await {
         Ok(held) => {
@@ -1274,6 +1358,146 @@ fn render_resolver(out: &mut String, discovery: &pbps_db::resolver::Discovery) {
 
 #[cfg(test)]
 mod tests {
+    /// The declarations in `files`, loaded as a SQL Server project would load
+    /// them.
+    fn loaded_from(files: &[(&str, String)]) -> pbps_load::Loaded {
+        let dir = std::env::temp_dir().join(format!(
+            "pbps-doctor-keys678-{}",
+            pbps_model::Uid::generate(pbps_model::UidKind::Table)
+        ));
+        std::fs::create_dir_all(dir.join("schema")).unwrap();
+        std::fs::write(dir.join("pbps.yml"), "dialect: mssql\n").unwrap();
+        for (file, declaration) in files {
+            std::fs::write(dir.join("schema").join(file), declaration).unwrap();
+        }
+        let project = Project::load(&dir.join("pbps.yml")).unwrap();
+        let loaded = crate::load_quiet(&project).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        loaded
+    }
+
+    /// A child moved from `src` to `dst` and its key into `app.p`, as the
+    /// environment recorded it and as it is now declared (#678). Which keys
+    /// survive is the differ's answer: a changed definition is dropped and
+    /// re-added around the delete, so its target leaves the surviving set; an
+    /// unchanged one stays, including across a column rename the uids resolve,
+    /// which a comparison by spelling would read as a drop.
+    #[test]
+    fn only_keys_the_plan_does_not_re_add_survive_the_deletes() {
+        let parent = (
+            "app.p.yml",
+            "table: app.p\ncolumns:\n  id: {type: int}\nprimary_key: [id]\n".to_owned(),
+        );
+        let child = |schema: &str, column: &str, keyed: &str| {
+            (
+                "c.yml",
+                format!(
+                    "table: {schema}.c\ncolumns:\n  id: {{type: int}}\n  {column}: {{type: int}}\n  \
+                     q: {{type: int}}\nforeign_keys:\n  fk_c_p:\n    columns: [{keyed}]\n    \
+                     references: app.p(id)\n"
+                ),
+            )
+        };
+        let recorded = loaded_from(&[parent.clone(), child("src", "p", "p")]);
+        let (p_uid, c_uid) = (
+            pbps_model::Uid::generate(pbps_model::UidKind::Table),
+            pbps_model::Uid::generate(pbps_model::UidKind::Table),
+        );
+        let column_uids: Vec<(String, pbps_model::Uid)> = ["id", "p", "q"]
+            .into_iter()
+            .map(|c| {
+                (
+                    c.to_owned(),
+                    pbps_model::Uid::generate(pbps_model::UidKind::Column),
+                )
+            })
+            .collect();
+        let parent_id = pbps_model::Uid::generate(pbps_model::UidKind::Column);
+        // The same uids on both sides, each side spelling them its own way.
+        let ids = |child_schema: &str, renamed_p: &str| {
+            let mut ids = pbps_model::IdsFile::default();
+            ids.tables.insert(p_uid.clone(), "app.p".parse().unwrap());
+            ids.tables
+                .insert(c_uid.clone(), format!("{child_schema}.c").parse().unwrap());
+            ids.columns.insert(
+                parent_id.clone(),
+                "app.p"
+                    .parse::<pbps_model::TableName>()
+                    .unwrap()
+                    .column("id"),
+            );
+            for (column, uid) in &column_uids {
+                let spelled = if column == "p" { renamed_p } else { column };
+                ids.columns.insert(
+                    uid.clone(),
+                    format!("{child_schema}.c")
+                        .parse::<pbps_model::TableName>()
+                        .unwrap()
+                        .column(spelled),
+                );
+            }
+            ids
+        };
+        let entry = pbps_db::LedgerEntry {
+            id: 1,
+            applied_at: "2026-10-04T00:00:00.000".into(),
+            snapshot: pbps_model::StateSnapshot::new(
+                pbps_model::StateKind::Apply,
+                recorded.schema.clone(),
+                ids("src", "p"),
+                "ci-deploy",
+            ),
+        };
+        let surviving = |declared: pbps_load::Loaded, declared_ids| {
+            surviving_keys(
+                &Declared {
+                    schemas: Vec::new(),
+                    tables: Vec::new(),
+                    referenced: Vec::new(),
+                    referenced_columns: Default::default(),
+                    declared_keys: Default::default(),
+                    granted: Default::default(),
+                    data: Default::default(),
+                    ids: declared_ids,
+                    loaded: Some(declared),
+                    dialect: pbps_config::DialectName::Mssql,
+                },
+                &entry,
+            )
+            .expect("the differ answers for these declarations")
+        };
+        let moved: pbps_model::TableName = "dst.c".parse().unwrap();
+        let target: pbps_model::TableName = "app.p".parse().unwrap();
+        // Unchanged key: it is there when the deletes run.
+        let kept = surviving(
+            loaded_from(&[parent.clone(), child("dst", "p", "p")]),
+            ids("dst", "p"),
+        );
+        assert!(
+            kept.get(&moved).is_some_and(|t| t.contains(&target)),
+            "{kept:?}"
+        );
+        // The referencing column renamed through its uid: still the same key.
+        let renamed = surviving(
+            loaded_from(&[parent.clone(), child("dst", "p2", "p2")]),
+            ids("dst", "p2"),
+        );
+        assert!(
+            renamed.get(&moved).is_some_and(|t| t.contains(&target)),
+            "{renamed:?}"
+        );
+        // A different referencing column: dropped before the delete, re-added
+        // after it, so nothing reads the child through it.
+        let changed = surviving(
+            loaded_from(&[parent.clone(), child("dst", "p", "q")]),
+            ids("dst", "p"),
+        );
+        assert!(
+            !changed.get(&moved).is_some_and(|t| t.contains(&target)),
+            "{changed:?}"
+        );
+    }
+
     use super::*;
 
     /// DEC-952.1: a loaded key is named by its identifier, a configured key
