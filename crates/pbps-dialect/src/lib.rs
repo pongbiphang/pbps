@@ -2696,6 +2696,40 @@ pub fn check_history_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String
     problems
 }
 
+/// An `INSTEAD OF` trigger declared on a system-versioned table (#1176):
+/// SQL Server refuses one there (13569), and takes an `AFTER` trigger, or
+/// either kind on a table with a period alone (measured on 17.0). The
+/// trigger's timing is the first of `FOR`, `AFTER` or `INSTEAD` in its code,
+/// which is where a definition starts after any `WITH` options.
+pub fn check_system_time_triggers(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (id, module) in &schema.modules {
+        let ModuleId::Trigger { on, name } = id else {
+            continue;
+        };
+        let versioned = schema
+            .tables
+            .get(on)
+            .and_then(|t| t.system_time.as_ref())
+            .is_some_and(|st| st.versioning.is_some());
+        if !versioned {
+            continue;
+        }
+        let code = dialect.code_only(&module.definition).to_ascii_uppercase();
+        let timing = code
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .find(|word| matches!(*word, "FOR" | "AFTER" | "INSTEAD"));
+        if timing == Some("INSTEAD") {
+            problems.push(format!(
+                "trigger `{name}` on `{on}` is INSTEAD OF, which {} refuses on a \
+                 system-versioned table; make it AFTER, or leave `versioning` out",
+                dialect.name()
+            ));
+        }
+    }
+    problems
+}
+
 /// The whole-schema question of whether a declared index, or the index behind
 /// a named primary key or unique constraint, collides with another relation
 /// in its schema — a third case of the namespace-sharing rule 201 moved to
@@ -3872,6 +3906,62 @@ mod tests {
                 problems.len() == 1 && problems[0].contains(says),
                 "{history}: {problems:?}"
             );
+        }
+    }
+
+    /// An INSTEAD OF trigger is refused on a versioned table, by its timing
+    /// in code and not by a word in a comment, and an AFTER trigger, or one on
+    /// a table with a period alone, is not (#1176).
+    #[test]
+    fn an_instead_of_trigger_is_refused_only_on_a_versioned_table() {
+        let table = |versioned: bool| Table {
+            system_time: Some(pbps_model::SystemTime {
+                start: "vf".into(),
+                end: "vt".into(),
+                hidden: false,
+                versioning: versioned.then(|| pbps_model::SystemVersioning {
+                    history: "app.t_history".parse().unwrap(),
+                    retention: None,
+                }),
+            }),
+            ..Default::default()
+        };
+        let with_trigger = |versioned: bool, definition: &str| {
+            let mut schema = Schema::default();
+            schema
+                .tables
+                .insert("app.t".parse().unwrap(), table(versioned));
+            schema.modules.insert(
+                ModuleId::Trigger {
+                    on: "app.t".parse().unwrap(),
+                    name: "tr".into(),
+                },
+                Module {
+                    definition: definition.into(),
+                    ..module(ModuleKind::Trigger)
+                },
+            );
+            check_system_time_triggers(&schema, &MinimalDialect)
+        };
+        for definition in [
+            "INSTEAD OF INSERT AS SELECT 1",
+            "instead  of delete as select 1",
+            "WITH EXECUTE AS OWNER INSTEAD OF UPDATE AS SELECT 1",
+        ] {
+            let problems = with_trigger(true, definition);
+            assert!(
+                problems.len() == 1 && problems[0].contains("is INSTEAD OF"),
+                "{definition}: {problems:?}"
+            );
+            assert!(with_trigger(false, definition).is_empty(), "{definition}");
+        }
+        for definition in [
+            "AFTER INSERT AS SELECT 1",
+            "FOR UPDATE AS SELECT 1 -- not INSTEAD OF",
+            "AFTER DELETE AS SELECT 'INSTEAD OF'",
+            "/* INSTEAD OF */ AFTER INSERT AS SELECT 1",
+        ] {
+            assert!(with_trigger(true, definition).is_empty(), "{definition}");
         }
     }
 

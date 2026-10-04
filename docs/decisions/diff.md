@@ -2076,6 +2076,20 @@ Measured on 17.0.4075.5, Developer and Express editions:
 - A period column must be `datetime2` (13501). It may have a default.
 - A system-versioned table must have a primary key (13553); a period alone
   needs none.
+
+**The engine's temporal limitations, audited once against 17.0** (#1501
+review):
+
+| Limitation | On 17.0 | pbps |
+|---|---|---|
+| No primary key on a versioned table | refused (13553) | validation refuses it |
+| An INSTEAD OF trigger on a versioned table | refused (13569) | validation refuses it |
+| An AFTER trigger on it, or either kind with a period alone | accepted | held |
+| A cascading foreign key from or to a versioned table | accepted | held; the restriction was 2016's (#1502) |
+| A computed, identity, `xml`, `(max)` or `ntext` column | accepted | held as for any table |
+| A sparse or FILESTREAM column | refused (11418) | outside the model |
+| A history table's constraints, triggers or own layout | see above | the pair is left out |
+| TRUNCATE, DROP, and changes to the period or the history | refused or rewrites history | every change refused until #1177 |
 - History is kept for at most 1000 years in any unit (365242 days, 52177
   weeks, 12000 months, 1000 years; 13749 beyond, found by bisection), so
   validation refuses a longer retention.
