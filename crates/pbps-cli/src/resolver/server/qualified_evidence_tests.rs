@@ -4302,12 +4302,25 @@ async fn recorded_renames_with_type_and_nullability_edits_match_actual_child_cat
     // Properties are sealed HMACs. This fixture declares no other
     // constraints, so its pg_constraint identities enumerate the NOT NULL
     // children; the actual catalog query below also checks their contype.
+    // The closing manifest keeps a record the plan installs only where
+    // something names it (DEC-1274.1), so the children the plan makes are
+    // read from the transitions that install them.
+    let evidence = serde_json::to_value(&result.evidence).unwrap();
+    let installed: Vec<pbps_db::resolver::capture::ObjectIdentity> = evidence["transitions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|t| t["after"].as_array().into_iter().flatten())
+        .map(|object| serde_json::from_value(object.clone()).unwrap())
+        .collect();
     let child_identities: BTreeSet<_> = closing
         .prerequisites()
         .iter()
-        .filter(|row| row.object.class == "pg_constraint")
-        .map(|row| {
-            let relation = row.object.signature.get(1).unwrap();
+        .map(|row| &row.object)
+        .chain(&installed)
+        .filter(|object| object.class == "pg_constraint")
+        .map(|object| {
+            let relation = object.signature.get(1).unwrap();
             assert_eq!(relation.class, "pg_class");
             assert_eq!(
                 relation.name.first().map(String::as_str),
@@ -4315,7 +4328,7 @@ async fn recorded_renames_with_type_and_nullability_edits_match_actual_child_cat
             );
             (
                 relation.name.get(1).unwrap().clone(),
-                row.object.name.first().unwrap().clone(),
+                object.name.first().unwrap().clone(),
             )
         })
         .collect();
