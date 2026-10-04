@@ -1296,12 +1296,19 @@ A plan can give a table's name to another table: it drops `app.a` and renames
 its table's rename; a removal precedes its table's drop; a removal precedes the
 restoration it makes room for) compared names, so the renamed table's check
 removal read as a change to the dropped table, and the three rules closed a
-cycle no order has. Each step's table is now its recorded UID. A step spells a
-table as it is named where the differ placed the step, so the UID is that of
-the latest earlier rename to the name or creation under it, and otherwise the
-base table's. A rule fires only when the names match and, where both UIDs are
-known, the UIDs match too. This only removes the false edges between two tables
-that share a name in turn; it adds none.
+cycle no order has. Each step's table is now its recorded UID. A step of the
+ordinary plan spells a table as it is named where the differ placed the step,
+so the UID is that of the latest earlier rename to the name or creation under
+it, and otherwise the base table's. A binding rebuild the resolver appends
+after the ordinary plan does not follow its position: it spells its teardown by
+the base name, so that the teardown can precede the table's rename, and its
+restoration by the final name. Its UID is therefore the base table's for a
+teardown and the desired table's for anything else. Read by position, the
+teardown of the old `app.b` in a rename chain (`app.b` to `app.c`, then `app.a`
+to `app.b`) would belong to the table that took its name. A rule fires only
+when the names match and, where both UIDs are known, the UIDs match too. This
+only removes the false edges between two tables that share a name in turn; it
+adds none.
 
 The observations need no such re-keying (#1499). A `SurfaceResolution` holds
 the opening record under the surface's base spelling and the compiled record

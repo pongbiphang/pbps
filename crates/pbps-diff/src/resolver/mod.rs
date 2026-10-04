@@ -75,7 +75,7 @@ pub fn plan(
         .collect();
     let ordinary = crate::diff_rebuilding(base, desired, dialect, hints, &modules)
         .map_err(|e| Error::Diff(e.into_iter().map(|e| e.to_string()).collect()))?;
-    let changes = prepare::changes(
+    let (changes, ordinary) = prepare::changes(
         &ordinary,
         base.schema,
         desired.schema,
@@ -85,7 +85,14 @@ pub fn plan(
         hints,
         dialect,
     )?;
-    let edges = graph::constraints(&changes, resolution, &hints.module_deps, base, desired);
+    let edges = graph::constraints(
+        &changes,
+        ordinary,
+        resolution,
+        &hints.module_deps,
+        base,
+        desired,
+    );
     order(changes, edges)
 }
 

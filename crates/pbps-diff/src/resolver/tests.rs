@@ -403,6 +403,7 @@ fn a_delayed_child_rename_does_not_lose_its_foreign_key_drop_dependency() {
     observed.current = Some(current);
     let edges = graph::constraints(
         &changes,
+        changes.changes.len(),
         &[observed],
         &Default::default(),
         crate::Side {
@@ -1625,5 +1626,97 @@ mod generated_surface_coverage {
         let rebound = plan("f_exact");
         assert_eq!(rewritten(&rebound), vec!["app.b.g".parse().unwrap()]);
         rebound.proof.validate(&rebound.changes).unwrap();
+    }
+
+    /// A rebuild the resolver appends after the ordinary plan spells its
+    /// teardown by the base name and its restoration by the final one, not
+    /// by where it sits. In a rename chain, app.b to app.c and then app.a to
+    /// app.b, the old app.b's check is dropped before its rename, never
+    /// after it, which would hit the table that took the name (DEC-1498.1).
+    #[test]
+    fn an_appended_teardown_belongs_to_its_base_table_in_a_rename_chain() {
+        let (id, module) = routine();
+        let names =
+            ["app.a", "app.b", "app.c"].map(|n| n.parse::<pbps_model::TableName>().unwrap());
+        let [a, b, c] = names.clone();
+        let mut checked = table(None);
+        checked.checks.insert(
+            "k".into(),
+            pbps_model::CheckConstraint {
+                expression: "app.f(a) > 0".into(),
+            },
+        );
+        let mut base = Schema::default();
+        base.modules.insert(id.clone(), module);
+        base.tables.insert(a.clone(), table(None));
+        base.tables.insert(b.clone(), checked.clone());
+        let mut desired = Schema {
+            modules: base.modules.clone(),
+            ..Default::default()
+        };
+        desired.tables.insert(b.clone(), table(None));
+        desired.tables.insert(c.clone(), checked);
+        let before_ids = ids(&base, &IdsFile::default());
+        let mut after_ids = before_ids.clone();
+        after_ids.rename_table(&b, &c);
+        after_ids.rename_table(&a, &b);
+        let function = Surface::Module(id);
+        let check = |table: &pbps_model::TableName| Surface::Check {
+            table: table.clone(),
+            name: "k".into(),
+        };
+        let constraint = |binds: &str| {
+            Some(bound(
+                "pg_constraint",
+                "app.x.k",
+                std::slice::from_ref(&function),
+                binds,
+            ))
+        };
+        let ordered = super::plan(
+            crate::Side {
+                schema: &base,
+                ids: &before_ids,
+            },
+            crate::Side {
+                schema: &desired,
+                ids: &after_ids,
+            },
+            &Hints::default(),
+            &[
+                SurfaceResolution {
+                    surface: check(&b),
+                    current: constraint("f"),
+                    desired: None,
+                },
+                SurfaceResolution {
+                    surface: check(&c),
+                    current: None,
+                    desired: constraint("f_exact"),
+                },
+                SurfaceResolution {
+                    surface: function.clone(),
+                    current: Some(bound("pg_proc", "app.f", &[], "int4in")),
+                    desired: Some(bound("pg_proc", "app.f", &[], "int4in")),
+                },
+            ],
+            &pbps_dialect::MinimalDialect,
+        )
+        .unwrap();
+        let steps = &ordered.changes.changes;
+        let position = |f: &dyn Fn(&Change) -> bool| {
+            steps
+                .iter()
+                .position(|p| f(&p.change))
+                .unwrap_or_else(|| panic!("missing from {steps:?}"))
+        };
+        let teardown = position(&|ch| matches!(ch, Change::DropCheck { table, .. } if table == &b));
+        let away = position(&|ch| matches!(ch, Change::RenameTable { from, .. } if from == &b));
+        let into = position(&|ch| matches!(ch, Change::RenameTable { to, .. } if to == &b));
+        let restore = position(&|ch| matches!(ch, Change::AddCheck { table, .. } if table == &c));
+        assert!(teardown < away, "{steps:?}");
+        assert!(away < into, "{steps:?}");
+        assert!(away < restore, "{steps:?}");
+        ordered.proof.validate(&ordered.changes).unwrap();
     }
 }

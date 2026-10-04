@@ -115,6 +115,7 @@ fn expression(c: &Change) -> Option<bool> {
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(super) fn constraints(
     changes: &ChangeSet,
+    ordinary: usize,
     observations: &[SurfaceResolution],
     annotations: &pbps_model::ModuleDeps,
     base: crate::Side<'_>,
@@ -144,9 +145,11 @@ pub(super) fn constraints(
             surfaces
         })
         .collect();
-    // The table each step changes, by recorded UID. A step spells a table as
-    // it is named where the differ placed the step: by the latest earlier
-    // rename to that name or creation under it, otherwise by the base table.
+    // The table each step changes, by recorded UID. A step of the ordinary
+    // plan spells a table as it is named where the differ placed the step:
+    // by the latest earlier rename to that name or creation under it,
+    // otherwise by the base table. A rebuild appended after it spells a
+    // teardown by the base name and a restoration by the final one.
     // A dropped table's name taken by a renamed one is two tables
     // (DEC-1498.1).
     let owners: Vec<Option<&pbps_model::Uid>> = steps
@@ -156,6 +159,15 @@ pub(super) fn constraints(
             Change::CreateTable { uid, .. }
             | Change::DropTable { uid, .. }
             | Change::RenameTable { uid, .. } => Some(uid),
+            other if k >= ordinary => other.table().and_then(|t| {
+                if expression(other) == Some(false)
+                    || matches!(other, Change::AlterColumnDefault { to: None, .. })
+                {
+                    base.ids.table_uid(t)
+                } else {
+                    desired.ids.table_uid(t)
+                }
+            }),
             other => other.table().and_then(|t| {
                 steps[..k]
                     .iter()
