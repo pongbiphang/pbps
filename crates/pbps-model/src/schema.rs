@@ -570,7 +570,9 @@ impl std::str::FromStr for Retention {
         if count == 0 {
             return Err(wrong());
         }
-        let unit = match unit.to_ascii_lowercase().trim_end_matches('s') {
+        // Singular or plural, and nothing else: one `s` at most.
+        let lower = unit.to_ascii_lowercase();
+        let unit = match lower.strip_suffix('s').unwrap_or(&lower) {
             "day" => RetentionUnit::Day,
             "week" => RetentionUnit::Week,
             "month" => RetentionUnit::Month,
@@ -1241,6 +1243,8 @@ mod tests {
             "six months",
             "6 fortnights",
             "6 months ago",
+            "6 monthss",
+            "1 dayss",
             "",
         ] {
             assert!(text.parse::<Retention>().is_err(), "{text:?}");
