@@ -54,10 +54,11 @@ path. See SPEC §9.3.2 for configuration and the current limitation.
 
 `pbps-db::transport::PeerVerifiedConn` owns one connection whose TLS handshake
 verified the certificate chain and expected peer name. It requires PostgreSQL
-`sslmode=require` and SQL Server encryption with certificate validation. Failed
-trust setup, plaintext/opportunistic settings and disabled peer checks cannot
-construct it. Its opaque connection identity changes on reconnect; callers
-cannot replace the underlying connection while retaining that identity.
+`sslmode=require`, which a string naming no `sslmode` gets as every connection
+does (DECISIONS 543), and SQL Server encryption with certificate validation.
+Failed trust setup, plaintext/opportunistic settings and disabled peer checks
+cannot construct it. Its opaque connection identity changes on reconnect;
+callers cannot replace the underlying connection while retaining that identity.
 
 Disposable PostgreSQL and SQL Server fixtures exercise trusted and untrusted
 roots, wrong peer names, reconnects, successful relay traffic and corruption of
