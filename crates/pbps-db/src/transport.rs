@@ -149,7 +149,10 @@ mod tests {
     async fn insecure_options_are_refused_without_opening_a_socket() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        for options in ["", " sslmode=disable", " sslmode=prefer"] {
+        // A string naming no `sslmode` is not here: it means verified TLS,
+        // as on every connection (DECISIONS 543), so it goes on to a verified
+        // handshake rather than being refused (#1514 review).
+        for options in [" sslmode=disable", " sslmode=prefer"] {
             let result = tokio::time::timeout(
                 Duration::from_secs(1),
                 PeerVerifiedConn::connect(
