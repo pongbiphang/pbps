@@ -1076,7 +1076,10 @@ pub(crate) fn after_the_rebuilds(
 /// Places a column this plan adds whose default or generation expression
 /// names a function the plan creates or rebuilds after that function's
 /// create, and whatever may need the column after the column (DEC-1364.1).
-/// Returns how many such columns it placed, or why no order performs them.
+/// A table the plan creates whose generated column does so is placed whole,
+/// since that column cannot leave the table without moving in its column
+/// order (DEC-1274.2). Returns how many it placed, or why no order performs
+/// them.
 ///
 /// The column cannot simply follow the last create, as a check does: a
 /// module the plan creates may read it, and measured on 18.6 the engine
@@ -1094,6 +1097,7 @@ pub(crate) fn after_the_rebuilds(
 /// rows are written before the modules, where a trigger the plan creates
 /// cannot fire on them. Such a plan is refused, naming the column and the
 /// functions, with the two-plan remedy.
+#[allow(clippy::wildcard_enum_match_arm)]
 fn after_their_functions(cs: &mut ChangeSet, deps: &ModuleDeps) -> Result<usize, String> {
     let functions = function_creates(cs);
     let Some(last) = functions.iter().map(|(_, at)| *at).max() else {
@@ -1102,17 +1106,30 @@ fn after_their_functions(cs: &mut ChangeSet, deps: &ModuleDeps) -> Result<usize,
     // Each such column, with the creates after it that its text names.
     let mut waits: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (i, p) in cs.changes[..last].iter().enumerate() {
-        if let Change::AddColumn { column, .. } = &p.change
-            && let Some(text) = column_expression(column)
-        {
-            let named: Vec<usize> = functions
-                .iter()
-                .filter(|(name, at)| *at > i && pbps_pg::generated::may_call(text, name))
-                .map(|(_, at)| *at)
-                .collect();
-            if !named.is_empty() {
-                waits.insert(i, named);
-            }
+        // A new table's generated column stays in its CREATE TABLE, where
+        // its place in the column order is (DEC-1364.1), so the whole table
+        // waits instead.
+        let texts: Vec<&str> = match &p.change {
+            Change::AddColumn { column, .. } => column_expression(column).into_iter().collect(),
+            Change::CreateTable { table, .. } => table
+                .columns
+                .values()
+                .filter_map(|c| c.generated.as_ref().map(|g| g.expression.as_str()))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let named: Vec<usize> = functions
+            .iter()
+            .filter(|(name, at)| {
+                *at > i
+                    && texts
+                        .iter()
+                        .any(|text| pbps_pg::generated::may_call(text, name))
+            })
+            .map(|(_, at)| *at)
+            .collect();
+        if !named.is_empty() {
+            waits.insert(i, named);
         }
     }
     let Some(&start) = waits.keys().next() else {
@@ -1187,6 +1204,14 @@ fn cycle(
     };
     let column = match &cs.changes[at].change {
         Change::AddColumn { table, name, .. } => format!("{table}.{name}"),
+        Change::CreateTable { name, table, .. } => table
+            .columns
+            .iter()
+            .find(|(_, c)| c.generated.is_some())
+            .map_or_else(
+                || name.to_string(),
+                |(column, _)| format!("{name}.{column}"),
+            ),
         other => format!("{other:?}"),
     };
     let module = |i: usize| cs.changes[i].change.module_id().map(|id| format!("`{id}`"));
@@ -1274,6 +1299,13 @@ fn needs(later: &Change, earlier: &Change, deps: &ModuleDeps) -> bool {
             }
         }
         Change::InsertRow { .. } | Change::UpdateRow { .. } | Change::DeleteRow { .. } => true,
+        // Two new tables are independent unless the later one names the
+        // earlier: a table held back for its generation expression must not
+        // drag every later new table behind it, or a function that reads one
+        // of those closes a cycle no order has (#1303 review).
+        Change::CreateTable { name: made, .. } if matches!(later, Change::CreateTable { .. }) => {
+            matches!(later, Change::CreateTable { table, .. } if names_new_table(table, made))
+        }
         other => match (later, other.table()) {
             (Change::CreateModule { id, module } | Change::AlterModule { id, module }, Some(t)) => {
                 names_table(id, &module.definition, t)
@@ -1282,6 +1314,35 @@ fn needs(later: &Change, earlier: &Change, deps: &ModuleDeps) -> bool {
             _ => true,
         },
     }
+}
+
+/// Whether a new table's definition may name another new table `made`: a
+/// column of its row type, a foreign key to it, or an expression whose text
+/// may name it, read by the engine's lexer as a module's is. A string
+/// literal counts too: an OID-alias literal such as `'app.a'::regclass` is
+/// resolved as the default or check is installed (measured on 16 and 18),
+/// as `may_call` reads a function's (DEC-1364.1).
+fn names_new_table(table: &pbps_model::Table, made: &TableName) -> bool {
+    let named = |text: &str| pbps_pg::generated::may_call(text, &made.name);
+    let typed = |base: &str| base == made.name || base == made.to_string();
+    table.columns.values().any(|column| {
+        typed(&column.ty.base)
+            || column.default.as_deref().is_some_and(named)
+            || column
+                .generated
+                .as_ref()
+                .is_some_and(|g| named(&g.expression))
+    }) || table
+        .foreign_keys
+        .values()
+        .any(|key| &key.references_table == made)
+        || table.checks.values().any(|check| named(&check.expression))
+        || table.indexes.values().any(|index| {
+            index.filter.as_deref().is_some_and(named)
+                || index.columns.iter().any(|column| {
+                    matches!(&column.key, pbps_model::IndexKey::Expression(text) if named(text))
+                })
+        })
 }
 
 /// Whether a module may read column `column` of `table`: its definition names
@@ -2098,6 +2159,188 @@ mod tests {
             assert_eq!(column("plain"), 0, "{order:?}");
             assert!(created("app.f(integer)") < created("app.z()"), "{order:?}");
         }
+    }
+
+    /// A new table whose generated column calls a new function cannot have
+    /// the column split out without changing its column order, so the whole
+    /// table follows the function, and a module naming the table follows the
+    /// table. A new table generating from nothing new does not wait.
+    #[test]
+    fn a_new_table_generating_from_a_new_function_follows_it_whole() {
+        let table = |name: &str, expression: &str| {
+            let mut t = Table::default();
+            t.columns.insert(
+                "id".into(),
+                Column::new("integer".parse().unwrap()).not_null(),
+            );
+            let mut g = Column::new("integer".parse().unwrap());
+            g.generated = Some(pbps_model::Generated {
+                expression: expression.into(),
+                stored: true,
+            });
+            t.columns.insert("g".into(), g);
+            Change::CreateTable {
+                uid: Uid::derived(UidKind::Table, name, 0),
+                name: name.parse().unwrap(),
+                table: Box::new(t),
+            }
+        };
+        let mut cs = plan(vec![
+            table("app.n", "app.f(id)"),
+            table("app.plain", "id * 2"),
+            routine("app.a_reader()", "SELECT g FROM app.n LIMIT 1"),
+            routine("app.f(integer)", "SELECT 1"),
+        ]);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
+        let at =
+            |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
+        let created =
+            |name: &str| at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id(name)));
+        let table_at = |name: &str| {
+            at(&|c| matches!(c, Change::CreateTable { name: n, .. } if n.to_string() == name))
+        };
+        let order = names(&cs);
+        assert!(created("app.f(integer)") < table_at("app.n"), "{order:?}");
+        assert!(table_at("app.n") < created("app.a_reader()"), "{order:?}");
+        #[allow(clippy::wildcard_enum_match_arm)]
+        match &cs.changes[table_at("app.n")].change {
+            Change::CreateTable { table, .. } => {
+                assert_eq!(table.columns.keys().collect::<Vec<_>>(), ["id", "g"]);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A new table held back for its generation expression does not drag an
+    /// unrelated new table behind it: when the function it calls reads that
+    /// other table, the order other table, function, generated table exists
+    /// and is found. A new table that names the held one still follows it.
+    #[test]
+    fn a_held_new_table_leaves_unrelated_new_tables_free() {
+        let new_table = |name: &str, columns: &[(&str, Option<&str>)], key: Option<&str>| {
+            let mut t = Table::default();
+            for (column, expression) in columns {
+                let mut c = Column::new("integer".parse().unwrap());
+                c.generated = expression.map(|expression| pbps_model::Generated {
+                    expression: expression.into(),
+                    stored: true,
+                });
+                t.columns.insert((*column).into(), c);
+            }
+            if let Some(target) = key {
+                t.foreign_keys.insert(
+                    "fk".into(),
+                    pbps_model::ForeignKey {
+                        columns: vec!["id".into()],
+                        references_table: target.parse().unwrap(),
+                        references_columns: vec!["id".into()],
+                        on_delete: Default::default(),
+                        on_update: Default::default(),
+                    },
+                );
+            }
+            Change::CreateTable {
+                uid: Uid::derived(UidKind::Table, name, 0),
+                name: name.parse().unwrap(),
+                table: Box::new(t),
+            }
+        };
+        // A later new table naming app.n only inside an OID-alias literal.
+        let literal_table = || {
+            let mut t = Table::default();
+            let mut r = Column::new("regclass".parse().unwrap());
+            r.default = Some("'app.n'::regclass".into());
+            t.columns.insert("r".into(), r);
+            Change::CreateTable {
+                uid: Uid::derived(UidKind::Table, "app.literal", 0),
+                name: "app.literal".parse().unwrap(),
+                table: Box::new(t),
+            }
+        };
+        let mut cs = plan(vec![
+            new_table("app.n", &[("id", None), ("g", Some("app.f(id)"))], None),
+            new_table("app.other", &[("id", None)], None),
+            new_table("app.child", &[("id", None)], Some("app.n")),
+            literal_table(),
+            routine("app.f(integer)", "SELECT count(*)::integer FROM app.other"),
+        ]);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
+        let at =
+            |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
+        let table_at = |name: &str| {
+            at(&|c| matches!(c, Change::CreateTable { name: n, .. } if n.to_string() == name))
+        };
+        let created = at(&|c| matches!(c, Change::CreateModule { .. }));
+        let order = names(&cs);
+        assert!(table_at("app.other") < created, "{order:?}");
+        assert!(created < table_at("app.n"), "{order:?}");
+        assert!(table_at("app.n") < table_at("app.child"), "{order:?}");
+        assert!(table_at("app.n") < table_at("app.literal"), "{order:?}");
+
+        // Two tables held behind different functions keep their own order:
+        // app.b waits for the earlier function but names app.a, which waits
+        // for the later one.
+        let mut cs = plan(vec![
+            new_table("app.a", &[("id", None), ("g", Some("app.f2(id)"))], None),
+            new_table(
+                "app.b",
+                &[
+                    ("id", None),
+                    ("g", Some("app.f1(id)")),
+                    ("r", Some("'app.a'::regclass::oid::integer")),
+                ],
+                None,
+            ),
+            routine("app.f1(integer)", "SELECT 1"),
+            routine("app.f2(integer)", "SELECT 2"),
+        ]);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 2);
+        let order = names(&cs);
+        let position = |name: &str| {
+            cs.changes
+                .iter()
+                .position(|p| {
+                    matches!(&p.change, Change::CreateTable { name: n, .. } if n.to_string() == name)
+                        || matches!(&p.change, Change::CreateModule { id, .. } if id.to_string() == name)
+                })
+                .unwrap_or_else(|| panic!("{name} missing from {order:?}"))
+        };
+        assert!(position("app.f2(integer)") < position("app.a"), "{order:?}");
+        assert!(position("app.a") < position("app.b"), "{order:?}");
+
+        // An underscored name is not read as app.a's array type: its spelling
+        // depends on what the target already holds (#1503), and guessing it
+        // would close a cycle no order has. app.other names a declared
+        // app.__a and is read by the function app.a calls.
+        let mut other = Table::default();
+        let mut r = Column::new("integer".parse().unwrap());
+        r.default = Some("'app.__a'::regtype::oid::integer".into());
+        other.columns.insert("r".into(), r);
+        let mut cs = plan(vec![
+            new_table("app.a", &[("id", None), ("g", Some("app.f(id)"))], None),
+            Change::CreateTable {
+                uid: Uid::derived(UidKind::Table, "app.other", 0),
+                name: "app.other".parse().unwrap(),
+                table: Box::new(other),
+            },
+            routine("app.f(integer)", "SELECT count(*)::integer FROM app.other"),
+        ]);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
+        let order = names(&cs);
+        let position = |name: &str| {
+            cs.changes
+                .iter()
+                .position(|p| {
+                    matches!(&p.change, Change::CreateTable { name: n, .. } if n.to_string() == name)
+                        || matches!(&p.change, Change::CreateModule { id, .. } if id.to_string() == name)
+                })
+                .unwrap_or_else(|| panic!("{name} missing from {order:?}"))
+        };
+        assert!(
+            position("app.other") < position("app.f(integer)"),
+            "{order:?}"
+        );
+        assert!(position("app.f(integer)") < position("app.a"), "{order:?}");
     }
 
     /// DEC-1364.1: a literal an OID-alias type reads names the function to

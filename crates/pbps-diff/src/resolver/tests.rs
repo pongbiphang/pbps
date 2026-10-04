@@ -835,3 +835,665 @@ fn new_table_indexes_are_offline_while_existing_table_indexes_keep_the_requested
         }
     }
 }
+
+mod generated_surface_coverage {
+    use super::*;
+    use pbps_model::resolver::{Binding, BoundSurface, ObjectIdentity};
+    use pbps_model::{Column, Generated, Hints, IdsFile, Schema, Table};
+
+    struct Fixture {
+        base: Schema,
+        desired: Schema,
+        before_ids: IdsFile,
+        after_ids: IdsFile,
+        resolution: Vec<SurfaceResolution>,
+    }
+
+    fn generated(expression: &str) -> Column {
+        let mut column = Column::new("int".parse().unwrap());
+        column.generated = Some(Generated {
+            expression: expression.into(),
+            stored: true,
+        });
+        column
+    }
+
+    fn attrdef(name: &str, present_before: bool, reads_input: bool) -> SurfaceResolution {
+        let input = ObjectIdentity {
+            class: "pg_attribute".into(),
+            name: vec!["app".into(), "t".into(), "a".into()],
+            signature: vec![],
+        };
+        let bound = BoundSurface {
+            object: ObjectIdentity {
+                class: "pg_attrdef".into(),
+                name: vec!["app".into(), "t".into(), name.into()],
+                signature: vec![],
+            },
+            bindings: if reads_input {
+                vec![Binding {
+                    node: "Var".into(),
+                    path: vec!["a".into()],
+                    target: input,
+                }]
+            } else {
+                vec![]
+            },
+            managed_inputs: if reads_input {
+                BTreeSet::from([Surface::Column("app.t.a".parse().unwrap())])
+            } else {
+                BTreeSet::new()
+            },
+        };
+        SurfaceResolution {
+            surface: Surface::Default(format!("app.t.{name}").parse().unwrap()),
+            current: present_before.then(|| bound.clone()),
+            desired: Some(bound),
+        }
+    }
+
+    // These are the two connected generation shapes, not engine admission or
+    // version qualification. The pure planner uses the existing minimal dialect.
+    fn fixture(add_stored: bool) -> Fixture {
+        let table_name = "app.t".parse().unwrap();
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("a".into(), Column::new("int".parse().unwrap()));
+        table.columns.insert("g".into(), generated("a * 2 + 1"));
+        let mut ordinary = Column::new("int".parse().unwrap());
+        ordinary.default = Some("7".into());
+        table.columns.insert("d".into(), ordinary);
+        let mut base = Schema::default();
+        base.tables.insert(table_name, table);
+        let before_ids = ids(&base, &IdsFile::default());
+        let mut desired = base.clone();
+        let columns = &mut desired
+            .tables
+            .get_mut(&"app.t".parse().unwrap())
+            .unwrap()
+            .columns;
+        let mut resolution = vec![attrdef("g", true, true), attrdef("d", true, false)];
+        if add_stored {
+            columns.insert("h".into(), generated("a + 4"));
+            resolution.push(attrdef("h", false, true));
+        } else {
+            columns.insert("g".into(), generated("a * 3"));
+        }
+        let after_ids = ids(&desired, &before_ids);
+        Fixture {
+            base,
+            desired,
+            before_ids,
+            after_ids,
+            resolution,
+        }
+    }
+
+    impl Fixture {
+        fn plan(&self, resolution: &[SurfaceResolution]) -> Result<Ordered, Error> {
+            super::plan(
+                crate::Side {
+                    schema: &self.base,
+                    ids: &self.before_ids,
+                },
+                crate::Side {
+                    schema: &self.desired,
+                    ids: &self.after_ids,
+                },
+                &Hints::default(),
+                resolution,
+                &pbps_dialect::MinimalDialect,
+            )
+        }
+
+        fn retained_column_uid(&self, name: &str) -> pbps_model::Uid {
+            let column = format!("app.t.{name}").parse().unwrap();
+            let before = self.before_ids.column_uid(&column).unwrap();
+            assert_eq!(Some(before), self.after_ids.column_uid(&column));
+            before.clone()
+        }
+    }
+
+    #[test]
+    fn replacing_a_stored_expression_keeps_its_uid_and_ordinary_default() {
+        let fixture = fixture(false);
+        assert_eq!(fixture.before_ids.tables, fixture.after_ids.tables);
+        let uid = fixture.retained_column_uid("g");
+        fixture.retained_column_uid("a");
+        fixture.retained_column_uid("d");
+        let ordered = fixture
+            .plan(&fixture.resolution)
+            .expect("generated attrdef evidence must admit the expression replacement");
+        assert_eq!(ordered.changes.changes.len(), 1);
+        assert_eq!(
+            ordered.changes.changes[0].change,
+            Change::AlterColumnExpression {
+                uid,
+                column: "app.t.g".parse().unwrap(),
+                from: "a * 2 + 1".into(),
+                to: "a * 3".into(),
+            }
+        );
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    #[test]
+    fn adding_stored_generation_retains_existing_generation_and_ordinary_default() {
+        let fixture = fixture(true);
+        assert_eq!(fixture.before_ids.tables, fixture.after_ids.tables);
+        for name in ["a", "g", "d"] {
+            fixture.retained_column_uid(name);
+        }
+        let column = "app.t.h".parse().unwrap();
+        assert!(fixture.before_ids.column_uid(&column).is_none());
+        let uid = fixture.after_ids.column_uid(&column).unwrap().clone();
+        let ordered = fixture
+            .plan(&fixture.resolution)
+            .expect("generated attrdef evidence must admit ADD STORED beside retained generation");
+        assert_eq!(ordered.changes.changes.len(), 1);
+        assert_eq!(
+            ordered.changes.changes[0].change,
+            Change::AddColumn {
+                uid,
+                table: "app.t".parse().unwrap(),
+                name: "h".into(),
+                column: Box::new(generated("a + 4")),
+            }
+        );
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    #[test]
+    fn generated_and_ordinary_attrdefs_require_exact_coverage_and_per_side_presence() {
+        for add_stored in [false, true] {
+            let fixture = fixture(add_stored);
+            for (index, record) in fixture.resolution.iter().enumerate() {
+                let mut missing = fixture.resolution.clone();
+                missing.remove(index);
+                assert!(matches!(
+                    fixture.plan(&missing),
+                    Err(Error::Coverage(surface)) if surface == record.surface
+                ));
+
+                let mut wrong_current = fixture.resolution.clone();
+                wrong_current[index].current = if record.current.is_some() {
+                    None
+                } else {
+                    record.desired.clone()
+                };
+                assert!(matches!(
+                    fixture.plan(&wrong_current),
+                    Err(Error::Coverage(surface)) if surface == record.surface
+                ));
+
+                let mut missing_desired = fixture.resolution.clone();
+                missing_desired[index].desired = None;
+                assert!(matches!(
+                    fixture.plan(&missing_desired),
+                    Err(Error::Coverage(surface)) if surface == record.surface
+                ));
+            }
+
+            let mut extra = fixture.resolution.clone();
+            extra.push(attrdef("a", false, false));
+            assert!(matches!(
+                fixture.plan(&extra),
+                Err(Error::Coverage(surface))
+                    if surface == Surface::Default("app.t.a".parse().unwrap())
+            ));
+
+            let mut duplicate = fixture.resolution.clone();
+            duplicate.push(fixture.resolution[0].clone());
+            assert!(matches!(
+                fixture.plan(&duplicate),
+                Err(Error::Coverage(surface)) if surface == fixture.resolution[0].surface
+            ));
+
+            let mut reference_only = fixture.resolution.clone();
+            reference_only[0].surface = Surface::Column("app.t.a".parse().unwrap());
+            assert!(matches!(
+                fixture.plan(&reference_only),
+                Err(Error::Coverage(surface))
+                    if surface == Surface::Column("app.t.a".parse().unwrap())
+            ));
+
+            let mut absent_desired_default = fixture;
+            absent_desired_default
+                .desired
+                .tables
+                .get_mut(&"app.t".parse().unwrap())
+                .unwrap()
+                .columns
+                .get_mut("d")
+                .unwrap()
+                .default = None;
+            assert!(matches!(
+                absent_desired_default.plan(&absent_desired_default.resolution),
+                Err(Error::Coverage(surface))
+                    if surface == Surface::Default("app.t.d".parse().unwrap())
+            ));
+        }
+    }
+
+    /// A generation expression stays in its CREATE TABLE or ADD COLUMN, so
+    /// that step provides its `pg_attrdef` surface: a function the plan
+    /// creates and the expression calls is ordered before the table or
+    /// column, not after it (DEC-1274.2).
+    #[test]
+    fn a_generation_expression_waits_for_the_function_it_calls() {
+        let function: pbps_model::ModuleId = "app.f(integer)".parse().unwrap();
+        let calls = |name: &str| SurfaceResolution {
+            surface: Surface::Default(name.parse().unwrap()),
+            current: None,
+            desired: Some(BoundSurface {
+                object: ObjectIdentity {
+                    class: "pg_attrdef".into(),
+                    name: name.split('.').map(str::to_owned).collect(),
+                    signature: vec![],
+                },
+                bindings: vec![],
+                // It reads its own table's column too, which the same
+                // CREATE TABLE provides: no edge of a step to itself.
+                managed_inputs: BTreeSet::from([
+                    Surface::Module(function.clone()),
+                    Surface::Column("app.t.a".parse().unwrap()),
+                ]),
+            }),
+        };
+        let module = SurfaceResolution {
+            surface: Surface::Module(function.clone()),
+            current: None,
+            desired: Some(BoundSurface {
+                object: ObjectIdentity {
+                    class: "pg_proc".into(),
+                    name: vec!["app".into(), "f".into()],
+                    signature: vec![],
+                },
+                bindings: vec![],
+                managed_inputs: BTreeSet::new(),
+            }),
+        };
+        for new_table in [true, false] {
+            let mut base = Schema::default();
+            let mut table = Table::default();
+            table
+                .columns
+                .insert("a".into(), Column::new("int".parse().unwrap()));
+            if !new_table {
+                base.tables.insert("app.t".parse().unwrap(), table.clone());
+            }
+            let before_ids = ids(&base, &IdsFile::default());
+            let mut desired = base.clone();
+            table.columns.insert("g".into(), generated("app.f(a)"));
+            desired.tables.insert("app.t".parse().unwrap(), table);
+            desired.modules.insert(
+                function.clone(),
+                pbps_model::Module {
+                    kind: pbps_model::ModuleKind::Function,
+                    description: None,
+                    definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+                },
+            );
+            let after_ids = ids(&desired, &before_ids);
+            let ordered = super::plan(
+                crate::Side {
+                    schema: &base,
+                    ids: &before_ids,
+                },
+                crate::Side {
+                    schema: &desired,
+                    ids: &after_ids,
+                },
+                &Hints::default(),
+                &[calls("app.t.g"), module.clone()],
+                &pbps_dialect::MinimalDialect,
+            )
+            .unwrap();
+            let at = |f: &dyn Fn(&Change) -> bool| {
+                ordered
+                    .changes
+                    .changes
+                    .iter()
+                    .position(|p| f(&p.change))
+                    .unwrap()
+            };
+            let created = at(&|c| matches!(c, Change::CreateModule { id, .. } if id == &function));
+            let generation = at(&|c| {
+                matches!(c, Change::CreateTable { .. })
+                    || matches!(c, Change::AddColumn { name, .. } if name == "g")
+            });
+            assert!(created < generation, "new_table={new_table}");
+            ordered.proof.validate(&ordered.changes).unwrap();
+        }
+    }
+
+    /// A routine every case below calls from a generation expression.
+    fn routine() -> (pbps_model::ModuleId, pbps_model::Module) {
+        (
+            "app.f(integer)".parse().unwrap(),
+            pbps_model::Module {
+                kind: pbps_model::ModuleKind::Function,
+                description: None,
+                definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+            },
+        )
+    }
+
+    fn bound(class: &str, name: &str, inputs: &[Surface], binds: &str) -> BoundSurface {
+        BoundSurface {
+            object: ObjectIdentity {
+                class: class.into(),
+                name: name.split('.').map(str::to_owned).collect(),
+                signature: vec![],
+            },
+            bindings: vec![Binding {
+                node: "FuncExpr".into(),
+                path: vec!["expr".into()],
+                target: ObjectIdentity {
+                    class: "pg_proc".into(),
+                    name: vec!["app".into(), binds.into()],
+                    signature: vec![],
+                },
+            }],
+            managed_inputs: inputs.iter().cloned().collect(),
+        }
+    }
+
+    fn sided(base: &Schema, desired: &Schema, observations: &[SurfaceResolution]) -> Ordered {
+        let before_ids = ids(base, &IdsFile::default());
+        let after_ids = ids(desired, &before_ids);
+        super::plan(
+            crate::Side {
+                schema: base,
+                ids: &before_ids,
+            },
+            crate::Side {
+                schema: desired,
+                ids: &after_ids,
+            },
+            &Hints::default(),
+            observations,
+            &pbps_dialect::MinimalDialect,
+        )
+        .unwrap()
+    }
+
+    fn at(ordered: &Ordered, f: &dyn Fn(&Change) -> bool) -> usize {
+        ordered
+            .changes
+            .changes
+            .iter()
+            .position(|p| f(&p.change))
+            .unwrap_or_else(|| panic!("missing from {:?}", ordered.changes.changes))
+    }
+
+    fn table(expression: Option<&str>) -> Table {
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("a".into(), Column::new("int".parse().unwrap()));
+        if let Some(expression) = expression {
+            table.columns.insert("g".into(), generated(expression));
+        }
+        table
+    }
+
+    /// A rewritten generation expression lets go of the routine its old text
+    /// called, so it precedes that routine's drop.
+    #[test]
+    fn a_rewritten_generation_expression_precedes_the_drop_of_what_it_called() {
+        let (id, module) = routine();
+        let mut base = Schema::default();
+        base.modules.insert(id.clone(), module);
+        base.tables
+            .insert("app.t".parse().unwrap(), table(Some("app.f(a)")));
+        let mut desired = Schema::default();
+        desired
+            .tables
+            .insert("app.t".parse().unwrap(), table(Some("a * 2")));
+        let function = Surface::Module(id.clone());
+        let ordered = sided(
+            &base,
+            &desired,
+            &[
+                SurfaceResolution {
+                    surface: Surface::Default("app.t.g".parse().unwrap()),
+                    current: Some(bound(
+                        "pg_attrdef",
+                        "app.t.g",
+                        std::slice::from_ref(&function),
+                        "f",
+                    )),
+                    desired: Some(bound("pg_attrdef", "app.t.g", &[], "int4mul")),
+                },
+                SurfaceResolution {
+                    surface: function,
+                    current: Some(bound("pg_proc", "app.f", &[], "int4in")),
+                    desired: None,
+                },
+            ],
+        );
+        let rewrite = at(&ordered, &|c| {
+            matches!(c, Change::AlterColumnExpression { .. })
+        });
+        let drop = at(
+            &ordered,
+            &|c| matches!(c, Change::DropModule { id: d, .. } if d == &id),
+        );
+        assert!(rewrite < drop, "{:?}", ordered.changes.changes);
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    /// A generated column computes its rows as it is added, so an execute
+    /// grant on the routine it calls goes first.
+    #[test]
+    fn an_execute_grant_precedes_the_generated_column_that_calls_the_routine() {
+        let (id, module) = routine();
+        let mut base = Schema::default();
+        base.modules.insert(id.clone(), module);
+        base.tables.insert("app.t".parse().unwrap(), table(None));
+        base.roles
+            .insert("reader".into(), pbps_model::Role::default());
+        let mut desired = base.clone();
+        desired
+            .tables
+            .insert("app.t".parse().unwrap(), table(Some("app.f(a)")));
+        desired.roles.get_mut("reader").unwrap().grants.insert(
+            pbps_model::GrantTarget::Routine(match &id {
+                pbps_model::ModuleId::Routine(routine) => routine.clone(),
+                other @ (pbps_model::ModuleId::Named(_) | pbps_model::ModuleId::Trigger { .. }) => {
+                    panic!("{other:?}")
+                }
+            }),
+            BTreeSet::from([pbps_model::Permission::Execute]),
+        );
+        let function = Surface::Module(id.clone());
+        let ordered = sided(
+            &base,
+            &desired,
+            &[
+                SurfaceResolution {
+                    surface: Surface::Default("app.t.g".parse().unwrap()),
+                    current: None,
+                    desired: Some(bound(
+                        "pg_attrdef",
+                        "app.t.g",
+                        std::slice::from_ref(&function),
+                        "f",
+                    )),
+                },
+                SurfaceResolution {
+                    surface: function,
+                    current: Some(bound("pg_proc", "app.f", &[], "int4in")),
+                    desired: Some(bound("pg_proc", "app.f", &[], "int4in")),
+                },
+            ],
+        );
+        let grant = at(&ordered, &|c| matches!(c, Change::Grant { .. }));
+        let column = at(
+            &ordered,
+            &|c| matches!(c, Change::AddColumn { name, .. } if name == "g"),
+        );
+        assert!(grant < column, "{:?}", ordered.changes.changes);
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    /// An unchanged generation expression that binds differently is rewritten
+    /// with its own text, so the new binding is installed.
+    #[test]
+    fn a_rebinding_generation_expression_is_rewritten_with_its_own_text() {
+        let (id, module) = routine();
+        let mut base = Schema::default();
+        base.modules.insert(id.clone(), module);
+        base.tables
+            .insert("app.t".parse().unwrap(), table(Some("app.f(a)")));
+        let desired = base.clone();
+        let function = Surface::Module(id);
+        let ordered = sided(
+            &base,
+            &desired,
+            &[
+                SurfaceResolution {
+                    surface: Surface::Default("app.t.g".parse().unwrap()),
+                    current: Some(bound(
+                        "pg_attrdef",
+                        "app.t.g",
+                        std::slice::from_ref(&function),
+                        "f",
+                    )),
+                    desired: Some(bound(
+                        "pg_attrdef",
+                        "app.t.g",
+                        std::slice::from_ref(&function),
+                        "f_exact",
+                    )),
+                },
+                SurfaceResolution {
+                    surface: function,
+                    current: Some(bound("pg_proc", "app.f", &[], "int4in")),
+                    desired: Some(bound("pg_proc", "app.f", &[], "int4in")),
+                },
+            ],
+        );
+        assert!(ordered.changes.changes.iter().any(|p| matches!(
+            &p.change,
+            Change::AlterColumnExpression { from, to, .. } if from == "app.f(a)" && to == "app.f(a)"
+        )));
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    /// A check removed after its table's rename is covered under the spelling
+    /// its removal uses, as the producer names it; the opening spelling no
+    /// longer covers it.
+    #[test]
+    fn a_surface_removed_after_a_rename_is_covered_under_its_removal_spelling() {
+        let mut table = table(None);
+        table.checks.insert(
+            "c".into(),
+            pbps_model::CheckConstraint {
+                expression: "a > 0".into(),
+            },
+        );
+        let mut base = Schema::default();
+        base.tables.insert("app.t".parse().unwrap(), table);
+        let before_ids = ids(&base, &IdsFile::default());
+        let mut desired = Schema::default();
+        desired
+            .tables
+            .insert("app.u".parse().unwrap(), self::table(None));
+        let mut after_ids = before_ids.clone();
+        after_ids.rename_table(&"app.t".parse().unwrap(), &"app.u".parse().unwrap());
+        let removed = |table: &str| SurfaceResolution {
+            surface: Surface::Check {
+                table: table.parse().unwrap(),
+                name: "c".into(),
+            },
+            current: Some(bound("pg_constraint", "app.t.c", &[], "int4gt")),
+            desired: None,
+        };
+        let plan = |observation: SurfaceResolution| {
+            super::plan(
+                crate::Side {
+                    schema: &base,
+                    ids: &before_ids,
+                },
+                crate::Side {
+                    schema: &desired,
+                    ids: &after_ids,
+                },
+                &Hints::default(),
+                &[observation],
+                &pbps_dialect::MinimalDialect,
+            )
+        };
+        let ordered = plan(removed("app.u")).unwrap();
+        assert!(
+            ordered
+                .changes
+                .changes
+                .iter()
+                .any(|p| matches!(p.change, Change::DropCheck { .. }))
+        );
+        ordered.proof.validate(&ordered.changes).unwrap();
+        assert!(matches!(
+            plan(removed("app.t")),
+            Err(super::Error::Coverage(_))
+        ));
+    }
+
+    /// Dropping `app.a` and renaming `app.b` to it, with each table's check
+    /// removed: the dropped table's check holds the shared spelling, so the
+    /// renamed table's is covered under its opening one, and each removal
+    /// still needs its own resolution.
+    #[test]
+    fn removals_sharing_a_reused_name_are_covered_apart() {
+        let checked = || {
+            let mut t = table(None);
+            t.checks.insert(
+                "c".into(),
+                pbps_model::CheckConstraint {
+                    expression: "a > 0".into(),
+                },
+            );
+            t
+        };
+        let a: pbps_model::TableName = "app.a".parse().unwrap();
+        let b: pbps_model::TableName = "app.b".parse().unwrap();
+        let mut base = Schema::default();
+        base.tables.insert(a.clone(), checked());
+        base.tables.insert(b.clone(), checked());
+        let before_ids = ids(&base, &IdsFile::default());
+        let mut desired = Schema::default();
+        desired.tables.insert(a.clone(), table(None));
+        let mut after_ids = before_ids.clone();
+        let dropped = before_ids.table_uid(&a).unwrap().clone();
+        after_ids.tables.remove(&dropped);
+        after_ids.columns.retain(|_, column| column.table != a);
+        after_ids.rename_table(&b, &a);
+        let removed = |table: &pbps_model::TableName| SurfaceResolution {
+            surface: Surface::Check {
+                table: table.clone(),
+                name: "c".into(),
+            },
+            current: Some(bound("pg_constraint", "app.x.c", &[], "int4gt")),
+            desired: None,
+        };
+        // Coverage alone: the ordering graph keys its same-table rule by
+        // name, so a reused name is a separate, deferred limit.
+        let base_side = crate::Side {
+            schema: &base,
+            ids: &before_ids,
+        };
+        let desired_side = crate::Side {
+            schema: &desired,
+            ids: &after_ids,
+        };
+        super::super::prepare::coverage(base_side, desired_side, &[removed(&a), removed(&b)])
+            .unwrap();
+        assert!(matches!(
+            super::super::prepare::coverage(base_side, desired_side, &[removed(&a)]),
+            Err(super::super::Error::Coverage(_))
+        ));
+    }
+}

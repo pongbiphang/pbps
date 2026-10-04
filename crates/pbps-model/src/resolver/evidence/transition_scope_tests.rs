@@ -75,6 +75,7 @@ pub(super) fn fixture() -> (ChangeSet, ResolverEvidence) {
         desired: Some(bound),
     }];
     evidence.transitions = vec![ObjectTransition {
+        references: BTreeSet::new(),
         surface: Surface::Table(table),
         before: BTreeSet::from([object("changed-default")]),
         after: BTreeSet::from([object("changed-default")]),
@@ -124,20 +125,9 @@ fn aggregate_default_changes_preserve_every_untouched_target_fingerprint() {
     let (changes, evidence) = fixture();
     let projected = seal(&changes, &evidence).unwrap();
     projected.validate(&changes).unwrap();
-    for record in projected.after.prerequisites() {
-        let source = if record.object == object("changed-default") {
-            &evidence.after
-        } else {
-            &evidence.before
-        };
-        assert_eq!(
-            Some(record),
-            source
-                .prerequisites()
-                .iter()
-                .find(|p| p.object == record.object)
-        );
-    }
+    // `evidence.after` is the compiled capture, whose "bb" fingerprints
+    // differ for every record; none of them may reach the closing manifest.
+    super::tests::assert_closing(&projected, &evidence.after);
     for name in [
         "table",
         "column",
@@ -226,18 +216,18 @@ fn one_aggregate_can_account_for_multiple_explicit_default_changes() {
     evidence.ordering = OrderingProof::new(&changes, BTreeSet::new()).unwrap();
     let projected = seal(&changes, &evidence).unwrap();
     projected.validate(&changes).unwrap();
+    // Both changed defaults are the plan's own records and nothing names
+    // them: neither is predicted, while every untouched record is kept.
     for name in ["changed-default", "sibling-default"] {
-        assert_eq!(
-            projected
+        assert!(
+            !projected
                 .after
                 .prerequisites()
                 .iter()
-                .find(|p| p.object == object(name))
-                .unwrap()
-                .properties,
-            "bb".repeat(32)
+                .any(|p| p.object == object(name))
         );
     }
+    super::tests::assert_closing(&projected, &evidence.after);
     evidence.transitions[0].before.insert(object("column"));
     evidence.transitions[0].after.insert(object("column"));
     refuses(&changes, &evidence);

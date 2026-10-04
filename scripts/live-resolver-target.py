@@ -43,6 +43,54 @@ DAEMON_TEST = "resolver::docker::tests::direct_native_daemon_is_accepted_but_a_r
 SQL_RECOVERY_CLOSE_TEST = "resolver::server::container_tests::sql_recovery::confirmed_workload_removal_finishes_only_its_existing_sql_recovery"
 SQL_RECOVERY_DISCARD_TEST = "resolver::server::container_tests::sql_recovery::interrupted_open_discard_finishes_sql_recovery_only_after_workload_removal"
 SQL_RECOVERY_CANCEL_TEST = "resolver::server::container_tests::sql_recovery::cancelled_cleanup_keeps_uncertain_owned_sql_names_and_remains_terminal"
+PG18_GENERATION_TEST = "resolver::server::qualified_evidence_tests::the_pg18_producer_projects_the_replaced_generated_attrdef_and_preserves_column_identity"
+PG16_GENERATION_TEST = "resolver::server::qualified_evidence_tests::the_pg16_producer_adds_stored_generation_and_retains_existing_generated_bindings"
+# Major-specific cases stay separate from the existing producer-only suite.
+GENERATION_TESTS = [PG18_GENERATION_TEST, PG16_GENERATION_TEST]
+PRODUCER_TESTS = [
+    "resolver::server::qualified_evidence_tests::the_container_producer_seals_the_overload_and_default_from_one_fresh_read",
+    "resolver::server::qualified_evidence_tests::only_recorded_table_and_index_roots_own_their_catalog_columns",
+    "resolver::server::qualified_evidence_tests::a_same_named_view_cannot_own_the_declared_table_uid",
+    "resolver::server::qualified_evidence_tests::a_same_named_index_on_another_table_cannot_own_the_declared_index",
+    "resolver::server::qualified_evidence_tests::the_connected_producer_refuses_a_missing_environment_key_before_sealing",
+    "resolver::server::qualified_evidence_tests::a_rebuilt_view_with_old_target_grants_closes_on_the_actual_catalog",
+    "resolver::server::qualified_evidence_tests::an_empty_target_producer_orders_table_routines_and_expressions_before_sealing",
+    "resolver::server::qualified_evidence_tests::a_replaced_routine_rebuilds_cross_kind_dependents_in_the_final_plan",
+    "resolver::server::qualified_evidence_tests::recorded_table_and_column_uids_survive_rename_with_dependent_rebuilds",
+    "resolver::server::qualified_evidence_tests::recorded_rename_of_a_table_owned_by_another_role_closes_on_the_actual_catalog",
+    "resolver::server::qualified_evidence_tests::rebuilt_routine_with_explicit_public_execution_matches_the_post_ddl_acl",
+    "resolver::server::qualified_evidence_tests::rebuilt_routine_replays_declared_role_grants",
+    "resolver::server::qualified_evidence_tests::an_unaffected_routine_keeps_its_grant_option_through_connected_evidence",
+    "resolver::server::qualified_evidence_tests::a_dropped_routine_seals_its_closing_signature_lookup",
+    "resolver::server::qualified_evidence_tests::renaming_a_referenced_table_carries_the_foreign_key_that_names_it",
+    "resolver::server::qualified_evidence_tests::renaming_a_referenced_column_carries_the_foreign_key_that_names_it",
+    "resolver::server::qualified_evidence_tests::dropping_a_table_with_toast_storage_closes_on_the_actual_catalog",
+    "resolver::server::qualified_evidence_tests::adding_a_default_carries_the_columns_own_flag",
+    "resolver::server::qualified_evidence_tests::dropping_a_default_carries_the_columns_own_flag",
+    "resolver::server::qualified_evidence_tests::a_retype_carries_the_key_and_index_it_rebuilds",
+    "resolver::server::qualified_evidence_tests::newly_created_routines_under_target_default_privileges_close_on_the_actual_catalog",
+    "resolver::server::qualified_evidence_tests::a_new_routine_created_by_an_ordinary_deployer_closes_on_the_actual_catalog",
+    "resolver::server::qualified_evidence_tests::an_explicit_extra_schema_changes_only_the_unqualified_lookup_in_the_final_plan",
+    "resolver::server::qualified_evidence_tests::a_prequalified_matching_scope_seals_the_same_ordinary_plan",
+    "resolver::server::qualified_evidence_tests::a_prequalified_scope_rejects_reordered_write_path_extras_before_compilation",
+    "resolver::server::qualified_evidence_tests::a_prequalified_scope_rejects_changed_preliminary_grants_before_compilation",
+    "resolver::server::qualified_evidence_tests::recorded_renames_and_reused_old_spellings_keep_distinct_owned_inventories",
+    "resolver::server::qualified_evidence_tests::recorded_renames_with_type_and_nullability_edits_match_actual_child_catalog",
+    "resolver::server::qualified_evidence_tests::persisted_authorization_is_stable_across_processes_only_with_the_same_environment_key",
+    "resolver::server::qualified_evidence_tests::adding_named_key_and_check_keeps_existing_table_owner_and_grants",
+    "resolver::server::qualified_evidence_tests::adding_check_alone_keeps_existing_table_owner_and_grants",
+    "resolver::server::qualified_evidence_tests::granting_on_an_existing_table_keeps_old_acl_and_adds_the_declared_role",
+    "resolver::server::qualified_evidence_tests::unnamed_primary_key_on_existing_table_owns_only_its_exact_constraint_and_index",
+    "resolver::server::qualified_evidence_tests::unnamed_primary_key_on_created_table_owns_only_its_exact_constraint_and_index",
+    "resolver::server::qualified_evidence_tests::adding_index_keeps_existing_table_metadata_and_sets_the_engine_index_flag",
+    "resolver::server::qualified_evidence_tests::direct_schema_option_beats_inherited_owner_for_the_typed_grant",
+    "resolver::server::qualified_evidence_tests::combined_schema_grant_uses_one_inherited_grantor_for_its_whole_mask",
+]
+NATIVE_TESTS = [DAEMON_TEST, TARGET_TEST, FACTORY_TEST, RECIPE_TEST, ANALYSIS_TEST,
+                INVALIDATION_TEST, CANCELLATION_TEST, DEADLINE_TEST,
+                ADMIN_RECOVERY_TEST, SCRATCH_RECOVERY_TEST, JANITOR_RECOVERY_TEST,
+                SQL_RECOVERY_CLOSE_TEST, SQL_RECOVERY_DISCARD_TEST,
+                SQL_RECOVERY_CANCEL_TEST]
 QUIET = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
 DOCKER_SOCKET = "/var/run/docker.sock"
 
@@ -62,12 +110,41 @@ def interrupted(signum, _frame):
     raise SystemExit(128 + signum)
 
 
-def native_tests(binary, env):
+def native_tests(binary, env, producer_only=False, generation_only=False):
+    if producer_only and generation_only:
+        raise RuntimeError("producer-only and generation-only are mutually exclusive")
+    if generation_only:
+        if env.get("PBPS_NATIVE_DRIVER") != "pg":
+            raise RuntimeError("generation-only requires PBPS_NATIVE_DRIVER=pg")
+        if env.get("PBPS_NATIVE_PG_MAJOR") not in ("16", "18"):
+            raise RuntimeError("generation-only requires PBPS_NATIVE_PG_MAJOR=16 or 18")
     # The daemon/proxy case needs the same disposable root host as the factory;
     # the ordinary library run only compiles it and leaves it ignored.
-    for test in (DAEMON_TEST, TARGET_TEST, FACTORY_TEST, RECIPE_TEST, ANALYSIS_TEST, INVALIDATION_TEST, CANCELLATION_TEST, DEADLINE_TEST, ADMIN_RECOVERY_TEST, SCRATCH_RECOVERY_TEST, JANITOR_RECOVERY_TEST, SQL_RECOVERY_CLOSE_TEST, SQL_RECOVERY_DISCARD_TEST, SQL_RECOVERY_CANCEL_TEST):
-        if test in (RECIPE_TEST, ANALYSIS_TEST, INVALIDATION_TEST, CANCELLATION_TEST, DEADLINE_TEST, ADMIN_RECOVERY_TEST, SCRATCH_RECOVERY_TEST, JANITOR_RECOVERY_TEST, SQL_RECOVERY_CLOSE_TEST, SQL_RECOVERY_DISCARD_TEST, SQL_RECOVERY_CANCEL_TEST) and env.get("PBPS_NATIVE_DRIVER") != "pg":
+    # The ignored-test inventory admits a selector list only as an iteration
+    # source, so each mode copies the lists it runs by iterating them.
+    if generation_only:
+        selected = [test for test in GENERATION_TESTS]
+    elif producer_only:
+        selected = [test for test in PRODUCER_TESTS]
+    else:
+        selected = [test for test in NATIVE_TESTS]
+        selected += [test for test in PRODUCER_TESTS]
+        selected += [test for test in GENERATION_TESTS]
+    producers = {test for test in PRODUCER_TESTS}
+    generations = {test for test in GENERATION_TESTS}
+    for test in selected:
+        if (test in producers or test in (
+                RECIPE_TEST, ANALYSIS_TEST, INVALIDATION_TEST, CANCELLATION_TEST,
+                DEADLINE_TEST, ADMIN_RECOVERY_TEST, SCRATCH_RECOVERY_TEST,
+                JANITOR_RECOVERY_TEST, SQL_RECOVERY_CLOSE_TEST,
+                SQL_RECOVERY_DISCARD_TEST, SQL_RECOVERY_CANCEL_TEST,
+        )) and env.get("PBPS_NATIVE_DRIVER") != "pg":
             continue
+        if test in generations:
+            major = "18" if test == PG18_GENERATION_TEST else "16"
+            # Each case verifies the actual major; selection alone is not proof.
+            if env.get("PBPS_NATIVE_DRIVER") != "pg" or env.get("PBPS_NATIVE_PG_MAJOR") != major:
+                continue
         result = run(binary, "--ignored", "--exact", test, "--nocapture",
                      env=dict(os.environ, **env), stdout=subprocess.PIPE,
                      stderr=subprocess.STDOUT, check=False)
@@ -195,7 +272,7 @@ def fixture(args, binary, root, owned):
         if engine == "pg":
             env["PBPS_NATIVE_PG_MAJOR"] = str(args.pg_major)
             env["PBPS_NATIVE_DOCKER"] = str(Path(shutil.which("docker")).resolve())
-        native_tests(binary, env)
+        native_tests(binary, env, args.producer_only, args.generation_only)
         return
     reader = "pbps-native-reader-" + uuid.uuid4().hex
     owned.append(reader)
@@ -226,11 +303,20 @@ def main():
     parser.add_argument("--pg-major", type=int, choices=PG_IMAGES, default=18,
                         help="pinned PostgreSQL fixture image; default: 18")
     parser.add_argument("--native-host", action="store_true")
+    focused = parser.add_mutually_exclusive_group()
+    focused.add_argument("--producer-only", action="store_true",
+                         help="run only the focused #1274 producer cases")
+    focused.add_argument("--generation-only", action="store_true",
+                         help="run only the connected generated-expression case for this PG major")
     parser.add_argument("--socket", default="/var/run/docker.sock")
     parser.add_argument("--test-binary", type=Path, help="prebuilt CLI library test executable")
     args = parser.parse_args()
     if args.engine != "pg" and args.pg_major != 18:
         parser.error("--pg-major applies only to pg")
+    if args.producer_only and (not args.native_host or args.engine != "pg"):
+        parser.error("--producer-only requires --native-host pg")
+    if args.generation_only and (not args.native_host or args.engine != "pg"):
+        parser.error("--generation-only requires --native-host pg")
     if sys.platform != "linux":
         parser.error("native process qualification requires Linux")
     if not Path(args.socket).is_absolute():

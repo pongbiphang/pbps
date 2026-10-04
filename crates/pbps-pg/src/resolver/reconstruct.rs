@@ -27,7 +27,7 @@
 use pbps_db::resolver::capture::ObjectIdentity;
 use pbps_dialect::Dialect;
 use pbps_model::{Change, ModuleId, ModuleKind, Strategy};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Why the desired namespace could not be built on scratch. A named limit,
 /// never a partially compiled namespace that evidence could be read from.
@@ -41,6 +41,20 @@ pub enum ReconstructError {
     Compile { declaration: String, reason: String },
     #[error("scratch compilation could not {0} its transaction")]
     Transaction(&'static str),
+    #[error(
+        "{0} has a generated column calling a declared function that itself needs the table; \
+         no order compiles both"
+    )]
+    Cycle(String),
+}
+
+/// A table whose generated columns may call a declared function. Its
+/// `CREATE TABLE` must follow that function, and a generated column cannot be
+/// split out without changing the column order (DEC-1364.1).
+struct Late {
+    table: pbps_model::TableName,
+    steps: std::ops::Range<usize>,
+    generated: Vec<String>,
 }
 
 /// When a step runs. Everything in one phase can be named by the phases
@@ -121,9 +135,18 @@ impl Reconstruction {
     /// the differ produces it; its order among modules is kept.
     pub fn new(dialect: &crate::Postgres, bootstrap: &[Change]) -> Result<Self, ReconstructError> {
         let mut steps = Vec::new();
+        let mut late = Vec::new();
+        let mut functions: Vec<(usize, String)> = Vec::new();
+        let mut foreign = BTreeSet::new();
         for change in bootstrap {
             match change {
                 Change::CreateTable { uid, name, table } => {
+                    let first = steps.len();
+                    let generated: Vec<String> = table
+                        .columns
+                        .values()
+                        .filter_map(|c| c.generated.as_ref().map(|g| g.expression.clone()))
+                        .collect();
                     let mut bare = (**table).clone();
                     let checks = std::mem::take(&mut bare.checks);
                     let indexes = std::mem::take(&mut bare.indexes);
@@ -156,6 +179,7 @@ impl Reconstruction {
                         None,
                     )?);
                     for (key, constraint) in keys {
+                        foreign.insert(steps.len());
                         steps.push(step(
                             dialect,
                             Phase::Keys,
@@ -243,6 +267,13 @@ impl Reconstruction {
                             None,
                         )?);
                     }
+                    if !generated.is_empty() {
+                        late.push(Late {
+                            table: name.clone(),
+                            steps: first..steps.len(),
+                            generated,
+                        });
+                    }
                 }
                 Change::CreateModule { id, module } => {
                     // A trigger is named by nothing and names its function
@@ -261,6 +292,9 @@ impl Reconstruction {
                         };
                         (Phase::Modules, names, Some(id.clone()))
                     };
+                    if module.kind == ModuleKind::Function {
+                        functions.push((steps.len(), id.name().to_owned()));
+                    }
                     steps.push(step(
                         dialect,
                         phase,
@@ -268,6 +302,21 @@ impl Reconstruction {
                         change,
                         names,
                         compiled,
+                    )?);
+                }
+                // The differ splits every new table's foreign keys out of its
+                // CREATE, so a bootstrap of related tables carries them as
+                // their own changes. A key names only tables and their keys,
+                // so it follows every table, as a key kept inline does.
+                Change::AddForeignKey { table, .. } => {
+                    foreign.insert(steps.len());
+                    steps.push(step(
+                        dialect,
+                        Phase::Keys,
+                        &format!("table {table}"),
+                        change,
+                        Vec::new(),
+                        None,
                     )?);
                 }
                 // None of these changes what a name resolves to.
@@ -295,7 +344,6 @@ impl Reconstruction {
                 | Change::SetReplicaIdentity { .. }
                 | Change::AddUnique { .. }
                 | Change::DropUnique { .. }
-                | Change::AddForeignKey { .. }
                 | Change::DropForeignKey { .. }
                 | Change::AddCheck { .. }
                 | Change::DropCheck { .. }
@@ -319,6 +367,7 @@ impl Reconstruction {
                 }
             }
         }
+        let mut steps = after_their_functions(steps, late, &functions, &foreign)?;
         // Stable: within a phase the differ's order stands, which for modules
         // is its dependency order.
         steps.sort_by_key(|step| step.phase);
@@ -557,6 +606,119 @@ async fn routines(
 /// What creating a table or view makes nameable before it compiles: the
 /// relation with its row type, which always has its name. Its array type is
 /// read back once it exists ([`array_type`]).
+/// Places each table whose generated column may call a declared function
+/// after that function, as the ordinary plan does (DEC-1364.1). The table
+/// and what it holds that runs before the modules join the modules phase
+/// after the last function its generation text names. A module ahead of it
+/// that names the table, or names something so moved, follows it; a foreign
+/// key naming such a table waits for the end of the modules. A function the
+/// table calls that would itself have to follow the table is a cycle no
+/// order compiles. Other steps keep their place.
+fn after_their_functions(
+    steps: Vec<Step>,
+    late: Vec<Late>,
+    functions: &[(usize, String)],
+    foreign: &BTreeSet<usize>,
+) -> Result<Vec<Step>, ReconstructError> {
+    let late: Vec<(Late, Vec<usize>)> = late
+        .into_iter()
+        .filter_map(|table| {
+            let called: Vec<usize> = functions
+                .iter()
+                .filter(|(_, name)| {
+                    table
+                        .generated
+                        .iter()
+                        .any(|text| crate::generated::may_call(text, name))
+                })
+                .map(|(at, _)| *at)
+                .collect();
+            (!called.is_empty()).then_some((table, called))
+        })
+        .collect();
+    if late.is_empty() {
+        return Ok(steps);
+    }
+    // A literal counts: an OID-alias literal such as `'app.n'::regclass`
+    // names the table to the engine as the step compiles (DEC-1364.1).
+    let names = |at: usize, name: &str| {
+        steps[at]
+            .statements
+            .iter()
+            .any(|sql| crate::generated::may_call(sql, name))
+    };
+    let early = |at: usize| matches!(steps[at].phase, Phase::Tables | Phase::Keys);
+    // A foreign key naming a late table waits for the end of the modules:
+    // it names only tables, and every table exists by then.
+    let keys: Vec<usize> = foreign
+        .iter()
+        .copied()
+        .filter(|&at| late.iter().any(|(table, _)| names(at, &table.table.name)))
+        .collect();
+    let mut modules: Vec<usize> = (0..steps.len())
+        .filter(|&at| steps[at].phase == Phase::Modules)
+        .collect();
+    // Steps already moved for an earlier table. A table that names one of
+    // them, such as by an OID-alias literal in its generated column, follows
+    // it as it follows its own functions.
+    let mut delayed: BTreeSet<usize> = BTreeSet::new();
+    for (table, called) in &late {
+        let group: Vec<usize> = table
+            .steps
+            .clone()
+            .filter(|&at| early(at) && !keys.contains(&at))
+            .collect();
+        let point = modules
+            .iter()
+            .rposition(|at| {
+                called.contains(at)
+                    || (delayed.contains(at)
+                        && steps[*at]
+                            .names
+                            .iter()
+                            .any(|(_, _, name)| group.iter().any(|&own| names(own, name))))
+            })
+            .map_or(0, |position| position + 1);
+        delayed.extend(group.iter().copied());
+        let mut held = BTreeSet::from([table.table.name.clone()]);
+        let mut kept = Vec::new();
+        let mut moved = Vec::new();
+        for &at in &modules[..point] {
+            if held.iter().any(|name| names(at, name)) {
+                if called.contains(&at) {
+                    return Err(ReconstructError::Cycle(format!("table {}", table.table)));
+                }
+                held.extend(steps[at].names.iter().map(|(_, _, name)| name.clone()));
+                moved.push(at);
+            } else {
+                kept.push(at);
+            }
+        }
+        kept.extend(group);
+        kept.extend(moved);
+        kept.extend_from_slice(&modules[point..]);
+        modules = kept;
+    }
+    modules.extend(keys);
+    let placed: BTreeSet<usize> = modules.iter().copied().collect();
+    let order: Vec<usize> = (0..steps.len())
+        .filter(|at| !placed.contains(at) && early(*at))
+        .chain(modules)
+        .chain((0..steps.len()).filter(|&at| steps[at].phase == Phase::Expressions))
+        .collect();
+    let mut taken: Vec<Option<Step>> = steps.into_iter().map(Some).collect();
+    Ok(order
+        .into_iter()
+        .map(|at| {
+            let mut step = taken[at].take().expect("each step is placed once");
+            if placed.contains(&at) {
+                step.phase = Phase::Modules;
+            }
+            step
+        })
+        .collect())
+}
+
 fn relation(schema: &str, name: &str) -> Vec<(Nameable, String, String)> {
     vec![(Nameable::Relation, schema.to_owned(), name.to_owned())]
 }

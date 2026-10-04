@@ -216,6 +216,243 @@ fn a_later_object_shadows_only_what_it_could_be_resolved_as() {
     assert!(!Nameable::Type.shadows("pg_proc", false));
 }
 
+/// The differ splits a new table's foreign keys out of its CREATE, so a
+/// bootstrap of related tables carries each as its own change. It is a key
+/// like one kept inline: it follows every table and precedes the modules.
+#[test]
+fn a_split_foreign_key_follows_every_table() {
+    let parent = TableName::new("app", "p");
+    let child = TableName::new("app", "c");
+    let mut keyed = Table::default();
+    keyed.columns.insert(
+        "id".into(),
+        pbps_model::Column::new("integer".parse().unwrap()).not_null(),
+    );
+    keyed.primary_key = Some(pbps_model::PrimaryKey {
+        name: Some("p_pk".into()),
+        columns: vec!["id".into()],
+        storage_parameters: Default::default(),
+    });
+    let mut referencing = Table::default();
+    referencing.columns.insert(
+        "id".into(),
+        pbps_model::Column::new("integer".parse().unwrap()),
+    );
+    let bootstrap = vec![
+        Change::CreateTable {
+            uid: Uid::generate(UidKind::Table),
+            name: child.clone(),
+            table: Box::new(referencing),
+        },
+        Change::CreateTable {
+            uid: Uid::generate(UidKind::Table),
+            name: parent.clone(),
+            table: Box::new(keyed),
+        },
+        Change::AddForeignKey {
+            table: child,
+            name: "c_fk".into(),
+            constraint: Box::new(pbps_model::ForeignKey {
+                columns: vec!["id".into()],
+                references_table: parent,
+                references_columns: vec!["id".into()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            }),
+        },
+        module(
+            "app.f()",
+            ModuleKind::Function,
+            "() RETURNS integer LANGUAGE sql RETURN 1",
+        ),
+    ];
+    let reconstruction = Reconstruction::new(&crate::Postgres::new(), &bootstrap).unwrap();
+    let phases: Vec<_> = reconstruction
+        .steps
+        .iter()
+        .map(|step| (step.phase, step.declaration.as_str()))
+        .collect();
+    assert_eq!(
+        phases,
+        [
+            (Phase::Tables, "table app.c"),
+            (Phase::Tables, "table app.p"),
+            (Phase::Keys, "table app.c"),
+            (Phase::Modules, "function app.f()"),
+        ]
+    );
+    assert!(
+        reconstruction.steps[2]
+            .statements
+            .join("\n")
+            .contains("REFERENCES")
+    );
+}
+
+/// A table whose generated column calls a declared function cannot have
+/// the column split out without changing its column order, so the table
+/// follows the function on scratch, as in the ordinary plan (DEC-1364.1):
+/// its plain index with it, a view naming it after it, and a foreign key
+/// naming it once every module exists. A table generating from nothing
+/// declared keeps its place, and a function that needs the table it is
+/// called from is refused by name.
+#[test]
+fn a_table_generating_from_a_declared_function_compiles_after_it() {
+    use pbps_model::{Column, ForeignKey, Generated, Index, IndexColumn, IndexKey, Module, Schema};
+    let generated = |expression: &str| {
+        let mut column = Column::new("integer".parse().unwrap());
+        column.generated = Some(Generated {
+            expression: expression.into(),
+            stored: true,
+        });
+        column
+    };
+    let schema = |reads_table: bool| {
+        let mut n = Table::default();
+        n.columns.insert(
+            "id".into(),
+            Column::new("integer".parse().unwrap()).not_null(),
+        );
+        n.columns.insert("g".into(), generated("app.f(id)"));
+        n.indexes.insert(
+            "n_ix".into(),
+            Index {
+                columns: vec![IndexColumn {
+                    key: IndexKey::Column("id".into()),
+                    descending: false,
+                    opclass: None,
+                }],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: Default::default(),
+                storage_parameters: Default::default(),
+            },
+        );
+        let mut plain = Table::default();
+        plain
+            .columns
+            .insert("id".into(), Column::new("integer".parse().unwrap()));
+        plain.columns.insert("g".into(), generated("id * 2"));
+        plain.foreign_keys.insert(
+            "plain_fk".into(),
+            ForeignKey {
+                columns: vec!["id".into()],
+                references_table: TableName::new("app", "n"),
+                references_columns: vec!["id".into()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+        n.unique.insert(
+            "n_id".into(),
+            pbps_model::UniqueConstraint {
+                columns: vec!["id".into()],
+                storage_parameters: Default::default(),
+            },
+        );
+        let mut schema = Schema::default();
+        schema.tables.insert(TableName::new("app", "n"), n);
+        schema.tables.insert(TableName::new("app", "plain"), plain);
+        let body = if reads_table {
+            "(integer) RETURNS integer LANGUAGE sql IMMUTABLE BEGIN ATOMIC SELECT count(*)::integer FROM app.n; END"
+        } else {
+            "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1"
+        };
+        schema.modules.insert(
+            "app.f(integer)".parse().unwrap(),
+            Module {
+                kind: ModuleKind::Function,
+                description: None,
+                definition: body.into(),
+            },
+        );
+        schema.modules.insert(
+            "app.v".parse().unwrap(),
+            Module {
+                kind: ModuleKind::View,
+                description: None,
+                definition: "SELECT g FROM app.n".into(),
+            },
+        );
+        // Names the table only inside an OID-alias literal.
+        schema.modules.insert(
+            "app.w".parse().unwrap(),
+            Module {
+                kind: ModuleKind::View,
+                description: None,
+                definition: "SELECT 'app.n'::regclass AS r".into(),
+            },
+        );
+        schema
+    };
+    let bootstrap = |schema: &Schema| {
+        let ids = pbps_diff::resolve(
+            schema,
+            &pbps_model::IdsFile::default(),
+            &[],
+            &pbps_diff::Context {
+                operator: "1274-test".into(),
+                today: "2026-10-03".into(),
+            },
+        )
+        .unwrap()
+        .ids;
+        let empty = Schema::default();
+        pbps_diff::diff(
+            pbps_diff::Side {
+                schema: &empty,
+                ids: &pbps_model::IdsFile::default(),
+            },
+            pbps_diff::Side { schema, ids: &ids },
+            &crate::Postgres::new(),
+            &pbps_model::Hints::default(),
+        )
+        .unwrap()
+        .changes
+        .into_iter()
+        .map(|planned| planned.change)
+        .collect::<Vec<_>>()
+    };
+    let reconstruction =
+        Reconstruction::new(&crate::Postgres::new(), &bootstrap(&schema(false))).unwrap();
+    let order: Vec<_> = reconstruction
+        .steps
+        .iter()
+        .map(|step| (step.phase, step.declaration.as_str()))
+        .collect();
+    let at = |declaration: &str| {
+        order
+            .iter()
+            .position(|(_, d)| *d == declaration)
+            .unwrap_or_else(|| panic!("{declaration} missing from {order:?}"))
+    };
+    assert!(
+        at("function app.f(integer)") < at("table app.n"),
+        "{order:?}"
+    );
+    assert!(at("table app.n") < at("index n_ix on app.n"), "{order:?}");
+    assert!(at("table app.n") < at("view app.v"), "{order:?}");
+    assert!(at("table app.n") < at("view app.w"), "{order:?}");
+    let key = order
+        .iter()
+        .rposition(|(_, d)| *d == "table app.plain")
+        .unwrap();
+    assert!(
+        at("view app.v") < key,
+        "the key waits for every module: {order:?}"
+    );
+    assert_eq!(order[key].0, Phase::Modules, "{order:?}");
+    assert_eq!(
+        order[at("table app.plain")],
+        (Phase::Tables, "table app.plain")
+    );
+    assert_eq!(
+        Reconstruction::new(&crate::Postgres::new(), &bootstrap(&schema(true))).unwrap_err(),
+        ReconstructError::Cycle("table app.n".into())
+    );
+}
+
 /// A plan that drops, renames or alters is not a bootstrap, and building a
 /// namespace from one would reproduce neither side.
 #[test]
@@ -280,4 +517,96 @@ fn an_index_replica_identity_is_set_after_its_index() {
     assert!(!table.contains("REPLICA IDENTITY"), "{table}");
     let last = reconstruction.steps[2].statements.join("\n");
     assert!(last.contains("REPLICA IDENTITY USING INDEX"), "{last}");
+}
+
+/// Two tables held behind different functions keep the order between them:
+/// `app.b` calls the earlier function and another of its generated columns
+/// names `app.a` in an OID-alias literal, resolved as the table is created
+/// (measured on 18), while `app.a` waits for the later function. Placing
+/// `app.b` after its own function alone would create it before `app.a`.
+#[test]
+fn a_held_table_naming_another_held_table_follows_it() {
+    use pbps_model::{Column, Generated, Module, Schema};
+    let generated = |expression: &str| {
+        let mut column = Column::new("integer".parse().unwrap());
+        column.generated = Some(Generated {
+            expression: expression.into(),
+            stored: true,
+        });
+        column
+    };
+    let mut a = Table::default();
+    a.columns
+        .insert("id".into(), Column::new("integer".parse().unwrap()));
+    a.columns.insert("g".into(), generated("app.f2(id)"));
+    let mut b = Table::default();
+    b.columns
+        .insert("id".into(), Column::new("integer".parse().unwrap()));
+    b.columns.insert("g".into(), generated("app.f1(id)"));
+    let mut r = generated("'app.a'::regclass::oid::bigint");
+    r.ty = "bigint".parse().unwrap();
+    b.columns.insert("r".into(), r);
+    let mut schema = Schema::default();
+    schema.tables.insert(TableName::new("app", "a"), a);
+    schema.tables.insert(TableName::new("app", "b"), b);
+    for name in ["app.f1(integer)", "app.f2(integer)"] {
+        schema.modules.insert(
+            name.parse().unwrap(),
+            Module {
+                kind: ModuleKind::Function,
+                description: None,
+                definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+            },
+        );
+    }
+    let ids = pbps_diff::resolve(
+        &schema,
+        &pbps_model::IdsFile::default(),
+        &[],
+        &pbps_diff::Context {
+            operator: "1274-test".into(),
+            today: "2026-10-04".into(),
+        },
+    )
+    .unwrap()
+    .ids;
+    let empty = Schema::default();
+    let changes: Vec<_> = pbps_diff::diff(
+        pbps_diff::Side {
+            schema: &empty,
+            ids: &pbps_model::IdsFile::default(),
+        },
+        pbps_diff::Side {
+            schema: &schema,
+            ids: &ids,
+        },
+        &crate::Postgres::new(),
+        &pbps_model::Hints::default(),
+    )
+    .unwrap()
+    .changes
+    .into_iter()
+    .map(|planned| planned.change)
+    .collect();
+    let reconstruction = Reconstruction::new(&crate::Postgres::new(), &changes).unwrap();
+    let order: Vec<_> = reconstruction
+        .steps
+        .iter()
+        .map(|step| step.declaration.as_str())
+        .collect();
+    let at = |declaration: &str| {
+        order
+            .iter()
+            .position(|d| *d == declaration)
+            .unwrap_or_else(|| panic!("{declaration} missing from {order:?}"))
+    };
+    assert!(
+        at("function app.f1(integer)") < at("table app.b"),
+        "{order:?}"
+    );
+    assert!(
+        at("function app.f2(integer)") < at("table app.a"),
+        "{order:?}"
+    );
+    assert!(at("table app.a") < at("table app.b"), "{order:?}");
 }

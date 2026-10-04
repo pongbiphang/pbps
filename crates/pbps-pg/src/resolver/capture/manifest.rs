@@ -1,12 +1,13 @@
 //! Private complete input records and versioned cryptographic comparison.
 //! No external verifier, source, or derived checksum is an ordinary report.
 
-use super::{CaptureScope, Uncovered, bindings::Binding, properties, read, scope};
+use super::{CaptureScope, Uncovered, bindings::Binding, logical, properties, read, scope};
 use pbps_db::fingerprint::FingerprintKey;
 use pbps_db::resolver::capture::{CaptureDifference, InputChange, ObjectIdentity};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+#[derive(Clone)]
 pub(super) struct Input {
     pub(super) properties: BTreeMap<String, Value>,
     pub(super) bindings: Vec<Binding>,
@@ -68,10 +69,172 @@ pub struct CapturedInputs {
     major: u32,
     scope: CaptureScope,
     pub(super) inputs: BTreeMap<ObjectIdentity, Input>,
+    /// Raw attribute numbers prove physical children before the ordinal is
+    /// erased from durable catalog properties. Never seal these positions.
+    pub(super) attribute_numbers: BTreeMap<ObjectIdentity, i32>,
     pub(super) candidates: BTreeMap<super::CandidateSet, BTreeSet<ObjectIdentity>>,
     pub(super) limitations: BTreeSet<ObjectIdentity>,
     /// What each requested dropped signature named in this snapshot.
     dropped: BTreeMap<super::DroppedSignature, Option<ObjectIdentity>>,
+}
+
+/// Logical planning facts only. Private properties never leave the fixed-key
+/// capture that produced them.
+#[derive(Clone)]
+pub struct BindingRecord {
+    pub object: ObjectIdentity,
+    pub ownership: pbps_model::resolver::ObjectOwnership,
+    pub bindings: Vec<pbps_model::resolver::Binding>,
+}
+
+/// An in-progress producer, with its environment key selected before the
+/// coherent read. It exposes no raw capture getter, callback or rekey setter.
+/// The only outward observations are verdicts and logical binding identities.
+pub struct CompiledCapture {
+    captured: CapturedInputs,
+    key: pbps_db::fingerprint::EnvironmentFingerprintKey,
+    roles: crate::resolver::authorization::RoleMap,
+    ownership: BTreeMap<ObjectIdentity, pbps_model::resolver::ObjectOwnership>,
+}
+
+// Scratch's own server roles are separate observed prerequisites, even when
+// a spelling equals a target role.
+const SCRATCH_ROLE: &str = "resolver-scratch-authid";
+
+/// A one-shot fixed-key seal refusal. The public boundary conveys only a
+/// safe category, never a captured property, chosen mapping or verifier.
+#[derive(Debug, thiserror::Error)]
+pub enum SealError {
+    #[error(transparent)]
+    Manifest(#[from] pbps_model::resolver::ManifestError),
+}
+
+impl CompiledCapture {
+    pub(super) fn new(
+        captured: CapturedInputs,
+        key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+        roles: &crate::resolver::authorization::RoleMap,
+        ownership: BTreeMap<ObjectIdentity, pbps_model::resolver::ObjectOwnership>,
+    ) -> Self {
+        Self {
+            captured,
+            key: key.clone(),
+            roles: roles.clone(),
+            ownership,
+        }
+    }
+
+    pub fn assess(
+        &self,
+        target: &CapturedInputs,
+        base: &super::Managed,
+        paths: &super::Paths,
+        reconstruction: &crate::resolver::reconstruct::Reconstruction,
+    ) -> pbps_db::resolver::capture::Assessment {
+        super::assess(target, &self.captured, base, paths, reconstruction)
+    }
+
+    /// Consume the fixed-key producer once. The compiled records only prove
+    /// the plan's closing inventories and supply its own bindings and
+    /// candidate members; the closing manifest does not predict their
+    /// properties or engine-generated names (DEC-1274.1). No caller supplies
+    /// a property mapping.
+    pub fn seal_for_plan(self) -> Result<pbps_model::resolver::InputManifest, SealError> {
+        Ok(self
+            .captured
+            .seal_with_roles(&self.key, Some(&self.roles), Some(&self.ownership))?)
+    }
+
+    pub fn planning_records(
+        &self,
+    ) -> Result<Vec<BindingRecord>, pbps_model::resolver::ManifestError> {
+        self.captured
+            .inputs
+            .iter()
+            .map(|(object, input)| {
+                let mut bindings: Vec<pbps_model::resolver::Binding> = input
+                    .bindings
+                    .iter()
+                    .map(|binding| {
+                        Ok(pbps_model::resolver::Binding {
+                            node: binding.node.clone(),
+                            path: binding.path.clone(),
+                            target: normalize_identity(&binding.target, Some(&self.roles))?,
+                        })
+                    })
+                    .collect::<Result<_, pbps_model::resolver::ManifestError>>()?;
+                // The raw capture orders paths first; the sealed manifest
+                // orders model Bindings after role normalization. Resolution
+                // must carry that same order into BoundSurface.
+                bindings.sort();
+                Ok(BindingRecord {
+                    object: normalize_identity(object, Some(&self.roles))?,
+                    ownership: self
+                        .ownership
+                        .get(object)
+                        .cloned()
+                        .unwrap_or(pbps_model::resolver::ObjectOwnership::Unqualified),
+                    bindings,
+                })
+            })
+            .collect()
+    }
+}
+
+fn normalize_identity(
+    object: &ObjectIdentity,
+    roles: Option<&crate::resolver::authorization::RoleMap>,
+) -> Result<ObjectIdentity, pbps_model::resolver::ManifestError> {
+    use pbps_model::resolver::ManifestError;
+    let mut result = object.clone();
+    result.signature = object
+        .signature
+        .iter()
+        .map(|id| normalize_identity(id, roles))
+        .collect::<Result<_, _>>()?;
+    if object.class == "pg_authid"
+        && let Some(roles) = roles
+    {
+        let [name] = object.name.as_slice() else {
+            return Err(ManifestError::Invalid);
+        };
+        if let Some(logical) = roles.logical_of(name) {
+            result.name = vec![logical];
+        } else {
+            // The scratch server's own role is a separate observed
+            // prerequisite, even if its spelling equals a target role.
+            result.class = SCRATCH_ROLE.into();
+        }
+    }
+    Ok(result)
+}
+
+fn normalize_value(
+    value: &Value,
+    roles: Option<&crate::resolver::authorization::RoleMap>,
+) -> Result<Value, pbps_model::resolver::ManifestError> {
+    if let Value::Object(map) = value {
+        if map.get("class").and_then(Value::as_str) == Some("pg_authid") {
+            let identity: ObjectIdentity = serde_json::from_value(value.clone())
+                .map_err(|_| pbps_model::resolver::ManifestError::Invalid)?;
+            return serde_json::to_value(normalize_identity(&identity, roles)?)
+                .map_err(|_| pbps_model::resolver::ManifestError::Invalid);
+        }
+        return Ok(Value::Object(
+            map.iter()
+                .map(|(name, member)| Ok((name.clone(), normalize_value(member, roles)?)))
+                .collect::<Result<_, pbps_model::resolver::ManifestError>>()?,
+        ));
+    }
+    if let Value::Array(items) = value {
+        return Ok(Value::Array(
+            items
+                .iter()
+                .map(|item| normalize_value(item, roles))
+                .collect::<Result<_, _>>()?,
+        ));
+    }
+    Ok(value.clone())
 }
 
 impl CapturedInputs {
@@ -92,9 +255,21 @@ impl CapturedInputs {
         &self,
         key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
     ) -> Result<pbps_model::resolver::InputManifest, pbps_model::resolver::ManifestError> {
+        self.seal_with_roles(key, None, None)
+    }
+
+    /// The mapped variant is used only during the scratch read owned by the
+    /// qualified run. Every principal position is normalized before hashing;
+    /// neither NULL ACLs nor grant options are collapsed.
+    pub(super) fn seal_with_roles(
+        &self,
+        key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+        roles: Option<&crate::resolver::authorization::RoleMap>,
+        ownership: Option<&BTreeMap<ObjectIdentity, pbps_model::resolver::ObjectOwnership>>,
+    ) -> Result<pbps_model::resolver::InputManifest, pbps_model::resolver::ManifestError> {
         use pbps_model::resolver::{
-            Binding, CandidateSet, InputManifest, Membership, Prerequisite, ReadScope,
-            RoutineLookup,
+            Binding, CandidateSet, InputManifest, ManifestError, Membership, Prerequisite,
+            ReadScope, RoutineLookup,
         };
         let digest = |component: &str, bytes: Vec<u8>| -> String {
             key.fingerprint(self.rule, component, &bytes)
@@ -102,6 +277,7 @@ impl CapturedInputs {
                 .map(|b| format!("{b:02x}"))
                 .collect()
         };
+        let normalized = |object: &ObjectIdentity| normalize_identity(object, roles);
         let candidate = |q: &super::CandidateSet| CandidateSet {
             class: q.class.catalog().into(),
             namespace: q.namespace.clone(),
@@ -110,68 +286,93 @@ impl CapturedInputs {
         let mut membership: Vec<_> = self
             .candidates
             .iter()
-            .map(|(q, members)| Membership {
-                predicate: candidate(q),
-                members: members.clone(),
+            .map(|(q, members)| {
+                Ok(Membership {
+                    predicate: candidate(q),
+                    members: members.iter().map(&normalized).collect::<Result<_, _>>()?,
+                })
             })
-            .collect();
+            .collect::<Result<_, ManifestError>>()?;
         membership.sort_by(|a, b| a.predicate.cmp(&b.predicate));
+        let mut prerequisites: Vec<Prerequisite> = self
+            .inputs
+            .iter()
+            .map(|(object, input)| {
+                let mut bindings: Vec<Binding> = input
+                    .bindings
+                    .iter()
+                    .map(|binding| {
+                        Ok(Binding {
+                            node: binding.node.clone(),
+                            path: binding.path.clone(),
+                            target: normalized(&binding.target)?,
+                        })
+                    })
+                    .collect::<Result<_, ManifestError>>()?;
+                bindings.sort();
+                let properties: BTreeMap<String, Value> = input
+                    .properties
+                    .iter()
+                    .map(|(name, value)| Ok((name.clone(), normalize_value(value, roles)?)))
+                    .collect::<Result<_, ManifestError>>()?;
+                Ok(Prerequisite {
+                    object: normalized(object)?,
+                    // An ordinary read still proves no ownership. The qualified
+                    // producer assigns it only from the recorded managed UID.
+                    ownership: ownership
+                        .and_then(|owners| owners.get(object))
+                        .cloned()
+                        .unwrap_or(pbps_model::resolver::ObjectOwnership::Unqualified),
+                    canonicalization: self.rule.into(),
+                    properties: digest(
+                        "properties",
+                        serde_json::to_vec(&properties).expect("canonical properties serialize"),
+                    ),
+                    bindings,
+                })
+            })
+            .collect::<Result<_, ManifestError>>()?;
+        prerequisites.sort_by(|a, b| a.object.cmp(&b.object));
         InputManifest::new(
             self.rule.into(),
             self.major,
             key.id().as_str().into(),
             ReadScope {
-                retained: self.scope.retained.clone(),
+                retained: self
+                    .scope
+                    .retained
+                    .iter()
+                    .map(&normalized)
+                    .collect::<Result<_, _>>()?,
                 candidates: self.scope.candidates.iter().map(candidate).collect(),
             },
             digest(
                 "baseline",
                 serde_json::to_vec(&self.baseline).expect("baseline serializes"),
             ),
+            // Projection retains the opening target session; the scratch
+            // admin's session hash is not used as an approved postcondition.
             digest(
                 "session",
                 serde_json::to_vec(&self.session).expect("session serializes"),
             ),
-            self.inputs
-                .iter()
-                .map(|(object, input)| {
-                    let mut bindings: Vec<_> = input
-                        .bindings
-                        .iter()
-                        .map(|b| Binding {
-                            node: b.node.clone(),
-                            path: b.path.clone(),
-                            target: b.target.clone(),
-                        })
-                        .collect();
-                    bindings.sort();
-                    Prerequisite {
-                        object: object.clone(),
-                        // A raw capture supplies read prerequisites. The qualified
-                        // producer's ownership bridge must prove managed ownership
-                        // before any record may enter a transition (#615).
-                        ownership: pbps_model::resolver::ObjectOwnership::Unqualified,
-                        canonicalization: self.rule.into(),
-                        properties: digest(
-                            "properties",
-                            serde_json::to_vec(&input.properties)
-                                .expect("canonical properties serialize"),
-                        ),
-                        bindings,
-                    }
-                })
-                .collect(),
+            prerequisites,
             membership,
-            self.limitations.clone(),
+            self.limitations
+                .iter()
+                .map(&normalized)
+                .collect::<Result<_, _>>()?,
             self.dropped
                 .iter()
-                .map(|(query, resolved)| RoutineLookup {
-                    signature: query.spelled.clone(),
-                    search_path: query.path.clone(),
-                    kind: query.kind.into(),
-                    resolved: resolved.clone(),
+                .map(|(query, resolved)| {
+                    Ok(RoutineLookup {
+                        signature: query.spelled.clone(),
+                        search_path: query.path.clone(),
+                        kind: query.kind.into(),
+                        resolved: resolved.as_ref().map(normalized).transpose()?,
+                    })
                 })
-                .collect(),
+                .collect::<Result<_, ManifestError>>()?,
         )
     }
 
@@ -368,6 +569,7 @@ pub(super) fn finish(
     scope: CaptureScope,
 ) -> Result<CapturedInputs, Uncovered> {
     let mut inputs = BTreeMap::new();
+    let mut attribute_numbers = BTreeMap::new();
     for (object, locator) in prepared.members {
         let row = &read.catalog.rows[locator.class][locator.index];
         // Rows in the two passes need not have the same iteration order.
@@ -382,6 +584,22 @@ pub(super) fn finish(
                     Uncovered::object(&object, "selected object is missing from rendered input")
                 })?
         };
+        if object.class == "column" {
+            if locator.class != "pg_attribute" {
+                return Err(Uncovered::object(
+                    &object,
+                    "column provenance has the wrong catalog kind",
+                ));
+            }
+            let number = logical::signed(row, "attnum")
+                .map_err(|_| Uncovered::object(&object, "column number is unreadable"))?;
+            if number == 0 || attribute_numbers.insert(object.clone(), number).is_some() {
+                return Err(Uncovered::object(
+                    &object,
+                    "column number is not unique or valid",
+                ));
+            }
+        }
         let properties = properties::normalize(&read.catalog, locator.class, row, read.major)
             .map_err(|_| Uncovered::object(&object, "incomplete canonical properties"))?;
         let bindings = prepared
@@ -418,6 +636,7 @@ pub(super) fn finish(
         major: read.major,
         scope,
         inputs,
+        attribute_numbers,
         candidates: prepared.candidates,
         limitations: prepared.limitations,
         dropped: read.dropped,
@@ -451,3 +670,8 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, unix))]
+mod guard_tests;
+#[cfg(all(test, unix))]
+mod view_ownership_tests;

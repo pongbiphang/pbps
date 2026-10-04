@@ -8,7 +8,9 @@ fn surfaces(schema: &Schema) -> BTreeSet<Surface> {
     let mut result = BTreeSet::new();
     for (table, definition) in &schema.tables {
         for (column, spec) in &definition.columns {
-            if spec.default.is_some() {
+            // Generated expressions use the same binding surface as defaults;
+            // omitting them rejects qualified evidence (DEC-1168.1).
+            if spec.default.is_some() || spec.generated.is_some() {
                 result.insert(Surface::Default(table.column(column)));
             }
         }
@@ -32,12 +34,16 @@ fn surfaces(schema: &Schema) -> BTreeSet<Surface> {
 }
 
 pub(super) fn coverage(
-    base: &Schema,
-    desired: &Schema,
+    base: crate::Side<'_>,
+    desired: crate::Side<'_>,
     observations: &[SurfaceResolution],
 ) -> Result<(), Error> {
-    let before = surfaces(base);
-    let after = surfaces(desired);
+    let after = surfaces(desired.schema);
+    let opening = surfaces(base.schema);
+    let before: BTreeSet<_> = opening
+        .iter()
+        .map(|surface| removal_spelling(surface, base, desired, &opening, &after))
+        .collect();
     let expected: BTreeSet<_> = before.union(&after).cloned().collect();
     let actual: BTreeSet<_> = observations.iter().map(|o| o.surface.clone()).collect();
     if let Some(surface) = expected.symmetric_difference(&actual).next() {
@@ -54,6 +60,31 @@ pub(super) fn coverage(
         }
     }
     Ok(())
+}
+
+/// The spelling under which a base surface is covered. One the plan keeps is
+/// its own; one the plan removes is named as its removal names it once the
+/// plan's renames have run, through the recorded identities, unless another
+/// surface already holds that spelling: one the plan keeps (a rename that
+/// keeps it), or another base surface, such as a dropped table's whose name
+/// the renamed table takes. A removal named there is covered by that surface,
+/// and two removals are never collapsed onto one spelling.
+pub(super) fn removal_spelling(
+    surface: &Surface,
+    base: crate::Side<'_>,
+    desired: crate::Side<'_>,
+    before: &BTreeSet<Surface>,
+    after: &BTreeSet<Surface>,
+) -> Surface {
+    if after.contains(surface) {
+        return surface.clone();
+    }
+    let named = forward(surface, base.ids, desired.ids);
+    if after.contains(&named) || (&named != surface && before.contains(&named)) {
+        surface.clone()
+    } else {
+        named
+    }
 }
 
 /// Replacing an input requires tearing down existing dependents even when
@@ -138,8 +169,11 @@ pub(super) fn invalidates(change: &Change, surface: &Surface) -> bool {
             .columns_redefined()
             .iter()
             .any(|(r, field)| r == column && *field != pbps_model::ColumnField::Deprecated),
+        // A rewritten generation expression replaces its `pg_attrdef` as a
+        // changed default does (DEC-1168.1).
         Surface::Default(column) => {
             matches!(change, Change::AlterColumnDefault { column: r, from: Some(_), .. } if r == column)
+                || matches!(change, Change::AlterColumnExpression { column: r, .. } if r == column)
         }
         Surface::Check { table, name } => {
             matches!(change, Change::DropCheck { table: t, name: n } if t == table && n == name)
@@ -282,6 +316,42 @@ pub(super) fn changes(
                 let Surface::Default(before_column) = &previous else {
                     unreachable!("surface kind is preserved")
                 };
+                let generated = |schema: &Schema, at: &pbps_model::ColumnRef| {
+                    schema
+                        .tables
+                        .get(&at.table)
+                        .and_then(|t| t.columns.get(&at.name))
+                        .and_then(|c| c.generated.clone())
+                };
+                // A generation expression is rewritten in place with its own
+                // text, keeping the column and its place in the column order,
+                // so the engine binds it anew (DEC-1168.1). A server with no
+                // in-place form refuses that change by name.
+                if let (Some(old), Some(new)) =
+                    (generated(base, before_column), generated(desired, column))
+                {
+                    let uid = ids
+                        .column_uid(column)
+                        .ok_or_else(|| Error::Definition(surface.clone()))?
+                        .clone();
+                    let rewrite = Change::AlterColumnExpression {
+                        uid,
+                        column: column.clone(),
+                        from: old.expression,
+                        to: new.expression,
+                    };
+                    if !changes.iter().any(|p| p.change == rewrite) {
+                        let mut planned = PlannedChange::new(rewrite);
+                        planned.risks = dialect.change_risks(&planned.change);
+                        planned.strategy = hints
+                            .strategies
+                            .get(&column.table)
+                            .copied()
+                            .unwrap_or_default();
+                        changes.push(planned);
+                    }
+                    continue;
+                }
                 let Some(old) = base
                     .tables
                     .get(&before_column.table)

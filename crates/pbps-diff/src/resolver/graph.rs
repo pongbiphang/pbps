@@ -7,13 +7,17 @@ use std::collections::BTreeSet;
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(super) fn provides(c: &Change) -> BTreeSet<Surface> {
     match c {
+        // A generation expression stays in its CREATE TABLE, where its place
+        // in the column order is; a default is split out (prepare.rs). Either
+        // way the step that writes it provides its `pg_attrdef` surface, so a
+        // function it calls is ordered first (DEC-1168.1, DEC-1274.2).
         Change::CreateTable { name, table, .. } => std::iter::once(Surface::Table(name.clone()))
-            .chain(
-                table
-                    .columns
-                    .keys()
-                    .map(|n| Surface::Column(name.column(n))),
-            )
+            .chain(table.columns.iter().flat_map(|(n, column)| {
+                std::iter::once(Surface::Column(name.column(n))).chain(
+                    (column.default.is_some() || column.generated.is_some())
+                        .then(|| Surface::Default(name.column(n))),
+                )
+            }))
             .collect(),
         Change::AddColumn {
             table,
@@ -22,7 +26,7 @@ pub(super) fn provides(c: &Change) -> BTreeSet<Surface> {
             ..
         } => {
             let mut set = BTreeSet::from([Surface::Column(table.column(name))]);
-            if column.default.is_some() {
+            if column.default.is_some() || column.generated.is_some() {
                 set.insert(Surface::Default(table.column(name)));
             }
             set
@@ -31,7 +35,10 @@ pub(super) fn provides(c: &Change) -> BTreeSet<Surface> {
             column,
             to: Some(_),
             ..
-        } => BTreeSet::from([Surface::Default(column.clone())]),
+        }
+        | Change::AlterColumnExpression { column, .. } => {
+            BTreeSet::from([Surface::Default(column.clone())])
+        }
         Change::CreateModule { id, .. } | Change::AlterModule { id, .. } => {
             BTreeSet::from([Surface::Module(id.clone())])
         }
@@ -58,11 +65,29 @@ fn release(c: &Change, surface: &Surface) -> bool {
             Surface::Default(r),
         ) => column == r,
         (Change::DropColumn { column, .. }, Surface::Default(r)) => column == r,
+        // A rewritten generation expression lets go of what the old one
+        // bound, as a dropped default does, so it precedes the drop of a
+        // routine the old text called (DEC-1168.1).
+        (Change::AlterColumnExpression { column, .. }, Surface::Default(r)) => column == r,
         (Change::DropCheck { table, name }, Surface::Check { table: t, name: n })
         | (Change::DropIndex { table, name }, Surface::Index { table: t, name: n }) => {
             table == t && name == n
         }
         (Change::DropTable { name, .. }, surface) => table_of(surface).is_some_and(|t| t == name),
+        _ => false,
+    }
+}
+
+/// Whether a step writes a column's `pg_attrdef` expression in its own DDL:
+/// an added column's default or generation expression, a new table's
+/// generation expression, or a rewritten one. A generated column computes
+/// its rows as the step runs, so a routine it calls must be executable then.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn writes_attrdef(c: &Change) -> bool {
+    match c {
+        Change::AddColumn { column, .. } => column.default.is_some() || column.generated.is_some(),
+        Change::CreateTable { table, .. } => table.columns.values().any(|c| c.generated.is_some()),
+        Change::AlterColumnExpression { .. } => true,
         _ => false,
     }
 }
@@ -273,8 +298,7 @@ pub(super) fn constraints(
                 _ => None,
             };
             if let Some(target) = target
-                && (expression(other) == Some(true)
-                    || matches!(other, Change::AddColumn { column, .. } if column.default.is_some()))
+                && (expression(other) == Some(true) || writes_attrdef(other))
                 && (observations.iter().any(|o| {
                     made[j].contains(&o.surface)
                         && o.desired.as_ref().is_some_and(|d| {
@@ -335,7 +359,9 @@ pub(super) fn constraints(
             .map(|(i, _)| i)
             .collect();
         for &drop in &removes {
-            for &create in &creates {
+            // A rewritten expression both lets go of its old binding and
+            // installs its new one: no step precedes itself.
+            for &create in creates.iter().filter(|&&create| create != drop) {
                 edge(drop, create, OrderReason::Restoration);
             }
         }
@@ -356,7 +382,9 @@ pub(super) fn constraints(
             for input in &desired.managed_inputs {
                 for (i, surfaces) in made.iter().enumerate() {
                     if surfaces.contains(input) {
-                        for &create in &creates {
+                        // A table's generation expression reads columns the
+                        // same CREATE TABLE makes: no step precedes itself.
+                        for &create in creates.iter().filter(|&&create| create != i) {
                             edge(i, create, OrderReason::Binding);
                         }
                     }

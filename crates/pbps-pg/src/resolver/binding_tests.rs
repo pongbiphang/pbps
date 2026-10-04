@@ -378,6 +378,125 @@ async fn an_unrelated_arriving_routine_leaves_a_view_and_a_capturing_one_rebuild
     }
 }
 
+/// The differ splits a new table's foreign keys out of its CREATE, so the
+/// bootstrap of two related tables carries the key as its own change. Scratch
+/// compiles it after both tables and before the modules, and the analysis
+/// reaches a verdict instead of refusing the namespace.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn related_tables_compile_on_scratch_with_their_foreign_key() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let target = "
+            CREATE TABLE app.p (id integer NOT NULL, CONSTRAINT p_pk PRIMARY KEY (id));
+            CREATE TABLE app.c (id integer, CONSTRAINT c_fk FOREIGN KEY (id) REFERENCES app.p (id));
+            CREATE VIEW app.v AS SELECT id FROM app.c;";
+        let mut parent = pbps_model::Table::default();
+        parent.columns.insert(
+            "id".into(),
+            pbps_model::Column::new("integer".parse().unwrap()).not_null(),
+        );
+        parent.primary_key = Some(pbps_model::PrimaryKey {
+            name: Some("p_pk".into()),
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+        });
+        let mut child = pbps_model::Table::default();
+        child.columns.insert(
+            "id".into(),
+            pbps_model::Column::new("integer".parse().unwrap()),
+        );
+        child.foreign_keys.insert(
+            "c_fk".into(),
+            pbps_model::ForeignKey {
+                columns: vec!["id".into()],
+                references_table: "app.p".parse().unwrap(),
+                references_columns: vec!["id".into()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+        let declared = || {
+            Declared::default()
+                .table("app.p", parent.clone())
+                .table("app.c", child.clone())
+                .view("app.v", "SELECT id FROM app.c")
+        };
+        let assessment = analyze(
+            &server,
+            "foreign",
+            Case {
+                schemas: &["app"],
+                extras: &[],
+                target,
+                base: declared(),
+                desired: declared(),
+            },
+        )
+        .await
+        .unwrap_or_else(|refusal| panic!("{variable}: {refusal}"));
+        assert_eq!(
+            only(&assessment, "app", "v"),
+            Verdict::Unaffected,
+            "{variable}"
+        );
+    }
+}
+
+/// A table whose generated column calls a declared function compiles on
+/// scratch after that function, as the ordinary plan creates it (DEC-1364.1),
+/// so even an unchanged schema reaches a verdict instead of failing to
+/// compile the table before its function exists.
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_table_generating_from_a_declared_function_compiles_on_scratch() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        let target = "
+            CREATE FUNCTION app.f(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1;
+            CREATE TABLE app.n (id integer, g integer GENERATED ALWAYS AS (app.f(id)) STORED);
+            CREATE VIEW app.v AS SELECT g FROM app.n;";
+        let mut table = pbps_model::Table::default();
+        table.columns.insert(
+            "id".into(),
+            pbps_model::Column::new("integer".parse().unwrap()),
+        );
+        let mut generated = pbps_model::Column::new("integer".parse().unwrap());
+        generated.generated = Some(pbps_model::Generated {
+            expression: "app.f(id)".into(),
+            stored: true,
+        });
+        table.columns.insert("g".into(), generated);
+        let declared = || {
+            Declared::default()
+                .function(
+                    "app.f(integer)",
+                    "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1",
+                )
+                .table("app.n", table.clone())
+                .view("app.v", "SELECT g FROM app.n")
+        };
+        let assessment = analyze(
+            &server,
+            "generated",
+            Case {
+                schemas: &["app"],
+                extras: &[],
+                target,
+                base: declared(),
+                desired: declared(),
+            },
+        )
+        .await
+        .unwrap_or_else(|refusal| panic!("{variable}: {refusal}"));
+        assert_eq!(
+            only(&assessment, "app", "v"),
+            Verdict::Unaffected,
+            "{variable}"
+        );
+    }
+}
+
 fn numeric_f() -> Declared {
     Declared::default().function(
         "app.f(numeric)",
@@ -807,6 +926,54 @@ async fn a_candidate_scratch_did_not_reproduce_leaves_the_surface_unresolved() {
             .await
             .unwrap();
             assert!(unresolved(&assessment), "{variable} {tag}: {assessment:#?}");
+        }
+    }
+}
+
+/// A view the plan creates has no target record to compare, but its call
+/// binds against the target's candidates when it is created. An unmanaged
+/// overload elsewhere on the path that scratch did not reconstruct leaves the
+/// new view unresolved, as it does an existing one; without it, the view is
+/// `Created` (#1303 review).
+#[tokio::test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn a_created_surface_is_unresolved_by_a_candidate_scratch_did_not_reproduce() {
+    for variable in SERVERS {
+        let server = std::env::var(variable).unwrap();
+        for (tag, target, verdict) in [
+            (
+                "created_unmanaged",
+                "CREATE FUNCTION app.f(numeric) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;
+                 CREATE FUNCTION util.f(integer) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;",
+                None,
+            ),
+            (
+                "created_faithful",
+                "CREATE FUNCTION app.f(numeric) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;",
+                Some(Verdict::Created),
+            ),
+        ] {
+            let assessment = analyze(
+                &server,
+                tag,
+                Case {
+                    schemas: &["app", "util"],
+                    extras: &["util"],
+                    target,
+                    base: numeric_f(),
+                    desired: numeric_f().view("app.v", "SELECT f(1) AS x"),
+                },
+            )
+            .await
+            .unwrap();
+            let found = only(&assessment, "app", "v");
+            match verdict {
+                Some(expected) => assert_eq!(found, expected, "{variable} {tag}"),
+                None => assert!(
+                    matches!(&found, Verdict::Unresolved { condition } if condition.contains("not reconstructed")),
+                    "{variable} {tag}: {found:?}"
+                ),
+            }
         }
     }
 }

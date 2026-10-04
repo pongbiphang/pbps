@@ -88,12 +88,20 @@ descriptors; a row label list alone is not a completeness certificate. Missing,
 unreadable or truncated output shapes refuse coverage.
 
 The closure includes class-specific type, cast, operator, routine, extension,
-collation, relation and authorization properties; referenced prerequisites;
-owned children; extension membership; and initial privileges/dependencies.
-Explicit field dispositions distinguish scalar properties, logical references,
-ACLs, canonical definitions and physical bookkeeping. NULL/default ACL and an
-explicit empty ACL remain distinct. Public `pg_roles` supplies authorization
-facts without reading password verifiers from `pg_authid`.
+collation, relation and role properties; referenced prerequisites; owned
+children; extension membership; and dependencies. Explicit field dispositions
+distinguish scalar properties, logical references, canonical definitions,
+authorization metadata and physical bookkeeping. Owners, ACLs, shared
+(`pg_shdepend`) owner/ACL rows, initial privileges and default ACLs are
+authorization metadata: they do not change what a creation binds, so they are
+not read as prerequisites (DEC-1274.1). The deployer's effective privileges,
+which do change name lookup, are the separate authorization condition. Public
+`pg_roles` supplies role facts without reading password verifiers from
+`pg_authid`. A constraint's internal triggers, whose names embed
+their OID, are identified by relation, constraint and trigger function. A
+table's TOAST relation, whose name embeds the table's OID, is out-of-line
+storage that no expression binds: it and its index, columns and dependency rows
+are physical bookkeeping and stay out of the closure (DEC-1274.1).
 
 Actual stored node trees supply creation-time bindings, including pinned
 builtins that `pg_depend` omits. Qualified surfaces include views, SQL-standard
@@ -159,13 +167,13 @@ again, without acquiring Docker resources.
 
 ## Private comparison and delivery limits
 
-Rule `postgres-catalog-inputs-v1` defines the complete property and binding
-representations. Comparisons use HMAC-SHA256 fingerprints, framed by the rule
+Rule `postgres-catalog-inputs-v2` defines the complete property and binding
+representations; v1, which fingerprinted owners and ACLs, is no longer read. Comparisons use HMAC-SHA256 fingerprints, framed by the rule
 and the input's component, over canonical properties, full engine definitions
 including literals, logical bindings, recorded baseline and effective session
 inputs. Membership/absence is explicit. Identity equality alone cannot hide a
-changed cast context, type property, operator implementation/estimator,
-extension property or grant.
+changed cast context, type property, operator implementation/estimator or
+extension property.
 
 The key is `FingerprintKey::process()`: random, generated once per process and
 never written anywhere (DEC-952.1). A capture's fingerprints are compared and
@@ -200,7 +208,7 @@ The PostgreSQL live library fixtures run on both qualified majors, alongside
 ordinary PostgreSQL integration tests. They cover historical bindings versus
 fresh-bootstrap choices; missing builtin dependency rows; coherent rendering
 and change-and-restore; unchanged input; candidate additions/removals; cast,
-type, routine, operator and extension changes; authorization/session changes;
+type, routine, operator and extension changes; role/session changes;
 baseline states; unsupported layouts/versions; output qualification; local
 setting restoration; and preservation of caller-owned transactions.
 

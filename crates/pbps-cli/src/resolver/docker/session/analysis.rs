@@ -278,6 +278,14 @@ pub(crate) struct ContainerControl {
 }
 
 impl ContainerControl {
+    /// The admitted image's immutable content identity, retained with the
+    /// owned workload. Runtime and native-code checks remain separate.
+    pub(crate) fn image_digest(&self) -> Option<&str> {
+        self.state
+            .as_ref()
+            .map(|state| state.image.identity().image_id.as_str())
+    }
+
     pub(crate) fn driver(&self) -> Driver {
         self.state.as_ref().expect("live state").connection.driver()
     }

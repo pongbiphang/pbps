@@ -1,16 +1,25 @@
 //! Versioned property coverage for PostgreSQL resolution prerequisites.
 //!
 //! Every catalog field has an explicit disposition: retained scalar, logical
-//! object reference, ACL, engine-rendered expression, or physical bookkeeping.
-//! The last category is intentionally narrow; candidate identity alone is
-//! never the property's fingerprint (ADR-0016, decision 9).
+//! object reference, engine-rendered expression, authorization metadata or
+//! physical bookkeeping. The last two are not fingerprinted; candidate
+//! identity alone is never the property's fingerprint (ADR-0016, decision 9).
+//!
+//! Authorization metadata (owners, ACLs and their shared-dependency and
+//! initial-privilege rows) does not change what a creation binds: measured on
+//! PostgreSQL 16 and 18, revoking EXECUTE on the chosen overload, changing its
+//! owner or revoking every table privilege leaves each binding unchanged. The
+//! one authorization input that does, the deployer's schema USAGE, is the
+//! engine-computed `AuthorizationCondition` (DEC-1274.1). Fingerprinting the
+//! metadata would force a planner to predict PostgreSQL's ACL, grantor and
+//! owner-dependency results for every object a plan touches.
 
 use super::logical::{self, Catalog, Row};
 use pbps_db::resolver::capture::ObjectIdentity;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-pub(super) const RULE: &str = "postgres-catalog-inputs-v1";
+pub(super) const RULE: &str = "postgres-catalog-inputs-v2";
 pub(super) const CLASSES: &[&str] = &[
     "pg_namespace",
     "pg_class",
@@ -25,7 +34,6 @@ pub(super) const CLASSES: &[&str] = &[
     "pg_roles",
     "pg_auth_members",
     "pg_db_role_setting",
-    "pg_default_acl",
     "pg_rewrite",
     "pg_attrdef",
     "pg_constraint",
@@ -47,8 +55,6 @@ pub(super) const CLASSES: &[&str] = &[
     "pg_tablespace",
     "pg_inherits",
     "pg_depend",
-    "pg_shdepend",
-    "pg_init_privs",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,7 +64,7 @@ pub(super) enum Field {
     References(&'static str),
     Columns(&'static str),
     Column(&'static str),
-    Acl,
+    Authorization,
     Definition,
     Physical,
     Address,
@@ -186,30 +192,33 @@ pub(super) fn field(class: &str, name: &str, kind: &str) -> Result<Field> {
     if physical {
         return Ok(Physical);
     }
-    if kind == "_aclitem" {
-        return Ok(Acl);
+    if kind == "_aclitem"
+        || matches!(
+            (class, name),
+            ("pg_namespace", "nspowner")
+                | ("pg_class", "relowner")
+                | ("pg_type", "typowner")
+                | ("pg_proc", "proowner")
+                | ("pg_operator", "oprowner")
+                | ("pg_collation", "collowner")
+                | ("pg_language", "lanowner")
+                | ("pg_extension", "extowner")
+                | ("pg_opclass", "opcowner")
+                | ("pg_opfamily", "opfowner")
+                | ("pg_tablespace", "spcowner")
+                | ("pg_database", "datdba")
+        )
+    {
+        return Ok(Authorization);
     }
     if kind == "pg_node_tree" {
         return Ok(Definition);
     }
-    if matches!(class, "pg_depend" | "pg_shdepend" | "pg_init_privs") {
+    if class == "pg_depend" {
         return Ok(Address);
     }
     let reference = match (class, name) {
-        ("pg_namespace", "nspowner")
-        | ("pg_class", "relowner")
-        | ("pg_type", "typowner")
-        | ("pg_proc", "proowner")
-        | ("pg_operator", "oprowner")
-        | ("pg_collation", "collowner")
-        | ("pg_language", "lanowner")
-        | ("pg_extension", "extowner")
-        | ("pg_opclass", "opcowner")
-        | ("pg_opfamily", "opfowner")
-        | ("pg_tablespace", "spcowner")
-        | ("pg_database", "datdba")
-        | ("pg_default_acl", "defaclrole")
-        | ("pg_auth_members", "roleid" | "member" | "grantor")
+        ("pg_auth_members", "roleid" | "member" | "grantor")
         | ("pg_db_role_setting", "setrole") => Some("pg_authid"),
         ("pg_class", "relnamespace")
         | ("pg_type", "typnamespace")
@@ -219,8 +228,7 @@ pub(super) fn field(class: &str, name: &str, kind: &str) -> Result<Field> {
         | ("pg_extension", "extnamespace")
         | ("pg_constraint", "connamespace")
         | ("pg_opclass", "opcnamespace")
-        | ("pg_opfamily", "opfnamespace")
-        | ("pg_default_acl", "defaclnamespace") => Some("pg_namespace"),
+        | ("pg_opfamily", "opfnamespace") => Some("pg_namespace"),
         ("pg_class", "reltype" | "reloftype")
         | ("pg_attribute", "atttypid")
         | ("pg_type", "typelem" | "typarray" | "typbasetype")
@@ -322,6 +330,23 @@ pub(super) fn field(class: &str, name: &str, kind: &str) -> Result<Field> {
     }
 }
 
+/// An internal constraint trigger's definition without its OID-bearing name.
+/// Only the name token of the `CREATE CONSTRAINT TRIGGER` prefix is
+/// replaced: the same spelling elsewhere, such as a relation named after a
+/// trigger, is the relation's and stays. `pg_get_triggerdef` quotes the name
+/// as an identifier, so `RI_ConstraintTrigger_...` always appears quoted
+/// (measured on 16 and 18); any other shape refuses.
+fn without_trigger_name(rendered: &str, name: &str) -> Result<String> {
+    const PREFIX: &str = "CREATE CONSTRAINT TRIGGER ";
+    let rest = rendered.strip_prefix(PREFIX).ok_or(Uncovered::Definition)?;
+    let quoted = format!("\"{}\"", name.replace('"', "\"\""));
+    let tail = [quoted.as_str(), name]
+        .into_iter()
+        .find_map(|token| rest.strip_prefix(token)?.strip_prefix(' '))
+        .ok_or(Uncovered::Definition)?;
+    Ok(format!("{PREFIX}<internal constraint trigger> {tail}"))
+}
+
 fn reference(catalog: &Catalog, class: &str, value: &Value) -> Result<Value> {
     let oid = value
         .as_u64()
@@ -402,8 +427,12 @@ pub(super) fn normalize(
                 .expect("column identities serialize"),
         );
     }
+    // An internal constraint trigger's name embeds its OID; its identity is
+    // its relation, constraint and function instead (logical.rs). The name is
+    // neither a property nor part of its rendered definition.
+    let oid_named = class == "pg_trigger" && logical::internal_constraint_trigger(row)?;
     if complete {
-        let definition = &definitions["complete"];
+        let mut definition = definitions["complete"].clone();
         let required = class != "pg_proc" || matches!(logical::string(row, "prokind")?, "f" | "p");
         if required && !definition.as_str().is_some_and(|s| !s.is_empty()) {
             return Err(Uncovered::Definition);
@@ -411,12 +440,20 @@ pub(super) fn normalize(
         if !required && !definition.is_null() {
             return Err(Uncovered::Definition);
         }
-        output.insert("engine_definition".to_owned(), definition.clone());
+        if oid_named {
+            let name = logical::string(row, "tgname")?;
+            let rendered = definition.as_str().ok_or(Uncovered::Definition)?;
+            definition = Value::String(without_trigger_name(rendered, name)?);
+        }
+        output.insert("engine_definition".to_owned(), definition);
     }
     for &(name, kind) in layout {
+        if oid_named && name == "tgname" {
+            continue;
+        }
         let value = row.get(name).ok_or(Uncovered::Field)?;
         let normalized = match field(class, name, kind)? {
-            Field::Physical => continue,
+            Field::Physical | Field::Authorization => continue,
             Field::Scalar => {
                 // The raw pass uses a boolean presence marker instead of
                 // invoking an unqualified array element's output function.
@@ -456,7 +493,6 @@ pub(super) fn normalize(
                     )
                 }
             }
-            Field::Acl => acl(catalog, value)?,
             Field::Definition => {
                 let definition = definitions.get(name).ok_or(Uncovered::Definition)?;
                 // A present private node must have its complete engine output.
@@ -507,28 +543,6 @@ pub(super) fn address_row(
             )?),
             logical::string(row, "deptype")?,
         ),
-        "pg_shdepend" => (
-            catalog.address(
-                logical::number(row, "classid")?,
-                logical::number(row, "objid")?,
-                logical::signed(row, "objsubid")?,
-            )?,
-            Some(catalog.address(
-                logical::number(row, "refclassid")?,
-                logical::number(row, "refobjid")?,
-                0,
-            )?),
-            logical::string(row, "deptype")?,
-        ),
-        "pg_init_privs" => (
-            catalog.address(
-                logical::number(row, "classoid")?,
-                logical::number(row, "objoid")?,
-                logical::signed(row, "objsubid")?,
-            )?,
-            None,
-            logical::string(row, "privtype")?,
-        ),
         _ => return Err(Uncovered::Class),
     };
     let mut signature = vec![object];
@@ -538,53 +552,7 @@ pub(super) fn address_row(
         name: vec![kind.into()],
         signature,
     };
-    let mut properties = BTreeMap::new();
-    if class == "pg_init_privs" {
-        properties.insert(
-            "privileges".into(),
-            acl(catalog, row.get("initprivs").ok_or(Uncovered::Field)?)?,
-        );
-    }
-    Ok((identity, properties))
-}
-
-fn acl(catalog: &Catalog, value: &Value) -> Result<Value> {
-    if value.is_null() {
-        return Ok(Value::Null);
-    }
-    let mut result = Vec::new();
-    for item in value.as_array().ok_or(Uncovered::Reference)? {
-        let row = item.as_object().ok_or(Uncovered::Reference)?;
-        if row.len() != 4 {
-            return Err(Uncovered::Field);
-        }
-        if logical::number(row, "grantor")? == 0 {
-            return Err(Uncovered::Reference);
-        }
-        let grantor = reference(
-            catalog,
-            "pg_authid",
-            row.get("grantor").ok_or(Uncovered::Field)?,
-        )?;
-        let grantee_oid = row.get("grantee").ok_or(Uncovered::Field)?;
-        let grantee = if grantee_oid.as_u64() == Some(0) {
-            json!(ObjectIdentity {
-                class: "public-principal".into(),
-                name: vec!["PUBLIC".into()],
-                signature: vec![]
-            })
-        } else {
-            reference(catalog, "pg_authid", grantee_oid)?
-        };
-        let privilege = logical::string(row, "privilege_type")?;
-        let option = row
-            .get("is_grantable")
-            .and_then(Value::as_bool)
-            .ok_or(Uncovered::Field)?;
-        result.push(json!({"grantor":grantor,"grantee":grantee,"privilege":privilege,"grant_option":option}));
-    }
-    result.sort_by_cached_key(Value::to_string);
-    Ok(Value::Array(result))
+    Ok((identity, BTreeMap::new()))
 }
 
 include!("catalog_fields.rs");
@@ -610,18 +578,69 @@ mod tests {
         assert_eq!(fields("pg_future", 18), Err(Uncovered::Class));
     }
 
+    /// Only the trigger's own name token is normalized, as
+    /// `pg_get_triggerdef` renders it on 16 and 18. A relation spelled like
+    /// the trigger keeps its spelling, and a definition of any other shape
+    /// is refused rather than half-normalized.
     #[test]
-    fn default_acl_and_an_explicit_empty_acl_are_distinct() {
-        let catalog = Catalog::new(BTreeMap::new()).unwrap_or_else(|e| panic!("{e:?}"));
-        assert_eq!(acl(&catalog, &Value::Null), Ok(Value::Null));
-        assert_eq!(acl(&catalog, &json!([])), Ok(json!([])));
-        assert!(acl(&catalog, &json!([{}])).is_err());
-        assert!(
-            acl(
-                &catalog,
-                &json!([{"grantor":0,"grantee":0,"privilege_type":"SELECT","is_grantable":false}])
+    fn only_the_internal_trigger_name_token_is_normalized() {
+        let name = "RI_ConstraintTrigger_a_1780903";
+        let rendered = |relation: &str| {
+            format!(
+                "CREATE CONSTRAINT TRIGGER \"{name}\" AFTER DELETE ON app.\"{relation}\" \
+                 FROM app.c NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW \
+                 EXECUTE FUNCTION \"RI_FKey_noaction_del\"()"
             )
-            .is_err()
+        };
+        assert_eq!(
+            without_trigger_name(&rendered("p"), name).unwrap(),
+            rendered("p").replace(&format!("\"{name}\""), "<internal constraint trigger>")
         );
+        let collided = without_trigger_name(&rendered(name), name).unwrap();
+        assert!(collided.starts_with("CREATE CONSTRAINT TRIGGER <internal constraint trigger> "));
+        assert!(collided.contains(&format!("ON app.\"{name}\"")));
+        for wrong in [
+            rendered("p").replace("CREATE CONSTRAINT", "CREATE"),
+            rendered("p").replace(name, "RI_ConstraintTrigger_a_1"),
+        ] {
+            assert!(without_trigger_name(&wrong, name).is_err(), "{wrong}");
+        }
+    }
+
+    #[test]
+    fn owners_and_acls_are_authorization_metadata_not_prerequisites() {
+        for (class, name, kind) in [
+            ("pg_class", "relowner", "oid"),
+            ("pg_class", "relacl", "_aclitem"),
+            ("pg_proc", "proowner", "oid"),
+            ("pg_proc", "proacl", "_aclitem"),
+            ("pg_namespace", "nspowner", "oid"),
+            ("pg_namespace", "nspacl", "_aclitem"),
+            ("pg_type", "typowner", "oid"),
+            ("pg_attribute", "attacl", "_aclitem"),
+            ("pg_database", "datdba", "oid"),
+        ] {
+            assert_eq!(
+                field(class, name, kind),
+                Ok(Field::Authorization),
+                "{class}.{name}"
+            );
+        }
+        // Role catalogs keep their references: membership and role settings
+        // are the deployer's context, and they are never transitioned.
+        assert_eq!(
+            field("pg_auth_members", "roleid", "oid"),
+            Ok(Field::Reference("pg_authid"))
+        );
+        assert_eq!(
+            field("pg_proc", "prorettype", "oid"),
+            Ok(Field::Reference("pg_type"))
+        );
+        for class in ["pg_shdepend", "pg_init_privs", "pg_default_acl"] {
+            assert!(
+                !CLASSES.contains(&class),
+                "{class} is not a prerequisite class"
+            );
+        }
     }
 }

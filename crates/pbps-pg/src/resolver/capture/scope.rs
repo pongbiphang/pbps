@@ -40,7 +40,7 @@ pub(super) fn prepare(
 ) -> Result<Prepared, Uncovered> {
     let mut index = BTreeMap::new();
     for &class in properties::CLASSES {
-        if matches!(class, "pg_depend" | "pg_shdepend" | "pg_init_privs") {
+        if class == "pg_depend" {
             continue;
         }
         for (position, row) in catalog.rows[class].iter().enumerate() {
@@ -78,12 +78,13 @@ pub(super) fn prepare(
             render: render::Selection::default(),
         },
     };
-    // Authorization is a complete snapshot set, not a cache-derived effective
-    // privilege answer. Include absence and all grant/membership properties.
+    // Role attributes, memberships and role/database settings are complete
+    // snapshot sets. Object ACLs and owners are not binding inputs (see
+    // properties.rs); the deployer's effective privileges are the separate
+    // AuthorizationCondition.
     for &class in &[
         "pg_roles",
         "pg_auth_members",
-        "pg_default_acl",
         "pg_db_role_setting",
         "pg_parameter_acl",
         "pg_database",
@@ -108,6 +109,11 @@ pub(super) fn prepare(
         }
     }
     for object in &scope.retained {
+        // A dependency row is not a catalog object; it is read when its
+        // subject is, below.
+        if object.class == "pg_depend" {
+            continue;
+        }
         builder.add(object.clone())?;
     }
     for candidate in &scope.candidates {
@@ -263,7 +269,7 @@ impl Builder<'_> {
                 | Field::References(_)
                 | Field::Columns(_)
                 | Field::Column(_)
-                | Field::Acl
+                | Field::Authorization
                 | Field::Definition
                 | Field::Physical
                 | Field::Address => {}
@@ -334,14 +340,46 @@ impl Builder<'_> {
         Ok(())
     }
 
+    /// Whether a dependency row's dependent is a TOAST relation. A table's
+    /// out-of-line storage is physical, as its relfilenode is: no expression
+    /// binds it, and its name carries the table's OID, so it differs between
+    /// the target and scratch. It and everything under it stay out of the
+    /// capture (DEC-1274.1).
+    /// Whether a dependency row's dependent is authorization metadata: a
+    /// default ACL depends automatically on its schema, but owners and ACLs
+    /// are not binding inputs (rule v2, DEC-1274.1), so the row is not one
+    /// either. Any other dependent of a class the capture cannot read still
+    /// refuses.
+    fn authorization(&self, row: &Row) -> Result<bool, ()> {
+        let class = self
+            .catalog
+            .row("pg_class", logical::number(row, "classid").map_err(|_| ())?)
+            .map_err(|_| ())?;
+        Ok(logical::string(class, "relname").map_err(|_| ())? == "pg_default_acl")
+    }
+
+    fn toast(&self, row: &Row) -> Result<bool, ()> {
+        let relation = |field| logical::number(row, field).map_err(|_| ());
+        let class = self
+            .catalog
+            .row("pg_class", relation("classid")?)
+            .map_err(|_| ())?;
+        if logical::string(class, "relname").map_err(|_| ())? != "pg_class"
+            || logical::signed(row, "objsubid").map_err(|_| ())? != 0
+        {
+            return Ok(false);
+        }
+        let dependent = self
+            .catalog
+            .row("pg_class", relation("objid")?)
+            .map_err(|_| ())?;
+        Ok(logical::string(dependent, "relkind").map_err(|_| ())? == "t")
+    }
+
     fn dependencies(&mut self) -> Result<(), Uncovered> {
-        for &class in &["pg_depend", "pg_shdepend", "pg_init_privs"] {
+        for &class in &["pg_depend"] {
             for row in &self.catalog.rows[class] {
-                let (class_field, object_field, sub_field) = if class == "pg_init_privs" {
-                    ("classoid", "objoid", "objsubid")
-                } else {
-                    ("classid", "objid", "objsubid")
-                };
+                let (class_field, object_field, sub_field) = ("classid", "objid", "objsubid");
                 let fail = || Uncovered::class(class, "unreadable prerequisite dependency");
                 let subject = self.catalog.address(
                     logical::number(row, class_field).map_err(|_| fail())?,
@@ -367,7 +405,10 @@ impl Builder<'_> {
                         .as_ref()
                         .is_ok_and(|id| self.result.members.contains_key(id));
                 }
-                if !selected {
+                if !selected
+                    || self.toast(row).map_err(|_| fail())?
+                    || self.authorization(row).map_err(|_| fail())?
+                {
                     continue;
                 }
                 let (identity, properties) =
