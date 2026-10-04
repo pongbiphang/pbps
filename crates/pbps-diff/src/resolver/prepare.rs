@@ -34,12 +34,15 @@ fn surfaces(schema: &Schema) -> BTreeSet<Surface> {
 }
 
 pub(super) fn coverage(
-    base: &Schema,
-    desired: &Schema,
+    base: crate::Side<'_>,
+    desired: crate::Side<'_>,
     observations: &[SurfaceResolution],
 ) -> Result<(), Error> {
-    let before = surfaces(base);
-    let after = surfaces(desired);
+    let after = surfaces(desired.schema);
+    let before: BTreeSet<_> = surfaces(base.schema)
+        .iter()
+        .map(|surface| removal_spelling(surface, base, desired, &after))
+        .collect();
     let expected: BTreeSet<_> = before.union(&after).cloned().collect();
     let actual: BTreeSet<_> = observations.iter().map(|o| o.surface.clone()).collect();
     if let Some(surface) = expected.symmetric_difference(&actual).next() {
@@ -56,6 +59,27 @@ pub(super) fn coverage(
         }
     }
     Ok(())
+}
+
+/// The spelling under which a base surface is covered. One the plan keeps is
+/// its own; one the plan removes is named as its removal names it once the
+/// plan's renames have run, through the recorded identities, unless that
+/// spelling belongs to a surface the plan keeps (a rename that keeps it).
+pub(super) fn removal_spelling(
+    surface: &Surface,
+    base: crate::Side<'_>,
+    desired: crate::Side<'_>,
+    after: &BTreeSet<Surface>,
+) -> Surface {
+    if after.contains(surface) {
+        return surface.clone();
+    }
+    let named = forward(surface, base.ids, desired.ids);
+    if after.contains(&named) {
+        surface.clone()
+    } else {
+        named
+    }
 }
 
 /// Replacing an input requires tearing down existing dependents even when

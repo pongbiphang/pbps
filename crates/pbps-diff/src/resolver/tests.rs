@@ -1382,4 +1382,63 @@ mod generated_surface_coverage {
         )));
         ordered.proof.validate(&ordered.changes).unwrap();
     }
+
+    /// A check removed after its table's rename is covered under the spelling
+    /// its removal uses, as the producer names it; the opening spelling no
+    /// longer covers it.
+    #[test]
+    fn a_surface_removed_after_a_rename_is_covered_under_its_removal_spelling() {
+        let mut table = table(None);
+        table.checks.insert(
+            "c".into(),
+            pbps_model::CheckConstraint {
+                expression: "a > 0".into(),
+            },
+        );
+        let mut base = Schema::default();
+        base.tables.insert("app.t".parse().unwrap(), table);
+        let before_ids = ids(&base, &IdsFile::default());
+        let mut desired = Schema::default();
+        desired
+            .tables
+            .insert("app.u".parse().unwrap(), self::table(None));
+        let mut after_ids = before_ids.clone();
+        after_ids.rename_table(&"app.t".parse().unwrap(), &"app.u".parse().unwrap());
+        let removed = |table: &str| SurfaceResolution {
+            surface: Surface::Check {
+                table: table.parse().unwrap(),
+                name: "c".into(),
+            },
+            current: Some(bound("pg_constraint", "app.t.c", &[], "int4gt")),
+            desired: None,
+        };
+        let plan = |observation: SurfaceResolution| {
+            super::plan(
+                crate::Side {
+                    schema: &base,
+                    ids: &before_ids,
+                },
+                crate::Side {
+                    schema: &desired,
+                    ids: &after_ids,
+                },
+                &Hints::default(),
+                &[observation],
+                &pbps_dialect::MinimalDialect,
+            )
+        };
+        let ordered = plan(removed("app.u")).unwrap();
+        assert!(
+            ordered
+                .changes
+                .changes
+                .iter()
+                .any(|p| matches!(p.change, Change::DropCheck { .. }))
+        );
+        ordered.proof.validate(&ordered.changes).unwrap();
+        assert!(matches!(
+            plan(removed("app.t")),
+            Err(super::Error::Coverage(_))
+        ));
+    }
 }

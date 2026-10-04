@@ -99,47 +99,9 @@ fn bound(records: &[BindingRecord], surface: &Surface) -> Result<BoundSurface, E
     })
 }
 
-/// Where a surface the plan removes is named once the plan's renames have
-/// run: a drop ordered after its table's or column's rename names the new
-/// spelling, while the opening capture holds it under the old one. The
-/// recorded UIDs map between them; a surface whose table or column has no
-/// recorded desired identity keeps its spelling.
-fn relocated(
-    surface: &Surface,
-    base: pbps_diff::Side<'_>,
-    desired: pbps_diff::Side<'_>,
-) -> Surface {
-    let table = |name: &pbps_model::TableName| {
-        base.ids
-            .table_uid(name)
-            .and_then(|uid| desired.ids.tables.get(uid))
-            .cloned()
-            .unwrap_or_else(|| name.clone())
-    };
-    match surface {
-        Surface::Default(column) => Surface::Default(
-            base.ids
-                .column_uid(column)
-                .and_then(|uid| desired.ids.columns.get(uid))
-                .cloned()
-                .unwrap_or_else(|| column.clone()),
-        ),
-        Surface::Check { table: t, name } => Surface::Check {
-            table: table(t),
-            name: name.clone(),
-        },
-        Surface::Index { table: t, name } => Surface::Index {
-            table: table(t),
-            name: name.clone(),
-        },
-        Surface::Namespace(_) | Surface::Table(_) | Surface::Column(_) | Surface::Module(_) => {
-            surface.clone()
-        }
-    }
-}
-
 /// [`from_records`] for the planning sides, naming each removed surface by
-/// the spelling the plan's removal of it uses ([`relocated`]).
+/// the spelling the plan's removal of it uses, by the rule the planner's
+/// coverage check applies (`pbps_diff::resolver::removal_spelling`).
 pub(super) fn from_sides(
     base: pbps_diff::Side<'_>,
     desired: pbps_diff::Side<'_>,
@@ -150,7 +112,7 @@ pub(super) fn from_sides(
     resolve(
         base.schema,
         desired.schema,
-        &|surface| relocated(surface, base, desired),
+        &|surface, after| pbps_diff::resolver::removal_spelling(surface, base, desired, after),
         opening,
         compiled,
         assessment,
@@ -168,7 +130,7 @@ pub(super) fn from_records(
     resolve(
         base,
         desired,
-        &Surface::clone,
+        &|surface, _| surface.clone(),
         opening,
         compiled,
         assessment,
@@ -178,7 +140,7 @@ pub(super) fn from_records(
 fn resolve(
     base: &Schema,
     desired: &Schema,
-    relocate: &dyn Fn(&Surface) -> Surface,
+    relocate: &dyn Fn(&Surface, &BTreeSet<Surface>) -> Surface,
     opening: &[BindingRecord],
     compiled: &[BindingRecord],
     assessment: &Assessment,
@@ -190,10 +152,8 @@ fn resolve(
         // A removed surface is resolved by its opening spelling and named by
         // the one its removal uses. One the plan keeps keeps its own.
         if before.contains(surface) && !after.contains(surface) {
-            let named = relocate(surface);
-            if &named != surface && after.contains(&named) {
-                // Renamed and kept: the desired side resolves it below.
-            } else if &named != surface {
+            let named = relocate(surface, &after);
+            if &named != surface {
                 let current = Some(bound(opening, surface)?);
                 resolved.push(SurfaceResolution {
                     surface: named,
