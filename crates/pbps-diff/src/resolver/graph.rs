@@ -265,6 +265,17 @@ pub(super) fn constraints(
         }
     }
 
+    // A default change spelled by its own column's final name: the plan
+    // renames that column, by its UID, into the name the change uses.
+    let final_spelled: Vec<bool> = steps
+        .iter()
+        .map(|c| {
+            matches!(c, Change::AlterColumnDefault { uid, column, .. }
+                if steps.iter().any(|r| matches!(r,
+                    Change::RenameColumn { uid: renamed, table, to, .. }
+                        if renamed == uid && *table == column.table && *to == column.name)))
+        })
+        .collect();
     for (i, change) in steps.iter().enumerate() {
         for (j, other) in steps.iter().enumerate() {
             if i == j {
@@ -277,23 +288,19 @@ pub(super) fn constraints(
             {
                 edge(j, i, OrderReason::Identity);
             }
-            // A default spelled by its column's final name follows the
-            // renames that give the column that name: its own rename into the
-            // name, and another column's rename out of it. So an expression
-            // change follows its table's rename, and the ordinary plan orders
-            // `RenameColumn` before later changes naming the column
-            // (docs/ORDERING.md; #1292). The column is read by its UID, not
-            // by a name two columns hold in turn. The removal-first rule below
-            // would address the name before the column holds it.
-            let renamed_into = matches!(
-                (change, other),
-                (
-                    Change::AlterColumnDefault { uid, column, .. },
-                    Change::RenameColumn { uid: renamed, table, from, to, .. },
-                ) if column.table == *table
-                    && ((renamed == uid && column.name == *to)
-                        || (renamed != uid && column.name == *from))
-            ) && same_table(i, j);
+            // A default spelled by its column's final name follows every
+            // column rename of its table: the name is the one the column has
+            // once they have all run, as an expression change follows its
+            // table's rename and as the ordinary plan orders `RenameColumn`
+            // before later changes naming the column (docs/ORDERING.md;
+            // #1292). Whose rename frees that name is not read from names: a
+            // chain may fold case, as the differ's rename order does. The
+            // removal-first rule below would address the name before the
+            // column holds it. A teardown spelled by the base name keeps it.
+            let renamed_into = final_spelled[i]
+                && matches!(other, Change::RenameColumn { table, .. }
+                    if change.table() == Some(table))
+                && same_table(i, j);
             if renamed_into {
                 edge(j, i, OrderReason::Identity);
             }

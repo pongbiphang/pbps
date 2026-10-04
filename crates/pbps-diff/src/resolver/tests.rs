@@ -1967,29 +1967,33 @@ mod generated_surface_coverage {
             schema.tables.insert(t.clone(), table);
             schema
         };
-        let plan =
-            |label: &str, base: &Schema, desired: &Schema, observations: &[SurfaceResolution]| {
-                let before_ids = ids(base, &IdsFile::default());
-                let mut after_ids = before_ids.clone();
-                let a = before_ids.column_uid(&t.column("a")).unwrap().clone();
-                let b = before_ids.column_uid(&t.column("b")).unwrap().clone();
-                after_ids.columns.get_mut(&b).unwrap().name = "c".into();
-                after_ids.columns.get_mut(&a).unwrap().name = "b".into();
-                super::plan(
-                    crate::Side {
-                        schema: base,
-                        ids: &before_ids,
-                    },
-                    crate::Side {
-                        schema: desired,
-                        ids: &after_ids,
-                    },
-                    &Hints::default(),
-                    observations,
-                    &pbps_dialect::MinimalDialect,
-                )
-                .unwrap_or_else(|error| panic!("{label}: {error:?}"))
-            };
+        // `second` is the base name of the column renamed to `c`.
+        let plan = |label: &str,
+                    second: &str,
+                    base: &Schema,
+                    desired: &Schema,
+                    observations: &[SurfaceResolution]| {
+            let before_ids = ids(base, &IdsFile::default());
+            let mut after_ids = before_ids.clone();
+            let a = before_ids.column_uid(&t.column("a")).unwrap().clone();
+            let b = before_ids.column_uid(&t.column(second)).unwrap().clone();
+            after_ids.columns.get_mut(&b).unwrap().name = "c".into();
+            after_ids.columns.get_mut(&a).unwrap().name = "b".into();
+            super::plan(
+                crate::Side {
+                    schema: base,
+                    ids: &before_ids,
+                },
+                crate::Side {
+                    schema: desired,
+                    ids: &after_ids,
+                },
+                &Hints::default(),
+                observations,
+                &pbps_dialect::MinimalDialect,
+            )
+            .unwrap_or_else(|error| panic!("{label}: {error:?}"))
+        };
         let position = |ordered: &Ordered, f: &dyn Fn(&Change) -> bool| {
             ordered
                 .changes
@@ -2005,6 +2009,7 @@ mod generated_surface_coverage {
         // The old `a` loses its default under its final name `b`.
         let removed = plan(
             "final-spelled removal",
+            "b",
             &schema(&[("a", Some("1")), ("b", None)]),
             &schema(&[("b", None), ("c", None)]),
             &[SurfaceResolution {
@@ -2030,6 +2035,7 @@ mod generated_surface_coverage {
         // `b` by its base name and runs before `b` is renamed to `c`.
         let rebound = plan(
             "base-spelled teardown",
+            "b",
             &schema(&[("a", None), ("b", Some("1"))]),
             &schema(&[("b", None), ("c", Some("1"))]),
             &[
@@ -2052,5 +2058,31 @@ mod generated_surface_coverage {
             rebound.changes.changes
         );
         rebound.proof.validate(&rebound.changes).unwrap();
+
+        // The chain folds case: `B` frees `b`, as the differ's rename order
+        // reads it, so it goes first and the removal spelled `b` follows.
+        let folded = plan(
+            "case-folded chain",
+            "B",
+            &schema(&[("a", Some("1")), ("B", None)]),
+            &schema(&[("b", None), ("c", None)]),
+            &[SurfaceResolution {
+                surface: Surface::Default(t.column("b")),
+                current: attrdef("int4in"),
+                desired: None,
+            }],
+        );
+        let at = position(&folded, &removal);
+        assert!(
+            position(&folded, &rename("B")) < at,
+            "{:?}",
+            folded.changes.changes
+        );
+        assert!(
+            position(&folded, &rename("a")) < at,
+            "{:?}",
+            folded.changes.changes
+        );
+        folded.proof.validate(&folded.changes).unwrap();
     }
 }
