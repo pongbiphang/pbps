@@ -115,6 +115,7 @@ fn expression(c: &Change) -> Option<bool> {
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(super) fn constraints(
     changes: &ChangeSet,
+    ordinary: usize,
     observations: &[SurfaceResolution],
     annotations: &pbps_model::ModuleDeps,
     base: crate::Side<'_>,
@@ -144,6 +145,49 @@ pub(super) fn constraints(
             surfaces
         })
         .collect();
+    // The table each step changes, by recorded UID. A step of the ordinary
+    // plan spells a table as it is named where the differ placed the step:
+    // by the latest earlier rename to that name or creation under it,
+    // otherwise by the base table. A rebuild appended after it spells a
+    // teardown by the base name and a restoration by the final one.
+    // A dropped table's name taken by a renamed one is two tables
+    // (DEC-1498.1).
+    let owners: Vec<Option<&pbps_model::Uid>> = steps
+        .iter()
+        .enumerate()
+        .map(|(k, c)| match c {
+            Change::CreateTable { uid, .. }
+            | Change::DropTable { uid, .. }
+            | Change::RenameTable { uid, .. } => Some(uid),
+            other if k >= ordinary => other.table().and_then(|t| {
+                if expression(other) == Some(false)
+                    || matches!(other, Change::AlterColumnDefault { to: None, .. })
+                {
+                    base.ids.table_uid(t)
+                } else {
+                    desired.ids.table_uid(t)
+                }
+            }),
+            other => other.table().and_then(|t| {
+                steps[..k]
+                    .iter()
+                    .rev()
+                    .find_map(|earlier| match earlier {
+                        Change::RenameTable { uid, to, .. } if to == t => Some(uid),
+                        Change::CreateTable { uid, name, .. } if name == t => Some(uid),
+                        _ => None,
+                    })
+                    .or_else(|| base.ids.table_uid(t))
+                    .or_else(|| desired.ids.table_uid(t))
+            }),
+        })
+        .collect();
+    // Same name is not enough when both UIDs are known: only a false edge
+    // between two tables that share a name in turn is ever dropped.
+    let same_table = |i: usize, j: usize| match (owners[i], owners[j]) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    };
     let mut edges = BTreeSet::new();
     let mut edge = |before, after, reason| {
         edges.insert(OrderEdge {
@@ -229,12 +273,14 @@ pub(super) fn constraints(
             if expression(change).is_some()
                 && let Change::RenameTable { to, .. } = other
                 && change.table() == Some(to)
+                && same_table(i, j)
             {
                 edge(j, i, OrderReason::Identity);
             }
             if let (Some(t), Some(u), Some(install)) =
                 (change.table(), other.table(), expression(change))
                 && t == u
+                && same_table(i, j)
                 && expression(other).is_none()
                 // A replica identity follows the index it names and goes
                 // ahead of the old identity's index's drop, as the differ
@@ -260,6 +306,7 @@ pub(super) fn constraints(
             }
             if let (Some(false), Some(true)) = (expression(change), expression(other))
                 && change.table() == other.table()
+                && same_table(i, j)
             {
                 edge(i, j, OrderReason::Restoration);
             }
@@ -345,17 +392,46 @@ pub(super) fn constraints(
             }
         }
     }
+    // An observation names its opening record by the base spelling when the
+    // base holds the surface, and otherwise by the final one, as coverage
+    // does. A step releases or makes it only if it changes that table, by
+    // UID: a dropped table and the one that takes its name are two owners,
+    // and the renamed table's removal is spelled by its final name
+    // (DEC-1498.1).
+    let opening = super::prepare::surfaces(base.schema);
+    let owned = |i: usize, owner: Option<&pbps_model::Uid>| match (owners[i], owner) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    };
     for observation in observations {
+        let surface = &observation.surface;
+        let table = table_of(surface);
+        let base_owner = table.and_then(|t| {
+            if opening.contains(surface) {
+                base.ids.table_uid(t)
+            } else {
+                desired.ids.table_uid(t)
+            }
+        });
+        let final_spelling = super::prepare::forward(surface, base.ids, desired.ids);
         let removes: Vec<_> = steps
             .iter()
             .enumerate()
-            .filter(|(_, c)| release(c, &observation.surface))
+            .filter(|&(i, c)| {
+                owned(i, base_owner)
+                    && (release(c, surface)
+                        || (&final_spelling != surface
+                            && owners[i].is_some()
+                            && base_owner.is_some()
+                            && release(c, &final_spelling)))
+            })
             .map(|(i, _)| i)
             .collect();
+        let desired_owner = table.and_then(|t| desired.ids.table_uid(t));
         let creates: Vec<_> = made
             .iter()
             .enumerate()
-            .filter(|(_, s)| s.contains(&observation.surface))
+            .filter(|&(i, s)| s.contains(surface) && owned(i, desired_owner))
             .map(|(i, _)| i)
             .collect();
         for &drop in &removes {

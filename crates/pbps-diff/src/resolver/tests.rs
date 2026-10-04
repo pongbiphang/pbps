@@ -403,6 +403,7 @@ fn a_delayed_child_rename_does_not_lose_its_foreign_key_drop_dependency() {
     observed.current = Some(current);
     let edges = graph::constraints(
         &changes,
+        changes.changes.len(),
         &[observed],
         &Default::default(),
         crate::Side {
@@ -1479,8 +1480,6 @@ mod generated_surface_coverage {
             current: Some(bound("pg_constraint", "app.x.c", &[], "int4gt")),
             desired: None,
         };
-        // Coverage alone: the ordering graph keys its same-table rule by
-        // name, so a reused name is a separate, deferred limit.
         let base_side = crate::Side {
             schema: &base,
             ids: &before_ids,
@@ -1495,5 +1494,341 @@ mod generated_surface_coverage {
             super::super::prepare::coverage(base_side, desired_side, &[removed(&a)]),
             Err(super::super::Error::Coverage(_))
         ));
+
+        // The ordering graph tells the two tables apart by recorded UID, not
+        // by the name they share in turn: the dropped table goes first, with
+        // its check, then the rename, then the renamed table's check.
+        let ordered = super::plan(
+            base_side,
+            desired_side,
+            &Hints::default(),
+            &[removed(&a), removed(&b)],
+            &pbps_dialect::MinimalDialect,
+        )
+        .unwrap();
+        let steps = &ordered.changes.changes;
+        let position = |f: &dyn Fn(&Change) -> bool| {
+            steps
+                .iter()
+                .position(|p| f(&p.change))
+                .unwrap_or_else(|| panic!("missing from {steps:?}"))
+        };
+        let dropped_table =
+            position(&|c| matches!(c, Change::DropTable { uid, .. } if uid == &dropped));
+        let rename = position(&|c| matches!(c, Change::RenameTable { .. }));
+        let check = position(&|c| matches!(c, Change::DropCheck { table, .. } if table == &a));
+        assert!(dropped_table < rename, "{steps:?}");
+        assert!(rename < check, "{steps:?}");
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    /// Two tables swap names while each generation expression keeps its own
+    /// binding. Each observation holds the opening record under its base
+    /// spelling and the compiled one under its desired spelling, so one
+    /// spelling pairs two different tables; the rebuild check pairs them
+    /// through recorded UIDs, and a rename-only swap rewrites nothing
+    /// (DEC-1498.1).
+    #[test]
+    fn swapped_table_names_pair_bindings_through_recorded_uids() {
+        let (id, module) = routine();
+        let a: pbps_model::TableName = "app.a".parse().unwrap();
+        let b: pbps_model::TableName = "app.b".parse().unwrap();
+        let mut base = Schema::default();
+        base.modules.insert(id.clone(), module);
+        base.tables.insert(a.clone(), table(Some("app.f(a)")));
+        base.tables.insert(b.clone(), table(Some("app.f(a)")));
+        let before_ids = ids(&base, &IdsFile::default());
+        let desired = base.clone();
+        let mut after_ids = before_ids.clone();
+        let (ua, ub) = (
+            before_ids.table_uid(&a).unwrap().clone(),
+            before_ids.table_uid(&b).unwrap().clone(),
+        );
+        after_ids.tables.insert(ua.clone(), b.clone());
+        after_ids.tables.insert(ub.clone(), a.clone());
+        for column in after_ids.columns.values_mut() {
+            column.table = if column.table == a {
+                b.clone()
+            } else {
+                a.clone()
+            };
+        }
+        let function = Surface::Module(id);
+        let g = |table: &str| Surface::Default(format!("{table}.g").parse().unwrap());
+        let attrdef = |binds: &str| {
+            Some(bound(
+                "pg_attrdef",
+                "app.x.g",
+                std::slice::from_ref(&function),
+                binds,
+            ))
+        };
+        // The old app.a binds f and the old app.b binds f_exact. `old_a_binds`
+        // is what the old app.a binds under its new name, app.b.
+        let plan = |old_a_binds: &str| {
+            let observations = [
+                SurfaceResolution {
+                    surface: g("app.a"),
+                    current: attrdef("f"),
+                    desired: attrdef("f_exact"),
+                },
+                SurfaceResolution {
+                    surface: g("app.b"),
+                    current: attrdef("f_exact"),
+                    desired: attrdef(old_a_binds),
+                },
+                SurfaceResolution {
+                    surface: function.clone(),
+                    current: Some(bound("pg_proc", "app.f", &[], "int4in")),
+                    desired: Some(bound("pg_proc", "app.f", &[], "int4in")),
+                },
+            ];
+            super::plan(
+                crate::Side {
+                    schema: &base,
+                    ids: &before_ids,
+                },
+                crate::Side {
+                    schema: &desired,
+                    ids: &after_ids,
+                },
+                &Hints::default(),
+                &observations,
+                &pbps_dialect::MinimalDialect,
+            )
+            .unwrap()
+        };
+        let rewritten = |ordered: &Ordered| -> Vec<pbps_model::ColumnRef> {
+            ordered
+                .changes
+                .changes
+                .iter()
+                .filter_map(|p| {
+                    if let Change::AlterColumnExpression { column, .. } = &p.change {
+                        Some(column.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        let unchanged = plan("f");
+        assert!(
+            unchanged
+                .changes
+                .changes
+                .iter()
+                .any(|p| matches!(p.change, Change::RenameTable { .. }))
+        );
+        assert_eq!(rewritten(&unchanged), Vec::new(), "a rename-only swap");
+        unchanged.proof.validate(&unchanged.changes).unwrap();
+        // The old app.a rebinds: only it is rebuilt, under its new name.
+        let rebound = plan("f_exact");
+        assert_eq!(rewritten(&rebound), vec!["app.b.g".parse().unwrap()]);
+        rebound.proof.validate(&rebound.changes).unwrap();
+    }
+
+    /// A rebuild the resolver appends after the ordinary plan spells its
+    /// teardown by the base name and its restoration by the final one, not
+    /// by where it sits. In a rename chain, app.b to app.c and then app.a to
+    /// app.b, the old app.b's check is dropped before its rename, never
+    /// after it, which would hit the table that took the name (DEC-1498.1).
+    #[test]
+    fn an_appended_teardown_belongs_to_its_base_table_in_a_rename_chain() {
+        let (id, module) = routine();
+        let names =
+            ["app.a", "app.b", "app.c"].map(|n| n.parse::<pbps_model::TableName>().unwrap());
+        let [a, b, c] = names.clone();
+        let mut checked = table(None);
+        checked.checks.insert(
+            "k".into(),
+            pbps_model::CheckConstraint {
+                expression: "app.f(a) > 0".into(),
+            },
+        );
+        let mut base = Schema::default();
+        base.modules.insert(id.clone(), module);
+        base.tables.insert(a.clone(), table(None));
+        base.tables.insert(b.clone(), checked.clone());
+        let mut desired = Schema {
+            modules: base.modules.clone(),
+            ..Default::default()
+        };
+        desired.tables.insert(b.clone(), table(None));
+        desired.tables.insert(c.clone(), checked);
+        let before_ids = ids(&base, &IdsFile::default());
+        let mut after_ids = before_ids.clone();
+        after_ids.rename_table(&b, &c);
+        after_ids.rename_table(&a, &b);
+        let function = Surface::Module(id);
+        let check = |table: &pbps_model::TableName| Surface::Check {
+            table: table.clone(),
+            name: "k".into(),
+        };
+        let constraint = |binds: &str| {
+            Some(bound(
+                "pg_constraint",
+                "app.x.k",
+                std::slice::from_ref(&function),
+                binds,
+            ))
+        };
+        let ordered = super::plan(
+            crate::Side {
+                schema: &base,
+                ids: &before_ids,
+            },
+            crate::Side {
+                schema: &desired,
+                ids: &after_ids,
+            },
+            &Hints::default(),
+            &[
+                SurfaceResolution {
+                    surface: check(&b),
+                    current: constraint("f"),
+                    desired: None,
+                },
+                SurfaceResolution {
+                    surface: check(&c),
+                    current: None,
+                    desired: constraint("f_exact"),
+                },
+                SurfaceResolution {
+                    surface: function.clone(),
+                    current: Some(bound("pg_proc", "app.f", &[], "int4in")),
+                    desired: Some(bound("pg_proc", "app.f", &[], "int4in")),
+                },
+            ],
+            &pbps_dialect::MinimalDialect,
+        )
+        .unwrap();
+        let steps = &ordered.changes.changes;
+        let position = |f: &dyn Fn(&Change) -> bool| {
+            steps
+                .iter()
+                .position(|p| f(&p.change))
+                .unwrap_or_else(|| panic!("missing from {steps:?}"))
+        };
+        let teardown = position(&|ch| matches!(ch, Change::DropCheck { table, .. } if table == &b));
+        let away = position(&|ch| matches!(ch, Change::RenameTable { from, .. } if from == &b));
+        let into = position(&|ch| matches!(ch, Change::RenameTable { to, .. } if to == &b));
+        let restore = position(&|ch| matches!(ch, Change::AddCheck { table, .. } if table == &c));
+        assert!(teardown < away, "{steps:?}");
+        assert!(away < into, "{steps:?}");
+        assert!(away < restore, "{steps:?}");
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    /// Releases are read through the table that owns them, not the spelling
+    /// they share. `app.a` is dropped and `app.b` renamed to it, and each
+    /// table's check calls its own function, which the plan also drops. The
+    /// renamed table's check removal is spelled `app.a` but releases the
+    /// `app.b` observation, so the function it called waits for it
+    /// (DEC-1498.1).
+    #[test]
+    fn a_reused_name_releases_each_tables_own_bindings() {
+        let module = |name: &str| -> (pbps_model::ModuleId, pbps_model::Module) {
+            (
+                format!("app.{name}(integer)").parse().unwrap(),
+                pbps_model::Module {
+                    kind: pbps_model::ModuleKind::Function,
+                    description: None,
+                    definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+                },
+            )
+        };
+        let (f1, m1) = module("f1");
+        let (f2, m2) = module("f2");
+        let checked = |function: &str| {
+            let mut t = table(None);
+            t.checks.insert(
+                "c".into(),
+                pbps_model::CheckConstraint {
+                    expression: format!("app.{function}(a) > 0"),
+                },
+            );
+            t
+        };
+        let a: pbps_model::TableName = "app.a".parse().unwrap();
+        let b: pbps_model::TableName = "app.b".parse().unwrap();
+        let mut base = Schema::default();
+        base.modules.insert(f1.clone(), m1);
+        base.modules.insert(f2.clone(), m2);
+        base.tables.insert(a.clone(), checked("f1"));
+        base.tables.insert(b.clone(), checked("f2"));
+        let before_ids = ids(&base, &IdsFile::default());
+        let mut desired = Schema::default();
+        desired.tables.insert(a.clone(), table(None));
+        let mut after_ids = before_ids.clone();
+        let dropped = before_ids.table_uid(&a).unwrap().clone();
+        after_ids.tables.remove(&dropped);
+        after_ids.columns.retain(|_, column| column.table != a);
+        after_ids.rename_table(&b, &a);
+        let (s1, s2) = (Surface::Module(f1.clone()), Surface::Module(f2.clone()));
+        let check =
+            |table: &pbps_model::TableName, input: &Surface, binds: &str| SurfaceResolution {
+                surface: Surface::Check {
+                    table: table.clone(),
+                    name: "c".into(),
+                },
+                current: Some(bound(
+                    "pg_constraint",
+                    "app.x.c",
+                    std::slice::from_ref(input),
+                    binds,
+                )),
+                desired: None,
+            };
+        let routine = |surface: &Surface| SurfaceResolution {
+            surface: surface.clone(),
+            current: Some(bound("pg_proc", "app.f", &[], "int4in")),
+            desired: None,
+        };
+        let ordered = super::plan(
+            crate::Side {
+                schema: &base,
+                ids: &before_ids,
+            },
+            crate::Side {
+                schema: &desired,
+                ids: &after_ids,
+            },
+            &Hints::default(),
+            &[
+                check(&a, &s1, "f1"),
+                check(&b, &s2, "f2"),
+                routine(&s1),
+                routine(&s2),
+            ],
+            &pbps_dialect::MinimalDialect,
+        )
+        .unwrap();
+        let steps = &ordered.changes.changes;
+        let position = |f: &dyn Fn(&Change) -> bool| {
+            steps
+                .iter()
+                .position(|p| f(&p.change))
+                .unwrap_or_else(|| panic!("missing from {steps:?}"))
+        };
+        let removal = position(&|c| matches!(c, Change::DropCheck { table, .. } if table == &a));
+        let table = position(&|c| matches!(c, Change::DropTable { uid, .. } if uid == &dropped));
+        let drop = |id: &pbps_model::ModuleId| {
+            position(&|c| matches!(c, Change::DropModule { id: d, .. } if d == id))
+        };
+        assert!(removal < drop(&f2), "{steps:?}");
+        assert!(table < drop(&f1), "{steps:?}");
+        // The dropped table's observation does not claim the renamed
+        // table's removal: no edge ties that removal to the other function.
+        let f1_drop = drop(&f1);
+        assert!(
+            !ordered
+                .proof
+                .edges()
+                .iter()
+                .any(|e| e.before == removal && e.after == f1_drop),
+            "{steps:?}"
+        );
+        ordered.proof.validate(&ordered.changes).unwrap();
     }
 }

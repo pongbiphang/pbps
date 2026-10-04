@@ -4,7 +4,7 @@ use pbps_model::resolver::{Surface, SurfaceResolution};
 use pbps_model::{Change, ChangeSet, IdsFile, PlannedChange, Schema};
 use std::collections::BTreeSet;
 
-fn surfaces(schema: &Schema) -> BTreeSet<Surface> {
+pub(super) fn surfaces(schema: &Schema) -> BTreeSet<Surface> {
     let mut result = BTreeSet::new();
     for (table, definition) in &schema.tables {
         for (column, spec) in &definition.columns {
@@ -194,7 +194,7 @@ pub(super) fn changes(
     rebuilds: &BTreeSet<Surface>,
     hints: &pbps_model::Hints,
     dialect: &dyn Dialect,
-) -> Result<ChangeSet, Error> {
+) -> Result<(ChangeSet, usize), Error> {
     let mut changes = Vec::new();
     for planned in &ordinary.changes {
         let expanded = match &planned.change {
@@ -309,6 +309,10 @@ pub(super) fn changes(
             changes.push(p);
         }
     }
+    // The rebuilds follow the ordinary plan. They spell a teardown by its
+    // base name and a restoration by its final one, wherever they sit, so
+    // the graph reads their tables by kind, not by position (DEC-1498.1).
+    let mut added: Vec<PlannedChange> = Vec::new();
     for surface in rebuilds {
         let previous = forward(surface, ids, before_ids);
         let pair = match surface {
@@ -340,7 +344,7 @@ pub(super) fn changes(
                         from: old.expression,
                         to: new.expression,
                     };
-                    if !changes.iter().any(|p| p.change == rewrite) {
+                    if !changes.iter().chain(&added).any(|p| p.change == rewrite) {
                         let mut planned = PlannedChange::new(rewrite);
                         planned.risks = dialect.change_risks(&planned.change);
                         planned.strategy = hints
@@ -348,7 +352,7 @@ pub(super) fn changes(
                             .get(&column.table)
                             .copied()
                             .unwrap_or_default();
-                        changes.push(planned);
+                        added.push(planned);
                     }
                     continue;
                 }
@@ -453,7 +457,7 @@ pub(super) fn changes(
             changes.retain(|p| !tears_down(&p.change, surface));
         }
         for change in pair {
-            if !changes.iter().any(|p| p.change == change) {
+            if !changes.iter().chain(&added).any(|p| p.change == change) {
                 let mut planned = PlannedChange::new(change);
                 planned.risks = dialect.change_risks(&planned.change);
                 if let Some(table) = planned.change.table() {
@@ -466,11 +470,13 @@ pub(super) fn changes(
                     };
                     planned.strategy = hints.strategies.get(owner).copied().unwrap_or_default();
                 }
-                changes.push(planned);
+                added.push(planned);
             }
         }
     }
-    Ok(ChangeSet { changes })
+    let ordinary = changes.len();
+    changes.extend(added);
+    Ok((ChangeSet { changes }, ordinary))
 }
 
 fn tears_down(change: &Change, surface: &Surface) -> bool {
