@@ -107,17 +107,20 @@ pub enum DiffError {
     },
 
     /// A change to a table with `system_time`, on either side, other than
-    /// creating it (#1176, DEC-1176.1). The engine refuses some (dropping
-    /// the table, 13552; altering the period, 13599) and does others with
-    /// history side effects nobody declared: DROP COLUMN deletes that
-    /// column's history, and ADD NOT NULL with a default writes the default
-    /// into every history row (measured on 17.0).
+    /// creating it or adding a nullable column (#1176, #1177, DEC-1177.1).
+    /// The engine refuses some (dropping the table, 13552; altering the
+    /// period, 13599) and does others with history side effects nobody
+    /// declared: DROP COLUMN deletes that column's history, and ADD NOT NULL
+    /// with a default writes the default into every history row (measured on
+    /// 17.0). `what` names each refused change, in plan order.
     #[error(
-        "{table} has `system_time`, and pbps can create such a table but not change it yet: \
-         some changes are refused by SQL Server and others rewrite or delete its history. \
-         Declare {table} as it is recorded, and make the change by hand."
+        "{table} has `system_time`, and the only change pbps makes to such a table is adding \
+         a nullable column; this plan would also {}. SQL Server refuses some of these and \
+         does others by rewriting or deleting the table's history. Declare {table} as it is \
+         recorded apart from nullable columns it gains, and make the rest by hand.",
+        what.join(", ")
     )]
-    TemporalTableChange { table: TableName },
+    TemporalTableChange { table: TableName, what: Vec<String> },
 
     /// A `data:` table whose primary key moved to a different column. The row
     /// keys on each side are values of that side's key column, so the two sets
@@ -1862,7 +1865,13 @@ fn refuse_temporal_changes(
             .get(name)
             .is_some_and(|t| t.system_time.is_some())
     };
-    let mut refused = BTreeSet::new();
+    let mut refused: BTreeMap<TableName, Vec<String>> = BTreeMap::new();
+    let mut refuse = |table: &TableName, what: String| {
+        let list = refused.entry(table.clone()).or_default();
+        if !list.contains(&what) {
+            list.push(what);
+        }
+    };
     // A difference in `system_time` itself, which no change carries: without
     // this it would plan nothing and record the declaration as applied.
     for (uid, declared_name) in &declared.ids.tables {
@@ -1874,7 +1883,7 @@ fn refuse_temporal_changes(
             declared.schema.tables.get(declared_name),
         ) && b.system_time != d.system_time
         {
-            refused.insert(declared_name.clone());
+            refuse(declared_name, "change its `system_time`".to_owned());
         }
     }
     // A table this plan creates is created with every change it splits out
@@ -1906,6 +1915,15 @@ fn refuse_temporal_changes(
         {
             continue;
         }
+        // A nullable column the engine adds to the history beside the table,
+        // NULL in every row of both, with versioning left on (DEC-1177.1,
+        // measured on 17.0). A period column is declared through
+        // `system_time`, whose difference is refused above.
+        if let Change::AddColumn { column, .. } = change
+            && column.nullable
+        {
+            continue;
+        }
         // A drop or a rename acts on the table the base has at that name, and
         // a rename brings it to the declared one: asked of those sides, so the
         // ordinary table a new temporal one replaces may still go.
@@ -1927,13 +1945,39 @@ fn refuse_temporal_changes(
                 .filter(|n| temporal(base.schema, n) || temporal(declared.schema, n))
                 .collect()
         };
-        refused.extend(asked.into_iter().cloned());
+        // The one kind admitted is refused only for its nullability: say so.
+        let what = if matches!(change, Change::AddColumn { .. }) {
+            "add a NOT NULL column".to_owned()
+        } else {
+            change_in_words(change)
+        };
+        for table in asked {
+            refuse(table, what.clone());
+        }
     }
     errs.extend(
         refused
             .into_iter()
-            .map(|table| DiffError::TemporalTableChange { table }),
+            .map(|(table, what)| DiffError::TemporalTableChange { table, what }),
     );
+}
+
+/// A change's kind as words, `drop column` for `DropColumn`: the variant's
+/// own name, so a kind added later is named without anyone remembering to.
+fn change_in_words(change: &Change) -> String {
+    let debug = format!("{change:?}");
+    let kind = debug
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .next()
+        .unwrap_or_default();
+    let mut words = String::new();
+    for (i, c) in kind.chars().enumerate() {
+        if c.is_ascii_uppercase() && i > 0 {
+            words.push(' ');
+        }
+        words.push(c.to_ascii_lowercase());
+    }
+    words
 }
 
 fn refuse_computed_dependencies(
@@ -4758,7 +4802,7 @@ mod tests {
             .get_mut(&"app.t".parse().unwrap())
             .unwrap()
             .columns
-            .insert("note".into(), Column::new(ty("int")));
+            .insert("note".into(), Column::new(ty("int")).not_null());
         let retained = schema_of("app.t", versioned(Some("6 months")));
         let mut renamed_history = base.clone();
         renamed_history
@@ -4774,7 +4818,7 @@ mod tests {
             .history = "app.t_audit".parse().unwrap();
         let renamed = schema_of("app.u", versioned(None));
         for (what, declared, intents) in [
-            ("a column added", &added, vec![]),
+            ("a NOT NULL column added", &added, vec![]),
             ("its retention", &retained, vec![]),
             ("its history renamed", &renamed_history, vec![]),
             (
@@ -4796,10 +4840,47 @@ mod tests {
         ] {
             let errors = refused(&base, declared, &intents);
             assert!(
-                !errors.is_empty() && errors.iter().all(|e| e.contains("has `system_time`")),
+                !errors.is_empty()
+                    && errors
+                        .iter()
+                        .all(|e| e.contains("the only change pbps makes")),
                 "{what}: {errors:?}"
             );
         }
+        // A nullable column is the one change it takes (#1177), with or
+        // without a default; the refusal names every other change it meets.
+        for column in [
+            Column::new(ty("int")),
+            Column {
+                default: Some("5".into()),
+                ..Column::new(ty("int"))
+            },
+        ] {
+            let mut grown = base.clone();
+            grown
+                .tables
+                .get_mut(&"app.t".parse().unwrap())
+                .unwrap()
+                .columns
+                .insert("note".into(), column);
+            let cs = outcome(&base, &grown, &[]).expect("a nullable column is added");
+            assert_eq!(kinds(&cs), ["AddColumn"]);
+        }
+        let mut mixed = retained.clone();
+        let t = mixed.tables.get_mut(&"app.t".parse().unwrap()).unwrap();
+        t.columns.insert("note".into(), Column::new(ty("int")));
+        t.columns
+            .insert("must".into(), Column::new(ty("int")).not_null());
+        t.columns
+            .insert("also".into(), Column::new(ty("int")).not_null());
+        let errors = refused(&base, &mixed, &[]);
+        assert!(
+            errors.len() == 1
+                && errors[0]
+                    .contains("would also change its `system_time`, add a NOT NULL column.")
+                && !errors[0].contains("NOT NULL column, add a NOT NULL"),
+            "{errors:?}"
+        );
         // Negative: an ordinary table referencing it changes freely.
         let mut referencing = base.clone();
         let mut other = table(&[("t_id", Column::new(ty("int")))]);

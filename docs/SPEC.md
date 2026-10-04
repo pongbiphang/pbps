@@ -254,8 +254,9 @@ indexes:
   versioning into a named `history:` table, with an optional `retention: 6
   months`. The history is part of its table: it has no file and no identity of
   its own, and only the layout the engine builds for it is read. Such a table
-  is created whole, and any change to it is refused until #1177. PostgreSQL
-  refuses `system_time` (DEC-1176.1).
+  is created whole, and the one change it takes is a nullable column, which
+  the engine adds to its history too; every other change is refused by name.
+  PostgreSQL refuses `system_time` (DEC-1176.1, DEC-1177.1).
 - **An index key is `column [opclass] [asc|desc]`**, in PostgreSQL's order, and
   `method:` names the access method only where it is not the default `btree`.
   An absent class is the method's default for the column's type. The first
