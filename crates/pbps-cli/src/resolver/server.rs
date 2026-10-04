@@ -230,8 +230,15 @@ impl std::fmt::Debug for ScratchEndpoint {
 const DEFAULT_DAEMON: &str = "/var/run/docker.sock";
 
 impl ScratchEndpoint {
-    /// Parses the configured environment variable's value. A failure never
-    /// echoes the value: it carries the scratch server's password.
+    /// Parses the configured environment variable's value: whitespace-separated
+    /// `key=value` fields, each key once. A failure never echoes the value: it
+    /// carries the scratch server's password.
+    ///
+    /// `user` and `password` are percent-decoded (`%20` for a space, `%25` for
+    /// `%`), so a credential the separator would otherwise split can still be
+    /// spelled (#677). Only those two: every other field keeps the plain,
+    /// refusable grammar that stops a host, port or repeated field being
+    /// smuggled in.
     pub fn parse(value: &str) -> Result<Self, Error> {
         let mut fields: [(&str, Option<String>); 5] = [
             ("profile", None),
@@ -272,8 +279,8 @@ impl ScratchEndpoint {
             profile,
             container,
             daemon,
-            user: user.ok_or(Error::Endpoint)?,
-            password: password.ok_or(Error::Endpoint)?,
+            user: percent_decoded(&user.ok_or(Error::Endpoint)?)?,
+            password: percent_decoded(&password.ok_or(Error::Endpoint)?)?,
         })
     }
 
@@ -294,6 +301,35 @@ impl ScratchEndpoint {
             database: database.to_owned(),
         }
     }
+}
+
+/// A credential field's `%XX` escapes, decoded. Strict rather than lenient: a
+/// `%` without two hex digits after it, a result that is not UTF-8, or a NUL
+/// no engine login can carry is refused, never passed through as written, so
+/// a value is either exactly what the operator encoded or no value at all.
+fn percent_decoded(value: &str) -> Result<String, Error> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'%' {
+            let hex = bytes
+                .get(at + 1..at + 3)
+                .filter(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+                .ok_or(Error::Endpoint)?;
+            let hex = std::str::from_utf8(hex).map_err(|_| Error::Endpoint)?;
+            decoded.push(u8::from_str_radix(hex, 16).map_err(|_| Error::Endpoint)?);
+            at += 3;
+        } else {
+            decoded.push(bytes[at]);
+            at += 1;
+        }
+    }
+    let decoded = String::from_utf8(decoded).map_err(|_| Error::Endpoint)?;
+    if decoded.contains('\0') {
+        return Err(Error::Endpoint);
+    }
+    Ok(decoded)
 }
 
 /// The daemon's record of the supplied container, pinned at admission and
