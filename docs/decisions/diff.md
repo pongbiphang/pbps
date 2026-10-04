@@ -2084,6 +2084,7 @@ review):
 |---|---|---|
 | No primary key on a versioned table | refused (13553) | validation refuses it |
 | Period columns of two precisions (an omitted one is 7) | refused (13513) | validation refuses it |
+| A history name over 124 characters | its `ix_` index name is cut at 127 | validation refuses it |
 | An INSTEAD OF trigger on a versioned table | refused (13569) | validation refuses it |
 | An AFTER trigger on it, or either kind with a period alone | accepted | held |
 | A cascading foreign key from or to a versioned table | accepted | held; the restriction was 2016's (#1502) |
@@ -2148,12 +2149,6 @@ declaration lists it:
 - `apply` asks the same under the lock, before anything runs, for a table made
   there since the plan was computed. A staged run asks when it starts, not on
   a resume, whose own earlier statement created the history;
-- after the statements run, an apply or bootstrap refuses to keep a history
-  the `CREATE` took over rather than made, because no check before it can close
-  the window until it runs. The engine's record tells them apart: a history it
-  creates is 3 to 20 ms newer than its table and empty, and one it took over
-  predates the statement. In a transaction the plan rolls back. A staged run
-  asks at its closing read, by age alone, and does not close (SPEC §7.6);
 - validation refuses the ledger's own table names for it, as for a table;
 - `doctor` asks for its schema, and bootstrap holds that schema's spelling to
   the database's, as it does a table's.
@@ -2162,6 +2157,21 @@ Every place that lists what a declaration puts in the database was audited
 for the history once (#1501 review). The places above are the ones that need
 it. The ids file, the managed scope and declared grants do not: the history
 has no identity, and pbps declares no grant on it.
+
+**Creation never adopts.** `HISTORY_TABLE = <name>` would take an existing
+table that matches. No check before the statement can close the window in
+which another session makes one, and the creation timestamps cannot tell the
+two apart: in a tight loop, 169 of 200 fresh histories had their table's
+`create_date`, which is a `datetime`. So pbps does not use `HISTORY_TABLE`.
+It creates the table with versioning on and lets the engine name the history
+`MSSQL_TemporalHistoryFor_<object_id>`, a name that belongs to the new table
+and that nothing can hold. In the same batch it then moves the history to
+the declared schema and renames it and its `ix_` index. The engine accepts
+both renames and the transfer while versioning is on, in one transaction. A
+declared name that is taken fails the rename (15335), and the plan rolls back
+with it. The checks before the statements still give a taken name a refusal
+that names it. The engine cuts the index name at 127 characters, so a history
+name longer than 124 characters is refused.
 
 **Changes.** Creating the table is one statement, so the engine builds the
 history. Every other change to a table with `system_time` on either side is

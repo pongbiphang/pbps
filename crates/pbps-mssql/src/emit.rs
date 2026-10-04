@@ -1730,6 +1730,48 @@ fn computed_definition(
     ))
 }
 
+/// The history named as declared, in the batch that created it under the
+/// engine's own name (#1176, #1501 review).
+///
+/// Not `HISTORY_TABLE = <name>`: given an existing table whose columns match,
+/// that takes it as the history, rows and all, and no check before the
+/// statement closes the window another session has until it runs. The name
+/// the engine chooses, `MSSQL_TemporalHistoryFor_<object_id>`, is the new
+/// table's own and cannot be taken; it is moved to the declared schema, then
+/// renamed, with its index, to the declared names. A name that is taken there
+/// fails the rename (15335), and the plan with it. Measured on 17.0: the
+/// history and its `ix_` index take both renames and the transfer while
+/// versioning is on, in one transaction.
+fn history_rename(table: &TableName, history: &TableName) -> Result<String, DialectError> {
+    let mut sql = format!(
+        "\nDECLARE @pbps_history sysname = (SELECT OBJECT_NAME(history_table_id) \
+         FROM sys.tables WHERE object_id = OBJECT_ID({}));\nDECLARE @pbps_object nvarchar(max);",
+        literal(&qualified(table)?)
+    );
+    if history.schema != table.schema {
+        sql.push_str(&format!(
+            "\nSET @pbps_object = {} + QUOTENAME(@pbps_history) + N';';\n\
+             EXEC sys.sp_executesql @pbps_object;",
+            literal(&format!(
+                "ALTER SCHEMA {} TRANSFER {}.",
+                quote(&history.schema)?,
+                quote(&table.schema)?
+            ))
+        ));
+    }
+    sql.push_str(&format!(
+        "\nSET @pbps_object = {} + QUOTENAME(@pbps_history);\n\
+         EXEC sys.sp_rename @pbps_object, {}, N'OBJECT';\n\
+         SET @pbps_object = {} + QUOTENAME(N'ix_' + @pbps_history);\n\
+         EXEC sys.sp_rename @pbps_object, {}, N'INDEX';",
+        literal(&format!("{}.", quote(&history.schema)?)),
+        literal(&history.name),
+        literal(&format!("{}.", qualified(history)?)),
+        literal(&format!("ix_{}", history.name)),
+    ));
+    Ok(sql)
+}
+
 fn create_table(name: &TableName, table: &Table) -> Sql {
     if table.columns.is_empty() {
         return Err(DialectError::Invalid {
@@ -1777,6 +1819,7 @@ fn create_table(name: &TableName, table: &Table) -> Sql {
     // layout itself, and that layout is the only one the model holds
     // (#1176, DEC-1176.1).
     let mut with = String::new();
+    let mut rename = String::new();
     if let Some(st) = &table.system_time {
         body.push(format!(
             "PERIOD FOR SYSTEM_TIME ({}, {})",
@@ -1787,20 +1830,18 @@ fn create_table(name: &TableName, table: &Table) -> Sql {
             let retention = match &v.retention {
                 None => String::new(),
                 Some(r) => format!(
-                    ", HISTORY_RETENTION_PERIOD = {} {}",
+                    " (HISTORY_RETENTION_PERIOD = {} {})",
                     r.count,
                     r.unit.keyword()
                 ),
             };
-            with = format!(
-                " WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = {}{retention}))",
-                qualified(&v.history)?
-            );
+            with = format!(" WITH (SYSTEM_VERSIONING = ON{retention})");
+            rename = history_rename(name, &v.history)?;
         }
     }
 
     let mut out = vec![Statement::new(format!(
-        "CREATE TABLE {qualified_name} (\n    {}\n){with};",
+        "CREATE TABLE {qualified_name} (\n    {}\n){with};{rename}",
         body.join(",\n    ")
     ))];
 
@@ -2206,20 +2247,33 @@ mod tests {
             "[vf] datetime2(3) GENERATED ALWAYS AS ROW START HIDDEN NOT NULL CONSTRAINT",
             "[vt] datetime2(3) GENERATED ALWAYS AS ROW END HIDDEN NOT NULL",
             "PERIOD FOR SYSTEM_TIME ([vf], [vt])",
-            ") WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = [hist].[t_history], \
-             HISTORY_RETENTION_PERIOD = 6 MONTH));",
+            ") WITH (SYSTEM_VERSIONING = ON (HISTORY_RETENTION_PERIOD = 6 MONTH));",
+            // Created under the engine's name, which nothing can hold, then
+            // moved and renamed: never adopted (#1501 review).
+            "OBJECT_ID(N'[dbo].[t]')",
+            "SET @pbps_object = N'ALTER SCHEMA [hist] TRANSFER [dbo].' + QUOTENAME(@pbps_history) + N';';",
+            "SET @pbps_object = N'[hist].' + QUOTENAME(@pbps_history);",
+            "EXEC sys.sp_rename @pbps_object, N't_history', N'OBJECT';",
+            "SET @pbps_object = N'[hist].[t_history].' + QUOTENAME(N'ix_' + @pbps_history);",
+            "EXEC sys.sp_rename @pbps_object, N'ix_t_history', N'INDEX';",
         ] {
             assert!(sql[0].contains(part), "{part}: {}", sql[0]);
         }
+        assert!(!sql[0].contains("HISTORY_TABLE"), "{}", sql[0]);
         assert!(!sql[0].contains("[id] int GENERATED"), "{}", sql[0]);
         // INFINITE is the engine's default, and not spelled.
+        // A history in the table's own schema is renamed and not moved.
         let st = t.system_time.as_mut().unwrap();
         st.hidden = false;
-        st.versioning.as_mut().unwrap().retention = None;
+        let v = st.versioning.as_mut().unwrap();
+        v.retention = None;
+        v.history = tname("dbo.t_history");
         let sql = create(&t);
         assert!(
             sql[0].contains("GENERATED ALWAYS AS ROW START NOT NULL")
-                && sql[0].ends_with("(HISTORY_TABLE = [hist].[t_history]));"),
+                && sql[0].contains(") WITH (SYSTEM_VERSIONING = ON);")
+                && sql[0].contains("N't_history', N'OBJECT'")
+                && !sql[0].contains("ALTER SCHEMA"),
             "{}",
             sql[0]
         );

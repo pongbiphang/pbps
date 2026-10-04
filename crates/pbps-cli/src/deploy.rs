@@ -1753,54 +1753,6 @@ fn blocking_history_occupants<'a>(
 /// to the engine: given an existing table whose columns match, SQL Server
 /// takes it as the history, rows, layout and all, where any other `CREATE`
 /// would be refused (measured on 17.0).
-/// Refuses to keep what a plan's `CREATE TABLE`s did if one took an existing
-/// table as its history (#1501 review): in a transaction, before it commits;
-/// in a staged run, at the closing read, which then does not close. See
-/// [`pbps_mssql::catalog::adopted_histories`].
-async fn refuse_adopted_histories(
-    conn: &mut Conn,
-    cs: &pbps_model::ChangeSet,
-    in_transaction: bool,
-    label: &str,
-) -> anyhow::Result<()> {
-    if conn.driver() != pbps_db::Driver::Mssql {
-        return Ok(());
-    }
-    let pairs: Vec<(TableName, TableName)> = cs
-        .changes
-        .iter()
-        .filter_map(|p| {
-            if let pbps_model::Change::CreateTable { name, table, .. } = &p.change {
-                let v = table.system_time.as_ref()?.versioning.as_ref()?;
-                Some((name.clone(), v.history.clone()))
-            } else {
-                None
-            }
-        })
-        .collect();
-    if pairs.is_empty() {
-        return Ok(());
-    }
-    let adopted = pbps_mssql::catalog::adopted_histories(conn, &pairs, in_transaction).await?;
-    if adopted.is_empty() {
-        return Ok(());
-    }
-    let lines: Vec<String> = adopted
-        .iter()
-        .map(|(table, history, why)| format!("{table} took {history} as its history: {why}"))
-        .collect();
-    bail!(
-        "`{label}`: SQL Server took an existing table as a history this plan creates:\n  {}\n\
-         Another session made it while the plan ran. {}",
-        lines.join("\n  "),
-        if in_transaction {
-            "Nothing is kept: the whole plan is rolled back."
-        } else {
-            "The run does not close; `pbps verify` shows the database as it stands."
-        }
-    );
-}
-
 async fn refuse_taken_history_names(
     conn: &mut Conn,
     cs: &pbps_model::ChangeSet,
@@ -5508,7 +5460,6 @@ pub fn cmd_bootstrap(
 
             transaction_attempted = true;
             execute_transaction_body(&mut conn, dialect.as_ref(), &statements).await?;
-            refuse_adopted_histories(&mut conn, &cs, true, &target.label).await?;
             // Bootstrap creates routines as `apply` does, so the same form is
             // required of a definer among them (#322).
             crate::engine::refuse_unsafe_definers(
@@ -6897,7 +6848,6 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         )
         .await?;
         execute_statements(conn, statements, &data_guard).await?;
-        refuse_adopted_histories(conn, &plan.changes, true, &target.label).await?;
         crate::engine::check_module_rebuilds(conn, &plan.changes, true).await?;
         crate::engine::refuse_unsafe_definers(
             conn,
@@ -7548,10 +7498,6 @@ async fn apply_staged_under_lock(
         )?;
         previous = recorded;
     }
-
-    // A history the run's `CREATE TABLE` took over, from a table another
-    // session made in the meantime: the run does not close over it.
-    refuse_adopted_histories(conn, &plan.changes, false, &target.label).await?;
 
     // The closing entry is an ordinary apply with no staged marker: its absence
     // is what tells every later command this environment is no longer

@@ -1022,6 +1022,16 @@ fn system_time(name: &TableName, table: &Table, st: &pbps_model::SystemTime) -> 
                 "`system_time` names `{name}` itself as its history table; name another table"
             )));
         }
+        // Its index is `ix_` and the name, which the engine cuts at 127
+        // characters (measured on 17.0): a longer name has no index name it
+        // could read back as the engine's own.
+        if v.history.name.chars().count() > 124 {
+            errs.push(invalid(format!(
+                "history table `{}` has a name longer than 124 characters, which leaves its \
+                 index, `ix_` and the name, no room in SQL Server's 128; name it shorter",
+                v.history
+            )));
+        }
         // The engine keeps history for at most 1000 years, in any unit
         // (13749 beyond, measured on 17.0 by bisection).
         if let Some(r) = &v.retention {
@@ -1364,6 +1374,11 @@ mod tests {
         let mut bare = valid();
         bare.columns.get_mut("vf").unwrap().ty = "datetime2".parse().unwrap();
         assert!(found(&bare).is_empty(), "{:?}", found(&bare));
+        // A name of 124 characters leaves `ix_` room.
+        let mut longest = valid();
+        st(&mut longest).versioning.as_mut().unwrap().history =
+            TableName::new("hist", "h".repeat(124));
+        assert!(found(&longest).is_empty(), "{:?}", found(&longest));
         // A period alone needs no key.
         let mut period_only = valid();
         period_only.primary_key = None;
@@ -1376,7 +1391,7 @@ mod tests {
             assert!(found(&t).is_empty(), "{longest}: {:?}", found(&t));
         }
         type Break = fn(&mut Table);
-        let cases: [(Break, &str); 12] = [
+        let cases: [(Break, &str); 13] = [
             (|t| st(t).end = "vf".into(), "as both the start and the end"),
             (|t| st(t).end = "missing".into(), "no column of that name"),
             (
@@ -1417,6 +1432,13 @@ mod tests {
                 "longer than SQL Server keeps",
             ),
             (|t| t.primary_key = None, "must have a primary key"),
+            (
+                |t| {
+                    st(t).versioning.as_mut().unwrap().history =
+                        TableName::new("hist", "h".repeat(125))
+                },
+                "longer than 124 characters",
+            ),
             (
                 |t| t.columns.get_mut("vt").unwrap().ty = "datetime2(3)".parse().unwrap(),
                 "requires one precision for both",

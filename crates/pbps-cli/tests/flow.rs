@@ -2623,10 +2623,11 @@ fn a_history_name_taken_after_the_plan_is_refused_at_apply() {
 }
 
 /// A table that appears at a history's name after every check before the
-/// statements, and before the `CREATE TABLE` that names it, is taken as the
-/// history by the engine. The apply then refuses to keep it, and the whole
-/// plan rolls back (#1501 review). A database DDL trigger stands in for the
-/// other session: it fires inside the apply's own transaction when the plan
+/// statements, and before the `CREATE TABLE` that names it, is never taken as
+/// the history: the history is created under the engine's own name and
+/// renamed, and the rename onto a taken name fails, so the whole plan rolls
+/// back (#1501 review). A database DDL trigger stands in for the other
+/// session: it fires inside the apply's own transaction when the plan
 /// creates `dbo.a`, ahead of `dbo.t`.
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
@@ -2689,7 +2690,7 @@ fn a_history_taken_over_mid_apply_rolls_the_plan_back() {
     on_server(own.connection(), "DROP TRIGGER tr_sneak ON DATABASE;");
     assert_ne!(code(&refused), 0, "{}", stdout(&refused));
     assert!(
-        stderr(&refused).contains("dbo.t took dbo.t_history as its history"),
+        stderr(&refused).contains("'t_history' is already in use"),
         "{}",
         stderr(&refused)
     );
