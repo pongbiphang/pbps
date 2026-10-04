@@ -4303,8 +4303,17 @@ async fn recorded_renames_with_type_and_nullability_edits_match_actual_child_cat
     // constraints, so its pg_constraint identities enumerate the NOT NULL
     // children; the actual catalog query below also checks their contype.
     // The closing manifest keeps a record the plan installs only where
-    // something names it (DEC-1274.1), so the children the plan makes are
-    // read from the transitions that install them.
+    // something names it (DEC-1274.1), and nothing names a NOT NULL child,
+    // so it claims none of the target's children.
+    assert!(
+        !closing
+            .prerequisites()
+            .iter()
+            .any(|row| row.object.class == "pg_constraint")
+    );
+    // The transitions install the compiled children, spelled as scratch
+    // makes them: a fresh NOT NULL is named by its final table and column,
+    // while the target keeps a rewritten one's opening name (below).
     let evidence = serde_json::to_value(&result.evidence).unwrap();
     let installed: Vec<pbps_db::resolver::capture::ObjectIdentity> = evidence["transitions"]
         .as_array()
@@ -4313,11 +4322,8 @@ async fn recorded_renames_with_type_and_nullability_edits_match_actual_child_cat
         .flat_map(|t| t["after"].as_array().into_iter().flatten())
         .map(|object| serde_json::from_value(object.clone()).unwrap())
         .collect();
-    let child_identities: BTreeSet<_> = closing
-        .prerequisites()
+    let compiled_children: BTreeSet<_> = installed
         .iter()
-        .map(|row| &row.object)
-        .chain(&installed)
         .filter(|object| object.class == "pg_constraint")
         .map(|object| {
             let relation = object.signature.get(1).unwrap();
@@ -4332,18 +4338,27 @@ async fn recorded_renames_with_type_and_nullability_edits_match_actual_child_cat
             )
         })
         .collect();
-    let expected_children: BTreeSet<_> = if major == 18 {
-        [
-            ("type_final", "type_case_id_not_null"),
-            ("add_final", "add_final_n_not_null"),
-        ]
-        .into_iter()
-        .map(|(table, name)| (table.to_owned(), name.to_owned()))
-        .collect()
-    } else {
-        BTreeSet::new()
+    let children = |pairs: [(&str, &str); 2]| -> BTreeSet<(String, String)> {
+        if major == 18 {
+            pairs
+                .into_iter()
+                .map(|(table, name)| (table.to_owned(), name.to_owned()))
+                .collect()
+        } else {
+            BTreeSet::new()
+        }
     };
-    assert_eq!(child_identities, expected_children);
+    assert_eq!(
+        compiled_children,
+        children([
+            ("type_final", "type_final_n_not_null"),
+            ("add_final", "add_final_n_not_null"),
+        ])
+    );
+    let expected_children = children([
+        ("type_final", "type_case_id_not_null"),
+        ("add_final", "add_final_n_not_null"),
+    ]);
 
     let mut peer = pbps_db::Conn::connect(
         Driver::Postgres,
