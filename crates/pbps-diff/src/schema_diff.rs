@@ -1877,10 +1877,26 @@ fn refuse_temporal_changes(
             refused.insert(declared_name.clone());
         }
     }
+    // A table this plan creates is created with every change it splits out
+    // of the `CREATE` (its foreign keys, #1501 review): those are the
+    // creation, not a change to a table that stands.
+    let created: BTreeSet<&TableName> = changes
+        .iter()
+        .filter_map(|c| {
+            if let Change::CreateTable { name, .. } = c {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .filter(|name| !base.schema.tables.contains_key(*name))
+        .collect();
     // A grant or a trigger on the table is not a change to the pair, and
     // `table()` names neither; a rename is reached by both of its names.
     for change in changes {
-        if matches!(change, Change::CreateTable { .. }) {
+        if matches!(change, Change::CreateTable { .. })
+            || change.table().is_some_and(|t| created.contains(t))
+        {
             continue;
         }
         let renamed_to = if let Change::RenameTable { to, .. } = change {
@@ -4605,6 +4621,34 @@ mod tests {
         // Created whole, in one change.
         let created = outcome(&Schema::default(), &base, &[]).expect("a create is planned");
         assert_eq!(kinds(&created), ["CreateTable"]);
+        // With the foreign keys the differ splits out of its `CREATE`, which
+        // are the creation too (#1501 review).
+        let mut keyed = base.clone();
+        keyed.tables.insert(
+            "app.parent".parse().unwrap(),
+            table(&[("id", Column::new(ty("int")).not_null())]),
+        );
+        keyed
+            .tables
+            .get_mut(&"app.t".parse().unwrap())
+            .unwrap()
+            .foreign_keys
+            .insert(
+                "fk_t_parent".into(),
+                pbps_model::ForeignKey {
+                    columns: vec!["id".into()],
+                    references_table: "app.parent".parse().unwrap(),
+                    references_columns: vec!["id".into()],
+                    on_delete: Default::default(),
+                    on_update: Default::default(),
+                },
+            );
+        let created = outcome(&Schema::default(), &keyed, &[]).expect("a keyed create is planned");
+        assert!(
+            kinds(&created).contains(&"AddForeignKey".to_owned()),
+            "{:?}",
+            kinds(&created)
+        );
         // Unchanged, nothing to plan.
         assert!(outcome(&base, &base, &[]).unwrap().changes.is_empty());
 

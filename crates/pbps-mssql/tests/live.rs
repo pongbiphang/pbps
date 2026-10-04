@@ -1984,9 +1984,12 @@ async fn system_versioned_tables_round_trip_through_an_empty_database() {
     let mut db = TestDb::create("temporal1176").await;
     for statement in [
         "CREATE SCHEMA hist;",
+        "CREATE TABLE dbo.parent (id int NOT NULL CONSTRAINT pk_parent PRIMARY KEY);",
         "CREATE TABLE dbo.named (
              id int NOT NULL CONSTRAINT pk_named PRIMARY KEY,
              v nvarchar(20) NULL,
+             -- A key the plan creates beside the table (#1501 review).
+             parent_id int NULL CONSTRAINT fk_named_parent REFERENCES dbo.parent (id),
              vf datetime2 GENERATED ALWAYS AS ROW START
                  CONSTRAINT df_named_vf DEFAULT SYSUTCDATETIME() NOT NULL,
              vt datetime2 GENERATED ALWAYS AS ROW END NOT NULL,
