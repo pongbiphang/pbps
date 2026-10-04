@@ -3723,6 +3723,15 @@ fn refuse_unplanned_movement(
                     }
                 ));
             }
+            // In the `CREATE` itself, period and versioning, so held from the
+            // first read that finds the table (#1176): another session's
+            // retention or versioning change after it is not the plan's.
+            if declared.system_time != now.system_time {
+                moved.push(format!(
+                    "{now_name} period or system versioning is not what this plan's `CREATE \
+                     TABLE` declares"
+                ));
+            }
             // In the `CREATE` itself (`WITH`), so held from the first read
             // that finds the table (#1441).
             if declared.storage_parameters != now.storage_parameters {
@@ -3993,6 +4002,14 @@ fn refuse_unplanned_movement(
                 moved.push(format!(
                     "{now_name} is {} and this plan does not leave it so",
                     if now.unlogged { "unlogged" } else { "logged" }
+                ));
+            }
+            // No change of a plan sets it on a table that exists (#1176), so
+            // it is held to the before-read throughout.
+            if was.system_time != now.system_time {
+                moved.push(format!(
+                    "{now_name} period or system versioning changed, and this plan does not \
+                     change it"
                 ));
             }
             // An index whose parameters the plan sets in place, held once
@@ -12780,6 +12797,80 @@ mod tests {
         let e =
             check(&creating, &empty, &schema(false), Settled::SoFar).expect_err("not as created");
         assert!(format!("{e:#}").contains("unlogged"), "{e:#}");
+    }
+
+    /// A table's period and versioning are held across an apply (#1176): a
+    /// change by another session to an untouched or touched table is
+    /// movement, and a created table is held to its `CREATE` from the first
+    /// read, so a retention changed after it commits is not recorded as the
+    /// plan's (#1501 review).
+    #[test]
+    fn a_system_time_change_by_someone_else_is_movement() {
+        use pbps_model::{Change, Column, PlannedChange, Table};
+        let name = TableName::new("dbo", "t");
+        let schema = |retention: Option<&str>| {
+            let mut t = Table::default();
+            t.columns
+                .insert("id".into(), Column::new("int".parse().unwrap()).not_null());
+            t.system_time = Some(pbps_model::SystemTime {
+                start: "vf".into(),
+                end: "vt".into(),
+                hidden: false,
+                versioning: Some(pbps_model::SystemVersioning {
+                    history: TableName::new("dbo", "t_history"),
+                    retention: retention.map(|r| r.parse().unwrap()),
+                }),
+            });
+            Schema {
+                tables: [(name.clone(), t)].into(),
+                ..Default::default()
+            }
+        };
+        let check = |plan: &pbps_model::ChangeSet, before: &Schema, after: &Schema, settled| {
+            refuse_unplanned_movement(&pbps_mssql::Mssql, plan, before, after, "test", settled)
+        };
+        let plan = |changes: Vec<Change>| pbps_model::ChangeSet {
+            changes: changes.into_iter().map(PlannedChange::new).collect(),
+        };
+        let nothing = plan(Vec::new());
+        check(&nothing, &schema(None), &schema(None), Settled::Whole).expect("unchanged");
+        let e = check(
+            &nothing,
+            &schema(None),
+            &schema(Some("1 day")),
+            Settled::SoFar,
+        )
+        .expect_err("changed by another, untouched");
+        assert!(format!("{e:#}").contains("dbo.t"), "{e:#}");
+        // Touched by the plan, which never sets it on a table that exists.
+        let mut grown = schema(Some("1 day"));
+        grown
+            .tables
+            .get_mut(&name)
+            .unwrap()
+            .columns
+            .insert("note".into(), Column::new("int".parse().unwrap()));
+        let adding = plan(vec![Change::AddColumn {
+            table: name.clone(),
+            name: "note".into(),
+            column: Box::new(Column::new("int".parse().unwrap())),
+            uid: "c_000000".parse().unwrap(),
+        }]);
+        let e = check(&adding, &schema(None), &grown, Settled::Whole)
+            .expect_err("changed by another, touched");
+        assert!(format!("{e:#}").contains("system versioning"), "{e:#}");
+        // Created: held to the `CREATE` from the first read.
+        let declared = schema(Some("6 months")).tables.remove(&name).unwrap();
+        let creating = plan(vec![Change::CreateTable {
+            uid: "t_000000".parse().unwrap(),
+            name: name.clone(),
+            table: Box::new(declared),
+        }]);
+        let empty = Schema::default();
+        check(&creating, &empty, &schema(Some("6 months")), Settled::SoFar).expect("as created");
+        let e = check(&creating, &empty, &schema(Some("1 day")), Settled::SoFar)
+            .expect_err("not as created");
+        assert!(format!("{e:#}").contains("system versioning"), "{e:#}");
     }
 
     /// Storage parameters are held across an apply (#1441): another
