@@ -2147,6 +2147,12 @@ declaration lists it:
 - `apply` asks the same under the lock, before anything runs, for a table made
   there since the plan was computed. A staged run asks when it starts, not on
   a resume, whose own earlier statement created the history;
+- after the statements run, an apply or bootstrap refuses to keep a history
+  the `CREATE` took over rather than made, because no check before it can close
+  the window until it runs. The engine's record tells them apart: a history it
+  creates is 3 to 20 ms newer than its table and empty, and one it took over
+  predates the statement. In a transaction the plan rolls back. A staged run
+  asks at its closing read, by age alone, and does not close (SPEC §7.6);
 - validation refuses the ledger's own table names for it, as for a table;
 - `doctor` asks for its schema.
 

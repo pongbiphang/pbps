@@ -2622,6 +2622,85 @@ fn a_history_name_taken_after_the_plan_is_refused_at_apply() {
     }
 }
 
+/// A table that appears at a history's name after every check before the
+/// statements, and before the `CREATE TABLE` that names it, is taken as the
+/// history by the engine. The apply then refuses to keep it, and the whole
+/// plan rolls back (#1501 review). A database DDL trigger stands in for the
+/// other session: it fires inside the apply's own transaction when the plan
+/// creates `dbo.a`, ahead of `dbo.t`.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_history_taken_over_mid_apply_rolls_the_plan_back() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "temporal1176_race");
+    on_server(
+        own.connection(),
+        "CREATE TABLE dbo.base (id int NOT NULL CONSTRAINT pk_base PRIMARY KEY);",
+    );
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let d = Demo::new("temporal1176-race");
+    ok(&d.run(&["pull", "--db", own.connection()]));
+    d.commit();
+    ok(&d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]));
+    std::fs::write(
+        d.dir.join("schema/dbo.a.yml"),
+        "table: dbo.a\ncolumns:\n  id: {type: int, nullable: false}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/dbo.t.yml"),
+        "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  vf: {type: datetime2(7), nullable: false}\n  vt: {type: datetime2(7), nullable: false}\n\nprimary_key: [id]\n\nsystem_time:\n  period: [vf, vt]\n  versioning:\n    history: dbo.t_history\n",
+    )
+    .unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let path = d.dir.join("plan.json");
+    ok(&d.run(&[
+        "plan",
+        "--db",
+        own.connection(),
+        "--out",
+        path.to_str().unwrap(),
+    ]));
+    on_server(
+        own.connection(),
+        "CREATE TRIGGER tr_sneak ON DATABASE FOR CREATE_TABLE AS
+         IF EVENTDATA().value('(/EVENT_INSTANCE/ObjectName)[1]', 'sysname') = N'a'
+         BEGIN
+             CREATE TABLE dbo.t_history (id int NOT NULL, vf datetime2 NOT NULL,
+                                         vt datetime2 NOT NULL);
+             -- The layout the engine would build, so the read-back alone
+             -- cannot tell it from the statement's own.
+             CREATE CLUSTERED INDEX ix_t_history ON dbo.t_history (vt, vf)
+                 WITH (DATA_COMPRESSION = PAGE);
+             INSERT dbo.t_history VALUES (7, '2000-01-01', '2001-01-01');
+         END;",
+    );
+    let checksum = plan_checksum(&path);
+    let refused = d.run(&[
+        "apply",
+        "--db",
+        own.connection(),
+        "--plan",
+        path.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+    ]);
+    on_server(own.connection(), "DROP TRIGGER tr_sneak ON DATABASE;");
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        stderr(&refused).contains("dbo.t took dbo.t_history as its history"),
+        "{}",
+        stderr(&refused)
+    );
+    on_server(
+        own.connection(),
+        "IF OBJECT_ID('dbo.t') IS NOT NULL OR OBJECT_ID('dbo.a') IS NOT NULL
+             OR OBJECT_ID('dbo.t_history') IS NOT NULL
+             THROW 50000, 'the plan was not rolled back', 1;",
+    );
+}
+
 /// Every file under `dir`, at any depth.
 fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
