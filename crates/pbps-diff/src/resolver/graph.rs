@@ -392,17 +392,46 @@ pub(super) fn constraints(
             }
         }
     }
+    // An observation names its opening record by the base spelling when the
+    // base holds the surface, and otherwise by the final one, as coverage
+    // does. A step releases or makes it only if it changes that table, by
+    // UID: a dropped table and the one that takes its name are two owners,
+    // and the renamed table's removal is spelled by its final name
+    // (DEC-1498.1).
+    let opening = super::prepare::surfaces(base.schema);
+    let owned = |i: usize, owner: Option<&pbps_model::Uid>| match (owners[i], owner) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    };
     for observation in observations {
+        let surface = &observation.surface;
+        let table = table_of(surface);
+        let base_owner = table.and_then(|t| {
+            if opening.contains(surface) {
+                base.ids.table_uid(t)
+            } else {
+                desired.ids.table_uid(t)
+            }
+        });
+        let final_spelling = super::prepare::forward(surface, base.ids, desired.ids);
         let removes: Vec<_> = steps
             .iter()
             .enumerate()
-            .filter(|(_, c)| release(c, &observation.surface))
+            .filter(|&(i, c)| {
+                owned(i, base_owner)
+                    && (release(c, surface)
+                        || (&final_spelling != surface
+                            && owners[i].is_some()
+                            && base_owner.is_some()
+                            && release(c, &final_spelling)))
+            })
             .map(|(i, _)| i)
             .collect();
+        let desired_owner = table.and_then(|t| desired.ids.table_uid(t));
         let creates: Vec<_> = made
             .iter()
             .enumerate()
-            .filter(|(_, s)| s.contains(&observation.surface))
+            .filter(|&(i, s)| s.contains(surface) && owned(i, desired_owner))
             .map(|(i, _)| i)
             .collect();
         for &drop in &removes {

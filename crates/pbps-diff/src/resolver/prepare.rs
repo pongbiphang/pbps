@@ -4,7 +4,7 @@ use pbps_model::resolver::{Surface, SurfaceResolution};
 use pbps_model::{Change, ChangeSet, IdsFile, PlannedChange, Schema};
 use std::collections::BTreeSet;
 
-fn surfaces(schema: &Schema) -> BTreeSet<Surface> {
+pub(super) fn surfaces(schema: &Schema) -> BTreeSet<Surface> {
     let mut result = BTreeSet::new();
     for (table, definition) in &schema.tables {
         for (column, spec) in &definition.columns {

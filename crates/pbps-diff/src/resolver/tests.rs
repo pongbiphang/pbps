@@ -1719,4 +1719,116 @@ mod generated_surface_coverage {
         assert!(away < restore, "{steps:?}");
         ordered.proof.validate(&ordered.changes).unwrap();
     }
+
+    /// Releases are read through the table that owns them, not the spelling
+    /// they share. `app.a` is dropped and `app.b` renamed to it, and each
+    /// table's check calls its own function, which the plan also drops. The
+    /// renamed table's check removal is spelled `app.a` but releases the
+    /// `app.b` observation, so the function it called waits for it
+    /// (DEC-1498.1).
+    #[test]
+    fn a_reused_name_releases_each_tables_own_bindings() {
+        let module = |name: &str| -> (pbps_model::ModuleId, pbps_model::Module) {
+            (
+                format!("app.{name}(integer)").parse().unwrap(),
+                pbps_model::Module {
+                    kind: pbps_model::ModuleKind::Function,
+                    description: None,
+                    definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+                },
+            )
+        };
+        let (f1, m1) = module("f1");
+        let (f2, m2) = module("f2");
+        let checked = |function: &str| {
+            let mut t = table(None);
+            t.checks.insert(
+                "c".into(),
+                pbps_model::CheckConstraint {
+                    expression: format!("app.{function}(a) > 0"),
+                },
+            );
+            t
+        };
+        let a: pbps_model::TableName = "app.a".parse().unwrap();
+        let b: pbps_model::TableName = "app.b".parse().unwrap();
+        let mut base = Schema::default();
+        base.modules.insert(f1.clone(), m1);
+        base.modules.insert(f2.clone(), m2);
+        base.tables.insert(a.clone(), checked("f1"));
+        base.tables.insert(b.clone(), checked("f2"));
+        let before_ids = ids(&base, &IdsFile::default());
+        let mut desired = Schema::default();
+        desired.tables.insert(a.clone(), table(None));
+        let mut after_ids = before_ids.clone();
+        let dropped = before_ids.table_uid(&a).unwrap().clone();
+        after_ids.tables.remove(&dropped);
+        after_ids.columns.retain(|_, column| column.table != a);
+        after_ids.rename_table(&b, &a);
+        let (s1, s2) = (Surface::Module(f1.clone()), Surface::Module(f2.clone()));
+        let check =
+            |table: &pbps_model::TableName, input: &Surface, binds: &str| SurfaceResolution {
+                surface: Surface::Check {
+                    table: table.clone(),
+                    name: "c".into(),
+                },
+                current: Some(bound(
+                    "pg_constraint",
+                    "app.x.c",
+                    std::slice::from_ref(input),
+                    binds,
+                )),
+                desired: None,
+            };
+        let routine = |surface: &Surface| SurfaceResolution {
+            surface: surface.clone(),
+            current: Some(bound("pg_proc", "app.f", &[], "int4in")),
+            desired: None,
+        };
+        let ordered = super::plan(
+            crate::Side {
+                schema: &base,
+                ids: &before_ids,
+            },
+            crate::Side {
+                schema: &desired,
+                ids: &after_ids,
+            },
+            &Hints::default(),
+            &[
+                check(&a, &s1, "f1"),
+                check(&b, &s2, "f2"),
+                routine(&s1),
+                routine(&s2),
+            ],
+            &pbps_dialect::MinimalDialect,
+        )
+        .unwrap();
+        let steps = &ordered.changes.changes;
+        let position = |f: &dyn Fn(&Change) -> bool| {
+            steps
+                .iter()
+                .position(|p| f(&p.change))
+                .unwrap_or_else(|| panic!("missing from {steps:?}"))
+        };
+        let removal = position(&|c| matches!(c, Change::DropCheck { table, .. } if table == &a));
+        let table = position(&|c| matches!(c, Change::DropTable { uid, .. } if uid == &dropped));
+        let drop = |id: &pbps_model::ModuleId| {
+            position(&|c| matches!(c, Change::DropModule { id: d, .. } if d == id))
+        };
+        assert!(removal < drop(&f2), "{steps:?}");
+        assert!(table < drop(&f1), "{steps:?}");
+        // The dropped table's observation does not claim the renamed
+        // table's removal: no edge ties that removal to the other function.
+        let f1_drop = drop(&f1);
+        assert!(
+            !ordered
+                .proof
+                .edges()
+                .iter()
+                .any(|e| e.before == removal && e.after == f1_drop),
+            "{steps:?}"
+        );
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
 }

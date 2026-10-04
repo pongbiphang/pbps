@@ -1310,6 +1310,13 @@ when the names match and, where both UIDs are known, the UIDs match too. This
 only removes the false edges between two tables that share a name in turn; it
 adds none.
 
+The observation edges read the same owners. An observation names its opening
+record by the base spelling when the base holds the surface, and otherwise by
+the final one. A step releases or makes it only if the step changes that table
+by UID, and a release may be spelled by the surface's final name: the renamed
+table's check removal, spelled `app.a`, releases the `app.b` observation, and
+the dropped `app.a`'s observation does not claim it.
+
 The observations need no such re-keying (#1499). A `SurfaceResolution` holds
 the opening record under the surface's base spelling and the compiled record
 under its desired spelling. When names swap, one spelling therefore pairs two
