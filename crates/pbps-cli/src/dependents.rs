@@ -1321,15 +1321,10 @@ fn needs(later: &Change, earlier: &Change, deps: &ModuleDeps) -> bool {
 /// may name it, read by the engine's lexer as a module's is. A string
 /// literal counts too: an OID-alias literal such as `'app.a'::regclass` is
 /// resolved as the default or check is installed (measured on 16 and 18),
-/// as `may_call` reads a function's (DEC-1364.1), and so does its array
-/// type by any spelling the engine may give it.
+/// as `may_call` reads a function's (DEC-1364.1).
 fn names_new_table(table: &pbps_model::Table, made: &TableName) -> bool {
-    let named = |text: &str| pbps_pg::generated::may_name_relation(text, &made.name);
-    let typed = |base: &str| {
-        base == made.name
-            || base == made.to_string()
-            || pbps_pg::generated::array_spellings(&made.name).any(|array| base == array)
-    };
+    let named = |text: &str| pbps_pg::generated::may_call(text, &made.name);
+    let typed = |base: &str| base == made.name || base == made.to_string();
     table.columns.values().any(|column| {
         typed(&column.ty.base)
             || column.default.as_deref().is_some_and(named)
@@ -2284,35 +2279,68 @@ mod tests {
 
         // Two tables held behind different functions keep their own order:
         // app.b waits for the earlier function but names app.a, which waits
-        // for the later one, as a relation or by its array type.
-        for naming in [
-            "'app.a'::regclass::oid::integer",
-            "'app._a'::regtype::oid::integer",
-        ] {
-            let mut cs = plan(vec![
-                new_table("app.a", &[("id", None), ("g", Some("app.f2(id)"))], None),
-                new_table(
-                    "app.b",
-                    &[("id", None), ("g", Some("app.f1(id)")), ("r", Some(naming))],
-                    None,
-                ),
-                routine("app.f1(integer)", "SELECT 1"),
-                routine("app.f2(integer)", "SELECT 2"),
-            ]);
-            assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 2);
-            let order = names(&cs);
-            let position = |name: &str| {
-                cs.changes
+        // for the later one.
+        let mut cs = plan(vec![
+            new_table("app.a", &[("id", None), ("g", Some("app.f2(id)"))], None),
+            new_table(
+                "app.b",
+                &[
+                    ("id", None),
+                    ("g", Some("app.f1(id)")),
+                    ("r", Some("'app.a'::regclass::oid::integer")),
+                ],
+                None,
+            ),
+            routine("app.f1(integer)", "SELECT 1"),
+            routine("app.f2(integer)", "SELECT 2"),
+        ]);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 2);
+        let order = names(&cs);
+        let position = |name: &str| {
+            cs.changes
                 .iter()
                 .position(|p| {
                     matches!(&p.change, Change::CreateTable { name: n, .. } if n.to_string() == name)
                         || matches!(&p.change, Change::CreateModule { id, .. } if id.to_string() == name)
                 })
                 .unwrap_or_else(|| panic!("{name} missing from {order:?}"))
-            };
-            assert!(position("app.f2(integer)") < position("app.a"), "{order:?}");
-            assert!(position("app.a") < position("app.b"), "{order:?}");
-        }
+        };
+        assert!(position("app.f2(integer)") < position("app.a"), "{order:?}");
+        assert!(position("app.a") < position("app.b"), "{order:?}");
+
+        // An underscored name is not read as app.a's array type: its spelling
+        // depends on what the target already holds (#1503), and guessing it
+        // would close a cycle no order has. app.other names a declared
+        // app.__a and is read by the function app.a calls.
+        let mut other = Table::default();
+        let mut r = Column::new("integer".parse().unwrap());
+        r.default = Some("'app.__a'::regtype::oid::integer".into());
+        other.columns.insert("r".into(), r);
+        let mut cs = plan(vec![
+            new_table("app.a", &[("id", None), ("g", Some("app.f(id)"))], None),
+            Change::CreateTable {
+                uid: Uid::derived(UidKind::Table, "app.other", 0),
+                name: "app.other".parse().unwrap(),
+                table: Box::new(other),
+            },
+            routine("app.f(integer)", "SELECT count(*)::integer FROM app.other"),
+        ]);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
+        let order = names(&cs);
+        let position = |name: &str| {
+            cs.changes
+                .iter()
+                .position(|p| {
+                    matches!(&p.change, Change::CreateTable { name: n, .. } if n.to_string() == name)
+                        || matches!(&p.change, Change::CreateModule { id, .. } if id.to_string() == name)
+                })
+                .unwrap_or_else(|| panic!("{name} missing from {order:?}"))
+        };
+        assert!(
+            position("app.other") < position("app.f(integer)"),
+            "{order:?}"
+        );
+        assert!(position("app.f(integer)") < position("app.a"), "{order:?}");
     }
 
     /// DEC-1364.1: a literal an OID-alias type reads names the function to
