@@ -1299,6 +1299,13 @@ fn needs(later: &Change, earlier: &Change, deps: &ModuleDeps) -> bool {
             }
         }
         Change::InsertRow { .. } | Change::UpdateRow { .. } | Change::DeleteRow { .. } => true,
+        // Two new tables are independent unless the later one names the
+        // earlier: a table held back for its generation expression must not
+        // drag every later new table behind it, or a function that reads one
+        // of those closes a cycle no order has (#1303 review).
+        Change::CreateTable { name: made, .. } if matches!(later, Change::CreateTable { .. }) => {
+            matches!(later, Change::CreateTable { table, .. } if names_new_table(table, made))
+        }
         other => match (later, other.table()) {
             (Change::CreateModule { id, module } | Change::AlterModule { id, module }, Some(t)) => {
                 names_table(id, &module.definition, t)
@@ -1307,6 +1314,32 @@ fn needs(later: &Change, earlier: &Change, deps: &ModuleDeps) -> bool {
             _ => true,
         },
     }
+}
+
+/// Whether a new table's definition may name another new table `made`: a
+/// column of its row type, a foreign key to it, or an expression whose text
+/// may name it, read by the engine's lexer as a module's is.
+fn names_new_table(table: &pbps_model::Table, made: &TableName) -> bool {
+    let named = |text: &str| pbps_pg::generated::may_name(text, &made.name);
+    let typed = |base: &str| base == made.name || base == made.to_string();
+    table.columns.values().any(|column| {
+        typed(&column.ty.base)
+            || column.default.as_deref().is_some_and(named)
+            || column
+                .generated
+                .as_ref()
+                .is_some_and(|g| named(&g.expression))
+    }) || table
+        .foreign_keys
+        .values()
+        .any(|key| &key.references_table == made)
+        || table.checks.values().any(|check| named(&check.expression))
+        || table.indexes.values().any(|index| {
+            index.filter.as_deref().is_some_and(named)
+                || index.columns.iter().any(|column| {
+                    matches!(&column.key, pbps_model::IndexKey::Expression(text) if named(text))
+                })
+        })
 }
 
 /// Whether a module may read column `column` of `table`: its definition names
@@ -2173,6 +2206,59 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A new table held back for its generation expression does not drag an
+    /// unrelated new table behind it: when the function it calls reads that
+    /// other table, the order other table, function, generated table exists
+    /// and is found. A new table that names the held one still follows it.
+    #[test]
+    fn a_held_new_table_leaves_unrelated_new_tables_free() {
+        let new_table = |name: &str, columns: &[(&str, Option<&str>)], key: Option<&str>| {
+            let mut t = Table::default();
+            for (column, expression) in columns {
+                let mut c = Column::new("integer".parse().unwrap());
+                c.generated = expression.map(|expression| pbps_model::Generated {
+                    expression: expression.into(),
+                    stored: true,
+                });
+                t.columns.insert((*column).into(), c);
+            }
+            if let Some(target) = key {
+                t.foreign_keys.insert(
+                    "fk".into(),
+                    pbps_model::ForeignKey {
+                        columns: vec!["id".into()],
+                        references_table: target.parse().unwrap(),
+                        references_columns: vec!["id".into()],
+                        on_delete: Default::default(),
+                        on_update: Default::default(),
+                    },
+                );
+            }
+            Change::CreateTable {
+                uid: Uid::derived(UidKind::Table, name, 0),
+                name: name.parse().unwrap(),
+                table: Box::new(t),
+            }
+        };
+        let mut cs = plan(vec![
+            new_table("app.n", &[("id", None), ("g", Some("app.f(id)"))], None),
+            new_table("app.other", &[("id", None)], None),
+            new_table("app.child", &[("id", None)], Some("app.n")),
+            routine("app.f(integer)", "SELECT count(*)::integer FROM app.other"),
+        ]);
+        assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
+        let at =
+            |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
+        let table_at = |name: &str| {
+            at(&|c| matches!(c, Change::CreateTable { name: n, .. } if n.to_string() == name))
+        };
+        let created = at(&|c| matches!(c, Change::CreateModule { .. }));
+        let order = names(&cs);
+        assert!(table_at("app.other") < created, "{order:?}");
+        assert!(created < table_at("app.n"), "{order:?}");
+        assert!(table_at("app.n") < table_at("app.child"), "{order:?}");
     }
 
     /// DEC-1364.1: a literal an OID-alias type reads names the function to
